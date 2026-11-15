@@ -744,7 +744,8 @@ fn set_operation_over_aliased_view_is_rejected_at_create() {
         &core,
         "CREATE VIEW b AS SELECT x FROM a UNION SELECT body FROM docs",
     );
-    assert_eq!(code, "42601");
+    // 参照時の拒否（未対応の参照形）と同じ `0A000`（Issue #3240。内側の SQLSTATE を保つ）。
+    assert_eq!(code, "0A000");
     // 副作用なし: b は作られていない。
     assert_eq!(q_code(&core, "SELECT * FROM b LIMIT 10"), "42P01");
 }
@@ -842,12 +843,31 @@ fn swapped_aliases_order_by_uses_the_public_column() {
     );
     assert_eq!(r.rows[0].cells[0], Cell::Text("b1".into()));
     assert_eq!(r.rows.len(), 5);
+    // DISTINCT ON は公開名どおりの列でグループ化する（Issue #3261）。公開 `lang`（物理 `body`）は
+    // 5 行すべて異なるので 5 グループ、公開 `body`（物理 `lang`）は ja／en の 2 グループになる。
+    let r = q(
+        &core,
+        "SELECT DISTINCT ON (lang) lang FROM vs ORDER BY lang LIMIT 10",
+    );
+    assert_eq!(ids(&r), vec![1, 2, 3, 4, 5]);
+    let r = q(
+        &core,
+        "SELECT DISTINCT ON (body) body FROM vs ORDER BY body, lang DESC LIMIT 10",
+    );
+    assert_eq!(
+        r.rows
+            .iter()
+            .map(|row| (row.id, row.cells[0].clone()))
+            .collect::<Vec<_>>(),
+        vec![(3, Cell::Text("en".into())), (5, Cell::Text("ja".into()))]
+    );
+    // 別名付きビュー上でも、利用者が書いた公開名どうしで先頭一致を比較する。
     assert_eq!(
         q_code(
             &core,
-            "SELECT DISTINCT ON (lang) lang, body FROM vs ORDER BY lang LIMIT 10"
+            "SELECT DISTINCT ON (lang) lang, body FROM vs ORDER BY body, lang LIMIT 10"
         ),
-        "42601"
+        "42P10"
     );
 }
 
@@ -860,7 +880,8 @@ fn simple_view_over_aliased_view_is_revalidated_at_create() {
     create_ok(&core, "CREATE VIEW v (a, b, c, d) AS SELECT * FROM docs");
     assert_eq!(
         create_err(&core, "CREATE VIEW w AS SELECT c FROM v WHERE a = '1'"),
-        "42601"
+        // 参照時の拒否と同じ `0A000`（Issue #3240。内側の SQLSTATE を保つ）。
+        "0A000"
     );
     // 読める定義は従来どおり作成でき、参照も一致して動く。
     create_ok(&core, "CREATE VIEW w2 AS SELECT c, d FROM v WHERE c = 'ja'");

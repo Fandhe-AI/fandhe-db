@@ -1883,7 +1883,8 @@ fn reject_unsupported_predicate_dml_conjunction(
                 | WherePredicate::ScalarSubqueryCompare { .. }
                 | WherePredicate::QuantifiedSubqueryCompare { .. }
                 | WherePredicate::IdCompare { .. }
-                | WherePredicate::CorrelatedExists(_) => return Err(unsupported()),
+                | WherePredicate::CorrelatedExists(_)
+                | WherePredicate::RowCompare { .. } => return Err(unsupported()),
             },
             // 列 × 数値リテラルの比較の形に限る（`Call` 等は持ち込ませない）。
             WherePredicate::Expression(expr) => match expr {
@@ -1914,7 +1915,8 @@ fn reject_unsupported_predicate_dml_conjunction(
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => return Err(unsupported()),
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => return Err(unsupported()),
         }
     }
     Ok(())
@@ -8456,7 +8458,7 @@ impl EngineCore {
                 detail: "internal error".to_string(),
             })?;
         let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
-        let bound = crate::sql::insert_select::bind(stmt, &schema, &source)?;
+        let bound = crate::sql::insert_select::bind(stmt, &schema, &source, session.udfs())?;
         // `ON CONFLICT` 併用（Issue #2614）の静的な誤りは Describe 段・内側 SELECT の評価前に返す
         // （`42P10`／`42704`／`42809` 等）。結果は捨て、実行本体が自分で取得したスキーマで再束縛する
         // （スキーマ取得と書き込みの間の差を TOCTOU として扱わないため）。
@@ -9625,6 +9627,7 @@ impl EngineCore {
                         ctx,
                         stmt,
                         &lookup,
+                        session.udfs(),
                     )?;
                     return Ok(crate::sql::SqlOutcome::Returning(outcome));
                 }
@@ -9674,6 +9677,7 @@ impl EngineCore {
                 self.execute_view_insert(
                     || crate::tenant::WriteTarget::Autocommit(&self.storage),
                     ctx,
+                    session,
                     stmt,
                     Some(crate::sql::view_write_scope::InsteadOfGuard::new(
                         ctx.tenant_id(),
@@ -9766,6 +9770,7 @@ impl EngineCore {
                             crate::tenant::WriteTarget::Autocommit(&self.storage),
                             ctx,
                             v,
+                            session.udfs(),
                         )?;
                         return Ok(crate::sql::SqlOutcome::Returning(outcome));
                     }
@@ -10989,9 +10994,13 @@ impl EngineCore {
                 let trigger_scope =
                     crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
                 let outcome = if stmt.returning.is_some() {
-                    crate::sql::SqlOutcome::Returning(
-                        self.execute_insert_returning_form(target, ctx, stmt, &lookup)?,
-                    )
+                    crate::sql::SqlOutcome::Returning(self.execute_insert_returning_form(
+                        target,
+                        ctx,
+                        stmt,
+                        &lookup,
+                        session.udfs(),
+                    )?)
                 } else {
                     crate::sql::SqlOutcome::Insert(
                         self.execute_insert_form(target, ctx, stmt, &lookup)?,
@@ -11033,6 +11042,7 @@ impl EngineCore {
                 let (outcome, base_table) = self.execute_view_insert(
                     || crate::tenant::WriteTarget::InTxn(write_txn),
                     ctx,
+                    session,
                     stmt,
                     None,
                 )?;
@@ -11120,9 +11130,12 @@ impl EngineCore {
                 let (outcome, table) = match stmt {
                     crate::sql::allowlist::DeleteStatement::SingleRow(v) => {
                         let outcome = if v.returning.is_some() {
-                            crate::sql::SqlOutcome::Returning(
-                                self.execute_delete_returning_form(target, ctx, v)?,
-                            )
+                            crate::sql::SqlOutcome::Returning(self.execute_delete_returning_form(
+                                target,
+                                ctx,
+                                v,
+                                session.udfs(),
+                            )?)
                         } else {
                             crate::sql::SqlOutcome::Delete(
                                 self.execute_delete_form(target, ctx, v)?,
@@ -11656,6 +11669,7 @@ impl EngineCore {
                 session.udfs(),
                 validated.limit,
                 validated.offset,
+                &validated.order_by,
                 max_result_bytes.min(crate::arena::MAX_ARENA_TOTAL_BYTES),
                 self.group_by_limits,
                 &self.result_limits,
@@ -12624,7 +12638,11 @@ impl EngineCore {
             ),
             ParsedSql::Insert(stmt) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&stmt.table_name)?;
-                match crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    stmt.returning.as_ref(),
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => Ok(Some(crate::sql::returning::column_meta(
                         &projection,
                         &schema,
@@ -12679,9 +12697,10 @@ impl EngineCore {
                         Ok::<_, crate::sql::allowlist::SqlSurfaceError>((rewritten, schema))
                     })
                     .map_err(crate::catalog::table_lookup_error)??;
-                match crate::sql::parser::bind_returning(
+                match crate::sql::parser::bind_returning_with_udfs(
                     rewritten.insert.returning.as_ref(),
                     &schema,
+                    session.udfs(),
                 )? {
                     Some(projection) => {
                         let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
@@ -12724,7 +12743,11 @@ impl EngineCore {
                     DeleteStatement::SingleRow(v) => v.returning.as_ref(),
                     DeleteStatement::Predicate(v) => v.returning(),
                 };
-                match crate::sql::parser::bind_returning(returning, &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    returning,
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => {
                         let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
                         crate::sql::view_insert::apply_public_names(
@@ -12764,7 +12787,11 @@ impl EngineCore {
                     ValidatedUpdateForm::Single(v) => v.returning.as_ref(),
                     ValidatedUpdateForm::Predicate(v) => v.returning(),
                 };
-                match crate::sql::parser::bind_returning(returning, &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    returning,
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => {
                         let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
                         crate::sql::view_insert::apply_public_names(
@@ -12833,7 +12860,11 @@ impl EngineCore {
             ParsedSql::SequenceFunction(stmt) => Ok(Some(crate::sql::sequence_fn::columns(stmt))),
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
-                match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    v.returning.as_ref(),
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => Ok(Some(crate::sql::returning::column_meta(
                         &projection,
                         &schema,
@@ -12846,7 +12877,11 @@ impl EngineCore {
             // 同じ規則で結果列を返す（`RETURNING` なしは `None`）。
             ParsedSql::Delete(DeleteStatement::Predicate(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
-                match crate::sql::parser::bind_returning(v.returning(), &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    v.returning(),
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => Ok(Some(crate::sql::returning::column_meta(
                         &projection,
                         &schema,
@@ -12856,7 +12891,11 @@ impl EngineCore {
             }
             ParsedSql::Update(ValidatedUpdateForm::Single(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(&v.table_name)?;
-                match crate::sql::parser::bind_returning(v.returning.as_ref(), &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    v.returning.as_ref(),
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => Ok(Some(crate::sql::returning::column_meta(
                         &projection,
                         &schema,
@@ -12866,7 +12905,11 @@ impl EngineCore {
             }
             ParsedSql::Update(ValidatedUpdateForm::Predicate(v)) => {
                 let (_read_txn, schema) = self.read_txn_with_schema(v.table_name())?;
-                match crate::sql::parser::bind_returning(v.returning(), &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    v.returning(),
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => Ok(Some(crate::sql::returning::column_meta(
                         &projection,
                         &schema,
@@ -13008,6 +13051,7 @@ impl EngineCore {
                     dummy_equality_flags,
                     validated.limit,
                     validated.offset,
+                    &validated.order_by,
                     limits,
                 )?;
                 Ok(Some(columns))
@@ -14312,6 +14356,7 @@ impl EngineCore {
                     session.udfs(),
                     validated.limit,
                     validated.offset,
+                    &validated.order_by,
                     self.group_by_limits,
                     limits,
                 )?;
@@ -17126,13 +17171,14 @@ impl EngineCore {
             session.udfs(),
             validated.limit,
             validated.offset,
+            &validated.order_by,
             &self.explain_limits(),
             Some(&mut leaves),
         )?;
         let mut leaf_lines = Vec::with_capacity(leaves.len());
         for leaf in &leaves {
-            match &leaf.scan {
-                Some(bound) => {
+            match &leaf.source {
+                crate::sql::set_op::BoundSetLeafSource::Scan(bound) => {
                     let schema =
                         schemas
                             .get(&leaf.table)
@@ -17142,7 +17188,11 @@ impl EngineCore {
                     let gins = Self::gin_decls_for_explain(read_txn, bound)?;
                     leaf_lines.push(Self::scan_explain_lines(schema, bound, &gins));
                 }
-                None => leaf_lines.push(crate::sql::set_op::aggregate_branch_explain_lines()),
+                crate::sql::set_op::BoundSetLeafSource::Aggregate => {
+                    leaf_lines.push(crate::sql::set_op::aggregate_branch_explain_lines())
+                }
+                // 定数枝は表を読まない。走査分類の行は無く、葉 `result` は固定語彙のみ。
+                crate::sql::set_op::BoundSetLeafSource::Constant => leaf_lines.push(Vec::new()),
             }
         }
         crate::sql::set_op_explain::explain_tree(validated, &leaves, leaf_lines)
@@ -20395,6 +20445,7 @@ impl EngineCore {
         &self,
         make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedViewInsert,
         instead_of_guard: Option<crate::sql::view_write_scope::InsteadOfGuard>,
     ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
@@ -20437,6 +20488,8 @@ impl EngineCore {
                         ctx,
                         &rewritten.insert,
                         &lookup,
+                        // セッションの UDF レジストリで解決する（基表 DML と同じ。Issue #3251）。
+                        session.udfs(),
                     )
                     .map(|mut outcome| {
                         crate::sql::view_insert::apply_public_names(
@@ -20486,13 +20539,18 @@ impl EngineCore {
                 };
                 match &rewritten.delete {
                     DeleteStatement::SingleRow(v) if v.returning.is_some() => self
-                        .execute_delete_returning_form(make_target(), ctx, v)
+                        .execute_delete_returning_form(make_target(), ctx, v, session.udfs())
                         .map(returning),
                     DeleteStatement::SingleRow(v) => self
                         .execute_delete_form(make_target(), ctx, v)
                         .map(crate::sql::SqlOutcome::Delete),
                     DeleteStatement::Predicate(v) if v.returning().is_some() => self
-                        .execute_predicate_delete_returning_form(make_target(), ctx, session, v)
+                        .execute_view_predicate_delete_returning_form(
+                            make_target(),
+                            ctx,
+                            session,
+                            v,
+                        )
                         .map(returning),
                     DeleteStatement::Predicate(v) => self
                         .execute_predicate_delete_form(make_target(), ctx, session, v)
@@ -20529,7 +20587,7 @@ impl EngineCore {
                     ValidatedUpdateForm::Predicate(v) => v.returning().is_some(),
                 };
                 if has_returning {
-                    self.execute_update_returning_form(
+                    self.execute_view_update_returning_form(
                         make_target(),
                         ctx,
                         session,
@@ -20715,6 +20773,7 @@ impl EngineCore {
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedInsert,
         lookup: &InsertSchemaLookup<'_>,
+        udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         self.check_insert_row_count_limit(stmt.rows.len())?;
         let schema = match lookup.take_schema(&stmt.table_name) {
@@ -20731,8 +20790,9 @@ impl EngineCore {
                     },
                 })?,
         };
-        let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)?
-            .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+        let returning =
+            crate::sql::parser::bind_returning_with_udfs(stmt.returning.as_ref(), &schema, udfs)?
+                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "execute_insert_returning_form called without RETURNING".to_string(),
             })?;
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
@@ -21531,7 +21591,33 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.execute_predicate_delete_returning_form_pre(target, ctx, session, stmt, None)
+        self.execute_predicate_delete_returning_form_pre(
+            target,
+            ctx,
+            session,
+            stmt,
+            None,
+            session.udfs(),
+        )
+    }
+
+    /// [`Self::execute_predicate_delete_returning_form`] のビュー経由版。`RETURNING` の束縛に
+    /// セッションの UDF レジストリを渡す（基表 DML と同じ。Issue #3251）。
+    fn execute_view_predicate_delete_returning_form(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_predicate_delete_returning_form_pre(
+            target,
+            ctx,
+            session,
+            stmt,
+            None,
+            session.udfs(),
+        )
     }
 
     /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
@@ -21544,15 +21630,17 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         pre: Option<Option<crate::sql::allowlist::ValidatedPredicateDelete>>,
+        returning_udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
-        let returning =
-            crate::sql::parser::bind_returning(stmt.returning(), &schema)?.ok_or_else(|| {
-                crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: "execute_predicate_delete_returning_form called without RETURNING"
-                        .to_string(),
-                }
-            })?;
+        let returning = crate::sql::parser::bind_returning_with_udfs(
+            stmt.returning(),
+            &schema,
+            returning_udfs,
+        )?
+        .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+            detail: "execute_predicate_delete_returning_form called without RETURNING".to_string(),
+        })?;
         let resolved = match pre {
             Some(resolved) => resolved,
             None => {
@@ -21590,6 +21678,7 @@ impl EngineCore {
         target: crate::tenant::WriteTarget<'_>,
         ctx: &PolicyContext,
         stmt: &crate::sql::allowlist::ValidatedDelete,
+        udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let schema = self
             .storage
@@ -21602,8 +21691,9 @@ impl EngineCore {
                     detail: "failed to load table schema".to_string(),
                 },
             })?;
-        let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)?
-            .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
+        let returning =
+            crate::sql::parser::bind_returning_with_udfs(stmt.returning.as_ref(), &schema, udfs)?
+                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "execute_delete_returning_form called without RETURNING".to_string(),
             })?;
         let bound = crate::sql::parser::bind_delete(stmt)?;
@@ -21881,7 +21971,19 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.execute_update_returning_form_pre(target, ctx, session, stmt, None)
+        self.execute_update_returning_form_pre(target, ctx, session, stmt, None, session.udfs())
+    }
+
+    /// [`Self::execute_update_returning_form`] のビュー経由版。`RETURNING` の束縛にセッションの
+    /// UDF レジストリを渡す（基表 DML と同じ。Issue #3251）。
+    fn execute_view_update_returning_form(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedUpdateForm,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_update_returning_form_pre(target, ctx, session, stmt, None, session.udfs())
     }
 
     /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
@@ -21894,6 +21996,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
         pre: Option<Option<crate::sql::allowlist::ValidatedPredicateUpdate>>,
+        returning_udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::ValidatedUpdateForm;
 
@@ -21903,11 +22006,10 @@ impl EngineCore {
         };
         let schema = self.load_table_schema_for_dml(table_name)?;
         let returning =
-            crate::sql::parser::bind_returning(projection, &schema)?.ok_or_else(|| {
-                crate::sql::allowlist::SqlSurfaceError::Internal {
+            crate::sql::parser::bind_returning_with_udfs(projection, &schema, returning_udfs)?
+                .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                     detail: "execute_update_returning_form called without RETURNING".to_string(),
-                }
-            })?;
+                })?;
         match stmt {
             ValidatedUpdateForm::Single(_) => {
                 let _sparsevec_limits_scope = self.sparsevec_limits_scope();

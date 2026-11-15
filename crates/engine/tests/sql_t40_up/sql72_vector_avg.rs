@@ -185,7 +185,7 @@ fn group_by_and_having_count_work_with_vector_avg() {
 }
 
 /// Issue の「DISTINCT と併用」: `count(DISTINCT ...)` との同居は成功し、`avg(DISTINCT <vector>)` は
-/// 構文層で拒否のまま（`sum` と同じ既存挙動）。
+/// 束縛段で `22000` 拒否（VECTOR は正準等価を持たない。Issue #3263）。
 #[test]
 fn distinct_combinations() {
     let (core, _g) = build_core("sql72-avg-distinct", &SEEDS_A, &SEEDS_B_HUGE);
@@ -203,7 +203,7 @@ fn distinct_combinations() {
 
     assert_eq!(
         code_of(&core, "SELECT avg(DISTINCT embedding) FROM t"),
-        "42601"
+        "22000"
     );
     // `SELECT DISTINCT avg(...)` は受理でも拒否でもよいが、内部エラーにはしない。
     match core.execute_sql(&ctx("tenant-a"), "SELECT DISTINCT avg(embedding) FROM t") {

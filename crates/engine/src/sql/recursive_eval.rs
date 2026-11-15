@@ -1140,6 +1140,7 @@ fn array_elem_lacks_equality(elem: crate::catalog::ArrayElemType) -> bool {
         | E::Numeric { .. }
         | E::Bytea
         | E::Jsonb
+        | E::Bit(_)
         | E::Enum => false,
     }
 }

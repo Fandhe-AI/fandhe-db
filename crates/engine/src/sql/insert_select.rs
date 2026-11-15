@@ -173,6 +173,14 @@ pub(crate) fn cell_to_insert_value(
         (ColumnType::Double, Cell::SignedInteger(i)) => Ok(Value::Double(i as f64)),
         (ColumnType::Real, Cell::Integer(u)) => Ok(Value::Real(u as f32)),
         (ColumnType::Real, Cell::SignedInteger(i)) => Ok(Value::Real(i as f32)),
+        // `BIT(n)[]` 列へは、同じ宣言の `BIT(n)[]` の値だけを恒等として受け取る（Issue #3235。要素の
+        // CAST が無いため代入変換へ回せない。宣言の一致は [`is_direct_pair`] が保証し、要素の長さは
+        // encode の検証が最後に守る）。
+        (ColumnType::Array(at), Cell::Array(a))
+            if matches!(at.elem(), crate::catalog::ArrayElemType::Bit(_)) =>
+        {
+            Ok(Value::Array(a))
+        }
         // 配列は要素型の照合規則を持たないため対象外（fail-closed）。
         (ColumnType::Array(_), _) => Err(unsupported_pair()),
         (ty, cell) => match super::matview::cell_to_value(cell, ty) {
@@ -214,6 +222,13 @@ fn is_direct_pair(src: &ColumnType, dst: &ColumnType) -> bool {
     use ColumnType as T;
     let int_like = |t: &ColumnType| matches!(t, T::SmallInt | T::Integer | T::BigInt);
     let json_like = |t: &ColumnType| matches!(t, T::Json | T::Jsonb);
+    // `BIT(n)[]` は要素の CAST が無く代入変換へ回せないため、宣言が同一のときだけ直接変換する
+    // （Issue #3235。宣言が異なる組は代入変換の束縛が `0A000` で拒否する）。
+    if let (T::Array(s), T::Array(d)) = (src, dst) {
+        if matches!(d.elem(), crate::catalog::ArrayElemType::Bit(_)) && s == d {
+            return true;
+        }
+    }
     // 配列は直接変換が常に拒否するため、同型でも代入変換（要素ごとの変換）へ回す。
     if matches!(dst, T::Array(_)) || matches!(src, T::Array(_)) {
         return false;
@@ -531,6 +546,7 @@ pub(crate) fn bind(
     stmt: &ValidatedInsertSelect,
     schema: &TableSchema,
     source: &[ColumnMeta],
+    udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundInsertSelectTarget, SqlSurfaceError> {
     // 列リスト省略（Issue #2613）は、内側の出力列数に応じて表の宣言順の先頭列へ展開する
     // （`VALUES` 形と同じ共有ヘルパー。束縛と同じスキーマのスナップショットで展開する）。
@@ -614,7 +630,8 @@ pub(crate) fn bind(
         .enumerate()
         .filter_map(|(i, p)| (!*p).then_some(i))
         .collect();
-    let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), schema)?;
+    let returning =
+        crate::sql::parser::bind_returning_with_udfs(stmt.returning.as_ref(), schema, udfs)?;
     Ok(BoundInsertSelectTarget {
         columns,
         slots,
@@ -756,6 +773,20 @@ mod tests {
 #[cfg(test)]
 mod bind_tests {
     use super::*;
+
+    /// テスト用の薄い包み（UDF を解決しない空のレジストリで `super::bind` を呼ぶ）。
+    fn bind(
+        stmt: &ValidatedInsertSelect,
+        schema: &TableSchema,
+        source: &[ColumnMeta],
+    ) -> Result<BoundInsertSelectTarget, SqlSurfaceError> {
+        super::bind(
+            stmt,
+            schema,
+            source,
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
     use crate::catalog::{ColumnDef, RowIdentity};
     use crate::sql::allowlist::{InsertSelectShape, Statement};
 

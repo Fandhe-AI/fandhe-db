@@ -545,8 +545,85 @@ pub(crate) fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
         ArrayElemType::Jsonb => CastType::Jsonb,
         ArrayElemType::Varchar(len) => CastType::Varchar(len),
         ArrayElemType::Bpchar(n) => CastType::Bpchar(n),
-        ArrayElemType::Enum => return None,
+        // `BIT(n)` 要素はスカラー BIT と同じく CAST の型を持たない（Issue #3235）。呼び出し側は
+        // `None` を ENUM と取り違えないこと（[`array_source_kind`] が `SourceKind::Bit` へ振る）。
+        ArrayElemType::Enum | ArrayElemType::Bit(_) => return None,
     })
+}
+
+/// 配列の要素型から CAST の変換元種別を決める。要素型を `CastType` で表せない配列のうち、
+/// `BIT(n)` 要素はスカラー BIT と同じ `SourceKind::Bit`（CAST は `0A000`）、残り（ENUM）だけが
+/// `Array(None)` になる。`Array(None)` は呼び出し側で ENUM 配列として扱われるため、BIT 配列を
+/// 取り違えて通さない（Issue #3235）。
+fn array_source_kind(elem: Option<ArrayElemType>) -> SourceKind {
+    match elem {
+        Some(ArrayElemType::Bit(_)) => SourceKind::Bit,
+        Some(e) => SourceKind::Array(elem_cast_type(e)),
+        None => SourceKind::Array(None),
+    }
+}
+
+/// 型なしリテラル（文字列・`NULL`）を `BIT(n)[]` として束縛する（Issue #3235。配列どうしの等値比較の
+/// 相手側。`BIT(n)` 要素は [`CastType`] を持たないため [`bind_string_literal_as`] を通れない）。
+/// 入力関数は実行時と同じ `CastFn`（テキスト → 配列）で、形式不正・長さ不一致は束縛時に報告する。
+pub(super) fn bind_bit_array_literal(
+    lit: &Expr,
+    elem: ArrayElemType,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    match lit {
+        Expr::Null => {
+            charge_node(node_budget)?;
+            Ok(BoundExpr::Null)
+        }
+        Expr::String(s) => {
+            if crate::sql::udf_call::in_check_binding() {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "array operators are not supported in a CHECK constraint".to_string(),
+                });
+            }
+            if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "string literal exceeds the maximum TEXT field length",
+                ));
+            }
+            charge_node(node_budget)?;
+            charge_node(node_budget)?;
+            let f = CastFn {
+                from: CastSrc::Text,
+                to: CastDst::Array(elem),
+            };
+            crate::sql::cast_value::apply_cast(
+                f,
+                crate::sql::udf_call::ExprValue::Text(std::borrow::Cow::Borrowed(s)),
+            )?;
+            Ok(cast_node(f, BoundExpr::Text(s.to_string())))
+        }
+        _ => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "array predicates on this element type are not supported".to_string(),
+        }),
+    }
+}
+
+/// 束縛済みの配列式が `BIT(n)` 要素の配列なら、その要素型（`n` つき）を返す（Issue #3235）。
+/// 要素の CAST の型を持たない `BIT(n)[]` は [`source_cast_kind`] では `SourceKind::Bit` になり
+/// 要素型を取り出せないため、添字（`v[1]`）の束縛がこの関数で `n` を得る。
+pub(super) fn bit_array_elem(
+    bound: &BoundExpr,
+    schema: Option<&TableSchema>,
+) -> Option<ArrayElemType> {
+    let elem = match bound {
+        BoundExpr::ArrayColumnRef { index } => {
+            match schema.and_then(|s| s.columns.get(*index)).map(|c| &c.ty) {
+                Some(ColumnType::Array(at)) => at.elem(),
+                _ => return None,
+            }
+        }
+        BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => *elem,
+        BoundExpr::ArrayFn(f) => f.elem?,
+        _ => return None,
+    };
+    matches!(elem, ArrayElemType::Bit(_)).then_some(elem)
 }
 
 pub(crate) fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
@@ -733,20 +810,20 @@ pub(super) fn source_cast_kind(
         // 配列を生成するのは配列列の参照（CAST の被演算子の位置）と CAST の結果（上で処理済み）だけ。
         ExprType::Array => match bound {
             BoundExpr::ArrayColumnRef { index } => {
-                SourceKind::Array(schema.and_then(|s| s.columns.get(*index)).and_then(|c| {
+                array_source_kind(schema.and_then(|s| s.columns.get(*index)).and_then(|c| {
                     match &c.ty {
-                        ColumnType::Array(at) => elem_cast_type(at.elem()),
+                        ColumnType::Array(at) => Some(at.elem()),
                         _ => None,
                     }
                 }))
             }
             // 配列コンストラクタ・スライスの結果は束縛結果が持つ要素型（TABLE-35・Issue #1602）。
             BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => {
-                SourceKind::Array(elem_cast_type(*elem))
+                array_source_kind(Some(*elem))
             }
             // 配列を返す配列関数の結果も束縛結果が持つ共通の要素型（Issue #1604）。
             BoundExpr::ArrayFn(f) => match f.elem {
-                Some(elem) => SourceKind::Array(elem_cast_type(elem)),
+                Some(elem) => array_source_kind(Some(elem)),
                 None => SourceKind::Array(None),
             },
             _ => SourceKind::Array(None),
@@ -1178,6 +1255,21 @@ pub(super) fn bind_array_assignment(
     let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
         detail: detail.to_string(),
     };
+    // `BIT(n)[]` 列（Issue #3235）。要素の CAST が無いため、宣言（要素の長さ・次元数・要素数上限）が
+    // 同一の `BIT(n)[]` 列の参照だけを恒等として通し、他の式（長さ違い・他の型の配列）は
+    // `0A000`（fail-closed）にする。
+    if matches!(target.elem(), ArrayElemType::Bit(_)) {
+        if let BoundExpr::ArrayColumnRef { index } = &bound {
+            if let Some(ColumnType::Array(src)) = schema.columns.get(*index).map(|c| &c.ty) {
+                if src == target {
+                    return Ok(bound);
+                }
+            }
+        }
+        return Err(unsupported(
+            "assigning this array expression to a bit array column is not supported",
+        ));
+    }
     let Some(tgt_ty) = elem_cast_type(target.elem()) else {
         return Err(unsupported(
             "assigning an array expression to this column type is not supported",
@@ -1955,11 +2047,30 @@ mod tests {
         );
     }
 
-    /// Issue #3229: 配列要素型 ⇔ CAST 型の写像が全要素型で往復する（Enum は対象外で `None`）。
+    /// Issue #3235: `BIT(n)` 要素の配列は CAST の型を持たず、変換元の種別は `SourceKind::Bit`
+    /// （CAST は `0A000`）になる。`Array(None)` に落とすと ENUM 配列として扱われてしまう。
+    #[test]
+    fn bit_array_source_kind_is_bit_not_enum() {
+        assert_eq!(
+            array_source_kind(Some(ArrayElemType::Bit(4))),
+            SourceKind::Bit
+        );
+        assert_eq!(
+            array_source_kind(Some(ArrayElemType::Enum)),
+            SourceKind::Array(None)
+        );
+        assert_eq!(array_source_kind(None), SourceKind::Array(None));
+        assert_eq!(
+            array_source_kind(Some(ArrayElemType::Integer)),
+            SourceKind::Array(Some(CastType::Int4))
+        );
+    }
+
+    /// Issue #3229: 配列要素型 ⇔ CAST 型の写像が全要素型で往復する（Enum・Bit は対象外で `None`）。
     #[test]
     fn array_elem_cast_mapping_roundtrips_for_all_kinds() {
         for elem in ArrayElemType::ALL_KINDS {
-            if elem == ArrayElemType::Enum {
+            if matches!(elem, ArrayElemType::Enum | ArrayElemType::Bit(_)) {
                 assert!(elem_cast_type(elem).is_none());
                 assert!(crate::sql::cast_value::elem_cast_src(elem).is_none());
                 assert!(crate::sql::cast_value::elem_cast_dst(elem).is_none());

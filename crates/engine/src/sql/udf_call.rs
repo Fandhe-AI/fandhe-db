@@ -245,6 +245,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// 剰余（`%`。`* /` と同じ優先度・左結合。Issue #3273・SQL-42 ポインタ）。
+    Rem,
     Gt,
     Lt,
     Ge,
@@ -6018,6 +6020,11 @@ pub(crate) fn expr_result_column_type(
                 .ok()
                 .map(ColumnType::Array);
         }
+        // `BIT(n)[]` の添字の結果は `bit(n)`（Issue #3235。`n` は要素型が持つ宣言長）。
+        BoundExpr::ArrayIndex {
+            elem: crate::catalog::ArrayElemType::Bit(n),
+            ..
+        } => return Some(ColumnType::Bit(*n)),
         BoundExpr::ArrayIndex { elem, .. } => {
             return crate::sql::cast::elem_cast_type(*elem)
                 .and_then(|t| t.result_column_type())
@@ -7252,7 +7259,10 @@ pub(super) fn bind_expr_any(
             // Issue #1812: 集計式項目では NUMERIC 値を算術の被演算子に使える。ゲート
             // （`reject_json_operand`）を被演算子の束縛後へ遅らせ、NUMERIC を含まない組は従来どおり拒否する。
             let numeric_mode = env.numeric_arith
-                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+                && matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                );
             // codex-review 指摘対応（Issue #1812）: NUMERIC 算術の数値リテラルは、相手が NUMERIC
             // 式なら `f64` 経由（`parse_number_literal` の 2^53 検証）を通さず `Decimal` へ直接
             // 束縛する（`sum(b) + 9007199254740993`）。そのため非リテラル側を先に束縛する。
@@ -7314,6 +7324,39 @@ pub(super) fn bind_expr_any(
                 reject_json_operand(lt)?;
                 reject_json_operand(rt)?;
             }
+            // Issue #3273・SQL-42: `%` の f64 レーンは、両被演算子が整数値と判定できる組だけを
+            // 受理する。PG の `%` は整数・numeric のみで、小数リテラル（`0.3 % 0.1` は numeric で 0）を
+            // f64 の fmod へ流すと値が変わり、float8 の式（CASE／COALESCE／NULLIF 経由を含む）は
+            // `42883` になるべきなので、束縛後の判定で整数と証明できない組は fail-closed で拒否する。
+            if *op == BinOp::Rem
+                && lt == ExprType::Scalar
+                && rt == ExprType::Scalar
+                && !(rem_integer_operand(lhs, &l, env) && rem_integer_operand(rhs, &r, env))
+            {
+                return Err(
+                    if matches!(&**lhs, Expr::Number(_)) && !rem_integer_operand(lhs, &l, env)
+                        || matches!(&**rhs, Expr::Number(_)) && !rem_integer_operand(rhs, &r, env)
+                    {
+                        SqlSurfaceError::FeatureNotSupported {
+                            detail:
+                                "remainder with a non-integer literal requires a numeric operand"
+                                    .to_string(),
+                        }
+                    } else {
+                        rem_operator_error()
+                    },
+                );
+            }
+            // `%` の被演算子の中間演算（`+ - * / %`）は f64 の丸めを剰余へ持ち込まないため、
+            // 各演算を整数の checked 演算（|v| <= 2^53 を超えれば 22003）へ置き換える。
+            let (l, r) = if *op == BinOp::Rem && lt == ExprType::Scalar && rt == ExprType::Scalar {
+                (
+                    rem_harden_operand(Some(lhs), l, env),
+                    rem_harden_operand(Some(rhs), r, env),
+                )
+            } else {
+                (l, r)
+            };
             // Issue #1539・SQL-42: 投影モードの `Scalar` 同士の算術は、オペランドの数値
             // 種別（整数／単精度／倍精度）から結果型を PostgreSQL に揃える。
             // Issue #2881: 整数モードの整数どうしの比較は i128 で丸めなく比較する。
@@ -7335,7 +7378,10 @@ pub(super) fn bind_expr_any(
                 }
             }
             if env.typed_arith
-                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                && matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                )
                 && lt == ExprType::Scalar
                 && rt == ExprType::Scalar
             {
@@ -7738,7 +7784,7 @@ fn is_int4_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
                 .is_some_and(|c| matches!(c.ty, ColumnType::Integer))
         }),
         Expr::Binary {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div,
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem,
             lhs,
             rhs,
         } => is_int4_expr(lhs, env) && is_int4_expr(rhs, env),
@@ -8574,6 +8620,7 @@ fn scalar_numeric_kind(
             | crate::catalog::ArrayElemType::Bytea
             | crate::catalog::ArrayElemType::Json
             | crate::catalog::ArrayElemType::Jsonb
+            | crate::catalog::ArrayElemType::Bit(_)
             | crate::catalog::ArrayElemType::Enum => None,
         },
         // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
@@ -9395,6 +9442,14 @@ fn bind_binary(
                 "'/' requires scalar operands, or a vector divided by a scalar",
             )),
         },
+        // 剰余（Issue #3273・SQL-42 ポインタ）。PostgreSQL の `%` は整数・numeric だけで、
+        // Scalar 以外の組は `operator does not exist`（42883）。値・列名は含めない固定文言。
+        BinOp::Rem => match (lt, rt) {
+            (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Scalar)),
+            (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
+            (ExprType::Interval, _) | (_, ExprType::Interval) => Err(interval_operator_error()),
+            _ => Err(rem_operator_error()),
+        },
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => match (lt, rt) {
             (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Bool)),
             // Issue #919・SQL-26: TEXT 同士の比較（バイト順＝UTF-8 コードポイント順。
@@ -9452,6 +9507,185 @@ fn bind_binary(
 /// `operator does not exist` 相当で `42883`。値・列名は含めない固定文言）。
 fn text_arithmetic_error() -> SqlSurfaceError {
     SqlSurfaceError::undefined_function("operator does not exist: arithmetic on text operand")
+}
+
+/// `%` の未対応の被演算子型の組（VECTOR・DATE・BOOL 等）のエラー。PostgreSQL の
+/// `operator does not exist` と同じ `42883`。値・列名は含めない固定文言（Issue #3273）。
+fn rem_operator_error() -> SqlSurfaceError {
+    SqlSurfaceError::undefined_function("operator does not exist: unsupported operand types for %")
+}
+
+/// `%` の f64 レーンの被演算子が整数値と証明できるか（Issue #3273）。束縛済みの数値種別
+/// （[`projection_kind`]。CASE／COALESCE／NULLIF の分岐型を透過する）が整数なら真。それ以外は
+/// 構文で、整数リテラル・整数列・疑似列 `id`・整数型への CAST と、それらの `+ - * %` だけを真とする
+/// （`/` は f64 の真の除算になりうるため含めない）。float8・小数リテラル・不明な型は偽（fail-closed）。
+fn rem_integer_operand(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> bool {
+    if matches!(
+        projection_kind(expr, bound, env.schema),
+        ProjKind::Num(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8)
+    ) {
+        return true;
+    }
+    rem_integer_syntax(expr, env)
+}
+
+/// `%` の被演算子に含まれる `+ - * / %` の [`BoundExpr::Binary`] を、整数の checked 演算
+/// （[`BuiltinFn::TypedArith`] の `Int8`。各演算の結果が 2^53 を超えれば `22003`）へ再帰的に
+/// 置き換える（Issue #3273）。f64 レーンでは `((b*b+1)-(b*b)) % 2` のように、最終値だけを見ても
+/// 中間の丸めを検出できないため、各中間演算で精度を保証する。葉（列・リテラル・CAST 等）は不変。
+fn rem_harden_operand(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> BoundExpr {
+    match e {
+        BoundExpr::Binary {
+            op: op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem),
+            lhs,
+            rhs,
+        } => {
+            let (le, re) = match expr {
+                Some(Expr::Binary { lhs: a, rhs: b, .. }) => (Some(&**a), Some(&**b)),
+                _ => (None, None),
+            };
+            BoundExpr::Builtin {
+                f: BuiltinFn::TypedArith(op, NumericKind::Int8),
+                args: vec![
+                    rem_harden_operand(le, *lhs, env),
+                    rem_harden_operand(re, *rhs, env),
+                ],
+            }
+        }
+        // 整数型への CAST の内部の整数算術も f64 の丸めを持ち込むため再帰的に硬化する。
+        // 内側が整数と証明できない CAST（float8 から整数への丸め等）は CAST 自身の意味論に任せる。
+        BoundExpr::Builtin {
+            f: f @ BuiltinFn::Cast(_),
+            mut args,
+        } => {
+            if let (Some(Expr::Cast { expr: inner, .. }), 1) = (expr, args.len()) {
+                if rem_integer_syntax(inner, env) {
+                    let a = args.remove(0);
+                    args.push(rem_harden_operand(Some(inner), a, env));
+                }
+            }
+            BoundExpr::Builtin { f, args }
+        }
+        // CASE／COALESCE／NULLIF／abs の内部も同様に硬化する（整数と証明できる枝・引数だけ。
+        // 丸めを持つ中間 f64 が最終値だけ小さくなって誤一致するのを防ぐ。CASE の条件部は値に
+        // ならないため対象外）。構文木と束縛木の形が対応しない場合は硬化せず `Cast` と同じ扱い。
+        BoundExpr::Case { whens, else_result } => {
+            let (ws, els) = match expr {
+                Some(Expr::Case {
+                    whens: ws,
+                    else_result: els,
+                }) if ws.len() == whens.len() => (Some(ws), els.as_deref()),
+                _ => (None, None),
+            };
+            let whens = whens
+                .into_iter()
+                .enumerate()
+                .map(|(i, (c, r))| {
+                    let r = rem_harden_checked(ws.map(|w| &w[i].1), r, env);
+                    (c, r)
+                })
+                .collect();
+            let else_result = Box::new(rem_harden_checked(els, *else_result, env));
+            BoundExpr::Case { whens, else_result }
+        }
+        BoundExpr::Coalesce(args) => {
+            let src = match expr {
+                Some(Expr::Coalesce(a)) if a.len() == args.len() => Some(a),
+                _ => None,
+            };
+            BoundExpr::Coalesce(
+                args.into_iter()
+                    .enumerate()
+                    .map(|(i, a)| rem_harden_checked(src.map(|s| &s[i]), a, env))
+                    .collect(),
+            )
+        }
+        BoundExpr::NullIf { lhs, rhs } => {
+            let (le, re) = match expr {
+                Some(Expr::NullIf(a, b)) => (Some(&**a), Some(&**b)),
+                _ => (None, None),
+            };
+            BoundExpr::NullIf {
+                lhs: Box::new(rem_harden_checked(le, *lhs, env)),
+                rhs: Box::new(rem_harden_checked(re, *rhs, env)),
+            }
+        }
+        BoundExpr::Builtin {
+            f: BuiltinFn::Abs,
+            mut args,
+        } => {
+            if let (Some(Expr::Call { args: src, .. }), 1) = (expr, args.len()) {
+                if src.len() == 1 {
+                    let a = args.remove(0);
+                    args.push(rem_harden_checked(src.first(), a, env));
+                }
+            }
+            BoundExpr::Builtin {
+                f: BuiltinFn::Abs,
+                args,
+            }
+        }
+        // GREATEST／LEAST の各引数も同様に硬化する（整数と証明できる引数だけ。構文木と束縛木の
+        // 引数個数が対応しない場合は硬化せず、そのまま返す）。
+        BoundExpr::MinMax { op, args } => {
+            let src = match expr {
+                Some(Expr::Call { args: a, .. }) if a.len() == args.len() => Some(a),
+                _ => None,
+            };
+            BoundExpr::MinMax {
+                op,
+                args: args
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, a)| rem_harden_checked(src.and_then(|s| s.get(i)), a, env))
+                    .collect(),
+            }
+        }
+        other => other,
+    }
+}
+
+/// ラッパー内部の枝・引数用: 整数と証明できる場合だけ [`rem_harden_operand`] を適用する。
+fn rem_harden_checked(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> BoundExpr {
+    match expr {
+        Some(x) if rem_integer_operand(x, &e, env) => rem_harden_operand(Some(x), e, env),
+        _ => e,
+    }
+}
+
+fn rem_integer_syntax(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    use crate::sql::cast::CastType;
+    match expr {
+        Expr::Number(raw) => classify_exact_int_literal(raw).is_some(),
+        Expr::Ident(name) => {
+            // UDF 引数は宣言型（`param_decl`）が整数型のときだけ整数と証明する。型なし引数は
+            // 偽（fail-closed）。型付き引数は呼び出し時に宣言型へ代入変換済みで整数値になる。
+            let lower = name.to_ascii_lowercase();
+            if env.params.contains_key(lower.as_str()) {
+                return matches!(
+                    env.param_decl.get(lower.as_str()),
+                    Some(CastType::Int2 | CastType::Int4 | CastType::Int8)
+                );
+            }
+            match env
+                .schema
+                .and_then(|s| s.columns.iter().find(|c| &c.name == name))
+            {
+                Some(c) => matches!(
+                    c.ty,
+                    ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+                ),
+                None => name.eq_ignore_ascii_case("id"),
+            }
+        }
+        Expr::Cast { ty, .. } => matches!(ty, CastType::Int2 | CastType::Int4 | CastType::Int8),
+        Expr::Binary {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Rem,
+            lhs,
+            rhs,
+        } => rem_integer_syntax(lhs, env) && rem_integer_syntax(rhs, env),
+        _ => false,
+    }
 }
 
 /// INTERVAL を含む未対応の算術の組のエラー（PostgreSQL の `operator does not exist` 相当で
@@ -12470,7 +12704,7 @@ pub(crate) fn apply_builtin<'a>(
                 BinOp::Ge => a >= b,
                 BinOp::Le => a <= b,
                 BinOp::Eq => a == b,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "arithmetic operator in exact integer comparison".to_string(),
                     });
@@ -12499,7 +12733,7 @@ pub(crate) fn apply_builtin<'a>(
                         BinOp::Ge => ord.is_ge(),
                         BinOp::Le => ord.is_le(),
                         BinOp::Eq => a == b,
-                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                             return Err(SqlSurfaceError::Internal {
                                 detail: "non-comparison operator in collated comparison"
                                     .to_string(),
@@ -12544,6 +12778,14 @@ fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlS
                     }
                     a / b
                 }
+                // PG の `%` は float4 を受け付けない。束縛段（`rem_operator_error`）が 42883 で
+                // 拒否するため到達しない不変条件（fail-closed）。
+                BinOp::Rem => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "remainder operator on a float kind in typed arithmetic"
+                            .to_string(),
+                    });
+                }
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "comparison operator in typed arithmetic evaluation".to_string(),
@@ -12583,6 +12825,13 @@ fn int_arith_checked(
                 return Err(SqlSurfaceError::division_by_zero("/"));
             }
             x.checked_div(y)
+        }
+        // 符号は被除数に従う。`i64::MIN % -1` は i128 で計算するため 0（PG も 0）。
+        BinOp::Rem => {
+            if y == 0 {
+                return Err(SqlSurfaceError::division_by_zero("%"));
+            }
+            x.checked_rem(y)
         }
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
             return Err(SqlSurfaceError::Internal {
@@ -12683,6 +12932,7 @@ fn numeric_arith_eval(
         BinOp::Sub => DecimalOp::Sub,
         BinOp::Mul => DecimalOp::Mul,
         BinOp::Div => DecimalOp::Div,
+        BinOp::Rem => DecimalOp::Rem,
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
             return Err(SqlSurfaceError::Internal {
                 detail: "comparison operator in numeric arithmetic evaluation".to_string(),
@@ -12690,7 +12940,9 @@ fn numeric_arith_eval(
         }
     };
     decimal_arith(dop, a, b).map_err(|e| match e {
-        DecimalArithError::DivisionByZero => SqlSurfaceError::division_by_zero("/"),
+        DecimalArithError::DivisionByZero => {
+            SqlSurfaceError::division_by_zero(if op == BinOp::Rem { "%" } else { "/" })
+        }
         DecimalArithError::OutOfRange => {
             SqlSurfaceError::numeric_out_of_range("numeric field overflow")
         }
@@ -12702,6 +12954,10 @@ fn numeric_arith_eval(
 fn exact_int(v: f64) -> Result<i64, SqlSurfaceError> {
     if v.is_finite() && v.fract() == 0.0 && v.abs() <= TYPED_INT_EXACT_MAX as f64 {
         Ok(v as i64)
+    } else if v.is_finite() && v.fract() == 0.0 {
+        // 整数値だが f64 で厳密に運べない大きさ（|v| > 2^53）は、不変条件違反ではなく
+        // 値域外として 22003 にする（`%` の被演算子が大きな BIGINT／id を含む場合。Issue #3273）。
+        Err(SqlSurfaceError::numeric_out_of_range("bigint out of range"))
     } else {
         Err(SqlSurfaceError::Internal {
             detail: "typed integer arithmetic received a non-integer operand".to_string(),
@@ -12921,6 +13177,15 @@ pub(crate) fn eval_binary<'a>(
         return Ok(ExprValue::Null);
     }
     match op {
+        // 剰余（Issue #3273）。束縛段（`bind_binary`）が受理する Scalar 同士だけが到達する。
+        BinOp::Rem => match (l, r) {
+            (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
+                apply_scalar_op(op, a, b).map(ExprValue::Scalar)
+            }
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "operand type mismatch at evaluation time".to_string(),
+            }),
+        },
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (l, r) {
             (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
                 let v = apply_scalar_op(op, a, b)?;
@@ -13019,7 +13284,7 @@ pub(crate) fn eval_binary<'a>(
                     (BinOp::Ge, None) => a >= b,
                     (BinOp::Le, None) => a <= b,
                     (BinOp::Eq, None) => a == b,
-                    (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, _) => {
+                    (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, _) => {
                         return Err(SqlSurfaceError::Internal {
                             detail: "non-comparison operator in comparison evaluation".to_string(),
                         });
@@ -13041,7 +13306,7 @@ pub(crate) fn eval_binary<'a>(
                     BinOp::Ge => ord.is_ge(),
                     BinOp::Le => ord.is_le(),
                     BinOp::Eq => a == b,
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         return Err(SqlSurfaceError::Internal {
                             detail: "non-comparison operator in comparison evaluation".to_string(),
                         });
@@ -13115,7 +13380,7 @@ fn compare<T: PartialOrd>(op: BinOp, a: T, b: T) -> Result<bool, SqlSurfaceError
         BinOp::Ge => a >= b,
         BinOp::Le => a <= b,
         BinOp::Eq => a == b,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
             return Err(SqlSurfaceError::Internal {
                 detail: "non-comparison operator in comparison evaluation".to_string(),
             });
@@ -13133,6 +13398,27 @@ fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
                 return Err(SqlSurfaceError::division_by_zero("/"));
             }
             a / b
+        }
+        // f64 運び手レーンの剰余（`fmod`。符号は被除数に従う）。|v| <= 2^53 の整数どうしでは
+        // 整数剰余と厳密に一致する。`-0.0` は `0` へ正規化する（PG の整数剰余は符号なしの 0）。
+        BinOp::Rem => {
+            if b == 0.0 {
+                return Err(SqlSurfaceError::division_by_zero("%"));
+            }
+            // 中間値（`b * b` 等）が f64 で丸められた被演算子を誤った剰余にしないため、
+            // 2^53 以上の絶対値は厳密に表せるか分からないので fail-closed で拒否する。
+            const EXACT_LIMIT: f64 = 9_007_199_254_740_992.0;
+            if a.abs() >= EXACT_LIMIT || b.abs() >= EXACT_LIMIT {
+                return Err(SqlSurfaceError::numeric_out_of_range(
+                    "remainder operand exceeds the exactly representable integer range",
+                ));
+            }
+            let r = a % b;
+            if r == 0.0 {
+                0.0
+            } else {
+                r
+            }
         }
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
             return Err(SqlSurfaceError::Internal {
@@ -13164,7 +13450,14 @@ fn apply_vector_scalar_op<'a>(
         let r = match op {
             BinOp::Mul => (x as f64) * s,
             BinOp::Div => (x as f64) / s,
-            BinOp::Add | BinOp::Sub | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Rem
+            | BinOp::Gt
+            | BinOp::Lt
+            | BinOp::Ge
+            | BinOp::Le
+            | BinOp::Eq => {
                 return Err(SqlSurfaceError::Internal {
                     detail: "non-mul/div operator in vector-scalar evaluation".to_string(),
                 });
@@ -13192,6 +13485,13 @@ fn apply_vector_scalar_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQL-57・Issue #3264: `json_agg`・`jsonb_agg` も集計関数名として予約される。
+    #[test]
+    fn json_agg_is_a_reserved_function_name() {
+        assert!(is_reserved_function_name("json_agg"));
+        assert!(is_reserved_function_name("JSONB_AGG"));
+    }
 
     /// SQL-57・Issue #1801: `array_agg` も集計関数名として予約され、同名の UDF は定義できない。
     #[test]
@@ -15298,6 +15598,94 @@ mod tests {
         assert_eq!(code(BinOp::Mul, Float4, 3.0e38, 10.0), "22003");
         assert_eq!(code(BinOp::Mul, Float4, 1.0e-30, 1.0e-30), "22003");
         assert_eq!(code(BinOp::Div, Float4, 1.0, 0.0), "22012");
+    }
+
+    /// Issue #3273・SQL-42: 剰余は符号が被除数に従い、0 除算は 22012、`MIN % -1` は 0。
+    #[test]
+    fn typed_arith_remainder_follows_postgres_semantics() {
+        use NumericKind::{Float4, Int2, Int4, Int8};
+        let ok = |op, k, a, b| typed_arith(op, k, a, b).expect("should succeed");
+        let code = |op, k, a, b| {
+            typed_arith(op, k, a, b)
+                .unwrap_err()
+                .wire_code()
+                .to_string()
+        };
+        assert_eq!(ok(BinOp::Rem, Int4, 7.0, 2.0), 1.0);
+        assert_eq!(ok(BinOp::Rem, Int4, -7.0, 2.0), -1.0);
+        assert_eq!(ok(BinOp::Rem, Int4, 7.0, -2.0), 1.0);
+        assert_eq!(ok(BinOp::Rem, Int2, 7.0, 4.0), 3.0);
+        assert_eq!(
+            ok(BinOp::Rem, Int8, 4503599627370496.0, 7.0),
+            4503599627370496.0 % 7.0
+        );
+        assert_eq!(code(BinOp::Rem, Int4, 1.0, 0.0), "22012");
+        assert_eq!(code(BinOp::Rem, Int8, 1.0, 0.0), "22012");
+        // `INT_MIN % -1` は範囲外ではなく 0（PG も 0）。
+        assert_eq!(ok(BinOp::Rem, Int4, -2147483648.0, -1.0), 0.0);
+        assert_eq!(
+            int_arith_checked(BinOp::Rem, Int8, i128::from(i64::MIN), -1).expect("rem"),
+            0
+        );
+        // float4 の剰余は束縛段が 42883 で拒否するため評価には到達しない（Internal）。
+        assert_eq!(code(BinOp::Rem, Float4, 7.0, 2.0), "XX000");
+    }
+
+    /// Issue #3273: f64 運び手レーンの剰余は fmod（符号は被除数）で、-0 は 0 へ正規化する。
+    #[test]
+    fn scalar_remainder_is_fmod_with_division_by_zero_check() {
+        assert_eq!(apply_scalar_op(BinOp::Rem, 10.5, 3.0).expect("rem"), 1.5);
+        assert_eq!(apply_scalar_op(BinOp::Rem, -7.0, 3.0).expect("rem"), -1.0);
+        let z = apply_scalar_op(BinOp::Rem, -6.0, 3.0).expect("rem");
+        assert!(z == 0.0 && z.is_sign_positive());
+        assert_eq!(
+            apply_scalar_op(BinOp::Rem, 1.0, 0.0)
+                .unwrap_err()
+                .wire_code(),
+            "22012"
+        );
+        assert_eq!(
+            apply_vector_scalar_op(BinOp::Rem, &[1.0], 2.0)
+                .unwrap_err()
+                .wire_code(),
+            "XX000"
+        );
+    }
+
+    /// Issue #3273: PG は float 型の `%` を持たない。REAL／DOUBLE 列・float 型への CAST は 42883。
+    #[test]
+    fn remainder_rejects_float_typed_operands_at_bind_time() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let rem = |l: Expr, r: Expr| {
+            let mut budget = MAX_EXPR_NODES;
+            bind_expr(&bin(BinOp::Rem, l, r), &schema, &registry, &mut budget)
+        };
+        let cast = call("float8", vec![num("1.5")]);
+        assert_eq!(rem(cast, num("2")).unwrap_err().wire_code(), "42883");
+        assert!(rem(num("7"), num("2")).is_ok());
+        // 小数リテラル（PG では numeric の剰余）は f64 の fmod へ流さず拒否する。
+        assert_eq!(
+            rem(num("0.3"), num("0.1")).unwrap_err().wire_code(),
+            "0A000"
+        );
+        assert_eq!(
+            rem(ident("id"), num("2.5")).unwrap_err().wire_code(),
+            "0A000"
+        );
+        // CASE／COALESCE／NULLIF で包んだ float8 も結果型から拒否する。
+        let f8 = || call("float8", vec![num("7")]);
+        let co = Expr::Coalesce(vec![f8(), f8()]);
+        assert_eq!(rem(co, num("2")).unwrap_err().wire_code(), "42883");
+        let ni = Expr::NullIf(Box::new(f8()), Box::new(num("0")));
+        assert_eq!(rem(ni, num("2")).unwrap_err().wire_code(), "42883");
+        let case = Expr::Case {
+            whens: vec![(bin(BinOp::Eq, num("1"), num("1")), f8())],
+            else_result: Some(Box::new(f8())),
+        };
+        assert_eq!(rem(case, num("2")).unwrap_err().wire_code(), "42883");
+        // 整数の COALESCE は受理する。
+        assert!(rem(Expr::Coalesce(vec![num("7"), num("1")]), num("2")).is_ok());
     }
 
     /// Issue #1560: smallint 同士の算術は smallint（i16 の溢れは 22003）、混在は広い方。

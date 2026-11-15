@@ -81,7 +81,7 @@ impl EngineCore {
     ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
         let (target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.from)?;
         let refs: Vec<&TableSchema> = others.iter().collect();
-        let bound = crate::sql::dml_from::bind_update_from(stmt, &target, &refs)?;
+        let bound = crate::sql::dml_from::bind_update_from_with_udfs(stmt, &target, &refs, udfs)?;
         crate::sql::join::dml_plan::plan_update_from(&bound, &target, &refs, udfs)
     }
 
@@ -93,7 +93,7 @@ impl EngineCore {
     ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
         let (target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.using)?;
         let refs: Vec<&TableSchema> = others.iter().collect();
-        let bound = crate::sql::dml_from::bind_delete_using(stmt, &target, &refs)?;
+        let bound = crate::sql::dml_from::bind_delete_using_with_udfs(stmt, &target, &refs, udfs)?;
         crate::sql::join::dml_plan::plan_delete_using(&bound, &target, &refs, udfs)
     }
 

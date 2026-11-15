@@ -836,3 +836,69 @@ fn wire_smallint_array_created_via_sql_roundtrips_with_int2_array_oid() {
     assert_eq!(read_command_complete(&mut bob), "SELECT 0");
     read_ready_for_query(&mut bob);
 }
+
+/// Issue #3235: `BIT(n)[]` 列を SQL の `CREATE TABLE`（末尾 `;` 付き単独の簡易クエリ。psql と
+/// 同じ送り方）で作り、INSERT・SELECT が往復して `RowDescription` が `_bit`（1561）と添字結果の
+/// `bit`（1560）を公告する（TABLE-14・TABLE-35・TABLE-48・WIRE-13）。文字種違反は `22P02`、長さ不一致は
+/// `22026`、別テナントは同じ OID で 0 行（RLS 相当の境界は不変）。
+#[test]
+fn wire_bit_array_created_via_sql_roundtrips_with_bit_array_oid() {
+    let path = temp_db::unique_db_path("wire-bit-array");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-alice", "pw-alice"),
+        ("bob", "tenant-bob", "pw-bob"),
+    ]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice", "bob"]);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "CREATE TABLE ba (id BIGINT PRIMARY KEY, embedding VECTOR(2), b BIT(4)[]);",
+    );
+    assert_eq!(read_command_complete(&mut alice), "CREATE TABLE");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ba (id, embedding, b) VALUES (1, '[0.1,0.2]', '{1010,NULL,0101}') USING OPERATION_ID 'op-ba1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    for (lit, want) in [("'{10x0}'", "22P02"), ("'{101}'", "22026")] {
+        send_simple_query(
+            &mut alice,
+            &format!(
+                "INSERT INTO ba (id, embedding, b) VALUES (2, '[0.1,0.2]', {lit}) USING OPERATION_ID 'op-ba2';"
+            ),
+        );
+        expect_error_response_with_sqlstate(&mut alice, want);
+        read_ready_for_query(&mut alice);
+    }
+
+    let select = "SELECT b, b[1] FROM ba WHERE id = 1 LIMIT 1;";
+    send_simple_query(&mut alice, select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        desc.iter().map(|d| d.1).collect::<Vec<_>>(),
+        vec![1561, 1560]
+    );
+    let row = read_data_row(&mut alice);
+    assert_eq!(row[0].as_deref(), Some("{1010,NULL,0101}"));
+    assert_eq!(row[1].as_deref(), Some("1010"));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}

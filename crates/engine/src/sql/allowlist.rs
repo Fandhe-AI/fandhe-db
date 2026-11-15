@@ -190,6 +190,10 @@ const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 /// 定数。Issue #945）と二重定義しないよう、同じ値をそちらから参照する。
 pub(crate) const MAX_IN_LIST_ITEMS: usize = crate::declarative_filter::MAX_IN_LIST_ITEMS;
 
+/// 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)` の 1 辺の成分数の上限（SQL-9・Issue #3255）。
+/// 成分を `Vec` へ push する**前**に判定し、超過は `54000`（無制限確保の防止）。
+pub(crate) const MAX_ROW_COMPARE_COMPONENTS: usize = 64;
+
 /// `ALTER TABLE` 1 文が持てるアクション数の上限（Issue #1633）。`MAX_COLUMN_COUNT` と同値で、
 /// 超過は確保前に `54000` で拒否する（無制限リソース確保の防止）。
 pub const MAX_ALTER_TABLE_ACTIONS: usize = MAX_COLUMN_COUNT;
@@ -620,6 +624,7 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
+            | Token::Punct('%')
             | Token::RegexMatch
             | Token::RegexMatchCi
             | Token::RegexNotMatch
@@ -728,6 +733,8 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
             | "MAX"
             | "STRING_AGG"
             | "ARRAY_AGG"
+            | "JSON_AGG"
+            | "JSONB_AGG"
             | "VARIANCE"
             | "VAR_POP"
             | "VAR_SAMP"
@@ -1281,6 +1288,10 @@ pub enum SqlSurfaceError {
     /// SQL-57・Issue #1800）。束縛段が返す固定文言で、列名・値を含めない。可否は文だけで
     /// 決まり、行の内容に依存しない。
     AggregateOrderByNotInArguments,
+    /// `SELECT DISTINCT ON (...)` の式が `ORDER BY` の先頭キーと一致しない（`42P10`。Issue #3260・
+    /// SQL-25 のポインタ）。固定文言で、列名・値を含めない。可否は文だけで決まり、行の内容・
+    /// テナントに依存しない。
+    DistinctOnOrderByMismatch,
     /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
     /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
     /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
@@ -2123,7 +2134,8 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::CteColumnListTooLong { .. }
             | SqlSurfaceError::DerivedTableColumnListTooLong { .. }
             | SqlSurfaceError::OrderByPositionNotInSelectList { .. }
-            | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
+            | SqlSurfaceError::AggregateOrderByNotInArguments
+            | SqlSurfaceError::DistinctOnOrderByMismatch => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::RelationPermissionDenied
             | SqlSurfaceError::ConflictTargetNotVisible
@@ -2470,6 +2482,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::AggregateOrderByNotInArguments => write!(
                 f,
                 "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+            ),
+            SqlSurfaceError::DistinctOnOrderByMismatch => write!(
+                f,
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
             ),
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
@@ -3059,6 +3075,19 @@ pub enum WherePredicate {
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
+    /// 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)`（SQL-9・Issue #3255。親 #3254）。構文段だけが
+    /// 生成する。不変条件は `lhs.len() == rhs.len()` かつ 2 以上 [`MAX_ROW_COMPARE_COMPONENTS`] 以下
+    /// （成分 1 個の括弧は従来どおり式として扱い本 variant にしない）。評価（辞書式・三値論理）は
+    /// #3256 の担当で、それまでは束縛段（`sql::parser::bind_where_predicates_recursive`）の暫定
+    /// ゲートが `0A000` で止める（fail-closed）。否定は `where_negation` が演算子反転で押し下げる。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    RowCompare {
+        lhs: Vec<Expr>,
+        op: ArrayCmpOp,
+        rhs: Vec<Expr>,
+    },
 }
 
 /// [`WherePredicate::ScalarSubqueryCompare`] の比較演算子（Issue #1191）。
@@ -4281,12 +4310,18 @@ pub(crate) enum SetOperator {
     Union,
     UnionAll,
     Intersect,
+    /// 多重集合版の `INTERSECT ALL`（Issue #3268）。左の順序で、同じ行を
+    /// min(左の出現数, 右の出現数) 件だけ残す。
+    IntersectAll,
     Except,
+    /// 多重集合版の `EXCEPT ALL`（Issue #3269）。左の順序で、同じ行を
+    /// max(左の出現数 − 右の出現数, 0) 件だけ残す（先に現れた行から相殺する）。
+    ExceptAll,
 }
 
-/// 集合演算の構文木。葉は単一テーブルの広域取得（[`ValidatedScan`]）に限定する
-/// （TASK-213 の設計判断: `JOIN` 基盤〔TASK-212〕を前提にしない。`sql::set_op`
-/// モジュールドキュメント参照）。
+/// 集合演算の構文木。葉は単一テーブルの広域取得（[`ValidatedScan`]）・集計形の枝・
+/// `FROM` なしの定数枝（Issue #3270）のいずれか（TASK-213 の設計判断: `JOIN` 基盤〔TASK-212〕を
+/// 前提にしない。`sql::set_op` モジュールドキュメント参照）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetTree {
     /// 既定の枝（`ORDER BY`／`LIMIT`／`OFFSET` を持たない単一テーブル広域取得）。
@@ -4302,6 +4337,10 @@ pub(crate) enum SetTree {
     /// 場合に限り枝内 `ORDER BY`／`LIMIT` を持てる（`ValidatedAggregate::group_by`
     /// の既存フィールドで表す）。
     AggregateBranch(Box<SetAggregateBranch>),
+    /// `FROM` なしの定数枝（`SELECT 7 UNION SELECT y FROM b`。Issue #3270・SQL-42 のポインタ）。
+    /// 表を読まないため RLS の対象になる行がなく、`sql::const_select` の束縛・実行をそのまま使う。
+    /// `WHERE`／`HAVING`／`LIMIT`／`OFFSET`／トップレベルの集計項目は構文段が `42601` にする。
+    ConstBranch(Box<SetConstBranch>),
     Op {
         op: SetOperator,
         left: Box<SetTree>,
@@ -4319,6 +4358,15 @@ pub(crate) struct SetAggregateBranch(pub(crate) ValidatedAggregate);
 
 impl Eq for SetAggregateBranch {}
 
+/// 集合演算の定数枝（[`SetTree::ConstBranch`]）を保持する薄いラッパー。
+/// [`ValidatedConstSelect`] は `PartialEq` のみを導出するため、[`SetAggregateBranch`] と同じく
+/// `Eq` を手動で付与する（構文段が生成する式リテラルは有限値のみで NaN を作らないため
+/// 反射律は成立する）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SetConstBranch(pub(crate) ValidatedConstSelect);
+
+impl Eq for SetConstBranch {}
+
 /// 許可形状の構造判定を通過した集合演算文（SQL-29 (c)・RLS-10 (b)・TASK-213）。
 /// 束縛（枝ごとの `bind_scan`）・実行（合成・重複除去・RLS 独立適用）は
 /// `sql::set_op` の責務（本モジュールは構造情報のみを保証する）。
@@ -4334,6 +4382,30 @@ pub struct ValidatedSetOperation {
     /// Issue #1796）。範囲検証（`0..=core::MAX_SEARCH_K`）は `limit` と同じく実行・
     /// Describe 双方が行い、適用順は OFFSET が先・LIMIT／結果行数上限の判定が後。
     pub(crate) offset: u32,
+    /// 括弧なし末尾の `ORDER BY`（集合演算全体のソートキー。Issue #3266・SQL-29・SQL-56 ポインタ）。
+    /// 空は `ORDER BY` なし。最後の枝の句ではなく集合全体に掛かる（枝内の句は
+    /// [`SetTree::LimitedBranch`] 等が持つ）。キーの解決（出力列名・序数 → 列位置）・型と照合の
+    /// 検査・実行（ソート → `OFFSET` → `LIMIT`）は `sql::set_op` が担う（Issue #3267）。
+    pub(crate) order_by: Vec<SetOrderKey>,
+}
+
+/// 集合演算全体の `ORDER BY` キー（Issue #3266）。PG と同じく出力列名または序数だけを
+/// 受け付ける（式キーは構文段で `0A000`。[`parse_set_operation`]）。`ScanOrderKey` は
+/// [`Expr`] を持ち `Eq` を導出できないため別型とする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetOrderKey {
+    /// 出力列名（左端の枝の列名）によるキー。
+    Column {
+        name: String,
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
+    /// 出力列の位置（1 始まり）によるキー。範囲検査は `sql::set_op` が行う。
+    Ordinal {
+        position: i64,
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
 }
 
 /// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
@@ -4451,6 +4523,12 @@ pub enum AggregateFunc {
     /// 1 次元配列（NULL 入力は NULL 要素・入力なしは NULL）。内側の `ORDER BY`・`DISTINCT` を
     /// 受理する（SQL 表層のみ。`string_agg` と同じ仕組みを共有する）。
     ArrayAgg,
+    /// `json_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #3264）。結果は `json` の配列
+    /// （`array_agg` と同じ状態・束縛を共有し、確定時に JSON テキストへ書く。入力なしは NULL）。
+    JsonAgg,
+    /// `jsonb_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #3264）。[`Self::JsonAgg`] の
+    /// `jsonb` 版で、結果は正規形（空白なし）の `jsonb` 配列。
+    JsonbAgg,
     /// `variance(<数値>)`（SQL-57・Issue #1803）。`var_samp` と同義（標本分散）。入力が整数系・
     /// numeric なら numeric、浮動小数・数値式なら double を返す。行数 0 は NULL、1 も NULL。
     Variance,
@@ -4489,6 +4567,15 @@ impl AggregateFunc {
         matches!(self, AggregateFunc::Grouping)
     }
 
+    /// `array_agg` の状態（[`crate::sql::array_agg::ArrayAggState`]）で評価する関数か
+    /// （`array_agg`・`json_agg`・`jsonb_agg`。Issue #3264）。束縛・DISTINCT・ORDER BY・資源上限が共通。
+    pub(crate) fn uses_array_agg_state(self) -> bool {
+        matches!(
+            self,
+            AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg
+        )
+    }
+
     /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp` と `stddev`／`stddev_pop`／
     /// `stddev_samp`。Issue #1803・#1804）。引数の型検査・結果型・累積器の選択がこの 6 関数で
     /// 共通になる。
@@ -4523,6 +4610,8 @@ impl AggregateFunc {
             "MAX" => Some(AggregateFunc::Max),
             "STRING_AGG" => Some(AggregateFunc::StringAgg),
             "ARRAY_AGG" => Some(AggregateFunc::ArrayAgg),
+            "JSON_AGG" => Some(AggregateFunc::JsonAgg),
+            "JSONB_AGG" => Some(AggregateFunc::JsonbAgg),
             "VARIANCE" => Some(AggregateFunc::Variance),
             "VAR_POP" => Some(AggregateFunc::VarPop),
             "VAR_SAMP" => Some(AggregateFunc::VarSamp),
@@ -4547,6 +4636,8 @@ impl AggregateFunc {
             AggregateFunc::Max => "max",
             AggregateFunc::StringAgg => "string_agg",
             AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::JsonAgg => "json_agg",
+            AggregateFunc::JsonbAgg => "jsonb_agg",
             AggregateFunc::Variance => "variance",
             AggregateFunc::VarPop => "var_pop",
             AggregateFunc::VarSamp => "var_samp",
@@ -4921,21 +5012,6 @@ pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
     name.strip_prefix(SCALAR_SUBQUERY_PLACEHOLDER_PREFIX)?
         .parse()
         .ok()
-}
-
-/// `RETURNING` 句の項目が「別名付き（または裸の）列参照」か（Issue #3248・SQL-21 のポインタ）。
-/// 値・型・読む列は別名なしと同じで、出力列名だけが変わる。式項目の受理可否は
-/// [`returning_item_rejection`] が決める（束縛段が列参照を式評価器へ通さない分岐と、
-/// データ変更 CTE・ビュー経由の書き込みの文言出し分けに使う）。
-pub(crate) fn is_returning_column_item(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::Column(_) => true,
-        SelectItem::Expr {
-            expr: Expr::Ident(name),
-            alias: Some(_),
-        } => !is_scalar_subquery_placeholder_name(name),
-        SelectItem::Expr { .. } => false,
-    }
 }
 
 /// 式 `expr` の直下の子式を `out` へ積む（[`returning_item_rejection`] の明示スタック走査用。
@@ -5400,6 +5476,12 @@ pub struct ValidatedScan {
     /// 値が等しい行を結果へ加える。単一表のスカラー `ORDER BY` 広域取得だけが真になり、
     /// 束縛段（`sql::parser::bind_scan_with_dummy_flags`）が `BoundScan` へ伝える。
     pub(crate) with_ties: bool,
+    /// `SELECT DISTINCT ON (...)`（Issue #3261・SQL-25 のポインタ）のグループ前置長（異なり ON キー数）。
+    /// `Some(k)` のとき実効 `ORDER BY`（[`Self::order_keys`]。ON キーを先頭 `k` 個に置く）の先頭 `k` キー
+    /// が等しい行を 1 グループとし、ソート順で最初の行だけを残す（`sql::scan` の経路 (B)）。
+    /// セッション最上位の単一表・畳み込み可能ビューの広域取得だけが立て（`validate_distinct_on_select`）、
+    /// 他の構築箇所は常に `None`。
+    pub(crate) distinct_on: Option<usize>,
 }
 
 impl ValidatedScan {
@@ -7686,7 +7768,7 @@ impl<'a> Parser<'a> {
                     && !self.quoted_null.contains(&self.pos)
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('[' | '(')));
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
-                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '%' | '['))
                         || matches!(t, Token::TypeCast)
                         || is_json_operator_token(t)
                         || matches!(t, Token::BitDistanceOp(_))
@@ -7711,8 +7793,10 @@ impl<'a> Parser<'a> {
                     if self.peek_ident_matches("COLLATE")
                         || self.peek_at_time_zone()
                         || self.peek().is_some_and(|t| {
-                            matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
-                                || is_json_operator_token(t)
+                            matches!(
+                                t,
+                                Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast
+                            ) || is_json_operator_token(t)
                                 || matches!(t, Token::BitDistanceOp(_))
                         })
                     {
@@ -8447,15 +8531,22 @@ impl<'a> Parser<'a> {
                     after_distinct,
                     Some(Token::StringLiteral(_)) | Some(Token::Punct('(' | '-' | '+'))
                 ),
-                AggregateFunc::ArrayAgg => matches!(
-                    after_distinct,
-                    Some(Token::StringLiteral(_))
-                        | Some(Token::Number(_))
-                        | Some(Token::Punct('(' | '-' | '+'))
-                ),
+                AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg => {
+                    matches!(
+                        after_distinct,
+                        Some(Token::StringLiteral(_))
+                            | Some(Token::Number(_))
+                            | Some(Token::Punct('(' | '-' | '+'))
+                    )
+                }
                 // SQL-57・Issue #1809: `COUNT(DISTINCT (a + b))`・`COUNT(DISTINCT -n)` も修飾子と読む
                 // （数値・文字列リテラルは従来どおり対象外。`COUNT(distinct)` の列名互換を保つ）。
-                AggregateFunc::Count => {
+                // Issue #3263: `SUM`／`AVG`／`MIN`／`MAX` の `DISTINCT` も同じ読み。
+                AggregateFunc::Count
+                | AggregateFunc::Sum
+                | AggregateFunc::Avg
+                | AggregateFunc::Min
+                | AggregateFunc::Max => {
                     matches!(after_distinct, Some(Token::Punct('(' | '-' | '+')))
                 }
                 _ => false,
@@ -8469,13 +8560,22 @@ impl<'a> Parser<'a> {
         if distinct
             && !matches!(
                 func,
-                AggregateFunc::Count | AggregateFunc::StringAgg | AggregateFunc::ArrayAgg
+                AggregateFunc::Count
+                    | AggregateFunc::Sum
+                    | AggregateFunc::Avg
+                    | AggregateFunc::Min
+                    | AggregateFunc::Max
+                    | AggregateFunc::StringAgg
             )
+            && !func.uses_array_agg_state()
         {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is only allowed inside COUNT(DISTINCT ...), string_agg and array_agg",
+                "DISTINCT is only allowed inside COUNT, SUM, AVG, MIN, MAX, string_agg, array_agg, json_agg and jsonb_agg",
             ));
         }
+        // Issue #3263: `MIN`／`MAX(DISTINCT x)` は重複除去が結果に影響しないため、解析直後に
+        // 非 DISTINCT 形へ畳む（状態・予算を持たせず、同一文の `MIN(x)` とアキュムレータを共有する）。
+        let distinct = distinct && !matches!(func, AggregateFunc::Min | AggregateFunc::Max);
         let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
             if func != AggregateFunc::Count {
                 return Err(SqlSurfaceError::unsupported(
@@ -8503,7 +8603,7 @@ impl<'a> Parser<'a> {
             // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
             let saved_null = self.allow_null_literal;
             self.allow_null_literal =
-                matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg);
+                func == AggregateFunc::StringAgg || func.uses_array_agg_state();
             let mut parsed = self.parse_value_expr(0);
             // `bool_and` 系に限り引数に比較式（`<値式> <比較演算子> <値式>`）を受理する
             // （SQL-57・Issue #1805）。ほかの集計関数の引数文法は変えない。
@@ -8551,13 +8651,15 @@ impl<'a> Parser<'a> {
                 func.default_alias()
             )));
         }
-        if func == AggregateFunc::ArrayAgg {
-            // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801）。引数が 2 つ以上の形は
+        if func.uses_array_agg_state() {
+            // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801。`json_agg`・`jsonb_agg` は
+            // Issue #3264 で同じ文法）。引数が 2 つ以上の形は
             // 該当シグネチャの関数が無い扱い（`42883`。`string_agg` と同じ）。
             if matches!(self.peek(), Some(Token::Punct(','))) {
-                return Err(SqlSurfaceError::undefined_function(
-                    "function array_agg requires exactly one argument",
-                ));
+                return Err(SqlSurfaceError::undefined_function(format!(
+                    "function {} requires exactly one argument",
+                    func.default_alias()
+                )));
             }
             if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
                 order_by = self.parse_in_aggregate_order_by()?;
@@ -8881,7 +8983,7 @@ impl<'a> Parser<'a> {
                     || self.is_value_function_keyword_at(self.pos)
                     || matches!(next, Some(Token::Punct('(')))
                     || next.is_some_and(|t| {
-                        matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                        matches!(t, Token::Punct('+' | '-' | '*' | '/' | '%' | '['))
                             || matches!(t, Token::TypeCast)
                             || is_json_operator_token(t)
                     })
@@ -8950,8 +9052,10 @@ impl<'a> Parser<'a> {
                 if self.peek_ident_matches("COLLATE")
                     || self.peek_at_time_zone()
                     || self.peek().is_some_and(|t| {
-                        matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
-                            || is_json_operator_token(t)
+                        matches!(
+                            t,
+                            Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast
+                        ) || is_json_operator_token(t)
                     })
                 {
                     return self.parse_aggregate_expr_item(Some(head));
@@ -8986,7 +9090,7 @@ impl<'a> Parser<'a> {
             if self.allow_aggregate_expr_items
                 && matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                    Some(Token::Punct('+' | '-' | '*' | '/' | '%'))
                 )
             {
                 return self.parse_aggregate_expr_item(None);
@@ -10139,6 +10243,11 @@ impl<'a> Parser<'a> {
     /// 否定押し下げ（`where_negation`）が `Expression(_)` を `42601` で拒否する（fail-closed。
     /// 三値論理で fail-open にしない）。
     fn parse_expression_predicate(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
+        // 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)`（SQL-9・Issue #3255）。WHERE の式述語の葉
+        // だけで判定し、`parse_primary_expr` は変えない（SELECT 項目・関数引数等では従来どおり `42601`）。
+        if self.row_compare_ahead() {
+            return self.parse_row_compare();
+        }
         // 左辺が引用なしの裸の `NULL` で直後が `IS [NOT] DISTINCT FROM` なら `NULL` リテラル
         // （SQL-54・Issue #1783。それ以外の位置の `NULL` は従来どおり列参照として読む）。
         let null_lhs = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NULL"))
@@ -10238,6 +10347,122 @@ impl<'a> Parser<'a> {
             ArrayCmpOp::Gt => ExprLeaf::Plain(binary(BinOp::Gt, lhs, rhs)),
             ArrayCmpOp::Ge => ExprLeaf::Plain(binary(BinOp::Ge, lhs, rhs)),
         })
+    }
+
+    /// 現在位置が行値比較の左辺 `( e1 , e2 ... ) <比較演算子>` か（消費しない。Issue #3255）。
+    /// 対応する `)` を 1 回だけ線形に探し、その内側に括弧深さ 1 の `,` があり、直後が比較演算子
+    /// （`= < > <= >=`・`<>`）のときだけ真。成分 1 個の括弧（`(a) < 3`）は偽で、従来の式経路へ流す。
+    /// CHECK 本体では行値を認識しない（従来どおり `42601`）。先読みは `get()` のみで後戻りしない。
+    fn row_compare_ahead(&self) -> bool {
+        if self.in_check_body || !matches!(self.peek(), Some(Token::Punct('('))) {
+            return false;
+        }
+        let Some(close) = self.find_matching_close_paren(self.pos) else {
+            return false;
+        };
+        let mut depth: u32 = 0;
+        // 配列コンストラクタ `ARRAY[1, 2]` 内のカンマを行値の区切りと誤認しないよう角括弧の深さも追跡する
+        let mut bracket_depth: u32 = 0;
+        let mut has_top_level_comma = false;
+        for idx in self.pos..close {
+            match self.tokens.get(idx) {
+                Some(Token::Punct('(')) => depth = depth.saturating_add(1),
+                Some(Token::Punct(')')) => depth = depth.saturating_sub(1),
+                Some(Token::Punct('[')) => bracket_depth = bracket_depth.saturating_add(1),
+                Some(Token::Punct(']')) => bracket_depth = bracket_depth.saturating_sub(1),
+                Some(Token::Punct(',')) if depth == 1 && bracket_depth == 0 => {
+                    has_top_level_comma = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        has_top_level_comma
+            && matches!(
+                close.checked_add(1).and_then(|i| self.tokens.get(i)),
+                Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
+            )
+    }
+
+    /// 行の 1 辺 `( e1 , e2 , ... )` を読む。成分数は `limit` 以下に抑え、`push` の**前**に検査する
+    /// （左辺は [`MAX_ROW_COMPARE_COMPONENTS`] 超で `54000`。右辺は左辺の個数を超えた時点で `42601`
+    /// として打ち切り、`parse_update_row_assignment` と同じく無制限に読み進めない）。
+    fn parse_row_side(&mut self, limit: Option<usize>) -> Result<Vec<Expr>, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut items: Vec<Expr> = Vec::new();
+        loop {
+            match limit {
+                Some(n) if items.len() >= n => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "unequal number of entries in row expressions",
+                    ));
+                }
+                None if items.len() >= MAX_ROW_COMPARE_COMPONENTS => {
+                    return Err(SqlSurfaceError::payload_too_large(format!(
+                        "row value component count exceeds limit {MAX_ROW_COMPARE_COMPONENTS}"
+                    )));
+                }
+                _ => {}
+            }
+            items.push(self.parse_value_expr(1)?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        Ok(items)
+    }
+
+    /// 行値比較の本体（[`Self::row_compare_ahead`] が真のとき呼ばれる。Issue #3255）。
+    /// 右辺が行でない・サブクエリ・成分数不一致は fail-closed（`42601`／`0A000`）。評価は #3256。
+    fn parse_row_compare(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
+        let lhs = self.parse_row_side(None)?;
+        let not_equal = matches!(self.peek(), Some(Token::Punct('<')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Punct('>'))
+            );
+        let op = if not_equal {
+            self.advance();
+            self.advance();
+            ArrayCmpOp::Ne
+        } else {
+            match self.expect_cmp_op()? {
+                BinOp::Gt => ArrayCmpOp::Gt,
+                BinOp::Lt => ArrayCmpOp::Lt,
+                BinOp::Ge => ArrayCmpOp::Ge,
+                BinOp::Le => ArrayCmpOp::Le,
+                _ => ArrayCmpOp::Eq,
+            }
+        };
+        if !matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(SqlSurfaceError::unsupported(
+                "row value comparison requires a row expression on both sides",
+            ));
+        }
+        // 行とサブクエリの比較は PostgreSQL では受理されるが当面は未対応（tracked: #3254 の対象外）。
+        if matches!(
+            self.tokens.get(self.pos.saturating_add(1)),
+            Some(Token::Keyword(Keyword::Select))
+        ) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "row value comparison with a subquery is not supported",
+            ));
+        }
+        let rhs = self.parse_row_side(Some(lhs.len()))?;
+        if rhs.len() != lhs.len() {
+            return Err(SqlSurfaceError::unsupported(
+                "unequal number of entries in row expressions",
+            ));
+        }
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Preds(vec![WherePredicate::RowCompare {
+            lhs,
+            op,
+            rhs,
+        }]))
     }
 
     /// `tokens[idx]` が式左辺の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）なら種別を返す
@@ -11763,7 +11988,7 @@ impl<'a> Parser<'a> {
         self.parse_mul_rest(lhs, depth)
     }
 
-    /// 乗除算ループ（`* /`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
+    /// 乗除算・剰余ループ（`* / %`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
     fn parse_mul_rest(&mut self, lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         // 先頭の関数呼び出しを先に読み終えた投影項目から継続する場合も、後置 `COLLATE` を
         // 一次式の直後として受理する（`parse_primary_expr` 経由では適用済みで冪等）。
@@ -11774,6 +11999,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
                 Some(Token::Punct('/')) => BinOp::Div,
+                Some(Token::Punct('%')) => BinOp::Rem,
                 _ => break,
             };
             self.advance();
@@ -13534,7 +13760,7 @@ impl<'a> Parser<'a> {
         matches!(self.peek(), Some(Token::Ident(_) | Token::Number(_)))
             && matches!(
                 self.tokens.get(self.pos + 1),
-                Some(Token::Punct('+' | '-' | '*' | '/'))
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%'))
             )
     }
 
@@ -13801,14 +14027,12 @@ impl<'a> Parser<'a> {
         Ok(Some(order))
     }
 
-    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...] [WHERE <条件>] [HAVING <条件>] [LIMIT <n>] [OFFSET <m>][;]`
-    /// （`FROM` なし。SQL-43・Issue #1531・#2329・#2331）を解析する。句の順序は固定で、
-    /// `SELECT *`・`AND`／`OR` 等を含む条件・`OFFSET` を `LIMIT` より前に置く形・
-    /// `GROUP BY`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
-    /// （fail-closed）。トップレベルの集計項目（Issue #2330）だけを受理し、
-    /// 集計を含む式・入れ子集計は `42601`。列参照の拒否は束縛段の責務（構文木だけでは
-    /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
-    fn parse_const_select(&mut self) -> Result<ValidatedConstSelect, SqlSurfaceError> {
+    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...]` の項目リストだけを読む（`FROM` なしの
+    /// 定数式 SELECT。Issue #3270 で [`Self::parse_const_select`] から切り出した）。後続の句
+    /// （`WHERE`／`LIMIT` 等）は読まず、呼び出し元に任せる。集合演算の定数枝
+    /// （`parse_set_branch`）も共有の [`Parser`] 上でこれだけを呼び、全体の `LIMIT`／`OFFSET`／
+    /// 末尾 `ORDER BY` を枝の句として誤って消費しない。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
+    fn parse_const_select_items(&mut self) -> Result<Vec<ConstSelectItem>, SqlSurfaceError> {
         self.expect_keyword(Keyword::Select)?;
         if matches!(self.peek(), Some(Token::Punct('*'))) {
             return Err(SqlSurfaceError::unsupported(
@@ -13857,6 +14081,18 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        Ok(items)
+    }
+
+    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...] [WHERE <条件>] [HAVING <条件>] [LIMIT <n>] [OFFSET <m>][;]`
+    /// （`FROM` なし。SQL-43・Issue #1531・#2329・#2331）を解析する。句の順序は固定で、
+    /// `SELECT *`・`AND`／`OR` 等を含む条件・`OFFSET` を `LIMIT` より前に置く形・
+    /// `GROUP BY`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
+    /// （fail-closed）。トップレベルの集計項目（Issue #2330）だけを受理し、
+    /// 集計を含む式・入れ子集計は `42601`。列参照の拒否は束縛段の責務（構文木だけでは
+    /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
+    fn parse_const_select(&mut self) -> Result<ValidatedConstSelect, SqlSurfaceError> {
+        let items = self.parse_const_select_items()?;
         let where_clause = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance();
             Some(self.parse_const_select_condition(false)?)
@@ -14043,7 +14279,7 @@ impl<'a> Parser<'a> {
             let lit = self.expect_literal()?;
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(lit);
@@ -14137,7 +14373,7 @@ impl<'a> Parser<'a> {
             let lit = self.expect_literal()?;
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(SetValue::Literal(lit));
@@ -15437,8 +15673,9 @@ impl<'a> Parser<'a> {
     /// 落とす）。省略時は `Ok(None)`。投影は `SELECT` と同じ許可形状
     /// （[`Self::parse_select_list`]）を再利用するが、[`Projection::Items`] は
     /// 式項目（Issue #3249）まで受理する。ただしスカラーサブクエリ（`42601`）と集計関数
-    /// （選択リスト構文解析が `42601`。多層防御の `42803`）は拒否する。UDF 呼び出しは束縛段が空の
-    /// UDF レジストリで解決して未定義関数として拒否する（受け皿 #3250）。
+    /// （選択リスト構文解析が `42601`。多層防御の `42803`）は拒否する。UDF 呼び出しは束縛段が
+    /// セッションの UDF レジストリで解決する（Issue #3250。宣言的・WASM UDF は評価、
+    /// `LANGUAGE sql|plpgsql` 関数は書き込み前に `0A000`、未定義は `42883`）。
     /// `*` と他項目の併用は `0A000`（未対応）。
     fn parse_returning_clause(&mut self) -> Result<Option<Projection>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("RETURNING") {
@@ -15461,12 +15698,18 @@ impl<'a> Parser<'a> {
     }
 
     /// FROM／USING つき UPDATE／DELETE 専用の `RETURNING` 句（Issue #1756・SQL-53 のポインタ）。
-    /// `*`・`<公開名>.*`・列参照（修飾あり・なし）の並びだけを受理し、式・関数呼び出し・
-    /// `AS` 別名は従来の `RETURNING` と同じく `42601`（受理範囲を従来より広げない）。
-    /// 呼び出し元は `parse_update_from`／`parse_delete_using`（Issue #3204 で結線）で、
-    /// 項目の束縛は `sql::dml_from_returning` が行う。
+    /// 受理する項目は次のとおり（Issue #3251 で別名・式を追加）。
+    /// - `*`・`<公開名>.*`（直後の `AS` は `42601`）。
+    /// - 列参照（修飾あり・なし）と、その `AS <別名>`（任意の relation の列・疑似列 `id`）。
+    /// - 対象表の列だけを参照する式・関数呼び出し（任意で `AS <別名>`）。対象表（`target_exposed`）で
+    ///   修飾した参照は非修飾へ正規化し、FROM／USING 側の修飾参照は `0A000`（fail-closed。
+    ///   SET の式と同じ境界）。サブクエリは `42601`・集計は `42803`（基表の `RETURNING` と同じ）。
+    ///
+    /// 呼び出し元は `parse_update_from`／`parse_delete_using`（Issue #3204 で結線）で、項目の束縛は
+    /// `sql::dml_from_returning` が行う。
     pub(crate) fn parse_dml_from_returning_clause(
         &mut self,
+        target_exposed: &str,
     ) -> Result<Option<crate::sql::dml_from_returning::DmlFromReturning>, SqlSurfaceError> {
         use crate::sql::dml_from_returning::{
             DmlFromReturning, DmlFromReturningItem, MAX_DML_FROM_RETURNING_ITEMS,
@@ -15482,6 +15725,10 @@ impl<'a> Parser<'a> {
                     "too many RETURNING items",
                 ));
             }
+            let star = matches!(
+                self.peek(),
+                Some(Token::Punct('*') | Token::QualifiedStar { .. })
+            );
             let item = match self.peek() {
                 Some(Token::Punct('*')) => {
                     self.advance();
@@ -15492,14 +15739,33 @@ impl<'a> Parser<'a> {
                     self.advance();
                     DmlFromReturningItem::QualifiedAll(qualifier)
                 }
-                _ => DmlFromReturningItem::Column(
-                    self.parse_join_colref_as(super::colref_sink::Role::SelectItemBare)?,
-                ),
+                _ if self.peek_dml_returning_single_column()
+                    || self.peek_dml_returning_paren_qualified_column() =>
+                {
+                    // 括弧付きの修飾列 `(s.v)` は括弧を剥がして括弧なしと同じ列束縛経路へ通す。
+                    let parenthesized = matches!(self.peek(), Some(Token::Punct('(')));
+                    if parenthesized {
+                        self.advance();
+                    }
+                    let colref =
+                        self.parse_join_colref_as(super::colref_sink::Role::SelectItemBare)?;
+                    if parenthesized {
+                        self.advance(); // `)`（先読みで存在確認済み）
+                    }
+                    if self.peek_ident_matches("AS") {
+                        self.advance();
+                        DmlFromReturningItem::AliasedColumn(colref, self.expect_ident()?)
+                    } else {
+                        DmlFromReturningItem::Column(colref)
+                    }
+                }
+                _ => self.parse_dml_from_returning_expr_item(target_exposed)?,
             };
-            if self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))) {
+            if star
+                && (self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))))
+            {
                 return Err(SqlSurfaceError::unsupported(
-                    "RETURNING aliases and expressions are not supported with UPDATE ... FROM \
-                     or DELETE ... USING yet",
+                    "RETURNING aliases are not supported on star items",
                 ));
             }
             items.push(item);
@@ -15510,6 +15776,97 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(Some(DmlFromReturning { items }))
+    }
+
+    /// FROM／USING つき DML の `RETURNING` 項目が列参照 1 個（直後が `,`・`AS`・句境界）かを先読みだけで
+    /// 判定する。関数呼び出し・演算子つきの式は含めない（式項目の経路で読む。Issue #3251）。
+    fn peek_dml_returning_single_column(&self) -> bool {
+        if !matches!(
+            self.peek(),
+            Some(Token::QualifiedIdent { .. } | Token::Ident(_))
+        ) {
+            return false;
+        }
+        // 引用なしの括弧なし SQL 値関数（`CURRENT_DATE` 等）は列参照ではなく式として読む。
+        // 引用付きの同名識別子は列参照のまま。
+        if self.is_value_function_keyword_at(self.pos) {
+            return false;
+        }
+        Self::returning_item_boundary(self.tokens.get(self.pos.saturating_add(1)))
+    }
+
+    /// 項目の直後のトークンが `RETURNING` 項目の境界（`,`・`;`・`AS`・句境界・終端）か。
+    fn returning_item_boundary(next: Option<&Token>) -> bool {
+        match next {
+            None => true,
+            Some(Token::Punct(',' | ';')) => true,
+            Some(Token::Ident(w)) => ["AS", "USING", "PARTITIONED"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k)),
+            _ => false,
+        }
+    }
+
+    /// `RETURNING` 項目が括弧付きの修飾列参照 `(q.col)` 1 個（直後が境界）かを先読みで判定する。
+    /// 括弧なしの `q.col` と同じ列束縛経路へ通すための判定（Issue #3251）。
+    fn peek_dml_returning_paren_qualified_column(&self) -> bool {
+        matches!(self.peek(), Some(Token::Punct('(')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::QualifiedIdent { .. })
+            )
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(2)),
+                Some(Token::Punct(')'))
+            )
+            && Self::returning_item_boundary(self.tokens.get(self.pos.saturating_add(3)))
+    }
+
+    /// FROM／USING つき DML の `RETURNING` の式項目 1 つ（Issue #3251）。`dml_from_target` を対象表の
+    /// 公開名に設定して式を読む間、対象表で修飾した列は非修飾へ正規化され、FROM／USING 側の修飾列は
+    /// `0A000`、実際に非修飾で書かれた識別子は `dml_from_unqualified` に集まる（束縛段が FROM／USING 側
+    /// との衝突を検査する）。状態はエラー時も元へ戻す。
+    fn parse_dml_from_returning_expr_item(
+        &mut self,
+        target_exposed: &str,
+    ) -> Result<crate::sql::dml_from_returning::DmlFromReturningItem, SqlSurfaceError> {
+        use crate::sql::dml_from_returning::DmlFromReturningItem;
+        let prev = self.dml_from_target.replace(target_exposed.to_string());
+        self.dml_from_unqualified.clear();
+        let parsed = self.parse_projection_infix(0);
+        self.dml_from_target = prev;
+        let unqualified = std::mem::take(&mut self.dml_from_unqualified);
+        let expr = parsed?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        // 括弧付きの裸識別子 `(n)` は列参照として扱う（別名なしは `Column`、別名付きは `AliasedColumn`）。
+        if let Expr::Ident(name) = &expr {
+            if is_scalar_subquery_placeholder_name(name) {
+                return Err(SqlSurfaceError::unsupported(
+                    "RETURNING does not support subqueries",
+                ));
+            }
+            // 非修飾で書かれた識別子だけがスコープ照合の対象。対象表で修飾された `(t.k)` は
+            // 式パーサーが非修飾へ正規化済みなので、対象表の修飾を戻して FROM／USING 側と衝突させない。
+            let colref = if unqualified.iter().any(|u| u == name) {
+                crate::sql::relation::ColumnRef::unqualified(name.clone())
+            } else {
+                crate::sql::relation::ColumnRef::qualified(target_exposed, name.clone())
+            };
+            return Ok(match alias {
+                Some(a) => DmlFromReturningItem::AliasedColumn(colref, a),
+                None => DmlFromReturningItem::Column(colref),
+            });
+        }
+        let item = SelectItem::Expr { expr, alias };
+        if let Some(err) = returning_item_rejection(&item) {
+            return Err(err);
+        }
+        Ok(DmlFromReturningItem::Expr { item, unqualified })
     }
 
     /// 文末専用句 `PARTITIONED [CHUNK <n>]`（Issue #1129・SQL-19）の構造パース。
@@ -18415,7 +18772,9 @@ fn check_view_body_pred_leaf(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
-        | WherePredicate::CorrelatedExists(_) => Err(rejected()),
+        | WherePredicate::CorrelatedExists(_)
+        // 行値比較は評価が #3256 まで未対応のため VIEW 本文では拒否する（tracked: #3256）。
+        | WherePredicate::RowCompare { .. } => Err(rejected()),
     }
 }
 
@@ -18443,7 +18802,9 @@ fn check_cte_body_predicates(where_predicates: &[WherePredicate]) -> Result<(), 
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {
+            | WherePredicate::CorrelatedExists(_)
+            // 行値比較は CTE／派生表本文では未対応（tracked: #3256）。
+            | WherePredicate::RowCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
                 ));
@@ -18593,6 +18954,8 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_)
+        // 行値比較は評価後射影形ビューの外側 WHERE では未対応（tracked: #3256）。
+        | WherePredicate::RowCompare { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::unsupported(
@@ -18759,6 +19122,9 @@ fn check_buffered_body_shape_with(
             }
             Ok(())
         }
+        // Issue #3267: 集合全体の `ORDER BY` は本文でも `sql::set_op` が実行する（参照時の評価は
+        // 本文を `order_by` ごと保った文として既存の集合演算経路へ渡す）。キー型・照合の拒否も
+        // 参照時に同じ `0A000` になる。
         Statement::SetOperation(v) => check_body_set_tree(&v.tree, lookup, out),
         // Issue #1411: 本文の FROM が別の評価後射影形ビュー（または単純形ビュー経由で
         // そこへ到達するビュー）の連鎖。本文として許すのは列射影・`WHERE`（宣言的述語、
@@ -18961,7 +19327,8 @@ fn check_body_aggregate(
         match item {
             AggregateSelectItem::Aggregate(agg) => {
                 // `string_agg`・`array_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
-                if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                if agg.func == AggregateFunc::StringAgg
+                    || agg.func.uses_array_agg_state()
                     || agg.func.is_variance_family()
                     || agg.func.is_bool_agg()
                     || agg.func.is_grouping()
@@ -18999,6 +19366,8 @@ fn check_body_set_tree(
         SetTree::AggregateBranch(agg) => {
             check_body_aggregate(&agg.0, lookup, BodyExprPolicy::Reject, out)
         }
+        // Issue #3270: ビュー本文には定数枝を書けない（fail-closed）。
+        SetTree::ConstBranch(_) => Err(body_form_unsupported()),
         SetTree::Op { left, right, .. } => {
             check_body_set_tree(left, lookup, out)?;
             check_body_set_tree(right, lookup, out)
@@ -19066,6 +19435,8 @@ fn check_body_pred(
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
         | WherePredicate::IsNull { .. } => Ok(()),
+        // 行値比較は本文の列走査が成分を辿れないため fail-closed に拒否する（tracked: #3256）。
+        WherePredicate::RowCompare { .. } => Err(body_form_unsupported()),
     }
 }
 
@@ -19160,62 +19531,91 @@ pub(crate) fn render_stored_simple_view_body(
 }
 
 /// 単純形ビュー本文 AST の列参照 `old` を `new` へ付け替える（TABLE-38 のポインタ、
-/// Issue #1621）。文字列置換でなく AST を書き換え、保存時は
+/// Issue #1621・#3239）。文字列置換でなく AST を書き換え、保存時は
 /// [`render_stored_simple_view_body`] で再描画する（リテラルのエスケープ・列名の
-/// 引用は既存レンダラーに任せる）。投影の列リストと `WHERE` 述語の列を対象とし、
-/// 変更があれば `true`。`parse_view_body` が受理しない述語形は到達しないが、
-/// 将来 variant が増えても追随漏れを起こさないよう `Err`（fail-closed）にする。
+/// 引用は既存レンダラーに任せ、往復ガードが意味の化けを拒否する）。投影の列リストと
+/// `WHERE` 述語の列を対象とし、変更があれば `true`。
+///
+/// `WHERE` は CHECK 制約の列改名・ビュー列別名と共有の走査器
+/// [`crate::sql::check_constraint::map_predicate_columns`] で書き換える（第 2 の走査器を
+/// 作らない）。式述語（`Expression`・`IN`・`BETWEEN`・`IS NULL`・`NOT`・`OR`）も 1 回の走査で
+/// 全列を一括写像するため連鎖置換は起きず、関数名は写像されない。`parse_view_body` が
+/// 受理しない述語形・`Projection::Items` は到達しないが、将来 variant が増えても追随漏れを
+/// 起こさないよう網羅的な `match` で `Err`（fail-closed）にする。
 pub(crate) fn rename_column_in_view_body(
     body: &mut ParsedViewBody,
     old: &str,
     new: &str,
 ) -> Result<bool, SqlSurfaceError> {
-    fn swap(column: &mut String, old: &str, new: &str) -> bool {
-        if column == old {
-            *column = new.to_string();
-            true
-        } else {
-            false
-        }
-    }
-    let mut changed = false;
-    if let Projection::Columns(cols) = &mut body.projection {
-        for c in cols.iter_mut() {
-            changed |= swap(c, old, new);
-        }
-    }
-    for pred in &mut body.where_predicates {
+    fn ensure_renamable(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
         match pred {
-            WherePredicate::Equality { column, .. }
-            | WherePredicate::Prefix {
-                lhs: Expr::Ident(column),
-                ..
-            }
-            | WherePredicate::BoolEquality { column, .. }
-            | WherePredicate::BoolColumn { column }
-            | WherePredicate::Compare { column, .. } => {
-                changed |= swap(column, old, new);
-            }
-            WherePredicate::Or(branches) if branches.is_empty() => {}
-            WherePredicate::Or(_)
-            | WherePredicate::PredicateCall { .. }
-            | WherePredicate::Prefix { .. }
-            | WherePredicate::Expression(_)
+            WherePredicate::Equality { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. }
             | WherePredicate::InList { .. }
             | WherePredicate::Between { .. }
             | WherePredicate::IsNull { .. }
-            | WherePredicate::Not(_)
+            | WherePredicate::Expression(_) => Ok(()),
+            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => Ok(()),
+            WherePredicate::Not(inner) => ensure_renamable(inner),
+            WherePredicate::Or(branches) => {
+                branches.iter().flatten().try_for_each(ensure_renamable)
+            }
+            WherePredicate::Prefix { .. }
+            | WherePredicate::PredicateCall { .. }
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {
-                return Err(SqlSurfaceError::unsupported(
-                    "view body WHERE predicate form is not supported",
-                ));
+            | WherePredicate::CorrelatedExists(_)
+            // 行値比較は VIEW 本文では未対応（tracked: #3256）。
+            | WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::unsupported(
+                "view body WHERE predicate form is not supported",
+            )),
+        }
+    }
+    let mut changed = false;
+    match &mut body.projection {
+        Projection::All => {}
+        Projection::Columns(cols) => {
+            for c in cols.iter_mut() {
+                if c == old {
+                    *c = new.to_string();
+                    changed = true;
+                }
             }
         }
+        Projection::Items(_) => {
+            return Err(SqlSurfaceError::unsupported(
+                "view body projection form is not supported",
+            ));
+        }
+    }
+    for pred in &body.where_predicates {
+        ensure_renamable(pred)?;
+    }
+    let map = |c: &str| {
+        if c == old {
+            new.to_string()
+        } else {
+            c.to_string()
+        }
+    };
+    let unsupported =
+        || SqlSurfaceError::unsupported("view body WHERE predicate form is not supported");
+    let mut renamed = Vec::with_capacity(body.where_predicates.len());
+    for pred in &body.where_predicates {
+        renamed.push(crate::sql::check_constraint::map_predicate_columns(
+            pred,
+            &map,
+            &unsupported,
+        )?);
+    }
+    if renamed != body.where_predicates {
+        changed = true;
+        body.where_predicates = renamed;
     }
     Ok(changed)
 }
@@ -19363,7 +19763,9 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
-        | WherePredicate::CorrelatedExists(_) => String::new(),
+        | WherePredicate::CorrelatedExists(_)
+        // VIEW 本文の検査が行値比較を拒否するため到達しない（tracked: #3256）。
+        | WherePredicate::RowCompare { .. } => String::new(),
     }
 }
 
@@ -22537,7 +22939,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
-        let returning = self.parse_dml_from_returning_clause()?;
+        let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
         // 文ハッシュは検証入口が元のトークン列から算出して差し替える（QuotedNull 正規化前の列を使うため）。
         let statement_hash = placeholder_statement_hash()?;
@@ -22563,7 +22965,7 @@ impl<'a> Parser<'a> {
         self.expect_contextual_keyword("USING")?;
         let using = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
-        let returning = self.parse_dml_from_returning_clause()?;
+        let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
         let statement_hash = placeholder_statement_hash()?;
         Ok(ParsedDeleteUsing {
@@ -22793,9 +23195,9 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
         });
     }
     // `array_agg` も同じ理由で JOIN は対象外（SQL-57・Issue #1801）。
-    if func == AggregateFunc::ArrayAgg {
+    if func.uses_array_agg_state() {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "array_agg is not supported in JOIN".to_string(),
+            detail: format!("{} is not supported in JOIN", func.default_alias()),
         });
     }
     // 分散系（SQL-57・Issue #1803）も JOIN は対象外（明示拒否で fail-closed に保つ）。
@@ -23490,6 +23892,7 @@ fn check_join_relations_are_tables(
 /// 落とした計画を返さないため、`core.rs` の入れ子文の `EXPLAIN` が `42601` に倒す根拠になる。
 pub(crate) fn scan_has_unrendered_explain_shape(v: &ValidatedScan) -> bool {
     !v.window_items.is_empty()
+        || v.distinct_on.is_some()
         || v.has_value_subqueries()
         || v.where_predicates
             .iter()
@@ -23511,6 +23914,8 @@ pub(crate) fn set_tree_has_unrendered_explain_shape(tree: &SetTree) -> bool {
         SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => {
             scan_has_unrendered_explain_shape(scan)
         }
+        // Issue #3271: 定数枝は葉 `result`（`source: constant`）として描画できる。
+        SetTree::ConstBranch(_) => false,
         SetTree::AggregateBranch(agg) => aggregate_has_unrendered_explain_shape(&agg.0),
         SetTree::Op { left, right, .. } => {
             set_tree_has_unrendered_explain_shape(left)
@@ -23524,9 +23929,115 @@ pub(crate) fn set_tree_has_unrendered_explain_shape(tree: &SetTree) -> bool {
 fn set_tree_has_value_subqueries(tree: &SetTree) -> bool {
     match tree {
         SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => scan.has_value_subqueries(),
-        SetTree::AggregateBranch(_) => false,
+        SetTree::AggregateBranch(_) | SetTree::ConstBranch(_) => false,
         SetTree::Op { left, right, .. } => {
             set_tree_has_value_subqueries(left) || set_tree_has_value_subqueries(right)
+        }
+    }
+}
+
+/// 式木が集計関数の呼び出しを含むか（Issue #3270）。集合演算の枝は、トップレベルの集計項目を
+/// 集計形の枝へ振り分ける（`looks_like_aggregate_select`）が、式の中に埋もれた集計
+/// （`coalesce(sum(n), 0)`）は振り分けられない。束縛段へ渡すと意図しない別のエラーや誤解釈に
+/// なり得るため、構文段で `42601` にする。`Expr` の全 variant を網羅する（variant 追加時に
+/// コンパイルエラーで検査漏れに気づく。fail-closed）。
+fn expr_contains_aggregate_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_)
+        | Expr::Ident(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. } => false,
+        Expr::Call { name, args } => {
+            is_aggregate_function_name(name) || args.iter().any(expr_contains_aggregate_call)
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
+            expr_contains_aggregate_call(lhs) || expr_contains_aggregate_call(rhs)
+        }
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => expr_contains_aggregate_call(expr),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .any(expr_contains_aggregate_call),
+        Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_aggregate_call),
+        Expr::Case { whens, else_result } => {
+            whens
+                .iter()
+                .any(|(c, r)| expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r))
+                || else_result
+                    .as_deref()
+                    .is_some_and(expr_contains_aggregate_call)
+        }
+        Expr::Coalesce(args) => args.iter().any(expr_contains_aggregate_call),
+    }
+}
+
+/// 集合演算の `FROM` あり枝の式項目に集計呼び出しが含まれていれば `42601`（Issue #3270）。
+fn reject_aggregate_in_branch_items(projection: &Projection) -> Result<(), SqlSurfaceError> {
+    if let Projection::Items(items) = projection {
+        let has_aggregate = items.iter().any(|it| match it {
+            SelectItem::Expr { expr, .. } => expr_contains_aggregate_call(expr),
+            SelectItem::Column(_) => false,
+        });
+        if has_aggregate {
+            return Err(SqlSurfaceError::unsupported(
+                "aggregate calls inside an expression are not allowed in a set operation branch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 集合演算の定数枝（`FROM` なしの `SELECT <項目>`。Issue #3270・SQL-42 のポインタ）を、共有の
+/// [`Parser`] 上で項目リストだけ読んで解析する。後続の全体 `LIMIT`／`OFFSET`／末尾 `ORDER BY`
+/// は呼び出し元（`parse_set_operation`）の担当で、ここでは消費しない（`parse_const_select` を
+/// 枝スライスへ使うと全体 `OFFSET` を枝の句として取り込み、結果が黙って変わるため使わない）。
+/// トップレベルの集計項目・`WHERE`／`HAVING` は枝が持てない句として `42601`（fail-closed）。
+fn parse_set_const_branch(p: &mut Parser<'_>) -> Result<SetTree, SqlSurfaceError> {
+    let items = p.parse_const_select_items()?;
+    if items.iter().any(|it| it.aggregate().is_some()) {
+        return Err(SqlSurfaceError::unsupported(
+            "aggregate items are not allowed in a FROM-less set operation branch",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) || p.peek_ident_matches("HAVING") {
+        return Err(SqlSurfaceError::unsupported(
+            "WHERE/HAVING are not allowed in a FROM-less set operation branch",
+        ));
+    }
+    Ok(SetTree::ConstBranch(Box::new(SetConstBranch(
+        ValidatedConstSelect {
+            items,
+            where_clause: None,
+            having: None,
+            limit: None,
+            offset: None,
+        },
+    ))))
+}
+
+/// 集合演算木が表を読む葉を 1 つ以上持つか（Issue #3270）。全枝が定数の木は、表の葉を前提とする
+/// 下流（読み取り権限・一時表の経路・カーソル・`EXPLAIN` の対象表名）が成り立たないため、
+/// `parse_set_operation` が `0A000` で拒否する。
+fn set_tree_has_table_leaf(tree: &SetTree) -> bool {
+    match tree {
+        SetTree::ConstBranch(_) => false,
+        SetTree::Branch(_) | SetTree::LimitedBranch(_) | SetTree::AggregateBranch(_) => true,
+        SetTree::Op { left, right, .. } => {
+            set_tree_has_table_leaf(left) || set_tree_has_table_leaf(right)
         }
     }
 }
@@ -23550,8 +24061,8 @@ fn looks_like_set_operation(tokens: &[Token]) -> bool {
 /// 追加した集計形の枝）を解析する。検索 SELECT・広域取得が持つランキング段・
 /// `LIMIT`・`OFFSET`・`DISTINCT` はいずれも括弧なしの枝では受理しない（fail-closed。
 /// 括弧なしの末尾 `ORDER BY`／`LIMIT` は集合演算全体に掛かるため。括弧付きの単一
-/// `SELECT` 枝は [`parse_set_limited_branch`]）。`Computed` 投影項目（宣言的 UDF・
-/// 組み込み関数呼び出し）も、束縛時に型を確定できないため受理しない。
+/// `SELECT` 枝は [`parse_set_limited_branch`]）。式項目（Issue #3270）は受理するが、式の中の
+/// 集計呼び出しは `42601`。`FROM` なしの枝は定数枝（[`parse_set_const_branch`]）へ振り分ける。
 fn parse_set_branch(
     p: &mut Parser<'_>,
     lookup: &impl TableLookup,
@@ -23563,6 +24074,13 @@ fn parse_set_branch(
     let branch_start = p.pos;
     let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
+        // Issue #3270（SQL-42 ポインタ）: 深さ 0 に `FROM` が無い枝は定数枝。トップレベルの
+        // `validate_select_statement` と同じく、集計形の判定より前に振り分ける。
+        if matches!(slice.first(), Some(Token::Keyword(Keyword::Select)))
+            && is_from_less_select(slice)
+        {
+            return parse_set_const_branch(p);
+        }
         if looks_like_aggregate_select(slice) {
             let shape = parse_aggregate_shape(
                 slice,
@@ -23578,13 +24096,7 @@ fn parse_set_branch(
     p.expect_keyword(Keyword::Select)?;
 
     let projection = p.parse_select_list()?;
-    if let Projection::Items(items) = &projection {
-        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })) {
-            return Err(SqlSurfaceError::unsupported(
-                "computed projection items are not allowed inside a set operation branch",
-            ));
-        }
-    }
+    reject_aggregate_in_branch_items(&projection)?;
 
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
@@ -23609,19 +24121,20 @@ fn parse_set_branch(
     // 最後の枝の直後に置かれる正当な形のため、ここでは拒否しない（枝の中の `OFFSET` は
     // `LIMIT` と同様に後続の検査で `42601` へ落ちる）。Issue #1796。
     //
-    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`DISTINCT` はいずれも
+    // 括弧なしの `ORDER BY` も `LIMIT`／`OFFSET` と同じく、最後の枝の直後に置かれた場合は
+    // 集合演算全体のソートキーとして `parse_set_operation` が消費する（Issue #3266）。
+    // 最後以外の枝の直後の `ORDER BY` は、`parse_set_operation` が読んだ後に演算子が残り
+    // `expect_end_of_statement` が `42601` にする（枝の句と誤解釈しない）。
+    //
+    // `GROUP BY`／`USING PLAN`／`DISTINCT` はいずれも
     // 集合演算の文法上どの位置にも現れ得ないため、ここで拒否しなくても
     // 同じ理由で最終的に `expect_end_of_statement` が `42601` に落とす。
     // ただし早期に拒否した方が構造的に読みやすいため、明示的に残す。
     let has_group_by = matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"))
         && matches!(p.tokens.get(p.pos + 1), Some(Token::Keyword(Keyword::By)));
-    if has_group_by
-        || matches!(p.peek(), Some(Token::Keyword(Keyword::Order)))
-        || p.peek_ident_matches("USING")
-        || p.peek_ident_matches("DISTINCT")
-    {
+    if has_group_by || p.peek_ident_matches("USING") || p.peek_ident_matches("DISTINCT") {
         return Err(SqlSurfaceError::unsupported(
-            "GROUP BY/ORDER BY/USING PLAN/DISTINCT are not allowed inside a set operation branch",
+            "GROUP BY/USING PLAN/DISTINCT are not allowed inside a set operation branch",
         ));
     }
 
@@ -23634,9 +24147,8 @@ fn parse_set_branch(
             where_predicates,
             limit: crate::core::MAX_SEARCH_K as u32,
             limit_implicit: false,
-            // Issue #915（SQL-25）: 集合演算の枝は上の構文検査
-            // （`Keyword::Order` を明示的に拒否）でスカラー ORDER BY も
-            // 受理しないため、常に空。
+            // Issue #915（SQL-25）: 括弧なしの枝は枝内の ORDER BY を持たない
+            // （末尾の `ORDER BY` は集合全体のキーとして別に保持する。Issue #3266）ため常に空。
             order_by: Vec::new(),
             offset: 0,
             // Issue #930（SQL-30・TASK-214）: 集合演算の枝は `parse_select_list`
@@ -23648,6 +24160,7 @@ fn parse_set_branch(
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         },
         super::view::Resolved::View {
             base_table,
@@ -23690,6 +24203,7 @@ fn parse_set_branch(
                 physical_order_keys: Vec::new(),
                 embedded_scalar_subqueries: Vec::new(),
                 with_ties: false,
+                distinct_on: None,
             }
         }
         // Issue #1192: 評価後射影形ビューは集合演算の枝として参照できない。
@@ -23866,12 +24380,13 @@ fn parse_set_limited_branch(
             "window functions are not allowed inside a set operation branch",
         ));
     }
-    if let Projection::Items(items) = &shape.projection {
-        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })) {
-            return Err(SqlSurfaceError::unsupported(
-                "computed projection items are not allowed inside a set operation branch",
-            ));
-        }
+    reject_aggregate_in_branch_items(&shape.projection)?;
+    // select list の値サブクエリは枝では束縛しない（fail-closed。Issue #3270。式項目の
+    // 受理解禁で、従来の一括拒否が担っていた経路が素通りしないようにする）。
+    if !shape.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries in the select list are not allowed inside a set operation branch",
+        ));
     }
     // Issue #1188: 式キーの `ORDER BY` は集合演算の枝では非対応（式キーを含む文は
     // `order_by` が空になるため、黙って渡すと並べ替えなしで LIMIT が適用される）。
@@ -24016,7 +24531,7 @@ fn parse_set_primary(
     parse_set_branch(p, lookup)
 }
 
-/// `set_term := primary { INTERSECT primary }`（`INTERSECT` は `UNION`／`EXCEPT`
+/// `set_term := primary { INTERSECT [ALL | DISTINCT] primary }`（`INTERSECT` は `UNION`／`EXCEPT`
 /// より高い優先順位で左結合。PostgreSQL と同じ優先順位規則）。
 fn parse_set_term(
     p: &mut Parser<'_>,
@@ -24027,14 +24542,20 @@ fn parse_set_term(
     let mut left = parse_set_primary(p, lookup, depth, branch_count)?;
     while p.peek_ident_matches("INTERSECT") {
         p.advance();
-        if p.peek_ident_matches("ALL") || p.peek_ident_matches("DISTINCT") {
-            return Err(SqlSurfaceError::unsupported(
-                "INTERSECT ALL/DISTINCT is not supported",
-            ));
-        }
+        // 量指定語は 1 語だけ消費する。`ALL DISTINCT` 等の連続は次の枝の開始を
+        // 見つけられず構文段で `42601` になる（fail-closed。Issue #3268）。
+        let op = if p.peek_ident_matches("ALL") {
+            p.advance();
+            SetOperator::IntersectAll
+        } else {
+            if p.peek_ident_matches("DISTINCT") {
+                p.advance();
+            }
+            SetOperator::Intersect
+        };
         let right = parse_set_primary(p, lookup, depth, branch_count)?;
         left = SetTree::Op {
-            op: SetOperator::Intersect,
+            op,
             left: Box::new(left),
             right: Box::new(right),
         };
@@ -24042,7 +24563,9 @@ fn parse_set_term(
     Ok(left)
 }
 
-/// `set_expr := set_term { (UNION [ALL] | EXCEPT) set_term }`（左結合）。
+/// `set_expr := set_term { (UNION [ALL | DISTINCT] | EXCEPT [ALL | DISTINCT]) set_term }`
+/// （左結合）。量指定語は 1 語だけ消費し、明示 `DISTINCT` は既定と同義（Issue #3269）。
+/// 量指定語の連続は次の `parse_set_term` が枝の開始を見つけられず `42601`。
 fn parse_set_expr(
     p: &mut Parser<'_>,
     lookup: &impl TableLookup,
@@ -24057,9 +24580,9 @@ fn parse_set_expr(
                 p.advance();
                 true
             } else if p.peek_ident_matches("DISTINCT") {
-                return Err(SqlSurfaceError::unsupported(
-                    "UNION DISTINCT is not supported",
-                ));
+                // 明示 DISTINCT は既定の `UNION` と同じ意味（Issue #3268）。
+                p.advance();
+                false
             } else {
                 false
             };
@@ -24075,14 +24598,22 @@ fn parse_set_expr(
             };
         } else if p.peek_ident_matches("EXCEPT") {
             p.advance();
-            if p.peek_ident_matches("ALL") || p.peek_ident_matches("DISTINCT") {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXCEPT ALL/DISTINCT is not supported",
-                ));
-            }
+            let all = if p.peek_ident_matches("ALL") {
+                p.advance();
+                true
+            } else if p.peek_ident_matches("DISTINCT") {
+                p.advance();
+                false
+            } else {
+                false
+            };
             let right = parse_set_term(p, lookup, depth, branch_count)?;
             left = SetTree::Op {
-                op: SetOperator::Except,
+                op: if all {
+                    SetOperator::ExceptAll
+                } else {
+                    SetOperator::Except
+                },
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -24102,13 +24633,54 @@ fn parse_set_operation(
     let mut p = Parser::new(tokens);
     let mut branch_count = 0usize;
     let tree = parse_set_expr(&mut p, lookup, 0, &mut branch_count)?;
+    // Issue #3266: 括弧なし末尾の `ORDER BY` は集合全体のキー（PG と同じ解釈）。句の順序は
+    // `ORDER BY` → `LIMIT` → `OFFSET` で、それ以外の並びは `expect_end_of_statement` が `42601`。
+    let scan_keys = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+        p.expect_keyword(Keyword::Order)?;
+        p.expect_keyword(Keyword::By)?;
+        p.parse_scalar_order_by()?
+    } else {
+        Vec::new()
+    };
     let limit = p.parse_optional_limit()?;
     let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
+    if !set_tree_has_table_leaf(&tree) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "a set operation whose branches are all FROM-less is not supported",
+        ));
+    }
+    // 構文の誤り（`42601`）を先に確定させてから、式キーを `0A000` にする
+    // （PG の「集合演算の ORDER BY は結果列名だけ」に対応する分類）。
+    let mut order_by = Vec::with_capacity(scan_keys.len());
+    for key in scan_keys {
+        order_by.push(match key {
+            ScanOrderKey::Column { key, nulls } => SetOrderKey::Column {
+                name: key.column,
+                descending: key.descending,
+                nulls,
+            },
+            ScanOrderKey::Ordinal {
+                position,
+                descending,
+                nulls,
+            } => SetOrderKey::Ordinal {
+                position,
+                descending,
+                nulls,
+            },
+            ScanOrderKey::Expr { .. } => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "ORDER BY over a set operation result supports only output column names or positions",
+                ));
+            }
+        });
+    }
     Ok(ValidatedSetOperation {
         tree,
         limit,
         offset,
+        order_by,
     })
 }
 
@@ -24130,6 +24702,53 @@ fn parse_select_shape(
     }
 
     p.expect_keyword(Keyword::Select)?;
+    parse_select_shape_body(p, subquery_ctx)
+}
+
+/// `SELECT DISTINCT ON (<式>, ...) <SELECT リスト以降>` の構文解析（Issue #3260・SQL-25 の
+/// ポインタ。`validate_select_statement` の DISTINCT ON gate だけが呼ぶ）。`ON` リストを既存の
+/// 値式パーサで読み（個数は [`MAX_SCALAR_ORDER_KEYS`] 以下。超過は確保前に `54000`）、残りは
+/// [`parse_select_shape_body`] へ同じ [`Parser`] のまま渡す（トークン列を合成し直さないため
+/// 列参照の記録位置が壊れない）。
+fn parse_distinct_on_select(
+    tokens: &[Token],
+    subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<(Vec<Expr>, ParsedSelect), SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
+    if let Some(depth) = subquery_ctx {
+        p = p.with_subquery_ctx(depth);
+    }
+    p.expect_keyword(Keyword::Select)?;
+    // `DISTINCT`・`ON` は呼び出し元が `is_distinct_on_head` で確認済み（どちらも文脈識別子）。
+    p.advance();
+    p.advance();
+    p.expect_punct('(')?;
+    let mut on_exprs: Vec<Expr> = Vec::new();
+    loop {
+        if on_exprs.len() >= MAX_SCALAR_ORDER_KEYS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many DISTINCT ON expressions",
+            ));
+        }
+        on_exprs.push(p.parse_value_expr(0)?);
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            continue;
+        }
+        break;
+    }
+    p.expect_punct(')')?;
+    let parsed = parse_select_shape_body(p, subquery_ctx)?;
+    Ok((on_exprs, parsed))
+}
+
+/// [`parse_select_shape`]・[`parse_distinct_on_select`] が共有する、`SELECT`（および
+/// `DISTINCT ON (...)`）消費後の本体。SELECT リスト以降を読んで広域取得／検索 SELECT へ振り分ける。
+fn parse_select_shape_body(
+    mut p: Parser<'_>,
+    subquery_ctx: Option<usize>,
+) -> Result<ParsedSelect, SqlSurfaceError> {
     // SQL-30・TASK-214（Issue #930）: ウィンドウ項目は SELECT リストの一部として
     // 通常項目と混在しうるため、`ORDER BY`／`USING PLAN` を伴う検索 SELECT 経路か
     // ランキング段を持たない広域取得かを判定する**前**にリストを読み終える必要が
@@ -24854,6 +25473,13 @@ fn parse_aggregate_shape(
 /// 意味論層（`sql::parser::bind_group_by_clause`）が担う（並べ替え不能な型
 /// `VECTOR` 等・未知列はいずれも `22000`）。
 fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
+    // Issue #3260: CTE 本文・WITH 主クエリなど `SELECT DISTINCT` 単純形を直接呼ぶ文脈で
+    // `DISTINCT ON (...)` を列名 `ON` と誤読して 42601 にせず、未対応文脈として明示的に拒否する。
+    if super::distinct::is_distinct_on_head(tokens, 1) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "SELECT DISTINCT ON is not supported in this context",
+        ));
+    }
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
@@ -26406,6 +27032,7 @@ fn build_scan_from_resolved(
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }),
         super::view::Resolved::View {
             base_table,
@@ -26476,6 +27103,7 @@ fn build_scan_from_resolved(
                 physical_order_keys,
                 embedded_scalar_subqueries: Vec::new(),
                 with_ties: false,
+                distinct_on: None,
             })
         }
         // 評価後射影形ビュー（Issue #1192）は CTE・集合演算の枝など、広域取得の
@@ -26672,7 +27300,8 @@ fn buffered_aggregate_outer(
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
                     // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
-                    if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                    if agg.func == AggregateFunc::StringAgg
+                        || agg.func.uses_array_agg_state()
                         || agg.func.is_variance_family()
                         || agg.func.is_bool_agg()
                         || agg.func.is_grouping()
@@ -28731,6 +29360,14 @@ fn recursive_cte_statement(
                 "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT",
             ));
         }
+        // 再帰 CTE のアンカー項の集合全体 `ORDER BY` は、PostgreSQL では構文上受理されない位置
+        // （アンカーは `WITH RECURSIVE` の非再帰項で、全体の `ORDER BY` を持てない）。意図的な拒否
+        // で、設計記録は `docs/design/set-operations.md`（Issue #3267）。
+        Statement::SetOperation(v) if !v.order_by.is_empty() => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "ORDER BY over a set operation result is not supported in the anchor term of WITH RECURSIVE",
+            ));
+        }
         Statement::Select(_)
         | Statement::Scan(_)
         | Statement::Aggregate(_)
@@ -28938,7 +29575,12 @@ fn validate_sql_tokens_impl(
         // SELECT／集計 SELECT）でのみサブクエリを解決できるようにする
         // （`EXPLAIN` 経由の呼び出しは常に `None` を渡す。後述）。
         Some(Token::Keyword(Keyword::Select)) => {
-            validate_select_statement(tokens, lookup, subquery_ctx, limits)
+            // `SELECT DISTINCT ON`（Issue #3261）の実行はセッション最上位の入口（`AllowMaterialize`・
+            // 深さ 0）だけに限る。ビュー本文・CTAS・カーソル・サブクエリの内側等の入口は、重複排除を
+            // 実行段へ運べないため `0A000` で拒否する（fail-closed）。
+            let allow_distinct_on =
+                cte_evaluation == CteEvaluation::AllowMaterialize && subquery_ctx == Some(0);
+            validate_select_statement(tokens, lookup, subquery_ctx, limits, allow_distinct_on)
         }
         // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
         // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
@@ -29149,7 +29791,7 @@ fn validate_sql_tokens_impl(
             // 段の組み立ては `core.rs` の `Statement::Explain` アームが行い、内側は実行しない。
             // 値としての部分クエリ・FILTER／HAVING の部分クエリ・ランキング検索の部分クエリは
             // 描画する段を持たないため下で明示的に `42601` にする（fail-closed）。
-            let target = match validate_select_statement(rest, lookup, subquery_ctx, limits)? {
+            let target = match validate_select_statement(rest, lookup, subquery_ctx, limits, false)? {
                 // Issue #2977: `USING PLAN(...)` つきの順位付き検索の部分クエリは、実行も LLM I/O の前に
                 // `42601` で拒否する形なので、EXPLAIN も同じコードで先に拒否する（fail-closed）。
                 // それ以外（HALFVEC の kNN は実行が Scan へ写して部分クエリを解決する。VECTOR の kNN・
@@ -29305,6 +29947,156 @@ fn select_range_contains_aggregate_call(tokens: &[Token], start: usize, item_onl
     false
 }
 
+/// `SELECT DISTINCT ON` の検証と受理（[`validate_select_statement`] の gate から呼ぶ。Issue #3260・#3261）。
+/// 判定順序は 構文（42601）→ 個数上限（54000）→ FROM の関係（42P01）→ 未対応の併用（0A000）→
+/// `ORDER BY` 先頭一致（42P10。直前に未知列 42703 を先に判定する）→ 実行できない文脈（0A000）→
+/// 実効ソートキーの組み立て（54000）。整合した文は、実効 `ORDER BY`（ON キーを先頭に置く）と
+/// グループ前置長（[`ValidatedScan::distinct_on`]）を持つ通常の広域取得 [`Statement::Scan`] になり、
+/// 束縛・実行（RLS・予算）は既存の広域取得経路を共有する（第 2 の実行器を持たない）。
+///
+/// 受理するのは `allow_exec`（セッション最上位の入口 [`validate_session_sql_tokens`] だけが真）で、
+/// 単一表または畳み込み可能ビューへの `SELECT DISTINCT ON (...) <投影> FROM <表> [WHERE] [ORDER BY]
+/// [LIMIT/OFFSET]`。サブクエリの内側・ビュー本文・CTAS・カーソル・EXPLAIN・INSERT…SELECT 等の
+/// 他の入口、評価後射影形ビュー、`WITH TIES`、式内のスカラーサブクエリは、実行段へ重複排除を運べない
+/// ため `0A000`（fail-closed。黙って重複排除を落とさない）。集計・`GROUP BY`・`HAVING`・ウィンドウとの
+/// 併用、距離順位付け形、`USING PLAN` も `0A000`。
+fn validate_distinct_on_select(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
+    allow_exec: bool,
+) -> Result<Statement, SqlSurfaceError> {
+    let unsupported_combo = || {
+        SqlSurfaceError::feature_not_supported(
+            "SELECT DISTINCT ON cannot be combined with aggregates, GROUP BY, HAVING or window functions",
+        )
+    };
+    if tokens_contain_group_by(tokens)
+        || tokens_contain_window_over(tokens)
+        || has_top_level_having_clause(tokens)
+        || select_range_contains_aggregate_call(tokens, 1, false)
+    {
+        return Err(unsupported_combo());
+    }
+    let (on_exprs, parsed) = parse_distinct_on_select(tokens, subquery_ctx, limits)?;
+    let ParsedSelect::Scan(mut shape) = parsed else {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "SELECT DISTINCT ON is not supported with vector ranking or USING PLAN",
+        ));
+    };
+    // FROM の存在確認（テーブル・ビュー。ビュー別名の書き換えより前に、利用者が書いた名前で比較する）。
+    let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
+    if !shape.window_items.is_empty() || !shape.scalar_subquery_items.is_empty() {
+        return Err(unsupported_combo());
+    }
+    if let Err(e) = super::distinct::check_distinct_on_order_prefix(
+        &on_exprs,
+        &shape.projection,
+        &shape.order_by,
+        &shape.order_keys,
+    ) {
+        // PostgreSQL は未知列を先頭一致（42P10）より先に判定する。もともとエラーになる経路で
+        // SQLSTATE が変わるだけなので、正しい文を拒否することはない。
+        if matches!(e, SqlSurfaceError::DistinctOnOrderByMismatch)
+            && matches!(resolved, super::view::Resolved::Table)
+        {
+            if let Some(columns) = lookup.table_columns(&shape.table_name)? {
+                if let Some(unknown) = super::distinct::first_unknown_column(
+                    &on_exprs,
+                    &shape.projection,
+                    &shape.order_by,
+                    &shape.order_keys,
+                    &columns,
+                ) {
+                    return Err(SqlSurfaceError::undefined_column(unknown));
+                }
+            }
+        }
+        return Err(e);
+    }
+    let not_here = |detail: &'static str| SqlSurfaceError::feature_not_supported(detail);
+    if !allow_exec {
+        return Err(not_here(
+            "SELECT DISTINCT ON is only supported as a top-level SELECT statement",
+        ));
+    }
+    if matches!(resolved, super::view::Resolved::Buffered { .. }) {
+        return Err(not_here(
+            "SELECT DISTINCT ON is not supported over a view with an aggregate/LIMIT body",
+        ));
+    }
+    if shape.with_ties {
+        return Err(not_here(
+            "SELECT DISTINCT ON cannot be combined with FETCH ... WITH TIES",
+        ));
+    }
+    if !shape.embedded_scalar_subqueries.is_empty() {
+        return Err(not_here(
+            "SELECT DISTINCT ON cannot be combined with scalar subqueries inside expressions",
+        ));
+    }
+    let (effective, prefix_len) = super::distinct::distinct_on_effective_order(
+        &on_exprs,
+        &shape.projection,
+        &shape.order_by,
+        &shape.order_keys,
+    )?;
+    shape.order_by = Vec::new();
+    shape.order_keys = effective;
+    match scan_statement_from_resolved(shape, resolved)? {
+        Statement::Scan(mut scan) => {
+            scan.distinct_on = Some(prefix_len);
+            Ok(Statement::Scan(scan))
+        }
+        // 評価後射影形ビューは上で拒否済み。他の形はここへ到達しない（多層防御として fail-closed）。
+        _ => Err(not_here("SELECT DISTINCT ON is not supported here")),
+    }
+}
+
+/// 広域取得（[`ParsedScanShape`]）の FROM を解決済みの [`super::view::Resolved`] から
+/// [`Statement`] へ組み立てる。通常の広域取得（[`validate_select_statement`] の
+/// `ParsedSelect::Scan` 腕）と `SELECT DISTINCT ON`（[`validate_distinct_on_select`]）が共有する
+/// 唯一の構築経路（第 2 の構築経路を作らない）。
+fn scan_statement_from_resolved(
+    shape: ParsedScanShape,
+    resolved: super::view::Resolved,
+) -> Result<Statement, SqlSurfaceError> {
+    // Issue #1192・#1360・#1411: 評価後射影形ビューへの参照は本文実行＋外側の
+    // 後処理の別 variant へ分岐する。外側は `SELECT <*|列> FROM <view> [WHERE ...]
+    // [ORDER BY <列|式>] LIMIT n [OFFSET m]`（ウィンドウ項目を含みうる）。WHERE は
+    // 宣言的な葉と NOT／OR・式述語のみ。式項目・投影位置のスカラーサブクエリは
+    // `42601`。
+    if let super::view::Resolved::Buffered { view_name, body } = resolved {
+        return buffered_scan_statement(view_name, body, shape);
+    }
+    // Issue #1848: 式の内側のスカラーサブクエリは実テーブル直接の参照だけが対象。ビュー・CTE 越しは
+    // 外側の述語・列名の書き換え（公開名 → 物理名）と相関列の対応を保証できないため `0A000`。
+    if !shape.embedded_scalar_subqueries.is_empty()
+        && !matches!(resolved, super::view::Resolved::Table)
+    {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "scalar subqueries inside expressions are not supported over a view",
+        ));
+    }
+    let embedded_scalar_subqueries = shape.embedded_scalar_subqueries;
+    let mut scan = build_scan_from_resolved(
+        shape.table_name,
+        resolved,
+        shape.projection,
+        shape.where_predicates,
+        shape.limit,
+        shape.order_by,
+        shape.offset,
+        shape.window_items,
+        shape.order_keys,
+        shape.scalar_subquery_items,
+    )?;
+    scan.with_ties = shape.with_ties;
+    scan.embedded_scalar_subqueries = embedded_scalar_subqueries;
+    Ok(Statement::Scan(scan))
+}
+
 /// 通常 SELECT・集計 SELECT（`GROUP BY` の有無いずれも）・`SELECT DISTINCT`
 /// の脱糖形・広域取得（ビュー展開後の形を含む）の共有振り分け（TASK-166・
 /// SQL-13／TASK-167・SQL-14／SQL-25 (c)・TASK-209／Issue #454 の先読み判定と
@@ -29333,6 +30125,7 @@ fn validate_select_statement(
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
     limits: crate::nesting_limits::NestingLimits,
+    allow_distinct_on: bool,
 ) -> Result<Statement, SqlSurfaceError> {
     // SQL-43（Issue #1531）: 括弧の深さ 0 に `FROM` が無い `SELECT` は定数式 SELECT。
     // 既存形（`FROM` あり）では常に偽で、以降の振り分けに一切影響しない。
@@ -29358,6 +30151,19 @@ fn validate_select_statement(
         {
             precheck_aggregate_filter_tokens(tokens, i.saturating_add(1))?;
         }
+    }
+    // Issue #3260・#3261（SQL-25 のポインタ）: `SELECT DISTINCT ON (...)`。構文・個数（54000）・FROM の
+    // 存在（42P01）・`ORDER BY` 先頭一致（42P10）を検証し、整合した文はセッション最上位の入口に限り
+    // 重複排除つきの広域取得として受理する（他の入口は `0A000`。fail-closed）。共有の検証経路に置くため
+    // Parse／Describe・ビュー本文・カーソル等の入口も同じ分類になる。
+    if super::distinct::is_distinct_on_head(tokens, 1) {
+        return validate_distinct_on_select(
+            tokens,
+            lookup,
+            subquery_ctx,
+            limits,
+            allow_distinct_on,
+        );
     }
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
@@ -29483,39 +30289,7 @@ fn validate_select_statement(
         // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
         ParsedSelect::Scan(shape) => {
             let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
-            // Issue #1192・#1360・#1411: 評価後射影形ビューへの参照は本文実行＋外側の
-            // 後処理の別 variant へ分岐する。外側は `SELECT <*|列> FROM <view> [WHERE ...]
-            // [ORDER BY <列|式>] LIMIT n [OFFSET m]`（ウィンドウ項目を含みうる）。WHERE は
-            // 宣言的な葉と NOT／OR・式述語のみ。式項目・投影位置のスカラーサブクエリは
-            // `42601`。
-            if let super::view::Resolved::Buffered { view_name, body } = resolved {
-                return buffered_scan_statement(view_name, body, shape);
-            }
-            // Issue #1848: 式の内側のスカラーサブクエリは実テーブル直接の参照だけが対象。ビュー・CTE 越しは
-            // 外側の述語・列名の書き換え（公開名 → 物理名）と相関列の対応を保証できないため `0A000`。
-            if !shape.embedded_scalar_subqueries.is_empty()
-                && !matches!(resolved, super::view::Resolved::Table)
-            {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "scalar subqueries inside expressions are not supported over a view",
-                ));
-            }
-            let embedded_scalar_subqueries = shape.embedded_scalar_subqueries;
-            let mut scan = build_scan_from_resolved(
-                shape.table_name,
-                resolved,
-                shape.projection,
-                shape.where_predicates,
-                shape.limit,
-                shape.order_by,
-                shape.offset,
-                shape.window_items,
-                shape.order_keys,
-                shape.scalar_subquery_items,
-            )?;
-            scan.with_ties = shape.with_ties;
-            scan.embedded_scalar_subqueries = embedded_scalar_subqueries;
-            Ok(Statement::Scan(scan))
+            scan_statement_from_resolved(shape, resolved)
         }
     }
 }
@@ -31309,6 +32083,7 @@ fn validate_copy_table_to_tokens(
         physical_order_keys: Vec::new(),
         embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
+        distinct_on: None,
     };
     Ok(CopyStatement::To(ValidatedCopyTo {
         inner: CopyToSource::Scan(Box::new(scan)),
@@ -31831,14 +32606,17 @@ mod tests {
         }
     }
 
-    /// SQL-53・Issue #1756: FROM／USING つき DML の RETURNING は `*`・`t.*`・列参照だけを受理する。
+    /// SQL-53・Issue #1756・#3251: FROM／USING つき DML の RETURNING は `*`・`t.*`・列参照・別名・
+    /// 対象表の式を受理し、FROM／USING 側の修飾列を含む式・サブクエリ・集計は拒否する。
     #[test]
-    fn dml_from_returning_clause_accepts_star_and_column_refs_only() {
+    fn dml_from_returning_clause_accepts_aliases_and_target_expressions() {
         use super::*;
         use crate::sql::dml_from_returning::DmlFromReturningItem;
         let parse = |sql: &str| {
             let toks = crate::sql::lexer::tokenize(sql).expect("lex");
-            Parser::new(&toks).parse_dml_from_returning_clause()
+            let mut p = Parser::new(&toks);
+            p.parse_dml_from_returning_clause("t")
+                .and_then(|r| p.expect_end_of_statement().map(|_| r))
         };
         let ok = parse("RETURNING *, t.*, a, s.b")
             .expect("accepted")
@@ -31850,18 +32628,53 @@ mod tests {
             DmlFromReturningItem::QualifiedAll("t".to_string())
         );
         assert!(parse("").expect("empty").is_none());
-        for bad in [
-            "RETURNING a AS x",
-            "RETURNING lower(a)",
-            "RETURNING a + 1",
-            "RETURNING",
+        let aliased = parse("RETURNING a AS x, s.b AS y, id AS i")
+            .expect("alias")
+            .expect("present");
+        assert!(aliased
+            .items
+            .iter()
+            .all(|i| matches!(i, DmlFromReturningItem::AliasedColumn(..))));
+        let expr = parse("RETURNING lower(t.a), a + 1 AS n, (b), -a")
+            .expect("expr")
+            .expect("present");
+        assert!(matches!(expr.items[0], DmlFromReturningItem::Expr { .. }));
+        match &expr.items[1] {
+            DmlFromReturningItem::Expr { unqualified, .. } => {
+                assert_eq!(unqualified, &vec!["a".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(expr.items[2], DmlFromReturningItem::Column(_)));
+        // 括弧なし SQL 値関数は式、引用付き同名は列参照（P1 回帰）。
+        let vf = parse("RETURNING CURRENT_DATE AS d, \"current_date\" AS c")
+            .expect("value function")
+            .expect("present");
+        assert!(matches!(vf.items[0], DmlFromReturningItem::Expr { .. }));
+        assert!(matches!(
+            vf.items[1],
+            DmlFromReturningItem::AliasedColumn(..)
+        ));
+        // 括弧付き FROM／USING 修飾列は括弧なしと同じ列束縛（Medium 回帰）。
+        let paren = parse("RETURNING (s.v), (s.v) AS w")
+            .expect("paren qualified")
+            .expect("present");
+        assert!(matches!(paren.items[0], DmlFromReturningItem::Column(_)));
+        assert!(matches!(
+            paren.items[1],
+            DmlFromReturningItem::AliasedColumn(..)
+        ));
+        for (bad, code) in [
+            ("RETURNING lower(s.a)", "0A000"),
+            ("RETURNING s.a + 1", "0A000"),
+            ("RETURNING *  AS x", "42601"),
+            ("RETURNING a x", "42601"),
+            ("RETURNING count(a)", "42601"),
+            ("RETURNING", "42601"),
         ] {
-            let tokens = crate::sql::lexer::tokenize(bad).expect("lex");
-            let mut p = Parser::new(&tokens);
-            let res = p
-                .parse_dml_from_returning_clause()
-                .and_then(|r| p.expect_end_of_statement().map(|_| r));
-            assert!(res.is_err(), "must reject: {bad}");
+            let res = parse(bad);
+            let err = res.expect_err(bad);
+            assert_eq!(err.wire_code(), code, "{bad}");
         }
     }
 
@@ -34049,6 +34862,125 @@ mod tests {
         }
     }
 
+    /// Issue #3255（SQL-9。親 #3254）: WHERE の行値比較 `(e1, e2, ...) <op> (f1, f2, ...)` の構文と AST。
+    /// 評価は #3256。成分 1 個の括弧は従来どおり式。
+    #[test]
+    fn row_value_comparison_parses_to_row_compare() {
+        use crate::sql::udf_call::ArrayCmpOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for (sql, want_op) in [
+            ("(a, b) = (1, 2)", ArrayCmpOp::Eq),
+            ("(a, b) <> (1, 2)", ArrayCmpOp::Ne),
+            ("(a, b) != (1, 2)", ArrayCmpOp::Ne),
+            ("(a, b) < (1, 2)", ArrayCmpOp::Lt),
+            ("(a, b) <= (1, 2)", ArrayCmpOp::Le),
+            ("(a, b) > (1, 2)", ArrayCmpOp::Gt),
+            ("(a, b) >= (1, 2)", ArrayCmpOp::Ge),
+            ("((a, b) < (1, 2))", ArrayCmpOp::Lt),
+            // 前置 NOT は演算子反転で押し下げる（`<` → `>=`）。
+            ("NOT (a, b) < (1, 2)", ArrayCmpOp::Ge),
+            ("NOT ((a, b) = (1, 2))", ArrayCmpOp::Ne),
+            ("NOT (a, b) <> (1, 2)", ArrayCmpOp::Eq),
+        ] {
+            let preds =
+                where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+            let [WherePredicate::RowCompare { lhs, op, rhs }] = preds.as_slice() else {
+                panic!("expected a row comparison for {sql}, got {preds:?}");
+            };
+            assert_eq!((lhs.len(), rhs.len(), *op), (2, 2, want_op), "{sql}");
+        }
+        // 成分は式でもよい。AND との組み合わせでは 1 葉として並ぶ。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE a = 1 AND (a + 1, lower(b), c) < (2, 'x', 3) {tail}"
+        ));
+        assert!(matches!(
+            preds.as_slice(),
+            [
+                WherePredicate::Expression(_),
+                WherePredicate::RowCompare { lhs, .. }
+            ] if lhs.len() == 3
+        ));
+        // 成分 1 個の括弧は従来どおりの式（行値にならない）。
+        let preds = where_predicates_for(&format!("SELECT * FROM documents WHERE (a) < 3 {tail}"));
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Lt,
+                ..
+            })]
+        ));
+    }
+
+    /// Issue #3255: 配列コンストラクタ内のカンマ（`ARRAY[1, 2]`）は行値の区切りではない
+    /// （括弧で囲んだ配列比較が `42601` へ後退しないこと）。
+    #[test]
+    fn row_value_detection_ignores_commas_inside_array_brackets() {
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for sql in [
+            "(ARRAY[1, 2]) = ARRAY[1, 2]",
+            "(ARRAY[1, 2]) = (ARRAY[1, 2])",
+        ] {
+            let preds =
+                where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+            assert!(
+                !preds
+                    .iter()
+                    .any(|p| matches!(p, WherePredicate::RowCompare { .. })),
+                "{sql}: {preds:?}"
+            );
+        }
+    }
+
+    /// Issue #3255: 行値比較の fail-closed な拒否（成分数不一致・未対応形は `42601`／`0A000`、
+    /// 上限超過は `54000`、CHECK 本体では認識しない）。
+    #[test]
+    fn row_value_comparison_rejects_unsupported_forms() {
+        let lookup = catalog_with(&["documents"]);
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let code = |sql: &str| {
+            validate_statement(sql, &lookup)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} must fail"))
+                .wire_code()
+        };
+        for pred in [
+            "(a, b) < (1, 2, 3)",
+            "(a, b, c) < (1, 2)",
+            "(a, b) < 3",
+            "a < (1, 2)",
+            "(a, b) < ROW(1, 2)",
+            "ROW(a, b) < (1, 2)",
+            "((a, b), c) < ((1, 2), 3)",
+            "(a, b) IN ((1, 2))",
+            "(a, b) IS NULL",
+            "(a, b) = ANY (b)",
+        ] {
+            assert_eq!(
+                code(&format!("SELECT * FROM documents WHERE {pred} {tail}")),
+                "42601",
+                "{pred}"
+            );
+        }
+        assert_eq!(
+            code(&format!(
+                "SELECT * FROM documents WHERE (a, b) = (SELECT 1, 2) {tail}"
+            )),
+            "0A000"
+        );
+        let row = |n: usize| vec!["a"; n].join(", ");
+        let at = MAX_ROW_COMPARE_COMPONENTS;
+        let ok_sql = format!(
+            "SELECT * FROM documents WHERE ({0}) = ({0}) {tail}",
+            row(at)
+        );
+        assert!(validate_statement(&ok_sql, &lookup).is_ok());
+        let over = format!(
+            "SELECT * FROM documents WHERE ({0}) = ({0}) {tail}",
+            row(at + 1)
+        );
+        assert_eq!(code(&over), "54000");
+    }
+
     /// Issue #1603（TABLE-35）: 量化比較 `ANY`／`SOME`／`ALL` と `&&` の構文。`SOME` は `ANY` に正規化し、
     /// `<>`／`!=` は `NOT =` と同じ `Or([<],[>])` へ脱糖し、サブクエリ形は `0A000`。
     #[test]
@@ -34383,19 +35315,29 @@ mod tests {
         }
     }
 
-    /// SQL-42・Issue #1521: lexer が `%`／単独 `#` を字句化しても、構文段は受理しない
-    /// （fail-closed）。変更前後で 42601 は同じ。
+    /// SQL-42・Issue #1521: 単独 `#`（ビット XOR）と、右辺の無い末尾 `%` は構文段が受理しない
+    /// （fail-closed）。`%` の二項演算は Issue #3273 で受理に変わった（別テストで固定）。
     #[test]
-    fn rejects_percent_and_hash_tokens_as_syntax_error() {
+    fn rejects_hash_token_and_dangling_percent_as_syntax_error() {
         for sql in [
-            "SELECT * FROM documents WHERE n % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
             "SELECT * FROM documents WHERE n # 1 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT n % 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT * FROM documents ORDER BY n % 2 LIMIT 5",
             "SELECT * FROM documents WHERE lang = 'ja' %",
             "SELECT * FROM documents WHERE lang = 'ja' #",
         ] {
             assert_rejected_as_syntax_error(sql);
+        }
+    }
+
+    /// SQL-42・Issue #3273: `%` は WHERE・投影・ORDER BY で `BinOp::Rem` の二項式として受理する。
+    #[test]
+    fn accepts_percent_as_remainder_operator() {
+        for sql in [
+            "SELECT * FROM documents WHERE n % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT n % 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents WHERE (n) % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        ] {
+            let lookup = catalog_with(&["documents"]);
+            validate_statement(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"));
         }
     }
 
@@ -38583,7 +39525,7 @@ mod tests {
         assert_eq!(code("SELECT string_agg(*) FROM documents"), "42601");
         assert_eq!(code("SELECT sum(a, b) FROM documents"), "42601");
         assert_eq!(code("SELECT count(a ORDER BY a) FROM documents"), "42601");
-        assert_eq!(code("SELECT sum(DISTINCT a) FROM documents"), "42601");
+        assert_eq!(code("SELECT variance(DISTINCT a) FROM documents"), "42601");
         let keys = ["a"; MAX_SCALAR_ORDER_KEYS + 1].join(", ");
         assert_eq!(
             code(&format!(
@@ -38593,6 +39535,27 @@ mod tests {
         );
         assert!(is_aggregate_function_name("String_Agg"));
     }
+    /// SQL-57・Issue #3264: `json_agg`・`jsonb_agg` は `array_agg` と同じ文法で解析され、
+    /// 関数名・既定列名・`DISTINCT`・内側 `ORDER BY` が AST に載る。
+    #[test]
+    fn json_agg_parses_like_array_agg() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT json_agg(DISTINCT a ORDER BY a DESC), JSONB_AGG(b) AS xs FROM documents",
+            &lookup,
+        );
+        let first = expect_agg_item(&agg.items()[0]);
+        assert_eq!(first.func, AggregateFunc::JsonAgg);
+        assert!(first.distinct);
+        assert_eq!(first.order_by.len(), 1);
+        assert_eq!(first.func.default_alias(), "json_agg");
+        let second = expect_agg_item(&agg.items()[1]);
+        assert_eq!(second.func, AggregateFunc::JsonbAgg);
+        assert_eq!(second.func.default_alias(), "jsonb_agg");
+        assert!(is_aggregate_function_name("Json_Agg"));
+        assert!(is_aggregate_function_name("JSONB_AGG"));
+    }
+
     /// SQL-57・Issue #1801: `array_agg` の構文。1 引数・`DISTINCT`・内側 `ORDER BY`（複数キー・
     /// 方向・NULL 位置）が AST に載り、数値リテラル・括弧式の前の `DISTINCT` も修飾子と読まれる。
     #[test]
@@ -39710,12 +40673,45 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// Issue #3263（SQL-25）: `SUM`／`AVG`／`MIN`／`MAX(DISTINCT)` を受理する。`MIN`／`MAX` は
+    /// 解析直後に非 DISTINCT 形へ畳まれる（`distinct == false`）。`(`・符号の続く形も修飾子と読む。
     #[test]
-    fn rejects_sum_distinct() {
+    fn accepts_sum_avg_min_max_distinct_modifier() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT SUM(DISTINCT id) FROM documents", &lookup)
-            .expect_err("DISTINCT is only allowed inside COUNT");
-        assert_eq!(err.wire_code(), "42601");
+        for (sql, expect_distinct) in [
+            ("SELECT SUM(DISTINCT id) FROM documents", true),
+            ("SELECT AVG(DISTINCT id) FROM documents", true),
+            ("SELECT SUM(DISTINCT (id + 1)) FROM documents", true),
+            ("SELECT SUM(DISTINCT -id) FROM documents", true),
+            ("SELECT MIN(DISTINCT id) FROM documents", false),
+            ("SELECT MAX(DISTINCT id) FROM documents", false),
+        ] {
+            let agg = expect_aggregate(sql, &lookup);
+            assert_eq!(
+                expect_agg_item(&agg.items()[0]).distinct,
+                expect_distinct,
+                "{sql}"
+            );
+        }
+        // 列名 `distinct` の互換は維持する。
+        let agg = expect_aggregate("SELECT SUM(distinct) FROM documents", &lookup);
+        assert!(!expect_agg_item(&agg.items()[0]).distinct);
+    }
+
+    /// Issue #3263: DISTINCT を受理しない集計は従来どおり `42601`（`*`・ウィンドウも同様）。
+    #[test]
+    fn rejects_distinct_in_non_supporting_aggregates() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT variance(DISTINCT id) FROM documents",
+            "SELECT stddev(DISTINCT id) FROM documents",
+            "SELECT bool_and(DISTINCT id) FROM documents",
+            "SELECT every(DISTINCT id) FROM documents",
+            "SELECT SUM(DISTINCT *) FROM documents",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// `distinct` という列名の後方互換（SQL-25 (c) 追加前の既存解釈を維持する）。
@@ -39788,6 +40784,164 @@ mod tests {
                 );
             }
             other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    /// Issue #3260: 列名 `on` は `DISTINCT` の直後でも従来どおり修飾子＋列名として解釈する
+    /// （3 番目のトークンが `(` でなければ DISTINCT ON ではない）。
+    #[test]
+    fn select_distinct_column_named_on_is_not_distinct_on() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT DISTINCT on FROM documents",
+            "SELECT DISTINCT on, lang FROM documents",
+        ] {
+            let err = validate_sql(sql, &lookup).err().map(|e| e.wire_code());
+            assert_ne!(err, Some("0A000"), "{sql}");
+            assert_ne!(err, Some("42P10"), "{sql}");
+        }
+    }
+
+    /// Issue #3260・#3261: DISTINCT ON の判定順序（構文 → 54000 → 42P01 → 未対応併用 → 42P10 →
+    /// 実行できない文脈 0A000）。セッション最上位の入口（`session_stmt`）だけが整合した文を受理し、
+    /// それ以外の入口（`validate_sql`）は整合した文も `0A000`（fail-closed）。
+    #[test]
+    fn distinct_on_classification_order() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).err().map(|e| e.wire_code());
+        let session = |sql: &str| session_stmt(sql, &lookup).err().map(|e| e.wire_code());
+        // 非セッション入口は整合した文も 0A000。
+        assert_eq!(
+            code("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang LIMIT 5"),
+            Some("0A000")
+        );
+        // セッション最上位は受理して `distinct_on = Some(前置長)` を立てる。
+        let ok = session_stmt(
+            "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang LIMIT 5",
+            &lookup,
+        )
+        .expect("accepted at session top level");
+        match ok {
+            Statement::Scan(scan) => {
+                assert_eq!(scan.distinct_on, Some(1));
+                assert!(scan.order_by.is_empty());
+                assert_eq!(scan.order_keys.len(), 1);
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+        for sql in [
+            "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY id, lang LIMIT 5",
+            "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY id",
+        ] {
+            assert_eq!(code(sql), Some("42P10"), "{sql}");
+            assert_eq!(session(sql), Some("42P10"), "{sql}");
+        }
+        assert_eq!(
+            code("SELECT DISTINCT ON (lang) lang FROM missing ORDER BY id"),
+            Some("42P01")
+        );
+        assert_eq!(
+            code("SELECT DISTINCT ON () lang FROM documents"),
+            Some("42601")
+        );
+        let many = ["lang"; MAX_SCALAR_ORDER_KEYS + 1].join(", ");
+        assert_eq!(
+            code(&format!("SELECT DISTINCT ON ({many}) lang FROM documents")),
+            Some("54000")
+        );
+        // 異なり ON キーが上限ちょうど（同一キーの重複は 1 個）なら受理され、前置長は 1。
+        let at_limit = ["lang"; MAX_SCALAR_ORDER_KEYS].join(", ");
+        let ok = session_stmt(
+            &format!("SELECT DISTINCT ON ({at_limit}) lang FROM documents"),
+            &lookup,
+        )
+        .expect("accepted");
+        assert!(matches!(ok, Statement::Scan(s) if s.distinct_on == Some(1)));
+        // 集計・GROUP BY との併用は PostgreSQL が受理する形のため 42601 ではなく 0A000。
+        assert_eq!(
+            session("SELECT DISTINCT ON (lang) lang, COUNT(*) FROM documents GROUP BY lang"),
+            Some("0A000")
+        );
+    }
+
+    /// Issue #3261: ORDER BY に無い ON キーは末尾へ ASC で暗黙に足され、前置長は異なり ON キー数。
+    #[test]
+    fn distinct_on_effective_order_appends_missing_on_keys() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = |sql: &str| match session_stmt(sql, &lookup).expect(sql) {
+            Statement::Scan(s) => s,
+            other => panic!("expected Scan, got {other:?}"),
+        };
+        let s =
+            scan("SELECT DISTINCT ON (lang, title) lang, title FROM documents ORDER BY lang DESC");
+        assert_eq!(s.distinct_on, Some(2));
+        assert_eq!(s.order_keys.len(), 2);
+        let s = scan("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang, id DESC");
+        assert_eq!(s.distinct_on, Some(1));
+        assert_eq!(s.order_keys.len(), 2);
+        // ORDER BY なしは ON キーの ASC だけ。
+        let s = scan("SELECT DISTINCT ON (lang) lang FROM documents");
+        assert_eq!(s.distinct_on, Some(1));
+        assert_eq!(s.order_keys.len(), 1);
+    }
+
+    /// Issue #3261: 実行段へ重複排除を運べない文脈は 0A000（黙って重複排除を落とさない）。
+    #[test]
+    fn distinct_on_unsupported_execution_contexts_are_0a000() {
+        let lookup = catalog_with(&["documents"]);
+        // セッション最上位の中でも、WITH TIES は 0A000。
+        assert_eq!(
+            session_stmt(
+                "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang FETCH FIRST 2 ROWS WITH TIES",
+                &lookup,
+            )
+            .err()
+            .map(|e| e.wire_code()),
+            Some("0A000")
+        );
+        // サブクエリの内側（深さ 1）・EXPLAIN・ビュー本文などの入口は常に 0A000。
+        let tokens = lexer::tokenize("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang")
+            .expect("tokenize");
+        let inner = validate_sql_tokens_with_subquery_ctx(&tokens, &lookup, 1);
+        assert_eq!(inner.err().map(|e| e.wire_code()), Some("0A000"));
+        let at_zero = validate_sql_tokens_with_subquery_ctx(&tokens, &lookup, 0);
+        assert_eq!(at_zero.err().map(|e| e.wire_code()), Some("0A000"));
+        assert_eq!(
+            session_stmt(
+                "EXPLAIN SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang",
+                &lookup,
+            )
+            .err()
+            .map(|e| e.wire_code()),
+            Some("0A000")
+        );
+    }
+
+    /// Issue #3261: 先頭一致を拒否する直前に未知列を先に判定する（PostgreSQL と同順）。
+    #[test]
+    fn distinct_on_unknown_column_is_reported_before_order_mismatch() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| session_stmt(sql, &lookup).err().map(|e| e.wire_code());
+        // `FakeCatalog` が列集合を返す場合だけ 42703（返さない lookup では 42P10 のまま）。
+        let got = code("SELECT DISTINCT ON (nope) lang FROM documents ORDER BY lang");
+        assert!(matches!(got, Some("42703" | "42P10")), "{got:?}");
+    }
+
+    /// Issue #3260: 未対応文脈（CTE 本文・JOIN・集合演算・派生表・FROM なし）の DISTINCT ON は
+    /// 通常のスキャンとして黙って実行されず、拒否のままであること（fail-closed）。
+    // tracked: #3259（これらの文脈での受理は親 Issue の範囲）
+    #[test]
+    fn distinct_on_in_unsupported_contexts_stays_rejected() {
+        let lookup = catalog_with(&["documents", "other"]);
+        for sql in [
+            "WITH c AS (SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang) SELECT * FROM c",
+            "SELECT DISTINCT ON (a.lang) a.lang FROM documents a JOIN other b ON a.id = b.id ORDER BY a.lang",
+            "SELECT DISTINCT ON (lang) lang FROM documents UNION SELECT lang FROM other",
+            "SELECT * FROM (SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang) t",
+            "SELECT DISTINCT ON (lang) 1",
+        ] {
+            assert!(validate_sql(sql, &lookup).is_err(), "{sql}");
+            assert!(session_stmt(sql, &lookup).is_err(), "{sql}");
         }
     }
 
@@ -40686,7 +41840,7 @@ mod tests {
 
     /// Issue #2047（SQL-75 (2) ポインタ）: 集合演算の `EXPLAIN` は `ExplainTarget::SetOperation`
     /// になる（先頭が括弧の形を含む）。集合演算子の無い `EXPLAIN (SELECT ...)` は従来どおり `42601`、
-    /// 未対応の枝形（`INTERSECT ALL`）は非 EXPLAIN と同じ拒否。
+    /// 未対応の枝形（`EXCEPT ALL DISTINCT`）は非 EXPLAIN と同じ拒否。
     #[test]
     fn explain_accepts_set_operation_shapes() {
         let lookup = catalog_with(&["a", "b"]);
@@ -40694,6 +41848,8 @@ mod tests {
             "EXPLAIN SELECT id FROM a UNION SELECT id FROM b",
             "EXPLAIN (SELECT id FROM a) UNION ALL SELECT id FROM b",
             "EXPLAIN SELECT id FROM a EXCEPT SELECT id FROM b LIMIT 3",
+            "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
+            "EXPLAIN SELECT id FROM a EXCEPT ALL SELECT id FROM b",
         ] {
             match validate_sql(sql, &lookup) {
                 Ok(Statement::Explain(target @ ExplainTarget::SetOperation(_))) => {
@@ -40711,14 +41867,70 @@ mod tests {
         }
         let err = validate_sql("EXPLAIN (SELECT id FROM a)", &lookup).expect_err("no operator");
         assert_eq!(err.wire_code(), "42601");
-        let plain = validate_sql("SELECT id FROM a INTERSECT ALL SELECT id FROM b", &lookup)
-            .expect_err("plain INTERSECT ALL is rejected");
-        let explained = validate_sql(
-            "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
+        let plain = validate_sql(
+            "SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
             &lookup,
         )
-        .expect_err("EXPLAIN INTERSECT ALL is rejected");
+        .expect_err("plain EXCEPT ALL DISTINCT is rejected");
+        let explained = validate_sql(
+            "EXPLAIN SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
+            &lookup,
+        )
+        .expect_err("EXPLAIN EXCEPT ALL DISTINCT is rejected");
         assert_eq!(plain.wire_code(), explained.wire_code());
+    }
+
+    /// Issue #3268: 量指定語つき集合演算の木の形と fail-closed。
+    #[test]
+    fn set_operation_quantifier_shapes() {
+        let lookup = catalog_with(&["a", "b", "c"]);
+        let op_of = |sql: &str| match validate_sql(sql, &lookup) {
+            Ok(Statement::SetOperation(v)) => match v.tree {
+                SetTree::Op { op, .. } => op,
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{sql}: {other:?}"),
+        };
+        assert_eq!(
+            op_of("SELECT id FROM a INTERSECT ALL SELECT id FROM b"),
+            SetOperator::IntersectAll
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a INTERSECT DISTINCT SELECT id FROM b"),
+            SetOperator::Intersect
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a UNION DISTINCT SELECT id FROM b"),
+            SetOperator::Union
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT ALL SELECT id FROM b"),
+            SetOperator::ExceptAll
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT DISTINCT SELECT id FROM b"),
+            SetOperator::Except
+        );
+        // INTERSECT は EXCEPT ALL より強く結合する（根が ExceptAll）。
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT ALL SELECT id FROM b INTERSECT SELECT id FROM c"),
+            SetOperator::ExceptAll
+        );
+        // INTERSECT ALL は UNION より強く結合する。
+        assert_eq!(
+            op_of("SELECT id FROM a UNION SELECT id FROM b INTERSECT ALL SELECT id FROM c"),
+            SetOperator::Union
+        );
+        for sql in [
+            "SELECT id FROM a INTERSECT ALL DISTINCT SELECT id FROM b",
+            "SELECT id FROM a INTERSECT ALL ALL SELECT id FROM b",
+            "SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
+            "SELECT id FROM a EXCEPT ALL ALL SELECT id FROM b",
+            "SELECT id FROM a EXCEPT DISTINCT ALL SELECT id FROM b",
+        ] {
+            let e = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]
@@ -42225,6 +43437,71 @@ mod tests {
         assert_eq!(v.checks.len(), 2);
     }
 
+    // ---------- 集合演算の枝の式射影・定数枝の構文段の振り分け（Issue #3270） ----------
+
+    fn set_op_of(sql: &str) -> Result<ValidatedSetOperation, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql).expect("valid tokens");
+        parse_set_operation(&tokens, &StructuralOnlyLookup)
+    }
+
+    #[test]
+    fn set_op_const_branch_is_parsed_as_const_leaf() {
+        let v = set_op_of("SELECT 7 UNION SELECT y FROM b").expect("accepted");
+        match &v.tree {
+            SetTree::Op { left, right, .. } => {
+                assert!(matches!(**left, SetTree::ConstBranch(_)));
+                assert!(matches!(**right, SetTree::Branch(_)));
+            }
+            other => panic!("unexpected tree {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_op_trailing_offset_is_not_swallowed_by_a_const_branch() {
+        let v = set_op_of("SELECT y FROM b UNION SELECT 7 OFFSET 1").expect("accepted");
+        assert_eq!(v.offset, 1);
+        let v = set_op_of("SELECT y FROM b UNION SELECT 7 LIMIT 2").expect("accepted");
+        assert_eq!(v.limit, Some(2));
+    }
+
+    #[test]
+    fn set_op_expression_items_are_accepted_but_embedded_aggregates_are_not() {
+        assert!(set_op_of("SELECT n+1 AS m FROM t UNION SELECT n FROM u").is_ok());
+        for sql in [
+            "SELECT coalesce(sum(n), 0) FROM t UNION SELECT n FROM u",
+            "SELECT 1 + max(n) FROM t UNION SELECT n FROM u",
+        ] {
+            let err = set_op_of(sql).expect_err("embedded aggregate must be rejected");
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_op_const_branch_rejects_aggregates_and_where_and_all_const_trees() {
+        for (sql, code) in [
+            ("SELECT count(*) UNION SELECT y FROM b", "42601"),
+            ("SELECT 7 WHERE true UNION SELECT y FROM b", "42601"),
+            ("SELECT 1 UNION SELECT 2", "0A000"),
+            ("SELECT 1 UNION ALL SELECT 2 UNION SELECT 3", "0A000"),
+        ] {
+            let err = set_op_of(sql).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_op_tree_with_expression_or_const_branch_is_rendered_for_explain() {
+        // Issue #3271: 式射影の枝・定数枝は EXPLAIN で描画できる（未描画形ではない）。
+        for sql in [
+            "SELECT n FROM t UNION SELECT n FROM u",
+            "SELECT n+1 FROM t UNION SELECT n FROM u",
+            "SELECT 7 UNION SELECT n FROM u",
+        ] {
+            let v = set_op_of(sql).expect("accepted");
+            assert!(!set_tree_has_unrendered_explain_shape(&v.tree), "{sql}");
+        }
+    }
+
     // ---------- 集合演算検出の誤検出防止（Issue #929 最終レビュー指摘の回帰） ----------
 
     /// `looks_like_set_operation` は `union`/`intersect`/`except` を
@@ -42361,6 +43638,40 @@ mod tests {
         ));
     }
 
+    /// Issue #3273・SQL-42: `%` は `* /` と同じ優先度・左結合で、単項マイナスより低い。
+    #[test]
+    fn projection_remainder_precedence_and_associativity() {
+        assert_eq!(first_expr("n % 2"), bin(BinOp::Rem, ident("n"), num("2")));
+        assert_eq!(
+            first_expr("n+1%2"),
+            bin(BinOp::Add, ident("n"), bin(BinOp::Rem, num("1"), num("2")))
+        );
+        assert_eq!(
+            first_expr("n*2%3"),
+            bin(BinOp::Rem, bin(BinOp::Mul, ident("n"), num("2")), num("3"))
+        );
+        assert_eq!(
+            first_expr("7%3*2"),
+            bin(BinOp::Mul, bin(BinOp::Rem, num("7"), num("3")), num("2"))
+        );
+        assert_eq!(first_expr("-7%3"), bin(BinOp::Rem, num("-7"), num("3")));
+        assert_eq!(
+            first_expr("-n%3"),
+            bin(BinOp::Rem, bin(BinOp::Sub, num("0"), ident("n")), num("3"))
+        );
+        assert_eq!(
+            first_expr("abs(n)%2"),
+            bin(
+                BinOp::Rem,
+                Expr::Call {
+                    name: "abs".to_string(),
+                    args: vec![ident("n")]
+                },
+                num("2")
+            )
+        );
+    }
+
     #[test]
     fn projection_infix_keeps_existing_projections() {
         let stmt = scan_items("n, lang").expect("accepted");
@@ -42410,7 +43721,7 @@ mod tests {
 
     #[test]
     fn projection_infix_rejections() {
-        for list in ["n % 2", "'a' + n", "n +", "(n"] {
+        for list in ["n %", "% 2", "'a' + n", "n +", "(n"] {
             let r = scan_items(list);
             assert_eq!(r.expect_err(list).wire_code(), "42601", "{list}");
         }
@@ -44611,6 +45922,81 @@ mod body_expr_policy_tests {
         assert!(stored.starts_with(crate::sql::lexer::STORED_BODY_BOOL_LITERAL_MARKER));
         let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retokenize");
         assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+    }
+
+    /// 式述語つき本文（Issue #3238 の受理形）の列改名（Issue #3239）: 全形で書き換え、
+    /// 描画 → 再パースの往復が書き換えた AST と一致する。関数名は写像されない。
+    #[test]
+    fn rename_column_in_view_body_follows_expression_predicates() {
+        for pred in [
+            "n > 3",
+            "n + 1 > 3",
+            "lower(n) = 'c'",
+            "COALESCE(n, 0) > 1",
+            "n IN (1, 2)",
+            "n BETWEEN 1 AND 5",
+            "n IS NULL",
+            "n IS NOT NULL",
+            "NOT (s = 'a' OR n > 3)",
+            "s = 'a' OR n > 3",
+            "n = 1 OR TRUE",
+        ] {
+            let sql = format!("SELECT s FROM t WHERE {pred}");
+            let tokens = crate::sql::lexer::tokenize(&sql).expect(pred);
+            let mut body = parse_view_body(&tokens).expect(pred);
+            let before = body.clone();
+            assert!(
+                !rename_column_in_view_body(&mut body.clone(), "absent", "zzz").expect(pred),
+                "{pred}"
+            );
+            assert!(
+                rename_column_in_view_body(&mut body, "n", "m").expect(pred),
+                "{pred}"
+            );
+            assert_ne!(body, before, "{pred}");
+            let stored = render_stored_simple_view_body(&body).expect(pred);
+            assert!(!stored.contains(" n "), "{pred}: {stored}");
+            let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect(pred);
+            assert_eq!(parse_view_body(&retokens).expect(pred), body, "{pred}");
+        }
+    }
+
+    /// 改名元を参照しない式述語は変更なし。関数名と同名の列を改名しても関数名は書き換わらず、
+    /// 2 列の入れ替えで連鎖置換が起きない。
+    #[test]
+    fn rename_column_in_view_body_expression_keeps_function_names_and_swaps() {
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect(sql);
+            parse_view_body(&tokens).expect(sql)
+        };
+        let mut body = parse("SELECT s FROM t WHERE lower(s) = 'c'");
+        assert!(!rename_column_in_view_body(&mut body, "n", "m").expect("noop"));
+        // 関数名 `lower` と同名の列 `lower` を改名しても呼び出し名は不変。
+        let mut body = parse("SELECT s FROM t WHERE lower(s) = 'c' OR lower > 1");
+        let before = body.clone();
+        assert!(rename_column_in_view_body(&mut body, "lower", "low").expect("rename"));
+        let stored = render_stored_simple_view_body(&body).expect("render");
+        assert!(stored.contains("lower("), "{stored}");
+        assert_ne!(body, before);
+        // 入れ替え: a→b の後に b→a を続けても、一括写像ではなく 1 回ずつなので別列へ化けない。
+        let mut body = parse("SELECT s FROM t WHERE a + b > 1");
+        assert!(rename_column_in_view_body(&mut body, "a", "b").expect("a->b"));
+        let stored = render_stored_simple_view_body(&body).expect("render");
+        let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retok");
+        assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+    }
+
+    /// 予約名（`true`）への改名で式述語の意味が化けた本文は保存されない（往復ガードで `Err`、
+    /// または引用で正しく往復する）。
+    #[test]
+    fn rename_column_in_view_body_expression_reserved_name_never_changes_meaning() {
+        let tokens = crate::sql::lexer::tokenize("SELECT s FROM t WHERE n + 1 > 3").expect("tok");
+        let mut body = parse_view_body(&tokens).expect("parse");
+        assert!(rename_column_in_view_body(&mut body, "n", "true").expect("rename"));
+        if let Ok(stored) = render_stored_simple_view_body(&body) {
+            let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retok");
+            assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+        }
     }
 
     /// `SELECT *` と述語なしの本文は改名元を参照しないため変更なし（`false`）。

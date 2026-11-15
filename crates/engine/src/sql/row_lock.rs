@@ -554,7 +554,8 @@ pub(crate) fn check_row_locking(
     match stmt {
         Statement::Select(_) => {}
         Statement::Scan(scan) => {
-            if !scan.window_items.is_empty() {
+            // `SELECT DISTINCT ON`（Issue #3261）への行ロックは、PostgreSQL と同じく併用不可（`0A000`）。
+            if !scan.window_items.is_empty() || scan.distinct_on.is_some() {
                 return Err(combo_error());
             }
         }

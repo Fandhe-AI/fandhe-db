@@ -414,8 +414,10 @@ fn pg_float_typed(expr: &Expr) -> bool {
     match expr {
         Expr::Call { name, .. } => crate::sql::udf_call::is_typed_float_name(name),
         Expr::Binary { op, lhs, rhs } => {
-            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
-                && (pg_float_typed(lhs) || pg_float_typed(rhs))
+            matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+            ) && (pg_float_typed(lhs) || pg_float_typed(rhs))
         }
         _ => false,
     }
@@ -1539,6 +1541,23 @@ mod tests {
             "22012"
         );
         assert_eq!(fold_text(&bin(BinOp::Div, num("7"), num("2"))), "3");
+    }
+
+    /// Issue #3273: 整数モードの剰余は符号が被除数に従い、`i64::MIN % -1` は 0、2^53 超でも厳密。
+    #[test]
+    fn exact_int_remainder_is_exact_and_fail_closed() {
+        assert_eq!(fold_text(&bin(BinOp::Rem, num("7"), num("2"))), "1");
+        let neg = |v: &str| bin(BinOp::Sub, num("0"), num(v));
+        assert_eq!(fold_text(&bin(BinOp::Rem, neg("7"), num("2"))), "-1");
+        assert_eq!(fold_text(&bin(BinOp::Rem, num("7"), neg("2"))), "1");
+        assert_eq!(code(&bin(BinOp::Rem, num("7"), num("0"))), "22012");
+        let min = || bin(BinOp::Sub, num("0"), num("9223372036854775808"));
+        assert_eq!(fold_text(&bin(BinOp::Rem, min(), neg("1"))), "0");
+        // 2^53 + 1 は f64 では表せないが、整数モードでは厳密に計算する。
+        assert_eq!(
+            fold_text(&bin(BinOp::Rem, num("9007199254740993"), num("10"))),
+            "3"
+        );
     }
 
     #[test]

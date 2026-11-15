@@ -453,7 +453,7 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             let has_null = array_value.has_null();
             let mark: u8 = if has_null { 0x80 } else { 0 };
             // 2 次元以上（Issue #1605）は要素型タグの前に未使用のマーカー 0x40・次元数・各次元長を
-            // 積む。1 次元の先頭バイトは要素型タグ（0..=16）または NULL 印付き（0x80 以上）で
+            // 積む。1 次元の先頭バイトは要素型タグ（0..=18）または NULL 印付き（0x80 以上）で
             // 0x40 とは衝突せず、`{{1,2},{3,4}}` と `{1,2,3,4}` が別ハッシュになる。1 次元の
             // 入力バイト列は従来と同一。
             if let crate::row_codec::ArrayValue::Multi(m) = array_value {
@@ -523,6 +523,21 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                         }
                         if let Some(item) = item {
                             b.push_u64(*item as u64);
+                        }
+                    }
+                }
+                // Issue #3235 の新規採番（既存タグのバイト列は不変）。ビット長を要素ごとに積み、
+                // `bit(4)` の `1000` と `bit(8)` の `10000000`（同じバイト列）を別ハッシュにする。
+                crate::row_codec::ArrayValue::Bit(items) => {
+                    b.push_u8(18 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(u64::from(item.bit_len()));
+                            b.push_bytes(item.as_bytes())?;
                         }
                     }
                 }
@@ -2594,6 +2609,22 @@ fn push_dml_where_predicate(
             });
             push_dml_subquery_tokens(b, inner_tokens)?;
         }
+        // 行値比較（SQL-9・Issue #3255）。述語形 DML は束縛ゲート（#3256 まで `0A000`）より先に
+        // content hash が計算されうるため、Internal にせず新タグ 19（変更禁止）で直列化する。
+        // 直列化順は「演算子の判別子（`ArrayCmpOp::hash_tag`）→ 左辺成分数（u32 LE）→ 左辺の各成分式
+        // → 右辺成分数（u32 LE）→ 右辺の各成分式」。演算子・成分順・成分数の違いは別ハッシュになる。
+        WherePredicate::RowCompare { lhs, op, rhs } => {
+            b.push_u8(19);
+            b.push_u8(op.hash_tag());
+            for side in [lhs, rhs] {
+                let count = u32::try_from(side.len()).map_err(|_| dml_hash_field_too_large())?;
+                b.push_raw(&count.to_le_bytes());
+                for expr in side {
+                    push_dml_expr(b, expr, None)?;
+                    collect_referenced_udfs(expr, udf_registry, referenced)?;
+                }
+            }
+        }
         // `IdCompare` は `sql::subquery` が解決段で生成する内部専用の葉で、構文解析
         // からは作られない（述語形 DML の content hash 対象へ到達しない防御的経路）。
         WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => {
@@ -3285,6 +3316,8 @@ fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
         BinOp::Sub => 2,
         BinOp::Mul => 3,
         BinOp::Div => 4,
+        // 追記のみのタグ。既存 1〜9 は不変（golden 互換。Issue #3273）。
+        BinOp::Rem => 10,
         BinOp::Gt => 5,
         BinOp::Lt => 6,
         BinOp::Ge => 7,
@@ -6223,15 +6256,34 @@ mod tests {
         );
     }
 
-    /// SQL-42・Issue #1521: 文字列リテラルの外の `%`／単独 `#` を含む DELETE は
+    /// SQL-42・Issue #3273: `%` の二項演算を含む DELETE は構文段を通ってハッシュ計算へ到達し、
+    /// `/` を含む同形の文とは別の operation_id になる（`Rem` はタグ 10）。
+    #[test]
+    fn percent_delete_is_accepted_and_hashed_apart_from_division() {
+        use crate::recovery::required_op_id::LedgerMode;
+        use crate::sql::allowlist::{validate_delete_statement, StructuralOnlyLookup};
+
+        let validate = |sql: &str| {
+            validate_delete_statement(
+                sql,
+                &StructuralOnlyLookup,
+                LedgerMode::CompareOnlyWithoutLedger,
+            )
+            .unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"))
+        };
+        let rem = validate("DELETE FROM t WHERE n % 2 = 0");
+        let div = validate("DELETE FROM t WHERE n / 2 = 0");
+        assert_ne!(rem, div);
+    }
+
+    /// SQL-42・Issue #1521: 文字列リテラルの外の単独 `#`・右辺の無い末尾 `%` を含む DELETE は
     /// 構文段で `42601` となり、ハッシュ計算（`for_*_where`）へ到達しない。
     #[test]
-    fn percent_and_hash_outside_literals_are_rejected_before_hashing() {
+    fn hash_and_dangling_percent_outside_literals_are_rejected_before_hashing() {
         use crate::recovery::required_op_id::LedgerMode;
         use crate::sql::allowlist::{validate_delete_statement, StructuralOnlyLookup};
 
         for sql in [
-            "DELETE FROM t WHERE n % 2 = 0",
             "DELETE FROM t WHERE n # 1 = 0",
             "DELETE FROM t WHERE id = 1 %",
         ] {
@@ -7610,6 +7662,7 @@ mod tests {
             BinOp::Sub,
             BinOp::Mul,
             BinOp::Div,
+            BinOp::Rem,
             BinOp::Gt,
             BinOp::Lt,
             BinOp::Ge,
@@ -8100,6 +8153,56 @@ mod tests {
                 b.push_u8(4);
             })
         );
+    }
+
+    /// Issue #3255（SQL-9）: 行値比較の述語形 DML の content hash。演算子・成分順・成分数・
+    /// 左右の入れ替えが別ハッシュで、同一の述語は同一ハッシュ（Internal にしない）。
+    #[test]
+    fn row_compare_where_hash_distinguishes_shape() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::{ArrayCmpOp, Expr};
+        let id = |n: &str| Expr::Ident(n.to_string());
+        let rc = |lhs: Vec<Expr>, op: ArrayCmpOp, rhs: Vec<Expr>| {
+            del_hash(&[WherePredicate::RowCompare { lhs, op, rhs }])
+        };
+        let base = rc(
+            vec![id("a"), id("b")],
+            ArrayCmpOp::Lt,
+            vec![id("c"), id("d")],
+        );
+        assert_eq!(
+            base,
+            rc(
+                vec![id("a"), id("b")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d")]
+            )
+        );
+        let variants = [
+            rc(
+                vec![id("a"), id("b")],
+                ArrayCmpOp::Le,
+                vec![id("c"), id("d")],
+            ),
+            rc(
+                vec![id("b"), id("a")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d")],
+            ),
+            rc(
+                vec![id("c"), id("d")],
+                ArrayCmpOp::Lt,
+                vec![id("a"), id("b")],
+            ),
+            rc(
+                vec![id("a"), id("b"), id("e")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d"), id("f")],
+            ),
+        ];
+        for v in &variants {
+            assert_ne!(&base, v);
+        }
     }
 
     /// 未束縛 `$n` と解決済みの内部の葉（`IdCompare`）は fail-closed。

@@ -2624,7 +2624,9 @@ fn rewrite_views_for_renamed_table_in_txn(
 /// `table` を読む、または改名元を公開する単純形ビューを読む場合は `FeatureNotSupported`
 /// （`0A000`）で拒否する（fail-closed）。再検証できない本文・公開列の導出失敗も拒否。
 /// 追随後の本文が [`MAX_VIEW_BODY_BYTES`] を超えれば `54000`。計画をすべて確定してから
-/// 書き込むため、拒否時にビュー定義は変更されない。[`Storage::alter_table_rename_column`]
+/// 書き込むため、拒否時にビュー定義は変更されない。式述語つき本文（`OR`・`IN`・`BETWEEN`・
+/// `IS NULL`・式・組み込み関数。Issue #3239）は共有の走査器で追随し、追随できない形（往復ガード
+/// 不一致・View 表の外の形）は `0A000` にそろえる。[`Storage::alter_table_rename_column`]
 /// から、スキーマ書き込みの前に同一 write txn で呼ばれる。`schema` は改名前のもの。
 fn rewrite_views_for_renamed_column_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -2712,13 +2714,15 @@ fn rewrite_views_for_renamed_column_in_txn(
         let tokens =
             crate::sql::lexer::tokenize_stored_view_body(&def.body_sql).map_err(|_| refused())?;
         let mut parsed = parse_view_body(&tokens).map_err(|_| refused())?;
+        // Issue #3239: 追随できない形（往復ガード不一致・予約名への改名で意味が化ける等）は
+        // 関数ドキュメントの契約どおり 0A000 に統一する（42601 のまま返さない）。
         let changed = crate::sql::allowlist::rename_column_in_view_body(&mut parsed, old, new)
-            .map_err(AlterCheckError::Sql)?;
+            .map_err(|_| refused())?;
         if !changed {
             continue;
         }
         let body_sql = crate::sql::allowlist::render_stored_simple_view_body(&parsed)
-            .map_err(AlterCheckError::Sql)?;
+            .map_err(|_| refused())?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(AlterCheckError::Sql(SqlSurfaceError::payload_too_large(
                 "view body exceeds the allowed size after column rename",
@@ -5656,7 +5660,7 @@ fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
     if !def.column_aliases.is_empty() || def.check_option != ViewCheckOption::None {
         if def.column_aliases.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
-                "too many view column aliases".to_string(),
+                VIEW_TOO_MANY_ALIASES_MESSAGE.to_string(),
             ));
         }
         let count = u32::try_from(def.column_aliases.len())
@@ -5847,7 +5851,7 @@ fn validate_view_body_matches_base_relation(
     let shape = view_body_shape(body_sql)?;
     if shape.relations.first().map(String::as_str) != Some(base_relation) {
         return Err(CatalogError::Invalid(
-            "view body FROM target does not match base_relation".to_string(),
+            VIEW_BASE_MISMATCH_MESSAGE.to_string(),
         ));
     }
     Ok(shape)
@@ -5870,15 +5874,10 @@ struct ViewBodyShape {
 /// [`ViewBodyShape`] を本文から導出する。字句・構造検証に失敗した本文は
 /// `CatalogError::Invalid`。
 fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
-    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| {
-        CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
-    })?;
+    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
+        .map_err(|_| CatalogError::Invalid(VIEW_BODY_LEXICAL_MESSAGE.to_string()))?;
     let kind = classify_view_body(&tokens, &StructuralOnlyLookup, ViewBodyCheck::Structural)
-        .map_err(|_| {
-            CatalogError::Invalid(
-                "view body does not match the allowed view definition shape".to_string(),
-            )
-        })?;
+        .map_err(|_| CatalogError::Invalid(VIEW_BODY_SHAPE_MESSAGE.to_string()))?;
     Ok(match kind {
         ViewBodyKind::Simple(parsed) => ViewBodyShape {
             relations: vec![parsed.table_name],
@@ -6679,7 +6678,7 @@ fn validate_new_view_body_in_txn(
         }
         if shape.join && catalog_table.get(rel.as_str())?.is_none() {
             return Err(CatalogError::Invalid(
-                "JOIN in a view body cannot reference a view".to_string(),
+                VIEW_JOIN_REFERENCES_VIEW_MESSAGE.to_string(),
             ));
         }
     }
@@ -6688,12 +6687,7 @@ fn validate_new_view_body_in_txn(
     // （または単純形ビュー経由でテーブル）直下なら `Resolved` の検証で `Invalid`
     // （`42601`）になる。作成できても参照時に必ず失敗する定義を作らない。
     if reaches_buffered || shape.deferred_expr || (shape.buffered && reaches_aliased) {
-        let invalid = || {
-            CatalogError::Invalid(
-                "a view cannot reference a view with an aggregate/LIMIT body in this position"
-                    .to_string(),
-            )
-        };
+        let invalid = || CatalogError::Invalid(VIEW_BUFFERED_POSITION_MESSAGE.to_string());
         if shape.buffered {
             let lookup = TxnViewLookup {
                 write_txn,
@@ -6708,6 +6702,11 @@ fn validate_new_view_body_in_txn(
                     SqlSurfaceError::PayloadTooLarge { detail } => {
                         CatalogError::ViewLimitExceeded(detail)
                     }
+                    // 内側が `0A000`（未対応機能）なら外側も `0A000` 系の固定文言へ写す
+                    // （内側の文言・識別子は転送しない。Issue #3240）。
+                    SqlSurfaceError::FeatureNotSupported { .. } => {
+                        CatalogError::Invalid(VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string())
+                    }
                     _ => invalid(),
                 }
             })?;
@@ -6715,8 +6714,14 @@ fn validate_new_view_body_in_txn(
             let tokens =
                 crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid())?;
             let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
-            crate::sql::allowlist::check_simple_layer_over_buffered(&parsed)
-                .map_err(|_| invalid())?;
+            crate::sql::allowlist::check_simple_layer_over_buffered(&parsed).map_err(
+                |e| match e {
+                    SqlSurfaceError::FeatureNotSupported { .. } => {
+                        CatalogError::Invalid(VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string())
+                    }
+                    _ => CatalogError::Invalid(VIEW_OVER_BUFFERED_LAYER_MESSAGE.to_string()),
+                },
+            )?;
         }
     }
     // 列別名付きビューへ到達する単純形の本文（Issue #1659）: 参照時は親の「公開名 → 物理名」
@@ -6724,11 +6729,13 @@ fn validate_new_view_body_in_txn(
     // （疑似列 `id` へ写る公開名の参照など）を含む定義は、作成できても以後の参照がすべて
     // 失敗するため、参照時と同じ検査（列スコープ・`rewrite_where`）を作成前に通す。
     if reaches_aliased && !shape.buffered {
-        let invalid = || {
-            CatalogError::Invalid(
-                "a view over a view with column aliases cannot use this predicate or column"
-                    .to_string(),
-            )
+        let invalid = || CatalogError::Invalid(VIEW_OVER_ALIASED_MESSAGE.to_string());
+        // 内側が `0A000` なら `0A000` 系の固定文言、それ以外は `42601` 系（Issue #3240）。
+        let classify = |e: SqlSurfaceError| match e {
+            SqlSurfaceError::FeatureNotSupported { .. } => {
+                CatalogError::Invalid(VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string())
+            }
+            _ => invalid(),
         };
         let lookup = TxnViewLookup {
             write_txn,
@@ -6743,7 +6750,7 @@ fn validate_new_view_body_in_txn(
             column_map: Some(map),
             base_allocated,
             ..
-        } = crate::sql::view::resolve_from(&lookup, base_relation).map_err(|_| invalid())?
+        } = crate::sql::view::resolve_from(&lookup, base_relation).map_err(classify)?
         {
             crate::sql::view::check_columns_within_view(
                 view_columns.as_deref(),
@@ -6751,12 +6758,12 @@ fn validate_new_view_body_in_txn(
                 &parsed.where_predicates,
                 &[],
             )
-            .map_err(|_| invalid())?;
+            .map_err(classify)?;
             crate::sql::view_alias::rewrite_where(
                 &crate::sql::view_alias::ColumnMap::new(&map, !base_allocated),
                 parsed.where_predicates,
             )
-            .map_err(|_| invalid())?;
+            .map_err(classify)?;
         }
     }
     // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
@@ -7219,6 +7226,11 @@ pub enum ArrayElemType {
     /// `TIME`（Issue #3232）。行内表現は 0 時起点のマイクロ秒 8 バイト LE（`Timestamp` と同形）。
     /// OID は別（`_time` = 1183）なので `Timestamp` へは丸めない。
     Time,
+    /// `BIT(n)`（Issue #3235・TABLE-14・TABLE-48）。`n` は `1..=`[`crate::bit_string::MAX_BIT_LENGTH`]。
+    /// 行内表現は要素ごとに固定幅 `ceil(n / 8)` バイト（MSB 先頭・詰め物ビットは 0。スカラー
+    /// `BitString` のバイト列と同じ）。OID は別（`_bit` = 1561）なので Text へは丸めない。
+    /// 長さなしの `BIT[]` は `BIT(1)[]`（スカラーと同じ）。`VARBIT[]`（OID 1563）は未対応。
+    Bit(u32),
     /// `TIMESTAMPTZ`（Issue #3233）。行内表現は UTC 起点のマイクロ秒 8 バイト LE（`Timestamp`・
     /// `Time` と同形）。OID は別（`_timestamptz` = 1185）なので他の要素型へは丸めない。
     TimestampTz,
@@ -7229,7 +7241,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 19] = [
+    pub const ALL_KINDS: [ArrayElemType; 20] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7251,6 +7263,7 @@ impl ArrayElemType {
         ArrayElemType::Bpchar(10),
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
+        ArrayElemType::Bit(4),
         ArrayElemType::TimestampTz,
     ];
 
@@ -7278,7 +7291,8 @@ impl ArrayElemType {
             ArrayElemType::Bpchar(_) => 15,
             ArrayElemType::SmallInt => 16,
             ArrayElemType::Time => 17,
-            ArrayElemType::TimestampTz => 18,
+            ArrayElemType::Bit(_) => 18,
+            ArrayElemType::TimestampTz => 19,
         }
     }
 
@@ -7305,6 +7319,7 @@ impl ArrayElemType {
             ArrayElemType::Varchar(None) => "varchar",
             ArrayElemType::Varchar(Some(_)) => "varchar_n",
             ArrayElemType::Bpchar(_) => "bpchar",
+            ArrayElemType::Bit(_) => "bit",
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
             ArrayElemType::TimestampTz => "timestamptz",
@@ -7389,6 +7404,7 @@ impl ArrayType {
             ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n) => {
                 validate_char_type_length(n)?
             }
+            ArrayElemType::Bit(n) => validate_bit_type_length(n)?,
             ArrayElemType::Varchar(None)
             | ArrayElemType::Text
             | ArrayElemType::Bool
@@ -7485,7 +7501,10 @@ impl ArrayType {
                 format!("numeric,{precision},{scale},{}", self.max_len)
             }
             (ArrayElemType::Enum, Some(def)) => format!("enum,{},{}", def.name, self.max_len),
-            (ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n), _) => {
+            (
+                ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n) | ArrayElemType::Bit(n),
+                _,
+            ) => {
                 format!("{},{n},{}", self.elem.catalog_tag(), self.max_len)
             }
             // `Enum` で語彙が無い組は構築経路（`new_enum` のみ）で作れないが、従来どおり
@@ -7532,7 +7551,7 @@ fn parse_array_param(
     let elem_tag = fields.first().copied().unwrap_or("");
     let expected = match elem_tag {
         "numeric" => 4,
-        "enum" | "varchar_n" | "bpchar" => 3,
+        "enum" | "varchar_n" | "bpchar" | "bit" => 3,
         _ => 2,
     };
     // 末尾の `d<N>`（2 次元以上の宣言。Issue #1605）を先に切り離す。
@@ -7574,6 +7593,10 @@ fn parse_array_param(
         ("bpchar", [_, n, _]) => {
             let n = parse_char_length_param("bpchar", n)?;
             ArrayType::new(ArrayElemType::Bpchar(n), max_len)
+        }
+        ("bit", [_, n, _]) => {
+            let n = parse_bit_length_param(n)?;
+            ArrayType::new(ArrayElemType::Bit(n), max_len)
         }
         (other, _) => ArrayType::new(ArrayElemType::from_catalog_tag(other)?, max_len),
     }?;
@@ -8220,7 +8243,8 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bpchar(_)
         | ArrayElemType::SmallInt
         | ArrayElemType::Time
-        | ArrayElemType::TimestampTz => false,
+        | ArrayElemType::TimestampTz
+        | ArrayElemType::Bit(_) => false,
     }
 }
 
@@ -8655,6 +8679,37 @@ pub(crate) enum MigratedIdRole {
     /// `id` 以外の宣言 PRIMARY KEY を持つ表。`id` は UNIQUE 相当として残る。
     Unique,
 }
+
+/// ビュー定義（`CREATE [OR REPLACE] VIEW`）の拒否原因ごとの固定文言（Issue #3240）。
+/// `sql::ddl::map_create_view_error` が文言一致で SQLSTATE を決める（`0A000` か `42601`）。
+/// 内部キー・他テナント名・内側エラーの文言を含めない（security.md P0）。
+pub(crate) const VIEW_BODY_LEXICAL_MESSAGE: &str =
+    "view body is not valid SQL for a view definition";
+/// 本文が許可された定義の形でない。
+pub(crate) const VIEW_BODY_SHAPE_MESSAGE: &str =
+    "view body does not match the allowed view definition shape";
+/// 本文の FROM 対象が `base_relation` と食い違う（公開 Rust API からのみ到達）。
+pub(crate) const VIEW_BASE_MISMATCH_MESSAGE: &str =
+    "view body FROM target does not match base_relation";
+/// JOIN の片辺がビュー。
+pub(crate) const VIEW_JOIN_REFERENCES_VIEW_MESSAGE: &str =
+    "JOIN in a view body cannot reference a view";
+/// 集計・`LIMIT` 付きビューを読めない位置から参照している（`42601`）。
+pub(crate) const VIEW_BUFFERED_POSITION_MESSAGE: &str =
+    "a view cannot reference a view with an aggregate/LIMIT body in this position";
+/// 集計・`LIMIT` 付きビューの上の単純形の段が許可外の投影・述語を使う（`42601`）。
+pub(crate) const VIEW_OVER_BUFFERED_LAYER_MESSAGE: &str =
+    "a view over a view with an aggregate/LIMIT body cannot use this projection or predicate";
+/// 列別名付きビューの上で使えない述語・列（`42601`）。
+pub(crate) const VIEW_OVER_ALIASED_MESSAGE: &str =
+    "a view over a view with column aliases cannot use this predicate or column";
+/// 本文が未対応の機能を使う（`0A000`。内側の検査が `0A000` を返した場合）。
+pub(crate) const VIEW_UNSUPPORTED_FEATURE_MESSAGE: &str =
+    "view body uses a feature that is not supported in this position";
+/// 列別名が多すぎる（公開 Rust API の多層防御）。
+pub(crate) const VIEW_TOO_MANY_ALIASES_MESSAGE: &str = "too many view column aliases";
+/// 列別名が重複している（公開 Rust API の多層防御）。
+pub(crate) const VIEW_DUPLICATE_ALIAS_MESSAGE: &str = "duplicate view column alias";
 
 /// 行識別方式が未対応の表（[`RowIdentity::Allocated`]）への操作を拒否するときの固定文言。
 /// rowid・テナント名・表名を含めない（情報漏えい防止。security.md）。
@@ -9339,6 +9394,16 @@ fn parse_char_length_param(tag: &str, param: &str) -> Result<u32> {
         )));
     }
     Ok(n)
+}
+
+/// `BIT(n)` の n 検証（Issue #3235）。0 と [`crate::bit_string::MAX_BIT_LENGTH`] 超過を拒否する。
+fn validate_bit_type_length(n: u32) -> Result<()> {
+    if n == 0 || n > crate::bit_string::MAX_BIT_LENGTH {
+        return Err(CatalogError::Invalid(
+            "bit length parameter out of range".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// `bit(n)` のカタログ param を厳密に解釈する（Issue #2021）。`1..=MAX_BIT_LENGTH` の
@@ -16298,7 +16363,7 @@ impl Storage {
         }
         if column_aliases.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
-                "too many view column aliases".to_string(),
+                VIEW_TOO_MANY_ALIASES_MESSAGE.to_string(),
             ));
         }
         let mut seen_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -16306,7 +16371,7 @@ impl Storage {
             validate_identifier(alias)?;
             if !seen_aliases.insert(alias.as_str()) {
                 return Err(CatalogError::Invalid(
-                    "duplicate view column alias".to_string(),
+                    VIEW_DUPLICATE_ALIAS_MESSAGE.to_string(),
                 ));
             }
         }
@@ -17065,7 +17130,7 @@ impl Storage {
         }
         if column_aliases.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
-                "too many view column aliases".to_string(),
+                VIEW_TOO_MANY_ALIASES_MESSAGE.to_string(),
             ));
         }
         let mut seen_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -17073,7 +17138,7 @@ impl Storage {
             validate_identifier(alias)?;
             if !seen_aliases.insert(alias.as_str()) {
                 return Err(CatalogError::Invalid(
-                    "duplicate view column alias".to_string(),
+                    VIEW_DUPLICATE_ALIAS_MESSAGE.to_string(),
                 ));
             }
         }
@@ -21177,6 +21242,57 @@ mod tests {
         assert_eq!(ts.catalog_fields(), ("array", "timestamp,4".to_string()));
     }
 
+    /// Issue #3235: `BIT(n)` 要素の param は `bit,<n>,<max_len>`（2 次元は末尾 `d2`）で往復し、
+    /// 非正準の長さ・範囲外・フィールドの過不足・2 フィールドの `bit,<n>` は拒否する。
+    #[test]
+    fn array_bit_param_roundtrips_and_rejects_malformed() {
+        let one = ColumnType::Array(ArrayType::new(ArrayElemType::Bit(4), 8).expect("array ty"));
+        assert_eq!(one.catalog_fields(), ("array", "bit,4,8".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "bit,4,8", &mut array_resolver)
+                .expect("decode"),
+            one
+        );
+        let two = ColumnType::Array(
+            ArrayType::new(ArrayElemType::Bit(4), 8)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(two.catalog_fields(), ("array", "bit,4,8,d2".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "bit,4,8,d2", &mut array_resolver)
+                .expect("decode 2d"),
+            two
+        );
+        let max = crate::bit_string::MAX_BIT_LENGTH;
+        let beyond = max + 1;
+        let max_ok = format!("bit,{max},8");
+        assert!(ColumnType::from_catalog_fields("array", &max_ok, &mut array_resolver).is_ok());
+        let too_long = format!("bit,{beyond},8");
+        for bad in [
+            "bit,04,8",  // 先頭ゼロ
+            "bit,0,8",   // 範囲外
+            "bit,4",     // max_len 欠落
+            "bit,8",     // 2 フィールド（スカラー bit の param 形）
+            "bit,4,8,1", // 余剰（`d<N>` でない）
+            "bit,4,08",  // max_len 非正準
+            "bit,-,8",   // 符号・非数字
+            "bit",       // 長さ・max_len 欠落
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    ColumnType::from_catalog_fields("array", bad, &mut array_resolver),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "param {bad:?} must be rejected"
+            );
+        }
+        assert_eq!(array_param_enum_name("bit,4,8").ok(), Some(None));
+        assert!(ArrayType::new(ArrayElemType::Bit(0), 8).is_err());
+        assert!(ArrayType::new(ArrayElemType::Bit(beyond), 8).is_err());
+    }
+
     /// Issue #3233: `TIMESTAMPTZ[]` の param は `timestamptz,<max_len>`（2 次元は末尾 `d2`）で
     /// 往復し、既存の `timestamp` の param を変えない。
     #[test]
@@ -23777,6 +23893,49 @@ mod tests {
         assert_eq!(gen_before, storage.table_generation("docs").expect("gen"));
         assert!(storage.get_table_schema("docs").is_ok());
         assert!(storage.get_table_schema("orphan").is_err());
+    }
+
+    /// 式述語つきの単純形ビュー本文（`OR`・`IN`・`BETWEEN`・`IS NULL`・式・関数）も列改名に追随し、
+    /// 関数名・リテラルは書き換わらず、再オープン後も本文が参照できる（TABLE-38 のポインタ、
+    /// Issue #3239）。
+    #[test]
+    fn alter_table_rename_column_rewrites_expression_predicate_view_bodies() {
+        let path = unique_db_path("rename-column-view-expr");
+        let _guard = CleanupGuard(path.clone());
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&TableSchema::new(
+                    "docs",
+                    vec![
+                        ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                        ColumnDef::new("kind", ColumnType::Text, true),
+                        ColumnDef::new("qty", ColumnType::Integer, true),
+                    ],
+                ))
+                .expect("docs");
+            storage
+                .create_view(
+                    "v_expr",
+                    "docs",
+                    "SELECT kind FROM docs WHERE lower(kind) = 'kind' OR qty + 1 > 3 \
+                     OR qty IN (1, 2) OR qty BETWEEN 5 AND 9 OR kind IS NULL",
+                )
+                .expect("v_expr");
+            storage
+                .alter_table_rename_column("docs", "kind", "lang")
+                .expect("rename follows expression view");
+        }
+        let storage = Storage::open(&path).expect("reopen");
+        let body = storage
+            .view_definition("v_expr")
+            .expect("get")
+            .expect("some")
+            .body_sql;
+        assert!(body.contains("lower(lang) = 'kind'"), "{body}");
+        assert!(body.contains("lang IS NULL"), "{body}");
+        assert!(body.starts_with("SELECT lang FROM docs"), "{body}");
+        assert!(!body.contains("lower(kind)"), "{body}");
     }
 
     /// 単純形ビューの保存本文が AST 経由で書き換わり、reopen 後も保持される。改名元を

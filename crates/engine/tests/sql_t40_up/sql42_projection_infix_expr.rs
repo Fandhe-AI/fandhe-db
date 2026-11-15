@@ -174,12 +174,10 @@ fn rejects_runtime_and_type_errors() {
 fn unsupported_forms_stay_rejected() {
     let (core, ctx, _g) = setup();
     for sql in [
-        "SELECT n % 2 FROM t LIMIT 10",
         "SELECT 'a' + n FROM t LIMIT 10",
         "SELECT n + FROM t LIMIT 10",
         "SELECT * FROM t WHERE n = -n LIMIT 10",
         "CREATE VIEW v AS SELECT n+1 FROM t",
-        "SELECT n+1 FROM t UNION SELECT n FROM t",
         "SELECT n+1 FROM t GROUP BY n",
         "SELECT n + sum(n) FROM t",
     ] {

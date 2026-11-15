@@ -88,7 +88,9 @@ impl EngineCore {
         structured: bool,
     ) -> Result<SqlOutcome, SqlSurfaceError> {
         let node = match target {
-            ExplainInsertTarget::Values(stmt) => self.insert_values_explain_node(stmt)?,
+            ExplainInsertTarget::Values(stmt) => {
+                self.insert_values_explain_node(stmt, session.udfs())?
+            }
             ExplainInsertTarget::Select { insert, inner } => {
                 self.insert_select_explain_node(ctx, session, insert, inner, structured)?
             }
@@ -102,6 +104,7 @@ impl EngineCore {
     fn insert_values_explain_node(
         &self,
         stmt: &crate::sql::allowlist::ValidatedInsert,
+        udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<ExplainNode, SqlSurfaceError> {
         self.check_insert_row_count_limit(stmt.rows.len())?;
         let schema = self
@@ -115,7 +118,7 @@ impl EngineCore {
                 },
             })?;
         if stmt.returning.is_some() {
-            crate::sql::parser::bind_returning(stmt.returning.as_ref(), &schema)?
+            crate::sql::parser::bind_returning_with_udfs(stmt.returning.as_ref(), &schema, udfs)?
                 .ok_or_else(internal)?;
         }
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;

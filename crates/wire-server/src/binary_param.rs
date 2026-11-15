@@ -118,6 +118,7 @@ pub(crate) fn binary_param_for_wire_type(t: crate::result_encoder::WireType) -> 
         | WireType::JsonbArray
         | WireType::VarcharArray
         | WireType::BpcharArray
+        | WireType::BitArray
         | WireType::Record
         | WireType::RecordArray => BinaryParam::Unsupported,
     }

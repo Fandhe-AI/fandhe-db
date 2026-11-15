@@ -41,6 +41,9 @@ pub(crate) enum Key<'a> {
     /// jsonb の値等価の正規化テキスト（[`json_key`]。`1` と `1.0` は同じキー）。全順序は等値と
     /// 整合するバイト列順だけ（意味順は持たない）で、順序比較の演算子は束縛段が拒否する。
     Json(Cow<'a, str>),
+    /// `BIT(n)` 要素（ビット長と正準ペイロード。Issue #3235）。順序はビット長 → バイト列だが、
+    /// 順序比較・包含の演算子は束縛段が拒否し、等値だけが使う。
+    Bit(u32, &'a [u8]),
 }
 
 impl Key<'_> {
@@ -53,6 +56,7 @@ impl Key<'_> {
             Key::Bytes(_) => 3,
             Key::Uuid(_) => 4,
             Key::Json(_) => 5,
+            Key::Bit(..) => 6,
         }
     }
 }
@@ -108,6 +112,7 @@ pub(crate) fn key_cmp(a: &Key<'_>, b: &Key<'_>) -> Ordering {
         (Key::Bytes(x), Key::Bytes(y)) => x.cmp(y),
         (Key::Uuid(x), Key::Uuid(y)) => x.cmp(y),
         (Key::Json(x), Key::Json(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Key::Bit(lx, x), Key::Bit(ly, y)) => lx.cmp(ly).then_with(|| x.cmp(y)),
         _ => a.rank().cmp(&b.rank()),
     }
 }
@@ -168,6 +173,7 @@ pub(crate) fn array_keys(a: &ArrayValue) -> Result<Vec<Option<Key<'_>>>, SqlSurf
             }
             out
         }
+        ArrayValue::Bit(v) => map(v, |b| Key::Bit(b.bit_len(), b.as_bytes())),
         ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Enum(_) => {
             return Err(internal("array element type has no comparator"))
         }
@@ -246,7 +252,11 @@ pub(crate) fn array_overlaps(a: &[Option<Key<'_>>], b: &[Option<Key<'_>>]) -> bo
 #[deny(clippy::wildcard_enum_match_arm)]
 fn comparable_elem(elem: ArrayElemType) -> bool {
     match elem {
-        ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum => false,
+        // `BIT(n)` もスカラー BIT と同じく比較が未解禁（cast-only。Issue #3235）。
+        ArrayElemType::Numeric { .. }
+        | ArrayElemType::Json
+        | ArrayElemType::Enum
+        | ArrayElemType::Bit(_) => false,
         ArrayElemType::Text
         | ArrayElemType::Varchar(_)
         | ArrayElemType::Bpchar(_)
@@ -288,7 +298,8 @@ fn is_float_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bytea
         | ArrayElemType::Json
         | ArrayElemType::Jsonb
-        | ArrayElemType::Enum => false,
+        | ArrayElemType::Enum
+        | ArrayElemType::Bit(_) => false,
     }
 }
 
@@ -314,7 +325,10 @@ fn lhs_kinds_for(elem: ArrayElemType) -> &'static [CastKind] {
         ArrayElemType::Uuid => &[K::Uuid],
         ArrayElemType::Bytea => &[K::Bytea],
         ArrayElemType::Jsonb => &[K::Jsonb],
-        ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum => &[],
+        ArrayElemType::Numeric { .. }
+        | ArrayElemType::Json
+        | ArrayElemType::Enum
+        | ArrayElemType::Bit(_) => &[],
     }
 }
 
@@ -324,17 +338,21 @@ fn bind_array_operand(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ArrayElemType), SqlSurfaceError> {
-    let (bound, orig) = bind_array_operand_orig(expr, env, node_budget)?;
+    let (bound, orig) = bind_array_operand_orig(expr, env, node_budget, false)?;
     let (bound, elem) = normalize_compare_operand(bound, orig);
     Ok((bound, elem))
 }
 
 /// 要素型を正規化する前（`CHAR(n)`・`VARCHAR(n)` のまま）の配列オペランドの束縛。
 /// 型なしリテラルを反対側の元の要素型で解釈するために、正規化と分けて呼ぶ（Issue #3231）。
+///
+/// `allow_bit` が真のときだけ `BIT(n)[]` を受理し、`n` つきの要素型を返す（Issue #3235。
+/// 等値比較の組 [`bind_array_pair`] 専用。量化比較などは偽のまま `0A000`）。
 fn bind_array_operand_orig(
     expr: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
+    allow_bit: bool,
 ) -> Result<(BoundExpr, ArrayElemType), SqlSurfaceError> {
     let (bound, ty) = bind_operand(expr, env, node_budget)?;
     if ty != ExprType::Array {
@@ -342,6 +360,7 @@ fn bind_array_operand_orig(
     }
     let elem = match source_cast_kind(expr, &bound, ty, env.schema()) {
         SourceKind::Array(Some(t)) => CastType::Array(Box::new(t)).array_elem_type(),
+        SourceKind::Bit if allow_bit => crate::sql::cast::bit_array_elem(&bound, env.schema()),
         _ => None,
     };
     let Some(elem) = elem else {
@@ -349,7 +368,7 @@ fn bind_array_operand_orig(
             "array predicates on an array of this element type are not supported yet",
         ));
     };
-    if !comparable_elem(elem) {
+    if !comparable_elem(elem) && !(allow_bit && matches!(elem, ArrayElemType::Bit(_))) {
         return Err(unsupported(
             "array predicates on numeric, json or enum elements are not supported yet",
         ));
@@ -414,28 +433,42 @@ fn bind_array_pair(
             .map(|t| CastType::Array(Box::new(t)))
             .ok_or_else(|| unsupported("array predicates on this element type are not supported"))
     };
+    // 型なしリテラルを反対側の要素型の配列として束縛する。`BIT(n)` 要素は CAST の型を持たないため
+    // 専用の束縛（`n` つきの入力関数）へ振る（Issue #3235）。
+    let bind_literal = |lit: &Expr,
+                        elem: ArrayElemType,
+                        env: &mut BindEnv<'_>,
+                        node_budget: &mut usize|
+     -> Result<BoundExpr, SqlSurfaceError> {
+        if let ArrayElemType::Bit(_) = elem {
+            return crate::sql::cast::bind_bit_array_literal(lit, elem, node_budget);
+        }
+        Ok(bind_cast(lit, &literal_as(elem)?, env, node_budget)?.0)
+    };
     match (l_arr, r_arr) {
         (true, true) => {
-            let (l, le) = bind_array_operand(lhs, env, node_budget)?;
-            let (r, re) = bind_array_operand(rhs, env, node_budget)?;
+            let (l, lo) = bind_array_operand_orig(lhs, env, node_budget, true)?;
+            let (r, ro) = bind_array_operand_orig(rhs, env, node_budget, true)?;
+            let (l, le) = normalize_compare_operand(l, lo);
+            let (r, re) = normalize_compare_operand(r, ro);
             if le != re {
                 return Err(operator_missing(op_sql));
             }
             Ok((l, r, le))
         }
         (true, false) if is_untyped_literal(rhs) => {
-            let (l, lo) = bind_array_operand_orig(lhs, env, node_budget)?;
+            let (l, lo) = bind_array_operand_orig(lhs, env, node_budget, true)?;
             let (l, le) = normalize_compare_operand(l, lo);
-            let (r, _) = bind_cast(rhs, &literal_as(le)?, env, node_budget)?;
+            let r = bind_literal(rhs, le, env, node_budget)?;
             // `CHAR(n)` 側の末尾空白を無視する比較に合わせ、リテラル側も同じ rtrim を通す
             // （`CHAR(n)` へは変換せず、PG と同じく切り詰め・空白詰めは行わない）。
             let r = rtrim_literal_like(r, lo);
             Ok((l, r, le))
         }
         (false, true) if is_untyped_literal(lhs) => {
-            let (r, ro) = bind_array_operand_orig(rhs, env, node_budget)?;
+            let (r, ro) = bind_array_operand_orig(rhs, env, node_budget, true)?;
             let (r, re) = normalize_compare_operand(r, ro);
-            let (l, _) = bind_cast(lhs, &literal_as(re)?, env, node_budget)?;
+            let l = bind_literal(lhs, re, env, node_budget)?;
             let l = rtrim_literal_like(l, ro);
             Ok((l, r, re))
         }
@@ -462,6 +495,7 @@ pub(super) fn bind_array_comparison(
     };
     let (l, r, elem) = bind_array_pair(sql, lhs, rhs, env, node_budget)?;
     reject_json_ordering(cmp, elem)?;
+    reject_bit_ordering(cmp, elem)?;
     Ok((
         BoundExpr::ArrayCompare {
             op: cmp,
@@ -478,6 +512,16 @@ fn reject_json_ordering(op: ArrayCmpOp, elem: ArrayElemType) -> Result<(), SqlSu
     if elem == ArrayElemType::Jsonb && !matches!(op, ArrayCmpOp::Eq | ArrayCmpOp::Ne) {
         return Err(unsupported(
             "ordering comparison of jsonb array elements is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// `BIT(n)` 要素は等値だけを持つ（順序は未解禁。Issue #3235）。順序比較は `0A000`。
+fn reject_bit_ordering(op: ArrayCmpOp, elem: ArrayElemType) -> Result<(), SqlSurfaceError> {
+    if matches!(elem, ArrayElemType::Bit(_)) && !matches!(op, ArrayCmpOp::Eq | ArrayCmpOp::Ne) {
+        return Err(unsupported(
+            "ordering comparison of bit array elements is not supported yet",
         ));
     }
     Ok(())
@@ -502,6 +546,11 @@ pub(super) fn bind_array_containment(
         }
     };
     let (l, r, elem) = bind_array_pair(op.as_sql(), lhs, rhs, env, node_budget)?;
+    if matches!(elem, ArrayElemType::Bit(_)) {
+        return Err(unsupported(
+            "containment on bit array elements is not supported yet",
+        ));
+    }
     Ok((
         BoundExpr::ArrayContainment {
             op: cop,
@@ -648,7 +697,7 @@ fn bind_quantified_like(
         ));
     }
     let array = if r_arr {
-        let (array, elem) = bind_array_operand_orig(rhs, env, node_budget)?;
+        let (array, elem) = bind_array_operand_orig(rhs, env, node_budget, false)?;
         match elem {
             ArrayElemType::Text | ArrayElemType::Varchar(_) => {}
             ArrayElemType::Bpchar(_) => {
@@ -671,7 +720,8 @@ fn bind_quantified_like(
             | ArrayElemType::Bytea
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
-            | ArrayElemType::Enum => {
+            | ArrayElemType::Enum
+            | ArrayElemType::Bit(_) => {
                 return Err(SqlSurfaceError::undefined_function(
                     "operator does not exist: LIKE/ILIKE on a non-text array element",
                 ))
@@ -1123,12 +1173,12 @@ mod tests {
                 E::Uuid => &[K::Uuid],
                 E::Bytea => &[K::Bytea],
                 E::Jsonb => &[K::Jsonb],
-                E::Numeric { .. } | E::Json | E::Enum => &[],
+                E::Numeric { .. } | E::Json | E::Enum | E::Bit(_) => &[],
             };
             assert_eq!(kinds, expected, "{elem:?}");
             assert_eq!(
                 comparable_elem(elem),
-                !matches!(elem, E::Numeric { .. } | E::Json | E::Enum),
+                !matches!(elem, E::Numeric { .. } | E::Json | E::Enum | E::Bit(_)),
                 "{elem:?}"
             );
             assert_eq!(is_float_elem(elem), matches!(elem, E::Real | E::Double));

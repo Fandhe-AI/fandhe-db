@@ -618,6 +618,10 @@ wire_type_enum! {
         VarcharArray,
         /// `ColumnMeta::Scalar{ty: Array(<char(n)>)}`（`_bpchar`。同上）。テキスト表現のみ対応。
         BpcharArray,
+        /// `ColumnMeta::Scalar{ty: Array(<bit(n)>)}`（`_bit`=1561。TABLE-14・TABLE-35・TABLE-48・Issue #3235）。
+        /// 要素の長さ `n` は typmod（`n`。VARHDRSZ を足さない。スカラー BIT と同じ）で公告する。
+        /// テキスト表現のみ対応。
+        BitArray,
         /// `ColumnMeta::Record{array: false}`（`record`。再帰 CTE の `SEARCH BREADTH FIRST` 順序列。
         /// SQL-35・Issue #2213）。テキスト表現のみ対応（`record_out` 形式）。
         Record,
@@ -671,6 +675,7 @@ impl WireType {
             WireType::JsonbArray => 3807,
             WireType::VarcharArray => 1015,
             WireType::BpcharArray => 1014,
+            WireType::BitArray => 1561,
             WireType::Record => 2249,
             WireType::RecordArray => 2287,
         }
@@ -705,6 +710,7 @@ impl WireType {
             | WireType::JsonbArray
             | WireType::VarcharArray
             | WireType::BpcharArray
+            | WireType::BitArray
             | WireType::Record
             | WireType::RecordArray => -1,
             WireType::Int2 => 2,
@@ -761,6 +767,7 @@ impl WireType {
             WireType::JsonbArray => "_jsonb",
             WireType::VarcharArray => "_varchar",
             WireType::BpcharArray => "_bpchar",
+            WireType::BitArray => "_bit",
             WireType::Record => "record",
             WireType::RecordArray => "_record",
         }
@@ -823,6 +830,7 @@ impl WireType {
             | WireType::JsonbArray
             | WireType::VarcharArray
             | WireType::BpcharArray
+            | WireType::BitArray
             | WireType::Record
             | WireType::RecordArray => None,
         }
@@ -886,6 +894,7 @@ impl WireType {
             | WireType::JsonbArray
             | WireType::VarcharArray
             | WireType::BpcharArray
+            | WireType::BitArray
             // レコード・レコード配列のバイナリ形式（`record_send`）は対象外（SQL-35・Issue #2213）。
             | WireType::Record
             | WireType::RecordArray => false,
@@ -995,6 +1004,8 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
                     .ok()
                     .and_then(|n| n.checked_add(VARHDRSZ))
                     .ok_or(EncodeError),
+                // `BIT(n)[]` の typmod は `n` そのもの（VARHDRSZ を加えない。Issue #3235）。
+                E::Bit(n) => i32::try_from(n).map_err(|_| EncodeError),
                 E::Varchar(None)
                 | E::Text
                 | E::Bool
@@ -1156,6 +1167,7 @@ fn array_wire_type(elem: engine::catalog::ArrayElemType) -> WireType {
         E::Jsonb => WireType::JsonbArray,
         E::Varchar(_) => WireType::VarcharArray,
         E::Bpchar(_) => WireType::BpcharArray,
+        E::Bit(_) => WireType::BitArray,
         E::Enum => WireType::Text,
     }
 }
@@ -2308,6 +2320,15 @@ mod tests {
             text_of(ArrayValue::Time(vec![Some(0), None, Some(86_400_000_000)])),
             "{00:00:00,NULL,24:00:00}"
         );
+        let bit = |s: &str| engine::bit_string::BitString::parse_text(s, 4).expect("bit");
+        assert_eq!(
+            text_of(ArrayValue::Bit(vec![
+                Some(bit("1010")),
+                None,
+                Some(bit("0101"))
+            ])),
+            "{1010,NULL,0101}"
+        );
         // TIMESTAMPTZ 要素は UTC の offset 付き（空白を含むため引用。Issue #3233）。
         assert_eq!(
             text_of(ArrayValue::TimestampTz(vec![Some(0), None])),
@@ -2969,7 +2990,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 40);
+        assert_eq!(WireType::ALL.len(), 41);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2995,7 +3016,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 40] = [
+        let expected: [(WireType, i32, i16, &str); 41] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -3034,6 +3055,7 @@ mod tests {
             (WireType::JsonbArray, 3807, -1, "_jsonb"),
             (WireType::VarcharArray, 1015, -1, "_varchar"),
             (WireType::BpcharArray, 1014, -1, "_bpchar"),
+            (WireType::BitArray, 1561, -1, "_bit"),
             (WireType::Record, 2249, -1, "record"),
             (WireType::RecordArray, 2287, -1, "_record"),
         ];
@@ -3077,6 +3099,16 @@ mod tests {
             };
             assert_eq!(column_wire_type(&computed).oid(), oid);
         }
+        // Issue #3235: `BIT(n)[]` は `_bit`（1561）で、typmod は `n`（VARHDRSZ を足さない）。
+        let bit_ty = ColumnType::Array(ArrayType::new(E::Bit(4), 4).expect("array type"));
+        let bit_col = ColumnMeta::Scalar {
+            name: "b".to_string(),
+            ty: bit_ty,
+        };
+        assert_eq!(column_wire_type(&bit_col).oid(), 1561);
+        assert_eq!(column_wire_type(&bit_col).typlen(), -1);
+        assert_eq!(column_type_modifier(&bit_col).ok(), Some(4));
+        assert!(!column_binary_support(&bit_col));
     }
 
     /// Issue #3229: 全配列要素型（`ArrayElemType::ALL_KINDS`）と配列 OID・型名の対応を固定する。
@@ -3106,6 +3138,7 @@ mod tests {
                 E::Jsonb => (3807, "_jsonb"),
                 E::Varchar(_) => (1015, "_varchar"),
                 E::Bpchar(_) => (1014, "_bpchar"),
+                E::Bit(_) => (1561, "_bit"),
                 // ENUM[] は語彙を公告できないため text として公告する。
                 E::Enum => (25, "text"),
             };

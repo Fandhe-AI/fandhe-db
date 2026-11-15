@@ -127,7 +127,8 @@ impl EngineCore {
                     },
                 })?;
         // RETURNING は評価より前に束縛する（未知の列は SELECT を走らせる前に `42703`）。
-        let returning = crate::sql::parser::bind_returning(req.returning, &schema)?;
+        let returning =
+            crate::sql::parser::bind_returning_with_udfs(req.returning, &schema, session.udfs())?;
         let targets = resolve_target_columns(&schema, req.columns)?;
 
         // `ON CONFLICT` の静的束縛（対象解決・SET 右辺）は台帳照合・内側 SELECT の評価より前に行う

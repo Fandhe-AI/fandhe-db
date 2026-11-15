@@ -20,6 +20,10 @@
 //! - 可変長要素の本文の累計 [`MAX_ARRAY_AGG_PAYLOAD_BYTES`]
 //! - 溜めた状態の大きさ [`MAX_ARRAY_AGG_STATE_BYTES`]（1 件あたりの固定見積りを含む）
 //!
+//! `json_agg`・`jsonb_agg`（Issue #3264）も同じ状態を使い、確定時だけ [`crate::sql::json_agg`] が
+//! JSON テキストへ書く。要素数の上限は JSON 列の要素数上限（`MAX_JSON_CONTAINER_ITEMS`）になる
+//! （配列の 1,024 件では実用上狭いため）。それ以外の上限・`54000` の契約は共通。
+//!
 //! 上限判定はテナントの可視行だけで決まり、他テナントの行の有無に依存しない。
 
 use std::cmp::Ordering;
@@ -36,7 +40,9 @@ use crate::sql::order_value::{
     compare_order_key, expr_value_to_order_value, extract_column_order_value_ref,
     scalar_key_ref_to_owned, NullPlacement, OrderValue,
 };
-use crate::sql::parser::{ArrayAggInput, ArrayAggValue, StringAggKeySource, StringAggOrderKey};
+use crate::sql::parser::{
+    ArrayAggInput, ArrayAggOutput, ArrayAggValue, StringAggKeySource, StringAggOrderKey,
+};
 use crate::sql::udf_call::{self, ExprValue};
 use crate::uuid::Uuid;
 
@@ -64,6 +70,14 @@ const TOO_MANY_ELEMENTS_DETAIL: &str = "array_agg result exceeds the allowed ele
 const PAYLOAD_TOO_LARGE_DETAIL: &str = "array_agg result exceeds the allowed size";
 /// 溜めた状態の超過。
 const STATE_TOO_LARGE_DETAIL: &str = "array_agg accumulated state exceeds the allowed size";
+
+/// [`ArrayAggState::finish`] の確定結果（`array_agg` は配列、`json_agg`・`jsonb_agg` は JSON テキスト）。
+#[derive(Debug, PartialEq)]
+pub(crate) enum ArrayAggFinished {
+    Array(ArrayValue),
+    /// `json` 型の配列テキスト。
+    Json(String),
+}
 
 /// 所有された要素値 1 個（[`ArrayValue`] の要素型 variant と 1 対 1）。
 #[derive(Clone)]
@@ -154,6 +168,10 @@ struct Entry {
 #[derive(Clone)]
 pub(crate) struct ArrayAggState {
     elem_ty: ArrayElemType,
+    /// 確定時の出力形（Issue #3264）。
+    output: ArrayAggOutput,
+    /// 溜めてよい要素数の上限（出力形で決まる）。
+    max_elements: usize,
     /// `ORDER BY`・`DISTINCT` のいずれかでキーを評価して並べ替えるか（`false` は入力順）。
     collect: bool,
     distinct: bool,
@@ -173,6 +191,13 @@ impl ArrayAggState {
     pub(crate) fn new(input: &ArrayAggInput) -> Self {
         Self {
             elem_ty: input.elem,
+            output: input.output,
+            max_elements: match input.output {
+                ArrayAggOutput::Array => MAX_ARRAY_AGG_ELEMENTS,
+                ArrayAggOutput::Json | ArrayAggOutput::Jsonb => {
+                    crate::json::MAX_JSON_CONTAINER_ITEMS
+                }
+            },
             collect: !input.keys.is_empty(),
             distinct: input.distinct,
             specs: input
@@ -258,7 +283,7 @@ impl ArrayAggState {
         } else {
             None
         };
-        if self.entries.len() >= MAX_ARRAY_AGG_ELEMENTS {
+        if self.entries.len() >= self.max_elements {
             return Err(SqlSurfaceError::payload_too_large(TOO_MANY_ELEMENTS_DETAIL));
         }
         let next_payload = self
@@ -302,7 +327,7 @@ impl ArrayAggState {
 
     /// 確定する。空集合は `None`（呼び出し元が `Cell::Null` にする）。キーがあれば安定ソートして
     /// から要素型の配列へ詰める。
-    pub(crate) fn finish(mut self) -> Result<Option<ArrayValue>, SqlSurfaceError> {
+    pub(crate) fn finish(mut self) -> Result<Option<ArrayAggFinished>, SqlSurfaceError> {
         if self.entries.is_empty() {
             return Ok(None);
         }
@@ -325,7 +350,12 @@ impl ArrayAggState {
             });
         }
         let elems: Vec<Option<Elem>> = self.entries.into_iter().map(|e| e.elem).collect();
-        build_array(self.elem_ty, elems).map(Some)
+        let array = build_array(self.elem_ty, elems)?;
+        match self.output {
+            ArrayAggOutput::Array => Ok(Some(ArrayAggFinished::Array(array))),
+            output => crate::sql::json_agg::render(&array, output)
+                .map(|text| Some(ArrayAggFinished::Json(text))),
+        }
     }
 }
 
@@ -425,6 +455,12 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
         ArrayElemType::Enum => {
             return Err(accumulator_bug(
                 "array_agg over ENUM elements reached finish",
+            ))
+        }
+        // `BIT(n)` もスカラー BIT と同じく array_agg 非対応（Issue #3235）。束縛段が拒否する。
+        ArrayElemType::Bit(_) => {
+            return Err(accumulator_bug(
+                "array_agg over BIT elements reached finish",
             ))
         }
     })
@@ -528,6 +564,7 @@ fn elem_from_scalar(
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Bit(_)
             | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
             _,
@@ -595,6 +632,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Bit(_)
             | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
             _,
@@ -676,6 +714,8 @@ mod tests {
     fn state(elem_ty: ArrayElemType, distinct: bool) -> ArrayAggState {
         ArrayAggState {
             elem_ty,
+            output: ArrayAggOutput::Array,
+            max_elements: MAX_ARRAY_AGG_ELEMENTS,
             collect: false,
             distinct,
             specs: Vec::new(),
@@ -809,7 +849,9 @@ mod tests {
         st.push_entry(None, Vec::new()).expect("push");
         assert_eq!(
             st.finish().expect("finish"),
-            Some(ArrayValue::Integer(vec![None, None]))
+            Some(ArrayAggFinished::Array(ArrayValue::Integer(vec![
+                None, None
+            ])))
         );
     }
 }

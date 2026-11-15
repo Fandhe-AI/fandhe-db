@@ -415,42 +415,195 @@ fn vector_column_with_union_all_is_accepted() {
 // ---------- 構文拒否（42601） ----------
 
 #[test]
-fn intersect_all_is_rejected() {
+fn intersect_all_keeps_min_multiplicity() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
+    let tenant_ctx = ctx("tenant-a");
+    // docs: ja,en,ja / other_docs: en,fr + ja x3 => ja は min(2,3)=2、en は min(1,1)=1。
+    for id in 20..23 {
+        insert_row(&storage, OTHER, &tenant_ctx, id, "ja", Visibility::Public);
+    }
     let core = new_core(storage);
-    let err = run_err(
+    let result = run(
         &core,
         "tenant-a",
         "SELECT lang FROM docs INTERSECT ALL SELECT lang FROM other_docs",
     );
-    assert_eq!(err.wire_code(), "42601");
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(got, vec!["en", "ja", "ja"]);
 }
 
 #[test]
-fn union_distinct_is_rejected() {
+fn intersect_all_multiplicity_ignores_other_tenants_rows() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    // tenant-b の非公開な同値重複行を大量に入れても tenant-a の多重度は変わらない。
+    let other = ctx("tenant-b");
+    for id in 100..110 {
+        insert_row(&storage, DOCS, &other, id, "ja", Visibility::Private);
+        insert_row(&storage, OTHER, &other, id, "ja", Visibility::Private);
+    }
+    let core = new_core(storage);
+    let sql = "SELECT lang FROM docs INTERSECT ALL SELECT lang FROM other_docs";
+    // tenant-a: docs {ja,en,ja} / other_docs {en,fr} => en のみ。
+    assert_eq!(langs(&run(&core, "tenant-a", sql)), vec!["en"]);
+}
+
+#[test]
+fn explicit_distinct_matches_default_set_operators() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for (explicit, plain) in [
+        ("UNION DISTINCT", "UNION"),
+        ("INTERSECT DISTINCT", "INTERSECT"),
+        ("EXCEPT DISTINCT", "EXCEPT"),
+    ] {
+        let a = run(
+            &core,
+            "tenant-a",
+            &format!("SELECT lang FROM docs {explicit} SELECT lang FROM other_docs"),
+        );
+        let b = run(
+            &core,
+            "tenant-a",
+            &format!("SELECT lang FROM docs {plain} SELECT lang FROM other_docs"),
+        );
+        assert_eq!(langs(&a), langs(&b), "{explicit}");
+    }
+}
+
+#[test]
+fn quantifier_followed_by_another_quantifier_is_rejected() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for sql in [
+        "SELECT lang FROM docs INTERSECT ALL DISTINCT SELECT lang FROM other_docs",
+        "SELECT lang FROM docs INTERSECT ALL ALL SELECT lang FROM other_docs",
+        "SELECT lang FROM docs UNION DISTINCT ALL SELECT lang FROM other_docs",
+        "SELECT lang FROM docs EXCEPT ALL DISTINCT SELECT lang FROM other_docs",
+        "SELECT lang FROM docs EXCEPT ALL ALL SELECT lang FROM other_docs",
+        "SELECT lang FROM docs EXCEPT DISTINCT ALL SELECT lang FROM other_docs",
+    ] {
+        assert_eq!(
+            run_err(&core, "tenant-a", sql).wire_code(),
+            "42601",
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn except_all_keeps_difference_multiplicity() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let tenant_ctx = ctx("tenant-a");
+    let core = new_core(storage);
+    // docs {ja,en,ja} / other_docs {en,fr}: en が相殺され、ja は 2 件とも残る（左の順序）。
+    let sql = "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs";
+    assert_eq!(langs(&run(&core, "tenant-a", sql)), vec!["ja", "ja"]);
+    // 右にだけ現れる fr は左右を入れ替えると残る。
+    assert_eq!(
+        langs(&run(
+            &core,
+            "tenant-a",
+            "SELECT lang FROM other_docs EXCEPT ALL SELECT lang FROM docs"
+        )),
+        vec!["fr"]
+    );
+    // other_docs に ja を 1 件足すと、左の ja が 1 件だけ相殺される。
+    let storage = core_storage_reseed(&tenant_ctx, 1);
+    let core1 = new_core(storage.0);
+    let _g1 = CleanupGuard(storage.1);
+    assert_eq!(langs(&run(&core1, "tenant-a", sql)), vec!["ja"]);
+    // 右の件数が左以上なら 0 件（ja x3 で ja も en も消える）。
+    let storage = core_storage_reseed(&tenant_ctx, 3);
+    let core3 = new_core(storage.0);
+    let _g3 = CleanupGuard(storage.1);
+    assert!(langs(&run(&core3, "tenant-a", sql)).is_empty());
+}
+
+/// `seeded_two_tables` に、other_docs へ ja を `extra` 件足したものを返す。
+fn core_storage_reseed(tenant_ctx: &PolicyContext, extra: u64) -> (Storage, std::path::PathBuf) {
+    let (storage, path) = seeded_two_tables();
+    for id in 20..(20 + extra) {
+        insert_row(&storage, OTHER, tenant_ctx, id, "ja", Visibility::Public);
+    }
+    (storage, path)
+}
+
+#[test]
+fn except_all_multiplicity_ignores_other_tenants_rows() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let other = ctx("tenant-b");
+    for id in 100..110 {
+        insert_row(&storage, DOCS, &other, id, "ja", Visibility::Private);
+        insert_row(&storage, OTHER, &other, id, "ja", Visibility::Private);
+    }
+    let core = new_core(storage);
+    let sql = "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs";
+    assert_eq!(langs(&run(&core, "tenant-a", sql)), vec!["ja", "ja"]);
+}
+
+#[test]
+fn except_all_chains_and_precedence() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let sorted = |sql: &str| {
+        let mut v = langs(&run(&core, "tenant-a", sql));
+        v.sort();
+        v
+    };
+    // 左結合: (docs EXCEPT ALL other_docs) EXCEPT docs => ja,ja から ja,ja を引いて 0 件。
+    assert!(sorted(
+        "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs EXCEPT SELECT lang FROM docs"
+    )
+    .is_empty());
+    // (docs UNION ALL other_docs) EXCEPT ALL docs => en,fr。
+    assert_eq!(
+        sorted("SELECT lang FROM docs UNION ALL SELECT lang FROM other_docs EXCEPT ALL SELECT lang FROM docs"),
+        vec!["en", "fr"]
+    );
+    // INTERSECT が先に結合: docs EXCEPT ALL (other_docs INTERSECT docs) => ja,ja（en が相殺）。
+    assert_eq!(
+        sorted("SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs INTERSECT SELECT lang FROM docs"),
+        vec!["ja", "ja"]
+    );
+    // 括弧で結果が変わる: docs EXCEPT ALL (other_docs UNION ALL docs) => 0 件。
+    assert!(sorted(
+        "SELECT lang FROM docs EXCEPT ALL (SELECT lang FROM other_docs UNION ALL SELECT lang FROM docs)"
+    )
+    .is_empty());
+}
+
+#[test]
+fn except_all_with_limit_keeps_leading_row() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs LIMIT 1",
+    );
+    assert_eq!(langs(&result), vec!["ja"]);
+}
+
+#[test]
+fn vector_column_with_except_all_is_rejected() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
     let err = run_err(
         &core,
         "tenant-a",
-        "SELECT lang FROM docs UNION DISTINCT SELECT lang FROM other_docs",
+        "SELECT embedding FROM docs EXCEPT ALL SELECT embedding FROM other_docs",
     );
-    assert_eq!(err.wire_code(), "42601");
-}
-
-#[test]
-fn except_all_is_rejected() {
-    let (storage, path) = seeded_two_tables();
-    let _guard = CleanupGuard(path);
-    let core = new_core(storage);
-    let err = run_err(
-        &core,
-        "tenant-a",
-        "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs",
-    );
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "22000");
 }
 
 #[test]
@@ -475,6 +628,21 @@ fn limit_inside_branch_is_rejected() {
         &core,
         "tenant-a",
         "SELECT lang FROM docs LIMIT 1 UNION SELECT lang FROM other_docs",
+    );
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// Issue #3270 レビュー対応: 括弧付き枝の select list の値サブクエリは束縛せず `42601`。
+#[test]
+fn scalar_subquery_in_limited_branch_is_rejected() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "(SELECT (SELECT lang FROM other_docs LIMIT 1) FROM docs LIMIT 1) \
+         UNION ALL (SELECT lang FROM other_docs LIMIT 1)",
     );
     assert_eq!(err.wire_code(), "42601");
 }
@@ -1479,13 +1647,13 @@ fn aggregate_branch_with_incompatible_column_type_is_datatype_mismatch() {
         "SELECT COUNT(*) FROM docs UNION SELECT lang FROM other_docs",
     );
     assert_eq!(err.wire_code(), "42804");
-    // 括弧なしの末尾 `ORDER BY` は集合演算全体に掛かるため対象外（`42601`）。
-    let err = run_err(
+    // 括弧なしの末尾 `ORDER BY` は集合演算全体のキーとして実行される（Issue #3266・#3267）。
+    let result = run(
         &core,
         "tenant-a",
         "SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY lang",
     );
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(langs(&result), vec!["en", "fr", "ja"]);
 }
 
 #[test]
@@ -1608,5 +1776,414 @@ fn describe_matches_execute_for_aggregate_and_limited_branches() {
                 .expect("execute should succeed"),
         );
         assert_eq!(described, executed.columns, "sql={sql}");
+    }
+}
+
+// ---------- 括弧なし末尾 ORDER BY（集合全体のソートキー。Issue #3266） ----------
+
+const SET_BASE: &str = "SELECT lang FROM docs UNION SELECT lang FROM other_docs";
+
+/// 全体 `ORDER BY`（OFFSET／LIMIT／FETCH を含む）は合成結果をソートして PostgreSQL と同じ順で返す
+/// （Issue #3267）。docs は ja, en, ja、other_docs は en, fr。
+#[test]
+fn trailing_order_by_over_set_operation_sorts_the_combined_result() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let cases: Vec<(String, Vec<&str>)> = vec![
+        (format!("{SET_BASE} ORDER BY lang"), vec!["en", "fr", "ja"]),
+        (format!("{SET_BASE} ORDER BY 1 DESC"), vec!["ja", "fr", "en"]),
+        (
+            format!("{SET_BASE} ORDER BY 1 DESC NULLS FIRST"),
+            vec!["ja", "fr", "en"],
+        ),
+        (
+            "SELECT lang FROM docs UNION ALL SELECT lang FROM other_docs ORDER BY lang".to_string(),
+            vec!["en", "en", "fr", "ja", "ja"],
+        ),
+        (
+            "SELECT lang FROM docs INTERSECT SELECT lang FROM other_docs ORDER BY lang".to_string(),
+            vec!["en"],
+        ),
+        (
+            "SELECT lang FROM docs INTERSECT ALL SELECT lang FROM other_docs ORDER BY lang"
+                .to_string(),
+            vec!["en"],
+        ),
+        (
+            "SELECT lang FROM docs EXCEPT SELECT lang FROM other_docs ORDER BY lang DESC"
+                .to_string(),
+            vec!["ja"],
+        ),
+        (
+            "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs ORDER BY lang"
+                .to_string(),
+            vec!["ja", "ja"],
+        ),
+        (
+            format!("{SET_BASE} ORDER BY lang LIMIT 2 OFFSET 1"),
+            vec!["fr", "ja"],
+        ),
+        (format!("{SET_BASE} ORDER BY lang OFFSET 2"), vec!["ja"]),
+        (format!("{SET_BASE} ORDER BY lang;"), vec!["en", "fr", "ja"]),
+        (
+            format!("{SET_BASE} ORDER BY lang FETCH FIRST 2 ROWS ONLY"),
+            vec!["en", "fr"],
+        ),
+        (
+            format!("{SET_BASE} ORDER BY lang OFFSET 1 ROWS FETCH NEXT 1 ROWS ONLY"),
+            vec!["fr"],
+        ),
+        (
+            format!("{SET_BASE} ORDER BY 1, lang DESC LIMIT 1"),
+            vec!["en"],
+        ),
+        (
+            format!("{SET_BASE} ORDER BY lang ASC NULLS LAST LIMIT 1"),
+            vec!["en"],
+        ),
+        // 最後の枝が括弧付きの単一 SELECT（枝内の句と全体の句の両立）。
+        (
+            "SELECT lang FROM docs UNION (SELECT lang FROM other_docs ORDER BY lang DESC LIMIT 1) ORDER BY 1"
+                .to_string(),
+            vec!["en", "fr", "ja"],
+        ),
+    ];
+    for (sql, want) in &cases {
+        let got = langs(&run(&core, "tenant-a", sql));
+        assert_eq!(&got, want, "sql={sql}");
+        // 同じ文を再実行しても結果は決定的。
+        assert_eq!(langs(&run(&core, "tenant-a", sql)), got, "rerun sql={sql}");
+    }
+}
+
+/// 集計枝（`Cell::Integer`）・`GROUP BY` 枝との全体 `ORDER BY`。
+#[test]
+fn trailing_order_by_orders_aggregate_branches() {
+    use engine::sql::exec::Cell;
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT COUNT(*) FROM docs UNION ALL SELECT COUNT(*) FROM other_docs ORDER BY 1",
+    );
+    assert_eq!(
+        cells_of(&result),
+        vec![vec![Cell::Integer(2)], vec![Cell::Integer(3)]]
+    );
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang, COUNT(*) FROM docs GROUP BY lang UNION ALL \
+         SELECT lang, COUNT(*) FROM other_docs GROUP BY lang ORDER BY 2 DESC, 1",
+    );
+    let got: Vec<(String, u64)> = result
+        .rows
+        .iter()
+        .map(|r| match (&r.cells[0], &r.cells[1]) {
+            (Cell::Text(l), Cell::Integer(n)) => (l.clone(), *n),
+            other => panic!("unexpected cells {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("ja".to_string(), 2),
+            ("en".to_string(), 1),
+            ("en".to_string(), 1),
+            ("fr".to_string(), 1)
+        ]
+    );
+}
+
+/// 整数・NULL・負数を含む列の全体 `ORDER BY`（NULL 位置は PG 既定と明示指定）。
+#[test]
+fn trailing_order_by_handles_integers_and_nulls() {
+    use engine::sql::exec::Cell;
+    let path = unique_db_path("set-op-order-int");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let nullable_int = |name: &str| {
+        TableSchema::new(
+            name,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("score", ColumnType::Integer, true),
+            ],
+        )
+    };
+    storage.create_table(&nullable_int("s1")).expect("s1");
+    storage.create_table(&nullable_int("s2")).expect("s2");
+    let c = ctx("tenant-a");
+    for (table, id, score) in [
+        ("s1", 1u64, Some(5i32)),
+        ("s1", 2, Some(-3)),
+        ("s1", 3, None),
+        ("s2", 4, Some(0)),
+        ("s2", 5, Some(5)),
+    ] {
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("seed-{table}-{id}"))
+                .expect("op id");
+        let v = match score {
+            Some(n) => Value::Integer(n),
+            None => Value::Null,
+        };
+        engine::tenant::insert_typed_row(
+            &storage,
+            table,
+            &c,
+            id,
+            Visibility::Public,
+            &[Value::Vector(vec![id as f32, 0.0]), v],
+            &op_id,
+        )
+        .expect("insert");
+    }
+    let core = new_core(storage);
+    let scores = |sql: &str| -> Vec<Option<i64>> {
+        run(&core, "tenant-a", sql)
+            .rows
+            .iter()
+            .map(|r| match &r.cells[0] {
+                Cell::SignedInteger(n) => Some(*n),
+                Cell::Integer(n) => Some(*n as i64),
+                Cell::Null => None,
+                other => panic!("unexpected cell {other:?}"),
+            })
+            .collect()
+    };
+    let base = "SELECT score FROM s1 UNION ALL SELECT score FROM s2";
+    assert_eq!(
+        scores(&format!("{base} ORDER BY 1")),
+        vec![Some(-3), Some(0), Some(5), Some(5), None]
+    );
+    assert_eq!(
+        scores(&format!("{base} ORDER BY 1 DESC")),
+        vec![None, Some(5), Some(5), Some(0), Some(-3)]
+    );
+    assert_eq!(
+        scores(&format!("{base} ORDER BY score NULLS FIRST")),
+        vec![None, Some(-3), Some(0), Some(5), Some(5)]
+    );
+    assert_eq!(
+        scores(&format!("{base} ORDER BY score DESC NULLS LAST LIMIT 2")),
+        vec![Some(5), Some(5)]
+    );
+}
+
+/// 構文の誤りは `42601` のまま（枝の句と誤解釈しない）。
+#[test]
+fn malformed_set_operation_order_by_stays_syntax_error() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for sql in [
+        // 最後以外の枝の直後。キーが式でも `42601`。
+        "SELECT lang FROM docs ORDER BY lang UNION SELECT lang FROM other_docs",
+        "SELECT lang FROM docs ORDER BY lower(lang) UNION SELECT lang FROM other_docs",
+        // 句の順序違い・キーなし・末尾カンマ。
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs LIMIT 2 ORDER BY lang",
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY",
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY lang,",
+        // 修飾名・距離演算子キー。
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY docs.lang",
+        "SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY embedding <=> '[0.1,0.2]'",
+        // LIMIT の無い括弧付き枝・括弧内の入れ子集合式。
+        "(SELECT lang FROM docs ORDER BY lang) UNION SELECT lang FROM other_docs",
+        "(SELECT lang FROM docs UNION SELECT lang FROM other_docs ORDER BY lang LIMIT 2) UNION SELECT lang FROM other_docs",
+    ] {
+        let err = run_err(&core, "tenant-a", sql);
+        assert_eq!(err.wire_code(), "42601", "sql={sql} err={err:?}");
+    }
+}
+
+/// 式キー・存在しない列・序数範囲外・キー過多・型不一致の分類。式キーは PostgreSQL と同じく
+/// 結果列名・序数だけを許す形のため意図的な拒否（`0A000`）。
+// intentional: docs/design/set-operations.md
+#[test]
+fn set_operation_order_by_classifies_unresolvable_keys() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let nine = ["lang"; 9].join(", ");
+    let cases: Vec<(String, &str)> = vec![
+        (format!("{SET_BASE} ORDER BY lower(lang)"), "0A000"),
+        (
+            format!("{SET_BASE} ORDER BY CASE WHEN lang = 'en' THEN 0 ELSE 1 END"),
+            "0A000",
+        ),
+        (format!("{SET_BASE} ORDER BY embedding"), "42703"),
+        (format!("{SET_BASE} ORDER BY nope"), "42703"),
+        // 列名は大文字小文字を区別して照合する（広域取得の ORDER BY と同じ）。
+        (format!("{SET_BASE} ORDER BY LANG"), "42703"),
+        (format!("{SET_BASE} ORDER BY 0"), "42P10"),
+        (format!("{SET_BASE} ORDER BY 2"), "42P10"),
+        (format!("{SET_BASE} ORDER BY {nine}"), "54000"),
+        // 型不一致（`42804`）はキーの解決・関門より優先する。
+        (
+            "SELECT COUNT(*) FROM docs UNION SELECT lang FROM other_docs ORDER BY 1".to_string(),
+            "42804",
+        ),
+    ];
+    for (sql, want) in &cases {
+        let err = run_err(&core, "tenant-a", sql);
+        assert_eq!(err.wire_code(), *want, "sql={sql} err={err:?}");
+    }
+}
+
+/// 重複する出力列名は `42702`。
+#[test]
+fn set_operation_order_by_on_duplicate_output_name_is_ambiguous() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let sql = "SELECT lang, lang FROM docs UNION SELECT lang, lang FROM other_docs ORDER BY lang";
+    let err = run_err(&core, "tenant-a", sql);
+    assert_eq!(err.wire_code(), "42702", "err={err:?}");
+}
+
+/// Describe と Execute は同じ分類を返す（式キーの `0A000` は意図的な拒否）。
+// intentional: docs/design/set-operations.md
+#[test]
+fn describe_matches_execute_for_set_operation_order_by() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for sql in [
+        format!("{SET_BASE} ORDER BY lang"),
+        format!("{SET_BASE} ORDER BY 1"),
+        format!("{SET_BASE} ORDER BY nope"),
+        format!("{SET_BASE} ORDER BY 3"),
+        format!("{SET_BASE} ORDER BY lower(lang)"),
+    ] {
+        let described = core
+            .parse_sql(&sql)
+            .and_then(|parsed| core.describe_parsed_in_session(&SessionState::default(), &parsed))
+            .map(|cols| cols.expect("set operation must produce result columns"))
+            .map_err(|e| e.wire_code());
+        let mut session = SessionState::default();
+        let executed = core
+            .execute_sql_in_session(&ctx("tenant-a"), &mut session, &sql)
+            .map(|o| expect_query(o).columns)
+            .map_err(|e| e.wire_code());
+        assert_eq!(described, executed, "sql={sql}");
+    }
+}
+
+/// テナントによって可視行が違っても、誤りの分類と文言は同一で行の値を含まない。成功する形の
+/// 結果は呼び出しセッションの可視行だけで構成され、他テナントの private 行は現れない。
+// tracked: #3265
+#[test]
+fn set_operation_order_by_results_and_errors_respect_tenant_boundary() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    insert_row(
+        &storage,
+        DOCS,
+        &ctx("tenant-a"),
+        4,
+        "secret-private-value",
+        Visibility::Private,
+    );
+    let core = new_core(storage);
+    let sql = format!("{SET_BASE} ORDER BY lang DESC");
+    // tenant-a は自分の private 行を含めて降順。
+    assert_eq!(
+        langs(&run(&core, "tenant-a", &sql)),
+        vec!["secret-private-value", "ja", "fr", "en"]
+    );
+    // tenant-b からは private 行が見えない（ソート・件数のどちらにも現れない）。
+    assert_eq!(langs(&run(&core, "tenant-b", &sql)), vec!["ja", "fr", "en"]);
+    for sql in [
+        format!("{SET_BASE} ORDER BY nope"),
+        format!("{SET_BASE} ORDER BY lower(lang)"),
+        format!("{SET_BASE} ORDER BY 3"),
+    ] {
+        let a = run_err(&core, "tenant-a", &sql);
+        let b = run_err(&core, "tenant-b", &sql);
+        assert_eq!(a.wire_code(), b.wire_code(), "sql={sql}");
+        assert_eq!(a.to_string(), b.to_string(), "sql={sql}");
+        assert!(!a.to_string().contains("secret-private-value"));
+    }
+}
+
+/// `DECLARE CURSOR` とビュー定義でも全体 `ORDER BY` がソート順で返る。
+#[test]
+fn set_operation_order_by_works_for_cursor_and_view() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let mut session = SessionState::default();
+    let c = ctx("tenant-a");
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &c,
+        &mut session,
+        &mut txn,
+        &format!("DECLARE c CURSOR FOR {SET_BASE} ORDER BY lang DESC"),
+    )
+    .expect("declare cursor over ordered set operation");
+    let fetched = match core
+        .execute_sql_in_txn(&c, &mut session, &mut txn, "FETCH ALL FROM c")
+        .expect("fetch")
+    {
+        SqlOutcome::Fetch(result) => result,
+        other => panic!("expected Fetch, got {other:?}"),
+    };
+    assert_eq!(langs(&fetched), vec!["ja", "fr", "en"]);
+    let _ = core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK");
+
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    core.execute_sql_in_session(
+        &c,
+        &mut ddl,
+        &format!("CREATE VIEW v AS {SET_BASE} ORDER BY lang DESC"),
+    )
+    .expect("create view over ordered set operation");
+    let viewed = expect_query(
+        core.execute_sql_in_session(&c, &mut ddl, "SELECT lang FROM v")
+            .expect("select from view"),
+    );
+    assert_eq!(langs(&viewed), vec!["ja", "fr", "en"]);
+}
+
+/// 比較できないキー型は `0A000`（未ソートの行を返さない）。Describe と Execute で一致する。
+// tracked: #3265
+#[test]
+fn set_operation_order_by_rejects_unsortable_key_types() {
+    let path = unique_db_path("set-op-order-unsortable");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    for name in ["u1", "u2"] {
+        storage
+            .create_table(&TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                    ColumnDef::new("ts", ColumnType::TimestampTz, true),
+                ],
+            ))
+            .expect("create");
+    }
+    let core = new_core(storage);
+    for sql in [
+        "SELECT ts FROM u1 UNION ALL SELECT ts FROM u2 ORDER BY ts",
+        "SELECT embedding FROM u1 UNION ALL SELECT embedding FROM u2 ORDER BY 1",
+    ] {
+        let executed = run_err(&core, "tenant-a", sql).wire_code();
+        assert_eq!(executed, "0A000", "sql={sql}");
+        let parsed = core.parse_sql(sql).expect("parse");
+        let described = core
+            .describe_parsed_in_session(&SessionState::default(), &parsed)
+            .err()
+            .map(|e| e.wire_code());
+        assert_eq!(described, Some(executed), "describe sql={sql}");
     }
 }

@@ -535,6 +535,44 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
 - **対象外**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14。対応しない）。VARCHAR・TIMESTAMPTZ・INTERVAL・BIT の
   各要素型は #3231・#3233〜#3235。
 
+## Issue #3235 追記（BIT(n)[] を要素型として受理）
+
+親 #3228・TABLE-14・TABLE-35・TABLE-48 のポインタ。`ArrayElemType` に `Bit(u32)`（`n` は `1..=MAX_BIT_LENGTH`）を
+追加した。専用の配列 OID（`_bit` = 1561）があるため TEXT へ写さない。長さなしの `BIT[]` はスカラーと同じく
+`BIT(1)[]`。`VARBIT[]`・`BIT VARYING[]`（OID 1563・1562）はスカラーの VARBIT が構文段で `0A000` のため未対応のまま。
+
+- **値表現**: `ArrayValue::Bit(Vec<Option<BitString>>)`。`n` は値が持たず（空配列・全 NULL 配列から復元できない）、
+  正は列宣言の `ArrayElemType::Bit(n)`。`ArrayValue::elem()` は先頭の非 NULL 要素の長さ（無ければ 1）を代表値として
+  返し、種別照合（`array_elem_kind_eq`）は `n` に依らず同じ種別とみなす。宣言長との照合は
+  `validate_array_elements`（要素ごとに `bit_len == n`）が担う。
+- **行内表現**: 要素ごとに固定幅 `ceil(n / 8)` バイト（MSB 先頭・詰め物ビットは 0。スカラーの `BitString` と同じ）。
+  decode は `BitString::from_parts` で詰め物ビットを検証し、破損データは `Invalid`（黙って受理しない）。
+  本文長は `NULL ビットマップ + 非 NULL 数 x ceil(n / 8)`。
+- **カタログ param**: 固定フィールド数の文法 `bit,<n>,<max_len>`（2 次元以上は末尾に `d<N>`）。`from_catalog_tag` には
+  `bit` を入れず、スカラーの 2 フィールド形 `bit,<n>` を受理しない。先頭ゼロ・0・上限超過・符号は `Invalid`。
+  既存の型の param は 1 バイトも変えない。旧バイナリは未知タグを `Invalid` で拒否する（fail-closed）。
+- **凍結タグ**: 一意キーの要素タグ・正準序数・content hash の要素型タグはいずれも **18**（0〜15 は使用済み、16・17 は
+  並行する TIMESTAMPTZ・INTERVAL の要素型が使う。既存値は振り直さない）。
+- **等価ペイロード**: `bit(4)` の `1000` と `bit(8)` の `10000000` は行バイトが同じ 0x80 になるため、
+  `equality_payload`・content hash は非 NULL 要素ごとに **ビット長（u32 LE）+ バイト列**を積む。保存側
+  （`ArrayRef`）は値へ復号してから同じ関数で正準化するので、新規値と既存行の経路は一致する（UNIQUE の `23505`）。
+- **DoS 対策**: 配列リテラルの束縛は、非 NULL 要素数 x 要素バイト幅が配列ペイロード上限を超えるなら確保の前に
+  `54000` にする。BIT の代入は長さ不一致を `22026` にし、空白詰めはしない（入力長が出力長を抑えるため増幅しない）。
+- **SQL 表層**: INSERT・UPDATE・UPSERT・列 DEFAULT・ALTER ADD COLUMN・配列リテラル・添字（`v[1]` は `bit(n)`、
+  OID 1560）・スライス（`bit(n)[]`）を受理する。値の等価（`=`・`<>`・UNIQUE・集合演算）は長さを含む正準
+  ペイロードで判定するため受理する。同じ宣言の `BIT(n)[]` 列どうしの代入（`UPDATE SET v = w`・`INSERT ... SELECT`）は
+  恒等として受理し、宣言が違う列・他の型の配列からの代入は `0A000`。
+- **fail-closed の面**: 等価比較（`=`・`<>`）は上記のとおり対応済み。それ以外の未対応の機能は拒否する。包含・重なり・量化比較（`@>`・`&&`・`ANY`）・
+  順序比較・ORDER BY・DISTINCT・GROUP BY・`array_agg`・`ARRAY[...]` 構築子・配列関数・CAST（`::text`・
+  `::bit(n)[]` 等）・索引・ALTER COLUMN TYPE。`CastType` に BIT が無いため、`elem_cast_type(Bit)` は `None` を返し、
+  そのままでは ENUM 配列（`SourceKind::Array(None)`）と取り違えて通してしまう。`cast::array_source_kind` が bit 配列を
+  `SourceKind::Bit`（CAST は `0A000`）へ振り分け、添字の束縛は `cast::bit_array_elem` で `n` つきの要素型を得る。
+- **wire**: `WireType::BitArray`（OID 1561・`_bit`）。typmod は `n`（VARHDRSZ を足さない。スカラーと同じ）。
+  バイナリ形式は対象外のまま（`0A000`）。Parse で 1561 を宣言した場合も `0A000`。NoSQL（HTTP）の型名は `bit[]`、
+  要素は `"1010"` の JSON 文字列（入力も JSON 文字列のみ。文字種・長さは engine が検査）。
+- **据え置いた面（対象外）**: `VARBIT[]`・`BIT VARYING[]`、`bit[]` の比較・包含・並べ替え・集計・CAST（スカラー BIT の
+  解禁に合わせて別 Issue）、配列のバイナリ形式（TABLE-35 (4)・WIRE-14）、NoSQL DDL の `element_type: "bit"`。
+
 ## Issue #3233 追記（`TIMESTAMPTZ[]` の受理）
 
 親 #3228・TABLE-14・TABLE-35・TABLE-33 のポインタ。#3232 と同じ手順で、`TIMESTAMPTZ[]`／`TIMESTAMPTZ[n]`／

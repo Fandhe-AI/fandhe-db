@@ -151,7 +151,8 @@ pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
         ArrayElemType::Bytea => CastSrc::Bytea,
         ArrayElemType::Json => CastSrc::Json,
         ArrayElemType::Jsonb => CastSrc::Jsonb,
-        ArrayElemType::Enum => return None,
+        // `BIT(n)` 要素もスカラー BIT と同じく CAST 未対応（Issue #3235）。
+        ArrayElemType::Enum | ArrayElemType::Bit(_) => return None,
     })
 }
 
@@ -176,7 +177,7 @@ pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
         ArrayElemType::Bytea => CastDst::Bytea,
         ArrayElemType::Json => CastDst::Json,
         ArrayElemType::Jsonb => CastDst::Jsonb,
-        ArrayElemType::Enum => return None,
+        ArrayElemType::Enum | ArrayElemType::Bit(_) => return None,
     })
 }
 
@@ -1218,6 +1219,9 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Json(v) => map(v, |s| Ok(ExprValue::JsonText(Cow::Owned(s.clone())))),
         ArrayValue::Jsonb(v) => map(v, |s| Ok(ExprValue::Json(Cow::Owned(s.clone())))),
         ArrayValue::Enum(_) => Err(internal("enum array reached an array cast")),
+        // 添字（`v[1]`）の結果は `ExprValue::Bit`（Issue #3235）。CAST 経路へは要素型の写像が
+        // 無いため到達しない。
+        ArrayValue::Bit(v) => map(v, |b| Ok(ExprValue::Bit(b.clone()))),
         ArrayValue::Multi(_) => Err(SqlSurfaceError::unsupported(
             "this operation on multi-dimensional arrays is not supported",
         )),
@@ -1315,6 +1319,14 @@ pub(crate) fn values_to_array(
             _ => Err(bad()),
         })?),
         ArrayElemType::Enum => return Err(internal("enum array is not a cast target")),
+        // 要素の長さが宣言長 `n` と一致する `bit` 値だけを受理する（不一致は `22026`）。
+        ArrayElemType::Bit(n) => ArrayValue::Bit(collect(values, |v| match v {
+            ExprValue::Bit(b) if b.bit_len() == n => Ok(b),
+            ExprValue::Bit(_) => Err(SqlSurfaceError::string_data_length_mismatch(
+                "bit string length does not match type bit(n)",
+            )),
+            _ => Err(bad()),
+        })?),
     })
 }
 

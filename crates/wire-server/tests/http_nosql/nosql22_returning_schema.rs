@@ -202,6 +202,35 @@ fn invalid_returning_values_are_42601_without_echo() {
     assert_eq!(snapshot(&core), before, "rejections must not write");
 }
 
+/// NoSQL の `returning` は列名の配列と `"*"` だけを受け、SQL 表層が受理する式・`AS` 別名・関数呼び出しの
+/// 文字列は従来どおり `42601` で拒否し、入力をエコーせず書き込みも残さない（Issue #3251。対応しない。
+/// 根拠のポインタ: docs/spec/04-behavior/nosql-surface.md NOSQL-22・docs/design/sql-returning.md）。
+// intentional: docs/design/sql-returning.md
+#[test]
+fn sql_expression_and_alias_strings_are_not_accepted_in_returning() {
+    let (core, _g) = new_core();
+    let before = snapshot(&core);
+    let c = spawn(core.clone());
+    for value in [
+        r#"["upper(secret)"]"#,
+        r#"["secret AS s"]"#,
+        r#""secret AS s""#,
+        r#"["secret + 1"]"#,
+    ] {
+        for body in bodies(&format!(r#","returning":{value}"#)) {
+            let resp = query(&c, &body, None);
+            assert_eq!(resp.status, 400, "{value} {resp:?}");
+            assert_eq!(
+                http_common::wire_code_of(&resp),
+                "42601",
+                "{value} {resp:?}"
+            );
+            assert!(!body_text(&resp).contains("secret"), "{value} {resp:?}");
+        }
+    }
+    assert_eq!(snapshot(&core), before, "rejections must not write");
+}
+
 #[test]
 fn valid_returning_executes_and_returns_columns_and_rows() {
     // Issue #2091: 妥当な `returning` は 0A000 ではなく実行され、件数キーに続けて

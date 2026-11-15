@@ -103,6 +103,7 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::Bpchar(_) => "bpchar",
         ArrayElemType::SmallInt => "smallint",
         ArrayElemType::Time => "time",
+        ArrayElemType::Bit(_) => "bit",
         ArrayElemType::TimestampTz => "timestamptz",
     }
 }
@@ -1555,6 +1556,15 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
                 Some(86_400_000_000),
             ]),
         ),
+        // Issue #3235: `BIT(n)[]`（宣言長 `n` の要素。端数ビットを含む）。
+        (
+            ArrayElemType::Bit(4),
+            ArrayValue::Bit(vec![
+                Some(engine::bit_string::BitString::parse_text("1010", 4).expect("bit")),
+                None,
+                Some(engine::bit_string::BitString::parse_text("0001", 4).expect("bit")),
+            ]),
+        ),
         (
             ArrayElemType::TimestampTz,
             ArrayValue::TimestampTz(vec![Some(0), None, Some(1_700_000_000_000_000), Some(-1)]),
@@ -1610,6 +1620,7 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::Integer(_) => ArrayValue::Integer(vec![]),
             ArrayValue::SmallInt(_) => ArrayValue::SmallInt(vec![]),
             ArrayValue::Time(_) => ArrayValue::Time(vec![]),
+            ArrayValue::Bit(_) => ArrayValue::Bit(vec![]),
             ArrayValue::TimestampTz(_) => ArrayValue::TimestampTz(vec![]),
             ArrayValue::BigInt(_) => ArrayValue::BigInt(vec![]),
             ArrayValue::Real(_) => ArrayValue::Real(vec![]),

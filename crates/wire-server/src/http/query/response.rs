@@ -426,6 +426,11 @@ fn write_array(
             quoted(out, label);
             Ok(())
         })?,
+        // `BIT(n)` 要素は `0`・`1` だけの文字列（Issue #3235）。
+        ArrayValue::Bit(items) => each!(out, items, |out, b| {
+            quoted(out, &b.format_text());
+            Ok(())
+        })?,
         // `flat()` は `Multi` を返さない（網羅性のための fail-closed な腕）。
         ArrayValue::Multi(_) => return Err(ResponseEncodeError),
     }
@@ -520,6 +525,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
                 engine::catalog::ArrayElemType::Enum => "enum[]",
                 engine::catalog::ArrayElemType::Varchar(_) => "varchar[]",
                 engine::catalog::ArrayElemType::Bpchar(_) => "bpchar[]",
+                engine::catalog::ArrayElemType::Bit(_) => "bit[]",
             },
         },
     }
@@ -1112,6 +1118,15 @@ mod tests {
                 "time[]",
                 V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)]),
                 r#"["10:00:00",null,"24:00:00"]"#,
+            ),
+            (
+                ArrayElemType::Bit(4),
+                "bit[]",
+                V::Bit(vec![
+                    engine::bit_string::BitString::parse_text("1010", 4).ok(),
+                    None,
+                ]),
+                r#"["1010",null]"#,
             ),
             (
                 ArrayElemType::TimestampTz,
