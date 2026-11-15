@@ -256,8 +256,14 @@ impl EngineCore {
             DmlStatement::Insert(v) => {
                 let lookup = super::InsertSchemaLookup::new(&self.storage);
                 if v.returning.is_some() {
-                    self.execute_insert_returning_form(target, ctx, v, &lookup)
-                        .map(|o| Some(o.result))
+                    self.execute_insert_returning_form(
+                        target,
+                        ctx,
+                        v,
+                        &lookup,
+                        &crate::sql::udf_call::UdfRegistry::default(),
+                    )
+                    .map(|o| Some(o.result))
                 } else {
                     self.execute_insert_form(target, ctx, v, &lookup)
                         .map(|_| None)
@@ -269,8 +275,16 @@ impl EngineCore {
                     ValidatedUpdateForm::Predicate(v) => v.returning().is_some(),
                 };
                 if has_returning {
-                    self.execute_update_returning_form_pre(target, ctx, session, form, pre_update)
-                        .map(|o| Some(o.result))
+                    self.execute_update_returning_form_pre(
+                        target,
+                        ctx,
+                        session,
+                        form,
+                        pre_update,
+                        // CTE 本体は外側プランの束縛を通らない場合があるため、UDF は評価せず空レジストリで 42883 に倒す（fail-closed）。
+                        &crate::sql::udf_call::UdfRegistry::default(),
+                    )
+                    .map(|o| Some(o.result))
                 } else {
                     self.execute_predicate_update_form_pre(target, ctx, session, form, pre_update)
                         .map(|_| None)
@@ -278,8 +292,13 @@ impl EngineCore {
             }
             DmlStatement::Delete(crate::sql::allowlist::DeleteStatement::SingleRow(v)) => {
                 if v.returning.is_some() {
-                    self.execute_delete_returning_form(target, ctx, v)
-                        .map(|o| Some(o.result))
+                    self.execute_delete_returning_form(
+                        target,
+                        ctx,
+                        v,
+                        &crate::sql::udf_call::UdfRegistry::default(),
+                    )
+                    .map(|o| Some(o.result))
                 } else {
                     self.execute_delete_form(target, ctx, v).map(|_| None)
                 }
@@ -287,7 +306,13 @@ impl EngineCore {
             DmlStatement::Delete(crate::sql::allowlist::DeleteStatement::Predicate(v)) => {
                 if v.returning().is_some() {
                     self.execute_predicate_delete_returning_form_pre(
-                        target, ctx, session, v, pre_delete,
+                        target,
+                        ctx,
+                        session,
+                        v,
+                        pre_delete,
+                        // 同上（参照されない CTE 本体で UDF が評価され書き込みが残るのを防ぐ）。
+                        &crate::sql::udf_call::UdfRegistry::default(),
                     )
                     .map(|o| Some(o.result))
                 } else {
