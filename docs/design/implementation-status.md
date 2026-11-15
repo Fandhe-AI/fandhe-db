@@ -2095,4 +2095,11 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #3221（perf(engine): hybrid の可視集合 BTreeSet 構築と VisibleBitmap::build の再構築を省く。SEARCH-12・SEARCH-13・RLS-8 のポインタ）**: 依存・unsafe・公開 API の変更なし。hybrid 検索の可視 id 列（`input.ids`）が `0..n` の恒等列のときだけ、毎クエリの `BTreeSet<u64>` 構築を省き（`hybrid.rs` の `VisibleIdSet::Identity`。恒等列かどうかは入力列を線形に確かめて判定し、失敗した列は従来の `BTreeSet` へ倒す）、疎索引側では索引の最大 DocId が可視長より小さい（全文書が可視と確定する）とき、構築時に固定した全可視の統計（文書数・文書長合計）と全可視ビットで可視ビットマップを O(1) で返す（`sparse.rs` の `VisibleDocs::SlotRange`・`VisibleBits::All`・`SparseIndex::{max_doc_id, full_visible_total_len}`）。部分可視の恒等列は `doc_ids` の添字走査で、SipHash を引かない。全可視の統計は `Arc<SparseIndex>` に付随し、その索引は `SparseIndexCache` が（表・テナント・本文列・テキスト処理）と表世代で保持するため、テナント × 世代の単位で分離され、他テナントと共有しない。母数は従来どおり可視集合だけから決まり（`ScoreScope::Visible` のまま）、可視の判定は呼び出し元のフラグではなくデータから毎回確かめる。公開 API の `&BTreeSet` シグネチャは不変で、crate 内部に `score_within_docs_with_params`・`score_text_query_within_docs` を追加した。固定した検査は `sparse.rs`・`hybrid.rs` の単体テスト（SlotRange と BTreeSet 経路のビットマップ・スコア・テキストクエリのビット一致、オーバーフロー拒否、索引ごとの統計分離、範囲外 id の拒否）と `tests/core_misc/sparse_cache.rs` の `issue3221_*`（SQL 経由。先頭スロットを WHERE で除外した従来経路のオラクルと、行 id・スコアのビット・列型・行数が一致。本文 NULL・空表・無一致・テナント交互・世代変更を含む）。A/B（hybrid_rrf の p50）は未検証（本環境では実測していない）。
 
+## Issue #3223: scan の decode_row_header 二重デコードの解消
+
+`sql/scan.rs::with_visible_row` の `Fast`／`DimAndScalar` 段で、RLS 判定のヘッダデコードの offset を
+`storage::decode_row_dim_and_metadata_body_borrowed(buf, offset)` へ渡し、行ごとのヘッダ（tenant の UTF-8 検証）
+デコードを 1 回にした。検査の順序・fail-closed は不変。単体・結合テストを追加。同一ホスト A/B の実測は未検証。
+詳細は `docs/design/wide-retrieval-scan.md` の追記節。
+
 **Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。
