@@ -238,7 +238,7 @@ fn push_array_element(out: &mut String, text: &str, quote: bool) {
 }
 
 /// `ARRAY` 列（`TEXT`／`BOOLEAN`／`SMALLINT`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
-/// `DATE`／`TIMESTAMP`／`TIME`／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
+/// `DATE`／`TIMESTAMP`／`TIME`／`TIMESTAMPTZ`／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
 /// 向け配列直列化。要素種別を
 /// `array_ty.elem()` に応じて検証したうえで `{...}` テキストを組み立てる。
 /// 要素数が [`ArrayType::max_len`] を超える場合はテキストを組み立てる**前**に
@@ -284,6 +284,7 @@ pub fn array_literal_text(
                 ArrayElemType::Date
                 | ArrayElemType::Timestamp
                 | ArrayElemType::Time
+                | ArrayElemType::TimestampTz
                 | ArrayElemType::Uuid,
                 JsonValue::String(s),
             ) => push_array_element(&mut out, s, true),
@@ -352,6 +353,7 @@ pub fn array_literal_text(
                 ArrayElemType::Date
                 | ArrayElemType::Timestamp
                 | ArrayElemType::Time
+                | ArrayElemType::TimestampTz
                 | ArrayElemType::Uuid,
                 _,
             ) => {
@@ -890,6 +892,14 @@ mod tests {
             parse(ArrayElemType::Time, r#"["10:00:00",null,"24:00:00"]"#),
             V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)])
         );
+        // offset 付きの文字列要素は UTC マイクロ秒へ束縛される（Issue #3233）。
+        assert_eq!(
+            parse(
+                ArrayElemType::TimestampTz,
+                r#"["2026-01-01 10:00:00+09",null]"#
+            ),
+            V::TimestampTz(vec![Some(1_767_229_200_000_000), None])
+        );
         assert!(matches!(
             parse(
                 ArrayElemType::Uuid,
@@ -910,6 +920,7 @@ mod tests {
             (ArrayElemType::Uuid, JsonValue::Bool(false)),
             (ArrayElemType::Timestamp, num("[]")),
             (ArrayElemType::Time, num("1")),
+            (ArrayElemType::TimestampTz, num("1")),
         ] {
             let err = array_literal_text(&[item], &ty(elem)).expect_err("reject");
             assert!(matches!(err, TypedJsonError::TypeMismatch(_)));

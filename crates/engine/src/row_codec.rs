@@ -248,6 +248,9 @@ pub enum ArrayValue {
     /// `TIME[]`（Issue #3232）。0 時起点のマイクロ秒。`Timestamp` と別 variant にして型の区別
     /// （OID 1183）を保つ。
     Time(Vec<Option<i64>>),
+    /// `TIMESTAMPTZ[]`（Issue #3233）。UTC 起点のマイクロ秒。`Timestamp` と別 variant にして
+    /// 型の区別（OID 1185）を保つ。テキスト出力だけがセッション TimeZone に依存する。
+    TimestampTz(Vec<Option<i64>>),
     BigInt(Vec<Option<i64>>),
     Real(Vec<Option<f32>>),
     Double(Vec<Option<f64>>),
@@ -372,14 +375,34 @@ impl ArrayValue {
     /// 一致するものは `"..."` で囲み `"`・`\` をバックスラッシュでエスケープするため、文字列
     /// `NULL` は NULL 要素と区別される。出力は `sql::parser::parse_array_literal` で同じ値へ
     /// 往復できる。
+    ///
+    /// `TIMESTAMPTZ` 要素は UTC（`+00`）で描画する。セッション TimeZone で描画する版は
+    /// [`Self::to_pg_text_in_tz`]（Issue #3233）。他の要素型の出力は TimeZone に依存しない。
     pub fn to_pg_text(&self) -> String {
-        self.to_pg_text_bounded(usize::MAX).unwrap_or_default()
+        self.to_pg_text_in_tz(&crate::datetime::SessionTimeZone::utc())
+    }
+
+    /// [`Self::to_pg_text`] の TimeZone 指定版。`TIMESTAMPTZ` 要素だけが `tz` に従う
+    /// （wire-server の DataRow 描画が接続のセッション TimeZone を渡す。Issue #3233）。
+    pub fn to_pg_text_in_tz(&self, tz: &crate::datetime::SessionTimeZone) -> String {
+        self.to_pg_text_bounded_in_tz(usize::MAX, tz)
+            .unwrap_or_default()
     }
 
     /// [`Self::to_pg_text`] の長さ上限つき版。描画結果が `max_len` バイトを超えると確定した
     /// 時点で打ち切って `None` を返す（BYTEA 要素を多数含む配列の文字列化が巨大な確保にならない
     /// ようにするため。呼び出し元は `None` を上限超過として拒否する）。
     pub fn to_pg_text_bounded(&self, max_len: usize) -> Option<String> {
+        self.to_pg_text_bounded_in_tz(max_len, &crate::datetime::SessionTimeZone::utc())
+    }
+
+    /// [`Self::to_pg_text_bounded`] の TimeZone 指定版（`TIMESTAMPTZ` 要素のみ `tz` に従う。
+    /// `CAST(<timestamptz[]> AS text)` がセッション TimeZone で描画するために使う。Issue #3233）。
+    pub fn to_pg_text_bounded_in_tz(
+        &self,
+        max_len: usize,
+        tz: &crate::datetime::SessionTimeZone,
+    ) -> Option<String> {
         // `dims` に従い入れ子の `{}` を描画する（1 次元は `[要素数]`）。要素の整形は
         // `f`、NULL 要素は引用なしの `NULL`。出力が `max_len` を超えた時点で打ち切る。
         fn write_level<T>(
@@ -451,6 +474,9 @@ impl ArrayValue {
             ArrayValue::Time(items) => bounded(items, dims, max_len, |v| {
                 quote_pg_array_text_elem(&crate::datetime::format_time(*v))
             }),
+            ArrayValue::TimestampTz(items) => bounded(items, dims, max_len, |v| {
+                quote_pg_array_text_elem(&crate::datetime::format_timestamptz(*v, tz))
+            }),
             ArrayValue::Uuid(items) => bounded(items, dims, max_len, |v| v.to_string()),
             // NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を含むため常に引用・
             // エスケープされ PostgreSQL と同形の `"\\x0102"` になる）、JSON／JSONB／ENUM は
@@ -489,6 +515,9 @@ impl ArrayValue {
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => ArrayValue::Integer(join(a, b)),
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => ArrayValue::SmallInt(join(a, b)),
             (ArrayValue::Time(a), ArrayValue::Time(b)) => ArrayValue::Time(join(a, b)),
+            (ArrayValue::TimestampTz(a), ArrayValue::TimestampTz(b)) => {
+                ArrayValue::TimestampTz(join(a, b))
+            }
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => ArrayValue::BigInt(join(a, b)),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => ArrayValue::Real(join(a, b)),
             (ArrayValue::Double(a), ArrayValue::Double(b)) => ArrayValue::Double(join(a, b)),
@@ -553,6 +582,7 @@ impl ArrayValue {
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Time(a), ArrayValue::Time(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::TimestampTz(a), ArrayValue::TimestampTz(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => {
                 eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
@@ -617,6 +647,7 @@ impl ArrayValue {
             ArrayValue::Integer(v) => ArrayValue::Integer(pick(v, keep)),
             ArrayValue::SmallInt(v) => ArrayValue::SmallInt(pick(v, keep)),
             ArrayValue::Time(v) => ArrayValue::Time(pick(v, keep)),
+            ArrayValue::TimestampTz(v) => ArrayValue::TimestampTz(pick(v, keep)),
             ArrayValue::BigInt(v) => ArrayValue::BigInt(pick(v, keep)),
             ArrayValue::Real(v) => ArrayValue::Real(pick(v, keep)),
             ArrayValue::Double(v) => ArrayValue::Double(pick(v, keep)),
@@ -648,6 +679,10 @@ impl ArrayValue {
             ArrayValue::Integer(v) => map(v, |x| x.to_string()),
             ArrayValue::SmallInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Time(v) => map(v, |x| crate::datetime::format_time(*x)),
+            // `array_to_string` 等の入力。`CAST(.. AS text)` と同じくセッション TimeZone で整形する。
+            ArrayValue::TimestampTz(v) => crate::datetime::with_current_session_time_zone(|tz| {
+                map(v, |x| crate::datetime::format_timestamptz(*x, tz))
+            }),
             ArrayValue::BigInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Real(v) => map(v, |x| crate::scalar_float::format_real(*x)),
             ArrayValue::Double(v) => map(v, |x| crate::scalar_float::format_double(*x)),
@@ -695,6 +730,7 @@ macro_rules! array_dispatch {
             ArrayValue::Integer($items) => $body,
             ArrayValue::SmallInt($items) => $body,
             ArrayValue::Time($items) => $body,
+            ArrayValue::TimestampTz($items) => $body,
             ArrayValue::BigInt($items) => $body,
             ArrayValue::Real($items) => $body,
             ArrayValue::Double($items) => $body,
@@ -728,6 +764,7 @@ impl ArrayValue {
             ArrayValue::Integer(_) => ArrayElemType::Integer,
             ArrayValue::SmallInt(_) => ArrayElemType::SmallInt,
             ArrayValue::Time(_) => ArrayElemType::Time,
+            ArrayValue::TimestampTz(_) => ArrayElemType::TimestampTz,
             ArrayValue::BigInt(_) => ArrayElemType::BigInt,
             ArrayValue::Real(_) => ArrayElemType::Real,
             ArrayValue::Double(_) => ArrayElemType::Double,
@@ -781,6 +818,7 @@ impl ArrayValue {
             ArrayValue::Integer(v) => cut!(Integer, v),
             ArrayValue::SmallInt(v) => cut!(SmallInt, v),
             ArrayValue::Time(v) => cut!(Time, v),
+            ArrayValue::TimestampTz(v) => cut!(TimestampTz, v),
             ArrayValue::BigInt(v) => cut!(BigInt, v),
             ArrayValue::Real(v) => cut!(Real, v),
             ArrayValue::Double(v) => cut!(Double, v),
@@ -851,6 +889,9 @@ impl ArrayValue {
             ArrayValue::Integer(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
             ArrayValue::SmallInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i16>>()),
             ArrayValue::Time(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
+            ArrayValue::TimestampTz(v) => {
+                v.len().saturating_mul(std::mem::size_of::<Option<i64>>())
+            }
             ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::Real(v) => v.len().saturating_mul(std::mem::size_of::<Option<f32>>()),
             ArrayValue::Double(v) => v.len().saturating_mul(std::mem::size_of::<Option<f64>>()),
@@ -886,6 +927,8 @@ impl ArrayValue {
             ArrayValue::SmallInt(_) => 14,
             // Issue #3232 の新規採番。
             ArrayValue::Time(_) => 15,
+            // Issue #3233 の新規採番。
+            ArrayValue::TimestampTz(_) => 16,
             // `flat()` は `Multi` を返さない。
             ArrayValue::Multi(_) => {
                 return Err(RowCodecError::Invalid(
@@ -1386,6 +1429,7 @@ impl<'a> ArrayRef<'a> {
             | ArrayElemType::Uuid
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Bytea
             | ArrayElemType::Enum => Ok(std::borrow::Cow::Borrowed(self.bytes)),
         }
@@ -2017,7 +2061,8 @@ fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
         ArrayElemType::BigInt
         | ArrayElemType::Double
         | ArrayElemType::Timestamp
-        | ArrayElemType::Time => Some(8),
+        | ArrayElemType::Time
+        | ArrayElemType::TimestampTz => Some(8),
         ArrayElemType::Uuid => Some(16),
     }
 }
@@ -2222,6 +2267,7 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
             _,
         ) => {}
@@ -2382,6 +2428,16 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
                 if !crate::datetime::validate_time_micros(*v) {
                     return Err(RowCodecError::Invalid(
                         "array TIME element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::TimestampTz(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_timestamptz_micros(*v) {
+                    return Err(RowCodecError::Invalid(
+                        "array TIMESTAMPTZ element out of range".to_string(),
                     ));
                 }
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -2683,6 +2739,16 @@ fn decode_array_elements(
             Ok(v)
         })
         .map(ArrayValue::Time),
+        ArrayElemType::TimestampTz => decode_fixed_array_elements(rest, &nulls, 8, |c| {
+            let v = i64::from_le_bytes(array_le_bytes::<8>(c)?);
+            if !crate::datetime::validate_timestamptz_micros(v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array TIMESTAMPTZ element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::TimestampTz),
         ArrayElemType::Uuid => decode_fixed_array_elements(rest, &nulls, 16, |c| {
             Ok(Uuid::from_bytes(array_le_bytes::<16>(c)?))
         })
@@ -7966,6 +8032,90 @@ mod tests {
             decode_array_elements(ArrayElemType::Time, &[0u8, 1, 2, 3, 4, 5, 6, 7], 1, 0),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` は固定幅 8 バイトで往復する（NULL 要素・空配列・境界値・
+    /// 2 次元）。範囲外・型違い・壊れたフレームは encode／decode とも Invalid で fail-closed。
+    /// テキスト出力は UTC・非 UTC とも offset 付きで引用される。
+    #[test]
+    fn timestamptz_array_roundtrips_with_fixed_eight_byte_width() {
+        let ty = |nd: bool| {
+            let a = ArrayType::new(ArrayElemType::TimestampTz, 8).expect("array ty");
+            ColumnType::Array(if nd {
+                a.with_ndims(2).expect("array ty")
+            } else {
+                a
+            })
+        };
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ty(false), true),
+                ColumnDef::new("b", ty(true), true),
+            ],
+        );
+        let flat = ArrayValue::TimestampTz(vec![Some(0), None, Some(1_000_000), Some(-1)]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::TimestampTz(vec![Some(1), Some(2), Some(3), Some(4)]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::TimestampTz(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 16);
+        assert_eq!(payload.len(), 1 + 3 * 8);
+        // 型違い（Timestamp の値を TIMESTAMPTZ[] 列へ）は拒否する。
+        let bad = vec![
+            Value::Array(ArrayValue::Timestamp(vec![Some(1)])),
+            Value::Null,
+        ];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 範囲外は encode／decode とも Invalid。
+        for micros in [i64::MIN, i64::MAX] {
+            assert!(!crate::datetime::validate_timestamptz_micros(micros));
+            let out_of_range = vec![
+                Value::Array(ArrayValue::TimestampTz(vec![Some(micros)])),
+                Value::Null,
+            ];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &out_of_range),
+                Err(RowCodecError::Invalid(_))
+            ));
+            let mut body = vec![0u8];
+            body.extend_from_slice(&micros.to_le_bytes());
+            assert!(matches!(
+                decode_array_elements(ArrayElemType::TimestampTz, &body, 1, 0),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            decode_array_elements(
+                ArrayElemType::TimestampTz,
+                &[0u8, 1, 2, 3, 4, 5, 6, 7],
+                1,
+                0
+            ),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // テキスト出力: UTC 既定は `+00`、非 UTC は offset 付き。いずれも空白を含むため引用する。
+        let v = ArrayValue::TimestampTz(vec![Some(0), None]);
+        assert_eq!(v.to_pg_text(), r#"{"1970-01-01 00:00:00+00",NULL}"#);
+        let tokyo = crate::datetime::SessionTimeZone::parse_setting("Asia/Tokyo").expect("tz");
+        assert_eq!(
+            v.to_pg_text_in_tz(&tokyo),
+            r#"{"1970-01-01 09:00:00+09",NULL}"#
+        );
     }
 
     #[test]

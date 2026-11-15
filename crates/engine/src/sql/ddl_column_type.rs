@@ -153,10 +153,12 @@ pub(crate) fn to_static_column_type_with_array_default(
                 // `time[]` は別 OID（1183）を持つ専用の要素型へ写す（Issue #3232。Timestamp 等へ丸めると
                 // 型の区別が失われる。Issue #1569 で拒否していた形を受理へ反転した）。
                 ColumnType::Time => ArrayElemType::Time,
-                // `timestamptz[]` も別 OID（1185）のため拒否する（Issue #1574）。
+                // `timestamptz[]` も別 OID（1185）を持つ専用の要素型へ写す（Issue #3233。Issue #1574
+                // で拒否していた形を受理へ反転した。`TIMESTAMPTZ(p)[]` はスカラー側が未対応で 0A000）。
+                ColumnType::TimestampTz => ArrayElemType::TimestampTz,
                 // `interval[]` も別 OID（1187）のため拒否する（Issue #1579）。
                 // `bit[]` も別 OID（1561）のため拒否する（Issue #2021）。
-                ColumnType::TimestampTz | ColumnType::Interval | ColumnType::Bit(_) => {
+                ColumnType::Interval | ColumnType::Bit(_) => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })
@@ -1232,6 +1234,24 @@ mod tests {
             match to_static_column_type(&ty).expect(raw) {
                 StaticColumnType::Resolved(ColumnType::Array(a)) => {
                     assert_eq!(a.elem(), ArrayElemType::Time, "for {raw:?}");
+                }
+                other => panic!("unexpected static type for {raw:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` 系の綴りは専用の要素型 `TimestampTz` へ写る。
+    #[test]
+    fn timestamptz_array_spellings_map_to_timestamptz_element_type() {
+        for raw in [
+            "TIMESTAMPTZ[]",
+            "TIMESTAMPTZ[3]",
+            "TIMESTAMP WITH TIME ZONE[]",
+        ] {
+            let (ty, _) = parse_type(raw).expect(raw);
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::TimestampTz, "for {raw:?}");
                 }
                 other => panic!("unexpected static type for {raw:?}: {other:?}"),
             }

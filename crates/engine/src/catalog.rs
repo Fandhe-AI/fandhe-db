@@ -7212,6 +7212,9 @@ pub enum ArrayElemType {
     /// `TIME`（Issue #3232）。行内表現は 0 時起点のマイクロ秒 8 バイト LE（`Timestamp` と同形）。
     /// OID は別（`_time` = 1183）なので `Timestamp` へは丸めない。
     Time,
+    /// `TIMESTAMPTZ`（Issue #3233）。行内表現は UTC 起点のマイクロ秒 8 バイト LE（`Timestamp`・
+    /// `Time` と同形）。OID は別（`_timestamptz` = 1185）なので他の要素型へは丸めない。
+    TimestampTz,
 }
 
 impl ArrayElemType {
@@ -7219,7 +7222,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 16] = [
+    pub const ALL_KINDS: [ArrayElemType; 17] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7239,6 +7242,7 @@ impl ArrayElemType {
         ArrayElemType::Enum,
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
+        ArrayElemType::TimestampTz,
     ];
 
     /// 種別の序数（[`ArrayElemType::ALL_KINDS`] の添字）。ワイルドカード無しの網羅 match の
@@ -7263,6 +7267,7 @@ impl ArrayElemType {
             ArrayElemType::Enum => 13,
             ArrayElemType::SmallInt => 14,
             ArrayElemType::Time => 15,
+            ArrayElemType::TimestampTz => 16,
         }
     }
 
@@ -7288,6 +7293,7 @@ impl ArrayElemType {
             ArrayElemType::Enum => "enum",
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
+            ArrayElemType::TimestampTz => "timestamptz",
         }
     }
 
@@ -7302,6 +7308,7 @@ impl ArrayElemType {
             "bigint" => Ok(ArrayElemType::BigInt),
             "smallint" => Ok(ArrayElemType::SmallInt),
             "time" => Ok(ArrayElemType::Time),
+            "timestamptz" => Ok(ArrayElemType::TimestampTz),
             "real" => Ok(ArrayElemType::Real),
             "double" => Ok(ArrayElemType::Double),
             "date" => Ok(ArrayElemType::Date),
@@ -7377,7 +7384,8 @@ impl ArrayType {
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
-            | ArrayElemType::Time => {}
+            | ArrayElemType::Time
+            | ArrayElemType::TimestampTz => {}
         }
         Ok(Self {
             elem,
@@ -7475,7 +7483,8 @@ impl ArrayType {
                 | ArrayElemType::Json
                 | ArrayElemType::Jsonb
                 | ArrayElemType::SmallInt
-                | ArrayElemType::Time,
+                | ArrayElemType::Time
+                | ArrayElemType::TimestampTz,
                 _,
             ) => format!("{},{}", self.elem.catalog_tag(), self.max_len),
         };
@@ -8177,7 +8186,8 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Numeric { .. }
         | ArrayElemType::Bytea
         | ArrayElemType::SmallInt
-        | ArrayElemType::Time => false,
+        | ArrayElemType::Time
+        | ArrayElemType::TimestampTz => false,
     }
 }
 
@@ -20904,6 +20914,7 @@ mod tests {
             (ArrayElemType::BigInt, "bigint"),
             (ArrayElemType::SmallInt, "smallint"),
             (ArrayElemType::Time, "time"),
+            (ArrayElemType::TimestampTz, "timestamptz"),
             (ArrayElemType::Real, "real"),
             (ArrayElemType::Double, "double"),
             (ArrayElemType::Date, "date"),
@@ -21064,6 +21075,36 @@ mod tests {
         assert_eq!(two.catalog_fields(), ("array", "time,4,d2".to_string()));
         assert_eq!(
             ColumnType::from_catalog_fields("array", "time,4,d2", &mut array_resolver)
+                .expect("decode 2d"),
+            two
+        );
+        let ts = ColumnType::Array(ArrayType::new(ArrayElemType::Timestamp, 4).expect("array ty"));
+        assert_eq!(ts.catalog_fields(), ("array", "timestamp,4".to_string()));
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` の param は `timestamptz,<max_len>`（2 次元は末尾 `d2`）で
+    /// 往復し、既存の `timestamp` の param を変えない。
+    #[test]
+    fn timestamptz_array_param_roundtrips_and_leaves_timestamp_param_unchanged() {
+        let one =
+            ColumnType::Array(ArrayType::new(ArrayElemType::TimestampTz, 4).expect("array ty"));
+        assert_eq!(one.catalog_fields(), ("array", "timestamptz,4".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4", &mut array_resolver)
+                .expect("decode"),
+            one
+        );
+        let two = ColumnType::Array(
+            ArrayType::new(ArrayElemType::TimestampTz, 4)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(
+            two.catalog_fields(),
+            ("array", "timestamptz,4,d2".to_string())
+        );
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4,d2", &mut array_resolver)
                 .expect("decode 2d"),
             two
         );

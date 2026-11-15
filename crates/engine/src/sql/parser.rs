@@ -1722,6 +1722,17 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Time),
+        // timestamptz は列束縛と同じ検査（offset 無しはセッション TimeZone で解釈・範囲外 22008・
+        // 書式不正 22007・未知の TZ 名 22023）を経てから格納する（Issue #3233）。
+        E::TimestampTz => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::TimestampTz, raw)? {
+                Value::TimestampTz(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "timestamptz array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::TimestampTz),
         E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
             Value::Uuid(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
@@ -9123,8 +9134,8 @@ fn bind_array_agg_value(
             ColumnType::Jsonb => ArrayElemType::Jsonb,
             ColumnType::SmallInt => ArrayElemType::SmallInt,
             ColumnType::Time => ArrayElemType::Time,
+            ColumnType::TimestampTz => ArrayElemType::TimestampTz,
             ColumnType::Bpchar(_)
-            | ColumnType::TimestampTz
             | ColumnType::Interval
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
@@ -9212,6 +9223,7 @@ fn resolve_array_agg_input(
             | ArrayElemType::Date
             | ArrayElemType::Timestamp
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Uuid
             | ArrayElemType::Numeric { .. }
             | ArrayElemType::Jsonb

@@ -1087,11 +1087,57 @@ fn time_array_cast_converts_values_and_checks_range() {
     assert_eq!(err_of(&core, "CAST('{x}' AS time[])").wire_code(), "22007");
 }
 
+/// `timestamptz[]` への CAST（Issue #3233）。値・結果の列型・型付き NULL・範囲外・書式不正・
+/// 規則表で `×` の整数配列（`42846`）・timestamp 配列からのセッション TZ 変換。
+#[test]
+fn timestamptz_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-timestamptz");
+    let tz_ty = ColumnType::Array(
+        ArrayType::new(ArrayElemType::TimestampTz, MAX_ARRAY_ELEMENTS).expect("ty"),
+    );
+    let (cell, meta) = first(
+        &core,
+        "CAST('{2026-01-01 10:00:00+09,2026-01-01 00:00:00}' AS timestamptz[])",
+    );
+    // 2026-01-01 01:00:00 UTC と 2026-01-01 00:00:00 UTC（offset 無しはセッション既定の UTC）。
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::TimestampTz(vec![
+            Some(1_767_229_200_000_000),
+            Some(1_767_225_600_000_000)
+        ]))
+    );
+    assert_eq!(meta_type(&meta), Some(tz_ty.clone()));
+    let (cell, meta) = first(&core, "CAST(NULL AS timestamptz[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(tz_ty));
+    // 整数配列 -> timestamptz[] は規則表で `×`（42846）のまま。
+    assert_eq!(
+        err_of(&core, "CAST(ai AS timestamptz[])").wire_code(),
+        "42846"
+    );
+    // text 配列からは要素ごとの io 変換。
+    assert_eq!(
+        value(
+            &core,
+            "CAST(CAST('{2026-01-01 00:00:00+00}' AS text[]) AS timestamptz[])"
+        ),
+        Cell::Array(ArrayValue::TimestampTz(vec![Some(1_767_225_600_000_000)]))
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{x}' AS timestamptz[])").wire_code(),
+        "22007"
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{2026-13-01 00:00:00Z}' AS timestamptz[])").wire_code(),
+        "22008"
+    );
+}
+
 #[test]
 fn arrays_without_a_representable_element_type_are_not_implemented() {
     let (core, _g) = setup("cast-array-unsupported");
     for target in [
-        "timestamptz[]",
         "interval[]",
         "character varying(3)[]",
         "character(3)[]",
@@ -1101,8 +1147,7 @@ fn arrays_without_a_representable_element_type_are_not_implemented() {
         // 規則表で `×` なら 42846 が先に出る（time／timestamptz／interval）。
         for operand in ["ai", "CAST('{1}' AS text)", "NULL"] {
             let e = err_of(&core, &format!("CAST({operand} AS {target})"));
-            let elem_is_impossible =
-                operand == "ai" && ["timestamptz[]", "interval[]"].contains(&target);
+            let elem_is_impossible = operand == "ai" && ["interval[]"].contains(&target);
             let want = if elem_is_impossible { "42846" } else { "0A000" };
             assert_eq!(e.wire_code(), want, "{operand} -> {target}");
         }

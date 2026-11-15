@@ -162,6 +162,8 @@ pub(super) fn common_element_type(kinds: &[CastKind]) -> Result<CastType, SqlSur
             K::Bytea => Ok(CastType::Bytea),
             // 要素がすべて time なら `time[]`（Issue #3232）。他の型との混在は group 不一致で 42804。
             K::Time => Ok(CastType::Time),
+            // 要素がすべて timestamptz なら `timestamptz[]`（Issue #3233）。timestamp との混在は 42804。
+            K::TimestampTz => Ok(CastType::TimestampTz),
             _ => Err(unsupported(
                 "ARRAY of this element type is not supported yet",
             )),
@@ -435,17 +437,14 @@ pub(super) fn own(v: ExprValue<'_>) -> Result<ExprValue<'static>, SqlSurfaceErro
         ExprValue::Date(d) => ExprValue::Date(d),
         ExprValue::Timestamp(t) => ExprValue::Timestamp(t),
         ExprValue::Time(t) => ExprValue::Time(t),
+        ExprValue::TimestampTz(t) => ExprValue::TimestampTz(t),
         ExprValue::Json(s) => ExprValue::Json(Cow::Owned(s.into_owned())),
         ExprValue::JsonText(s) => ExprValue::JsonText(Cow::Owned(s.into_owned())),
         ExprValue::Numeric(d) => ExprValue::Numeric(d),
         ExprValue::Uuid(u) => ExprValue::Uuid(u),
         ExprValue::Bytes(b) => ExprValue::Bytes(Cow::Owned(b.into_owned())),
         ExprValue::Null => ExprValue::Null,
-        ExprValue::Vector(_)
-        | ExprValue::TimestampTz(_)
-        | ExprValue::Interval(_)
-        | ExprValue::Bit(_)
-        | ExprValue::Array(_) => {
+        ExprValue::Vector(_) | ExprValue::Interval(_) | ExprValue::Bit(_) | ExprValue::Array(_) => {
             return Err(SqlSurfaceError::Internal {
                 detail: "array element evaluated to a type that cannot be stored".to_string(),
             })

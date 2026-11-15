@@ -386,6 +386,18 @@ fn write_array(
             quoted(out, &engine::datetime::format_time(*v));
             Ok(())
         })?,
+        // スカラー `timestamptz` と同じく、セッションに依らない UTC の offset 付き（`+00`）で出す
+        // （TABLE-33 (5)。HTTP 面はセッション TimeZone を持たない。Issue #3233）。
+        ArrayValue::TimestampTz(items) => each!(out, items, |out, v| {
+            quoted(
+                out,
+                &engine::datetime::format_timestamptz(
+                    *v,
+                    &engine::datetime::SessionTimeZone::utc(),
+                ),
+            );
+            Ok(())
+        })?,
         ArrayValue::Uuid(items) => each!(out, items, |out, v| {
             quoted(out, &v.to_string());
             Ok(())
@@ -499,6 +511,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
                 engine::catalog::ArrayElemType::Date => "date[]",
                 engine::catalog::ArrayElemType::Timestamp => "timestamp[]",
                 engine::catalog::ArrayElemType::Time => "time[]",
+                engine::catalog::ArrayElemType::TimestampTz => "timestamptz[]",
                 engine::catalog::ArrayElemType::Uuid => "uuid[]",
                 engine::catalog::ArrayElemType::Numeric { .. } => "numeric[]",
                 engine::catalog::ArrayElemType::Bytea => "bytea[]",
@@ -1097,6 +1110,12 @@ mod tests {
                 "time[]",
                 V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)]),
                 r#"["10:00:00",null,"24:00:00"]"#,
+            ),
+            (
+                ArrayElemType::TimestampTz,
+                "timestamptz[]",
+                V::TimestampTz(vec![Some(0), None]),
+                r#"["1970-01-01 00:00:00+00",null]"#,
             ),
             (
                 ArrayElemType::Uuid,

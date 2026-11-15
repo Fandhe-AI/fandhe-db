@@ -9,6 +9,8 @@
 
 ### Changed
 
+- `TIMESTAMPTZ[]`・`TIMESTAMPTZ[n]`・`TIMESTAMP WITH TIME ZONE[]` を配列要素型として受理するようにした（Issue #3233・TABLE-14・TABLE-35・TABLE-33 ポインタ。判断は [array-column-type.md](docs/design/array-column-type.md) の「Issue #3233 追記」）。従来 `0A000` だった形が通り、wire は `_timestamptz`（OID 1185）を公告する。テキスト出力はセッション TimeZone に従い、engine に `ArrayValue::to_pg_text_in_tz`・`to_pg_text_bounded_in_tz` を追加した（既存の `to_pg_text`・`to_pg_text_bounded` は UTC で委譲し、他の要素型の出力は不変）。永続バイト列・一意キー・content hash の既存の値は変えない。`TIMESTAMPTZ(p)[]` は `0A000` のまま。
+  BREAKING CHANGE: 公開 enum `catalog::ArrayElemType`・`row_codec::ArrayValue` に variant `TimestampTz`、wire-server の公開 enum `result_encoder::WireType` に variant `TimestampTzArray` を追加し、定数 `ArrayElemType::ALL_KINDS` の要素数を 16 から 17 にした（網羅 `match` の下流はコンパイルできなくなる。移行は腕の追加）。
 - `RETURNING` がスカラー式と組み込み関数を評価するようにした（Issue #3249・SQL-21 ポインタ。基表への INSERT・UPDATE・DELETE・UPSERT。判断は [sql-returning.md](docs/design/sql-returning.md) の「式・組み込み関数の評価」節）。結果の型・値・列名は同じ式の `SELECT` と一致する。UDF 呼び出し・サブクエリ・集計は従来どおり拒否し、採番列・`id` 省略の INSERT との組み合わせは `0A000` で拒否する。依存の追加はない。
   BREAKING CHANGE: 公開 enum `tenant::TenantWriteError`（`#[non_exhaustive]` ではない）に variant `ReturningExpressionFailed` を追加した（網羅 `match` の下流はコンパイルできなくなる。移行は腕の追加。内側の `SqlSurfaceError` をそのまま透過する）。
 - `RETURNING` が `AS` 別名付きの列参照を受理するようにした（Issue #3248・SQL-21 ポインタ。基表への INSERT・UPDATE・DELETE・UPSERT。判断は [sql-returning.md](docs/design/sql-returning.md) の追記節）。式と `AS` なしの暗黙の別名は従来どおり `42601`。**挙動の変更**: 拒否の文言を原因別に改め、「function-call items」を廃止した。公開 API の変更はない。依存の追加はない。

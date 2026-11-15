@@ -80,6 +80,8 @@ enum Elem {
     Timestamp(i64),
     /// `TIME`（Issue #3232）。0 時起点のマイクロ秒。
     Time(i64),
+    /// `TIMESTAMPTZ`（Issue #3233）。UTC 起点のマイクロ秒。
+    TimestampTz(i64),
     Uuid(Uuid),
     Numeric(Decimal),
     Bytea(Vec<u8>),
@@ -118,7 +120,7 @@ impl Elem {
             Elem::Bool(b) => out.push(u8::from(*b)),
             Elem::Integer(v) | Elem::Date(v) => out.extend_from_slice(&v.to_be_bytes()),
             Elem::SmallInt(v) => out.extend_from_slice(&v.to_be_bytes()),
-            Elem::BigInt(v) | Elem::Timestamp(v) | Elem::Time(v) => {
+            Elem::BigInt(v) | Elem::Timestamp(v) | Elem::Time(v) | Elem::TimestampTz(v) => {
                 out.extend_from_slice(&v.to_be_bytes())
             }
             Elem::Real(v) => out.extend_from_slice(&canon_f64(f64::from(*v))),
@@ -389,6 +391,10 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
             Elem::Time(v) => Some(v),
             _ => None,
         })?),
+        ArrayElemType::TimestampTz => ArrayValue::TimestampTz(collect(elems, |e| match e {
+            Elem::TimestampTz(v) => Some(v),
+            _ => None,
+        })?),
         ArrayElemType::Timestamp => ArrayValue::Timestamp(collect(elems, |e| match e {
             Elem::Timestamp(v) => Some(v),
             _ => None,
@@ -491,6 +497,7 @@ fn elem_from_scalar(
         (ArrayElemType::Date, S::Date(x)) => Elem::Date(*x),
         (ArrayElemType::Timestamp, S::Timestamp(x)) => Elem::Timestamp(*x),
         (ArrayElemType::Time, S::Time(x)) => Elem::Time(*x),
+        (ArrayElemType::TimestampTz, S::TimestampTz(x)) => Elem::TimestampTz(*x),
         (ArrayElemType::Uuid, S::Uuid(u)) => Elem::Uuid(*u),
         (ArrayElemType::Numeric { .. }, S::Numeric(d)) => Elem::Numeric(*d),
         (ArrayElemType::Bytea, S::Bytes(b)) => Elem::Bytea(try_clone_bytes(b)?),
@@ -514,6 +521,7 @@ fn elem_from_scalar(
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),
@@ -552,6 +560,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
         (ArrayElemType::Date, ExprValue::Date(d)) => Elem::Date(d),
         (ArrayElemType::Timestamp, ExprValue::Timestamp(t)) => Elem::Timestamp(t),
         (ArrayElemType::Time, ExprValue::Time(t)) => Elem::Time(t),
+        (ArrayElemType::TimestampTz, ExprValue::TimestampTz(t)) => Elem::TimestampTz(t),
         (ArrayElemType::Uuid, ExprValue::Uuid(u)) => Elem::Uuid(u),
         (ArrayElemType::Numeric { .. }, ExprValue::Numeric(d)) => Elem::Numeric(d),
         (ArrayElemType::Bytea, ExprValue::Bytes(b)) => Elem::Bytea(try_clone_bytes(&b)?),
@@ -574,6 +583,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),
