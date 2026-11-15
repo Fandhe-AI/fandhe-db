@@ -421,6 +421,12 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
                 "array_agg over ENUM elements reached finish",
             ))
         }
+        // `BIT(n)` もスカラー BIT と同じく array_agg 非対応（Issue #3235）。束縛段が拒否する。
+        ArrayElemType::Bit(_) => {
+            return Err(accumulator_bug(
+                "array_agg over BIT elements reached finish",
+            ))
+        }
     })
 }
 
@@ -521,6 +527,7 @@ fn elem_from_scalar(
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Bit(_)
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),
@@ -586,6 +593,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Bit(_)
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),

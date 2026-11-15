@@ -116,6 +116,9 @@ fn each_operator_renders_its_token() {
         ("UNION", "union"),
         ("UNION ALL", "union_all"),
         ("INTERSECT", "intersect"),
+        ("INTERSECT ALL", "intersect_all"),
+        ("UNION DISTINCT", "union"),
+        ("INTERSECT DISTINCT", "intersect"),
         ("EXCEPT", "except"),
     ] {
         let sql = format!("EXPLAIN SELECT k FROM a {kw} SELECT k FROM b");
@@ -307,7 +310,7 @@ fn binding_errors_match_execution() {
         "SELECT k FROM a UNION SELECT k, v FROM a".to_string(),
         "SELECT k FROM a UNION SELECT k FROM b LIMIT 99999999999".to_string(),
         "SELECT e FROM vv UNION SELECT e FROM vv".to_string(),
-        "SELECT k FROM a INTERSECT ALL SELECT k FROM b".to_string(),
+        "SELECT e FROM vv INTERSECT ALL SELECT e FROM vv".to_string(),
         many,
     ];
     for body in &bodies {
