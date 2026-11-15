@@ -135,7 +135,9 @@ fn render_predicate(predicate: &WherePredicate, consts: bool) -> String {
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
-        | WherePredicate::CorrelatedExists(_) => String::new(),
+        | WherePredicate::CorrelatedExists(_)
+        // 行値比較は CHECK 本体の構文段が認識せず `42601` にするため到達しない（#3255）。
+        | WherePredicate::RowCompare { .. } => String::new(),
     }
 }
 
@@ -472,7 +474,8 @@ pub(crate) fn normalize_session_local_predicates(predicates: &mut [WherePredicat
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {}
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => {}
         }
     }
 }
@@ -645,7 +648,8 @@ fn reject_forbidden_predicate(predicate: &WherePredicate) -> Result<(), SqlSurfa
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::unsupported(
                 "NOT over this predicate form is not supported in CHECK constraints",
             )),
         },
@@ -658,6 +662,10 @@ fn reject_forbidden_predicate(predicate: &WherePredicate) -> Result<(), SqlSurfa
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(
             "CHECK constraint predicate must not contain a subquery",
+        )),
+        // 行値比較は CHECK では未対応（構文段が `42601` にするため通常は到達しない。#3255）。
+        WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::unsupported(
+            "row value comparison is not supported in CHECK constraints",
         )),
     }
 }
@@ -709,7 +717,8 @@ fn reject_vector_family_null_tests(
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {}
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => {}
         }
     }
     Ok(())
@@ -894,7 +903,8 @@ fn referenced_column_names(
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {}
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();
@@ -1241,6 +1251,12 @@ pub(crate) fn map_predicate_columns(
         WherePredicate::IdCompare { op, value } => WherePredicate::IdCompare {
             op: *op,
             value: *value,
+        },
+        // 行値比較（#3255）: 各成分の式中の列参照を写像する（成分の列を取りこぼさない）。
+        WherePredicate::RowCompare { lhs, op, rhs } => WherePredicate::RowCompare {
+            lhs: lhs.iter().map(|e| map_expr_idents(e, f)).collect(),
+            op: *op,
+            rhs: rhs.iter().map(|e| map_expr_idents(e, f)).collect(),
         },
         WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
