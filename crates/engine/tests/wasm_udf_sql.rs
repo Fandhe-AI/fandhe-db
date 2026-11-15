@@ -500,3 +500,32 @@ fn expression_index_over_wasm_function_is_rejected() {
         .expect_err("expression index over a WASM function must be rejected");
     assert_eq!(err.wire_code(), "0A000");
 }
+// --- RETURNING からの呼び出し（Issue #3250・SQL-21 のポインタ） ---------------------------
+
+/// WASM UDF は RETURNING でも SELECT と同じ値で評価される（DELETE は削除前の行に対する値）。
+#[test]
+fn real_module_in_returning_matches_select() {
+    let (core, _guard) = new_core_with_docs();
+    let mut session = SessionState::default();
+    register(&mut session, "wfn", &first_times_scalar()).expect("register");
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "DELETE FROM docs WHERE id = 1 RETURNING wfn(embedding, 2.0) AS a \
+             USING OPERATION_ID 'op-wasm-ret'",
+        )
+        .expect("delete returning wasm udf");
+    let SqlOutcome::Returning(out) = outcome else {
+        panic!("expected SqlOutcome::Returning");
+    };
+    assert_eq!(out.result.rows.len(), 1);
+    assert_eq!(
+        float_cell(&out.result.rows[0], 0),
+        f64::from(corpus_first(1) * 2.0)
+    );
+}

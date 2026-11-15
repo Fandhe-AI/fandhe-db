@@ -15476,8 +15476,9 @@ impl<'a> Parser<'a> {
     /// 落とす）。省略時は `Ok(None)`。投影は `SELECT` と同じ許可形状
     /// （[`Self::parse_select_list`]）を再利用するが、[`Projection::Items`] は
     /// 式項目（Issue #3249）まで受理する。ただしスカラーサブクエリ（`42601`）と集計関数
-    /// （選択リスト構文解析が `42601`。多層防御の `42803`）は拒否する。UDF 呼び出しは束縛段が空の
-    /// UDF レジストリで解決して未定義関数として拒否する（受け皿 #3250）。
+    /// （選択リスト構文解析が `42601`。多層防御の `42803`）は拒否する。UDF 呼び出しは束縛段が
+    /// セッションの UDF レジストリで解決する（Issue #3250。宣言的・WASM UDF は評価、
+    /// `LANGUAGE sql|plpgsql` 関数は書き込み前に `0A000`、未定義は `42883`）。
     /// `*` と他項目の併用は `0A000`（未対応）。
     fn parse_returning_clause(&mut self) -> Result<Option<Projection>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("RETURNING") {
