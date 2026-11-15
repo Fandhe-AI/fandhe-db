@@ -49,7 +49,7 @@ use crate::sql::allowlist::{
 };
 use crate::sql::cell_sort::{sort_rows, OrderClass, OrderKeyPlan};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
-use crate::sql::join::values::{cmp_class, CmpClass, CmpVal};
+use crate::sql::join::values::{cmp_class, CmpClass};
 use crate::sql::order_value::NullPlacement;
 use crate::sql::udf_call::UdfRegistry;
 
@@ -1007,12 +1007,7 @@ fn charge_sort_budget(
     rows: usize,
     keys: usize,
 ) -> Result<(), SqlSurfaceError> {
-    let per_key = std::mem::size_of::<Option<CmpVal<'static>>>();
-    let per_row = keys
-        .checked_mul(per_key)
-        .and_then(|k| k.checked_add(std::mem::size_of::<usize>().checked_mul(2)?))
-        .and_then(|k| k.checked_add(std::mem::size_of::<Option<ResultRow>>()));
-    match per_row.and_then(|p| p.checked_mul(rows)) {
+    match crate::sql::cell_sort::sort_alloc_bytes(rows, keys) {
         Some(total) => budget.charge(total),
         None => Err(SqlSurfaceError::payload_too_large(
             "set operation exceeds the shared result byte budget",

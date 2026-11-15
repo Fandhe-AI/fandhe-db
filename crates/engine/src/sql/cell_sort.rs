@@ -54,6 +54,25 @@ pub(crate) fn order_val<'a>(
     }
 }
 
+/// 行ごとに先に取り出した 1 キー分の比較値。レコード列はセルの借用のまま持ち、比較時に
+/// フィールドごとに取り出す（経路長に比例する複製を作らない）。
+enum SortKey<'a> {
+    Scalar(Option<CmpVal<'a>>),
+    Record(&'a Cell),
+}
+
+/// [`sort_rows`] が確保する領域の概算バイト数（呼び出し側が確保前に共有バイト予算へ計上する用）。
+/// 行別キー配列の外側（行ごとの `Vec` ヘッダー）・実 `SortKey` 本体・添字列とソート作業領域・
+/// 並べ替え用スロットを含む。算術は `checked_*` で行い、オーバーフローは `None`。
+pub(crate) fn sort_alloc_bytes(rows: usize, keys: usize) -> Option<usize> {
+    let per_row = keys
+        .checked_mul(std::mem::size_of::<SortKey<'static>>())?
+        .checked_add(std::mem::size_of::<Vec<SortKey<'static>>>())?
+        .checked_add(std::mem::size_of::<usize>().checked_mul(2)?)?
+        .checked_add(std::mem::size_of::<Option<ResultRow>>())?;
+    per_row.checked_mul(rows)
+}
+
 /// 行を外側 `ORDER BY`（列キーのみ）のキーで安定ソートする。キーの比較値は先に行ごとへ展開し
 /// （比較器からエラーを返せないため）、行の添字列だけを `sort_by`（安定）で並べ替える。
 /// 比較値の個数は「行数 × キー数（`MAX_SCALAR_ORDER_KEYS` 以下）」で、行数は本文の
@@ -62,12 +81,6 @@ pub(crate) fn sort_rows(
     rows: Vec<ResultRow>,
     order: &[OrderKeyPlan],
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
-    /// 行ごとに先に取り出した 1 キー分の比較値。レコード列はセルの借用のまま持ち、比較時に
-    /// フィールドごとに取り出す（経路長に比例する複製を作らない）。
-    enum SortKey<'a> {
-        Scalar(Option<CmpVal<'a>>),
-        Record(&'a Cell),
-    }
     // 比較器からはエラーを返せないため、最初のエラーを保持して `Equal` を返し、整列後に返す。
     let failure: std::cell::RefCell<Option<SqlSurfaceError>> = std::cell::RefCell::new(None);
     let idx = {
