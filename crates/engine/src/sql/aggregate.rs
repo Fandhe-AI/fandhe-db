@@ -1090,10 +1090,7 @@ impl Accumulator {
             // を構造的に拒否済みのため、ここへ到達する `item.func` は常に
             // `Count`。念のため多層防御として確認する（`accumulator_bug` は
             // untrusted 入力起因ではなく実装バグ検出用）。
-            if matches!(
-                item.func,
-                AggregateFunc::StringAgg | AggregateFunc::ArrayAgg
-            ) {
+            if item.func == AggregateFunc::StringAgg || item.func.uses_array_agg_state() {
                 // `string_agg`・`array_agg` の `DISTINCT` は状態の内部で重複を除く（SQL-57）。
                 return Self::new(item.func, &item.input);
             }
@@ -1142,9 +1139,10 @@ impl Accumulator {
                 AggregateFunc::BoolOr,
                 AggregateInput::BooleanColumn(_) | AggregateInput::BoolExpr { .. },
             ) => Accumulator::BoolOr(None),
-            (AggregateFunc::ArrayAgg, AggregateInput::ArrayAgg(inp)) => {
-                Accumulator::ArrayAgg(Box::new(crate::sql::array_agg::ArrayAggState::new(inp)))
-            }
+            (
+                AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg,
+                AggregateInput::ArrayAgg(inp),
+            ) => Accumulator::ArrayAgg(Box::new(crate::sql::array_agg::ArrayAggState::new(inp))),
             (AggregateFunc::StringAgg, AggregateInput::StringAgg(inp)) => {
                 Accumulator::StringAgg(Box::new(crate::sql::string_agg::StringAggState::new(inp)))
             }
@@ -2481,7 +2479,8 @@ impl Accumulator {
             // 仮の値。`sql::group_by::finish_groups` が直後にセット番号から確定値で上書きする。
             Accumulator::Grouping => Cell::Null,
             Accumulator::ArrayAgg(state) => match state.finish()? {
-                Some(array) => Cell::Array(array),
+                Some(crate::sql::array_agg::ArrayAggFinished::Array(array)) => Cell::Array(array),
+                Some(crate::sql::array_agg::ArrayAggFinished::Json(text)) => Cell::Json(text),
                 None => Cell::Null,
             },
             Accumulator::VarianceExact {
@@ -3359,6 +3358,8 @@ pub(crate) fn aggregate_result_type(
         ) => ColumnType::Boolean,
         // `array_agg` は入力の型の 1 次元配列（要素数の上限は `MAX_ARRAY_ELEMENTS`）。公告できない
         // 要素型（`ArrayType::new` が拒否する位取り）は `None`（wire では text フォールバック）。
+        (AggregateFunc::JsonAgg, AggregateInput::ArrayAgg(_)) => ColumnType::Json,
+        (AggregateFunc::JsonbAgg, AggregateInput::ArrayAgg(_)) => ColumnType::Jsonb,
         (AggregateFunc::ArrayAgg, AggregateInput::ArrayAgg(inp)) => ColumnType::Array(
             crate::catalog::ArrayType::new(inp.elem, crate::catalog::MAX_ARRAY_ELEMENTS).ok()?,
         ),

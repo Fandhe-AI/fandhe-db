@@ -435,9 +435,9 @@ fn bind_aggregate_call(
         });
     }
     // `array_agg` も同じ理由で FROM なしは対象外（SQL-57・Issue #1801）。
-    if agg.func == AggregateFunc::ArrayAgg {
+    if agg.func.uses_array_agg_state() {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "array_agg without FROM is not supported".to_string(),
+            detail: format!("{} without FROM is not supported", agg.func.default_alias()),
         });
     }
     // `FILTER (WHERE ...)` の FROM なし集計は対象外（SQL-57・Issue #1806。fail-closed）。

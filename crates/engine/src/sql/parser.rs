@@ -7558,6 +7558,19 @@ pub(crate) struct ArrayAggInput {
     pub(crate) keys: Vec<StringAggOrderKey>,
     /// `DISTINCT`（重複判定は要素値の正準形。NULL 要素は 1 個だけ残す）。
     pub(crate) distinct: bool,
+    /// 確定時の出力形（`array_agg` は配列、`json_agg`・`jsonb_agg` は JSON 配列。Issue #3264）。
+    pub(crate) output: ArrayAggOutput,
+}
+
+/// [`ArrayAggInput`] の出力形（Issue #3264）。状態・束縛は共通で、確定時の写し先だけが違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArrayAggOutput {
+    /// `array_agg`: 要素型の 1 次元配列。
+    Array,
+    /// `json_agg`: `json` 型の配列テキスト（区切りは `, `）。
+    Json,
+    /// `jsonb_agg`: `jsonb` 型の配列テキスト（正規形）。
+    Jsonb,
 }
 
 /// [`ArrayAggInput`] の要素の取得元。
@@ -7767,9 +7780,9 @@ impl BoundAggregateItem {
         }
         // `string_agg` は SQL 表層のみ（SQL-57。NoSQL 表層は対象外）。2 引数・内側 ORDER BY を
         // 持てないこの入口では構文層の拒否（`42601`）と同じ分類で拒否する。
-        if matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg) {
+        if func == AggregateFunc::StringAgg || func.uses_array_agg_state() {
             return Err(SqlSurfaceError::unsupported(
-                "string_agg and array_agg are not supported by this interface",
+                "string_agg, array_agg, json_agg and jsonb_agg are not supported by this interface",
             ));
         }
         // 分散系（SQL-57・Issue #1803）も SQL 表層のみ（NoSQL 表層は対象外）。多層防御として拒否する。
@@ -8794,7 +8807,7 @@ fn resolve_aggregate_item_input(
     if item.func == crate::sql::allowlist::AggregateFunc::StringAgg {
         return resolve_string_agg_input(item, schema, udfs, node_budget);
     }
-    if item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg {
+    if item.func.uses_array_agg_state() {
         return resolve_array_agg_input(item, schema, udfs, node_budget);
     }
     if item.func.is_bool_agg() {
@@ -9116,6 +9129,7 @@ fn bind_array_agg_value(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
+    fname: &str,
 ) -> Result<(ArrayAggValue, crate::catalog::ArrayElemType), SqlSurfaceError> {
     use crate::catalog::ArrayElemType;
 
@@ -9130,9 +9144,9 @@ fn bind_array_agg_value(
             .find(|(_, c)| &c.name == name)
         else {
             if name == "id" && schema.has_pseudo_id() {
-                return Err(unsupported(
-                    "array_agg over the id pseudo column is not supported",
-                ));
+                return Err(unsupported(&format!(
+                    "{fname} over the id pseudo column is not supported"
+                )));
             }
             return Err(SqlSurfaceError::undefined_column(name));
         };
@@ -9165,9 +9179,9 @@ fn bind_array_agg_value(
             | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Enum(_) => {
-                return Err(unsupported(
-                    "array_agg over this column type is not supported yet",
-                ))
+                return Err(unsupported(&format!(
+                    "{fname} over this column type is not supported yet"
+                )))
             }
         };
         *node_budget = node_budget
@@ -9214,11 +9228,23 @@ fn resolve_array_agg_input(
         }
     };
     if !item.extra_args.is_empty() {
-        return Err(SqlSurfaceError::undefined_function(
-            "function array_agg requires exactly one argument",
-        ));
+        return Err(SqlSurfaceError::undefined_function(format!(
+            "function {} requires exactly one argument",
+            item.func.default_alias()
+        )));
     }
-    let (value, elem) = bind_array_agg_value(value_expr, schema, udfs, node_budget)?;
+    let output = match item.func {
+        crate::sql::allowlist::AggregateFunc::JsonAgg => ArrayAggOutput::Json,
+        crate::sql::allowlist::AggregateFunc::JsonbAgg => ArrayAggOutput::Jsonb,
+        _ => ArrayAggOutput::Array,
+    };
+    let (value, elem) = bind_array_agg_value(
+        value_expr,
+        schema,
+        udfs,
+        node_budget,
+        item.func.default_alias(),
+    )?;
     let orders_by_value = item.distinct || item.order_by.iter().any(|k| k.expr == *value_expr);
     if orders_by_value {
         match elem {
@@ -9229,8 +9255,10 @@ fn resolve_array_agg_input(
             }
             ArrayElemType::Bytea => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "DISTINCT or ORDER BY over bytea in array_agg is not supported yet"
-                        .to_string(),
+                    detail: format!(
+                        "DISTINCT or ORDER BY over bytea in {} is not supported yet",
+                        item.func.default_alias()
+                    ),
                 })
             }
             // 比較・順序づけに支障のない要素型。要素型の追加時に判断を強制する（Issue #3229）。
@@ -9286,6 +9314,7 @@ fn resolve_array_agg_input(
         elem,
         keys,
         distinct: item.distinct,
+        output,
     })))
 }
 
@@ -13073,7 +13102,9 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             ColumnType::Boolean
         }
         // 配列は式中の列として扱えない（`array_agg(x) || ...` などは `22000`。SQL-57）。
-        AggregateFunc::ArrayAgg => EXPR_UNSUPPORTED_COLUMN_TYPE,
+        AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg => {
+            EXPR_UNSUPPORTED_COLUMN_TYPE
+        }
         // 分散系（SQL-57・Issue #1803）: numeric 結果（整数系・`id`・numeric 列）は式内で扱えない列、
         // 浮動小数列・数値式の入力は double 結果。
         AggregateFunc::Variance
@@ -13136,7 +13167,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
 /// SQL-57・SQL-72 (4) の範囲外。`group_by::cmp_cell_values` は未定義の組を等値として扱うため、
 /// 通すと並びが黙って崩れる。束縛時に拒否する。Issue #2038）。
 fn is_unorderable_aggregate(item: &BoundAggregateItem) -> bool {
-    item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg
+    item.func.uses_array_agg_state()
         || matches!(
             item.input,
             AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
