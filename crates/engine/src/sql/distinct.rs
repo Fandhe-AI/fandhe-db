@@ -151,25 +151,27 @@ fn resolve_alias(name: &str, projection: &Projection) -> Result<Expr, SqlSurface
     let Projection::Items(items) = projection else {
         return Ok(Expr::Ident(name.to_string()));
     };
-    let mut found: Option<&Expr> = None;
+    let mut found: Option<Expr> = None;
     for item in items {
-        // 明示別名がなければ PostgreSQL と同じく暗黙の出力名（関数呼び出しは関数名）を使う。
+        // 明示別名がなければ PostgreSQL と同じく暗黙の出力名（通常列は列名・関数呼び出しは関数名）を使う。
         let (expr, matches) = match item {
             SelectItem::Expr {
                 expr,
                 alias: Some(alias),
-            } => (expr, alias == name),
+            } => (expr.clone(), alias == name),
             SelectItem::Expr { expr, alias: None } => match expr {
-                Expr::Call { name: f, .. } => (expr, f.eq_ignore_ascii_case(name)),
+                Expr::Call { name: f, .. } => (expr.clone(), f.eq_ignore_ascii_case(name)),
                 _ => continue,
             },
+            // 通常列の暗黙の出力名は列名自身。明示別名との同名衝突を曖昧として検出するため候補に含める。
+            SelectItem::Column(c) if c != "*" => (Expr::Ident(c.clone()), c == name),
             _ => continue,
         };
         if !matches {
             continue;
         }
-        match found {
-            Some(prev) if prev != expr => {
+        match &found {
+            Some(prev) if *prev != expr => {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "SELECT DISTINCT ON key is ambiguous among output column names",
                 ));
@@ -177,9 +179,7 @@ fn resolve_alias(name: &str, projection: &Projection) -> Result<Expr, SqlSurface
             _ => found = Some(expr),
         }
     }
-    Ok(found
-        .cloned()
-        .unwrap_or_else(|| Expr::Ident(name.to_string())))
+    Ok(found.unwrap_or_else(|| Expr::Ident(name.to_string())))
 }
 
 fn resolve_ordinal(position: i64, projection: &Projection) -> Result<Expr, SqlSurfaceError> {
@@ -377,6 +377,30 @@ mod tests {
     fn distinct_on_prefix_ignores_duplicate_order_keys() {
         // ORDER BY lang, id, lang は重複キーを除くと lang, id で先頭一致（PostgreSQL 準拠）。
         assert!(check(&["lang"], &["lang", "id", "lang"]).is_ok());
+    }
+
+    #[test]
+    fn distinct_on_prefix_rejects_column_and_alias_name_collision() {
+        // SELECT DISTINCT ON (lang) lang, id AS lang ... ORDER BY body
+        let proj = Projection::Items(vec![
+            SelectItem::Column("lang".to_string()),
+            SelectItem::Expr {
+                expr: id("id"),
+                alias: Some("lang".to_string()),
+            },
+        ]);
+        let err = check_distinct_on_order_prefix(&[id("lang")], &proj, &[sk("body")], &[])
+            .expect_err("same output name for different exprs is ambiguous");
+        assert_eq!(err.wire_code(), "0A000");
+        // 同一式の重複は曖昧にならない。
+        let proj = Projection::Items(vec![
+            SelectItem::Column("lang".to_string()),
+            SelectItem::Expr {
+                expr: id("lang"),
+                alias: Some("lang".to_string()),
+            },
+        ]);
+        assert!(check_distinct_on_order_prefix(&[id("lang")], &proj, &[sk("lang")], &[]).is_ok());
     }
 
     #[test]
