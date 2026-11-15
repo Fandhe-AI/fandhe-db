@@ -10793,7 +10793,8 @@ impl<'a> Parser<'a> {
     /// 要素が数値でない・混在・`NULL`・`$n`・空・`BETWEEN SYMMETRIC` は `42601`、
     /// 要素数上限は push の前に `54000`。生成する比較のノードは式ノード予算へ課金する。
     /// 先頭が `<Ident> [NOT] IN ( <Number>` または `<Ident> [NOT] BETWEEN <Number>`
-    /// でなければ `Ok(None)`（位置不変）。CHECK 本体では常に `Ok(None)`。
+    /// でなければ `Ok(None)`（位置不変）。CHECK 本体も WHERE と同じ展開で受理する（Issue #3244。
+    /// 展開で生じる `Or` は `check_constraint` が許可する）。
     fn try_parse_numeric_list_leaf(
         &mut self,
     ) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
@@ -10809,9 +10810,6 @@ impl<'a> Parser<'a> {
     fn try_parse_numeric_list_leaf_inner(
         &mut self,
     ) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
-        if self.in_check_body {
-            return Ok(None);
-        }
         let Some(Token::Ident(col)) = self.peek().cloned() else {
             return Ok(None);
         };

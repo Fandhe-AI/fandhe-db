@@ -176,26 +176,224 @@ fn create_table_rejects_check_calling_visible() {
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// Issue #1184: WHERE で受理する `NOT ( ... )`・数値の `IN`／`BETWEEN` は、CHECK 本体
-/// （TABLE-16）では従来どおり `42601` のまま（脱糖後の形が CHECK の許可形と区別
-/// できず、受理範囲が黙って広がるのを防ぐ。解禁は後続 Issue で扱う）。
-/// tracked: #3244
+/// Issue #3244・TABLE-16・SQL-24: CHECK の `IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL` は
+/// 受理され、NULL の扱いが PG と同じ（`IS NOT NULL` だけが NULL を違反にする）。
+/// 末尾 `;` 付きの単独文でも同じ。違反した文は副作用を残さず、文言に値を含めない。
 #[test]
-fn create_table_rejects_numeric_in_and_between_in_check() {
-    let (core, path) = new_core("check-1184-forms");
+fn check_in_between_is_null_forms_follow_pg_null_semantics() {
+    // (CHECK 本体, 合格する n, 違反する n, NULL が合格するか)
+    let cases: [(&str, &str, &str, bool); 6] = [
+        ("n IN (1, 2)", "1", "3", true),
+        ("n NOT IN (1, 2)", "3", "1", true),
+        ("n BETWEEN 1 AND 3", "2", "4", true),
+        ("n NOT BETWEEN 1 AND 3", "4", "2", true),
+        ("n IS NOT NULL", "1", "NULL", false),
+        ("n IS NULL", "NULL", "1", true),
+    ];
+    for (idx, (cond, ok_value, bad_value, null_passes)) in cases.into_iter().enumerate() {
+        let (core, path) = new_core(&format!("check-3244-{idx}"));
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+        let mut session = granted_session();
+        core.execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            &format!("CREATE TABLE docs (n INTEGER, CHECK ({cond}));"),
+        )
+        .unwrap_or_else(|e| panic!("{cond}: CREATE TABLE must succeed: {e:?}"));
+
+        core.execute_insert_sql(
+            &alice,
+            &format!("INSERT INTO docs (id, n) VALUES (1, {ok_value}) USING OPERATION_ID 'ok-1';"),
+        )
+        .unwrap_or_else(|e| panic!("{cond}: n={ok_value} must pass: {e:?}"));
+
+        let err = core
+            .execute_insert_sql(
+                &alice,
+                &format!(
+                    "INSERT INTO docs (id, n) VALUES (2, {bad_value}) USING OPERATION_ID 'bad-2';"
+                ),
+            )
+            .expect_err("violating row must be rejected");
+        assert_eq!(err.wire_code(), "23514", "{cond}: n={bad_value}");
+        assert!(err.client_message().contains("docs_check"), "{cond}");
+
+        let null_result = core.execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, n) VALUES (3, NULL) USING OPERATION_ID 'null-3';",
+        );
+        if null_passes {
+            null_result.unwrap_or_else(|e| panic!("{cond}: NULL must pass: {e:?}"));
+        } else {
+            assert_eq!(
+                null_result.expect_err("NULL must violate").wire_code(),
+                "23514",
+                "{cond}"
+            );
+        }
+
+        // 違反した文は行を残さない（合格した行だけが見える）。
+        let expected = if null_passes { 2 } else { 1 };
+        assert_eq!(
+            select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
+            expected,
+            "{cond}"
+        );
+    }
+}
+
+/// Issue #3244: 文字列の `IN`／`NOT IN`／`IS NOT NULL`（TEXT 列）と、UPDATE 経路の強制。
+#[test]
+fn check_text_in_not_in_and_update_are_enforced() {
+    let (core, path) = new_core("check-3244-text");
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (kind TEXT, CHECK (kind IN ('a', 'b')), CHECK (kind NOT IN ('x')));",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, kind) VALUES (1, 'a') USING OPERATION_ID 'i1';",
+    )
+    .expect("a passes");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, kind) VALUES (2, NULL) USING OPERATION_ID 'i2';",
+    )
+    .expect("NULL passes");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, kind) VALUES (3, 'c') USING OPERATION_ID 'i3';",
+        )
+        .expect_err("c violates IN");
+    assert_eq!(err.wire_code(), "23514");
 
-    for cond in ["n IN (1, 2)", "n BETWEEN 1 AND 3"] {
+    let err = core
+        .execute_sql_in_session_legacy(
+            &alice,
+            &mut SessionState::default(),
+            "UPDATE docs SET kind = 'zzz' WHERE id = 1 USING OPERATION_ID 'u1'",
+        )
+        .expect_err("UPDATE to a value outside IN must be rejected");
+    assert_eq!(err.wire_code(), "23514");
+    assert_eq!(
+        select_count(
+            &core,
+            &alice,
+            "SELECT id FROM docs WHERE kind = 'a' LIMIT 100"
+        ),
+        1
+    );
+}
+
+/// Issue #3244: 数値の `IN`／`NOT BETWEEN`（OR 展開）でしか参照されない列も依存列として記録され、
+/// `ALTER TABLE ... DROP COLUMN` が拒否される（取りこぼすと fail-open）。改名後も新しい名前で強制される。
+#[test]
+fn or_expanded_check_records_dependency_and_follows_rename() {
+    let (core, path) = new_core("check-3244-deps");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER CHECK (a IN (1, 2)), b INTEGER CHECK (b NOT BETWEEN 1 AND 3))",
+    )
+    .expect("create table");
+
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN a TO a2",
+    )
+    .expect("rename column");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a2, b) VALUES (1, 9, 5) USING OPERATION_ID 'r1'",
+        )
+        .expect_err("renamed column keeps the IN check");
+    assert_eq!(err.wire_code(), "23514");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a2, b) VALUES (2, 1, 5) USING OPERATION_ID 'r2'",
+    )
+    .expect("satisfying row");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    for column in ["a2", "b"] {
+        let err = storage
+            .alter_table_drop_column("docs", column)
+            .expect_err("dropping an OR-expanded CHECK dependency must be rejected");
+        assert!(
+            matches!(
+                err,
+                engine::catalog::CatalogError::DependentObjectsStillExist(_)
+            ),
+            "{column}"
+        );
+    }
+}
+
+/// Issue #3244: `ALTER TABLE ADD CHECK` も新しい形を受け付け、以降の INSERT で強制される。
+#[test]
+fn alter_table_add_check_accepts_in_between_is_null() {
+    let (core, path) = new_core("check-3244-add");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (n INTEGER)")
+        .expect("create table");
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs ADD CHECK (n BETWEEN 1 AND 10)",
+    )
+    .expect("ADD CHECK with BETWEEN");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, n) VALUES (1, 5) USING OPERATION_ID 'a1'",
+    )
+    .expect("in range");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, n) VALUES (2, 11) USING OPERATION_ID 'a2'",
+        )
+        .expect_err("out of range");
+    assert_eq!(err.wire_code(), "23514");
+}
+
+/// Issue #3244: 未対応の形は fail-closed のまま（式を左辺にとる形・TEXT の `BETWEEN`・数値列 ×
+/// 文字列要素の `IN`・vector 系列の `IS NULL`）。
+/// intentional: docs/design/sql-check-constraint.md
+#[test]
+fn unsupported_in_between_null_forms_stay_rejected_in_check() {
+    let (core, path) = new_core("check-3244-reject");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    for (cond, code) in [
+        ("n + 1 IS NULL", "42601"),
+        ("n + 1 IN (1, 2)", "42601"),
+        ("kind BETWEEN 'a' AND 'z'", "22000"),
+        ("n IN ('1', '2')", "22000"),
+    ] {
         let err = core
             .execute_sql_in_session_legacy(
                 &alice,
                 &mut session,
                 &format!("CREATE TABLE docs (kind TEXT, n INTEGER, CHECK ({cond}))"),
             )
-            .expect_err("new WHERE-only forms must be rejected in CHECK");
-        assert_eq!(err.wire_code(), "42601", "{cond}");
+            .expect_err("unsupported form must be rejected");
+        assert_eq!(err.wire_code(), code, "{cond}");
     }
 }
 
