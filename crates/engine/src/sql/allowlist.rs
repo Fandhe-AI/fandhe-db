@@ -30531,7 +30531,7 @@ pub enum CopyFormat {
 pub struct ValidatedCopyFrom {
     /// INTO 相当で指定され、カタログ存在確認を通過したテーブル名。
     pub table_name: String,
-    /// 列リストの宣言順（`id` 疑似列を必ず含む。重複はここで拒否済み）。
+    /// 列リストの宣言順（重複はここで拒否済み）。空は列リストの省略で、束縛段（`sql::copy`）が全列を補う（Issue #3252）。
     pub columns: Vec<String>,
     pub format: CopyFormat,
     /// 解決済みの `WITH` オプション（Issue #1763 で解決、Issue #1764 で `sql::copy` が適用）。
@@ -30943,8 +30943,8 @@ impl Parser<'_> {
     }
 }
 
-/// `COPY <table> (<col>[, <col>]*) FROM STDIN [WITH] [(FORMAT text|csv)]
-/// USING OPERATION_ID '<id>' [;]` を構造判定する（Issue #939・WIRE-17）。
+/// `COPY <table> [(<col>[, <col>]*)] FROM STDIN [WITH] [(FORMAT text|csv)]
+/// USING OPERATION_ID '<id>' [;]` を構造判定する（Issue #939・WIRE-17。列リスト省略は Issue #3252）。
 fn validate_copy_from_tokens(
     rest: &[Token],
     lookup: &impl TableLookup,
@@ -30953,16 +30953,21 @@ fn validate_copy_from_tokens(
     let mut p = Parser::new(rest);
     let table_name = p.expect_ident()?;
 
-    p.expect_punct('(')?;
-    let mut columns = vec![p.expect_ident()?];
-    while matches!(p.peek(), Some(Token::Punct(','))) {
+    // 列リストは省略できる（Issue #3252）。省略時は空のまま返し、全列の補完は束縛段
+    // （`sql::copy::CopyInSession::new`）が表のスキーマを見て行う。`()`（空の括弧）は従来どおり拒否する。
+    let mut columns: Vec<String> = Vec::new();
+    if matches!(p.peek(), Some(Token::Punct('('))) {
         p.advance();
-        if columns.len() >= MAX_COLUMN_COUNT {
-            return Err(SqlSurfaceError::unsupported("too many COPY columns"));
-        }
         columns.push(p.expect_ident()?);
+        while matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            if columns.len() >= MAX_COLUMN_COUNT {
+                return Err(SqlSurfaceError::unsupported("too many COPY columns"));
+            }
+            columns.push(p.expect_ident()?);
+        }
+        p.expect_punct(')')?;
     }
-    p.expect_punct(')')?;
 
     p.expect_keyword(Keyword::From)?;
     p.expect_contextual_keyword("STDIN")?;
@@ -31052,7 +31057,7 @@ fn parse_copy_to_tail(
 
 /// `COPY <ident> [(...)] TO ...` の形か（テーブル形 `COPY ... TO STDOUT` の判定。Issue #1771）。
 /// 先頭が識別子で、任意の括弧グループの直後が文脈キーワード `TO` のときだけ真。
-/// `FROM STDIN` 形（列リスト必須）には影響しない。
+/// `FROM STDIN` 形（列リスト省略可。Issue #3252）には影響しない。
 fn is_copy_table_to_form(rest: &[Token]) -> bool {
     let after_name = match rest.split_first() {
         // 引用符付き `"null"` 等は字句段が QuotedNull／QuotedBoolWord で返す。
