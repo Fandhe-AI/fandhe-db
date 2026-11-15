@@ -538,8 +538,12 @@ pub(crate) fn validate_data_modifying_cte(
             }
             cols.clone()
         }
-        // 関数呼び出し項目は RETURNING の構造検証で拒否済み（防御的に fail-closed）。
-        Projection::Items(_) => return Err(data_modifying_cte_unsupported()),
+        // 別名付き列参照（Issue #3248 で構文段が受理）は CTE 展開が未対応（#3251）。式は構文段で拒否済み。
+        Projection::Items(_) => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "RETURNING column aliases in a data-modifying CTE are not supported yet",
+            ));
+        }
     };
     if !def.column_aliases.is_empty() {
         if def.column_aliases.len() > exposed.len() {

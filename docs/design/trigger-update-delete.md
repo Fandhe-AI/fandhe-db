@@ -30,7 +30,7 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
 | SQL の UPDATE／DELETE（上記 3 形。ビュー経由・データ変更 CTE の副文も同じフォーム関数を通るため INSERT と同様に発火する） | 発火 |
 | 分割実行 DML | 行トリガは発火（Issue #3283）。文トリガ・子表のトリガは `0A000` |
 | `RETURNING` 付きの UPDATE／DELETE（id 指定形・述語形） | 発火（Issue #3192。返る行は書いた最終 NEW、DELETE は削除前の値。[sql-returning.md](sql-returning.md)） |
-| UPSERT（`ON CONFLICT`） | INSERT・UPDATE のどちらかのトリガがあれば `0A000`（`DO UPDATE` を発火させるのは後続） |
+| UPSERT（`ON CONFLICT`） | 発火（#3191。`DO UPDATE` の更新側で BEFORE／AFTER ROW UPDATE。[trigger-upsert.md](trigger-upsert.md)）。`RETURNING` 付きは `0A000` |
 | NoSQL（HTTP）表層の単一行・述語形の更新・削除（Issue #3282 で結線。入口が通過証と発火元の主体の写しを渡し、SQL 表層と同じ実行器・発火計画を使う） | 発火する |
 | NoSQL の `RETURNING` 付き更新・削除、結合形（`UPDATE ... FROM`／`DELETE ... USING`）の `RETURNING`、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000`（意図的に未結線） |
 | 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | ROW トリガは子行ごとに発火（Issue #3284 の実装記録。`constraint/referential_triggers.rs`）。親にトリガが無くても、文の開始時にカタログの FK 宣言から静的に判定して発火経路に載せる。自己参照 FK の対象表自身も子表に数える。子表の文トリガと、結線の無い経路は `0A000` |
@@ -76,7 +76,7 @@ AFTER の失敗は文全体の失敗で、同じ write txn の単一 commit な�
 
 ## 引き継ぎ
 
-- UPSERT の発火、`WHEN` の評価（NEW／OLD の列修飾の束縛を要する）。`RETURNING` の最終値の投影は Issue #3192 で結線済み
+- `WHEN` の評価（NEW／OLD の列修飾の束縛を要する）。UPSERT の発火は #3191、`RETURNING` の最終値の投影は Issue #3192 で結線済み（`RETURNING` 付き UPSERT は `0A000` のまま）
 - 結合形 DML の SQL dispatch の結線（現状は `0A000`）
 - 入れ子の深さ上限（#1727）、自己変更の衝突 27000 と窓口の UPDATE／DELETE（#2226）
 - 分割実行の途中のチャンクで DDL によりトリガが追加された場合は、既存の部分完了の写像に従う

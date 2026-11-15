@@ -79,7 +79,7 @@ use std::fmt;
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
 use crate::sparse::text_eval::TextSearchError;
 use crate::sparse::text_query::TextQuery;
-use crate::sparse::{Bm25Params, ScoredDoc, SparseError, SparseIndex};
+use crate::sparse::{Bm25Params, ScoredDoc, SparseError, SparseIndex, VisibleDocs};
 use crate::text_query_limits::TextQueryLimits;
 
 /// 検索プールの深さ・k の上限。明示 `LIMIT` の設定可能なハード上限
@@ -1757,7 +1757,7 @@ fn hybrid_search_inner(
         .into());
     }
 
-    let visible_ids: std::collections::BTreeSet<u64> = input.ids.iter().copied().collect();
+    let visible_ids = VisibleIdSet::from_ids(input.ids);
 
     // 密プール境界の同点グループ完全化（Issue #310・Issue #320）: `cfg.pool_depth()`
     // ちょうどで要求すると、境界（`pool_depth` 番目と `pool_depth + 1` 番目）が
@@ -1819,7 +1819,7 @@ fn hybrid_search_inner(
         // 行 `id` ではなくアリーナのスロット番号を渡し、同一 `id` の別テナント行が
         // 1 エントリへ畳み込まれないようにしている（`tests/row_id_tenant_scope.rs`
         // が固定）。
-        if hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
+        if hits.iter().any(|hit| !visible_ids.contains(hit.id)) {
             return Err(HybridError::ProviderResultRejected.into());
         }
         // 拡張取得列（`dense_fetch_k` 件。`pool_depth` を超えうる）全体に対し、
@@ -1892,7 +1892,8 @@ fn hybrid_search_inner(
     let (sparse_hits, sparse_limit) = sparse_refetch_loop(
         sparse_index,
         query_text,
-        &visible_ids,
+        visible_ids.as_docs(),
+        visible_ids.len(),
         cfg,
         bm25,
         |_fetch_k| {},
@@ -1905,6 +1906,61 @@ fn hybrid_search_inner(
     apply_soft_boost(&mut fused, rules, cfg)?;
     fused.truncate(k);
     Ok(fused)
+}
+
+/// hybrid 検索の可視 id 集合（Issue #3221）。呼び出し元（`sql/exec.rs`）が渡す
+/// `input.ids`（アリーナのスロット番号）が `0..n` の恒等列のとき（全可視の形）、
+/// 毎クエリの `BTreeSet<u64>` 構築を省くための crate 内部の表現。
+///
+/// 恒等列かどうかは呼び出し元のフラグではなく入力列そのものを線形に確かめて判定する
+/// （`core::SearchedIds::from_ids_checked` と同じ方式。Issue #3220）。判定に失敗した列
+/// （部分集合・並べ替え・重複・`u64` 変換失敗）は従来どおり `BTreeSet` へ倒れ、可視集合は
+/// 広がらない（fail-closed。テナント境界・RLS 相当は緩めない）。
+enum VisibleIdSet {
+    /// `0..len` の恒等列（重複なし）。
+    Identity { len: u64 },
+    /// 一般の可視集合（従来経路）。
+    Set(BTreeSet<u64>),
+}
+
+impl VisibleIdSet {
+    /// `ids` が恒等列なら `Identity`、それ以外は `BTreeSet` を構築する。
+    fn from_ids(ids: &[u64]) -> Self {
+        let identity = ids
+            .iter()
+            .enumerate()
+            .all(|(i, &id)| u64::try_from(i).is_ok_and(|i| i == id));
+        if identity {
+            if let Ok(len) = u64::try_from(ids.len()) {
+                return Self::Identity { len };
+            }
+        }
+        Self::Set(ids.iter().copied().collect())
+    }
+
+    /// `id` が可視集合に含まれるか。
+    fn contains(&self, id: u64) -> bool {
+        match self {
+            Self::Identity { len } => id < *len,
+            Self::Set(s) => s.contains(&id),
+        }
+    }
+
+    /// 可視集合の要素数（恒等列は重複なしのため `BTreeSet::len` と一致する）。
+    fn len(&self) -> usize {
+        match self {
+            Self::Identity { len } => usize::try_from(*len).unwrap_or(usize::MAX),
+            Self::Set(s) => s.len(),
+        }
+    }
+
+    /// 疎索引側へ渡す可視集合表現。
+    fn as_docs(&self) -> VisibleDocs<'_> {
+        match self {
+            Self::Identity { len } => VisibleDocs::SlotRange { len: *len },
+            Self::Set(s) => VisibleDocs::Set(s),
+        }
+    }
 }
 
 /// 疎側再取得ループ本体（Issue #320 の再取得ループ実装そのもの）。
@@ -1927,12 +1983,13 @@ fn hybrid_search_inner(
 fn sparse_refetch_loop(
     sparse_index: &SparseIndex,
     query_text: SparseQuery<'_>,
-    visible_ids: &BTreeSet<u64>,
+    visible_ids: VisibleDocs<'_>,
+    visible_len: usize,
     cfg: &RrfConfig,
     bm25: Bm25Params,
     mut record_fetch_k: impl FnMut(usize),
 ) -> Result<(Vec<ScoredDoc>, usize), HybridTextError> {
-    let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
+    let sparse_cap = MAX_FETCH_K.min(visible_len);
     let mut sparse_fetch_k = cfg
         .pool_depth()
         .checked_mul(2)
@@ -1951,10 +2008,10 @@ fn sparse_refetch_loop(
     // 処理は literal／構文の両方で共有する。
     let mut scored = match query_text {
         SparseQuery::Literal(q) => sparse_index
-            .score_within_with_params(q, visible_ids, bm25)
+            .score_within_docs_with_params(q, visible_ids, bm25)
             .map_err(HybridError::from)?,
         SparseQuery::Parsed { query, limits } => sparse_index
-            .score_text_query_within(query, visible_ids, bm25, limits)
+            .score_text_query_within_docs(query, visible_ids, bm25, limits)
             .map_err(HybridTextError::Text)?,
     };
     let (sparse_hits, sparse_limit) = loop {
@@ -1975,7 +2032,7 @@ fn sparse_refetch_loop(
         // `hits` が可視集合内で存在しうる疎ヒットを全件含む（＝取得済み範囲の末尾が
         // そのまま真の終端であると確定できる）かどうか。密側の `exhaustive` 算出と
         // 同じ判定基準。
-        let exhaustive = sparse_fetch_k >= visible_ids.len() || hits.len() < sparse_fetch_k;
+        let exhaustive = sparse_fetch_k >= visible_len || hits.len() < sparse_fetch_k;
         // 疎チャネル（BM25 は語一致なしで 0）は非正スコア＝無シグナルを保証
         // できるため `zero_is_no_signal = true`（[`trim_non_positive_score_tail`]・
         // [`resolve_boundary_tie_group`] ドキュメント参照。密側とは異なる契約）。
@@ -2026,7 +2083,8 @@ pub fn sparse_refetch_observed(
     let (sparse_hits, sparse_limit) = sparse_refetch_loop(
         sparse_index,
         SparseQuery::Literal(query_text),
-        visible_ids,
+        VisibleDocs::Set(visible_ids),
+        visible_ids.len(),
         cfg,
         sparse_index.params(),
         |fetch_k| fetch_ks.push(fetch_k),
@@ -4270,7 +4328,8 @@ mod tests {
             let (actual_hits, actual_limit) = sparse_refetch_loop(
                 index,
                 SparseQuery::Literal(query),
-                visible,
+                VisibleDocs::Set(visible),
+                visible.len(),
                 &cfg,
                 index.params(),
                 |_fetch_k| {},
@@ -4910,5 +4969,109 @@ mod tests {
             HybridTextError::Text(t) => assert_eq!(t.wire_code(), "54000"),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ---------- Issue #3221: 恒等列（全可視）経路の等価性・fail-closed ----------
+
+    #[test]
+    fn identity_ids_match_set_path_bitwise() {
+        // 同じ可視集合を恒等列（Identity 経路）と並べ替え列（Set 経路）で渡し、
+        // 結果が完全一致することを確認する。欠番のある疎索引（本文 NULL 行を模す）を使う。
+        let cfg = RrfConfig::default();
+        let texts: Vec<(u64, String)> = (0..12u64)
+            .filter(|i| i % 4 != 3)
+            .map(|i| (i, format!("term{} shared common{}", i % 3, i % 2)))
+            .collect();
+        let refs: Vec<(u64, &str)> = texts.iter().map(|(i, t)| (*i, t.as_str())).collect();
+        let index = SparseIndex::build(&refs).expect("build ok");
+        let ids_identity: Vec<u64> = (0..12).collect();
+        let ids_shuffled: Vec<u64> = vec![5, 0, 11, 2, 7, 1, 9, 3, 10, 4, 8, 6];
+        let vec_of = |id: u64| (id as f32) * 0.25 + 0.1;
+        let v_identity: Vec<f32> = ids_identity.iter().map(|&i| vec_of(i)).collect();
+        let v_shuffled: Vec<f32> = ids_shuffled.iter().map(|&i| vec_of(i)).collect();
+        let query = [1.0f32];
+        for q in ["shared", "term1 common0", "nomatch"] {
+            let run = |ids: &[u64], vectors: &[f32]| {
+                hybrid_search(
+                    &CpuScalarProvider,
+                    SearchInput {
+                        ids,
+                        vectors,
+                        dim: 1,
+                        query: &query,
+                        k: 12,
+                    },
+                    &index,
+                    q,
+                    12,
+                    &cfg,
+                )
+                .expect("ok")
+            };
+            let a = run(&ids_identity, &v_identity);
+            let b = run(&ids_shuffled, &v_shuffled);
+            assert_eq!(a.len(), b.len(), "q={q:?}");
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert_eq!(x.id, y.id);
+                assert_eq!(x.score.to_bits(), y.score.to_bits());
+                assert_eq!(x.dense_rank, y.dense_rank);
+                assert_eq!(x.sparse_rank, y.sparse_rank);
+            }
+        }
+    }
+
+    #[test]
+    fn visible_id_set_identity_detection_is_exact() {
+        assert!(matches!(
+            VisibleIdSet::from_ids(&[0, 1, 2]),
+            VisibleIdSet::Identity { len: 3 }
+        ));
+        assert!(matches!(
+            VisibleIdSet::from_ids(&[]),
+            VisibleIdSet::Identity { len: 0 }
+        ));
+        for ids in [&[1u64, 2][..], &[0, 2], &[1, 0], &[0, 0], &[0, 1, 1]] {
+            assert!(
+                matches!(VisibleIdSet::from_ids(ids), VisibleIdSet::Set(_)),
+                "{ids:?}"
+            );
+        }
+        let id = VisibleIdSet::from_ids(&[0, 1, 2]);
+        assert!(id.contains(2));
+        assert!(!id.contains(3));
+        assert_eq!(id.len(), 3);
+    }
+
+    #[test]
+    fn identity_path_still_rejects_out_of_range_provider_ids() {
+        struct OutOfRange;
+        impl crate::kernel::SearchProvider for OutOfRange {
+            fn search(
+                &self,
+                _input: SearchInput<'_>,
+            ) -> Result<Vec<CandidateHit>, crate::kernel::KernelError> {
+                Ok(vec![CandidateHit { id: 3, score: 1.0 }])
+            }
+        }
+        let cfg = RrfConfig::default();
+        let index = SparseIndex::build(&[(0, "a b"), (1, "a c"), (2, "a d")]).expect("build ok");
+        let ids = [0u64, 1, 2];
+        let vectors = [1.0f32, 1.0, 1.0];
+        let query = [1.0f32];
+        let r = hybrid_search(
+            &OutOfRange,
+            SearchInput {
+                ids: &ids,
+                vectors: &vectors,
+                dim: 1,
+                query: &query,
+                k: 3,
+            },
+            &index,
+            "a",
+            3,
+            &cfg,
+        );
+        assert!(matches!(r, Err(HybridError::ProviderResultRejected)));
     }
 }

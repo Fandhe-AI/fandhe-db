@@ -492,7 +492,7 @@ fn when_is_0a000() {
     assert_eq!(count(&core2, &a, "trg"), 0);
 }
 
-// 発火に未対応の経路（UPSERT）は AFTER ROW のある表でも `0A000`。台帳は消費されない。RETURNING 付きの INSERT は
+// 発火に未対応の経路（RETURNING 付き UPSERT）は AFTER ROW のある表でも `0A000`。台帳は消費されない。RETURNING 付きの INSERT は
 // 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 #[test]
 fn unwired_paths_stay_guarded_for_after_triggers() {
@@ -504,7 +504,7 @@ fn unwired_paths_stay_guarded_for_after_triggers() {
         &core,
         &a,
         "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-g'",
+         ON CONFLICT (id) DO NOTHING RETURNING id USING OPERATION_ID 'op-g'",
     )
     .unwrap_err();
     assert_eq!(err.wire_code(), "0A000");

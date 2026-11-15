@@ -1330,3 +1330,178 @@ fn upsert_returning_inside_explicit_transaction_returns_changed_rows() {
         .expect("select");
     assert_eq!(readback.rows.len(), 2);
 }
+// ---------------------------------------------------------------------
+// RETURNING の `AS` 別名（Issue #3248・SQL-21・SQL-42 のポインタ）
+// ---------------------------------------------------------------------
+
+/// 別名付き列は出力列名だけが別名になり、値・型は別名なしの `RETURNING` と一致する
+/// （疑似列 `id` の別名を含む。INSERT・単一行 UPDATE・述語形 UPDATE・DELETE の各形）。
+#[test]
+fn returning_as_alias_renames_columns_and_keeps_values() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+
+    let ins = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.1,0.2]', 'ja', 'hello') RETURNING id AS rid, lang AS l, body \
+                 USING OPERATION_ID 'op-alias-ins'"
+            ),
+        )
+        .expect("INSERT RETURNING alias"),
+    );
+    assert_eq!(
+        ins.result.columns,
+        vec![
+            ColumnMeta::AliasedId {
+                name: "rid".to_string()
+            },
+            ColumnMeta::Scalar {
+                name: "l".to_string(),
+                ty: ColumnType::Text
+            },
+            ColumnMeta::Scalar {
+                name: "body".to_string(),
+                ty: ColumnType::Text
+            },
+        ]
+    );
+    assert_eq!(
+        ins.result.rows[0].cells,
+        vec![
+            Cell::Integer(1),
+            Cell::Text("ja".to_string()),
+            Cell::Text("hello".to_string())
+        ]
+    );
+
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING lang AS l \
+                 USING OPERATION_ID 'op-alias-upd'"
+            ),
+        )
+        .expect("UPDATE RETURNING alias"),
+    );
+    assert_eq!(upd.result.rows[0].cells, vec![Cell::Text("en".to_string())]);
+
+    let upd_pred = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'fr' WHERE lang = 'en' RETURNING id AS rid \
+                 USING OPERATION_ID 'op-alias-upd-pred'"
+            ),
+        )
+        .expect("predicate UPDATE RETURNING alias"),
+    );
+    assert_eq!(upd_pred.result.rows[0].cells, vec![Cell::Integer(1)]);
+
+    let del = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE id = 1 RETURNING lang AS l, id AS rid \
+                 USING OPERATION_ID 'op-alias-del'"
+            ),
+        )
+        .expect("DELETE RETURNING alias"),
+    );
+    assert_eq!(
+        del.result.rows[0].cells,
+        vec![Cell::Text("fr".to_string()), Cell::Integer(1)]
+    );
+}
+
+/// 別名が重複しても受理し、同名の 2 列になる（PostgreSQL 準拠）。
+#[test]
+fn returning_duplicate_aliases_yield_two_same_named_columns() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    let out = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.1,0.2]', 'ja', 'hello') RETURNING lang AS x, body AS x \
+                 USING OPERATION_ID 'op-alias-dup'"
+            ),
+        )
+        .expect("duplicate aliases"),
+    );
+    assert_eq!(out.result.columns.len(), 2);
+    for col in &out.result.columns {
+        assert_eq!(
+            *col,
+            ColumnMeta::Scalar {
+                name: "x".to_string(),
+                ty: ColumnType::Text
+            }
+        );
+    }
+}
+
+/// 式・暗黙の別名・未知の列・`*` の併用は書き込み前に拒否し、台帳も消費しない。
+/// 文言に旧来の誤解を招く表現（function-call）を含まない。
+// tracked: #3249
+#[test]
+fn returning_unsupported_items_are_rejected_before_writing() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    for (items, code) in [
+        ("lang || 'x'", "42601"),
+        ("upper(lang)", "42601"),
+        ("lang l", "42601"),
+        ("nope AS n", "42703"),
+    ] {
+        let err = run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.1,0.2]', 'ja', 'hello') RETURNING {items} \
+                 USING OPERATION_ID 'op-alias-rej'"
+            ),
+        )
+        .expect_err(items);
+        assert!(!err.to_string().contains("function-call"), "{items}: {err}");
+        assert_eq!(err.wire_code(), code, "{items}");
+        assert_eq!(count_star(&core, &alice, TABLE), 0, "{items}");
+    }
+    // 台帳が消費されていないため、同じ operation_id で正常に実行できる。
+    let ok = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.1,0.2]', 'ja', 'hello') RETURNING lang AS l \
+                 USING OPERATION_ID 'op-alias-rej'"
+            ),
+        )
+        .expect("ledger must be unconsumed"),
+    );
+    assert_eq!(ok.rows_affected, 1);
+}
