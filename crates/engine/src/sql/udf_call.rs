@@ -6018,6 +6018,11 @@ pub(crate) fn expr_result_column_type(
                 .ok()
                 .map(ColumnType::Array);
         }
+        // `BIT(n)[]` の添字の結果は `bit(n)`（Issue #3235。`n` は要素型が持つ宣言長）。
+        BoundExpr::ArrayIndex {
+            elem: crate::catalog::ArrayElemType::Bit(n),
+            ..
+        } => return Some(ColumnType::Bit(*n)),
         BoundExpr::ArrayIndex { elem, .. } => {
             return crate::sql::cast::elem_cast_type(*elem)
                 .and_then(|t| t.result_column_type())
@@ -8573,6 +8578,7 @@ fn scalar_numeric_kind(
             | crate::catalog::ArrayElemType::Bytea
             | crate::catalog::ArrayElemType::Json
             | crate::catalog::ArrayElemType::Jsonb
+            | crate::catalog::ArrayElemType::Bit(_)
             | crate::catalog::ArrayElemType::Enum => None,
         },
         // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
@@ -13191,6 +13197,13 @@ fn apply_vector_scalar_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQL-57・Issue #3264: `json_agg`・`jsonb_agg` も集計関数名として予約される。
+    #[test]
+    fn json_agg_is_a_reserved_function_name() {
+        assert!(is_reserved_function_name("json_agg"));
+        assert!(is_reserved_function_name("JSONB_AGG"));
+    }
 
     /// SQL-57・Issue #1801: `array_agg` も集計関数名として予約され、同名の UDF は定義できない。
     #[test]

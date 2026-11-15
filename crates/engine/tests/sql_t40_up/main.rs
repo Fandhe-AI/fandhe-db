@@ -73,6 +73,7 @@ mod sql57_aggregate_expr_args;
 mod sql57_aggregate_filter;
 mod sql57_array_agg;
 mod sql57_bool_agg;
+mod sql57_json_agg;
 mod sql57_stddev;
 mod sql57_string_agg;
 mod sql57_variance;

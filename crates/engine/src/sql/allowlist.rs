@@ -728,6 +728,8 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
             | "MAX"
             | "STRING_AGG"
             | "ARRAY_AGG"
+            | "JSON_AGG"
+            | "JSONB_AGG"
             | "VARIANCE"
             | "VAR_POP"
             | "VAR_SAMP"
@@ -4290,6 +4292,9 @@ pub(crate) enum SetOperator {
     Union,
     UnionAll,
     Intersect,
+    /// 多重集合版の `INTERSECT ALL`（Issue #3268）。左の順序で、同じ行を
+    /// min(左の出現数, 右の出現数) 件だけ残す。
+    IntersectAll,
     Except,
 }
 
@@ -4460,6 +4465,12 @@ pub enum AggregateFunc {
     /// 1 次元配列（NULL 入力は NULL 要素・入力なしは NULL）。内側の `ORDER BY`・`DISTINCT` を
     /// 受理する（SQL 表層のみ。`string_agg` と同じ仕組みを共有する）。
     ArrayAgg,
+    /// `json_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #3264）。結果は `json` の配列
+    /// （`array_agg` と同じ状態・束縛を共有し、確定時に JSON テキストへ書く。入力なしは NULL）。
+    JsonAgg,
+    /// `jsonb_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #3264）。[`Self::JsonAgg`] の
+    /// `jsonb` 版で、結果は正規形（空白なし）の `jsonb` 配列。
+    JsonbAgg,
     /// `variance(<数値>)`（SQL-57・Issue #1803）。`var_samp` と同義（標本分散）。入力が整数系・
     /// numeric なら numeric、浮動小数・数値式なら double を返す。行数 0 は NULL、1 も NULL。
     Variance,
@@ -4498,6 +4509,15 @@ impl AggregateFunc {
         matches!(self, AggregateFunc::Grouping)
     }
 
+    /// `array_agg` の状態（[`crate::sql::array_agg::ArrayAggState`]）で評価する関数か
+    /// （`array_agg`・`json_agg`・`jsonb_agg`。Issue #3264）。束縛・DISTINCT・ORDER BY・資源上限が共通。
+    pub(crate) fn uses_array_agg_state(self) -> bool {
+        matches!(
+            self,
+            AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg
+        )
+    }
+
     /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp` と `stddev`／`stddev_pop`／
     /// `stddev_samp`。Issue #1803・#1804）。引数の型検査・結果型・累積器の選択がこの 6 関数で
     /// 共通になる。
@@ -4532,6 +4552,8 @@ impl AggregateFunc {
             "MAX" => Some(AggregateFunc::Max),
             "STRING_AGG" => Some(AggregateFunc::StringAgg),
             "ARRAY_AGG" => Some(AggregateFunc::ArrayAgg),
+            "JSON_AGG" => Some(AggregateFunc::JsonAgg),
+            "JSONB_AGG" => Some(AggregateFunc::JsonbAgg),
             "VARIANCE" => Some(AggregateFunc::Variance),
             "VAR_POP" => Some(AggregateFunc::VarPop),
             "VAR_SAMP" => Some(AggregateFunc::VarSamp),
@@ -4556,6 +4578,8 @@ impl AggregateFunc {
             AggregateFunc::Max => "max",
             AggregateFunc::StringAgg => "string_agg",
             AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::JsonAgg => "json_agg",
+            AggregateFunc::JsonbAgg => "jsonb_agg",
             AggregateFunc::Variance => "variance",
             AggregateFunc::VarPop => "var_pop",
             AggregateFunc::VarSamp => "var_samp",
@@ -8441,12 +8465,14 @@ impl<'a> Parser<'a> {
                     after_distinct,
                     Some(Token::StringLiteral(_)) | Some(Token::Punct('(' | '-' | '+'))
                 ),
-                AggregateFunc::ArrayAgg => matches!(
-                    after_distinct,
-                    Some(Token::StringLiteral(_))
-                        | Some(Token::Number(_))
-                        | Some(Token::Punct('(' | '-' | '+'))
-                ),
+                AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg => {
+                    matches!(
+                        after_distinct,
+                        Some(Token::StringLiteral(_))
+                            | Some(Token::Number(_))
+                            | Some(Token::Punct('(' | '-' | '+'))
+                    )
+                }
                 // SQL-57・Issue #1809: `COUNT(DISTINCT (a + b))`・`COUNT(DISTINCT -n)` も修飾子と読む
                 // （数値・文字列リテラルは従来どおり対象外。`COUNT(distinct)` の列名互換を保つ）。
                 // Issue #3263: `SUM`／`AVG`／`MIN`／`MAX` の `DISTINCT` も同じ読み。
@@ -8474,11 +8500,11 @@ impl<'a> Parser<'a> {
                     | AggregateFunc::Min
                     | AggregateFunc::Max
                     | AggregateFunc::StringAgg
-                    | AggregateFunc::ArrayAgg
             )
+            && !func.uses_array_agg_state()
         {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is only allowed inside COUNT, SUM, AVG, MIN, MAX, string_agg and array_agg",
+                "DISTINCT is only allowed inside COUNT, SUM, AVG, MIN, MAX, string_agg, array_agg, json_agg and jsonb_agg",
             ));
         }
         // Issue #3263: `MIN`／`MAX(DISTINCT x)` は重複除去が結果に影響しないため、解析直後に
@@ -8511,7 +8537,7 @@ impl<'a> Parser<'a> {
             // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
             let saved_null = self.allow_null_literal;
             self.allow_null_literal =
-                matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg);
+                func == AggregateFunc::StringAgg || func.uses_array_agg_state();
             let mut parsed = self.parse_value_expr(0);
             // `bool_and` 系に限り引数に比較式（`<値式> <比較演算子> <値式>`）を受理する
             // （SQL-57・Issue #1805）。ほかの集計関数の引数文法は変えない。
@@ -8559,13 +8585,15 @@ impl<'a> Parser<'a> {
                 func.default_alias()
             )));
         }
-        if func == AggregateFunc::ArrayAgg {
-            // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801）。引数が 2 つ以上の形は
+        if func.uses_array_agg_state() {
+            // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801。`json_agg`・`jsonb_agg` は
+            // Issue #3264 で同じ文法）。引数が 2 つ以上の形は
             // 該当シグネチャの関数が無い扱い（`42883`。`string_agg` と同じ）。
             if matches!(self.peek(), Some(Token::Punct(','))) {
-                return Err(SqlSurfaceError::undefined_function(
-                    "function array_agg requires exactly one argument",
-                ));
+                return Err(SqlSurfaceError::undefined_function(format!(
+                    "function {} requires exactly one argument",
+                    func.default_alias()
+                )));
             }
             if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
                 order_by = self.parse_in_aggregate_order_by()?;
@@ -19049,7 +19077,8 @@ fn check_body_aggregate(
         match item {
             AggregateSelectItem::Aggregate(agg) => {
                 // `string_agg`・`array_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
-                if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                if agg.func == AggregateFunc::StringAgg
+                    || agg.func.uses_array_agg_state()
                     || agg.func.is_variance_family()
                     || agg.func.is_bool_agg()
                     || agg.func.is_grouping()
@@ -22908,9 +22937,9 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
         });
     }
     // `array_agg` も同じ理由で JOIN は対象外（SQL-57・Issue #1801）。
-    if func == AggregateFunc::ArrayAgg {
+    if func.uses_array_agg_state() {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "array_agg is not supported in JOIN".to_string(),
+            detail: format!("{} is not supported in JOIN", func.default_alias()),
         });
     }
     // 分散系（SQL-57・Issue #1803）も JOIN は対象外（明示拒否で fail-closed に保つ）。
@@ -24131,7 +24160,7 @@ fn parse_set_primary(
     parse_set_branch(p, lookup)
 }
 
-/// `set_term := primary { INTERSECT primary }`（`INTERSECT` は `UNION`／`EXCEPT`
+/// `set_term := primary { INTERSECT [ALL | DISTINCT] primary }`（`INTERSECT` は `UNION`／`EXCEPT`
 /// より高い優先順位で左結合。PostgreSQL と同じ優先順位規則）。
 fn parse_set_term(
     p: &mut Parser<'_>,
@@ -24142,14 +24171,20 @@ fn parse_set_term(
     let mut left = parse_set_primary(p, lookup, depth, branch_count)?;
     while p.peek_ident_matches("INTERSECT") {
         p.advance();
-        if p.peek_ident_matches("ALL") || p.peek_ident_matches("DISTINCT") {
-            return Err(SqlSurfaceError::unsupported(
-                "INTERSECT ALL/DISTINCT is not supported",
-            ));
-        }
+        // 量指定語は 1 語だけ消費する。`ALL DISTINCT` 等の連続は次の枝の開始を
+        // 見つけられず構文段で `42601` になる（fail-closed。Issue #3268）。
+        let op = if p.peek_ident_matches("ALL") {
+            p.advance();
+            SetOperator::IntersectAll
+        } else {
+            if p.peek_ident_matches("DISTINCT") {
+                p.advance();
+            }
+            SetOperator::Intersect
+        };
         let right = parse_set_primary(p, lookup, depth, branch_count)?;
         left = SetTree::Op {
-            op: SetOperator::Intersect,
+            op,
             left: Box::new(left),
             right: Box::new(right),
         };
@@ -24157,7 +24192,8 @@ fn parse_set_term(
     Ok(left)
 }
 
-/// `set_expr := set_term { (UNION [ALL] | EXCEPT) set_term }`（左結合）。
+/// `set_expr := set_term { (UNION [ALL | DISTINCT] | EXCEPT) set_term }`
+/// （`EXCEPT ALL`／`EXCEPT DISTINCT` は #3269 まで `42601`）（左結合）。
 fn parse_set_expr(
     p: &mut Parser<'_>,
     lookup: &impl TableLookup,
@@ -24172,9 +24208,9 @@ fn parse_set_expr(
                 p.advance();
                 true
             } else if p.peek_ident_matches("DISTINCT") {
-                return Err(SqlSurfaceError::unsupported(
-                    "UNION DISTINCT is not supported",
-                ));
+                // 明示 DISTINCT は既定の `UNION` と同じ意味（Issue #3268）。
+                p.advance();
+                false
             } else {
                 false
             };
@@ -26841,7 +26877,8 @@ fn buffered_aggregate_outer(
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
                     // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
-                    if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                    if agg.func == AggregateFunc::StringAgg
+                        || agg.func.uses_array_agg_state()
                         || agg.func.is_variance_family()
                         || agg.func.is_bool_agg()
                         || agg.func.is_grouping()
@@ -38834,6 +38871,27 @@ mod tests {
         );
         assert!(is_aggregate_function_name("String_Agg"));
     }
+    /// SQL-57・Issue #3264: `json_agg`・`jsonb_agg` は `array_agg` と同じ文法で解析され、
+    /// 関数名・既定列名・`DISTINCT`・内側 `ORDER BY` が AST に載る。
+    #[test]
+    fn json_agg_parses_like_array_agg() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT json_agg(DISTINCT a ORDER BY a DESC), JSONB_AGG(b) AS xs FROM documents",
+            &lookup,
+        );
+        let first = expect_agg_item(&agg.items()[0]);
+        assert_eq!(first.func, AggregateFunc::JsonAgg);
+        assert!(first.distinct);
+        assert_eq!(first.order_by.len(), 1);
+        assert_eq!(first.func.default_alias(), "json_agg");
+        let second = expect_agg_item(&agg.items()[1]);
+        assert_eq!(second.func, AggregateFunc::JsonbAgg);
+        assert_eq!(second.func.default_alias(), "jsonb_agg");
+        assert!(is_aggregate_function_name("Json_Agg"));
+        assert!(is_aggregate_function_name("JSONB_AGG"));
+    }
+
     /// SQL-57・Issue #1801: `array_agg` の構文。1 引数・`DISTINCT`・内側 `ORDER BY`（複数キー・
     /// 方向・NULL 位置）が AST に載り、数値リテラル・括弧式の前の `DISTINCT` も修飾子と読まれる。
     #[test]
@@ -41033,7 +41091,7 @@ mod tests {
 
     /// Issue #2047（SQL-75 (2) ポインタ）: 集合演算の `EXPLAIN` は `ExplainTarget::SetOperation`
     /// になる（先頭が括弧の形を含む）。集合演算子の無い `EXPLAIN (SELECT ...)` は従来どおり `42601`、
-    /// 未対応の枝形（`INTERSECT ALL`）は非 EXPLAIN と同じ拒否。
+    /// 未対応の枝形（`EXCEPT ALL`）は非 EXPLAIN と同じ拒否。
     #[test]
     fn explain_accepts_set_operation_shapes() {
         let lookup = catalog_with(&["a", "b"]);
@@ -41041,6 +41099,7 @@ mod tests {
             "EXPLAIN SELECT id FROM a UNION SELECT id FROM b",
             "EXPLAIN (SELECT id FROM a) UNION ALL SELECT id FROM b",
             "EXPLAIN SELECT id FROM a EXCEPT SELECT id FROM b LIMIT 3",
+            "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
         ] {
             match validate_sql(sql, &lookup) {
                 Ok(Statement::Explain(target @ ExplainTarget::SetOperation(_))) => {
@@ -41058,14 +41117,53 @@ mod tests {
         }
         let err = validate_sql("EXPLAIN (SELECT id FROM a)", &lookup).expect_err("no operator");
         assert_eq!(err.wire_code(), "42601");
-        let plain = validate_sql("SELECT id FROM a INTERSECT ALL SELECT id FROM b", &lookup)
-            .expect_err("plain INTERSECT ALL is rejected");
+        let plain = validate_sql("SELECT id FROM a EXCEPT ALL SELECT id FROM b", &lookup)
+            .expect_err("plain EXCEPT ALL is rejected");
         let explained = validate_sql(
-            "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
+            "EXPLAIN SELECT id FROM a EXCEPT ALL SELECT id FROM b",
             &lookup,
         )
-        .expect_err("EXPLAIN INTERSECT ALL is rejected");
+        .expect_err("EXPLAIN EXCEPT ALL is rejected");
         assert_eq!(plain.wire_code(), explained.wire_code());
+    }
+
+    /// Issue #3268: 量指定語つき集合演算の木の形と fail-closed。
+    #[test]
+    fn set_operation_quantifier_shapes() {
+        let lookup = catalog_with(&["a", "b", "c"]);
+        let op_of = |sql: &str| match validate_sql(sql, &lookup) {
+            Ok(Statement::SetOperation(v)) => match v.tree {
+                SetTree::Op { op, .. } => op,
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{sql}: {other:?}"),
+        };
+        assert_eq!(
+            op_of("SELECT id FROM a INTERSECT ALL SELECT id FROM b"),
+            SetOperator::IntersectAll
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a INTERSECT DISTINCT SELECT id FROM b"),
+            SetOperator::Intersect
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a UNION DISTINCT SELECT id FROM b"),
+            SetOperator::Union
+        );
+        // INTERSECT ALL は UNION より強く結合する。
+        assert_eq!(
+            op_of("SELECT id FROM a UNION SELECT id FROM b INTERSECT ALL SELECT id FROM c"),
+            SetOperator::Union
+        );
+        for sql in [
+            "SELECT id FROM a INTERSECT ALL DISTINCT SELECT id FROM b",
+            "SELECT id FROM a INTERSECT ALL ALL SELECT id FROM b",
+            "SELECT id FROM a EXCEPT ALL SELECT id FROM b",
+            "SELECT id FROM a EXCEPT DISTINCT SELECT id FROM b",
+        ] {
+            let e = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(e.wire_code(), "42601", "{sql}");
+        }
     }
 
     #[test]

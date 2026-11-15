@@ -76,6 +76,7 @@ pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdl
                 (ArrayElemType::Bpchar(n), _) => format!("CHAR({n})"),
                 (ArrayElemType::SmallInt, _) => "SMALLINT".to_string(),
                 (ArrayElemType::Time, _) => "TIME".to_string(),
+                (ArrayElemType::Bit(n), _) => format!("BIT({n})"),
             };
             // 要素数の上限 `[N]` は最初の次元にだけ付ける（構文上 `[N]` は全体で高々 1 個）。
             let mut s = format!("{elem}[{}]", a.max_len());

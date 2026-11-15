@@ -854,6 +854,10 @@ fn retained_array_bytes(array: &engine::row_codec::ArrayValue) -> usize {
         ArrayValue::Bytea(v) => v.iter().fold(slots(v), |acc, it| {
             acc.saturating_add(it.as_ref().map_or(0, Vec::capacity))
         }),
+        // `BIT(n)[]`（Issue #3235）: スロット + 各要素のバイト列の長さ。
+        ArrayValue::Bit(v) => v.iter().fold(slots(v), |acc, it| {
+            acc.saturating_add(it.as_ref().map_or(0, |b| b.as_bytes().len()))
+        }),
     }
 }
 
@@ -3963,7 +3967,7 @@ mod tests {
         assert_eq!(declared_param_type_for_oid(1700), Ok(Some(D::Numeric)));
         // 持たない型は Issue #2438 で推論から拒否（`0A000`）へ変更された。
         // 配列 OID（`_int2`=1005・`_time`=1183 は Issue #3230・#3232 で公告するが、宣言は従来どおり拒否のまま）。
-        for oid in [99_999, -5, -1, i32::MIN, 1005, 1007, 1183] {
+        for oid in [99_999, -5, -1, i32::MIN, 1005, 1007, 1183, 1561] {
             assert_eq!(
                 declared_param_type_for_oid(oid),
                 Err(UnsupportedOid),
