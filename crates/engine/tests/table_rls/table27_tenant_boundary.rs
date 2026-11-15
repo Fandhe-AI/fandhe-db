@@ -310,6 +310,12 @@ const VIEW_DEF_BODIES: &[&str] = &[
     "CREATE VIEW {N} AS SELECT id FROM {S} WITH CHECK OPTION",
 ];
 
+/// 自前 `mine` を参照しても本文形が非対応で成功しないテンプレート（陽性対照から分離する）。
+const UNSUPPORTED_BODIES: &[&str] = &[
+    "CREATE VIEW {N} AS SELECT id FROM mine WHERE id IN (SELECT id FROM {S} LIMIT 5)",
+    "CREATE VIEW {N} AS WITH c AS (SELECT id FROM {S} LIMIT 5) SELECT id FROM c",
+];
+
 /// 他テナントの SCHEMA 配下を本文で読むビュー定義は、他テナントの SCHEMA がどこにも無い DB と
 /// 同じ SQLSTATE・文言で拒否される（TABLE-27・RLS-10 (b)・ERR-6 のポインタ）。原因別の文言（Issue
 /// #3240）は参照先の存在確認を通った後でしか出ないため、存在オラクルにならない。陽性対照として
@@ -344,6 +350,17 @@ fn t1_view_definitions_over_a_foreign_schema_match_a_world_without_it() {
         let rx = run(&x, TENANTS[1], true, &mut vx, &sql);
         let ry = run(&y, TENANTS[1], true, &mut vy, &sql);
         assert_eq!(shape(&rx), shape(&ry), "{sql}");
+        if UNSUPPORTED_BODIES.contains(tpl) {
+            // 自前 `mine` でも本文形が非対応のため成功しない。成功すべき陽性対照とは分け、
+            // 両 DB が同じ非対応エラーで拒否することだけを確かめる。
+            assert!(
+                rx.is_err() && ry.is_err(),
+                "unsupported body must be rejected: {sql}"
+            );
+        } else {
+            assert!(rx.is_ok(), "positive control must succeed: {sql}: {rx:?}");
+            assert!(ry.is_ok(), "positive control must succeed: {sql}: {ry:?}");
+        }
     }
     assert_eq!(trials, VIEW_DEF_BODIES.len() * 2, "trial count drifted");
     // `CREATE OR REPLACE VIEW`（自分の既存ビューの置換）でも同じ。
