@@ -212,6 +212,7 @@ fn ddl_permission_denies_regardless_of_existence() {
 
 // --- 受入基準 1: 許可リスト ---------------------------------------------------
 
+// intentional: docs/design/create-view.md
 #[test]
 fn disallowed_view_body_forms_are_rejected_and_not_persisted() {
     let path = unique_db_path("view-allowlist");
@@ -231,7 +232,6 @@ fn disallowed_view_body_forms_are_rejected_and_not_persisted() {
         "CREATE VIEW v AS SELECT id FROM docs LIMIT 5 UNION SELECT id FROM docs LIMIT 5",
         "CREATE VIEW v AS SELECT id, ROW_NUMBER() OVER (ORDER BY lang) FROM docs LIMIT 5",
         "CREATE VIEW v AS SELECT lower(body) FROM docs LIMIT 5",
-        "CREATE VIEW v AS SELECT id FROM docs WHERE lower(lang) = 'ja' LIMIT 5",
         "CREATE VIEW v AS SELECT SUM(id + 1) FROM docs",
         "CREATE VIEW v AS EXPLAIN SELECT * FROM docs LIMIT 5",
         "CREATE OR REPLACE VIEW IF NOT EXISTS v AS SELECT * FROM docs",

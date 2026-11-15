@@ -148,6 +148,7 @@ pub(crate) fn array_keys(a: &ArrayValue) -> Result<Vec<Option<Key<'_>>>, SqlSurf
         ArrayValue::Text(v) => map(v, |s| Key::Text(s.as_str())),
         ArrayValue::Bool(v) => map(v, |b| Key::Bool(*b)),
         ArrayValue::Integer(v) => map(v, |i| Key::Int(i64::from(*i))),
+        ArrayValue::SmallInt(v) => map(v, |i| Key::Int(i64::from(*i))),
         ArrayValue::BigInt(v) => map(v, |i| Key::Int(*i)),
         ArrayValue::Real(v) => map(v, |x| Key::Float(f64::from(*x))),
         ArrayValue::Double(v) => map(v, |x| Key::Float(*x)),
@@ -249,6 +250,7 @@ fn comparable_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bpchar(_)
         | ArrayElemType::Bool
         | ArrayElemType::Integer
+        | ArrayElemType::SmallInt
         | ArrayElemType::BigInt
         | ArrayElemType::Real
         | ArrayElemType::Double
@@ -271,6 +273,7 @@ fn is_float_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bpchar(_)
         | ArrayElemType::Bool
         | ArrayElemType::Integer
+        | ArrayElemType::SmallInt
         | ArrayElemType::BigInt
         | ArrayElemType::Date
         | ArrayElemType::Timestamp
@@ -290,6 +293,7 @@ fn lhs_kinds_for(elem: ArrayElemType) -> &'static [CastKind] {
     use CastKind as K;
     match elem {
         ArrayElemType::Integer
+        | ArrayElemType::SmallInt
         | ArrayElemType::BigInt
         | ArrayElemType::Real
         | ArrayElemType::Double => &[K::Int2, K::Int4, K::Int8, K::Float4, K::Float8],
@@ -498,8 +502,9 @@ fn check_lhs_compatible(kind: CastKind, elem: ArrayElemType) -> Result<(), SqlSu
 /// 左辺の種別から、型なしリテラルの配列を解釈する要素の CAST 型を決める。
 fn lhs_elem_cast_type(kind: CastKind) -> Result<CastType, SqlSurfaceError> {
     Ok(match kind {
-        // smallint[] の配列型は無いため、smallint 左辺の型なしリテラル配列は integer[] として解釈する
-        // （値は整数どうしで正確に比較される）。
+        // smallint 左辺の型なしリテラル配列は integer[] として解釈する（値は整数どうしで正確に
+        // 比較される）。`smallint[]` は Issue #3230 で配列要素型になったが、既存の受理形の結果
+        // （範囲外リテラルの扱いを含む）を変えないため、この解釈は意図的に据え置く。
         CastKind::Int2 | CastKind::Int4 => CastType::Int4,
         CastKind::Int8 => CastType::Int8,
         CastKind::Float4 => CastType::Float4,
@@ -917,7 +922,7 @@ mod tests {
         for elem in E::ALL_KINDS {
             let kinds = lhs_kinds_for(elem);
             let expected: &[CastKind] = match elem {
-                E::Integer | E::BigInt | E::Real | E::Double => {
+                E::Integer | E::SmallInt | E::BigInt | E::Real | E::Double => {
                     &[K::Int2, K::Int4, K::Int8, K::Float4, K::Float8]
                 }
                 E::Text | E::Varchar(_) | E::Bpchar(_) => &[K::Text, K::Varchar, K::Bpchar],

@@ -8472,6 +8472,7 @@ fn scalar_numeric_kind(
         BoundExpr::ArrayFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         // 整数・real 要素の添字は要素型どおりの整数演算にする（TABLE-35・Issue #1602）。
         BoundExpr::ArrayIndex { elem, .. } => match elem {
+            crate::catalog::ArrayElemType::SmallInt => Some(NumericKind::Int2),
             crate::catalog::ArrayElemType::Integer => Some(NumericKind::Int4),
             crate::catalog::ArrayElemType::BigInt => Some(NumericKind::Int8),
             crate::catalog::ArrayElemType::Real => Some(NumericKind::Float4),

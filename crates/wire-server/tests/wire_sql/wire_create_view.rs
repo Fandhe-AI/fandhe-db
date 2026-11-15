@@ -482,3 +482,81 @@ fn wire_create_or_replace_view_with_dependent_views() {
     expect_error_response_with_sqlstate(&mut stream, "0A000");
     read_ready_for_query(&mut stream);
 }
+/// 数値列 `n`（NULL 可）を持つ表の fixture（Issue #3238。既存の `docs` は数値列を持たない）。
+fn new_core_with_numeric_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-create-view-numeric");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs_n",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("n", ColumnType::Integer, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// Issue #3238: psql が送る「末尾 `;` 付きの単独 simple query」で、式述語（数値比較・`OR`・
+/// `IS NULL`）の本文の `CREATE VIEW` が通り、参照結果が正しい。非組み込み関数の本文は
+/// `42601` の後に `ReadyForQuery` が返り、接続は使い続けられる。
+// intentional: docs/design/create-view.md
+#[test]
+fn wire_create_view_accepts_expression_predicate_bodies_with_trailing_semicolon() {
+    let (core, _guard) = new_core_with_numeric_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (id, n) in [(1, "1"), (2, "5"), (3, "NULL")] {
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "INSERT INTO docs_n (id, embedding, n) VALUES ({id}, '[0.1,0.2,0.3]', {n}) USING OPERATION_ID 'op-n-{id}'"
+            ),
+        );
+        let _tag = read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+
+    for (view, pred, want) in [
+        ("vn", "n > 3", vec!["2"]),
+        ("vo", "n > 3 OR n IS NULL", vec!["2", "3"]),
+        ("vz", "n IS NULL", vec!["3"]),
+    ] {
+        send_simple_query(
+            &mut stream,
+            &format!("CREATE VIEW {view} AS SELECT * FROM docs_n WHERE {pred};"),
+        );
+        let tag = read_command_complete(&mut stream);
+        assert_eq!(tag, "CREATE VIEW", "view={view}");
+        read_ready_for_query(&mut stream);
+
+        send_simple_query(&mut stream, &format!("SELECT id FROM {view} LIMIT 10;"));
+        let _columns = read_row_description(&mut stream);
+        let mut got = Vec::new();
+        for _ in 0..want.len() {
+            let row = read_data_row(&mut stream);
+            got.push(row[0].clone().expect("id"));
+        }
+        got.sort();
+        assert_eq!(got, want, "view={view}");
+        let tag = read_command_complete(&mut stream);
+        assert_eq!(tag, format!("SELECT {}", want.len()), "view={view}");
+        read_ready_for_query(&mut stream);
+    }
+
+    // 非組み込み関数の本文は 42601。接続は使い続けられる。
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW vu AS SELECT * FROM docs_n WHERE no_such_fn(n) > 1;",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "SELECT * FROM vu LIMIT 10");
+    expect_error_response_with_sqlstate(&mut stream, "42P01");
+    read_ready_for_query(&mut stream);
+}

@@ -54,7 +54,7 @@
 //! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Jsonb}` → `jsonb`（OID 3802, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Array(<要素型>)}`／式の配列結果 → PostgreSQL の配列型 OID
-//!   （`_int4`=1007・`_text`=1009 など 13 種。typlen -1。次元数は OID に影響しない。
+//!   （`_int4`=1007・`_text`=1009 など 14 種。typlen -1。次元数は OID に影響しない。
 //!   テキスト形式のみで、バイナリは `0A000`。TABLE-35・WIRE-13・WIRE-14・Issue #1606）
 //! - `ColumnMeta::Scalar{ty: Enum(_)}`／`Array(<ENUM>)` → `text`
 //!   （OID 25。ENUM は組み込み OID を持たない据え置き判断。WIRE-13・TASK-200・Issue #895）
@@ -570,6 +570,9 @@ wire_type_enum! {
         /// `ColumnMeta::Scalar{ty: Array(<boolean>)}`（`_bool`。TABLE-35・WIRE-13・Issue #1606）。
         /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
         BoolArray,
+        /// `ColumnMeta::Scalar{ty: Array(<smallint>)}`（`_int2`=1005。TABLE-35・WIRE-13・Issue #3230）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        Int2Array,
         /// `ColumnMeta::Scalar{ty: Array(<integer>)}`（`_int4`。TABLE-35・WIRE-13・Issue #1606）。
         /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
         Int4Array,
@@ -645,6 +648,7 @@ impl WireType {
             WireType::Jsonb => 3802,
             WireType::TextArray => 1009,
             WireType::BoolArray => 1000,
+            WireType::Int2Array => 1005,
             WireType::Int4Array => 1007,
             WireType::Int8Array => 1016,
             WireType::Float4Array => 1021,
@@ -676,6 +680,7 @@ impl WireType {
             | WireType::Jsonb
             | WireType::TextArray
             | WireType::BoolArray
+            | WireType::Int2Array
             | WireType::Int4Array
             | WireType::Int8Array
             | WireType::Float4Array
@@ -729,6 +734,7 @@ impl WireType {
             WireType::Jsonb => "jsonb",
             WireType::TextArray => "_text",
             WireType::BoolArray => "_bool",
+            WireType::Int2Array => "_int2",
             WireType::Int4Array => "_int4",
             WireType::Int8Array => "_int8",
             WireType::Float4Array => "_float4",
@@ -788,6 +794,7 @@ impl WireType {
             WireType::Bit
             | WireType::TextArray
             | WireType::BoolArray
+            | WireType::Int2Array
             | WireType::Int4Array
             | WireType::Int8Array
             | WireType::Float4Array
@@ -848,6 +855,7 @@ impl WireType {
             // 配列のバイナリ形式は対象外（TABLE-35 (4)・WIRE-14）。fail-closed で `0A000`。
             WireType::TextArray
             | WireType::BoolArray
+            | WireType::Int2Array
             | WireType::Int4Array
             | WireType::Int8Array
             | WireType::Float4Array
@@ -984,6 +992,7 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
                 | E::Bytea
                 | E::Json
                 | E::Jsonb
+                | E::SmallInt
                 | E::Enum => Ok(-1),
             }
         }
@@ -1112,6 +1121,7 @@ fn array_wire_type(elem: engine::catalog::ArrayElemType) -> WireType {
     match elem {
         E::Text => WireType::TextArray,
         E::Bool => WireType::BoolArray,
+        E::SmallInt => WireType::Int2Array,
         E::Integer => WireType::Int4Array,
         E::BigInt => WireType::Int8Array,
         E::Real => WireType::Float4Array,
@@ -2248,6 +2258,10 @@ mod tests {
             "{1,NULL,-3}"
         );
         assert_eq!(
+            text_of(ArrayValue::SmallInt(vec![Some(1), None, Some(i16::MIN)])),
+            "{1,NULL,-32768}"
+        );
+        assert_eq!(
             text_of(ArrayValue::BigInt(vec![Some(9_007_199_254_740_993), None])),
             "{9007199254740993,NULL}"
         );
@@ -2923,7 +2937,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 37);
+        assert_eq!(WireType::ALL.len(), 38);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2949,7 +2963,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 37] = [
+        let expected: [(WireType, i32, i16, &str); 38] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2972,6 +2986,7 @@ mod tests {
             (WireType::Jsonb, 3802, -1, "jsonb"),
             (WireType::TextArray, 1009, -1, "_text"),
             (WireType::BoolArray, 1000, -1, "_bool"),
+            (WireType::Int2Array, 1005, -1, "_int2"),
             (WireType::Int4Array, 1007, -1, "_int4"),
             (WireType::Int8Array, 1016, -1, "_int8"),
             (WireType::Float4Array, 1021, -1, "_float4"),
@@ -3000,7 +3015,12 @@ mod tests {
     #[test]
     fn array_columns_advertise_postgres_array_oids() {
         use engine::catalog::{ArrayElemType as E, ArrayType, ColumnType};
-        let cases: [(E, i32); 3] = [(E::Integer, 1007), (E::Text, 1009), (E::Jsonb, 3807)];
+        let cases: [(E, i32); 4] = [
+            (E::SmallInt, 1005),
+            (E::Integer, 1007),
+            (E::Text, 1009),
+            (E::Jsonb, 3807),
+        ];
         for (elem, oid) in cases {
             // 多次元宣言でも OID は 1 次元と同じ。
             let array_ty = ArrayType::new(elem, 4)
@@ -3034,6 +3054,7 @@ mod tests {
             let (oid, name) = match elem {
                 E::Text => (1009, "_text"),
                 E::Bool => (1000, "_bool"),
+                E::SmallInt => (1005, "_int2"),
                 E::Integer => (1007, "_int4"),
                 E::BigInt => (1016, "_int8"),
                 E::Real => (1021, "_float4"),

@@ -38,8 +38,8 @@ DROP VIEW <name>
   いずれも構造的に受理しない（`42601`）。使える単純述語は
   `Equality`／`Prefix`／`BoolEquality`／`BoolColumn`／`Compare`（列 対
   リテラル）のみ。
-  （受理範囲は Issue #3237 の方針に従い #3238 で拡大する。末尾「Issue #3237 追記」参照。
-  それまでは本記述が現行の挙動である。）
+  （受理範囲は Issue #3237 の方針に従い Issue #3238 で拡大済み。上の「使える単純述語」は Phase 1 時点の
+  記述で、現行は末尾「Issue #3238 追記」を参照。）
 - `DROP VIEW` は単一ビュー名（`IF EXISTS` 付きも可。Issue #1614、[drop-table.md](drop-table.md) の「Issue #1614 追記」）の指定のみを受理し、
   `CASCADE`／`RESTRICT` は Issue #1641 で受理に変わった（[drop-table.md](drop-table.md) の「Issue #1641 追記」）。複数名指定は `42601`。
 - 拡張クエリプロトコルの `$n` を含む `CREATE VIEW`／`DROP VIEW` は Parse 時点で
@@ -258,7 +258,7 @@ JOIN 本文の辺はテーブルに限る。本文の大きさの上限（64 KiB
   依存検査（`2BP01`）・RLS（本文は参照セッションの `PolicyContext` で評価）は不変。
   単純形の段（`LIMIT` なしの列射影）は式述語を持てず、式述語つきの連鎖本文は `LIMIT` 付きの行形か
   集計形で書く。
-  （この制約は Issue #3237 の方針で解除する。実装は #3238。末尾「Issue #3237 追記」参照。）
+  （この制約は Issue #3238 で解除済み。末尾「Issue #3238 追記」参照。）
 - 単純形 → 評価後射影形: `resolve_from` が連鎖の各段（単純形）を、下位の本文の上に重ねた行形の
   `BufferedView`（`LIMIT` なし）として内側から畳み込む。各段の列スコープは下位の結果列に対する
   外側の検査（`22000`／`42702`）で担保する。式項目・UDF 述語を持つ段は作成時に `42601`。
@@ -895,3 +895,23 @@ SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコ�
 - `JOIN` 本文の `LIMIT` 必須と両辺テーブル限定: #3236 で対象外と明記済み
 - `ALTER VIEW`: 従来から対象外
 - `Structural`／`Resolved` の冗長な再検証の整理: 対応しない（挙動に影響しない整理のため）
+
+## Issue #3238 追記: VIEW 本文 WHERE の式述語の受理（実装記録）
+
+「Issue #3237 追記」の表 (A)〜(E) を実装した。TABLE-18・TABLE-42・TABLE-43・RLS-10 (b) のポインタ。
+
+- **判定表の分離**: `allowlist.rs` の `BodyPredicateTable { View, CteStrict }`。`parse_view_body` は `View`、
+  `parse_cte_select_body`（CTE 本文・FROM の派生表本文）と CTE の集計・tail 経路は `CteStrict`（従来の狭い表を据え置き）。
+- **View 表の受理**: `IN`／`BETWEEN`／`IS [NOT] NULL`、`first_non_builtin_call` が空の式述語（数値比較・算術・組み込み関数）、
+  `NOT`・非空の `OR`（全分岐の全葉を再帰判定）。`visible()`・式左辺の `LIKE`・サブクエリ系は `OR`／`NOT` の内側でも `42601`。
+  `now()`・現在時刻の値関数・`json_*` は非組み込み扱いのまま `42601`。
+- **Buffered 本文**: トップレベルの `Scan`／`Aggregate` は `Structural`／`Resolved` とも `BuiltinOnly`。サブクエリ内側
+  （`check_body_subquery`）と集合演算の枝は `Reject` を維持。
+- **描画と往復ガード**: `render_where_predicate` が `Expression`／`InList`／`Between`／`IsNull`／`Not` を描画する。
+  `render_stored_simple_view_body` は保存形を `tokenize_stored_view_body` → `parse_view_body` で再解析し、元 AST
+  （ゾーンなし `TIMESTAMPTZ` は UTC 確定形へ正規化）と一致しなければ `42601`（固定文言）で拒否する。
+  `CREATE VIEW` と `RENAME COLUMN`・`RENAME TABLE` の再描画が共有する。
+- **MATERIALIZED VIEW**: 本文の許可形は `CREATE VIEW` と同じ（Issue #1668 追記）ため、受理範囲も同じく広がる。
+- **連鎖**: 単純形の段が Buffered ビューの上に重なる場合は既存の `check_buffered_outer_pred` を使う（変更なし。ILIKE は従来どおり `0A000`）。
+- **据え置き**: 作成時の `CatalogError::Invalid` の文言分離・越境試験の網羅は #3240、式述語つきビューの `RENAME COLUMN` 追随
+  （現状は新しい形を `rename_column_in_view_body` が fail-closed で拒否）・参照時の再検証の網羅は #3239。

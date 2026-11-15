@@ -399,8 +399,8 @@ impl CastType {
     }
 
     /// 配列の変換先・変換元としての要素型（`CastType::Array(elem)` の `elem`）を、行内表現を
-    /// 持つ `ArrayElemType` へ写す。`varchar`／`varchar(n)`／`char(n)` は Issue #3231 で対応した。
-    /// 対応が無い要素（`smallint`・`time`・`timestamptz`・`interval`・修飾子なしの `numeric`・
+    /// 持つ `ArrayElemType` へ写す。`varchar`／`varchar(n)`／`char(n)`（Issue #3231）と `smallint`（Issue #3230）は対応した。
+    /// 対応が無い要素（`time`・`timestamptz`・`interval`・修飾子なしの `numeric`・
     /// ENUM）と、配列でない型は
     /// `None`（束縛段が `0A000` にする。fail-closed）。
     pub fn array_elem_type(&self) -> Option<ArrayElemType> {
@@ -410,6 +410,7 @@ impl CastType {
         Some(match elem.as_ref() {
             CastType::Text => ArrayElemType::Text,
             CastType::Bool => ArrayElemType::Bool,
+            CastType::Int2 => ArrayElemType::SmallInt,
             CastType::Int4 => ArrayElemType::Integer,
             CastType::Int8 => ArrayElemType::BigInt,
             CastType::Float4 => ArrayElemType::Real,
@@ -428,8 +429,7 @@ impl CastType {
             CastType::Bpchar(n) => ArrayElemType::Bpchar(*n),
             // 対応する要素型が無い CAST 型（束縛段が `0A000` にする）。CastType の追加時・
             // 要素型の追加時にここで対応判断を強制する（Issue #3229）。
-            CastType::Int2
-            | CastType::Numeric(None)
+            CastType::Numeric(None)
             | CastType::Time
             | CastType::TimestampTz
             | CastType::Interval
@@ -531,6 +531,7 @@ pub(crate) fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
     Some(match e {
         ArrayElemType::Text => CastType::Text,
         ArrayElemType::Bool => CastType::Bool,
+        ArrayElemType::SmallInt => CastType::Int2,
         ArrayElemType::Integer => CastType::Int4,
         ArrayElemType::BigInt => CastType::Int8,
         ArrayElemType::Real => CastType::Float4,
@@ -1787,8 +1788,9 @@ mod tests {
         assert_eq!(CastType::Bytea.expr_type(), Some(ExprType::Bytea));
         let arr = |e: CastType| CastType::Array(Box::new(e));
         assert_eq!(arr(CastType::Int4).expr_type(), Some(ExprType::Array));
+        assert_eq!(arr(CastType::Int2).expr_type(), Some(ExprType::Array));
         // 対応する要素型の無い配列は式の型を持たない（束縛段が `0A000` にする）。
-        assert_eq!(arr(CastType::Int2).expr_type(), None);
+        assert_eq!(arr(CastType::Time).expr_type(), None);
         assert_eq!(arr(CastType::Numeric(None)).expr_type(), None);
     }
 
@@ -1798,6 +1800,7 @@ mod tests {
         for (elem, want) in [
             (CastType::Text, ArrayElemType::Text),
             (CastType::Bool, ArrayElemType::Bool),
+            (CastType::Int2, ArrayElemType::SmallInt),
             (CastType::Int4, ArrayElemType::Integer),
             (CastType::Int8, ArrayElemType::BigInt),
             (CastType::Float4, ArrayElemType::Real),
@@ -1824,7 +1827,6 @@ mod tests {
             assert!(arr(elem).result_column_type().is_some());
         }
         for elem in [
-            CastType::Int2,
             CastType::Time,
             CastType::TimestampTz,
             CastType::Interval,

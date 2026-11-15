@@ -102,6 +102,7 @@ pub(crate) fn binary_param_for_wire_type(t: crate::result_encoder::WireType) -> 
         | WireType::Jsonb
         | WireType::TextArray
         | WireType::BoolArray
+        | WireType::Int2Array
         | WireType::Int4Array
         | WireType::Int8Array
         | WireType::Float4Array

@@ -115,19 +115,14 @@ fn alias_declared_columns_round_trip_values() {
     assert_eq!(result.rows.len(), 1);
 }
 
-/// 未確定型（長さなし `CHAR`／`CHARACTER`・`varchar(n)[]`・`SMALLINT[]` 等）は
+/// 未確定型（長さなし `CHAR`／`CHARACTER`・`varchar(n)[]` 等）は
 /// `0A000` で拒否し、真に未知の型名・`DOUBLE` 単独は `42704`（Issue #2303・#2306。
 /// ポインタ: TABLE-29・TABLE-30・TABLE-31）。拒否後はテーブルが作られない。
 #[test]
 fn unsettled_type_names_are_rejected_with_0a000_without_side_effects() {
     let (path, _g, core) = open("ta-unsettled");
     let mut s = allowed();
-    for sql in [
-        "CREATE TABLE t (a INT2[])",
-        "CREATE TABLE t (a SMALLINT[3])",
-        "CREATE TABLE t (a CHAR)",
-        "CREATE TABLE t (a CHARACTER)",
-    ] {
+    for sql in ["CREATE TABLE t (a CHAR)", "CREATE TABLE t (a CHARACTER)"] {
         assert_eq!(err(&core, &mut s, sql).wire_code(), "0A000", "{sql}");
     }
     for sql in ["CREATE TABLE t (a DOUBLE)", "CREATE TABLE t (a INT16)"] {
@@ -218,6 +213,9 @@ fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
         "CREATE TABLE t (a INT2)",
         "CREATE TABLE t (a SMALLINT)",
         "CREATE TABLE t (a mood)",
+        // `SMALLINT[]` は専用の要素型として実行段で解決されるため権限ゲートが先（Issue #3230）。
+        "CREATE TABLE t (a INT2[])",
+        "CREATE TABLE t (a SMALLINT[3])",
         // 長さなし VARCHAR は実行段で解決されるため権限ゲートが先（Issue #2305）。
         "CREATE TABLE t (a VARCHAR)",
         "CREATE TABLE t (a CHARACTER VARYING)",
@@ -233,13 +231,13 @@ fn ddl_permission_gate_precedes_runtime_resolution_but_not_syntax_rejection() {
         assert_eq!(err(&core, &mut denied, sql).wire_code(), "42501", "{sql}");
     }
     let mut ok = allowed();
-    for sql in [
-        "CREATE TABLE t (a INT2[])",
-        "CREATE TABLE t (a SMALLINT[3])",
-        "CREATE TABLE t (a CHAR)",
-    ] {
-        assert_eq!(err(&core, &mut denied, sql).wire_code(), "0A000", "{sql}");
-        assert_eq!(err(&core, &mut ok, sql).wire_code(), "0A000", "{sql}");
+    let sql = "CREATE TABLE t (a CHAR)";
+    assert_eq!(err(&core, &mut denied, sql).wire_code(), "0A000", "{sql}");
+    assert_eq!(err(&core, &mut ok, sql).wire_code(), "0A000", "{sql}");
+    // 権限ありなら `SMALLINT[]` は受理される（Issue #3230）。表名を分けて衝突を避ける。
+    for (i, ty) in ["INT2[]", "SMALLINT[3]"].into_iter().enumerate() {
+        let sql = format!("CREATE TABLE sa{i} (a {ty})");
+        run(&core, &mut ok, &sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     }
 }
 
@@ -345,15 +343,20 @@ fn alter_column_type_alias_failures_match_canonical_and_leave_schema() {
     let canon = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INTEGER").wire_code();
     let alias = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INT4").wire_code();
     assert_eq!(canon, alias);
-    for ty in ["INT2[]", "SMALLINT[3]", "CHAR"] {
-        let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
-        assert_eq!(err(&core, &mut s, &sql).wire_code(), "0A000", "{sql}");
-    }
+    let sql = "ALTER TABLE t ALTER COLUMN a TYPE CHAR";
+    assert_eq!(err(&core, &mut s, sql).wire_code(), "0A000", "{sql}");
     // 文字列系の配列型は受理済みの型名で、INTEGER 列からの変更は TEXT[] と同じ扱い（Issue #3231）。
     let text_arr = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE TEXT[]").wire_code();
     for ty in ["VARCHAR(10)[]", "VARCHAR[]", "CHAR(3)[]"] {
         let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
         assert_eq!(err(&core, &mut s, &sql).wire_code(), text_arr, "{sql}");
+    }
+    // `SMALLINT[]` は配列要素型として受理済み（Issue #3230）。INTEGER からの配列への変更は
+    // 正規名 `INTEGER[]` と同じ `wire_code` で拒否される（要素型の違いで結果を変えない）。
+    let canon_array = err(&core, &mut s, "ALTER TABLE t ALTER COLUMN a TYPE INTEGER[]").wire_code();
+    for ty in ["INT2[]", "SMALLINT[3]"] {
+        let sql = format!("ALTER TABLE t ALTER COLUMN a TYPE {ty}");
+        assert_eq!(err(&core, &mut s, &sql).wire_code(), canon_array, "{sql}");
     }
     // 長さ付き型への変更は構文を通り、INTEGER からは文字列型への代入変換として全行変換で受理される
     // （TABLE-40・Issue #1636。Issue #1563 では非互換変更として拒否していた）。INTEGER へ戻して

@@ -358,6 +358,10 @@ fn write_array(
             let _ = write!(out, "{v}");
             Ok(())
         })?,
+        ArrayValue::SmallInt(items) => each!(out, items, |out, v| {
+            let _ = write!(out, "{v}");
+            Ok(())
+        })?,
         ArrayValue::BigInt(items) => each!(out, items, |out, v| {
             if v.unsigned_abs() > MAX_SAFE_INTEGER.unsigned_abs() {
                 out.push('"');
@@ -483,6 +487,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Array(array_ty) => match array_ty.elem() {
                 engine::catalog::ArrayElemType::Text => "text[]",
                 engine::catalog::ArrayElemType::Bool => "boolean[]",
+                engine::catalog::ArrayElemType::SmallInt => "smallint[]",
                 engine::catalog::ArrayElemType::Integer => "integer[]",
                 engine::catalog::ArrayElemType::BigInt => "bigint[]",
                 engine::catalog::ArrayElemType::Real => "real[]",
@@ -1041,6 +1046,12 @@ mod tests {
                 "boolean[]",
                 V::Bool(vec![None, Some(true)]),
                 "[null,true]",
+            ),
+            (
+                ArrayElemType::SmallInt,
+                "smallint[]",
+                V::SmallInt(vec![Some(1), None, Some(-3)]),
+                "[1,null,-3]",
             ),
             (
                 ArrayElemType::Integer,

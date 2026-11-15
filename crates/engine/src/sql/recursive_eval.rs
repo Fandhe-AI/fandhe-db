@@ -1128,6 +1128,7 @@ fn array_elem_lacks_equality(elem: crate::catalog::ArrayElemType) -> bool {
         | E::Bpchar(_)
         | E::Bool
         | E::Integer
+        | E::SmallInt
         | E::BigInt
         | E::Real
         | E::Double
