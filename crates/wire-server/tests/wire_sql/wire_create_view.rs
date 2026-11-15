@@ -560,3 +560,60 @@ fn wire_create_view_accepts_expression_predicate_bodies_with_trailing_semicolon(
     expect_error_response_with_sqlstate(&mut stream, "42P01");
     read_ready_for_query(&mut stream);
 }
+/// Issue #3239: psql の形（末尾 `;` 付きの単独 simple query）で、式述語本文のビューが親表の
+/// 列改名に追随し、参照結果が改名前と一致する。追随できない形（`LIMIT` 付き本文）は `0A000` の後に
+/// `ReadyForQuery` が返り、接続は使い続けられる。
+// intentional: docs/design/create-view.md
+#[test]
+fn wire_rename_column_follows_expression_predicate_view() {
+    let (core, _guard) = new_core_with_numeric_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (id, n) in [(1, "1"), (2, "5"), (3, "NULL")] {
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "INSERT INTO docs_n (id, embedding, n) VALUES ({id}, '[0.1,0.2,0.3]', {n}) USING OPERATION_ID 'op-r-{id}'"
+            ),
+        );
+        let _tag = read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW vw AS SELECT * FROM docs_n WHERE n > 3 OR n IS NULL;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW vlim AS SELECT * FROM docs_n WHERE n > 3 OR n IS NULL LIMIT 5;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+    // 評価後射影形のビューが列を読むため、改名は 0A000。接続は使い続けられる。
+    send_simple_query(&mut stream, "ALTER TABLE docs_n RENAME COLUMN n TO m;");
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "DROP VIEW vlim;");
+    assert_eq!(read_command_complete(&mut stream), "DROP VIEW");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ALTER TABLE docs_n RENAME COLUMN n TO m;");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id FROM vw LIMIT 10;");
+    let _columns = read_row_description(&mut stream);
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let row = read_data_row(&mut stream);
+        got.push(row[0].clone().expect("id"));
+    }
+    got.sort();
+    assert_eq!(got, vec!["2", "3"]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+}
