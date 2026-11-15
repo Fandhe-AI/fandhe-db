@@ -5438,6 +5438,12 @@ pub struct ValidatedScan {
     /// 値が等しい行を結果へ加える。単一表のスカラー `ORDER BY` 広域取得だけが真になり、
     /// 束縛段（`sql::parser::bind_scan_with_dummy_flags`）が `BoundScan` へ伝える。
     pub(crate) with_ties: bool,
+    /// `SELECT DISTINCT ON (...)`（Issue #3261・SQL-25 のポインタ）のグループ前置長（異なり ON キー数）。
+    /// `Some(k)` のとき実効 `ORDER BY`（[`Self::order_keys`]。ON キーを先頭 `k` 個に置く）の先頭 `k` キー
+    /// が等しい行を 1 グループとし、ソート順で最初の行だけを残す（`sql::scan` の経路 (B)）。
+    /// セッション最上位の単一表・畳み込み可能ビューの広域取得だけが立て（`validate_distinct_on_select`）、
+    /// 他の構築箇所は常に `None`。
+    pub(crate) distinct_on: Option<usize>,
 }
 
 impl ValidatedScan {
@@ -23828,6 +23834,7 @@ fn check_join_relations_are_tables(
 /// 落とした計画を返さないため、`core.rs` の入れ子文の `EXPLAIN` が `42601` に倒す根拠になる。
 pub(crate) fn scan_has_unrendered_explain_shape(v: &ValidatedScan) -> bool {
     !v.window_items.is_empty()
+        || v.distinct_on.is_some()
         || v.has_value_subqueries()
         || v.where_predicates
             .iter()
@@ -23986,6 +23993,7 @@ fn parse_set_branch(
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         },
         super::view::Resolved::View {
             base_table,
@@ -24028,6 +24036,7 @@ fn parse_set_branch(
                 physical_order_keys: Vec::new(),
                 embedded_scalar_subqueries: Vec::new(),
                 with_ties: false,
+                distinct_on: None,
             }
         }
         // Issue #1192: 評価後射影形ビューは集合演算の枝として参照できない。
@@ -26814,6 +26823,7 @@ fn build_scan_from_resolved(
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }),
         super::view::Resolved::View {
             base_table,
@@ -26884,6 +26894,7 @@ fn build_scan_from_resolved(
                 physical_order_keys,
                 embedded_scalar_subqueries: Vec::new(),
                 with_ties: false,
+                distinct_on: None,
             })
         }
         // 評価後射影形ビュー（Issue #1192）は CTE・集合演算の枝など、広域取得の
@@ -29347,7 +29358,12 @@ fn validate_sql_tokens_impl(
         // SELECT／集計 SELECT）でのみサブクエリを解決できるようにする
         // （`EXPLAIN` 経由の呼び出しは常に `None` を渡す。後述）。
         Some(Token::Keyword(Keyword::Select)) => {
-            validate_select_statement(tokens, lookup, subquery_ctx, limits)
+            // `SELECT DISTINCT ON`（Issue #3261）の実行はセッション最上位の入口（`AllowMaterialize`・
+            // 深さ 0）だけに限る。ビュー本文・CTAS・カーソル・サブクエリの内側等の入口は、重複排除を
+            // 実行段へ運べないため `0A000` で拒否する（fail-closed）。
+            let allow_distinct_on =
+                cte_evaluation == CteEvaluation::AllowMaterialize && subquery_ctx == Some(0);
+            validate_select_statement(tokens, lookup, subquery_ctx, limits, allow_distinct_on)
         }
         // TASK-213・SQL-29 (b)・RLS-10 (b)（Issue #928）: 非再帰 CTE。CTE は
         // 「クエリの中だけで有効な名前なしビュー」として、`sql::cte::
@@ -29558,7 +29574,7 @@ fn validate_sql_tokens_impl(
             // 段の組み立ては `core.rs` の `Statement::Explain` アームが行い、内側は実行しない。
             // 値としての部分クエリ・FILTER／HAVING の部分クエリ・ランキング検索の部分クエリは
             // 描画する段を持たないため下で明示的に `42601` にする（fail-closed）。
-            let target = match validate_select_statement(rest, lookup, subquery_ctx, limits)? {
+            let target = match validate_select_statement(rest, lookup, subquery_ctx, limits, false)? {
                 // Issue #2977: `USING PLAN(...)` つきの順位付き検索の部分クエリは、実行も LLM I/O の前に
                 // `42601` で拒否する形なので、EXPLAIN も同じコードで先に拒否する（fail-closed）。
                 // それ以外（HALFVEC の kNN は実行が Scan へ写して部分クエリを解決する。VECTOR の kNN・
@@ -29714,16 +29730,25 @@ fn select_range_contains_aggregate_call(tokens: &[Token], start: usize, item_onl
     false
 }
 
-/// `SELECT DISTINCT ON` の検証（[`validate_select_statement`] の gate から呼ぶ。Issue #3260）。
-/// 判定順序は 構文（42601）→ 個数上限（54000）→ FROM の関係（42P01）→ `ORDER BY` 先頭一致
-/// （42P10）→ 実行段未実装（0A000。Issue #3261 が置き換える）。未知列（42703）は束縛段の責務で、
-/// 本関数の判定順は PostgreSQL と差がある（`docs/design/select-distinct-on.md` に既知差として記録）。
-/// 集計・`GROUP BY`・`HAVING`・ウィンドウとの併用、距離順位付け形、`USING PLAN` は `0A000`。
+/// `SELECT DISTINCT ON` の検証と受理（[`validate_select_statement`] の gate から呼ぶ。Issue #3260・#3261）。
+/// 判定順序は 構文（42601）→ 個数上限（54000）→ FROM の関係（42P01）→ 未対応の併用（0A000）→
+/// `ORDER BY` 先頭一致（42P10。直前に未知列 42703 を先に判定する）→ 実行できない文脈（0A000）→
+/// 実効ソートキーの組み立て（54000）。整合した文は、実効 `ORDER BY`（ON キーを先頭に置く）と
+/// グループ前置長（[`ValidatedScan::distinct_on`]）を持つ通常の広域取得 [`Statement::Scan`] になり、
+/// 束縛・実行（RLS・予算）は既存の広域取得経路を共有する（第 2 の実行器を持たない）。
+///
+/// 受理するのは `allow_exec`（セッション最上位の入口 [`validate_session_sql_tokens`] だけが真）で、
+/// 単一表または畳み込み可能ビューへの `SELECT DISTINCT ON (...) <投影> FROM <表> [WHERE] [ORDER BY]
+/// [LIMIT/OFFSET]`。サブクエリの内側・ビュー本文・CTAS・カーソル・EXPLAIN・INSERT…SELECT 等の
+/// 他の入口、評価後射影形ビュー、`WITH TIES`、式内のスカラーサブクエリは、実行段へ重複排除を運べない
+/// ため `0A000`（fail-closed。黙って重複排除を落とさない）。集計・`GROUP BY`・`HAVING`・ウィンドウとの
+/// 併用、距離順位付け形、`USING PLAN` も `0A000`。
 fn validate_distinct_on_select(
     tokens: &[Token],
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
     limits: crate::nesting_limits::NestingLimits,
+    allow_exec: bool,
 ) -> Result<Statement, SqlSurfaceError> {
     let unsupported_combo = || {
         SqlSurfaceError::feature_not_supported(
@@ -29738,25 +29763,121 @@ fn validate_distinct_on_select(
         return Err(unsupported_combo());
     }
     let (on_exprs, parsed) = parse_distinct_on_select(tokens, subquery_ctx, limits)?;
-    let ParsedSelect::Scan(shape) = parsed else {
+    let ParsedSelect::Scan(mut shape) = parsed else {
         return Err(SqlSurfaceError::feature_not_supported(
             "SELECT DISTINCT ON is not supported with vector ranking or USING PLAN",
         ));
     };
     // FROM の存在確認（テーブル・ビュー。ビュー別名の書き換えより前に、利用者が書いた名前で比較する）。
-    super::view::resolve_from(lookup, &shape.table_name)?;
+    let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
     if !shape.window_items.is_empty() || !shape.scalar_subquery_items.is_empty() {
         return Err(unsupported_combo());
     }
-    super::distinct::check_distinct_on_order_prefix(
+    if let Err(e) = super::distinct::check_distinct_on_order_prefix(
+        &on_exprs,
+        &shape.projection,
+        &shape.order_by,
+        &shape.order_keys,
+    ) {
+        // PostgreSQL は未知列を先頭一致（42P10）より先に判定する。もともとエラーになる経路で
+        // SQLSTATE が変わるだけなので、正しい文を拒否することはない。
+        if matches!(e, SqlSurfaceError::DistinctOnOrderByMismatch)
+            && matches!(resolved, super::view::Resolved::Table)
+        {
+            if let Some(columns) = lookup.table_columns(&shape.table_name)? {
+                if let Some(unknown) = super::distinct::first_unknown_column(
+                    &on_exprs,
+                    &shape.projection,
+                    &shape.order_by,
+                    &shape.order_keys,
+                    &columns,
+                ) {
+                    return Err(SqlSurfaceError::undefined_column(unknown));
+                }
+            }
+        }
+        return Err(e);
+    }
+    let not_here = |detail: &'static str| SqlSurfaceError::feature_not_supported(detail);
+    if !allow_exec {
+        return Err(not_here(
+            "SELECT DISTINCT ON is only supported as a top-level SELECT statement",
+        ));
+    }
+    if matches!(resolved, super::view::Resolved::Buffered { .. }) {
+        return Err(not_here(
+            "SELECT DISTINCT ON is not supported over a view with an aggregate/LIMIT body",
+        ));
+    }
+    if shape.with_ties {
+        return Err(not_here(
+            "SELECT DISTINCT ON cannot be combined with FETCH ... WITH TIES",
+        ));
+    }
+    if !shape.embedded_scalar_subqueries.is_empty() {
+        return Err(not_here(
+            "SELECT DISTINCT ON cannot be combined with scalar subqueries inside expressions",
+        ));
+    }
+    let (effective, prefix_len) = super::distinct::distinct_on_effective_order(
         &on_exprs,
         &shape.projection,
         &shape.order_by,
         &shape.order_keys,
     )?;
-    Err(SqlSurfaceError::feature_not_supported(
-        "SELECT DISTINCT ON is not supported yet",
-    ))
+    shape.order_by = Vec::new();
+    shape.order_keys = effective;
+    match scan_statement_from_resolved(shape, resolved)? {
+        Statement::Scan(mut scan) => {
+            scan.distinct_on = Some(prefix_len);
+            Ok(Statement::Scan(scan))
+        }
+        // 評価後射影形ビューは上で拒否済み。他の形はここへ到達しない（多層防御として fail-closed）。
+        _ => Err(not_here("SELECT DISTINCT ON is not supported here")),
+    }
+}
+
+/// 広域取得（[`ParsedScanShape`]）の FROM を解決済みの [`super::view::Resolved`] から
+/// [`Statement`] へ組み立てる。通常の広域取得（[`validate_select_statement`] の
+/// `ParsedSelect::Scan` 腕）と `SELECT DISTINCT ON`（[`validate_distinct_on_select`]）が共有する
+/// 唯一の構築経路（第 2 の構築経路を作らない）。
+fn scan_statement_from_resolved(
+    shape: ParsedScanShape,
+    resolved: super::view::Resolved,
+) -> Result<Statement, SqlSurfaceError> {
+    // Issue #1192・#1360・#1411: 評価後射影形ビューへの参照は本文実行＋外側の
+    // 後処理の別 variant へ分岐する。外側は `SELECT <*|列> FROM <view> [WHERE ...]
+    // [ORDER BY <列|式>] LIMIT n [OFFSET m]`（ウィンドウ項目を含みうる）。WHERE は
+    // 宣言的な葉と NOT／OR・式述語のみ。式項目・投影位置のスカラーサブクエリは
+    // `42601`。
+    if let super::view::Resolved::Buffered { view_name, body } = resolved {
+        return buffered_scan_statement(view_name, body, shape);
+    }
+    // Issue #1848: 式の内側のスカラーサブクエリは実テーブル直接の参照だけが対象。ビュー・CTE 越しは
+    // 外側の述語・列名の書き換え（公開名 → 物理名）と相関列の対応を保証できないため `0A000`。
+    if !shape.embedded_scalar_subqueries.is_empty()
+        && !matches!(resolved, super::view::Resolved::Table)
+    {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "scalar subqueries inside expressions are not supported over a view",
+        ));
+    }
+    let embedded_scalar_subqueries = shape.embedded_scalar_subqueries;
+    let mut scan = build_scan_from_resolved(
+        shape.table_name,
+        resolved,
+        shape.projection,
+        shape.where_predicates,
+        shape.limit,
+        shape.order_by,
+        shape.offset,
+        shape.window_items,
+        shape.order_keys,
+        shape.scalar_subquery_items,
+    )?;
+    scan.with_ties = shape.with_ties;
+    scan.embedded_scalar_subqueries = embedded_scalar_subqueries;
+    Ok(Statement::Scan(scan))
 }
 
 /// 通常 SELECT・集計 SELECT（`GROUP BY` の有無いずれも）・`SELECT DISTINCT`
@@ -29787,6 +29908,7 @@ fn validate_select_statement(
     lookup: &impl TableLookup,
     subquery_ctx: Option<usize>,
     limits: crate::nesting_limits::NestingLimits,
+    allow_distinct_on: bool,
 ) -> Result<Statement, SqlSurfaceError> {
     // SQL-43（Issue #1531）: 括弧の深さ 0 に `FROM` が無い `SELECT` は定数式 SELECT。
     // 既存形（`FROM` あり）では常に偽で、以降の振り分けに一切影響しない。
@@ -29813,12 +29935,18 @@ fn validate_select_statement(
             precheck_aggregate_filter_tokens(tokens, i.saturating_add(1))?;
         }
     }
-    // Issue #3260（SQL-25 のポインタ）: `SELECT DISTINCT ON (...)`。構文・個数（54000）・FROM の
-    // 存在（42P01）・`ORDER BY` 先頭一致（42P10）を検証し、整合した文も行を返す実行段（Issue #3261）が
-    // 入るまでは通常の広域取得として黙って実行せず `0A000` で拒否する（fail-closed）。共有の検証経路に
-    // 置くため Parse／Describe・ビュー本文・カーソル等の入口は同じ分類になる。
+    // Issue #3260・#3261（SQL-25 のポインタ）: `SELECT DISTINCT ON (...)`。構文・個数（54000）・FROM の
+    // 存在（42P01）・`ORDER BY` 先頭一致（42P10）を検証し、整合した文はセッション最上位の入口に限り
+    // 重複排除つきの広域取得として受理する（他の入口は `0A000`。fail-closed）。共有の検証経路に置くため
+    // Parse／Describe・ビュー本文・カーソル等の入口も同じ分類になる。
     if super::distinct::is_distinct_on_head(tokens, 1) {
-        return validate_distinct_on_select(tokens, lookup, subquery_ctx, limits);
+        return validate_distinct_on_select(
+            tokens,
+            lookup,
+            subquery_ctx,
+            limits,
+            allow_distinct_on,
+        );
     }
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
@@ -29944,39 +30072,7 @@ fn validate_select_statement(
         // すべて既存経路をそのまま通る（第 2 の実行器を作らない）。
         ParsedSelect::Scan(shape) => {
             let resolved = super::view::resolve_from(lookup, &shape.table_name)?;
-            // Issue #1192・#1360・#1411: 評価後射影形ビューへの参照は本文実行＋外側の
-            // 後処理の別 variant へ分岐する。外側は `SELECT <*|列> FROM <view> [WHERE ...]
-            // [ORDER BY <列|式>] LIMIT n [OFFSET m]`（ウィンドウ項目を含みうる）。WHERE は
-            // 宣言的な葉と NOT／OR・式述語のみ。式項目・投影位置のスカラーサブクエリは
-            // `42601`。
-            if let super::view::Resolved::Buffered { view_name, body } = resolved {
-                return buffered_scan_statement(view_name, body, shape);
-            }
-            // Issue #1848: 式の内側のスカラーサブクエリは実テーブル直接の参照だけが対象。ビュー・CTE 越しは
-            // 外側の述語・列名の書き換え（公開名 → 物理名）と相関列の対応を保証できないため `0A000`。
-            if !shape.embedded_scalar_subqueries.is_empty()
-                && !matches!(resolved, super::view::Resolved::Table)
-            {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "scalar subqueries inside expressions are not supported over a view",
-                ));
-            }
-            let embedded_scalar_subqueries = shape.embedded_scalar_subqueries;
-            let mut scan = build_scan_from_resolved(
-                shape.table_name,
-                resolved,
-                shape.projection,
-                shape.where_predicates,
-                shape.limit,
-                shape.order_by,
-                shape.offset,
-                shape.window_items,
-                shape.order_keys,
-                shape.scalar_subquery_items,
-            )?;
-            scan.with_ties = shape.with_ties;
-            scan.embedded_scalar_subqueries = embedded_scalar_subqueries;
-            Ok(Statement::Scan(scan))
+            scan_statement_from_resolved(shape, resolved)
         }
     }
 }
@@ -31770,6 +31866,7 @@ fn validate_copy_table_to_tokens(
         physical_order_keys: Vec::new(),
         embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
+        distinct_on: None,
     };
     Ok(CopyStatement::To(ValidatedCopyTo {
         inner: CopyToSource::Scan(Box::new(scan)),
@@ -40478,20 +40575,40 @@ mod tests {
         }
     }
 
-    /// Issue #3260: DISTINCT ON の判定順序（構文 → 54000 → 42P01 → 42P10 → 0A000）。
-    // tracked: #3261（整合した文の 0A000 は行を返す実行段で置き換わる）
+    /// Issue #3260・#3261: DISTINCT ON の判定順序（構文 → 54000 → 42P01 → 未対応併用 → 42P10 →
+    /// 実行できない文脈 0A000）。セッション最上位の入口（`session_stmt`）だけが整合した文を受理し、
+    /// それ以外の入口（`validate_sql`）は整合した文も `0A000`（fail-closed）。
     #[test]
     fn distinct_on_classification_order() {
         let lookup = catalog_with(&["documents"]);
         let code = |sql: &str| validate_sql(sql, &lookup).err().map(|e| e.wire_code());
+        let session = |sql: &str| session_stmt(sql, &lookup).err().map(|e| e.wire_code());
+        // 非セッション入口は整合した文も 0A000。
         assert_eq!(
             code("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang LIMIT 5"),
             Some("0A000")
         );
-        assert_eq!(
-            code("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY id, lang LIMIT 5"),
-            Some("42P10")
-        );
+        // セッション最上位は受理して `distinct_on = Some(前置長)` を立てる。
+        let ok = session_stmt(
+            "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang LIMIT 5",
+            &lookup,
+        )
+        .expect("accepted at session top level");
+        match ok {
+            Statement::Scan(scan) => {
+                assert_eq!(scan.distinct_on, Some(1));
+                assert!(scan.order_by.is_empty());
+                assert_eq!(scan.order_keys.len(), 1);
+            }
+            other => panic!("expected Scan, got {other:?}"),
+        }
+        for sql in [
+            "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY id, lang LIMIT 5",
+            "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY id",
+        ] {
+            assert_eq!(code(sql), Some("42P10"), "{sql}");
+            assert_eq!(session(sql), Some("42P10"), "{sql}");
+        }
         assert_eq!(
             code("SELECT DISTINCT ON (lang) lang FROM missing ORDER BY id"),
             Some("42P01")
@@ -40505,18 +40622,82 @@ mod tests {
             code(&format!("SELECT DISTINCT ON ({many}) lang FROM documents")),
             Some("54000")
         );
+        // 異なり ON キーが上限ちょうど（同一キーの重複は 1 個）なら受理され、前置長は 1。
         let at_limit = ["lang"; MAX_SCALAR_ORDER_KEYS].join(", ");
-        assert_eq!(
-            code(&format!(
-                "SELECT DISTINCT ON ({at_limit}) lang FROM documents"
-            )),
-            Some("0A000")
-        );
+        let ok = session_stmt(
+            &format!("SELECT DISTINCT ON ({at_limit}) lang FROM documents"),
+            &lookup,
+        )
+        .expect("accepted");
+        assert!(matches!(ok, Statement::Scan(s) if s.distinct_on == Some(1)));
         // 集計・GROUP BY との併用は PostgreSQL が受理する形のため 42601 ではなく 0A000。
         assert_eq!(
-            code("SELECT DISTINCT ON (lang) lang, COUNT(*) FROM documents GROUP BY lang"),
+            session("SELECT DISTINCT ON (lang) lang, COUNT(*) FROM documents GROUP BY lang"),
             Some("0A000")
         );
+    }
+
+    /// Issue #3261: ORDER BY に無い ON キーは末尾へ ASC で暗黙に足され、前置長は異なり ON キー数。
+    #[test]
+    fn distinct_on_effective_order_appends_missing_on_keys() {
+        let lookup = catalog_with(&["documents"]);
+        let scan = |sql: &str| match session_stmt(sql, &lookup).expect(sql) {
+            Statement::Scan(s) => s,
+            other => panic!("expected Scan, got {other:?}"),
+        };
+        let s =
+            scan("SELECT DISTINCT ON (lang, title) lang, title FROM documents ORDER BY lang DESC");
+        assert_eq!(s.distinct_on, Some(2));
+        assert_eq!(s.order_keys.len(), 2);
+        let s = scan("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang, id DESC");
+        assert_eq!(s.distinct_on, Some(1));
+        assert_eq!(s.order_keys.len(), 2);
+        // ORDER BY なしは ON キーの ASC だけ。
+        let s = scan("SELECT DISTINCT ON (lang) lang FROM documents");
+        assert_eq!(s.distinct_on, Some(1));
+        assert_eq!(s.order_keys.len(), 1);
+    }
+
+    /// Issue #3261: 実行段へ重複排除を運べない文脈は 0A000（黙って重複排除を落とさない）。
+    #[test]
+    fn distinct_on_unsupported_execution_contexts_are_0a000() {
+        let lookup = catalog_with(&["documents"]);
+        // セッション最上位の中でも、WITH TIES は 0A000。
+        assert_eq!(
+            session_stmt(
+                "SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang FETCH FIRST 2 ROWS WITH TIES",
+                &lookup,
+            )
+            .err()
+            .map(|e| e.wire_code()),
+            Some("0A000")
+        );
+        // サブクエリの内側（深さ 1）・EXPLAIN・ビュー本文などの入口は常に 0A000。
+        let tokens = lexer::tokenize("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang")
+            .expect("tokenize");
+        let inner = validate_sql_tokens_with_subquery_ctx(&tokens, &lookup, 1);
+        assert_eq!(inner.err().map(|e| e.wire_code()), Some("0A000"));
+        let at_zero = validate_sql_tokens_with_subquery_ctx(&tokens, &lookup, 0);
+        assert_eq!(at_zero.err().map(|e| e.wire_code()), Some("0A000"));
+        assert_eq!(
+            session_stmt(
+                "EXPLAIN SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang",
+                &lookup,
+            )
+            .err()
+            .map(|e| e.wire_code()),
+            Some("0A000")
+        );
+    }
+
+    /// Issue #3261: 先頭一致を拒否する直前に未知列を先に判定する（PostgreSQL と同順）。
+    #[test]
+    fn distinct_on_unknown_column_is_reported_before_order_mismatch() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| session_stmt(sql, &lookup).err().map(|e| e.wire_code());
+        // `FakeCatalog` が列集合を返す場合だけ 42703（返さない lookup では 42P10 のまま）。
+        let got = code("SELECT DISTINCT ON (nope) lang FROM documents ORDER BY lang");
+        assert!(matches!(got, Some("42703" | "42P10")), "{got:?}");
     }
 
     /// Issue #3260: 未対応文脈（CTE 本文・JOIN・集合演算・派生表・FROM なし）の DISTINCT ON は
@@ -40533,6 +40714,7 @@ mod tests {
             "SELECT DISTINCT ON (lang) 1",
         ] {
             assert!(validate_sql(sql, &lookup).is_err(), "{sql}");
+            assert!(session_stmt(sql, &lookup).is_err(), "{sql}");
         }
     }
 
