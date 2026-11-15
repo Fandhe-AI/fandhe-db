@@ -617,3 +617,48 @@ fn wire_rename_column_follows_expression_predicate_view() {
     assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     read_ready_for_query(&mut stream);
 }
+
+// intentional: docs/design/create-view.md
+/// ビュー定義の拒否が原因別の SQLSTATE になる（Issue #3240。TABLE-18・ERR-6 ポインタ）。psql 相当の
+/// 末尾 `;` 付き単独送信で、JOIN 辺のビュー参照・集合演算の枝からの参照は `42601`、
+/// `LIMIT` 付きビューの上の `ILIKE` は `0A000`。各拒否の後も接続は使い続けられ、受理形
+/// （数値比較 ＋ `LIMIT`）は同じ形式で `CREATE VIEW` タグになる。
+#[test]
+fn wire_create_view_rejections_are_cause_specific_and_connection_stays_usable() {
+    let (core, _guard) = new_core_with_docs_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut alice,
+        "CREATE VIEW lim AS SELECT id, lang FROM docs LIMIT 5;",
+    );
+    let _tag = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+    for (sql, sqlstate) in [
+        (
+            "CREATE VIEW x_join AS SELECT docs.id FROM docs JOIN lim ON docs.id = lim.id LIMIT 5;",
+            "42601",
+        ),
+        (
+            "CREATE VIEW x_union AS SELECT id FROM docs UNION ALL SELECT id FROM lim;",
+            "42601",
+        ),
+        (
+            "CREATE VIEW x_ilike AS SELECT id FROM lim WHERE lang ILIKE 'j%';",
+            "0A000",
+        ),
+    ] {
+        send_simple_query(&mut alice, sql);
+        expect_error_response_with_sqlstate(&mut alice, sqlstate);
+        read_ready_for_query(&mut alice);
+    }
+    send_simple_query(
+        &mut alice,
+        "CREATE VIEW ok_num AS SELECT id FROM docs WHERE id > 1 LIMIT 5;",
+    );
+    let tag = read_command_complete(&mut alice);
+    assert_eq!(tag, "CREATE VIEW");
+    read_ready_for_query(&mut alice);
+}

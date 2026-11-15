@@ -5660,7 +5660,7 @@ fn encode_view_def(def: &ViewDef) -> Result<Vec<u8>> {
     if !def.column_aliases.is_empty() || def.check_option != ViewCheckOption::None {
         if def.column_aliases.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
-                "too many view column aliases".to_string(),
+                VIEW_TOO_MANY_ALIASES_MESSAGE.to_string(),
             ));
         }
         let count = u32::try_from(def.column_aliases.len())
@@ -5851,7 +5851,7 @@ fn validate_view_body_matches_base_relation(
     let shape = view_body_shape(body_sql)?;
     if shape.relations.first().map(String::as_str) != Some(base_relation) {
         return Err(CatalogError::Invalid(
-            "view body FROM target does not match base_relation".to_string(),
+            VIEW_BASE_MISMATCH_MESSAGE.to_string(),
         ));
     }
     Ok(shape)
@@ -5874,15 +5874,10 @@ struct ViewBodyShape {
 /// [`ViewBodyShape`] を本文から導出する。字句・構造検証に失敗した本文は
 /// `CatalogError::Invalid`。
 fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
-    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| {
-        CatalogError::Invalid("view body is not valid SQL for a view definition".to_string())
-    })?;
+    let tokens = crate::sql::lexer::tokenize_stored_view_body(body_sql)
+        .map_err(|_| CatalogError::Invalid(VIEW_BODY_LEXICAL_MESSAGE.to_string()))?;
     let kind = classify_view_body(&tokens, &StructuralOnlyLookup, ViewBodyCheck::Structural)
-        .map_err(|_| {
-            CatalogError::Invalid(
-                "view body does not match the allowed view definition shape".to_string(),
-            )
-        })?;
+        .map_err(|_| CatalogError::Invalid(VIEW_BODY_SHAPE_MESSAGE.to_string()))?;
     Ok(match kind {
         ViewBodyKind::Simple(parsed) => ViewBodyShape {
             relations: vec![parsed.table_name],
@@ -6683,7 +6678,7 @@ fn validate_new_view_body_in_txn(
         }
         if shape.join && catalog_table.get(rel.as_str())?.is_none() {
             return Err(CatalogError::Invalid(
-                "JOIN in a view body cannot reference a view".to_string(),
+                VIEW_JOIN_REFERENCES_VIEW_MESSAGE.to_string(),
             ));
         }
     }
@@ -6692,12 +6687,7 @@ fn validate_new_view_body_in_txn(
     // （または単純形ビュー経由でテーブル）直下なら `Resolved` の検証で `Invalid`
     // （`42601`）になる。作成できても参照時に必ず失敗する定義を作らない。
     if reaches_buffered || shape.deferred_expr || (shape.buffered && reaches_aliased) {
-        let invalid = || {
-            CatalogError::Invalid(
-                "a view cannot reference a view with an aggregate/LIMIT body in this position"
-                    .to_string(),
-            )
-        };
+        let invalid = || CatalogError::Invalid(VIEW_BUFFERED_POSITION_MESSAGE.to_string());
         if shape.buffered {
             let lookup = TxnViewLookup {
                 write_txn,
@@ -6712,6 +6702,11 @@ fn validate_new_view_body_in_txn(
                     SqlSurfaceError::PayloadTooLarge { detail } => {
                         CatalogError::ViewLimitExceeded(detail)
                     }
+                    // 内側が `0A000`（未対応機能）なら外側も `0A000` 系の固定文言へ写す
+                    // （内側の文言・識別子は転送しない。Issue #3240）。
+                    SqlSurfaceError::FeatureNotSupported { .. } => {
+                        CatalogError::Invalid(VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string())
+                    }
                     _ => invalid(),
                 }
             })?;
@@ -6719,8 +6714,14 @@ fn validate_new_view_body_in_txn(
             let tokens =
                 crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid())?;
             let parsed = parse_view_body(&tokens).map_err(|_| invalid())?;
-            crate::sql::allowlist::check_simple_layer_over_buffered(&parsed)
-                .map_err(|_| invalid())?;
+            crate::sql::allowlist::check_simple_layer_over_buffered(&parsed).map_err(
+                |e| match e {
+                    SqlSurfaceError::FeatureNotSupported { .. } => {
+                        CatalogError::Invalid(VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string())
+                    }
+                    _ => CatalogError::Invalid(VIEW_OVER_BUFFERED_LAYER_MESSAGE.to_string()),
+                },
+            )?;
         }
     }
     // 列別名付きビューへ到達する単純形の本文（Issue #1659）: 参照時は親の「公開名 → 物理名」
@@ -6728,11 +6729,13 @@ fn validate_new_view_body_in_txn(
     // （疑似列 `id` へ写る公開名の参照など）を含む定義は、作成できても以後の参照がすべて
     // 失敗するため、参照時と同じ検査（列スコープ・`rewrite_where`）を作成前に通す。
     if reaches_aliased && !shape.buffered {
-        let invalid = || {
-            CatalogError::Invalid(
-                "a view over a view with column aliases cannot use this predicate or column"
-                    .to_string(),
-            )
+        let invalid = || CatalogError::Invalid(VIEW_OVER_ALIASED_MESSAGE.to_string());
+        // 内側が `0A000` なら `0A000` 系の固定文言、それ以外は `42601` 系（Issue #3240）。
+        let classify = |e: SqlSurfaceError| match e {
+            SqlSurfaceError::FeatureNotSupported { .. } => {
+                CatalogError::Invalid(VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string())
+            }
+            _ => invalid(),
         };
         let lookup = TxnViewLookup {
             write_txn,
@@ -6747,7 +6750,7 @@ fn validate_new_view_body_in_txn(
             column_map: Some(map),
             base_allocated,
             ..
-        } = crate::sql::view::resolve_from(&lookup, base_relation).map_err(|_| invalid())?
+        } = crate::sql::view::resolve_from(&lookup, base_relation).map_err(classify)?
         {
             crate::sql::view::check_columns_within_view(
                 view_columns.as_deref(),
@@ -6755,12 +6758,12 @@ fn validate_new_view_body_in_txn(
                 &parsed.where_predicates,
                 &[],
             )
-            .map_err(|_| invalid())?;
+            .map_err(classify)?;
             crate::sql::view_alias::rewrite_where(
                 &crate::sql::view_alias::ColumnMap::new(&map, !base_allocated),
                 parsed.where_predicates,
             )
-            .map_err(|_| invalid())?;
+            .map_err(classify)?;
         }
     }
     // テーブル自身が深さ 0 のため、それを直接参照する新規ビューの深さは
@@ -8666,6 +8669,37 @@ pub(crate) enum MigratedIdRole {
     /// `id` 以外の宣言 PRIMARY KEY を持つ表。`id` は UNIQUE 相当として残る。
     Unique,
 }
+
+/// ビュー定義（`CREATE [OR REPLACE] VIEW`）の拒否原因ごとの固定文言（Issue #3240）。
+/// `sql::ddl::map_create_view_error` が文言一致で SQLSTATE を決める（`0A000` か `42601`）。
+/// 内部キー・他テナント名・内側エラーの文言を含めない（security.md P0）。
+pub(crate) const VIEW_BODY_LEXICAL_MESSAGE: &str =
+    "view body is not valid SQL for a view definition";
+/// 本文が許可された定義の形でない。
+pub(crate) const VIEW_BODY_SHAPE_MESSAGE: &str =
+    "view body does not match the allowed view definition shape";
+/// 本文の FROM 対象が `base_relation` と食い違う（公開 Rust API からのみ到達）。
+pub(crate) const VIEW_BASE_MISMATCH_MESSAGE: &str =
+    "view body FROM target does not match base_relation";
+/// JOIN の片辺がビュー。
+pub(crate) const VIEW_JOIN_REFERENCES_VIEW_MESSAGE: &str =
+    "JOIN in a view body cannot reference a view";
+/// 集計・`LIMIT` 付きビューを読めない位置から参照している（`42601`）。
+pub(crate) const VIEW_BUFFERED_POSITION_MESSAGE: &str =
+    "a view cannot reference a view with an aggregate/LIMIT body in this position";
+/// 集計・`LIMIT` 付きビューの上の単純形の段が許可外の投影・述語を使う（`42601`）。
+pub(crate) const VIEW_OVER_BUFFERED_LAYER_MESSAGE: &str =
+    "a view over a view with an aggregate/LIMIT body cannot use this projection or predicate";
+/// 列別名付きビューの上で使えない述語・列（`42601`）。
+pub(crate) const VIEW_OVER_ALIASED_MESSAGE: &str =
+    "a view over a view with column aliases cannot use this predicate or column";
+/// 本文が未対応の機能を使う（`0A000`。内側の検査が `0A000` を返した場合）。
+pub(crate) const VIEW_UNSUPPORTED_FEATURE_MESSAGE: &str =
+    "view body uses a feature that is not supported in this position";
+/// 列別名が多すぎる（公開 Rust API の多層防御）。
+pub(crate) const VIEW_TOO_MANY_ALIASES_MESSAGE: &str = "too many view column aliases";
+/// 列別名が重複している（公開 Rust API の多層防御）。
+pub(crate) const VIEW_DUPLICATE_ALIAS_MESSAGE: &str = "duplicate view column alias";
 
 /// 行識別方式が未対応の表（[`RowIdentity::Allocated`]）への操作を拒否するときの固定文言。
 /// rowid・テナント名・表名を含めない（情報漏えい防止。security.md）。
@@ -16319,7 +16353,7 @@ impl Storage {
         }
         if column_aliases.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
-                "too many view column aliases".to_string(),
+                VIEW_TOO_MANY_ALIASES_MESSAGE.to_string(),
             ));
         }
         let mut seen_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -16327,7 +16361,7 @@ impl Storage {
             validate_identifier(alias)?;
             if !seen_aliases.insert(alias.as_str()) {
                 return Err(CatalogError::Invalid(
-                    "duplicate view column alias".to_string(),
+                    VIEW_DUPLICATE_ALIAS_MESSAGE.to_string(),
                 ));
             }
         }
@@ -17086,7 +17120,7 @@ impl Storage {
         }
         if column_aliases.len() > MAX_COLUMN_COUNT {
             return Err(CatalogError::Invalid(
-                "too many view column aliases".to_string(),
+                VIEW_TOO_MANY_ALIASES_MESSAGE.to_string(),
             ));
         }
         let mut seen_aliases: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -17094,7 +17128,7 @@ impl Storage {
             validate_identifier(alias)?;
             if !seen_aliases.insert(alias.as_str()) {
                 return Err(CatalogError::Invalid(
-                    "duplicate view column alias".to_string(),
+                    VIEW_DUPLICATE_ALIAS_MESSAGE.to_string(),
                 ));
             }
         }
