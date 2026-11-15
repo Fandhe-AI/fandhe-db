@@ -3074,9 +3074,10 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
-        CatalogError::Invalid(_) => {
-            SqlSurfaceError::unsupported("malformed view definition in CREATE VIEW")
-        }
+        // 原因別の固定文言（Issue #3240。TABLE-18・TABLE-41・ERR-6）。catalog 側の定数と
+        // 完全一致したものだけを写し、未知の detail は汎用文言へ丸める（fail-closed。
+        // detail は応答へ連結しない）。
+        CatalogError::Invalid(d) => view_definition_error(&d),
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の書き込み入口（`CREATE TABLE`／
         // `DROP TABLE`）と同じく `55P03` を返す（`XX000` へ丸めない）。
@@ -3087,6 +3088,37 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         _ => SqlSurfaceError::Internal {
             detail: "CREATE VIEW failed".to_string(),
         },
+    }
+}
+
+/// `CatalogError::Invalid` の detail（catalog の `VIEW_*_MESSAGE` 定数）を SQL 表層の契約へ
+/// 写像する（Issue #3240）。未対応機能は `0A000`、それ以外の定義エラーは `42601`。
+/// 定数以外の detail は汎用の固定文言にし、そのまま外へ出さない。
+fn view_definition_error(detail: &str) -> SqlSurfaceError {
+    use crate::catalog::{
+        VIEW_BASE_MISMATCH_MESSAGE, VIEW_BODY_LEXICAL_MESSAGE, VIEW_BODY_SHAPE_MESSAGE,
+        VIEW_BUFFERED_POSITION_MESSAGE, VIEW_DUPLICATE_ALIAS_MESSAGE,
+        VIEW_JOIN_REFERENCES_VIEW_MESSAGE, VIEW_OVER_ALIASED_MESSAGE,
+        VIEW_OVER_BUFFERED_LAYER_MESSAGE, VIEW_TOO_MANY_ALIASES_MESSAGE,
+        VIEW_UNSUPPORTED_FEATURE_MESSAGE,
+    };
+    if detail == VIEW_UNSUPPORTED_FEATURE_MESSAGE {
+        return SqlSurfaceError::feature_not_supported(VIEW_UNSUPPORTED_FEATURE_MESSAGE);
+    }
+    let known: [&'static str; 9] = [
+        VIEW_BODY_LEXICAL_MESSAGE,
+        VIEW_BODY_SHAPE_MESSAGE,
+        VIEW_BASE_MISMATCH_MESSAGE,
+        VIEW_JOIN_REFERENCES_VIEW_MESSAGE,
+        VIEW_BUFFERED_POSITION_MESSAGE,
+        VIEW_OVER_BUFFERED_LAYER_MESSAGE,
+        VIEW_OVER_ALIASED_MESSAGE,
+        VIEW_TOO_MANY_ALIASES_MESSAGE,
+        VIEW_DUPLICATE_ALIAS_MESSAGE,
+    ];
+    match known.iter().find(|m| **m == detail) {
+        Some(m) => SqlSurfaceError::unsupported(*m),
+        None => SqlSurfaceError::unsupported("invalid view definition"),
     }
 }
 
@@ -3707,6 +3739,27 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3240: ビュー定義の拒否は原因別の固定文言へ写り、未知の detail は汎用文言へ丸める
+    /// （内部キー・識別子を応答へ出さない）。未対応機能だけが `0A000`。
+    #[test]
+    fn view_definition_error_maps_known_causes_and_hides_unknown_detail() {
+        use crate::catalog::{VIEW_JOIN_REFERENCES_VIEW_MESSAGE, VIEW_UNSUPPORTED_FEATURE_MESSAGE};
+        let e = map_create_view_error(CatalogError::Invalid(
+            VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string(),
+        ));
+        assert_eq!(e.wire_code(), "0A000");
+        assert!(e.to_string().ends_with(VIEW_UNSUPPORTED_FEATURE_MESSAGE));
+        let e = map_create_view_error(CatalogError::Invalid(
+            VIEW_JOIN_REFERENCES_VIEW_MESSAGE.to_string(),
+        ));
+        assert_eq!(e.wire_code(), "42601");
+        assert!(e.to_string().ends_with(VIEW_JOIN_REFERENCES_VIEW_MESSAGE));
+        let e = map_create_view_error(CatalogError::Invalid("#1.secret".to_string()));
+        assert_eq!(e.wire_code(), "42601");
+        assert!(!e.to_string().contains("secret"));
+        assert!(e.to_string().ends_with("invalid view definition"));
+    }
 
     /// ADR D7（TABLE-27・Issue #1717）の回帰: 呼び出し元が「既存名」と判断して事前検査を省いた後に
     /// 名前が消えた競合を模す（対象名が存在しない状態で `IF NOT EXISTS` を直接実行する）。

@@ -937,3 +937,23 @@ TABLE-18・TABLE-38・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ�
   押し下げるため `Not(Expression)`／`Not(Or)` は通常生成されないが、現れても否定越しに非公開列を素通りさせない。
 - **対象外**: 評価後射影形・列別名つきビューの `RENAME` 追随（従来どおり `0A000`。#1659 の後続課題）、MATERIALIZED VIEW が
   参照する表の列 `RENAME`（暫定ガードの `0A000`）、`CatalogError::Invalid` の文言分離と越境試験の網羅（#3240）。
+
+## Issue #3240 追記: ビュー定義エラー文言の分離と越境試験
+
+親 #3236。TABLE-18・TABLE-41・TABLE-27・RLS-10 (b)・ERR-6 のポインタ。
+
+- **文言の分離**: catalog の `validate_new_view_body_in_txn` などが返す `CatalogError::Invalid` は、拒否原因ごとの
+  `pub(crate) const VIEW_*_MESSAGE`（固定の英語文言）を使う。`sql::ddl::map_create_view_error`（`CREATE OR REPLACE VIEW` も
+  委譲）は定数との完全一致で写像し、未知の detail は汎用の固定文言（`42601`）へ丸める。detail・内側エラーの文言・識別子は
+  応答へ連結しない。`CatalogError` に variant は足さない（公開 enum の破壊的変更を避ける）。
+- **SQLSTATE**: 内側の検査が `0A000`（未対応機能。例: `LIMIT` 付きビューの上の `ILIKE`）を返した場合だけ `0A000`
+  （`VIEW_UNSUPPORTED_FEATURE_MESSAGE`）を保つ。深さ超過は従来どおり `54000`。それ以外の定義エラーは `42601`。
+  白リスト方式のため、未知の内側エラーは `42601` のままで fail-closed。
+- **存在秘匿**: 判定順序は変えない。参照先の存在確認（`TableNotFound`）が形状の判定より先に行われ、他テナントの SCHEMA 配下の
+  名前は SQL 層の名前解決で `3F000`／`42P01` になるため、原因別の文言は存在オラクルにならない。
+- **試験**: `table27_tenant_boundary.rs` の双子 DB に、他テナント SCHEMA を本文で読むビュー定義（単純形・式述語・`LIMIT`・
+  集計・JOIN の辺・`IN (サブクエリ)`・CTE・`UNION` の枝・列別名・`WITH CHECK OPTION`・`CREATE OR REPLACE VIEW`）を追加し、
+  SQLSTATE と文言のバイト一致・拒否後の `42P01` を固定した。原因別の文言は `table18_view_body_where_expr.rs`、
+  `wire_create_view.rs`（末尾 `;` の単独送信）で固定した。
+- **対象外**: 受理範囲の拡大は #3237 の決定どおり行わない。`CREATE TABLE`・`DROP VIEW`・MATERIALIZED VIEW の
+  `Invalid` 写像は本件の対象外（MATERIALIZED VIEW の原因別分離は未起票）。

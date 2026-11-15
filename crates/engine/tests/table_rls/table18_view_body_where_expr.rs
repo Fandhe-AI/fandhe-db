@@ -873,3 +873,68 @@ fn body_or_true_creates_and_returns_all_rows() {
     let via_view = ids(&core, "alice", "SELECT id FROM vt LIMIT 100");
     assert_eq!(via_view, all);
 }
+
+// intentional: docs/design/create-view.md
+/// ビュー定義の拒否は原因ごとの固定文言と SQLSTATE を返し（Issue #3240）、何も永続化されない。
+/// 受理範囲は広げない。
+#[test]
+fn view_definition_rejections_carry_cause_specific_messages() {
+    let (core, _g) = open_core("view-reject-causes", false);
+    for pre in [
+        "CREATE VIEW lim AS SELECT * FROM t LIMIT 5",
+        "CREATE VIEW agg AS SELECT n, COUNT(*) AS c FROM t GROUP BY n",
+        "CREATE VIEW ali (a, b) AS SELECT n, s FROM t",
+    ] {
+        ddl(&core, pre).unwrap_or_else(|e| panic!("{pre}: {e:?}"));
+    }
+    // (名前, SQL, 期待 SQLSTATE, 期待する詳細文言)。文言は固定で、識別子・内部キーを含まない。
+    let cases: [(&str, &str, &str, &str); 6] = [
+        (
+            "x_join",
+            "CREATE VIEW x_join AS SELECT * FROM t JOIN lim ON t.n = lim.n LIMIT 5",
+            "42601",
+            "unsupported SQL syntax: JOIN in a view body cannot reference a view",
+        ),
+        (
+            "x_cte",
+            "CREATE VIEW x_cte AS WITH w AS (SELECT * FROM lim) SELECT * FROM w",
+            "42601",
+            "unsupported SQL syntax: view body form is not supported",
+        ),
+        (
+            "x_union",
+            "CREATE VIEW x_union AS SELECT * FROM t UNION ALL SELECT * FROM lim",
+            "42601",
+            "unsupported SQL syntax: a view cannot reference a view with an aggregate/LIMIT body in this position",
+        ),
+        (
+            "x_ilike",
+            "CREATE VIEW x_ilike AS SELECT * FROM lim WHERE s ILIKE 'a%'",
+            "0A000",
+            "feature not supported: view body uses a feature that is not supported in this position",
+        ),
+        (
+            "x_proj",
+            "CREATE VIEW x_proj AS SELECT n + 1 FROM lim",
+            "42601",
+            "unsupported SQL syntax: view body form is not supported",
+        ),
+        (
+            "x_replace",
+            "CREATE OR REPLACE VIEW lim AS SELECT * FROM lim",
+            "42P17",
+            "view definition must not reference the view itself",
+        ),
+    ];
+    for (name, sql, code, msg) in cases {
+        let e = ddl(&core, sql).expect_err(sql);
+        assert_eq!(e.wire_code(), code, "{sql}");
+        assert_eq!(e.to_string(), msg, "{sql}");
+        assert!(!e.to_string().contains('#'), "{sql}");
+        // 拒否された名前は永続化されない（参照すると `42P01`）。
+        if name != "x_replace" {
+            let r = run(&core, "alice", &format!("SELECT id FROM {name} LIMIT 1"));
+            assert_eq!(r.expect_err(name).wire_code(), "42P01", "{name}");
+        }
+    }
+}
