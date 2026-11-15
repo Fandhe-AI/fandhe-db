@@ -722,7 +722,30 @@ fn array_source_elem(
             .iter()
             .any(|i| static_type_of(i, schema) == Some(crate::sql::udf_call::ExprType::TimestampTz))
             .then_some(ArrayElemType::TimestampTz),
-        _ => None,
+        // スライス・配列関数（`array_cat` 等）は束縛結果が保持する要素型で判定する（Issue #3233）。
+        _ => {
+            use crate::sql::array_fn::ArrayFnKind;
+            use crate::sql::udf_call::BoundExpr;
+            let udfs = crate::sql::udf_call::UdfRegistry::default();
+            let mut budget = crate::sql::udf_call::MAX_EXPR_NODES;
+            let (bound, _) =
+                crate::sql::udf_call::bind_order_expr(e, schema, &udfs, &mut budget).ok()?;
+            match bound {
+                BoundExpr::ArraySlice { elem, .. } => Some(elem),
+                BoundExpr::ArrayFn(f)
+                    if matches!(
+                        f.kind,
+                        ArrayFnKind::Append
+                            | ArrayFnKind::Prepend
+                            | ArrayFnKind::Cat
+                            | ArrayFnKind::Remove
+                    ) =>
+                {
+                    f.elem
+                }
+                _ => None,
+            }
+        }
     }
 }
 
@@ -1233,6 +1256,8 @@ mod tests {
             "CAST(ts_arr AS timestamptz[])",
             "CAST(txt_arr AS timestamptz[])",
             "CAST(lang AS timestamptz[])",
+            "CAST(tz_arr[1:2] AS text)",
+            "CAST(array_cat(tz_arr, tz_arr) AS text)",
         ] {
             assert_eq!(bind_code(sql), "42P17", "{sql}");
         }
