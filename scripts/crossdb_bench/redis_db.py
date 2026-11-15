@@ -44,6 +44,7 @@ from redis.commands.search.query import Query
 import redis.commands.search.reducers as reducers
 
 from common import build_meta, doc_visibility, env_port, measure, unsupported
+from hybrid_depth import DEPTH_ARMS, body_only_expr, classify_explain, pick_diagnostic_index, redis_params
 
 HOST = "127.0.0.1"
 # 既定値 36379 は containers.sh の `${CROSSDB_REDIS_PORT:-36379}` と一致させること。
@@ -321,24 +322,32 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     phases["group_by_having"] = {**stats, "result": last}
 
     # --- hybrid_rrf: FT.HYBRID（SEARCH 句=全文・VSIM 句=KNN・COMBINE RRF） ---
-    def hybrid(i):
+    def _hybrid_terms(qt):
+        """hybrid 本体と語結合診断が共有する前処理（英数語を空白連結し 200 文字で切る）。"""
+        return " ".join(t for t in qt.split() if t.isalnum())[:200] or "the"
+
+    def _hybrid_once(i, k, window):
+        """K・WINDOW を引数に取る hybrid 1 回分（可視フィルタは常に前置する）。"""
         qv, qt = query_vecs[i], query_texts[i]
-        terms = " ".join(t for t in qt.split() if t.isalnum())[:200] or "the"
+        terms = _hybrid_terms(qt)
         sq = HybridSearchQuery(f"(@visibility:{{public}}) @body:({terms})")
         vq = HybridVsimQuery(
             "@embedding",
             "$vec",
             vsim_search_method=VectorSearchMethods.KNN,
-            vsim_search_method_params={"K": 50},
+            vsim_search_method_params={"K": k},
             filter=HybridFilter("@visibility:{public}"),
         )
         hq = HybridQuery(sq, vq)
-        combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=_hybrid_window(50))
+        combine = CombineResultsMethod(CombinationMethods.RRF, WINDOW=window)
         pp = HybridPostProcessingConfig().load("@id").limit(0, 10)
         res = r.ft(INDEX).hybrid_search(
             hq, combine_method=combine, post_processing=pp, params_substitution={"vec": _vec_bytes(qv)}
         )
         return [int(row["id"]) for row in res.results]
+
+    def hybrid(i):
+        return _hybrid_once(i, 50, _hybrid_window(50))
 
     idxs = list(range(len(queries)))
     try:
@@ -350,6 +359,55 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         if not _is_hybrid_unavailable(e):
             raise
         phases["hybrid_rrf"] = unsupported(f"FT.HYBRID が利用できない: {e}")
+
+    # --- hybrid_rrf_depth{50,200}（Issue #3225）: self と取得深さを揃えた arm（固定値） ---
+    for arm in DEPTH_ARMS:
+        params = redis_params(arm)
+
+        def hybrid_depth(i, _p=params):
+            return _hybrid_once(i, _p["K"], _p["WINDOW"])
+
+        try:
+            stats, _ = measure(hybrid_depth, idxs)
+            phases[arm] = {
+                **stats,
+                **{k.lower(): v for k, v in params.items()},
+                "ids_per_query": [hybrid_depth(i) for i in idxs],
+            }
+        except redis.exceptions.ResponseError as e:
+            if not _is_hybrid_unavailable(e):
+                raise
+            phases[arm] = unsupported(f"FT.HYBRID が利用できない: {e}")
+
+    # --- hybrid_text_conjunction（Issue #3225）: @body:(t1 t2 ...) の結合が AND か OR かの診断 ---
+    def _conj_expr(qt, sep):
+        """本体と同じ前処理・同じ可視フィルタの全文条件。sep は語の結合子（空白＝AND、`|`＝OR）。"""
+        terms = sep.join(_hybrid_terms(qt).split())
+        return f"(@visibility:{{public}}) @body:({terms})"
+
+    def _total(expr):
+        q = Query(expr).paging(0, 0).dialect(2)
+        return int(r.ft(INDEX).search(q).total)
+
+    # 診断は本文条件の部分木だけを FT.EXPLAIN にかける（可視性フィルタとの積の外側 INTERSECT を
+    # 語結合と誤認しない）。有効語が複数ある query を選ぶ。件数取得側は可視性フィルタを維持する
+    _term_strs = [" ".join(_hybrid_terms(qt).split()) for qt in query_texts]
+    _diag_terms = _term_strs[pick_diagnostic_index(_term_strs)]
+    explain_raw = r.execute_command("FT.EXPLAIN", INDEX, body_only_expr(_diag_terms), "DIALECT", "2")
+    explain_text = explain_raw.decode(errors="replace") if isinstance(explain_raw, bytes) else str(explain_raw)
+    and_counts = sorted(_total(_conj_expr(qt, " ")) for qt in query_texts)
+    or_counts = sorted(_total(_conj_expr(qt, "|")) for qt in query_texts)
+
+    def _dist(xs):
+        return {"min": xs[0], "median": xs[len(xs) // 2], "max": xs[-1]} if xs else None
+
+    phases["hybrid_text_conjunction"] = {
+        "conjunction": classify_explain(explain_text),
+        "explain": explain_text,
+        "and_form_matches": _dist(and_counts),
+        "or_form_matches": _dist(or_counts),
+        "note": "計測なしの診断。self は演算子なしの通常語を OR（BM25 合算）で扱う",
+    }
 
     phases["mode_recall"] = unsupported("RediSearch にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("RediSearch にモード切替（recall/precision）の概念が無い")
@@ -473,6 +531,11 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             "hnsw_config": {"m": 16, "ef_construct": 100} if args.config == "hnsw" else None,
             "search_params": "ef_runtime=64" if args.config == "hnsw" else "FLAT (exact)",
             "num_docs": info.get("num_docs"),
+            "hybrid_arms": {
+                "hybrid_rrf": {"K": 50, "WINDOW": _hybrid_window(50)},
+                "bulk_hybrid_k200": {"K": 200, "WINDOW": 200},
+                **{a: redis_params(a) for a in DEPTH_ARMS},
+            },
         },
     )
     return {"meta": meta, "phases": phases}

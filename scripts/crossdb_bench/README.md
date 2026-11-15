@@ -412,6 +412,8 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 | `agg_multi` | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` |
 | `group_by_having` | `GROUP BY`/`HAVING` |
 | `hybrid_rrf` | ベクトル + 全文検索の RRF 融合 |
+| `hybrid_rrf_depth50` / `hybrid_rrf_depth200` | Issue #3225。self（`window => 50／200`。初回 fetch_k は 2 倍）と Redis（K=100・WINDOW=50／K=400・WINDOW=200）の取得深さを揃えた hybrid。p50 と品質指標 3 種（下記）を並べる。env では変えない固定値 |
+| `hybrid_text_conjunction` | Redis のみ・計測なしの診断。`@body:(t1 t2 ...)` が AND か OR かを `FT.EXPLAIN` と一致件数で記録（self は OR） |
 | `mode_recall` / `mode_precision` | 取得モード切替（self のみ） |
 | `rls_isolation` | tenant-b 接続（self）／同一 public-only フィルタの再実行（他 DB）での `COUNT(*)`（RLS 相当の境界確認） |
 | `udf_call` | 宣言的 UDF 呼び出し（self のみ） |
@@ -527,6 +529,22 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 - **self**: `ingest_bulk` は SQL 表層では `COPY ... FROM STDIN`（TASK-220・WIRE-17）で
   計測する（`self_copy.py`）。docs jsonl が見つからない場合のみ unsupported を記録する。
 
+### hybrid 深さ arm の品質指標（Issue #3225）
+
+DB 間で共通の hybrid 正解は作れないため、BM25 の関連性 recall ではない次の 3 指標を並べる。
+算出不能なときは 0 ではなく `null` と理由（`quality_unsupported`・`topic_hit_rate_reason`）を記録する。
+
+- `dense_gt_recall_at_10`（同点許容。厳密版は `_strict`）: hybrid 上位 10 件と内積総当たり正解の一致率。
+  深さを浅くしたとき密側の上位が融合結果から落ちる度合いを測る
+- `overlap_at_10_vs_depth200`（`hybrid_rrf_depth50` のみ）: 同じ DB の depth200 arm 上位 10 件との重なり
+- `topic_hit_rate_at_10`: クエリの `topic` と一致する返却文書の割合（ラベル基準の代理指標）
+
+並べて見る例:
+
+```bash
+jq '.phases | to_entries[] | select(.key|startswith("hybrid_rrf_depth")) | {arm:.key, p50_us:.value.p50_us, recall:.value.dense_gt_recall_at_10, overlap:.value.overlap_at_10_vs_depth200, topic:.value.topic_hit_rate_at_10}' results/self_exact.json results/redis_exact.json
+```
+
 ## ファイル構成
 
 | ファイル | 役割 |
@@ -544,6 +562,7 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 | `mongodb_plain_db.py` | MongoDB Community の全フェーズ実装 |
 | `redis_db.py` | Redis の全フェーズ実装 |
 | `elasticsearch_db.py` | Elasticsearch の全フェーズ実装 |
+| `hybrid_depth.py` | hybrid 深さ arm の定義と品質指標の純ロジック（標準ライブラリのみ。Issue #3225。テストは `scripts/tests/test_crossdb_hybrid_depth.py`） |
 | `run.py` | CLI エントリポイント（フィクスチャ読み込み → 各 db モジュール呼び出し → recall 計算 → JSON 書き出し） |
 | `containers.sh` | pgvector・Qdrant・MySQL・MongoDB・Redis・Elasticsearch コンテナの起動・停止（`docker rm -f` で毎回冪等に作り直す） |
 
@@ -600,3 +619,4 @@ CROSSDB_DIR="$S" CROSSDB_PYTHON="$V" scripts/bench_crossdb_ab.sh
   条件が異なる。`CROSSDB_REDIS_HYBRID_WINDOW=200` で Redis 側を self の
   pool_depth に揃えた informational な追加計測ができる（本番スコアボードの
   既定計測条件は変えない。`redis_db.py` 側の既定値は 50 のまま不変）。
+  なお `hybrid_rrf_depth50`／`hybrid_rrf_depth200`（Issue #3225）は固定値で、この環境変数の影響を受けない。
