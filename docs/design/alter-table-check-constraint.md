@@ -31,15 +31,14 @@ ALTER TABLE <table> DROP CONSTRAINT <name> [;]      -- CHECK 名も対象にな�
 ```
 
 述語文法は `CREATE TABLE` の CHECK と同一（`Parser::parse_check_parenthesized_body`。
-`)` 境界・`OR` は `42601`）。制約名の検証は `catalog::validate_identifier` のみ
+`)` 境界は `42601`。`OR`・`NOT` は Issue #3243 で受理）。制約名の検証は `catalog::validate_identifier` のみ
 （`ADD UNIQUE` と揃える）。`CREATE TABLE` の列リストにある「列型キーワード
 （`TEXT`／`VECTOR`）と一致する名前の拒否」は列定義との曖昧さ対策であり、
 `ADD` の直後には曖昧さが無いので適用しない。
 
 スコープ外（`42601` のまま）: `NOT VALID`（既存行の検証を飛ばす形。黙って
 受理しない）・`VALIDATE CONSTRAINT`・`NO INHERIT`・`DROP CONSTRAINT IF
-EXISTS`／`CASCADE`／`RESTRICT`・1 文に複数の `ADD`／`DROP`・`CHECK` 本体の
-`OR`。NoSQL 表層（`alter_table` op）への CHECK 追加も対象外
+EXISTS`／`CASCADE`／`RESTRICT`・1 文に複数の `ADD`／`DROP`。NoSQL 表層（`alter_table` op）への CHECK 追加も対象外
 （`create_table` の `check` も `0A000` のまま）。
 
 ### D2. 制約名（UNIQUE と揃える）
@@ -97,7 +96,7 @@ CheckEvaluationFailed(SqlSurfaceError)`（0 除算・`BIGINT` 精度超過等）
 
 | 条件 | 経路 | `wire_code` |
 | --- | --- | --- |
-| 構文が許可リスト外（`NOT VALID`・`OR`・名前不正等） | `sql::allowlist` | `42601` |
+| 構文が許可リスト外（`NOT VALID`・名前不正等） | `sql::allowlist` | `42601` |
 | DDL 権限なし | `require_ddl_permission` | `42501`（カタログ照会より前） |
 | 明示トランザクション内 | 既存 catch-all | `0A000` |
 | テーブルが無い／ビュー・索引名 | `TableNotFound` 等 | `42P01`／`42809` |

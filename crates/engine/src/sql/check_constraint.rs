@@ -29,7 +29,7 @@ use crate::declarative_filter::MetadataFilter;
 use crate::sql::allowlist::{ParsedCheck, SqlSurfaceError, WherePredicate};
 use crate::sql::expr_program::StackValue;
 use crate::sql::udf_call::{self, Expr, ValueFunctionKind};
-use crate::sql::where_tree::{BoundConjunction, Truth};
+use crate::sql::where_tree::{BoundConjunction, BoundOrGroup, Truth};
 use crate::tenant::TenantWriteError;
 
 /// `predicates` を `sql::allowlist::Parser::parse_where`／`parse_check_body` と
@@ -569,66 +569,81 @@ pub(crate) fn escape_literal(s: &str) -> String {
 /// をいずれも `Err`（`42601`）として返す。
 fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSurfaceError> {
     for predicate in predicates {
-        match predicate {
-            WherePredicate::PredicateCall { name } => {
-                return Err(SqlSurfaceError::unsupported(format!(
-                    "CHECK constraint predicate must not call {name}() (RLS-dependent predicates are not allowed)"
-                )));
+        reject_forbidden_predicate(predicate)?;
+    }
+    Ok(())
+}
+
+/// [`reject_forbidden_elements`] の 1 述語ぶん。`OR` の各分岐・`NOT` の内側へ再帰し、
+/// 禁止要素が `OR`／`NOT` の内側へ紛れて通る経路を作らない（Issue #3243。fail-closed）。
+/// `match` はワイルドカードを使わず、将来の variant 追加で検査漏れが起きないようにする。
+fn reject_forbidden_predicate(predicate: &WherePredicate) -> Result<(), SqlSurfaceError> {
+    match predicate {
+        WherePredicate::PredicateCall { name } => Err(SqlSurfaceError::unsupported(format!(
+            "CHECK constraint predicate must not call {name}() (RLS-dependent predicates are not allowed)"
+        ))),
+        WherePredicate::Expression(expr) => reject_forbidden_expr(expr),
+        // SQL-24・TABLE-16（Issue #3244）: 列を左辺にとる `IN`／`BETWEEN`／`IS [NOT] NULL` は
+        // 受理する（評価は三値論理。左辺が式・TEXT の `BETWEEN` 等は束縛段が拒否する）。
+        WherePredicate::InList { .. }
+        | WherePredicate::Between { .. }
+        | WherePredicate::IsNull { .. } => Ok(()),
+        WherePredicate::Equality { .. }
+        | WherePredicate::BoolEquality { .. }
+        | WherePredicate::BoolColumn { .. }
+        | WherePredicate::Compare { .. } => Ok(()),
+        WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => Ok(()),
+        // 式左辺の LIKE（SQL-54、Issue #1781）は CHECK では未対応のため fail-closed。
+        WherePredicate::Prefix { .. } => Err(SqlSurfaceError::unsupported(
+            "LIKE with a non-column left operand is not supported in CHECK constraints",
+        )),
+        // `OR`（Issue #3243）: 各分岐を検査する。
+        WherePredicate::Or(branches) => {
+            for branch in branches {
+                reject_forbidden_elements(branch)?;
             }
-            WherePredicate::Expression(expr) => reject_forbidden_expr(expr)?,
-            // SQL-24・TABLE-16（Issue #3244）: 列を左辺にとる `IN`／`BETWEEN`／`IS [NULL|NOT NULL]`
-            // は受理する（評価は三値論理。`BoundConjunction::eval_three_valued`）。
-            WherePredicate::InList { .. }
-            | WherePredicate::Between { .. }
-            | WherePredicate::IsNull { .. } => {}
-            // `NOT` は上の 3 形の否定（`NOT col IN (...)` 等）だけを受理する。それ以外
-            // （`NOT <比較>`・`NOT (...)`）は未対応のまま fail-closed で拒否する（#3243）。
-            WherePredicate::Not(inner)
-                if matches!(
-                    inner.as_ref(),
-                    WherePredicate::InList { .. }
-                        | WherePredicate::Between { .. }
-                        | WherePredicate::IsNull { .. }
-                ) => {}
-            WherePredicate::Not(_) => {
-                return Err(SqlSurfaceError::unsupported(
-                    "NOT is not supported in CHECK constraints except before IN/BETWEEN/IS NULL",
-                ));
-            }
+            Ok(())
+        }
+        // `NOT`（Issue #3243）: 構文段は否定を葉まで押し下げ、宣言的な葉だけを `Not` で
+        // 包む。内側が許可形（等価・真偽比較・裸 BOOLEAN 列・範囲比較・列への LIKE）の
+        // ときだけ受理し、それ以外（`NOT IN`／`NOT BETWEEN` 等）は fail-closed。
+        WherePredicate::Not(inner) => match inner.as_ref() {
             WherePredicate::Equality { .. }
             | WherePredicate::BoolEquality { .. }
             | WherePredicate::BoolColumn { .. }
-            | WherePredicate::Compare { .. } => {}
-            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => {}
-            // 式左辺の LIKE（SQL-54、Issue #1781）は CHECK では未対応のため fail-closed。
-            WherePredicate::Prefix { .. } => {
-                return Err(SqlSurfaceError::unsupported(
-                    "LIKE with a non-column left operand is not supported in CHECK constraints",
-                ));
-            }
-            // 利用者が書いた `OR` は構文段（`parse_where_or`）が拒否する。ここへ届く `Or` は
-            // 数値の `IN`／`BETWEEN` の展開（WHERE と同じ形）か永続化テキストの再パース結果で、
-            // `visible()`・非組み込み関数・サブクエリが分岐に隠れても検出できるよう各分岐へ再帰する。
-            WherePredicate::Or(branches) => {
-                for branch in branches {
-                    reject_forbidden_elements(branch)?;
-                }
-            }
-            // Issue #927・SQL-29 (a)・TASK-213: 同上（構文段が既に `42601`
-            // で拒否するため到達しない防御的経路）。
-            WherePredicate::InSubquery { .. }
+            | WherePredicate::Compare { .. } => Ok(()),
+            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => Ok(()),
+            WherePredicate::Prefix { .. } => Err(SqlSurfaceError::unsupported(
+                "LIKE with a non-column left operand is not supported in CHECK constraints",
+            )),
+            // `NOT col IN (...)` 等（Issue #3244）。
+            WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::IsNull { .. } => Ok(()),
+            WherePredicate::PredicateCall { .. }
+            | WherePredicate::Expression(_)
+            | WherePredicate::Or(_)
+            | WherePredicate::Not(_)
+            | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {
-                return Err(SqlSurfaceError::unsupported(
-                    "CHECK constraint predicate must not contain a subquery",
-                ));
-            }
-        }
+            | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(
+                "NOT over this predicate form is not supported in CHECK constraints",
+            )),
+        },
+        // Issue #927・SQL-29 (a)・TASK-213: 構文段が既に `42601` で拒否するため通常は
+        // 到達しない防御的経路。
+        WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. }
+        | WherePredicate::IdCompare { .. }
+        | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(
+            "CHECK constraint predicate must not contain a subquery",
+        )),
     }
-    Ok(())
 }
 
 /// 列型に依存する CHECK の禁止形を検出する（Issue #3244）。`HALFVEC`／`INT8VEC`／`SPARSEVEC` 列
@@ -695,7 +710,7 @@ fn referenced_column_names(
     predicates: &[WherePredicate],
     filters: &[MetadataFilter],
     expr_filters: &[udf_call::BoundExpr],
-    or_filters: &[crate::sql::where_tree::BoundOrGroup],
+    or_filters: &[BoundOrGroup],
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |name: &str| {
@@ -734,6 +749,22 @@ fn referenced_column_names(
     for (index, wanted) in scalar_column_mask.iter().enumerate() {
         if *wanted {
             if let Some(column) = schema.columns.get(index) {
+                push(&column.name);
+            }
+        }
+    }
+    // Issue #3243: `OR` 群（`NOT (n = 0)` 等の脱糖結果を含む）の内側だけで参照される列も
+    // 依存列へ含める（取りこぼすと DROP COLUMN の依存検査を素通りし CHECK を黙って壊す）。
+    for group in or_filters {
+        let mut indices: Vec<usize> = Vec::new();
+        group.visit_column_indices(&mut |i| indices.push(i));
+        for index in indices {
+            if let Some(column) = schema.columns.get(index) {
+                push(&column.name);
+            }
+        }
+        if group.references_embedding() {
+            if let Some(column) = schema.columns.iter().find(|c| c.ty.is_vector()) {
                 push(&column.name);
             }
         }
@@ -801,21 +832,24 @@ fn referenced_column_names(
             | Expr::TimestampTzLiteral { .. } => {}
         }
     }
-    fn collect_predicate_idents<'a>(predicates: &'a [WherePredicate], acc: &mut Vec<&'a str>) {
-        for predicate in predicates {
-            match predicate {
-                WherePredicate::Expression(expr) => collect_idents(expr, acc),
-                WherePredicate::Or(branches) => {
-                    for branch in branches {
-                        collect_predicate_idents(branch, acc);
+    fn collect_predicate_idents<'a>(predicate: &'a WherePredicate, acc: &mut Vec<&'a str>) {
+        match predicate {
+            WherePredicate::Expression(expr) => collect_idents(expr, acc),
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    for p in branch {
+                        collect_predicate_idents(p, acc);
                     }
                 }
-                _ => {}
             }
+            WherePredicate::Not(inner) => collect_predicate_idents(inner, acc),
+            _ => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();
-    collect_predicate_idents(predicates, &mut idents);
+    for predicate in predicates {
+        collect_predicate_idents(predicate, &mut idents);
+    }
     for ident in idents {
         if let Some(column) = schema
             .columns
@@ -1625,20 +1659,12 @@ mod tests {
         }
     }
 
-    /// 未対応の形は fail-closed のまま（`NOT <比較>` は #3243、TEXT の `BETWEEN` は束縛段、
+    /// 未対応の形は fail-closed のまま（TEXT の `BETWEEN` は束縛段、
     /// vector 系列の `IS NULL` は各列型の Issue が固定した拒否）。
-    /// tracked: #3243 (NOT 比較・利用者の OR) / intentional: docs/design/sql-check-constraint.md (TEXT BETWEEN・vector 系列 IS NULL)
+    /// intentional: docs/design/sql-check-constraint.md (TEXT BETWEEN・vector 系列 IS NULL)
     #[test]
     fn validate_and_build_rejects_unsupported_in_between_null_forms() {
         for (sql, code) in [
-            (
-                "CREATE TABLE docs (kind TEXT CHECK (NOT kind = 'a'))",
-                "42601",
-            ),
-            (
-                "CREATE TABLE docs (n INTEGER CHECK (n = 1 OR n = 2))",
-                "42601",
-            ),
             (
                 "CREATE TABLE docs (n INTEGER CHECK (n + 1 IS NULL))",
                 "42601",
@@ -2776,7 +2802,7 @@ mod tests {
         assert_row(&schema, &compiled, &[Value::Null], &[], "ok");
     }
 
-    /// OR 群を持つ述語木を直接組む（OR は SQL からはまだ到達できない。#3243 の回帰ガード）。
+    /// OR 群を持つ述語木を直接組む（SQL 経由の OR は別テストが確かめる。#3243 の回帰ガード）。
     fn compiled_with_or_group() -> (TableSchema, CompiledChecks) {
         use crate::declarative_filter::FilterOp;
         use crate::sql::where_tree::BoundOrGroup;
@@ -2827,6 +2853,119 @@ mod tests {
         assert_row_new_only(&schema, &compiled, &[t("z"), Value::Null], "ok");
         // FALSE OR FALSE は違反。
         assert_row_new_only(&schema, &compiled, &[t("z"), t("z")], "viol:or_check");
+    }
+
+    /// Issue #3243: `OR`・`NOT` を SQL 経由で受理し、三値論理（FALSE のときだけ違反）で評価する。
+    #[test]
+    fn or_and_not_sql_forms_follow_three_valued_truth_table() {
+        let n = Value::Null;
+        type Case<'a> = (&'a str, Vec<(Vec<Value>, &'a str)>);
+        let cases: Vec<Case<'_>> = vec![
+            (
+                "a INTEGER, b INTEGER, CHECK (a > 0 OR b > 0)",
+                vec![
+                    (vec![int(1), n.clone()], "ok"),
+                    (vec![int(-1), n.clone()], "ok"),
+                    (vec![n.clone(), n.clone()], "ok"),
+                    (vec![int(-1), int(-1)], "viol:docs_check"),
+                    (vec![int(-1), int(1)], "ok"),
+                ],
+            ),
+            (
+                "a INTEGER, CHECK (NOT (a = 0))",
+                vec![
+                    (vec![int(0)], "viol:docs_check"),
+                    (vec![n.clone()], "ok"),
+                    (vec![int(1)], "ok"),
+                ],
+            ),
+            (
+                "kind TEXT, CHECK (NOT (kind = 'a'))",
+                vec![
+                    (vec![t("a")], "viol:docs_check"),
+                    (vec![n.clone()], "ok"),
+                    (vec![t("b")], "ok"),
+                ],
+            ),
+            (
+                "a INTEGER, b INTEGER, CHECK (NOT (a = 0 OR b = 0))",
+                vec![
+                    (vec![int(0), n.clone()], "viol:docs_check"),
+                    (vec![int(1), n.clone()], "ok"),
+                    (vec![int(1), int(1)], "ok"),
+                ],
+            ),
+            (
+                "n INTEGER, CHECK (NOT n > 1)",
+                vec![
+                    (vec![int(2)], "viol:docs_check"),
+                    (vec![int(1)], "ok"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+        ];
+        for (ddl, rows) in &cases {
+            let (schema, compiled) = compile_docs(ddl);
+            for (row, expected) in rows {
+                assert_row_new_only(&schema, &compiled, row, expected);
+            }
+        }
+    }
+
+    /// Issue #3243: OR の内側だけで参照される列も依存列に入り、描画 → 再パースで往復一致する。
+    #[test]
+    fn or_and_not_forms_record_columns_and_round_trip() {
+        for (ddl, cols) in [
+            (
+                "a TEXT, b TEXT, c TEXT, CHECK (a = 'x' OR b = 'y')",
+                vec!["a", "b"],
+            ),
+            ("n INTEGER, m INTEGER, CHECK (NOT (n = 0))", vec!["n"]),
+            ("n INTEGER, CHECK (n <> 0)", vec!["n"]),
+            ("kind TEXT, CHECK (kind <> 'x')", vec!["kind"]),
+            (
+                "a TEXT, b TEXT, c TEXT, CHECK (a = 'x' OR (b = 'y' OR c = 'z'))",
+                vec!["a", "b", "c"],
+            ),
+            ("s TEXT, CHECK (NOT s LIKE 'a%')", vec!["s"]),
+            (
+                "a INTEGER, b INTEGER, CHECK (a + 1 > 5 OR b * 2 < 3)",
+                vec!["a", "b"],
+            ),
+        ] {
+            let v = parse_create_table(&format!("CREATE TABLE docs ({ddl})"));
+            let schema = schema_of(&v);
+            let checks = validate_and_build(&schema, &v.checks)
+                .unwrap_or_else(|e| panic!("{ddl} must validate: {e:?}"));
+            let want: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+            assert_eq!(checks[0].columns, want, "{ddl}");
+            // 永続形（正規化テキスト）を再パース・再検証しても同じ依存列に戻る。
+            let schema = schema.with_checks(checks.clone());
+            let recomputed = recompute_referenced_columns(&schema, &checks[0]).expect("recompute");
+            assert_eq!(recomputed, want, "{ddl}");
+            let v2 = parse_create_table(&format!(
+                "CREATE TABLE docs ({ddl_cols}, CHECK ({sql}))",
+                ddl_cols = ddl.split(", CHECK").next().unwrap_or(""),
+                sql = checks[0].predicate_sql
+            ));
+            let checks2 = validate_and_build(&schema_of(&v2), &v2.checks).expect("re-validate");
+            assert_eq!(checks[0].predicate_sql, checks2[0].predicate_sql, "{ddl}");
+        }
+    }
+
+    /// Issue #3243: `OR`／`NOT` の内側に紛れた禁止要素は 42601（fail-closed）。
+    #[test]
+    fn forbidden_elements_inside_or_and_not_are_rejected() {
+        for sql in [
+            "CREATE TABLE docs (a INTEGER, CHECK (a > 0 OR my_udf(a) > 0))",
+            "CREATE TABLE docs (a INTEGER, CHECK (a > 0 OR (a < -5 OR my_udf(a) > 0)))",
+        ] {
+            let v = parse_create_table(sql);
+            let schema = schema_of(&v);
+            let err = validate_and_build(&schema, &v.checks)
+                .expect_err(&format!("{sql:?} must be rejected"));
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// 参照実装が OR 群を持たないため、OR 群の試験は新評価器の結果だけを確かめる。

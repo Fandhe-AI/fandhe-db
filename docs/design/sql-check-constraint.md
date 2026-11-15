@@ -103,10 +103,25 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   `wire_code` のまま透過する（D1'）。
 - `bind_check_predicates` が返す `OR` 群は捨てずに保持し、`column_mask` へ
   再帰的に反映する（マスク漏れはマスク外＝NULL 扱いで合格する fail-open）。
-  `IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL` は #3244 で解禁した（下記）。利用者が書く
-  `OR`・`NOT (...)`・`NOT <比較>` の解禁は #3243 で扱う。
+  `IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL` は #3244 で解禁した（下記）。
+- **`OR`・`NOT` の受理（Issue #3243）**: 構文段の拒否（`OR`・`NOT (...)`・裸の
+  `NOT <式比較>`）を外し、WHERE と同じ経路へ流す。否定は構文段の `negate_conjunction`
+  （De Morgan・演算子反転。Kleene の三値論理でも厳密に成り立つ）で葉まで押し下げ、
+  束縛木（`BoundConjunction`／`BoundOrGroup`）に `Not` 節点を足さない。したがって
+  第 2 の評価器は作らず、`Truth::not` は葉の宣言的フィルタ（`FilterOp::Not`）の内側で
+  既に効いており、群の上に Not を置く経路は不要（#3242 の申し送りへの回答）。例:
+  `NOT (a = 0)` は `a < 0 OR a > 0`、`NOT (a = 0 OR b = 0)` は連言 `[NOT a = 0, NOT b = 0]`、
+  `<>`／`!=` も同様に脱糖する。表示・永続形は正規化テキストで、往復一致は
+  `build_check_constraint` が検証する（カタログ版の変更なし。旧バイナリが新形式の述語を
+  読むと `compile` が `XX000` で fail-closed になるため、ダウングレード時は注意）。
+  `reject_forbidden_elements` は `OR` の各分岐・`NOT` の内側へ再帰し（ワイルドカードなしの
+  `match`）、UDF・`visible()`・式左辺の LIKE が紛れて通る経路を作らない。
 - **NULL の扱い（#3244）**: `IS NOT NULL` だけが NULL を違反にする。`IN`／`NOT IN`／
   `BETWEEN`／`NOT BETWEEN` は NULL で UNKNOWN になり合格する。`IS NULL` は非 NULL を違反にする。
+- **依存列の OR 網羅（Issue #3243）**: `referenced_column_names` は `OR` 群の内側
+  （脱糖された `NOT (n = 0)`・`n <> 0` を含む）の列も依存列に含める。取りこぼすと
+  `DROP COLUMN` の依存検査・`RENAME COLUMN` の追随・`ALTER COLUMN TYPE` の再計算を
+  すり抜け、CHECK を黙って壊す（fail-open）ため。
 - `VECTOR` 列を参照する式は、その行の embedding が NULL（`dim == 0`）なら
   `ExprProgram::eval` が NULL（UNKNOWN）を返す（`ExprStep::PushVector`）。
 
