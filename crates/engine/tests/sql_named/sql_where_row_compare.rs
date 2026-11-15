@@ -342,6 +342,76 @@ fn row_compare_type_matching_follows_scalar_comparison() {
     );
 }
 
+/// BOOLEAN 成分は通常の `col = TRUE` と同じ宣言的経路で評価し、INTERVAL 成分は通常の比較と同じコードで拒否する。
+#[test]
+fn row_compare_boolean_and_interval_components() {
+    let path = unique_db_path("row-cmp-bool-interval");
+    let _g = CleanupGuard(path.clone());
+    let core = core_at(&path);
+    ok(
+        &core,
+        "alice",
+        "CREATE TABLE y (embedding VECTOR(2) NOT NULL, i INTEGER, f BOOLEAN, v INTERVAL)",
+    );
+    ok(&core, "alice", "INSERT INTO y (id, embedding, i, f, v) VALUES (1, '[0.1,0.2]', 1, TRUE, INTERVAL '1 day') USING OPERATION_ID 'o1'");
+    ok(&core, "alice", "INSERT INTO y (id, embedding, i, f, v) VALUES (2, '[0.1,0.2]', 1, FALSE, INTERVAL '2 day') USING OPERATION_ID 'o2'");
+    for (sql, want) in [
+        (
+            "SELECT id FROM y WHERE (f, i) = (TRUE, 1) LIMIT 10",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM y WHERE (i, f) = (1, FALSE) LIMIT 10",
+            vec![2],
+        ),
+        (
+            "SELECT id FROM y WHERE (i, f) <> (1, FALSE) LIMIT 10",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM y WHERE (i, f) <> (2, FALSE) LIMIT 10",
+            vec![1, 2],
+        ),
+    ] {
+        assert_eq!(ids(&core, "alice", sql), want, "{sql}");
+    }
+    let scalar = code(
+        &core,
+        "SELECT id FROM y WHERE v = INTERVAL '1 day' LIMIT 10",
+    );
+    for sql in [
+        "SELECT id FROM y WHERE (v, i) = (INTERVAL '1 day', 1) LIMIT 10",
+        "SELECT id FROM y WHERE (i, v) < (1, INTERVAL '1 day') LIMIT 10",
+    ] {
+        assert_eq!(code(&core, sql), scalar, "{sql}");
+    }
+    // 非等価比較の BOOLEAN 成分は fail-closed（成功にもパニックにもならない）。
+    assert_eq!(
+        code(&core, "SELECT id FROM y WHERE (f, i) < (TRUE, 1) LIMIT 10"),
+        "22000"
+    );
+}
+
+/// 非自明な成分を上限個並べても、複製ノード数は予算に計上され 54000 で一貫して拒否される。
+#[test]
+fn row_compare_expansion_charges_expression_budget() {
+    let path = unique_db_path("row-cmp-budget");
+    let _g = CleanupGuard(path.clone());
+    let core = core_at(&path);
+    ok(
+        &core,
+        "alice",
+        "CREATE TABLE y (embedding VECTOR(2) NOT NULL, i INTEGER)",
+    );
+    let n = 64;
+    let lhs = vec!["i + 1"; n].join(", ");
+    let rhs = vec!["2"; n].join(", ");
+    for op in ["<", "<=", ">", ">="] {
+        let sql = format!("SELECT id FROM y WHERE ({lhs}) {op} ({rhs}) LIMIT 10");
+        assert_eq!(code(&core, &sql), "54000", "{op}");
+    }
+}
+
 /// 述語形 UPDATE／DELETE は対象行だけを変え、同じ `OPERATION_ID` の再送は冪等。他テナントの行は変わらない。
 #[test]
 fn row_compare_in_predicate_dml_affects_only_matching_rows() {

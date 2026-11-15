@@ -63,18 +63,72 @@ fn internal(detail: &str) -> SqlSurfaceError {
     }
 }
 
-fn leaf(op: BinOp, l: &Expr, r: &Expr) -> WherePredicate {
-    WherePredicate::Expression(Expr::Binary {
+/// 展開で複製する式ノード数を `remaining`（展開前の式ノード予算の写し）から引く（枯渇は `54000`）。
+/// 辞書式展開は成分式を複数の比較葉へ複製するため、全経路（`=`・`<>`・辞書式）で葉の生成ごとに数え、
+/// 非自明な成分を並べても展開後の木が予算の外へ膨らむ前に（束縛段へ渡す前に）一貫して拒否する。
+/// 実際の課金は束縛段が展開後の木に対して行うため、ここでは本物の予算を消費しない（二重課金の回避）。
+fn charge(budget: &mut usize, n: usize) -> Result<(), SqlSurfaceError> {
+    *budget = budget.checked_sub(n).ok_or_else(|| {
+        SqlSurfaceError::payload_too_large("expression exceeds the allowed node count")
+    })?;
+    Ok(())
+}
+
+/// 真偽値リテラルの `true` / `false`（構文段は行値の成分をそのまま `Expr::Ident` で保持する）。
+fn bool_literal(e: &Expr) -> Option<bool> {
+    match e {
+        Expr::Ident(w) if w.eq_ignore_ascii_case("true") => Some(true),
+        Expr::Ident(w) if w.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// 比較葉 1 件を作る。`<col> = TRUE|FALSE`（どちらの向きでも）は通常の比較と同じく
+/// 宣言的な `BoolEquality` にする（BOOLEAN 列は式内で束縛できないため）。
+/// それ以外の BOOLEAN 成分・INTERVAL 成分は通常の比較と同じ束縛エラー（fail-closed）になる。
+fn leaf(
+    op: BinOp,
+    l: &Expr,
+    r: &Expr,
+    budget: &mut usize,
+) -> Result<WherePredicate, SqlSurfaceError> {
+    if op == BinOp::Eq {
+        let col_and_value = match (l, r) {
+            (Expr::Ident(c), v) if bool_literal(l).is_none() => bool_literal(v).map(|b| (c, b)),
+            (v, Expr::Ident(c)) if bool_literal(r).is_none() => bool_literal(v).map(|b| (c, b)),
+            _ => None,
+        };
+        if let Some((column, value)) = col_and_value {
+            charge(budget, 1)?;
+            return Ok(WherePredicate::BoolEquality {
+                column: column.clone(),
+                value,
+            });
+        }
+    }
+    charge(
+        budget,
+        crate::sql::where_negation::expr_node_count(l)
+            .saturating_add(crate::sql::where_negation::expr_node_count(r))
+            .saturating_add(1),
+    )?;
+    Ok(WherePredicate::Expression(Expr::Binary {
         op,
         lhs: Box::new(l.clone()),
         rhs: Box::new(r.clone()),
-    })
+    }))
 }
 
 type Pair<'a> = (&'a Expr, &'a Expr);
 
-fn eq_conjunction(pairs: &[Pair<'_>]) -> Vec<WherePredicate> {
-    pairs.iter().map(|(l, r)| leaf(BinOp::Eq, l, r)).collect()
+fn eq_conjunction(
+    pairs: &[Pair<'_>],
+    budget: &mut usize,
+) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+    pairs
+        .iter()
+        .map(|(l, r)| leaf(BinOp::Eq, l, r, budget))
+        .collect()
 }
 
 /// 辞書式比較の展開。`pairs` は 1 個以上（空は `Internal`）。
@@ -82,14 +136,15 @@ fn lex(
     pairs: &[Pair<'_>],
     strict: BinOp,
     last: BinOp,
+    budget: &mut usize,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
     match pairs {
         [] => Err(internal("empty row comparison")),
-        [(l, r)] => Ok(vec![leaf(last, l, r)]),
+        [(l, r)] => Ok(vec![leaf(last, l, r, budget)?]),
         _ => {
             let (a, b) = pairs.split_at(pairs.len() / 2);
             let mut branches: Vec<Vec<WherePredicate>> = Vec::new();
-            let mut strict_a = lex(a, strict, strict)?;
+            let mut strict_a = lex(a, strict, strict, budget)?;
             // A 側が単一の `Or` なら分岐を親へ平坦化する（入れ子の深さを増やさない）。
             if matches!(strict_a.as_slice(), [WherePredicate::Or(_)]) {
                 if let Some(WherePredicate::Or(inner)) = strict_a.pop() {
@@ -98,8 +153,8 @@ fn lex(
             } else {
                 branches.push(strict_a);
             }
-            let mut tail = eq_conjunction(a);
-            tail.extend(lex(b, strict, last)?);
+            let mut tail = eq_conjunction(a, budget)?;
+            tail.extend(lex(b, strict, last, budget)?);
             branches.push(tail);
             Ok(vec![WherePredicate::Or(branches)])
         }
@@ -122,15 +177,17 @@ pub(crate) fn lower_row_compare(
         ));
     }
     let pairs: Vec<Pair<'_>> = lhs.iter().zip(rhs.iter()).collect();
+    let mut remaining = *budget;
     match op {
-        ArrayCmpOp::Eq => Ok(eq_conjunction(&pairs)),
-        ArrayCmpOp::Ne => {
-            crate::sql::where_negation::negate_conjunction(eq_conjunction(&pairs), budget)
-        }
-        ArrayCmpOp::Lt => lex(&pairs, BinOp::Lt, BinOp::Lt),
-        ArrayCmpOp::Le => lex(&pairs, BinOp::Lt, BinOp::Le),
-        ArrayCmpOp::Gt => lex(&pairs, BinOp::Gt, BinOp::Gt),
-        ArrayCmpOp::Ge => lex(&pairs, BinOp::Gt, BinOp::Ge),
+        ArrayCmpOp::Eq => eq_conjunction(&pairs, &mut remaining),
+        ArrayCmpOp::Ne => crate::sql::where_negation::negate_conjunction(
+            eq_conjunction(&pairs, &mut remaining)?,
+            budget,
+        ),
+        ArrayCmpOp::Lt => lex(&pairs, BinOp::Lt, BinOp::Lt, &mut remaining),
+        ArrayCmpOp::Le => lex(&pairs, BinOp::Lt, BinOp::Le, &mut remaining),
+        ArrayCmpOp::Gt => lex(&pairs, BinOp::Gt, BinOp::Gt, &mut remaining),
+        ArrayCmpOp::Ge => lex(&pairs, BinOp::Gt, BinOp::Ge, &mut remaining),
     }
 }
 
