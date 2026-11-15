@@ -80,6 +80,7 @@ impl TriggerCall<'_> {
         match self.timing {
             TriggerTiming::Before => "BEFORE",
             TriggerTiming::After => "AFTER",
+            TriggerTiming::InsteadOf => "INSTEAD OF",
         }
     }
 }

@@ -109,8 +109,22 @@ fn unsupported_and_malformed_forms_are_rejected_before_the_catalog() {
     let (_g, core) = open_fixture("trg-syntax");
     let mut s = allowed_session();
     for (sql, want) in [
+        // INSTEAD OF はビューへの FOR EACH ROW だけ（Issue #3193）。ROW の指定が無い形・STATEMENT・`UPDATE OF`・
+        // TRUNCATE はビューの存在を見る前に構文段で `0A000`。
         (
             "CREATE TRIGGER g INSTEAD OF INSERT ON t EXECUTE FUNCTION f()",
+            "0A000",
+        ),
+        (
+            "CREATE TRIGGER g INSTEAD OF INSERT ON t FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "0A000",
+        ),
+        (
+            "CREATE TRIGGER g INSTEAD OF UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION f()",
+            "0A000",
+        ),
+        (
+            "CREATE TRIGGER g INSTEAD OF TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION f()",
             "0A000",
         ),
         (

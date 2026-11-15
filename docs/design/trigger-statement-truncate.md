@@ -14,8 +14,9 @@ Issue #1726（親 #1720）の実装記録。上位の決定は [trigger-executio
   発火しない（PostgreSQL と同じ）
 - NEW／OLD は持たない（`old_row: None`・`new_row` は空。D1）。戻り値は無視する（D3）。`TG_LEVEL` は
   `TriggerCall::tg_level()`、`TG_OP` に `TRUNCATE` を追加した
-- 遷移テーブル（REFERENCING）・INSTEAD OF・CONSTRAINT TRIGGER・DEFERRABLE・TRUNCATE の行トリガは、定義の段で
-  `0A000`（#1722 で実装済み。`sql::allowlist::trigger` の `unsupported_forms_are_0a000` が回帰を担保する）
+- 遷移テーブル（REFERENCING）・CONSTRAINT TRIGGER・DEFERRABLE・TRUNCATE の行トリガは、定義の段で
+  `0A000`（#1722 で実装済み。`sql::allowlist::trigger` の `unsupported_forms_are_0a000` が回帰を担保する）。
+  INSTEAD OF はビューへの ROW だけ受理する（Issue #3193。[trigger-instead-of.md](trigger-instead-of.md)）
 
 ## 1 文のライフサイクル（D4 の段との対応）
 

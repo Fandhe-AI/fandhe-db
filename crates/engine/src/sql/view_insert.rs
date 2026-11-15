@@ -4,6 +4,8 @@
 //! の構造検証済みの形（[`ValidatedViewInsert`]）を、基表への [`ValidatedInsert`] へ名前の写像だけで
 //! 書き換える。SQL 文字列は組み立てず、書き換え後の束縛・実行・制約・RLS・台帳は既存の基表 INSERT
 //! 経路（`core.rs` の `execute_insert_form` 等）にそのまま乗る（第 2 の書き込み経路を作らない）。
+//! INSTEAD OF トリガ（TABLE-45・Issue #3193）を持つビューへの書き込みは本モジュールを通らずトリガへ振り分けられる
+//! （`core::view_instead_of`。自動更新可能でもトリガを優先する）。トリガの無いビューの挙動は変えない。
 //! 呼び出し元は `core.rs`: Parse 時は [`check_view_insert`]（判定だけ）、Execute／Describe 時は
 //! [`rewrite_view_insert`]（現在のカタログで書き換え）を呼ぶ。Parse 時の写像は持ち越さない。
 //!
@@ -29,6 +31,19 @@ use super::allowlist::{
 use super::exec::ColumnMeta;
 use super::view::{resolve_from, Resolved};
 use super::view_updatable::{view_updatability, ViewUpdatability};
+
+/// 別名で疑似列 `id` へ写る公開名への書き込みの拒否文言（自動書き換え固有。INSTEAD OF トリガ経路では
+/// 公開名は `NEW`／`OLD` の独立した列なので不要）。
+const ID_ALIAS_WRITE_UNSUPPORTED: &str =
+    "writing to a view column aliased to the row id is not supported";
+
+/// `e` が [`ID_ALIAS_WRITE_UNSUPPORTED`] か。構文解析段は、この拒否を実行段（トリガ有無の確定後）へ回す
+/// （トリガが無ければ実行段の書き換えが同じ拒否を返す）。
+pub(crate) fn is_id_alias_rejection(e: &SqlSurfaceError) -> bool {
+    matches!(e, SqlSurfaceError::FeatureNotSupported { detail }
+        if detail == ID_ALIAS_WRITE_UNSUPPORTED
+            || detail == crate::sql::view_dml::ID_USER_COLUMN_WHERE_UNSUPPORTED)
+}
 
 /// 書き換え結果。
 #[derive(Debug)]
@@ -330,7 +345,7 @@ impl Mapper<'_> {
         };
         if !self.base_allocated && physical == "id" && public != "id" {
             return Err(SqlSurfaceError::feature_not_supported(
-                "writing to a view column aliased to the row id is not supported",
+                ID_ALIAS_WRITE_UNSUPPORTED,
             ));
         }
         Ok(physical)

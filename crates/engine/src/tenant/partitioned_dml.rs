@@ -566,6 +566,17 @@ fn chunk_loop<E>(
         // ジョブ記録・台帳照合より前に判定するので、第 1 チャンクでは commit 前に止まり副作用はゼロ
         // （登録簿の登録は drop で外れる）。途中のチャンクで DDL によりトリガが追加された場合は、次の
         // チャンクで同じ判定が働き、既存の部分完了の写像（`VD001`）に従う。
+        // 子表トリガは供給せず（分割実行では結線しない）、該当すれば先にここで `0A000` にする。
+        crate::trigger::plan::reject_referential_child_triggers(
+            &write_txn,
+            tenant,
+            table,
+            match kind {
+                Kind::Delete => crate::catalog::trigger::TriggerEvents::DELETE,
+                Kind::Update { .. } => crate::catalog::trigger::TriggerEvents::UPDATE,
+            },
+        )
+        .map_err(w)?;
         let trigger_plan = match kind {
             Kind::Delete => crate::trigger::plan::plan_row_triggers(
                 &write_txn,

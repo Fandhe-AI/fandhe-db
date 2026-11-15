@@ -289,7 +289,7 @@ SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、�
   クエリ結果・エラーコード・テナント境界の一致）。
 - **対象外**: 移行後の `id` の採番（#1696・#1698〜#1700）・移行した表での rowid 採番器の使用・`UPDATE ... SET id`／ALTER の
   `id` 操作（従来どおり `42601`）・NoSQL の単一行アドレスと scan（#2201）・crash-test スクリプトへの移行シナリオ追加と
-  旧形式フィクスチャの網羅（#2202）・採番方式の親への `id` 参照 FK（移行の対象外のため未起票の後続 Issue で追跡）。
+  旧形式フィクスチャの網羅（#2202）・採番方式の親への `id` 参照 FK（移行の対象外。#3177 ツリーの #3178〜#3182 で対応済み。§15）。
 
 ## 13. Issue #2201 実装記録（NoSQL の単一行アドレスと insert・scan）
 
@@ -330,7 +330,7 @@ SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、�
     Public 行を作れない。採番方式の表は Private 込みモードを主軸にし、Public のみモードでは「読み取りが
     0 行・書き込みが所有かつ可視の行に限られる（自テナントの Private 行への `DO UPDATE` は `42501`）」ことと
     応答の不変性を確認する。Public 行は、Rust API で seed してから開き直して移行した表で検査する。
-  - 対象外: 採番方式の親への `id` 参照 FK（§11・§12）、他テナントの Public 行の読み取り可視性
+  - 対象外: 採番方式の親への `id` 参照 FK は #3182 で検査対象にした（§15）、他テナントの Public 行の読み取り可視性
     （`rls10_relational_paths.rs` の担当）、NoSQL 表層（`table23_nosql_pk_row_address.rs` の担当）。
 - **crash 耐性**（`crates/engine/examples/crash_tool_unique_index.rs`）: 新しい CI ジョブ・スクリプトは作らず、
   既存の `crash-test-unique-index` の対象表に、採番方式の `docs_pk`（複合 PK＋UNIQUE。各バッチ先頭行への
@@ -351,3 +351,24 @@ SQL-17・SQL-18・SQL-20・SQL-32）。契約の詳細は spec を正とし、�
   が固定する（非空虚ゲート付き）。バイナリは `.editorconfig-checker.json` の `Exclude` に追加した。
 - **対象外・後続への申し送り**: 独立した crash ジョブの新設（オーナー判断）、NoSQL `aggregate`／`search` の採番方式対応、
   移行後の `id` の IDENTITY 化。
+
+## 15. Issue #3182 実装記録（id 参照 FK の越境・再送・crash 試験）
+
+- **ポインタ**: TABLE-17・TABLE-23（関連: RLS-10・RECOVER-10〜12）。親 #3177 ツリーの最終段。本番コードの変更なし（試験・文書・コメントのみ）。
+- **試験の置き場所**:
+  - 越境: `tests/rls10_primary_key_paths.rs`（3 テナント回転×可視性 2 モード×実行経路 2 つの統一マトリクス）へ
+    採番方式の親の `id` 参照 FK の表（`id_parents`・`id_children`〔NO ACTION〕・`id_children_c`〔CASCADE〕・`id_children_s`
+    〔SET NULL〕・自己参照 `id_tree`）と `fk_id_*` の 11 形状を追加した（形状総数 53 → 64）。他テナントだけが持つ `id` を指す
+    INSERT／UPDATE は `23503` で、どこにも無い `id` と応答が一致する（T4）。連鎖は自テナントの子だけに及ぶ（T3・T8）。
+    遅延検査の越境は `table_rls/table23_id_ref_fk_actions.rs` の `deferred_fk_commit_never_sees_another_tenants_parent`。
+  - 再送冪等: `table_rls/table23_id_ref_fk_ledger.rs`（子 INSERT・親 DELETE の連鎖の再送が `23505`、内容違いは `22023`、
+    FK 違反で失敗した文は台帳を消費しない、台帳キーのテナント分離、明示トランザクション・開き直し後の再送）。
+  - psql 形（末尾 `;` 付き単独送信）: wire-server の `wire_sql/wire_fk_allocated_actions.rs`（再送・越境の応答一致）。
+  - 論理ダンプ: `table_rls/logical_dump_roundtrip.rs` の `data_filled_id_references_round_trip_and_keep_enforcing`
+    （データ入りの往復。COPY・INSERT 両形式で再ダンプが一致し、復元後も FK と連鎖が効く）。
+- **crash 耐性**: 独立した CI ジョブは作らず、既存の `crash-test-unique-index`（`examples/crash_tool_unique_index.rs`）へ
+  親子表 `docs_idfk_parent`・`docs_idfk_child`（ON DELETE CASCADE）を足した。新規ジョブは必須チェックの登録を伴い
+  オーナー判断事項になるため見送った。一時の親子を作って親を DELETE する連鎖削除を kill の対象経路に乗せ、verify は
+  連続性・孤児ゼロ・FK／PK 違反の拒否・読み取り専用の一意索引検証を確かめる。
+- **残る未対応の形**: 整数でない `id`（`id TEXT PRIMARY KEY`）への FK と `UNIQUE (id, x)` への複合 FK は `42830` のまま
+  （fail-closed）。受け皿 Issue は未確定（PR の「対象外」節で扱う）。

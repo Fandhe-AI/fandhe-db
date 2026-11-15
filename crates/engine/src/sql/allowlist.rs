@@ -5703,11 +5703,23 @@ impl ValidatedViewInsert {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedViewDelete {
     pub(crate) shape: DeleteStatement,
+    /// 文の `WHERE` 以降のトークン（`WHERE` を除く。`WHERE` なしは空）。INSTEAD OF トリガ経路（Issue #3193）が
+    /// 削除対象の OLD 行を、ビューを読む `SELECT` の述語として再利用するための写しで、基表への書き換え経路は読まない。
+    pub(crate) where_tail: Vec<Token>,
 }
 
 impl ValidatedViewDelete {
     pub(crate) fn new(shape: DeleteStatement) -> Self {
-        ValidatedViewDelete { shape }
+        ValidatedViewDelete {
+            shape,
+            where_tail: Vec::new(),
+        }
+    }
+
+    /// `WHERE` 以降のトークンの写しを載せる（INSTEAD OF トリガ経路用。Issue #3193）。
+    pub(crate) fn with_where_tail(mut self, tail: Vec<Token>) -> Self {
+        self.where_tail = tail;
+        self
     }
 
     /// FROM に指定されたビュー名。
@@ -5733,11 +5745,22 @@ impl ValidatedViewDelete {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedViewUpdate {
     pub(crate) shape: ValidatedUpdateForm,
+    /// 文の `WHERE` 以降のトークン（[`ValidatedViewDelete::where_tail`] と同じ。Issue #3193）。
+    pub(crate) where_tail: Vec<Token>,
 }
 
 impl ValidatedViewUpdate {
     pub(crate) fn new(shape: ValidatedUpdateForm) -> Self {
-        ValidatedViewUpdate { shape }
+        ValidatedViewUpdate {
+            shape,
+            where_tail: Vec::new(),
+        }
+    }
+
+    /// `WHERE` 以降のトークンの写しを載せる（INSTEAD OF トリガ経路用。Issue #3193）。
+    pub(crate) fn with_where_tail(mut self, tail: Vec<Token>) -> Self {
+        self.where_tail = tail;
+        self
     }
 
     /// UPDATE の対象に指定されたビュー名。
@@ -44604,4 +44627,26 @@ mod create_table_as_tests {
             assert_eq!(e.wire_code(), "0A000", "{sql}");
         }
     }
+}
+
+/// 文のトークン列から最上位（括弧の外）の最初の `WHERE` 以降を取り出す（`WHERE` 自体と末尾の `;` を除く）。
+/// `WHERE` が無ければ空。ビューへの `UPDATE`／`DELETE` の構文検証後に呼び、INSTEAD OF トリガ経路
+/// （Issue #3193）が OLD 行を読む `SELECT` の述語に再利用する。トークンのまま運び、SQL 文字列は組み立てない。
+pub(crate) fn where_tail_tokens(tokens: &[Token]) -> Vec<Token> {
+    let mut depth: i32 = 0;
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(Keyword::Where) if depth == 0 => {
+                let mut tail: Vec<Token> = tokens[i + 1..].to_vec();
+                while matches!(tail.last(), Some(Token::Punct(';'))) {
+                    tail.pop();
+                }
+                return tail;
+            }
+            _ => {}
+        }
+    }
+    Vec::new()
 }

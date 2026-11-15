@@ -200,6 +200,43 @@ fn statement_trigger_is_rejected_with_fixed_message() {
     assert!(ints(&core, "t1", "SELECT n FROM audit").is_empty());
 }
 
+// 参照アクションが及ぶ子表に行トリガがあるとき、分割実行 DML は `0A000`（子トリガをチャンク commit の
+// 途中で永続化しない）。行・子行・監査行・ジョブ記録を残さない（Issue #3284 の PR #3400 指摘）。
+#[test]
+fn child_row_trigger_on_referential_action_is_rejected() {
+    let (_g, core) = open("t45part-child");
+    ok(&core, "t1", "CREATE SCHEMA s");
+    ok(&core, "t1", "CREATE TABLE s.par (id INTEGER PRIMARY KEY)");
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE s.kid (pid INTEGER REFERENCES s.par (id) ON DELETE CASCADE ON UPDATE CASCADE)",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TABLE audit (n INTEGER, lv TEXT, op TEXT)",
+    );
+    func(&core, "t1", "audit_old", AUDIT_OLD);
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER ku AFTER DELETE OR UPDATE ON s.kid FOR EACH ROW EXECUTE FUNCTION audit_old()",
+    );
+    ok(&core, "t1", "INSERT INTO s.par (id) VALUES (1), (2)");
+    ok(&core, "t1", "INSERT INTO s.kid (pid) VALUES (1), (2)");
+    for sql in [
+        "DELETE FROM s.par WHERE id > 0 USING OPERATION_ID 'd1' PARTITIONED CHUNK 1",
+        "UPDATE s.par SET id = id + 10 WHERE id > 0 USING OPERATION_ID 'u1' PARTITIONED CHUNK 1",
+    ] {
+        let e = err_of(&core, "t1", sql);
+        assert_eq!(e.wire_code(), "0A000", "{sql}");
+    }
+    assert_eq!(ints(&core, "t1", "SELECT id FROM s.par"), vec![1, 2]);
+    assert_eq!(ints(&core, "t1", "SELECT pid FROM s.kid"), vec![1, 2]);
+    assert!(ints(&core, "t1", "SELECT n FROM audit").is_empty());
+}
+
 // テナント境界: t1 のトリガは t2 の分割実行で発火せず、t1 の監査行は t2 から見えない。
 #[test]
 fn trigger_does_not_fire_across_tenants() {

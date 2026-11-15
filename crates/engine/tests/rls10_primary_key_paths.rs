@@ -30,8 +30,11 @@
 //! 常に 0 行であることと、応答・事後状態が baseline／flooded で不変であることを検査する。Public
 //! 行を含む検査は、Rust API で Public／Private 行を seed してから開き直して移行した表で行う。
 //!
+//! 採番方式の親の `id` 列を参照する FK（`id_parents`・`id_children*`・`id_tree`。Issue #3182。
+//! 親 #3177 ツリーの #3178〜#3181 で解禁された形）も同じ統一マトリクスの形状（`fk_id_*`）として含める。
+//! 設計記録は `docs/design/rowid-primary-key-separation.md` §15。
+//!
 //! 対象外: NoSQL 表層（`crates/wire-server/tests/table23_nosql_pk_row_address.rs` の担当）、
-//! 採番方式の親への `id` 参照 FK（`0A000`。`docs/design/rowid-primary-key-separation.md` §11・§12）、
 //! 他テナントの Public 行を含む読み取りの可視性（`rls10_relational_paths.rs` の担当）。
 
 use std::path::PathBuf;
@@ -58,7 +61,7 @@ use temp_db::{unique_db_path, CleanupGuard};
 const TENANTS: [&str; 3] = ["tenant-a", "tenant-b", "tenant-c"];
 
 /// 採番方式の表（SQL `CREATE TABLE`）の DDL。
-const DDL: [&str; 9] = [
+const DDL: [&str; 14] = [
     "CREATE TABLE pk_text (code TEXT PRIMARY KEY, n BIGINT, body TEXT)",
     "CREATE TABLE pk_comp (a TEXT, b INTEGER, v TEXT, PRIMARY KEY (a, b))",
     "CREATE TABLE pk_id (id BIGINT PRIMARY KEY, v TEXT)",
@@ -69,6 +72,12 @@ const DDL: [&str; 9] = [
     "CREATE TABLE children_s (pcode TEXT REFERENCES parents (code) ON DELETE SET NULL, note TEXT)",
     "CREATE TABLE comp_children (a TEXT, b INTEGER, note TEXT, \
      FOREIGN KEY (a, b) REFERENCES pk_comp (a, b))",
+    // 採番方式の親の `id` 列を参照する FK（Issue #3182）。
+    "CREATE TABLE id_parents (id BIGINT PRIMARY KEY, name TEXT)",
+    "CREATE TABLE id_children (pid BIGINT REFERENCES id_parents (id), note TEXT)",
+    "CREATE TABLE id_children_c (pid BIGINT REFERENCES id_parents (id) ON DELETE CASCADE, note TEXT)",
+    "CREATE TABLE id_children_s (pid BIGINT REFERENCES id_parents (id) ON DELETE SET NULL, note TEXT)",
+    "CREATE TABLE id_tree (id BIGINT PRIMARY KEY, up BIGINT REFERENCES id_tree (id) ON DELETE CASCADE, label TEXT)",
 ];
 
 /// 移行済みの表になる従来方式の表（`LegacyExec`。開き直しで `MigratedId` へ移行される）。
@@ -78,7 +87,7 @@ const LEGACY_DDL: [&str; 2] = [
 ];
 
 /// 事後状態の走査: （表, 決定的な `ORDER BY`）。
-const SNAP: [(&str, &str); 11] = [
+const SNAP: [(&str, &str); 16] = [
     ("pk_text", "code, n"),
     ("pk_comp", "a, b"),
     ("pk_id", "id"),
@@ -88,6 +97,11 @@ const SNAP: [(&str, &str); 11] = [
     ("children_c", "pcode, note"),
     ("children_s", "pcode, note"),
     ("comp_children", "a, b"),
+    ("id_parents", "id, name"),
+    ("id_children", "pid, note"),
+    ("id_children_c", "pid, note"),
+    ("id_children_s", "pid, note"),
+    ("id_tree", "id, label"),
     ("legacy_pk", "code, tag"),
     ("legacy_plain", "id"),
 ];
@@ -119,6 +133,13 @@ fn seed_statements(t: &str, flood_extra: bool) -> Vec<String> {
         format!("INSERT INTO children_c (pcode, note) VALUES ('p2', 'tok-{t}-cc')"),
         format!("INSERT INTO children_s (pcode, note) VALUES ('p2', 'tok-{t}-cs')"),
         format!("INSERT INTO comp_children (a, b, note) VALUES ('x', 1, 'tok-{t}-cx')"),
+        format!("INSERT INTO id_parents (id, name) VALUES (1, 'tok-{t}-ip1')"),
+        format!("INSERT INTO id_parents (id, name) VALUES (2, 'tok-{t}-ip2')"),
+        format!("INSERT INTO id_children (pid, note) VALUES (1, 'tok-{t}-ic1')"),
+        format!("INSERT INTO id_children_c (pid, note) VALUES (2, 'tok-{t}-icc')"),
+        format!("INSERT INTO id_children_s (pid, note) VALUES (2, 'tok-{t}-ics')"),
+        format!("INSERT INTO id_tree (id, up, label) VALUES (1, NULL, 'tok-{t}-t1')"),
+        format!("INSERT INTO id_tree (id, up, label) VALUES (2, 1, 'tok-{t}-t2')"),
     ];
     if flood_extra {
         v.extend([
@@ -127,6 +148,8 @@ fn seed_statements(t: &str, flood_extra: bool) -> Vec<String> {
             format!("INSERT INTO pk_id (id, v) VALUES (77, 'tok-{t}-77')"),
             format!("INSERT INTO nopk (k, v) VALUES (99, 'tok-{t}-n99')"),
             format!("INSERT INTO parents (code, name) VALUES ('only-other', 'tok-{t}-po')"),
+            format!("INSERT INTO id_parents (id, name) VALUES (777, 'tok-{t}-ip777')"),
+            format!("INSERT INTO id_tree (id, up, label) VALUES (777, NULL, 'tok-{t}-t777')"),
         ]);
     }
     v
@@ -492,6 +515,18 @@ fn shapes() -> Vec<Shape> {
         sh("fk_comp_delete_referenced_parent", C, "DELETE FROM pk_comp WHERE a = 'x' AND b = 1 USING OPERATION_ID 'w{op}'", (E("23503"), N(0))),
         sh("fk_cascade_and_set_null_own_children_only", W, "DELETE FROM parents WHERE code = 'p2' USING OPERATION_ID 'w{op}'", (N(1), N(0))),
         sh("fk_delete_parent_only_other_has", W, "DELETE FROM parents WHERE code = 'only-other' USING OPERATION_ID 'w{op}'", (N(0), N(0))),
+        // ---- FK（採番方式の親の `id` 列参照。Issue #3182） ----
+        sh("fk_id_insert_own_parent", C, "INSERT INTO id_children (pid, note) VALUES (1, 'n') USING OPERATION_ID 'w{op}'", (N(1), N(1))),
+        sh("fk_id_insert_parent_only_other_has", C, "INSERT INTO id_children (pid, note) VALUES (777, 'n') USING OPERATION_ID 'w{op}'", (E("23503"), E("23503"))),
+        sh("fk_id_insert_parent_nowhere", C, "INSERT INTO id_children (pid, note) VALUES (4242, 'n') USING OPERATION_ID 'w{op}'", (E("23503"), E("23503"))),
+        sh("fk_id_update_child_to_other_only", C, "UPDATE id_children SET pid = 777 WHERE pid = 1 USING OPERATION_ID 'w{op}'", (E("23503"), N(0))),
+        sh("fk_id_delete_referenced_parent", C, "DELETE FROM id_parents WHERE id = 1 USING OPERATION_ID 'w{op}'", (E("23503"), N(0))),
+        sh("fk_id_update_referenced_parent_id", C, "UPDATE id_parents SET id = 9 WHERE id = 1 USING OPERATION_ID 'w{op}'", (E("23503"), N(0))),
+        sh("fk_id_cascade_and_set_null_own_children_only", W, "DELETE FROM id_parents WHERE id = 2 USING OPERATION_ID 'w{op}'", (N(1), N(0))),
+        sh("fk_id_delete_parent_only_other_has", W, "DELETE FROM id_parents WHERE id = 777 USING OPERATION_ID 'w{op}'", (N(0), N(0))),
+        sh("fk_id_self_cascade_own_tree_only", W, "DELETE FROM id_tree WHERE id = 1 USING OPERATION_ID 'w{op}'", (N(1), N(0))),
+        sh("fk_id_self_insert_parent_only_other_has", C, "INSERT INTO id_tree (id, up, label) VALUES (10, 777, 'n') USING OPERATION_ID 'w{op}'", (E("23503"), E("23503"))),
+        sh("fk_id_self_insert_parent_nowhere", C, "INSERT INTO id_tree (id, up, label) VALUES (10, 4242, 'n') USING OPERATION_ID 'w{op}'", (E("23503"), E("23503"))),
         // ---- 内部 rowid が見えない ----
         sh("pseudo_rowid_unknown", R, "SELECT rowid FROM pk_text ORDER BY code LIMIT 10", (E("42703"), E("42703"))),
         sh("pseudo_ctid_unknown", R, "SELECT ctid FROM nopk ORDER BY k LIMIT 10", (E("42703"), E("42703"))),
@@ -753,6 +788,14 @@ fn t4_fk_and_pk_existence_is_not_revealed() {
             "fk_comp_insert_parent_only_other_has",
             "fk_comp_insert_parent_nowhere",
         ),
+        (
+            "fk_id_insert_parent_only_other_has",
+            "fk_id_insert_parent_nowhere",
+        ),
+        (
+            "fk_id_self_insert_parent_only_other_has",
+            "fk_id_self_insert_parent_nowhere",
+        ),
     ];
     let mut compared = 0;
     for (hidden, nowhere) in pairs {
@@ -775,7 +818,7 @@ fn t4_fk_and_pk_existence_is_not_revealed() {
             compared += 1;
         }
     }
-    assert_eq!(compared, 2 * 3 * 2 * 2);
+    assert_eq!(compared, pairs.len() * 3 * 2 * 2);
     // PK: 他テナントだけが持つ値への点検索は、どこにも無い値と同じ 0 行（baseline と一致は T2）。
     for r in report()
         .iter()
@@ -793,7 +836,7 @@ fn t4_fk_and_pk_existence_is_not_revealed() {
 #[test]
 fn t5_trial_count_is_pinned() {
     let n_shapes = shapes().len();
-    assert_eq!(n_shapes, 53);
+    assert_eq!(n_shapes, 64);
     assert_eq!(report().len(), 3 * 2 * 2 * n_shapes);
     for viewer in TENANTS {
         assert_eq!(
@@ -901,6 +944,57 @@ fn t8_own_state_after_write_meets_independent_oracle() {
                 bad.push(format!("children must be untouched: {k}"));
             }
             bad
+        }),
+        // 採番方式の親の `id` 参照: CASCADE の子は消え、SET NULL の子は NULL になり、他は不変。
+        ("fk_id_cascade_and_set_null_own_children_only", |st, v| {
+            let mut bad = Vec::new();
+            let p = state_line(st, "id_parents");
+            if p.contains(&format!("tok-{v}-ip2")) || !p.contains(&format!("tok-{v}-ip1")) {
+                bad.push(format!("id_parents: {p}"));
+            }
+            let c = state_line(st, "id_children_c");
+            if c != "id_children_c:[]" {
+                bad.push(format!("id_children_c must be empty (CASCADE): {c}"));
+            }
+            let s = state_line(st, "id_children_s");
+            if !s.contains(&format!("tok-{v}-ics")) || !s.contains("Null") {
+                bad.push(format!(
+                    "id_children_s must keep the row with NULL key: {s}"
+                ));
+            }
+            let k = state_line(st, "id_children");
+            if !k.contains(&format!("tok-{v}-ic1")) {
+                bad.push(format!("id_children must be untouched: {k}"));
+            }
+            bad
+        }),
+        // 自己参照の連鎖は自テナントの木だけを消す（他テナントの同値 id の木は T3 が固定）。
+        ("fk_id_self_cascade_own_tree_only", |st, _v| {
+            let t = state_line(st, "id_tree");
+            if t == "id_tree:[]" {
+                vec![]
+            } else {
+                vec![format!("id_tree must be empty after cascade: {t}")]
+            }
+        }),
+        // 参照されている採番方式の親の削除は拒否され、親も子も残る。
+        ("fk_id_delete_referenced_parent", |st, v| {
+            let p = state_line(st, "id_parents");
+            let k = state_line(st, "id_children");
+            if p.contains(&format!("tok-{v}-ip1")) && k.contains(&format!("tok-{v}-ic1")) {
+                vec![]
+            } else {
+                vec![format!("{p} / {k}")]
+            }
+        }),
+        // 子の FK 列を他テナント専用の id へ変える UPDATE は拒否され、状態は不変。
+        ("fk_id_update_child_to_other_only", |st, v| {
+            let k = state_line(st, "id_children");
+            if k.contains(&format!("tok-{v}-ic1")) && !k.contains("777") {
+                vec![]
+            } else {
+                vec![format!("id_children: {k}")]
+            }
         }),
         // 参照されている親の削除は拒否され、親も子も残る。
         ("fk_delete_referenced_parent", |st, v| {

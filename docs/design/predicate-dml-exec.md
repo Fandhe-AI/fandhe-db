@@ -511,8 +511,8 @@ Issue #1757（実装済み）。
   `tenant::update_rows_joined_unchecked`（`update_rows_where_impl` と同じ処理順序）と既存の
   `delete_rows_where_unchecked`。`tenant::enumerate_dml_candidates` は述語が値を運べる
   `enumerate_dml_candidates_with<T>` へ汎用化し、既存関数は `T = ()` の薄いラッパーにした。
-- **fail-closed**: `WriteTarget::InTxn` 以外・FROM 側列を参照する RETURNINGは固定文言の
-  `0A000`。
+- **fail-closed**: `WriteTarget::InTxn` 以外は固定文言の `0A000`。FROM 側列を参照する RETURNING は
+  #3204 で結線済み。
 - **暫定事項と申し送り**:
   - 台帳（#1757・実装済み）: 構文段で算出した正規化文ハッシュ（結合結果は材料外）を `execute_joined_dml_in` が
     受け取り、source 走査の前に `precheck_in_write_txn` で事前照合する。暫定ゲートは撤去した
@@ -522,7 +522,8 @@ Issue #1757（実装済み）。
     `execute_subquery_dml_autocommit` と同じ暗黙トランザクション）、書き込み後に `mark_written` を呼ぶ。
     `PARTITIONED` との併用は構文段で拒否し、`run_partitioned_*` に結合形の多層防御を足す。SQL 文字列による
     結合テストも同時に追加する。
-  - #1756: FROM 側列の RETURNING（一致写像 `JoinedProbe::matches` を使う）と RLS 回帰の本体。
+  - #1756・#3204: FROM 側列の RETURNING と RLS 回帰は実装済み（SQL 経路の RETURNING は一致写像の共有ハンドルを
+    直接読む。`JoinedDmlOutcome::matches` は単体テスト専用で `cfg(test)`。Issue #3205）。
   - 未対応形（`0A000` で拒否する前提）: FROM／USING が 2 relation 以上、対象と source を跨ぐ非等値・`OR`
     （JOIN 拡張の範囲）、FROM 側がビュー・一時表・マテビュー。
 - **テスト**: `core/dml_join_exec_tests.rs`（手で組んだ実行入力で、多重一致の一意化・各上限の fail-closed と

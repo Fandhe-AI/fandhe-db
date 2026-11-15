@@ -13,7 +13,8 @@
 //! - [`plan`]: 書き込み txn 内でカタログを 1 回読み、発火する経路か・未結線で拒否する経路かを決める
 //! - [`fire`]: BEFORE ROW トリガの連鎖実行（NEW の受け渡し・NULL 返却による行のスキップ）と、
 //!   文の終わりの AFTER ROW トリガの実行（戻り値は無視。Issue #1724）、文トリガ（STATEMENT。TRUNCATE を
-//!   含む）の文につき 1 回の実行（対象 0 行でも発火。Issue #1726）
+//!   含む）の文につき 1 回の実行（対象 0 行でも発火。Issue #1726）。ビューへの INSTEAD OF ROW トリガの
+//!   連鎖実行（[`fire::fire_instead_of_row`]。Issue #3193。呼び出し元は `core::view_instead_of`）
 //! - [`row_loop`]: 外側の行ループが進行中の表の記録（本体の同表 `DELETE` を `0A000` で拒否する暫定ガード。Issue #3187）
 //! - [`write_handle`]: トリガ本体が同じ write txn・呼び出しテナントの文脈で他表へ書く狭い窓口
 //!
