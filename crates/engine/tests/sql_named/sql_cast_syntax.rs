@@ -334,7 +334,6 @@ fn unimplemented_conversions_are_rejected_not_evaluated() {
     // ここには、種別を静的に決められない数値（関数・`id` 疑似列）の変換と、対応する要素型の無い
     // 配列への変換が評価されずに拒否されることを固定する。
     for expr in [
-        "CAST('{1}' AS smallint[])",
         "CAST(NULL AS character varying(3)[])",
         "CAST(abs(i4) AS integer)",
         "CAST(abs(i4) AS text)",

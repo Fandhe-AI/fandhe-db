@@ -134,6 +134,7 @@ pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
     Some(match e {
         ArrayElemType::Text => CastSrc::Text,
         ArrayElemType::Bool => CastSrc::Bool,
+        ArrayElemType::SmallInt => CastSrc::Int2,
         ArrayElemType::Integer => CastSrc::Int4,
         ArrayElemType::BigInt => CastSrc::Int8,
         ArrayElemType::Real => CastSrc::Float4,
@@ -154,6 +155,7 @@ pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
     Some(match e {
         ArrayElemType::Text => CastDst::Text,
         ArrayElemType::Bool => CastDst::Bool,
+        ArrayElemType::SmallInt => CastDst::Int2,
         ArrayElemType::Integer => CastDst::Int4,
         ArrayElemType::BigInt => CastDst::Int8,
         ArrayElemType::Real => CastDst::Float4,
@@ -1178,6 +1180,7 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Text(v) => map(v, text),
         ArrayValue::Bool(v) => map(v, |b| Ok(ExprValue::Bool(*b))),
         ArrayValue::Integer(v) => map(v, |i| Ok(ExprValue::Scalar(f64::from(*i)))),
+        ArrayValue::SmallInt(v) => map(v, |i| Ok(ExprValue::Scalar(f64::from(*i)))),
         ArrayValue::BigInt(v) => map(v, |i| {
             if i.unsigned_abs() > EXACT_INT_MAX as u64 {
                 return Err(out_of_range(
@@ -1237,6 +1240,9 @@ pub(crate) fn values_to_array(
         })?),
         ArrayElemType::Integer => ArrayValue::Integer(collect(values, |v| {
             i32::try_from(int_of(v)?).map_err(|_| out_of_range("integer out of range"))
+        })?),
+        ArrayElemType::SmallInt => ArrayValue::SmallInt(collect(values, |v| {
+            i16::try_from(int_of(v)?).map_err(|_| out_of_range("smallint out of range"))
         })?),
         ArrayElemType::BigInt => ArrayValue::BigInt(collect(values, int_of)?),
         ArrayElemType::Real => ArrayValue::Real(collect(values, |v| match v {

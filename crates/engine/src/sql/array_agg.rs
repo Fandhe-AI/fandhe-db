@@ -71,6 +71,8 @@ enum Elem {
     Text(String),
     Bool(bool),
     Integer(i32),
+    /// `SMALLINT`（Issue #3230）。
+    SmallInt(i16),
     BigInt(i64),
     Real(f32),
     Double(f64),
@@ -113,6 +115,7 @@ impl Elem {
             Elem::Bytea(b) => out.extend_from_slice(b),
             Elem::Bool(b) => out.push(u8::from(*b)),
             Elem::Integer(v) | Elem::Date(v) => out.extend_from_slice(&v.to_be_bytes()),
+            Elem::SmallInt(v) => out.extend_from_slice(&v.to_be_bytes()),
             Elem::BigInt(v) | Elem::Timestamp(v) => out.extend_from_slice(&v.to_be_bytes()),
             Elem::Real(v) => out.extend_from_slice(&canon_f64(f64::from(*v))),
             Elem::Double(v) => out.extend_from_slice(&canon_f64(*v)),
@@ -358,6 +361,10 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
             Elem::Integer(v) => Some(v),
             _ => None,
         })?),
+        ArrayElemType::SmallInt => ArrayValue::SmallInt(collect(elems, |e| match e {
+            Elem::SmallInt(v) => Some(v),
+            _ => None,
+        })?),
         ArrayElemType::BigInt => ArrayValue::BigInt(collect(elems, |e| match e {
             Elem::BigInt(v) => Some(v),
             _ => None,
@@ -464,6 +471,12 @@ fn elem_from_scalar(
         (ArrayElemType::Text, S::Text(s)) => Elem::Text(try_clone_str(s)?),
         (ArrayElemType::Bool, S::Bool(b)) => Elem::Bool(*b),
         (ArrayElemType::Integer, S::Integer(x)) => Elem::Integer(*x),
+        // smallint 列は `ScalarRef::Integer`（i32）で読まれる。範囲外は格納値の破損として扱う。
+        (ArrayElemType::SmallInt, S::Integer(x)) => {
+            Elem::SmallInt(i16::try_from(*x).map_err(|_| {
+                accumulator_bug("array_agg observed an out-of-range smallint value")
+            })?)
+        }
         (ArrayElemType::BigInt, S::BigInt(x)) => Elem::BigInt(*x),
         (ArrayElemType::Real, S::Real(x)) => Elem::Real(*x),
         (ArrayElemType::Double, S::Double(x)) => Elem::Double(*x),
@@ -490,6 +503,7 @@ fn elem_from_scalar(
             | ArrayElemType::Bytea
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
+            | ArrayElemType::SmallInt
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),
@@ -517,6 +531,11 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
                 .map_err(|_| SqlSurfaceError::numeric_out_of_range("integer out of range"))?;
             Elem::Integer(n)
         }
+        (ArrayElemType::SmallInt, ExprValue::Scalar(x)) => {
+            let n = i16::try_from(int_of(x)?)
+                .map_err(|_| SqlSurfaceError::numeric_out_of_range("smallint out of range"))?;
+            Elem::SmallInt(n)
+        }
         (ArrayElemType::BigInt, ExprValue::Scalar(x)) => Elem::BigInt(int_of(x)?),
         (ArrayElemType::Real, ExprValue::Scalar(x)) => Elem::Real(x as f32),
         (ArrayElemType::Double, ExprValue::Scalar(x)) => Elem::Double(x),
@@ -542,6 +561,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
             | ArrayElemType::Bytea
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
+            | ArrayElemType::SmallInt
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),

@@ -1025,11 +1025,39 @@ fn array_conversions() {
     assert_eq!(cell, Cell::Null);
 }
 
+/// `smallint[]` への CAST（Issue #3230）。値・結果の列型・型付き NULL・範囲外（`22003`）。
+#[test]
+fn smallint_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-smallint");
+    let small_ty =
+        ColumnType::Array(ArrayType::new(ArrayElemType::SmallInt, MAX_ARRAY_ELEMENTS).expect("ty"));
+    let (cell, meta) = first(&core, "CAST(ai AS smallint[])");
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::SmallInt(vec![Some(1), None, Some(3)]))
+    );
+    assert_eq!(meta_type(&meta), Some(small_ty.clone()));
+    assert_eq!(
+        value(&core, "CAST('{1,2}' AS smallint[])"),
+        Cell::Array(ArrayValue::SmallInt(vec![Some(1), Some(2)]))
+    );
+    let (cell, meta) = first(&core, "CAST(NULL AS smallint[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(small_ty));
+    assert_eq!(
+        err_of(&core, "CAST('{70000}' AS smallint[])").wire_code(),
+        "22003"
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{a}' AS smallint[])").wire_code(),
+        "22P02"
+    );
+}
+
 #[test]
 fn arrays_without_a_representable_element_type_are_not_implemented() {
     let (core, _g) = setup("cast-array-unsupported");
     for target in [
-        "smallint[]",
         "time[]",
         "timestamptz[]",
         "interval[]",

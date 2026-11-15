@@ -844,6 +844,7 @@ fn retained_array_bytes(array: &engine::row_codec::ArrayValue) -> usize {
             strings(v)
         }
         ArrayValue::Bool(v) => slots(v),
+        ArrayValue::SmallInt(v) => slots(v),
         ArrayValue::Integer(v) | ArrayValue::Date(v) => slots(v),
         ArrayValue::BigInt(v) | ArrayValue::Timestamp(v) => slots(v),
         ArrayValue::Real(v) => slots(v),
@@ -3961,7 +3962,8 @@ mod tests {
         assert_eq!(declared_param_type_for_oid(23), Ok(Some(D::Int4)));
         assert_eq!(declared_param_type_for_oid(1700), Ok(Some(D::Numeric)));
         // 持たない型は Issue #2438 で推論から拒否（`0A000`）へ変更された。
-        for oid in [99_999, -5, -1, i32::MIN, 1007] {
+        // 配列 OID（`_int2`=1005 は Issue #3230 で公告するが、宣言は従来どおり拒否のまま）。
+        for oid in [99_999, -5, -1, i32::MIN, 1005, 1007] {
             assert_eq!(
                 declared_param_type_for_oid(oid),
                 Err(UnsupportedOid),

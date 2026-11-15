@@ -134,9 +134,8 @@ pub(super) fn common_element_type(kinds: &[CastKind]) -> Result<CastType, SqlSur
             } else if has(K::Int4) {
                 Ok(CastType::Int4)
             } else {
-                Err(unsupported(
-                    "ARRAY of smallint elements is not supported yet",
-                ))
+                // 残りは Int2 のみ（Issue #3230）。PG の `select_common_type` と同じく smallint[]。
+                Ok(CastType::Int2)
             }
         }
         1 => {

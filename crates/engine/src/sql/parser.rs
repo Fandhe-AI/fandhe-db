@@ -1672,6 +1672,17 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Integer),
+        // smallint は列束縛と同じ範囲検査（22003）を経てから i16 へ（Issue #3230）。
+        E::SmallInt => map_all(&raw_elements, |raw| {
+            match bind_int(raw, ColumnType::SmallInt)? {
+                Value::Integer(v) => i16::try_from(v)
+                    .map_err(|_| SqlSurfaceError::numeric_out_of_range("smallint out of range")),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "smallint array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::SmallInt),
         E::BigInt => map_all(&raw_elements, |raw| {
             match bind_int(raw, ColumnType::BigInt)? {
                 Value::BigInt(v) => Ok(v),
@@ -9100,8 +9111,8 @@ fn bind_array_agg_value(
             ColumnType::Bytea => ArrayElemType::Bytea,
             ColumnType::Json => ArrayElemType::Json,
             ColumnType::Jsonb => ArrayElemType::Jsonb,
-            ColumnType::SmallInt
-            | ColumnType::Bpchar(_)
+            ColumnType::SmallInt => ArrayElemType::SmallInt,
+            ColumnType::Bpchar(_)
             | ColumnType::Time
             | ColumnType::TimestampTz
             | ColumnType::Interval
@@ -9184,6 +9195,7 @@ fn resolve_array_agg_input(
             ArrayElemType::Text
             | ArrayElemType::Bool
             | ArrayElemType::Integer
+            | ArrayElemType::SmallInt
             | ArrayElemType::BigInt
             | ArrayElemType::Real
             | ArrayElemType::Double

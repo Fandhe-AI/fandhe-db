@@ -525,7 +525,9 @@ fn usable_in_projection_where_order_by_and_const_select() {
 }
 
 /// INSERT VALUES・UPDATE SET・CREATE VIEW 本文での扱いは、既存の jsonb 関数（Issue #1599）と
-/// 同じ受理／SQLSTATE になる（新しい受理経路を黙って増やさない）。
+/// 同じ受理／SQLSTATE になる（新しい受理経路を黙って増やさない）。ビュー本文は Issue #3238 以降、
+/// 組み込み関数だけの式述語を受理するため、対の側は同じく拒否される `json_*` 関数にする
+/// （`jsonb_array_length` のような組み込みの jsonb 関数は受理に変わった）。
 #[test]
 fn unsupported_contexts_match_existing_jsonb_functions() {
     let (core, _g, alice) = setup();
@@ -545,7 +547,7 @@ fn unsupported_contexts_match_existing_jsonb_functions() {
         ),
         (
             format!("CREATE VIEW vv AS SELECT id FROM {TABLE} WHERE JSON_EXISTS(docb, '$.a')"),
-            format!("CREATE VIEW vv2 AS SELECT id FROM {TABLE} WHERE jsonb_array_length(docb) > 0"),
+            format!("CREATE VIEW vv2 AS SELECT id FROM {TABLE} WHERE json_typeof(docb) = 'object'"),
         ),
     ];
     for (new, old) in pairs {
