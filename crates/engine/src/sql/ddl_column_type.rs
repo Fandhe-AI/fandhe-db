@@ -140,12 +140,9 @@ pub(crate) fn to_static_column_type_with_array_default(
                         detail: "this array element type is not supported yet".to_string(),
                     })
                 }
-                // `smallint[]` は別 OID（1005）のため拒否する（Issue #1558。`varchar[]` と同じ理由）。
-                ColumnType::SmallInt => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "this array element type is not supported yet".to_string(),
-                    })
-                }
+                // `smallint[]` は別 OID（1005）を持つ専用の要素型へ写す（Issue #3230。Integer へ丸めると
+                // 型の区別が失われる。Issue #1558 で拒否していた形を受理へ反転した）。
+                ColumnType::SmallInt => ArrayElemType::SmallInt,
                 ColumnType::Boolean => ArrayElemType::Bool,
                 ColumnType::Integer => ArrayElemType::Integer,
                 ColumnType::BigInt => ArrayElemType::BigInt,
@@ -153,7 +150,7 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Double => ArrayElemType::Double,
                 ColumnType::Date => ArrayElemType::Date,
                 ColumnType::Timestamp => ArrayElemType::Timestamp,
-                // `time[]` は別 OID（1183）のため拒否する（Issue #1569。`smallint[]` と同じ理由）。
+                // `time[]` は別 OID（1183）のため Integer 等へ丸めず拒否する（Issue #1569）。
                 // `timestamptz[]` も別 OID（1185）のため拒否する（Issue #1574）。
                 // `interval[]` も別 OID（1187）のため拒否する（Issue #1579）。
                 // `bit[]` も別 OID（1561）のため拒否する（Issue #2021）。
@@ -1215,11 +1212,15 @@ mod tests {
                 "for {raw:?}"
             );
         }
-        // 配列要素としては別 OID のため拒否する（構文は通り、静的写像で 0A000）。
+        // 配列要素としては専用の要素型 `SmallInt` へ写る（Issue #3230）。
         for raw in ["INT2[]", "SMALLINT[3]"] {
             let (ty, _) = parse_type(raw).expect(raw);
-            let e = to_static_column_type(&ty).expect_err(raw);
-            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::SmallInt, "for {raw:?}");
+                }
+                other => panic!("unexpected static type for {raw:?}: {other:?}"),
+            }
         }
     }
 

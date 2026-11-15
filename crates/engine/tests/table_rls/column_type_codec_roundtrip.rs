@@ -99,6 +99,7 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::Json => "json",
         ArrayElemType::Jsonb => "jsonb",
         ArrayElemType::Enum => "enum",
+        ArrayElemType::SmallInt => "smallint",
     }
 }
 
@@ -314,6 +315,7 @@ fn all_column_type_variants_are_covered_by_case_table() {
         ArrayElemType::Json,
         ArrayElemType::Jsonb,
         ArrayElemType::Enum,
+        ArrayElemType::SmallInt,
     ]
     .iter()
     .map(array_elem_label)
@@ -334,7 +336,8 @@ fn all_column_type_variants_are_covered_by_case_table() {
             "bytea",
             "json",
             "jsonb",
-            "enum"
+            "enum",
+            "smallint"
         ])
     );
 }
@@ -1532,6 +1535,10 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::Integer(vec![Some(i32::MIN), None, Some(0), Some(i32::MAX)]),
         ),
         (
+            ArrayElemType::SmallInt,
+            ArrayValue::SmallInt(vec![Some(i16::MIN), None, Some(0), Some(i16::MAX)]),
+        ),
+        (
             ArrayElemType::BigInt,
             ArrayValue::BigInt(vec![None, Some(i64::MIN), Some(i64::MAX)]),
         ),
@@ -1580,6 +1587,7 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::Text(_) => ArrayValue::Text(vec![]),
             ArrayValue::Bool(_) => ArrayValue::Bool(vec![]),
             ArrayValue::Integer(_) => ArrayValue::Integer(vec![]),
+            ArrayValue::SmallInt(_) => ArrayValue::SmallInt(vec![]),
             ArrayValue::BigInt(_) => ArrayValue::BigInt(vec![]),
             ArrayValue::Real(_) => ArrayValue::Real(vec![]),
             ArrayValue::Double(_) => ArrayValue::Double(vec![]),

@@ -7206,6 +7206,9 @@ pub enum ArrayElemType {
     Jsonb,
     /// 名前付き `ENUM`（Issue #1357）。語彙は [`ArrayType::enum_def`] が保持する。
     Enum,
+    /// `SMALLINT`（Issue #3230）。行内表現は 2 バイト LE。OID は別（`_int2` = 1005）なので
+    /// `Integer` へは丸めない。
+    SmallInt,
 }
 
 impl ArrayElemType {
@@ -7213,7 +7216,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 14] = [
+    pub const ALL_KINDS: [ArrayElemType; 15] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7231,6 +7234,7 @@ impl ArrayElemType {
         ArrayElemType::Json,
         ArrayElemType::Jsonb,
         ArrayElemType::Enum,
+        ArrayElemType::SmallInt,
     ];
 
     /// 種別の序数（[`ArrayElemType::ALL_KINDS`] の添字）。ワイルドカード無しの網羅 match の
@@ -7253,6 +7257,7 @@ impl ArrayElemType {
             ArrayElemType::Json => 11,
             ArrayElemType::Jsonb => 12,
             ArrayElemType::Enum => 13,
+            ArrayElemType::SmallInt => 14,
         }
     }
 
@@ -7276,6 +7281,7 @@ impl ArrayElemType {
             ArrayElemType::Json => "json",
             ArrayElemType::Jsonb => "jsonb",
             ArrayElemType::Enum => "enum",
+            ArrayElemType::SmallInt => "smallint",
         }
     }
 
@@ -7288,6 +7294,7 @@ impl ArrayElemType {
             "boolean" => Ok(ArrayElemType::Bool),
             "integer" => Ok(ArrayElemType::Integer),
             "bigint" => Ok(ArrayElemType::BigInt),
+            "smallint" => Ok(ArrayElemType::SmallInt),
             "real" => Ok(ArrayElemType::Real),
             "double" => Ok(ArrayElemType::Double),
             "date" => Ok(ArrayElemType::Date),
@@ -7361,7 +7368,8 @@ impl ArrayType {
             | ArrayElemType::Uuid
             | ArrayElemType::Bytea
             | ArrayElemType::Json
-            | ArrayElemType::Jsonb => {}
+            | ArrayElemType::Jsonb
+            | ArrayElemType::SmallInt => {}
         }
         Ok(Self {
             elem,
@@ -7457,7 +7465,8 @@ impl ArrayType {
                 | ArrayElemType::Uuid
                 | ArrayElemType::Bytea
                 | ArrayElemType::Json
-                | ArrayElemType::Jsonb,
+                | ArrayElemType::Jsonb
+                | ArrayElemType::SmallInt,
                 _,
             ) => format!("{},{}", self.elem.catalog_tag(), self.max_len),
         };
@@ -8157,7 +8166,8 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Timestamp
         | ArrayElemType::Uuid
         | ArrayElemType::Numeric { .. }
-        | ArrayElemType::Bytea => false,
+        | ArrayElemType::Bytea
+        | ArrayElemType::SmallInt => false,
     }
 }
 
@@ -20882,6 +20892,7 @@ mod tests {
             (ArrayElemType::Bool, "boolean"),
             (ArrayElemType::Integer, "integer"),
             (ArrayElemType::BigInt, "bigint"),
+            (ArrayElemType::SmallInt, "smallint"),
             (ArrayElemType::Real, "real"),
             (ArrayElemType::Double, "double"),
             (ArrayElemType::Date, "date"),
@@ -20995,6 +21006,32 @@ mod tests {
             ColumnType::from_catalog_fields("array", "enum,ghost,4", &mut array_resolver),
             Err(CatalogError::TypeNotFound(_))
         ));
+    }
+
+    /// Issue #3230: `SMALLINT[]` の param は `smallint,<max_len>`（2 次元は末尾 `d2`）で往復し、
+    /// 既存の `integer` の param を変えない。
+    #[test]
+    fn smallint_array_param_roundtrips_and_leaves_integer_param_unchanged() {
+        let one = ColumnType::Array(ArrayType::new(ArrayElemType::SmallInt, 4).expect("array ty"));
+        assert_eq!(one.catalog_fields(), ("array", "smallint,4".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "smallint,4", &mut array_resolver)
+                .expect("decode"),
+            one
+        );
+        let two = ColumnType::Array(
+            ArrayType::new(ArrayElemType::SmallInt, 4)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(two.catalog_fields(), ("array", "smallint,4,d2".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "smallint,4,d2", &mut array_resolver)
+                .expect("decode 2d"),
+            two
+        );
+        let int1 = ColumnType::Array(ArrayType::new(ArrayElemType::Integer, 4).expect("array ty"));
+        assert_eq!(int1.catalog_fields(), ("array", "integer,4".to_string()));
     }
 
     /// Issue #1605: 2 次元以上の宣言は param 末尾の `d<N>` で往復し、1 次元の param は従来の
