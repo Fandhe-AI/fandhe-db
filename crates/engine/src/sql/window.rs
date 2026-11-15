@@ -4352,6 +4352,7 @@ mod budget_regression_tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         }
     }
 

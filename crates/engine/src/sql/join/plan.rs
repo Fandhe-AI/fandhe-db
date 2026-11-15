@@ -1117,6 +1117,7 @@ pub(super) fn build_plan<'a>(
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         });
     }
 

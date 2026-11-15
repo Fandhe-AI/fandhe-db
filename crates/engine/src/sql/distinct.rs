@@ -22,8 +22,10 @@
 //! `SELECT DISTINCT ON (...)`（Issue #3260。SQL-25 のポインタ）の構文判定
 //! （[`is_distinct_on_head`]）と `ORDER BY` 先頭一致の検証
 //! （[`check_distinct_on_order_prefix`]）もここに置く。呼び出し元は
-//! `sql::allowlist::validate_select_statement` の DISTINCT ON gate だけで、行を返す実行段は
-//! 別 Issue（#3261）の責務。
+//! `sql::allowlist::validate_select_statement` の DISTINCT ON gate だけ。行を返す実行段（Issue #3261）の
+//! ために、実効ソートキーとグループ前置長の組み立て（[`distinct_on_effective_order`]）と、先頭一致を
+//! 拒否する直前の未知列判定（[`first_unknown_column`]）もここに置く。実行（グループ代表行の保持）は
+//! `sql::scan` の経路 (B) が担う。
 
 use crate::sql::allowlist::{
     Projection, ScalarOrderKey, ScanOrderKey, SelectItem, SqlSurfaceError,
@@ -216,6 +218,196 @@ fn resolve_ordinal(position: i64, projection: &Projection) -> Result<Expr, SqlSu
     }
 }
 
+/// `ORDER BY` の全キーを出力別名・序数を解決した正準キー列へ写し、重複を除く（PostgreSQL と同様に
+/// 既出キーを不一致判定へ再投入しない）。式キーを含む文は `order_keys` が正本で `order_by` は空。
+fn canonical_sort_keys(
+    projection: &Projection,
+    order_by: &[ScalarOrderKey],
+    order_keys: &[ScanOrderKey],
+) -> Result<Vec<Expr>, SqlSurfaceError> {
+    let mut sort_keys: Vec<Expr> = Vec::new();
+    if order_keys.is_empty() {
+        for k in order_by {
+            sort_keys.push(resolve_alias(&k.column, projection)?);
+        }
+    } else {
+        for k in order_keys {
+            sort_keys.push(match k {
+                ScanOrderKey::Column { key, .. } => resolve_alias(&key.column, projection)?,
+                ScanOrderKey::Expr { expr, .. } => expr.clone(),
+                ScanOrderKey::Ordinal { position, .. } => resolve_ordinal(*position, projection)?,
+            });
+        }
+    }
+    let mut unique_keys: Vec<Expr> = Vec::new();
+    for k in sort_keys {
+        if !unique_keys.contains(&k) {
+            unique_keys.push(k);
+        }
+    }
+    Ok(unique_keys)
+}
+
+/// `DISTINCT ON` の実効ソートキー列とグループ前置長を組み立てる（Issue #3261。SQL-25 のポインタ）。
+///
+/// PostgreSQL と同じく、`ORDER BY` に現れない ON キーは既定順（`ASC`・NULLS 未指定）で末尾へ暗黙に足す。
+/// 返す列の先頭 `prefix_len`（= 異なり ON キー数）個はちょうど ON 集合で、これが等しい行が 1 グループになる。
+/// 出力は常に `ScanOrderKey` 形で、呼び出し元（`sql::allowlist::validate_distinct_on_select`）は
+/// `ParsedScanShape::order_by` を空にして全キーを `order_keys` へ入れる（式キーを含む文の既存規約）。
+/// こうして ON キーも通常のソートキーとして束縛段・ビュー畳み込み（公開列検査・別名書き換え）に乗り、
+/// 第 2 の名前解決器を持たない。`check_distinct_on_order_prefix` を通過済みの文だけが対象で、
+/// 先頭一致が崩れていれば `Internal`（fail-closed）。実効キー数が `MAX_SCALAR_ORDER_KEYS` を超える
+/// 場合は確保前に `54000`。
+pub(crate) fn distinct_on_effective_order(
+    on_exprs: &[Expr],
+    projection: &Projection,
+    order_by: &[ScalarOrderKey],
+    order_keys: &[ScanOrderKey],
+) -> Result<(Vec<ScanOrderKey>, usize), SqlSurfaceError> {
+    let internal = |detail: &str| SqlSurfaceError::Internal {
+        detail: detail.to_string(),
+    };
+    // 利用者が書いた ORDER BY キーを出現順に並べる（既出の正準キーは除く）。
+    let mut effective: Vec<ScanOrderKey> = Vec::new();
+    let mut seen: Vec<Expr> = Vec::new();
+    let user_keys: Vec<ScanOrderKey> = if order_keys.is_empty() {
+        order_by
+            .iter()
+            .map(|k| ScanOrderKey::Column {
+                key: k.clone(),
+                nulls: None,
+            })
+            .collect()
+    } else {
+        order_keys.to_vec()
+    };
+    for key in user_keys {
+        let canon = match &key {
+            ScanOrderKey::Column { key, .. } => resolve_alias(&key.column, projection)?,
+            ScanOrderKey::Expr { expr, .. } => expr.clone(),
+            ScanOrderKey::Ordinal { position, .. } => resolve_ordinal(*position, projection)?,
+        };
+        if !seen.contains(&canon) {
+            seen.push(canon);
+            effective.push(key);
+        }
+    }
+    // ON キー（異なり）のうち ORDER BY に無いものを末尾へ ASC で足す。
+    let mut on_unique: Vec<Expr> = Vec::new();
+    for e in on_exprs {
+        let canon = canonical_key(e, projection)?;
+        if on_unique.contains(&canon) {
+            continue;
+        }
+        on_unique.push(canon.clone());
+        if seen.contains(&canon) {
+            continue;
+        }
+        seen.push(canon);
+        let key = match e {
+            Expr::Ident(name) => ScanOrderKey::Column {
+                key: ScalarOrderKey {
+                    column: name.clone(),
+                    descending: false,
+                },
+                nulls: None,
+            },
+            Expr::Number(n) => match n.parse::<i64>() {
+                Ok(position) => ScanOrderKey::Ordinal {
+                    position,
+                    descending: false,
+                    nulls: None,
+                },
+                Err(_) => ScanOrderKey::Expr {
+                    expr: e.clone(),
+                    descending: false,
+                    nulls: None,
+                },
+            },
+            other => ScanOrderKey::Expr {
+                expr: other.clone(),
+                descending: false,
+                nulls: None,
+            },
+        };
+        effective.push(key);
+    }
+    let prefix_len = on_unique.len();
+    if effective.len() > crate::sql::allowlist::MAX_SCALAR_ORDER_KEYS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many DISTINCT ON and ORDER BY expressions",
+        ));
+    }
+    // 不変条件: 実効キーの先頭 `prefix_len` 個は ON 集合そのもの（先頭一致の検証を通過済みの文）。
+    let head_ok = effective.len() >= prefix_len
+        && effective.iter().take(prefix_len).all(|k| {
+            let canon = match k {
+                ScanOrderKey::Column { key, .. } => resolve_alias(&key.column, projection),
+                ScanOrderKey::Expr { expr, .. } => Ok(expr.clone()),
+                ScanOrderKey::Ordinal { position, .. } => resolve_ordinal(*position, projection),
+            };
+            matches!(canon, Ok(c) if on_unique.contains(&c))
+        });
+    if prefix_len == 0 || !head_ok {
+        return Err(internal("DISTINCT ON key prefix invariant violated"));
+    }
+    Ok((effective, prefix_len))
+}
+
+/// ON 式・`ORDER BY` キーに現れる裸の列参照のうち、表の列にも出力名（別名・暗黙の出力名）にも
+/// 疑似列 `id` にも当たらない最初の名前を返す（先頭一致の検証で拒否する直前に、PostgreSQL と同じ
+/// 順序で未知列 `42703` を先に判定するために使う。Issue #3261）。`columns` は実テーブルの列名集合。
+pub(crate) fn first_unknown_column(
+    on_exprs: &[Expr],
+    projection: &Projection,
+    order_by: &[ScalarOrderKey],
+    order_keys: &[ScanOrderKey],
+    columns: &[String],
+) -> Option<String> {
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for e in on_exprs {
+        crate::sql::parser::collect_expr_idents(e, &mut set);
+    }
+    if order_keys.is_empty() {
+        for k in order_by {
+            set.insert(k.column.clone());
+        }
+    }
+    for k in order_keys {
+        match k {
+            ScanOrderKey::Column { key, .. } => {
+                set.insert(key.column.clone());
+            }
+            ScanOrderKey::Expr { expr, .. } => {
+                crate::sql::parser::collect_expr_idents(expr, &mut set)
+            }
+            ScanOrderKey::Ordinal { .. } => {}
+        }
+    }
+    let mut outputs: Vec<&str> = Vec::new();
+    if let Projection::Items(items) = projection {
+        for item in items {
+            match item {
+                SelectItem::Expr { alias: Some(a), .. } => outputs.push(a.as_str()),
+                SelectItem::Expr {
+                    expr: Expr::Call { name, .. },
+                    alias: None,
+                } => outputs.push(name.as_str()),
+                _ => {}
+            }
+        }
+    }
+    // 結果を決定的にするため辞書順の最小を返す。
+    let mut unknown: Vec<String> = set
+        .into_iter()
+        .filter(|name| {
+            name != "id" && !columns.iter().any(|c| c == name) && !outputs.iter().any(|o| o == name)
+        })
+        .collect();
+    unknown.sort();
+    unknown.into_iter().next()
+}
+
 /// `DISTINCT ON` の式列が `ORDER BY` の先頭と一致するかを検証する（PostgreSQL の規則。ON 集合に
 /// 含まれない `ORDER BY` キーを読み飛ばした後に ON 集合のキーが現れる、または ON 集合のキーが
 /// 結果列に入らないまま読み飛ばしが起きていれば `42P10`）。`ASC`／`DESC`・`NULLS` は一致に影響
@@ -231,28 +423,7 @@ pub(crate) fn check_distinct_on_order_prefix(
         .iter()
         .map(|e| canonical_key(e, projection))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut sort_keys: Vec<Expr> = Vec::new();
-    if order_keys.is_empty() {
-        for k in order_by {
-            sort_keys.push(resolve_alias(&k.column, projection)?);
-        }
-    } else {
-        for k in order_keys {
-            sort_keys.push(match k {
-                ScanOrderKey::Column { key, .. } => resolve_alias(&key.column, projection)?,
-                ScanOrderKey::Expr { expr, .. } => expr.clone(),
-                ScanOrderKey::Ordinal { position, .. } => resolve_ordinal(*position, projection)?,
-            });
-        }
-    }
-    // 重複キーは PostgreSQL と同様に除く（既出キーを不一致判定へ再投入しない）。
-    let mut unique_keys: Vec<Expr> = Vec::new();
-    for k in sort_keys {
-        if !unique_keys.contains(&k) {
-            unique_keys.push(k);
-        }
-    }
-    let sort_keys = unique_keys;
+    let sort_keys = canonical_sort_keys(projection, order_by, order_keys)?;
     let mismatch = SqlSurfaceError::DistinctOnOrderByMismatch;
     let mut covered: Vec<&Expr> = Vec::new();
     let mut skipped = false;
@@ -424,6 +595,72 @@ mod tests {
         // DISTINCT ON (lower(lang)) ... ORDER BY lower
         let on = [call];
         assert!(check_distinct_on_order_prefix(&on, &proj, &[sk("lower")], &[]).is_ok());
+    }
+
+    fn effective(
+        on: &[&str],
+        order: &[&str],
+    ) -> Result<(Vec<ScanOrderKey>, usize), SqlSurfaceError> {
+        let on: Vec<Expr> = on.iter().map(|n| id(n)).collect();
+        let order: Vec<ScalarOrderKey> = order.iter().map(|n| sk(n)).collect();
+        distinct_on_effective_order(&on, &Projection::All, &order, &[])
+    }
+
+    fn column_names(keys: &[ScanOrderKey]) -> Vec<String> {
+        keys.iter()
+            .map(|k| match k {
+                ScanOrderKey::Column { key, .. } => key.column.clone(),
+                other => panic!("unexpected key {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn effective_order_appends_missing_on_keys_and_counts_distinct_prefix() {
+        let (keys, k) = effective(&["a", "b"], &["a"]).expect("ok");
+        assert_eq!((column_names(&keys), k), (vec!["a".into(), "b".into()], 2));
+        let (keys, k) = effective(&["b", "a"], &["a", "b", "c"]).expect("ok");
+        assert_eq!(
+            (column_names(&keys), k),
+            (vec!["a".into(), "b".into(), "c".into()], 2)
+        );
+        // 重複する ON キー・ORDER BY キーは 1 個に数える。
+        let (keys, k) = effective(&["a", "a"], &["a", "a"]).expect("ok");
+        assert_eq!((column_names(&keys), k), (vec!["a".into()], 1));
+        // ORDER BY なしは ON キーの昇順だけ。
+        let (keys, k) = effective(&["a"], &[]).expect("ok");
+        assert_eq!((column_names(&keys), k), (vec!["a".into()], 1));
+    }
+
+    #[test]
+    fn effective_order_rejects_too_many_keys_with_54000_and_broken_prefix_as_internal() {
+        let on: Vec<String> = (0..4).map(|i| format!("a{i}")).collect();
+        let order: Vec<String> = (0..5).map(|i| format!("o{i}")).collect();
+        let on_refs: Vec<&str> = on.iter().map(String::as_str).collect();
+        let mut ord: Vec<&str> = on_refs.clone();
+        ord.extend(order.iter().map(String::as_str));
+        let err = effective(&on_refs, &ord).expect_err("9 keys exceed the limit");
+        assert_eq!(err.wire_code(), "54000");
+        // 先頭一致の検証を通っていない文（非 ON キーが先頭）は fail-closed の内部エラー。
+        let err = effective(&["a"], &["b", "a"]).expect_err("prefix invariant");
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    #[test]
+    fn first_unknown_column_ignores_output_names_and_id() {
+        let proj = Projection::Items(vec![SelectItem::Expr {
+            expr: id("lang"),
+            alias: Some("l".to_string()),
+        }]);
+        let cols = vec!["lang".to_string()];
+        assert_eq!(
+            first_unknown_column(&[id("l")], &proj, &[sk("id")], &[], &cols),
+            None
+        );
+        assert_eq!(
+            first_unknown_column(&[id("nope")], &proj, &[sk("lang")], &[], &cols),
+            Some("nope".to_string())
+        );
     }
 
     #[test]

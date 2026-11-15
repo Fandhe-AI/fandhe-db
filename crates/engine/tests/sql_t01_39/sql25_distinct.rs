@@ -748,7 +748,7 @@ fn distinct_on_outcome_is_tenant_independent(sql: &str) -> (String, String) {
             let ctx = ctx_for(tenant, allow_private);
             let err = core
                 .execute_sql(&ctx, sql)
-                .expect_err("DISTINCT ON must not return rows in this stage");
+                .expect_err("this DISTINCT ON form must be rejected");
             let outcome = (err.wire_code().to_string(), err.to_string());
             match &seen {
                 Some(prev) => assert_eq!(prev, &outcome, "outcome must not depend on tenant"),
@@ -775,19 +775,312 @@ fn distinct_on_with_mismatched_order_by_is_42p10_for_every_tenant() {
     }
 }
 
-// tracked: #3261（行を返す実行段。整合した文は構文・先頭一致の検証を通過した後 0A000 で拒否する）
+/// 可視行から lang ごとの代表（`ORDER BY lang, id DESC` なら id 最大、`ORDER BY lang, id` なら最小）を
+/// 独立に計算するオラクル。`BTreeMap` の昇順が `ORDER BY lang`（C 照合のバイト順）の出力順になる。
+fn oracle_representatives(
+    visible: &[&RowTruth],
+    pick_max_id: bool,
+) -> std::collections::BTreeMap<&'static str, u64> {
+    let mut out: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+    for r in visible {
+        out.entry(r.lang)
+            .and_modify(|cur| {
+                if (pick_max_id && r.id > *cur) || (!pick_max_id && r.id < *cur) {
+                    *cur = r.id;
+                }
+            })
+            .or_insert(r.id);
+    }
+    out
+}
+
+fn text_and_id_rows(result: &engine::sql::exec::QueryResult) -> Vec<(String, u64)> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                as_text(&row.cells[0]).expect("lang is never NULL"),
+                as_integer(&row.cells[1]),
+            )
+        })
+        .collect()
+}
+
+/// SQL-25（Issue #3261）: 整合した DISTINCT ON は各 ON キーの先頭行（ソート順で最初）だけを返し、
+/// 全テナント・private 許可の有無のいずれでも独立オラクルと一致する（不可視行は代表行・件数に現れない）。
 #[test]
-fn distinct_on_with_matching_order_by_passes_validation_then_fails_closed_0a000() {
-    for sql in [
-        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang LIMIT 10",
-        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang DESC, id LIMIT 10;",
-        "SELECT DISTINCT ON (lang) lang FROM docs LIMIT 10",
-    ] {
-        let (code, _msg) = distinct_on_outcome_is_tenant_independent(sql);
-        assert_eq!(code, "0A000", "{sql}");
+fn distinct_on_returns_first_row_per_group_across_tenants() {
+    let path = unique_db_path("sql25-distinct-on-exec");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    for tenant in TENANTS {
+        for allow_private in [false, true] {
+            let ctx = ctx_for(tenant, allow_private);
+            let visible = visible_rows(&truths, tenant, allow_private);
+            for (sql, pick_max) in [
+                (
+                    "SELECT DISTINCT ON (lang) lang, id FROM docs ORDER BY lang, id DESC",
+                    true,
+                ),
+                (
+                    "SELECT DISTINCT ON (lang) lang, id FROM docs ORDER BY lang, id;",
+                    false,
+                ),
+                (
+                    "SELECT DISTINCT ON (lang) lang, id FROM docs ORDER BY lang DESC, id LIMIT 100",
+                    false,
+                ),
+            ] {
+                let descending_lang = sql.contains("lang DESC");
+                let result = core.execute_sql(&ctx, sql).expect(sql);
+                let mut expected: Vec<(String, u64)> = oracle_representatives(&visible, pick_max)
+                    .into_iter()
+                    .map(|(l, id)| (l.to_string(), id))
+                    .collect();
+                if descending_lang {
+                    expected.reverse();
+                }
+                assert_eq!(
+                    text_and_id_rows(&result),
+                    expected,
+                    "{tenant} {allow_private} {sql}"
+                );
+            }
+            // ORDER BY なし: キーごとに 1 行（どの行が代表かの決定性は #3262 の範囲）。
+            let result = core
+                .execute_sql(&ctx, "SELECT DISTINCT ON (lang) lang FROM docs")
+                .expect("distinct on without order by");
+            let got: BTreeSet<String> = result
+                .rows
+                .iter()
+                .map(|r| as_text(&r.cells[0]).expect("lang"))
+                .collect();
+            assert_eq!(result.rows.len(), got.len(), "one row per key");
+            let want: BTreeSet<String> = oracle_distinct_langs(&visible)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(got, want);
+        }
     }
 }
 
+/// 重複排除は OFFSET／LIMIT より前（OFFSET はグループ単位で効く）。式・別名・序数キーも受理する。
+#[test]
+fn distinct_on_dedups_before_offset_and_accepts_alias_ordinal_expression_keys() {
+    let path = unique_db_path("sql25-distinct-on-offset");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let ctx = ctx_for("tenant-a", true);
+    let visible = visible_rows(&truths, "tenant-a", true);
+    let reps = oracle_representatives(&visible, true);
+    assert!(reps.len() >= 3, "corpus must have several groups");
+    let langs: Vec<(&str, u64)> = reps.into_iter().collect();
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT DISTINCT ON (lang) lang, id FROM docs ORDER BY lang, id DESC LIMIT 1 OFFSET 1",
+        )
+        .expect("offset");
+    assert_eq!(
+        text_and_id_rows(&result),
+        vec![(langs[1].0.to_string(), langs[1].1)]
+    );
+    for sql in [
+        "SELECT DISTINCT ON (l) lang AS l, id FROM docs ORDER BY l, id DESC",
+        "SELECT DISTINCT ON (1) lang, id FROM docs ORDER BY 1, id DESC",
+        "SELECT DISTINCT ON (lower(lang)) lang, id FROM docs ORDER BY lower(lang), id DESC",
+    ] {
+        let result = core.execute_sql(&ctx, sql).expect(sql);
+        let got = text_and_id_rows(&result);
+        let want: Vec<(String, u64)> = langs.iter().map(|(l, id)| (l.to_string(), *id)).collect();
+        assert_eq!(got, want, "{sql}");
+    }
+}
+
+/// ORDER BY に無い ON キーは末尾へ暗黙に昇順で足される（`ON (a, b) ORDER BY a` は b も昇順）。
+#[test]
+fn distinct_on_multi_key_appends_missing_on_key_ascending() {
+    let path = unique_db_path("sql25-distinct-on-multikey");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let ctx = ctx_for("tenant-b", true);
+    let visible = visible_rows(&truths, "tenant-b", true);
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT DISTINCT ON (lang, id) lang, id FROM docs ORDER BY lang DESC",
+        )
+        .expect("multi key");
+    // `id` は一意なので全可視行が返り、(lang DESC, id ASC) の順になる。
+    let mut want: Vec<(String, u64)> = visible.iter().map(|r| (r.lang.to_string(), r.id)).collect();
+    want.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    assert_eq!(text_and_id_rows(&result), want);
+}
+
+/// NULL キーは 1 グループにまとまる（PostgreSQL 準拠）。ASC は末尾・DESC／NULLS FIRST は先頭。
+#[test]
+fn distinct_on_groups_nulls_together() {
+    let path = unique_db_path("sql25-distinct-on-null");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&TableSchema::new(
+            "nl",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM as u32), false),
+                ColumnDef::new("tag", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let ctx = ctx_for("tenant-a", false);
+    for (id, tag) in [
+        (1u64, Some("x")),
+        (2, None),
+        (3, None),
+        (4, Some("y")),
+        (5, None),
+    ] {
+        engine::tenant::insert_typed_row(
+            &storage,
+            "nl",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32; DIM]),
+                match tag {
+                    Some(t) => Value::Text(t.to_string()),
+                    None => Value::Null,
+                },
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{id}"))
+                .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+    let core = new_core(storage);
+    let run = |sql: &str| -> Vec<(Option<String>, u64)> {
+        core.execute_sql(&ctx, sql)
+            .expect(sql)
+            .rows
+            .iter()
+            .map(|r| (as_text(&r.cells[0]), as_integer(&r.cells[1])))
+            .collect()
+    };
+    let x = (Some("x".to_string()), 1);
+    let y = (Some("y".to_string()), 4);
+    assert_eq!(
+        run("SELECT DISTINCT ON (tag) tag, id FROM nl ORDER BY tag, id"),
+        vec![x.clone(), y.clone(), (None, 2)]
+    );
+    assert_eq!(
+        run("SELECT DISTINCT ON (tag) tag, id FROM nl ORDER BY tag DESC, id"),
+        vec![(None, 2), y.clone(), x.clone()]
+    );
+    assert_eq!(
+        run("SELECT DISTINCT ON (tag) tag, id FROM nl ORDER BY tag NULLS FIRST, id DESC"),
+        vec![(None, 5), x, y]
+    );
+}
+
+/// 結果行数上限（`cap`）付きの core を、同一内容のコーパスで新規に作る（`with_result_limits` は
+/// core を消費するため、上限を変えるたびに作り直す）。
+fn corpus_core_with_cap(
+    label: &str,
+    cap: impl FnOnce(&[RowTruth]) -> usize,
+) -> (EngineCore, Vec<RowTruth>, CleanupGuard) {
+    let path = unique_db_path(label);
+    let guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_multi_tenant_corpus(&storage);
+    let cap = cap(&truths);
+    let core = new_core(storage).with_result_limits(engine::result_limits::ResultLimits::new(cap));
+    (core, truths, guard)
+}
+
+/// LIMIT 省略時の上限（`54000`）は入力行数ではなくグループ数に掛かる。結果はテナントごとに可視行だけで決まる。
+#[test]
+fn distinct_on_implicit_row_cap_applies_to_groups_not_input_rows() {
+    for tenant in TENANTS {
+        for allow_private in [false, true] {
+            let (core, truths, _guard) = corpus_core_with_cap("sql25-distinct-on-cap", |truths| {
+                oracle_distinct_langs(&visible_rows(truths, tenant, allow_private)).len()
+            });
+            let ctx = ctx_for(tenant, allow_private);
+            let visible = visible_rows(&truths, tenant, allow_private);
+            let groups = oracle_distinct_langs(&visible).len();
+            assert!(visible.len() > groups, "input rows exceed the group count");
+            // 入力行数 > cap かつ グループ数 <= cap は成功する。
+            let result = core
+                .execute_sql(
+                    &ctx,
+                    "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang",
+                )
+                .expect("groups within the cap");
+            assert_eq!(result.rows.len(), groups);
+        }
+    }
+}
+
+#[test]
+fn distinct_on_over_group_cap_is_54000_for_every_tenant() {
+    for tenant in TENANTS {
+        let (core, truths, _guard) = corpus_core_with_cap("sql25-distinct-on-cap-over", |truths| {
+            oracle_distinct_langs(&visible_rows(truths, tenant, true)).len() - 1
+        });
+        let ctx = ctx_for(tenant, true);
+        assert!(oracle_distinct_langs(&visible_rows(&truths, tenant, true)).len() >= 2);
+        let err = core
+            .execute_sql(
+                &ctx,
+                "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang",
+            )
+            .expect_err("groups exceed the cap");
+        assert_eq!(err.wire_code(), "54000");
+        assert!(err.to_string().ends_with("result exceeds the row limit"));
+    }
+}
+
+/// 実行段へ重複排除を運べない形は拒否（黙って重複排除を落とさない）。
+#[test]
+fn distinct_on_unsupported_forms_are_rejected_fail_closed() {
+    for sql in [
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang FETCH FIRST 2 ROWS WITH TIES",
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang FOR UPDATE",
+        "EXPLAIN SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang",
+        "SELECT DISTINCT ON (lang) lang FROM docs WHERE id IN (SELECT DISTINCT ON (lang) id FROM docs ORDER BY lang)",
+        "SELECT DISTINCT ON (lang) lang, COUNT(*) FROM docs GROUP BY lang",
+        "SELECT DISTINCT ON (lang) lang, row_number() OVER () FROM docs ORDER BY lang",
+        "CREATE VIEW dv AS SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang",
+    ] {
+        let (code, _msg) = distinct_on_outcome_is_tenant_independent(sql);
+        assert!(
+            matches!(code.as_str(), "0A000" | "42601"),
+            "{sql} must be rejected fail-closed, got {code}"
+        );
+    }
+}
+
+/// 整合した文の未知列は束縛段の `42703`、不一致の文でも未知列が先に判定される（PostgreSQL と同順）。
+#[test]
+fn distinct_on_unknown_column_is_42703() {
+    for sql in [
+        "SELECT DISTINCT ON (nope) lang FROM docs ORDER BY nope",
+        "SELECT DISTINCT ON (nope) lang FROM docs ORDER BY id",
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY nope, lang",
+    ] {
+        let (code, _msg) = distinct_on_outcome_is_tenant_independent(sql);
+        assert_eq!(code, "42703", "{sql}");
+    }
+}
 #[test]
 fn distinct_on_syntax_errors_and_limits_are_classified() {
     let many = ["lang"; 9].join(", ");

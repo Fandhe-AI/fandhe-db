@@ -1330,6 +1330,7 @@ mod tests {
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }))
     }
 
@@ -1616,6 +1617,7 @@ mod tests {
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }))
     }
 
@@ -1788,6 +1790,7 @@ mod tests {
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }))
     }
 

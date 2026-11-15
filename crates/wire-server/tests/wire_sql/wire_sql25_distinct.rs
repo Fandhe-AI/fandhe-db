@@ -371,40 +371,67 @@ fn column_named_distinct_keeps_existing_projection_semantics_over_wire() {
     read_ready_for_query(&mut stream);
 }
 
-/// Issue #3260: `SELECT DISTINCT ON` は簡易クエリ（psql 風の末尾 `;` を含む）・拡張クエリの
-/// どちらでも 42601 ではなく、先頭一致違反は 42P10、整合した文は実行段未実装の 0A000 で拒否され、
-/// いずれも `ReadyForQuery` は `I` に戻り接続は維持される。
-// tracked: #3261（行を返す実行段が入るまで整合した文は 0A000）
+/// Issue #3260・#3261: `SELECT DISTINCT ON` は簡易クエリ（psql 風の末尾 `;` を含む）・拡張クエリの
+/// どちらでも、先頭一致違反は 42P10、整合した文は各 ON キーの先頭行を返す（RowDescription・DataRow・
+/// `SELECT n`）。いずれも `ReadyForQuery` は `I` に戻り接続は維持される。テナントは alice（tenant-a）で、
+/// 可視行は public の 3 行と自テナントの private 1 行（lang = xx）。他テナントの private 行は現れない。
 #[test]
 fn distinct_on_is_classified_over_simple_and_extended_and_connection_survives() {
     let (core, _guard) = new_core_aggregate_docs();
     let (mut stream, _users_path) = spawn_with_alice(core);
 
-    for (sql, expected_sqlstate) in [
-        (
-            "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang;",
-            "0A000",
-        ),
-        (
-            "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY id, lang;",
-            "42P10",
-        ),
-        (
-            "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang",
-            "0A000",
-        ),
+    // 先頭一致違反は 42P10（簡易・拡張とも）。
+    for sql in [
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY id, lang;",
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY id",
     ] {
         send_simple_query(&mut stream, sql);
-        expect_error_response_with_sqlstate(&mut stream, expected_sqlstate);
+        expect_error_response_with_sqlstate(&mut stream, "42P10");
         assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
 
         send_length_prefixed_message(&mut stream, b'P', &parse_body("", sql, 0));
         send_length_prefixed_message(&mut stream, b'B', &bind_body("", ""));
         send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
         send_length_prefixed_message(&mut stream, b'S', &[]);
-        expect_error_response_with_sqlstate(&mut stream, expected_sqlstate);
+        expect_error_response_with_sqlstate(&mut stream, "42P10");
         assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
     }
+
+    // 簡易クエリ（末尾 `;` 単独送信を含む）は lang ごとの先頭行（id 最大）を返す。
+    for sql in [
+        "SELECT DISTINCT ON (lang) lang, id FROM docs ORDER BY lang, id DESC;",
+        "SELECT DISTINCT ON (lang) lang, id FROM docs ORDER BY lang, id DESC",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_row_description(&mut stream), vec!["lang", "id"]);
+        for (lang, id) in [("en", "2"), ("ja", "3"), ("xx", "11")] {
+            let row = read_data_row(&mut stream);
+            assert_eq!(row[0].as_deref(), Some(lang), "{sql}");
+            assert_eq!(row[1].as_deref(), Some(id), "{sql}");
+        }
+        assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+        assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
+    }
+
+    // 拡張クエリ（Parse/Bind/Execute/Sync）も同じ行を返す。
+    let sql = "SELECT DISTINCT ON (lang) lang, id FROM docs ORDER BY lang, id DESC";
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("", sql, 0));
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("", ""));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+    let mut kinds = Vec::new();
+    loop {
+        let (kind, body) = read_message(&mut stream);
+        kinds.push(kind);
+        if kind == b'C' {
+            assert_eq!(body, b"SELECT 3\0");
+        }
+        if kind == b'Z' {
+            assert_eq!(body, b"I");
+            break;
+        }
+    }
+    assert_eq!(kinds, vec![b'1', b'2', b'D', b'D', b'D', b'C', b'Z']);
 
     send_simple_query(&mut stream, "SELECT COUNT(DISTINCT lang) AS n FROM docs");
     let _columns = read_row_description(&mut stream);
