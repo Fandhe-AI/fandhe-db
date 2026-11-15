@@ -293,6 +293,80 @@ fn t1_autocommit_responses_match_a_world_without_the_schema() {
     assert_eq!(trials, MUST_FAIL.len() * 2, "trial count drifted");
 }
 
+/// ビュー定義（Issue #3240）の本文テンプレート。`{S}` は参照先（他テナント SCHEMA の `a.t` か、
+/// 陽性対照の自前 `mine`）。`{N}` は作成するビュー名（ケースごとに一意）。
+const VIEW_DEF_BODIES: &[&str] = &[
+    "CREATE VIEW {N} AS SELECT id FROM {S}",
+    "CREATE VIEW {N} AS SELECT id FROM {S} WHERE id > 0",
+    "CREATE VIEW {N} AS SELECT id FROM {S} WHERE id + 1 > 1 OR id IS NULL",
+    "CREATE VIEW {N} AS SELECT id FROM {S} LIMIT 5",
+    "CREATE VIEW {N} AS SELECT id FROM {S} WHERE id > 0 LIMIT 5",
+    "CREATE VIEW {N} AS SELECT COUNT(*) AS c FROM {S}",
+    "CREATE VIEW {N} AS SELECT m.id FROM mine m JOIN {S} x ON m.id = x.id LIMIT 5",
+    "CREATE VIEW {N} AS SELECT id FROM mine WHERE id IN (SELECT id FROM {S} LIMIT 5)",
+    "CREATE VIEW {N} AS WITH c AS (SELECT id FROM {S} LIMIT 5) SELECT id FROM c",
+    "CREATE VIEW {N} AS SELECT id FROM {S} UNION ALL SELECT id FROM mine",
+    "CREATE VIEW {N} (k) AS SELECT id FROM {S}",
+    "CREATE VIEW {N} AS SELECT id FROM {S} WITH CHECK OPTION",
+];
+
+/// 他テナントの SCHEMA 配下を本文で読むビュー定義は、他テナントの SCHEMA がどこにも無い DB と
+/// 同じ SQLSTATE・文言で拒否される（TABLE-27・RLS-10 (b)・ERR-6 のポインタ）。原因別の文言（Issue
+/// #3240）は参照先の存在確認を通った後でしか出ないため、存在オラクルにならない。陽性対照として
+/// 同じ形で参照先を自前の `mine` に変えたものは両 DB で成功する。
+#[test]
+fn t1_view_definitions_over_a_foreign_schema_match_a_world_without_it() {
+    let (x, _gx, y, _gy) = twin_worlds("t27-tb-t1-viewdef");
+    let mut vx = session(TENANTS[1]);
+    let mut vy = session(TENANTS[1]);
+    let mut trials = 0usize;
+    for (i, tpl) in VIEW_DEF_BODIES.iter().enumerate() {
+        for (j, src) in ["a.t", "a.v"].into_iter().enumerate() {
+            let name = format!("vd{i}_{j}");
+            let sql = tpl.replace("{N}", &name).replace("{S}", src);
+            let rx = run(&x, TENANTS[1], true, &mut vx, &sql);
+            let ry = run(&y, TENANTS[1], true, &mut vy, &sql);
+            assert_eq!(shape(&rx), shape(&ry), "{sql}");
+            let (code, _) = rx.as_ref().expect_err(&sql);
+            assert!(FAIL_CODES.contains(&code.as_str()), "{sql}: {code}");
+            assert_no_leak(&sql, &rx);
+            // 拒否後に作ろうとした名前を読んでも、両 DB で同じ `42P01`。
+            let probe = format!("SELECT id FROM {name} LIMIT 1");
+            let px = run(&x, TENANTS[1], true, &mut vx, &probe);
+            let py = run(&y, TENANTS[1], true, &mut vy, &probe);
+            assert_eq!(shape(&px), shape(&py), "{probe}");
+            assert_eq!(px.as_ref().expect_err(&probe).0, "42P01");
+            trials += 1;
+        }
+        // 陽性対照: 参照先が自前の `mine` なら両 DB で成功する。
+        let name = format!("ok{i}");
+        let sql = tpl.replace("{N}", &name).replace("{S}", "mine");
+        let rx = run(&x, TENANTS[1], true, &mut vx, &sql);
+        let ry = run(&y, TENANTS[1], true, &mut vy, &sql);
+        assert_eq!(shape(&rx), shape(&ry), "{sql}");
+    }
+    assert_eq!(trials, VIEW_DEF_BODIES.len() * 2, "trial count drifted");
+    // `CREATE OR REPLACE VIEW`（自分の既存ビューの置換）でも同じ。
+    ok(
+        &x,
+        TENANTS[1],
+        &mut vx,
+        "CREATE VIEW rv AS SELECT id FROM mine",
+    );
+    ok(
+        &y,
+        TENANTS[1],
+        &mut vy,
+        "CREATE VIEW rv AS SELECT id FROM mine",
+    );
+    let sql = "CREATE OR REPLACE VIEW rv AS SELECT id FROM a.t";
+    let rx = run(&x, TENANTS[1], true, &mut vx, sql);
+    let ry = run(&y, TENANTS[1], true, &mut vy, sql);
+    assert_eq!(shape(&rx), shape(&ry), "{sql}");
+    assert!(FAIL_CODES.contains(&rx.as_ref().expect_err(sql).0.as_str()));
+    assert_no_leak(sql, &rx);
+}
+
 #[test]
 fn t1_explicit_transaction_responses_match_a_world_without_the_schema() {
     let mut trials = 0usize;
