@@ -167,7 +167,7 @@ pub(crate) fn array_keys(a: &ArrayValue) -> Result<Vec<Option<Key<'_>>>, SqlSurf
             }
             out
         }
-        ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Enum(_) => {
+        ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Enum(_) | ArrayValue::Bit(_) => {
             return Err(internal("array element type has no comparator"))
         }
         // 多次元値（Issue #1605）の比較・包含・量化は次元ヘッダを考慮した意味論が未定義のため、
@@ -245,7 +245,11 @@ pub(crate) fn array_overlaps(a: &[Option<Key<'_>>], b: &[Option<Key<'_>>]) -> bo
 #[deny(clippy::wildcard_enum_match_arm)]
 fn comparable_elem(elem: ArrayElemType) -> bool {
     match elem {
-        ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum => false,
+        // `BIT(n)` もスカラー BIT と同じく比較が未解禁（cast-only。Issue #3235）。
+        ArrayElemType::Numeric { .. }
+        | ArrayElemType::Json
+        | ArrayElemType::Enum
+        | ArrayElemType::Bit(_) => false,
         ArrayElemType::Text
         | ArrayElemType::Varchar(_)
         | ArrayElemType::Bpchar(_)
@@ -285,7 +289,8 @@ fn is_float_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bytea
         | ArrayElemType::Json
         | ArrayElemType::Jsonb
-        | ArrayElemType::Enum => false,
+        | ArrayElemType::Enum
+        | ArrayElemType::Bit(_) => false,
     }
 }
 
@@ -310,7 +315,10 @@ fn lhs_kinds_for(elem: ArrayElemType) -> &'static [CastKind] {
         ArrayElemType::Uuid => &[K::Uuid],
         ArrayElemType::Bytea => &[K::Bytea],
         ArrayElemType::Jsonb => &[K::Jsonb],
-        ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum => &[],
+        ArrayElemType::Numeric { .. }
+        | ArrayElemType::Json
+        | ArrayElemType::Enum
+        | ArrayElemType::Bit(_) => &[],
     }
 }
 
@@ -970,12 +978,12 @@ mod tests {
                 E::Uuid => &[K::Uuid],
                 E::Bytea => &[K::Bytea],
                 E::Jsonb => &[K::Jsonb],
-                E::Numeric { .. } | E::Json | E::Enum => &[],
+                E::Numeric { .. } | E::Json | E::Enum | E::Bit(_) => &[],
             };
             assert_eq!(kinds, expected, "{elem:?}");
             assert_eq!(
                 comparable_elem(elem),
-                !matches!(elem, E::Numeric { .. } | E::Json | E::Enum),
+                !matches!(elem, E::Numeric { .. } | E::Json | E::Enum | E::Bit(_)),
                 "{elem:?}"
             );
             assert_eq!(is_float_elem(elem), matches!(elem, E::Real | E::Double));

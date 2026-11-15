@@ -453,7 +453,7 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             let has_null = array_value.has_null();
             let mark: u8 = if has_null { 0x80 } else { 0 };
             // 2 次元以上（Issue #1605）は要素型タグの前に未使用のマーカー 0x40・次元数・各次元長を
-            // 積む。1 次元の先頭バイトは要素型タグ（0..=15）または NULL 印付き（0x80 以上）で
+            // 積む。1 次元の先頭バイトは要素型タグ（0..=18）または NULL 印付き（0x80 以上）で
             // 0x40 とは衝突せず、`{{1,2},{3,4}}` と `{1,2,3,4}` が別ハッシュになる。1 次元の
             // 入力バイト列は従来と同一。
             if let crate::row_codec::ArrayValue::Multi(m) = array_value {
@@ -523,6 +523,21 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                         }
                         if let Some(item) = item {
                             b.push_u64(*item as u64);
+                        }
+                    }
+                }
+                // Issue #3235 の新規採番（既存タグのバイト列は不変）。ビット長を要素ごとに積み、
+                // `bit(4)` の `1000` と `bit(8)` の `10000000`（同じバイト列）を別ハッシュにする。
+                crate::row_codec::ArrayValue::Bit(items) => {
+                    b.push_u8(18 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(u64::from(item.bit_len()));
+                            b.push_bytes(item.as_bytes())?;
                         }
                     }
                 }
