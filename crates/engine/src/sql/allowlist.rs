@@ -15680,9 +15680,19 @@ impl<'a> Parser<'a> {
                     self.advance();
                     DmlFromReturningItem::QualifiedAll(qualifier)
                 }
-                _ if self.peek_dml_returning_single_column() => {
+                _ if self.peek_dml_returning_single_column()
+                    || self.peek_dml_returning_paren_qualified_column() =>
+                {
+                    // 括弧付きの修飾列 `(s.v)` は括弧を剥がして括弧なしと同じ列束縛経路へ通す。
+                    let parenthesized = matches!(self.peek(), Some(Token::Punct('(')));
+                    if parenthesized {
+                        self.advance();
+                    }
                     let colref =
                         self.parse_join_colref_as(super::colref_sink::Role::SelectItemBare)?;
+                    if parenthesized {
+                        self.advance(); // `)`（先読みで存在確認済み）
+                    }
                     if self.peek_ident_matches("AS") {
                         self.advance();
                         DmlFromReturningItem::AliasedColumn(colref, self.expect_ident()?)
@@ -15718,7 +15728,17 @@ impl<'a> Parser<'a> {
         ) {
             return false;
         }
-        match self.tokens.get(self.pos.saturating_add(1)) {
+        // 引用なしの括弧なし SQL 値関数（`CURRENT_DATE` 等）は列参照ではなく式として読む。
+        // 引用付きの同名識別子は列参照のまま。
+        if self.is_value_function_keyword_at(self.pos) {
+            return false;
+        }
+        Self::returning_item_boundary(self.tokens.get(self.pos.saturating_add(1)))
+    }
+
+    /// 項目の直後のトークンが `RETURNING` 項目の境界（`,`・`;`・`AS`・句境界・終端）か。
+    fn returning_item_boundary(next: Option<&Token>) -> bool {
+        match next {
             None => true,
             Some(Token::Punct(',' | ';')) => true,
             Some(Token::Ident(w)) => ["AS", "USING", "PARTITIONED"]
@@ -15726,6 +15746,21 @@ impl<'a> Parser<'a> {
                 .any(|k| w.eq_ignore_ascii_case(k)),
             _ => false,
         }
+    }
+
+    /// `RETURNING` 項目が括弧付きの修飾列参照 `(q.col)` 1 個（直後が境界）かを先読みで判定する。
+    /// 括弧なしの `q.col` と同じ列束縛経路へ通すための判定（Issue #3251）。
+    fn peek_dml_returning_paren_qualified_column(&self) -> bool {
+        matches!(self.peek(), Some(Token::Punct('(')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::QualifiedIdent { .. })
+            )
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(2)),
+                Some(Token::Punct(')'))
+            )
+            && Self::returning_item_boundary(self.tokens.get(self.pos.saturating_add(3)))
     }
 
     /// FROM／USING つき DML の `RETURNING` の式項目 1 つ（Issue #3251）。`dml_from_target` を対象表の
@@ -32297,6 +32332,24 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         assert!(matches!(expr.items[2], DmlFromReturningItem::Column(_)));
+        // 括弧なし SQL 値関数は式、引用付き同名は列参照（P1 回帰）。
+        let vf = parse("RETURNING CURRENT_DATE AS d, \"current_date\" AS c")
+            .expect("value function")
+            .expect("present");
+        assert!(matches!(vf.items[0], DmlFromReturningItem::Expr { .. }));
+        assert!(matches!(
+            vf.items[1],
+            DmlFromReturningItem::AliasedColumn(..)
+        ));
+        // 括弧付き FROM／USING 修飾列は括弧なしと同じ列束縛（Medium 回帰）。
+        let paren = parse("RETURNING (s.v), (s.v) AS w")
+            .expect("paren qualified")
+            .expect("present");
+        assert!(matches!(paren.items[0], DmlFromReturningItem::Column(_)));
+        assert!(matches!(
+            paren.items[1],
+            DmlFromReturningItem::AliasedColumn(..)
+        ));
         for (bad, code) in [
             ("RETURNING lower(s.a)", "0A000"),
             ("RETURNING s.a + 1", "0A000"),
