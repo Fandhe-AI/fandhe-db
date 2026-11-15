@@ -469,7 +469,7 @@ fn nested_trigger_target_fires() {
     assert_eq!(count(&core, &a, "audit"), 1);
 }
 
-// `WHEN` 付き AFTER は `0A000`（発火時に二重化）。副作用なし。文トリガの発火は
+// `WHEN` の評価を結線していない注入 invoker では、`WHEN` 付き AFTER は `0A000`（fail-closed）。副作用なし。文トリガの発火は
 // `trigger_statement_tests.rs`（Issue #1726）で固定する。
 #[test]
 fn when_is_0a000() {

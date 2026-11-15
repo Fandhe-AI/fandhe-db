@@ -38,6 +38,8 @@ pub(super) struct QueuedAfter {
     table: String,
     schema: TableSchema,
     triggers: Vec<TriggerDef>,
+    /// 行の変更の時点で `WHEN` が TRUE だった `triggers` 内の位置（Issue #3190。実行モデルの D7）。
+    selected: Vec<usize>,
     op: TriggerOp,
     old: Option<Vec<Value>>,
     new: Vec<Value>,
@@ -178,15 +180,30 @@ pub(super) fn apply_with_triggers(
             pre_images.record(*id, original_values.clone());
             deleted_ids.push(*id);
             if !plan.after.is_empty() {
-                state.after_queue.push(QueuedAfter {
-                    table: child_schema.name.clone(),
-                    schema: child_schema.clone(),
-                    triggers: plan.after.clone(),
-                    op: TriggerOp::Delete,
-                    old: Some(old_values),
-                    new: Vec::new(),
-                    depth: state.branch_depth,
-                });
+                // `WHEN` は行の変更の時点（表ハンドルを開いていない区間）で評価し、偽なら積まない。
+                let selected = crate::trigger::fire::select_after_row(
+                    ctx.runtime,
+                    ctx.writes,
+                    &child_schema.name,
+                    child_schema,
+                    &plan.after,
+                    TriggerOp::Delete,
+                    Some(&old_values),
+                    &[],
+                )
+                .map_err(TenantWriteError::TriggerFailed)?;
+                if !selected.is_empty() {
+                    state.after_queue.push(QueuedAfter {
+                        table: child_schema.name.clone(),
+                        schema: child_schema.clone(),
+                        triggers: plan.after.clone(),
+                        selected,
+                        op: TriggerOp::Delete,
+                        old: Some(old_values),
+                        new: Vec::new(),
+                        depth: state.branch_depth,
+                    });
+                }
             }
             continue;
         }
@@ -254,15 +271,30 @@ pub(super) fn apply_with_triggers(
         }
         pre_images.record(*id, original_values.clone());
         if !plan.after.is_empty() {
-            state.after_queue.push(QueuedAfter {
-                table: child_schema.name.clone(),
-                schema: child_schema.clone(),
-                triggers: plan.after.clone(),
-                op: TriggerOp::Update,
-                old: Some(old_values),
-                new: final_row,
-                depth: state.branch_depth,
-            });
+            // `WHEN` は行の変更の時点（表ハンドルを開いていない区間）で評価し、偽なら積まない。
+            let selected = crate::trigger::fire::select_after_row(
+                ctx.runtime,
+                ctx.writes,
+                &child_schema.name,
+                child_schema,
+                &plan.after,
+                TriggerOp::Update,
+                Some(&old_values),
+                &final_row,
+            )
+            .map_err(TenantWriteError::TriggerFailed)?;
+            if !selected.is_empty() {
+                state.after_queue.push(QueuedAfter {
+                    table: child_schema.name.clone(),
+                    schema: child_schema.clone(),
+                    triggers: plan.after.clone(),
+                    selected,
+                    op: TriggerOp::Update,
+                    old: Some(old_values),
+                    new: final_row,
+                    depth: state.branch_depth,
+                });
+            }
         }
     }
 
@@ -303,12 +335,13 @@ pub(super) fn flush_after(state: &mut ActionState<'_, '_>) -> Result<(), TenantW
                     .map_err(TenantWriteError::TriggerFailed)?,
             );
         }
-        crate::trigger::fire::fire_after_row(
+        crate::trigger::fire::invoke_after_row(
             ctx.runtime,
             ctx.writes,
             &q.table,
             &q.schema,
             &q.triggers,
+            &q.selected,
             q.op,
             q.old.as_deref(),
             &q.new,

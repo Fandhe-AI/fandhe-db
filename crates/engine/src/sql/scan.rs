@@ -251,7 +251,7 @@ fn raise_tier_for_policy(tier: DecodeTier, needs: PolicyNeeds) -> DecodeTier {
 enum DecodeTier {
     /// 投影列が疑似列 `id`・embedding を参照しない `Computed` 式のみ・`WHERE` 句
     /// なしの場合に限り選択する。dim・metadata の構造検証（破損検知）は
-    /// `DimAndScalar` と同じ [`storage::decode_row_dim_and_metadata_borrowed`] を
+    /// `DimAndScalar` と同じ [`storage::decode_row_dim_and_metadata_body_borrowed`] を
     /// 通す（`sql::aggregate` の `DecodeTier::Fast` と同方針。破損した可視行を
     /// fail-open で見逃さない）。
     Fast,
@@ -554,7 +554,9 @@ fn with_visible_row<T>(
 
     let (dim, metadata): (u32, &[u8]) = match tier {
         DecodeTier::Fast | DecodeTier::DimAndScalar => {
-            storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
+            // ヘッダは上の RLS 段で 1 回だけデコード済み。offset を渡して再デコードしない（Issue #3223）。
+            storage::decode_row_dim_and_metadata_body_borrowed(buf, offset)
+                .map_err(storage_internal)?
         }
         DecodeTier::Embedding => storage::decode_row_body_into(buf, offset, embedding_scratch)
             .map_err(storage_internal)?,
@@ -2393,6 +2395,141 @@ mod tests {
                 .expect("insert row");
         }
         crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    /// 検証専用: 生の行バッファを直接 insert する（本体破損・ヘッダ破損の再現用）。
+    fn write_raw_row(storage: &Storage, tenant_key: &str, id: u64, buf: &[u8]) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            table.insert((tenant_key, id), buf).expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    fn encoded(tenant: &str, visibility: Visibility, embedding: &[f32]) -> Vec<u8> {
+        crate::storage::encode_row(&RowInput {
+            tenant_id: tenant,
+            visibility,
+            embedding,
+            metadata: &[],
+        })
+        .expect("encode row")
+    }
+
+    fn id_only_scan(limit: usize) -> BoundScan {
+        let mut b = bound_star_scan(limit);
+        b.projection = vec![ProjectedColumn::Id];
+        b
+    }
+
+    /// Issue #3223: Fast・Embedding 両段で、可視行の本体破損は Err、不可視行の
+    /// 本体破損はスキップ、ヘッダ破損・キー/ヘッダ tenant 不一致は Err（fail-closed・TABLE-12）。
+    #[test]
+    fn scan_fail_closed_contract_after_single_header_decode() {
+        for tier_scan in [id_only_scan(10), bound_star_scan(10)] {
+            let path = unique_db_path("scan-hdr-once-corrupt");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            let schema = nullable_vector_schema();
+            storage.create_table(&schema).expect("create table");
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+            // 不可視（他テナント Private）行は本体が破損していてもスキップ。
+            let mut bad_body = encoded("tenant-b", Visibility::Private, &[1.0, 2.0, 3.0]);
+            bad_body.pop();
+            write_raw_row(&storage, "tenant-b", 1, &bad_body);
+            write_row_direct(&storage, "docs", "tenant-a", 2, &[1.0, 2.0, 3.0]);
+            {
+                let read_txn = storage.db().begin_read().expect("begin_read");
+                let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan).expect("scan");
+                assert_eq!(r.rows.iter().map(|x| x.id).collect::<Vec<_>>(), vec![2]);
+            }
+
+            // 可視行の本体破損は Err。
+            let mut bad_visible = encoded("tenant-a", Visibility::Public, &[1.0, 2.0, 3.0]);
+            bad_visible.pop();
+            write_raw_row(&storage, "tenant-a", 3, &bad_visible);
+            {
+                let read_txn = storage.db().begin_read().expect("begin_read");
+                let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan);
+                assert!(matches!(r, Err(SqlSurfaceError::Internal { .. })));
+            }
+            write_raw_row(
+                &storage,
+                "tenant-a",
+                3,
+                &encoded("tenant-a", Visibility::Public, &[]),
+            );
+
+            // ヘッダ破損（未知 version）は Err。
+            let mut bad_header = encoded("tenant-a", Visibility::Public, &[1.0, 2.0, 3.0]);
+            bad_header[0] = 0xFF;
+            write_raw_row(&storage, "tenant-a", 4, &bad_header);
+            {
+                let read_txn = storage.db().begin_read().expect("begin_read");
+                let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan);
+                assert!(matches!(r, Err(SqlSurfaceError::Internal { .. })));
+            }
+            write_raw_row(
+                &storage,
+                "tenant-a",
+                4,
+                &encoded("tenant-a", Visibility::Public, &[]),
+            );
+
+            // キー側 tenant とヘッダ側 tenant の不一致（TABLE-12）は Err。
+            write_raw_row(
+                &storage,
+                "tenant-a",
+                5,
+                &encoded("tenant-a2", Visibility::Public, &[1.0, 2.0, 3.0]),
+            );
+            let read_txn = storage.db().begin_read().expect("begin_read");
+            let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan);
+            assert!(matches!(r, Err(SqlSurfaceError::Internal { .. })));
+        }
+    }
+
+    /// Issue #3223 の回帰ガード: 走査した行ごとにヘッダデコードは 1 回、本体の
+    /// 構造デコードは可視行のみ（`Fast` 段）。
+    #[test]
+    fn scan_decodes_header_once_per_row() {
+        let path = unique_db_path("scan-hdr-once-count");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        for id in 1..=5u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &[1.0, 2.0, 3.0]);
+        }
+        for id in 6..=8u64 {
+            write_row_direct_with_visibility(
+                &storage,
+                "docs",
+                "tenant-b",
+                id,
+                &[1.0, 2.0, 3.0],
+                Visibility::Private,
+            );
+        }
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let before = crate::storage::decode_probe::snapshot();
+        let r = execute_scan(&read_txn, &ctx, &schema, &id_only_scan(100)).expect("scan");
+        let delta = crate::storage::decode_probe::snapshot().since(before);
+        assert_eq!(r.rows.len(), 5);
+        assert_eq!(delta.dim_and_metadata, 5);
+        assert!(delta.header >= 5, "scan must decode headers");
+        assert!(
+            delta.header <= 8,
+            "header must be decoded at most once per scanned row, got {}",
+            delta.header
+        );
     }
 
     fn bound_star_scan(limit: usize) -> BoundScan {

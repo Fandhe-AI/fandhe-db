@@ -151,6 +151,8 @@ mod standard_body_binding;
 #[allow(dead_code)]
 mod plpgsql_host;
 mod plpgsql_trigger_host;
+// 行トリガの `WHEN` 条件の定義時検査・発火時評価（Issue #3190）。
+mod trigger_when;
 // ビューへの書き込みを INSTEAD OF ROW トリガへ振り替える実行本体（TABLE-45・Issue #3193）。
 #[cfg(test)]
 mod trigger_instead_of_forms_tests;
@@ -10228,6 +10230,8 @@ impl EngineCore {
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateTrigger,
                 )?;
+                // WHEN 条件の定義時の意味検査（Issue #3190。D7）。権限ゲートの後・カタログ書き込みの前。
+                self.validate_trigger_when(stmt)?;
                 let outcome = crate::sql::trigger_ddl::execute_create_trigger(
                     &self.storage,
                     ctx.tenant_id(),
