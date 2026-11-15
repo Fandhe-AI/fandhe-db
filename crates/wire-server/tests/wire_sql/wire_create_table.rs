@@ -422,3 +422,55 @@ fn wire_check_constraint_accepts_null_comparison_and_rejects_false_with_trailing
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
     read_ready_for_query(&mut stream);
 }
+/// CHECK の `IN`／`NOT IN`／`BETWEEN`／`IS NOT NULL` は受理され、NULL の扱いが PG と同じ
+/// （`IS NOT NULL` だけが NULL を違反にする。TABLE-16・SQL-24、Issue #3244）。psql が送る
+/// 末尾 `;` 付きの単独文でも同じで、違反後も接続は継続して使える。
+#[test]
+fn wire_check_constraint_accepts_in_between_is_not_null_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE items (kind TEXT, n INTEGER, m INTEGER, note TEXT, \
+             CHECK (kind IN ('a', 'b')), CHECK (n BETWEEN 1 AND 10), \
+             CHECK (m NOT IN (7, 8)), CHECK (note IS NOT NULL));",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO items (kind, n, m, note) VALUES ('a', 5, 1, 'x');",
+            "INSERT 0 1",
+        ),
+        // IN／BETWEEN／NOT IN の NULL は UNKNOWN で合格する。
+        (
+            "INSERT INTO items (kind, n, m, note) VALUES (NULL, NULL, NULL, 'x');",
+            "INSERT 0 1",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    for sql in [
+        "INSERT INTO items (kind, n, m, note) VALUES ('c', 5, 1, 'x');",
+        "INSERT INTO items (kind, n, m, note) VALUES ('a', 11, 1, 'x');",
+        "INSERT INTO items (kind, n, m, note) VALUES ('a', 5, 7, 'x');",
+        // IS NOT NULL だけは NULL が違反になる。
+        "INSERT INTO items (kind, n, m, note) VALUES ('a', 5, 1, NULL);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "23514");
+        read_ready_for_query(&mut stream);
+    }
+
+    // 接続は継続して使える。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind, n, m, note) VALUES ('b', 10, 9, 'y');",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}

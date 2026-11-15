@@ -89,10 +89,9 @@ fn render_predicate(predicate: &WherePredicate, consts: bool) -> String {
             )
         }
         WherePredicate::Expression(expr) => render_expression_predicate(expr),
-        // SQL-24（TASK-208 ポインタ）。CHECK 制約は `reject_forbidden_elements`
-        // が構築（`validate_and_build`）の時点でこれらの形を `42601` として
-        // 拒否するため、本関数へは実質到達しない。網羅性のためだけに正規化
-        // レンダリングを用意する（往復一致の対象にはならない）。
+        // SQL-24・TABLE-16（Issue #3244）: 列を左辺にとる `IN`／`BETWEEN`／`IS [NOT] NULL`／
+        // その `NOT` も CHECK で受理するため、正規化描画は再パースで同じ AST へ戻る形にする
+        // （往復一致は `build_check_constraint` が検証する）。
         WherePredicate::InList { column, values } => {
             let items = values
                 .iter()
@@ -116,9 +115,8 @@ fn render_predicate(predicate: &WherePredicate, consts: bool) -> String {
             }
         }
         WherePredicate::Not(inner) => format!("NOT {}", render_predicate(inner, consts)),
-        // `parse_check_clause`（構文段）が `CHECK (...)` 本体の `OR` を既に
-        // `42601` で拒否するため到達しない（TASK-208・Issue #912）。網羅性のため
-        // 防御的に括弧付きで描画する。
+        // 数値の `IN`／`BETWEEN` の展開で生じる `Or`（Issue #3244）を括弧付きで描く。利用者が
+        // 書いた `OR` は構文段（`parse_where_or`）が拒否する。
         WherePredicate::Or(branches) => {
             if consts && branches.is_empty() {
                 return "FALSE".to_string();
@@ -578,15 +576,23 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                 )));
             }
             WherePredicate::Expression(expr) => reject_forbidden_expr(expr)?,
-            // SQL-24（TASK-208 ポインタ）: `IN`／`BETWEEN`／`IS [NOT] NULL`／`NOT`
-            // は CHECK 制約では未対応のまま拒否する（TABLE-16 の既存挙動は不変。
-            // 評価器は三値化済みで、解禁は #3243・#3244 で扱う）。
+            // SQL-24・TABLE-16（Issue #3244）: 列を左辺にとる `IN`／`BETWEEN`／`IS [NULL|NOT NULL]`
+            // は受理する（評価は三値論理。`BoundConjunction::eval_three_valued`）。
             WherePredicate::InList { .. }
             | WherePredicate::Between { .. }
-            | WherePredicate::IsNull { .. }
-            | WherePredicate::Not(_) => {
+            | WherePredicate::IsNull { .. } => {}
+            // `NOT` は上の 3 形の否定（`NOT col IN (...)` 等）だけを受理する。それ以外
+            // （`NOT <比較>`・`NOT (...)`）は未対応のまま fail-closed で拒否する（#3243）。
+            WherePredicate::Not(inner)
+                if matches!(
+                    inner.as_ref(),
+                    WherePredicate::InList { .. }
+                        | WherePredicate::Between { .. }
+                        | WherePredicate::IsNull { .. }
+                ) => {}
+            WherePredicate::Not(_) => {
                 return Err(SqlSurfaceError::unsupported(
-                    "IN/BETWEEN/IS NULL/NOT are not supported in CHECK constraints",
+                    "NOT is not supported in CHECK constraints except before IN/BETWEEN/IS NULL",
                 ));
             }
             WherePredicate::Equality { .. }
@@ -600,12 +606,13 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                     "LIKE with a non-column left operand is not supported in CHECK constraints",
                 ));
             }
-            // `parse_check_clause` が構文段で既に拒否するため到達しない
-            // （TASK-208・Issue #912）。防御的に fail-closed で拒否する。
-            WherePredicate::Or(_) => {
-                return Err(SqlSurfaceError::unsupported(
-                    "CHECK constraint predicate must not contain OR",
-                ));
+            // 利用者が書いた `OR` は構文段（`parse_where_or`）が拒否する。ここへ届く `Or` は
+            // 数値の `IN`／`BETWEEN` の展開（WHERE と同じ形）か永続化テキストの再パース結果で、
+            // `visible()`・非組み込み関数・サブクエリが分岐に隠れても検出できるよう各分岐へ再帰する。
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    reject_forbidden_elements(branch)?;
+                }
             }
             // Issue #927・SQL-29 (a)・TASK-213: 同上（構文段が既に `42601`
             // で拒否するため到達しない防御的経路）。
@@ -619,6 +626,42 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                     "CHECK constraint predicate must not contain a subquery",
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// 列型に依存する CHECK の禁止形を検出する（Issue #3244）。`HALFVEC`／`INT8VEC`／`SPARSEVEC` 列
+/// への `IS [NOT] NULL`（`NOT` の内側を含む）は、各列型の Issue が拒否を固定している範囲のため
+/// `42601` のままにする（評価経路の保証範囲を本 Issue で広げない）。`VECTOR` 列は束縛段の既存の
+/// 拒否に任せる。`Or` の分岐へ再帰する。`build_check_constraint` と `CompiledChecks::compile` が
+/// [`reject_forbidden_elements`] の後に呼ぶ。
+fn reject_vector_family_null_tests(
+    schema: &TableSchema,
+    predicates: &[WherePredicate],
+) -> Result<(), SqlSurfaceError> {
+    for predicate in predicates {
+        match predicate {
+            WherePredicate::IsNull { column, .. } => {
+                let non_plain_vector = schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name == *column && c.ty.is_vector_family() && !c.ty.is_vector());
+                if non_plain_vector {
+                    return Err(SqlSurfaceError::unsupported(
+                        "IS [NOT] NULL on this vector column type is not supported in CHECK constraints",
+                    ));
+                }
+            }
+            WherePredicate::Not(inner) => {
+                reject_vector_family_null_tests(schema, std::slice::from_ref(inner.as_ref()))?;
+            }
+            WherePredicate::Or(branches) => {
+                for branch in branches {
+                    reject_vector_family_null_tests(schema, branch)?;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -652,6 +695,7 @@ fn referenced_column_names(
     predicates: &[WherePredicate],
     filters: &[MetadataFilter],
     expr_filters: &[udf_call::BoundExpr],
+    or_filters: &[crate::sql::where_tree::BoundOrGroup],
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |name: &str| {
@@ -664,7 +708,11 @@ fn referenced_column_names(
             push(&column.name);
         }
     }
-    if expr_filters.iter().any(udf_call::references_embedding) {
+    if expr_filters.iter().any(udf_call::references_embedding)
+        || or_filters
+            .iter()
+            .any(crate::sql::where_tree::BoundOrGroup::references_embedding)
+    {
         if let Some(column) = schema.columns.iter().find(|c| c.ty.is_vector()) {
             push(&column.name);
         }
@@ -676,6 +724,12 @@ fn referenced_column_names(
     let mut scalar_column_mask = vec![false; schema.columns.len()];
     for expr in expr_filters {
         udf_call::mark_referenced_scalar_columns(expr, &mut scalar_column_mask);
+    }
+    // 数値の `IN`／`BETWEEN` の展開で生じる OR 群（#3244）の内側の参照列も依存列へ含める
+    // （取りこぼすと `ALTER TABLE DROP COLUMN` の依存検査をすり抜ける fail-open になる）。
+    // 列マスクの規則は評価側（`CompiledChecks::compile`）と同じ `mark_scalar_column_mask`。
+    for group in or_filters {
+        group.mark_scalar_column_mask(&mut scalar_column_mask);
     }
     for (index, wanted) in scalar_column_mask.iter().enumerate() {
         if *wanted {
@@ -747,12 +801,21 @@ fn referenced_column_names(
             | Expr::TimestampTzLiteral { .. } => {}
         }
     }
-    let mut idents: Vec<&str> = Vec::new();
-    for predicate in predicates {
-        if let WherePredicate::Expression(expr) = predicate {
-            collect_idents(expr, &mut idents);
+    fn collect_predicate_idents<'a>(predicates: &'a [WherePredicate], acc: &mut Vec<&'a str>) {
+        for predicate in predicates {
+            match predicate {
+                WherePredicate::Expression(expr) => collect_idents(expr, acc),
+                WherePredicate::Or(branches) => {
+                    for branch in branches {
+                        collect_predicate_idents(branch, acc);
+                    }
+                }
+                _ => {}
+            }
         }
     }
+    let mut idents: Vec<&str> = Vec::new();
+    collect_predicate_idents(predicates, &mut idents);
     for ident in idents {
         if let Some(column) = schema
             .columns
@@ -777,13 +840,14 @@ pub(crate) fn recompute_referenced_columns(
     let predicates = crate::sql::allowlist::parse_check_predicate_text(&check.predicate_sql)?;
     reject_forbidden_elements(&predicates)?;
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
+    let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         crate::sql::parser::bind_check_predicates(&predicates, schema, &mut node_budget)?;
     Ok(referenced_column_names(
         schema,
         &predicates,
         &metadata_filters,
         &expr_filters,
+        &or_filters,
     ))
 }
 
@@ -891,13 +955,19 @@ pub(crate) fn build_check_constraint(
     name: String,
 ) -> Result<CheckConstraint, SqlSurfaceError> {
     reject_forbidden_elements(&check.predicates)?;
+    reject_vector_family_null_tests(schema, &check.predicates)?;
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
+    let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
         crate::sql::parser::bind_check_predicates(&check.predicates, schema, &mut node_budget)?;
 
-    let columns =
-        referenced_column_names(schema, &check.predicates, &metadata_filters, &expr_filters);
+    let columns = referenced_column_names(
+        schema,
+        &check.predicates,
+        &metadata_filters,
+        &expr_filters,
+        &or_filters,
+    );
     if columns.len() > crate::catalog::MAX_CHECK_REFERENCED_COLUMNS {
         return Err(SqlSurfaceError::payload_too_large(
             "CHECK constraint references too many columns",
@@ -1223,6 +1293,7 @@ impl CompiledChecks {
                 crate::sql::allowlist::parse_check_predicate_text(&check.predicate_sql)
                     .map_err(corrupt_check)?;
             reject_forbidden_elements(&predicates).map_err(corrupt_check)?;
+            reject_vector_family_null_tests(schema, &predicates).map_err(corrupt_check)?;
             let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
             let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
                 crate::sql::parser::bind_check_predicates(&predicates, schema, &mut node_budget)
@@ -1231,8 +1302,13 @@ impl CompiledChecks {
             // 依存列の記録（`CheckConstraint::columns`）が再計算結果を覆っていること
             // を検査する。欠けていれば `ALTER TABLE` の依存検査が素通りし得た
             // 破損・漂流であり、書き込みを fail-closed に拒否する。
-            let recomputed =
-                referenced_column_names(schema, &predicates, &metadata_filters, &expr_filters);
+            let recomputed = referenced_column_names(
+                schema,
+                &predicates,
+                &metadata_filters,
+                &expr_filters,
+                &or_filters,
+            );
             if let Some(missing) = recomputed.iter().find(|c| !check.columns.contains(c)) {
                 return Err(corrupt_check(SqlSurfaceError::unsupported(format!(
                     "CHECK constraint {:?} does not record dependent column {missing:?}",
@@ -1486,27 +1562,214 @@ mod tests {
         assert_eq!(checks[0].name, "kind_ck");
     }
 
-    /// SQL-24（TASK-208 ポインタ）: `IN`／`BETWEEN`／`IS [NOT] NULL`／`NOT` は
-    /// 構文段（`sql::allowlist`）では受理されるが、CHECK 制約の構築時に
-    /// `reject_forbidden_elements` が `42601` で拒否する（TABLE-16 の既存挙動は
-    /// 不変のまま。評価器は三値化済みで、解禁は後続 Issue で扱う）。
-    /// tracked: #3243, #3244
+    /// SQL-24・TABLE-16（Issue #3244）: 列を左辺にとる `IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL`
+    /// を受理し、描画テキストが再パースで同じ AST へ戻る（`build_check_constraint` の往復検証）。
+    /// 数値の `IN`／`BETWEEN` は WHERE と同じ展開で永続化される。
     #[test]
-    fn validate_and_build_rejects_new_sql24_predicate_forms() {
-        for sql in [
-            "CREATE TABLE docs (kind TEXT CHECK (kind IN ('a', 'b')))",
-            "CREATE TABLE docs (kind TEXT CHECK (kind NOT IN ('a', 'b')))",
-            "CREATE TABLE docs (kind TEXT CHECK (kind BETWEEN 'a' AND 'z'))",
-            "CREATE TABLE docs (kind TEXT CHECK (kind IS NULL))",
-            "CREATE TABLE docs (kind TEXT CHECK (kind IS NOT NULL))",
-            "CREATE TABLE docs (kind TEXT CHECK (NOT kind = 'a'))",
+    fn validate_and_build_accepts_in_between_is_null_forms() {
+        for (ddl, expected_sql, expected_cols) in [
+            (
+                "kind TEXT CHECK (kind IN ('a', 'b'))",
+                "kind IN ('a', 'b')",
+                vec!["kind"],
+            ),
+            (
+                "kind TEXT CHECK (kind NOT IN ('a', 'b'))",
+                "NOT kind IN ('a', 'b')",
+                vec!["kind"],
+            ),
+            (
+                "kind TEXT CHECK (kind IS NULL)",
+                "kind IS NULL",
+                vec!["kind"],
+            ),
+            (
+                "kind TEXT CHECK (kind IS NOT NULL)",
+                "kind IS NOT NULL",
+                vec!["kind"],
+            ),
+            (
+                "n INTEGER CHECK (n BETWEEN 1 AND 3)",
+                "n >= 1 AND n <= 3",
+                vec!["n"],
+            ),
+            ("n INTEGER CHECK (n IN (1))", "n = 1", vec!["n"]),
+            (
+                "n INTEGER CHECK (n IN (1, -2))",
+                "(n = 1 OR n = -2)",
+                vec!["n"],
+            ),
+            (
+                "n INTEGER CHECK (n NOT BETWEEN 1 AND 3)",
+                "(n < 1 OR n > 3)",
+                vec!["n"],
+            ),
+            (
+                "n INTEGER CHECK (n NOT IN (1, 2))",
+                "(n < 1 OR n > 1) AND (n < 2 OR n > 2)",
+                vec!["n"],
+            ),
+            (
+                "n INTEGER CHECK (NOT n IN (1, 2))",
+                "(n < 1 OR n > 1) AND (n < 2 OR n > 2)",
+                vec!["n"],
+            ),
         ] {
-            let v = parse_create_table(sql);
+            let v = parse_create_table(&format!("CREATE TABLE docs ({ddl})"));
             let schema = schema_of(&v);
-            let err = validate_and_build(&schema, &v.checks)
-                .expect_err(&format!("{sql:?} must be rejected"));
-            assert_eq!(err.wire_code(), "42601", "{sql}");
+            let checks = validate_and_build(&schema, &v.checks)
+                .unwrap_or_else(|e| panic!("{ddl:?} must be accepted: {e:?}"));
+            assert_eq!(checks[0].predicate_sql, expected_sql, "{ddl}");
+            let cols: Vec<&str> = checks[0].columns.iter().map(String::as_str).collect();
+            assert_eq!(cols, expected_cols, "{ddl}");
         }
+    }
+
+    /// 未対応の形は fail-closed のまま（`NOT <比較>` は #3243、TEXT の `BETWEEN` は束縛段、
+    /// vector 系列の `IS NULL` は各列型の Issue が固定した拒否）。
+    /// tracked: #3243 (NOT 比較・利用者の OR) / intentional: docs/design/sql-check-constraint.md (TEXT BETWEEN・vector 系列 IS NULL)
+    #[test]
+    fn validate_and_build_rejects_unsupported_in_between_null_forms() {
+        for (sql, code) in [
+            (
+                "CREATE TABLE docs (kind TEXT CHECK (NOT kind = 'a'))",
+                "42601",
+            ),
+            (
+                "CREATE TABLE docs (n INTEGER CHECK (n = 1 OR n = 2))",
+                "42601",
+            ),
+            (
+                "CREATE TABLE docs (n INTEGER CHECK (n + 1 IS NULL))",
+                "42601",
+            ),
+            (
+                "CREATE TABLE docs (n INTEGER CHECK (n IN ('1', '2')))",
+                "22000",
+            ),
+            (
+                "CREATE TABLE docs (kind TEXT CHECK (kind BETWEEN 'a' AND 'z'))",
+                "22000",
+            ),
+            (
+                "CREATE TABLE docs (v HALFVEC(2) CHECK (v IS NOT NULL))",
+                "42601",
+            ),
+            (
+                "CREATE TABLE docs (v HALFVEC(2) CHECK (NOT v IS NULL))",
+                "42601",
+            ),
+        ] {
+            let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");
+            let rejected = match crate::sql::allowlist::validate_create_table_tokens(&tokens) {
+                Err(e) => Some(e),
+                Ok(v) => validate_and_build(&schema_of(&v), &v.checks).err(),
+            };
+            let err = rejected.unwrap_or_else(|| panic!("{sql:?} must be rejected"));
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+    }
+
+    /// 三値論理（PG と同じ）: `IS NOT NULL` だけが NULL を違反にし、`IN`／`NOT IN`／`BETWEEN`／
+    /// `NOT BETWEEN` は NULL で UNKNOWN＝合格。`IS NULL` は非 NULL を違反にする。
+    #[test]
+    fn in_between_is_null_follow_three_valued_logic() {
+        let cases: [(&str, [(Value, &str); 4]); 6] = [
+            (
+                "n IN (1, 2)",
+                [
+                    (Value::Integer(1), "ok"),
+                    (Value::Integer(3), "viol:docs_check"),
+                    (Value::Null, "ok"),
+                    (Value::Integer(2), "ok"),
+                ],
+            ),
+            (
+                "n NOT IN (1, 2)",
+                [
+                    (Value::Integer(1), "viol:docs_check"),
+                    (Value::Integer(3), "ok"),
+                    (Value::Null, "ok"),
+                    (Value::Integer(2), "viol:docs_check"),
+                ],
+            ),
+            (
+                "n BETWEEN 1 AND 3",
+                [
+                    (Value::Integer(1), "ok"),
+                    (Value::Integer(4), "viol:docs_check"),
+                    (Value::Null, "ok"),
+                    (Value::Integer(3), "ok"),
+                ],
+            ),
+            (
+                "n NOT BETWEEN 1 AND 3",
+                [
+                    (Value::Integer(0), "ok"),
+                    (Value::Integer(2), "viol:docs_check"),
+                    (Value::Null, "ok"),
+                    (Value::Integer(3), "viol:docs_check"),
+                ],
+            ),
+            (
+                "n IS NOT NULL",
+                [
+                    (Value::Integer(1), "ok"),
+                    (Value::Integer(0), "ok"),
+                    (Value::Null, "viol:docs_check"),
+                    (Value::Integer(5), "ok"),
+                ],
+            ),
+            (
+                "n IS NULL",
+                [
+                    (Value::Integer(1), "viol:docs_check"),
+                    (Value::Integer(0), "viol:docs_check"),
+                    (Value::Null, "ok"),
+                    (Value::Integer(5), "viol:docs_check"),
+                ],
+            ),
+        ];
+        for (pred, rows) in cases {
+            let (schema, compiled) = compile_docs(&format!("n INTEGER, CHECK ({pred})"));
+            for (value, expected) in rows {
+                assert_row_new_only(&schema, &compiled, std::slice::from_ref(&value), expected);
+            }
+        }
+    }
+
+    /// 文字列の `IN`／`NOT IN`／`IS NULL` も NULL の扱いが同じ（TEXT 列）。
+    #[test]
+    fn text_in_not_in_is_null_follow_three_valued_logic() {
+        let (schema, compiled) = compile_docs("k TEXT, CHECK (k IN ('a', 'b'))");
+        assert_row_new_only(&schema, &compiled, &[t("a")], "ok");
+        assert_row_new_only(&schema, &compiled, &[t("c")], "viol:docs_check");
+        assert_row_new_only(&schema, &compiled, &[Value::Null], "ok");
+        let (schema, compiled) = compile_docs("k TEXT, CHECK (k NOT IN ('a', 'b'))");
+        assert_row_new_only(&schema, &compiled, &[t("a")], "viol:docs_check");
+        assert_row_new_only(&schema, &compiled, &[t("c")], "ok");
+        assert_row_new_only(&schema, &compiled, &[Value::Null], "ok");
+        let (schema, compiled) = compile_docs("k TEXT, CHECK (k IS NOT NULL)");
+        assert_row_new_only(&schema, &compiled, &[t("a")], "ok");
+        assert_row_new_only(&schema, &compiled, &[Value::Null], "viol:docs_check");
+    }
+
+    /// OR 展開の内側にだけ現れる列も依存列・列マスクへ入る（漏れると `DROP COLUMN` の依存検査を
+    /// すり抜け、マスク外の列が NULL 扱いで合格する fail-open になる）。
+    #[test]
+    fn or_expansion_columns_are_recorded_as_dependencies_and_mask() {
+        let v = parse_create_table(
+            "CREATE TABLE docs (a INTEGER, b INTEGER, CHECK (a IN (1, 2)), CHECK (b NOT BETWEEN 1 AND 3))",
+        );
+        let schema = schema_of(&v);
+        let checks = validate_and_build(&schema, &v.checks).expect("must validate");
+        assert_eq!(checks[0].columns, vec!["a".to_string()]);
+        assert_eq!(checks[1].columns, vec!["b".to_string()]);
+        let recomputed = recompute_referenced_columns(&schema, &checks[0]).expect("recompute");
+        assert_eq!(recomputed, vec!["a".to_string()]);
+        let (_, compiled) =
+            compile_docs("a INTEGER, b INTEGER, CHECK (a IN (1, 2)), CHECK (b IS NULL)");
+        assert_eq!(compiled.column_mask, vec![true, true]);
     }
 
     #[test]

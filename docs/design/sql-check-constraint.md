@@ -47,6 +47,15 @@ CREATE TABLE <table> (
 ラッパー。空の `UdfRegistry` で呼び、セッションの UDF を解決させない）で行う
 ため、評価器は完全に既存のものを再利用する（第 2 の実装を作らない）。
 
+**受け付ける `IN`／`BETWEEN`／`IS [NOT] NULL`（Issue #3244・TABLE-16・SQL-24 ポインタ）**:
+列を左辺にとる `IN`（文字列・数値）・`NOT IN`・`BETWEEN`（数値・型付きリテラル）・
+`NOT BETWEEN`・`IS NULL`・`IS NOT NULL` を受理する。数値の `IN`／`BETWEEN` は WHERE と同じ展開で
+保持・永続化する（`n IN (1, 2)` は `(n = 1 OR n = 2)`、`n BETWEEN 1 AND 3` は
+`n >= 1 AND n <= 3` として保存される。PG も `BETWEEN` は展開して保存する）。この展開で生じる
+`Or` は許可し、`reject_forbidden_elements` は各分岐へ再帰して `visible()`・非組み込み関数・
+サブクエリが分岐に隠れても拒否する。利用者が書いた `OR` は構文段（`parse_where_or`）が `42601`
+で拒否する（#3243）。
+
 **数値列の式参照（Issue #1075・TABLE-16 ポインタ）**: `sql::udf_call::
 bind_expr_in` の `Expr::Ident` 分岐は、束縛環境の列参照ポリシー
 （`ColumnRefPolicy`）に応じて INTEGER/BIGINT/REAL/DOUBLE 列の式内参照を許可
@@ -94,8 +103,10 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   `wire_code` のまま透過する（D1'）。
 - `bind_check_predicates` が返す `OR` 群は捨てずに保持し、`column_mask` へ
   再帰的に反映する（マスク漏れはマスク外＝NULL 扱いで合格する fail-open）。
-  構文段・`reject_forbidden_elements` の拒否範囲は据え置きで、`OR`・`NOT`・`IN`・
-  `BETWEEN`・`IS [NOT] NULL` の解禁は #3243・#3244 で扱う。
+  `IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL` は #3244 で解禁した（下記）。利用者が書く
+  `OR`・`NOT (...)`・`NOT <比較>` の解禁は #3243 で扱う。
+- **NULL の扱い（#3244）**: `IS NOT NULL` だけが NULL を違反にする。`IN`／`NOT IN`／
+  `BETWEEN`／`NOT BETWEEN` は NULL で UNKNOWN になり合格する。`IS NULL` は非 NULL を違反にする。
 - `VECTOR` 列を参照する式は、その行の embedding が NULL（`dim == 0`）なら
   `ExprProgram::eval` が NULL（UNKNOWN）を返す（`ExprStep::PushVector`）。
 
@@ -254,6 +265,9 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - `alter_table_add_column`／`alter_table_widen_numeric_precision`：
   再エンコード時に `checks` を保持する（`decode_schema_with_resolver` →
   変更 → `encode_schema` の往復で自動的に保存される）。
+- 依存列の収集は OR 群（数値の `IN`／`BETWEEN` の展開。#3244）の内側の参照列も含める
+  （束縛済みの OR 群は評価側の列マスクと同じ `mark_scalar_column_mask`、未束縛の式述語は
+  `Or` の分岐を再帰して識別子を集める。取りこぼすと `DROP COLUMN` の依存検査をすり抜ける）。
 - 依存列（`CheckConstraint::columns`）は、宣言的フィルタの参照列に加え、式述語
   （組み込み関数の引数・算術式の内側を含む）が参照する列も集める（`vec_norm(embedding)`
   の `VECTOR` 列等。PR #1055 codex P1 の是正）。`ALTER TABLE` の依存検査は記録された
@@ -288,6 +302,13 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 
 ## 対象外（申し送り）
 
+- #3244 で fail-closed のまま残す形（拒否固定テストは `intentional:` でこの節を指す）。
+  - 式を左辺にとる `IN`／`BETWEEN`／`IS NULL`（`n + 1 IS NULL` 等。`42601`。評価経路の保証範囲外）。
+  - TEXT 列の `BETWEEN`（束縛段が TEXT 範囲を受け付けず `22000`。CHECK は範囲書き換えを行わない）。
+  - 数値列 × 文字列要素の `IN`（`n IN ('1', '2')`。書き換えは WHERE 文脈だけで `22000`）。
+  - `HALFVEC`／`INT8VEC`／`SPARSEVEC` 列の `IS [NOT] NULL`（各列型の Issue が固定した拒否で `42601`。
+    `build_check_constraint` と `CompiledChecks::compile` の列型ガード）。
+  - 受け皿 Issue は無い（対応しない判断。要否は別途判断）。
 - レーン A（`WHERE`／`SELECT`／集計での INTEGER/BIGINT/REAL/DOUBLE 列の式
   参照。未起票）。`CHECK` は Issue #1075 で `ColumnRefPolicy::
   AllowNumericColumns` による opt-in 拡張として対応済みだが、汎用の
@@ -330,6 +351,10 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   compile/enforce・三値論理・数値列比較〔INTEGER/BIGINT/REAL/DOUBLE の
   合否・列マスク OR の fail-open 回帰ガード・BIGINT 精度超過・0 除算の
   fail-closed・数値列以外は引き続き拒否〕）。
+- Issue #3244: `check_constraint.rs` の単体テスト（受理形の描画と往復一致・NULL を含む
+  三値評価・OR 展開の依存列と列マスク・未対応形の `wire_code` 固定）、
+  `tests/table_rls/table16_check_constraint.rs`（INSERT・UPDATE・`ALTER TABLE ADD CHECK`・
+  DROP／RENAME COLUMN の依存）、wire-server の `wire_create_table.rs`（末尾 `;` 付き単独文）。
 - `crates/engine/src/sql/where_tree.rs`（三値評価器。Kleene の真理値表・`OR`
   群の短絡と UNKNOWN の伝播・非 NULL で UNKNOWN の葉と範囲外 index の
   `Internal`）。`check_constraint.rs` には置換前の `enforce`（連言ごとの NULL

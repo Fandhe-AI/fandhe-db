@@ -695,15 +695,6 @@ fn where_predicates_contain_visible(predicates: &[WherePredicate]) -> bool {
     })
 }
 
-/// `predicates` が [`WherePredicate::Or`] を（直接またはネストした分岐の内部に）
-/// 1 つでも含むかどうかを判定する（TASK-208・Issue #912）。`CHECK (...)` 本体
-/// （[`Parser::parse_check_clause`]）が `OR` を明示的に拒否するために使う。
-fn where_predicates_contain_or(predicates: &[WherePredicate]) -> bool {
-    predicates
-        .iter()
-        .any(|predicate| matches!(predicate, WherePredicate::Or(_)))
-}
-
 /// `token` が `WHERE` 述語の範囲比較演算子（`< > <= >=`）トークンであれば
 /// 対応する [`CompareOp`] を返す（TABLE-13・TASK-199、Issue #891）。`=` は
 /// 既存の [`WherePredicate::Equality`] 判定が別腕で扱うためここには含めない。
@@ -9649,6 +9640,14 @@ impl<'a> Parser<'a> {
         let mut branches =
             vec![self.parse_where_and(extra_close_paren, set_operators, depth, leaf_count)?];
         while matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("OR")) {
+            // CHECK 本体では利用者が書いた `OR` を構文段で拒否する（TABLE-16・SQL-24。受理は別 Issue
+            // #3243 の範囲）。数値の `IN`／`BETWEEN` が内部で作る `Or` 展開はこの腕を通らないため
+            // 影響を受けない（`try_parse_numeric_list_leaf_inner` が直接 `Or` を組み立てる）。
+            if self.in_check_body {
+                return Err(SqlSurfaceError::unsupported(
+                    "OR is not supported inside a CHECK clause",
+                ));
+            }
             self.advance();
             branches.push(self.parse_where_and(
                 extra_close_paren,
@@ -9884,9 +9883,9 @@ impl<'a> Parser<'a> {
                 self.advance();
                 negate_odd = !negate_odd;
             }
-            // CHECK 本体（TABLE-16）では `NOT ( ... )`・裸の `NOT <式比較>`・数値の
-            // `IN`／`BETWEEN` を従来どおり `42601` にする（脱糖後の形が
-            // `check_constraint` の許可形と区別できないため。Issue #1184）。
+            // CHECK 本体（TABLE-16）では `NOT ( ... )` をここで `42601` にする。裸の `NOT <式比較>`
+            // は `Not(..)` のまま残り `check_constraint::reject_forbidden_elements` が拒否する。
+            // 数値の `NOT IN`／`NOT BETWEEN` は WHERE と同じ展開で受理する（Issue #3244）。
             if self.in_check_body && matches!(self.peek(), Some(Token::Punct('('))) {
                 return Err(SqlSurfaceError::unsupported(
                     "NOT ( ... ) grouping is not supported",
@@ -10720,7 +10719,8 @@ impl<'a> Parser<'a> {
     /// 要素が数値でない・混在・`NULL`・`$n`・空・`BETWEEN SYMMETRIC` は `42601`、
     /// 要素数上限は push の前に `54000`。生成する比較のノードは式ノード予算へ課金する。
     /// 先頭が `<Ident> [NOT] IN ( <Number>` または `<Ident> [NOT] BETWEEN <Number>`
-    /// でなければ `Ok(None)`（位置不変）。CHECK 本体では常に `Ok(None)`。
+    /// でなければ `Ok(None)`（位置不変）。CHECK 本体も WHERE と同じ展開で受理する（Issue #3244。
+    /// 展開で生じる `Or` は `check_constraint` が許可する）。
     fn try_parse_numeric_list_leaf(
         &mut self,
     ) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
@@ -10736,9 +10736,6 @@ impl<'a> Parser<'a> {
     fn try_parse_numeric_list_leaf_inner(
         &mut self,
     ) -> Result<Option<Vec<WherePredicate>>, SqlSurfaceError> {
-        if self.in_check_body {
-            return Ok(None);
-        }
         let Some(Token::Ident(col)) = self.peek().cloned() else {
             return Ok(None);
         };
@@ -16432,15 +16429,6 @@ impl<'a> Parser<'a> {
         self.in_check_body = prev_in_check;
         let predicates = body?;
         self.expect_punct(')')?;
-        if where_predicates_contain_or(&predicates) {
-            // TASK-208・SQL-24（Issue #912）の対象は読み取り文・書き込み文の
-            // `WHERE` のみで、`CHECK (...)` 本体（TABLE-16）は含まない。
-            // 明示的に `42601` で拒否する（将来解禁する場合に備え、
-            // `render_predicate` 側は既に `Or` を網羅描画できる）。
-            return Err(SqlSurfaceError::unsupported(
-                "OR is not supported inside a CHECK clause",
-            ));
-        }
         Ok(predicates)
     }
 
