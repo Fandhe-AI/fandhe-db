@@ -30,6 +30,7 @@
 //! | `Expression(a ~ b)` 等の正規表現マッチ | `negated` を反転（左辺・パターンが NULL なら否定の有無に関わらず NULL のため三値論理でも同値。SQL-55・Issue #1787） |
 //! | `visible()` | `42601`（RLS-7: 否定越しに RLS 述語を扱わせない） |
 //! | `IN (SELECT)`／`EXISTS` | `Not(..)`（解決段 `sql::subquery` が NULL 規則込みで否定形を評価する。Issue #1191） |
+//! | `(a, b) <op> (c, d)`（行値比較。Issue #3255） | 演算子反転（`<`↔`>=`・`<=`↔`>`・`=`↔`<>`。結果は最初の非等価／NULL 成分で決まるため三値論理でも同値） |
 //! | `<col> <op> (SELECT)` | 演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`。Issue #1191） |
 //!
 //! 演算子反転の根拠: 束縛段の比較は同型（数値×数値・TEXT×TEXT・DATE/TIMESTAMP 系）
@@ -251,6 +252,14 @@ fn negate_one(
                 "NOT must be followed by a comparison",
             )),
         },
+        // 行値比較（#3255）: 演算子を反転する（`<`↔`>=`・`<=`↔`>`・`=`↔`<>`）。三値論理でも、
+        // 結果は最初の非等価成分（または NULL 成分）で決まり、そこでの反転が全体の反転と一致する。
+        // 全成分が等しい場合も `<`→false／`>=`→true で一致し、`=`↔`<>` は De Morgan による。
+        WherePredicate::RowCompare { lhs, op, rhs } => Ok(vec![WherePredicate::RowCompare {
+            lhs,
+            op: op.negated(),
+            rhs,
+        }]),
         WherePredicate::Expression(_)
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(

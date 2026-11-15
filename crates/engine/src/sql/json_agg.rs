@@ -169,7 +169,7 @@ pub(crate) fn render(
         })?,
         ArrayValue::Jsonb(v) => render_items(v, sep, &mut out, |s, o| push_checked(o, s))?,
         // 束縛段が拒否する要素型。到達したら束縛層の実装バグ（fail-closed）。
-        ArrayValue::Enum(_) | ArrayValue::Multi(_) => {
+        ArrayValue::Enum(_) | ArrayValue::Multi(_) | ArrayValue::Bit(_) => {
             return Err(accumulator_bug(
                 "json aggregate element type reached finish",
             ))

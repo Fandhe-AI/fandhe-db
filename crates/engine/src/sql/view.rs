@@ -858,6 +858,11 @@ fn check_predicate_columns_within(
         // `Not(Expression)`／`Not(Or)` は通常生成されないが、現れても否定越しに非公開列を
         // 素通りさせない（fail-closed。DROP COLUMN／ALTER TYPE の依存検査にも効く）。
         WherePredicate::Not(inner) => check_predicate_columns_within(columns, inner),
+        // 行値比較（#3255）: 全成分の列参照を検査する（非公開列の漏えい防止。評価は #3256）。
+        WherePredicate::RowCompare { lhs, rhs, .. } => lhs
+            .iter()
+            .chain(rhs.iter())
+            .try_for_each(|e| expr_columns_within(columns, e)),
         WherePredicate::Or(branches) => {
             for branch in branches {
                 for leaf in branch {
@@ -1039,6 +1044,9 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         WherePredicate::Exists { .. } => None,
         // 解決段が生成する内部専用の葉（疑似列 `id` の比較）。列参照を持たない。
         WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => None,
+        // 行値比較は VIEW 本文の形状検査（`check_view_body_pred_leaf` 等）が先に拒否するため
+        // 到達しない。万一到達しても単純列を持たない（None）。tracked: #3256
+        WherePredicate::RowCompare { .. } => None,
     }
 }
 
