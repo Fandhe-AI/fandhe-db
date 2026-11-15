@@ -4334,6 +4334,30 @@ pub struct ValidatedSetOperation {
     /// Issue #1796）。範囲検証（`0..=core::MAX_SEARCH_K`）は `limit` と同じく実行・
     /// Describe 双方が行い、適用順は OFFSET が先・LIMIT／結果行数上限の判定が後。
     pub(crate) offset: u32,
+    /// 括弧なし末尾の `ORDER BY`（集合演算全体のソートキー。Issue #3266・SQL-29・SQL-56 ポインタ）。
+    /// 空は `ORDER BY` なし。最後の枝の句ではなく集合全体に掛かる（枝内の句は
+    /// [`SetTree::LimitedBranch`] 等が持つ）。キーの解決（出力列名・序数 → 列位置）と、
+    /// ソート未実装の間の `0A000` の関門は `sql::set_op` が担う（実行は Issue #3267）。
+    pub(crate) order_by: Vec<SetOrderKey>,
+}
+
+/// 集合演算全体の `ORDER BY` キー（Issue #3266）。PG と同じく出力列名または序数だけを
+/// 受け付ける（式キーは構文段で `0A000`。[`parse_set_operation`]）。`ScanOrderKey` は
+/// [`Expr`] を持ち `Eq` を導出できないため別型とする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SetOrderKey {
+    /// 出力列名（左端の枝の列名）によるキー。
+    Column {
+        name: String,
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
+    /// 出力列の位置（1 始まり）によるキー。範囲検査は `sql::set_op` が行う。
+    Ordinal {
+        position: i64,
+        descending: bool,
+        nulls: Option<NullPlacement>,
+    },
 }
 
 /// `EXPLAIN` の対象文（Issue #922・SQL-27。TASK-78・SQL-6 の `USING PLAN` 付き
@@ -18773,6 +18797,13 @@ fn check_buffered_body_shape_with(
             }
             Ok(())
         }
+        // Issue #3266: 集合全体の `ORDER BY` はソート実行（#3267）まで未実装。参照時の拒否より
+        // 手前の定義時に `0A000` にし、使えない本文の永続化を防ぐ（fail-closed）。
+        Statement::SetOperation(v) if !v.order_by.is_empty() => {
+            Err(SqlSurfaceError::feature_not_supported(
+                "ORDER BY over a set operation result is not supported yet",
+            ))
+        }
         Statement::SetOperation(v) => check_body_set_tree(&v.tree, lookup, out),
         // Issue #1411: 本文の FROM が別の評価後射影形ビュー（または単純形ビュー経由で
         // そこへ到達するビュー）の連鎖。本文として許すのは列射影・`WHERE`（宣言的述語、
@@ -23650,19 +23681,20 @@ fn parse_set_branch(
     // 最後の枝の直後に置かれる正当な形のため、ここでは拒否しない（枝の中の `OFFSET` は
     // `LIMIT` と同様に後続の検査で `42601` へ落ちる）。Issue #1796。
     //
-    // `GROUP BY`／`ORDER BY`／`USING PLAN`／`DISTINCT` はいずれも
+    // 括弧なしの `ORDER BY` も `LIMIT`／`OFFSET` と同じく、最後の枝の直後に置かれた場合は
+    // 集合演算全体のソートキーとして `parse_set_operation` が消費する（Issue #3266）。
+    // 最後以外の枝の直後の `ORDER BY` は、`parse_set_operation` が読んだ後に演算子が残り
+    // `expect_end_of_statement` が `42601` にする（枝の句と誤解釈しない）。
+    //
+    // `GROUP BY`／`USING PLAN`／`DISTINCT` はいずれも
     // 集合演算の文法上どの位置にも現れ得ないため、ここで拒否しなくても
     // 同じ理由で最終的に `expect_end_of_statement` が `42601` に落とす。
     // ただし早期に拒否した方が構造的に読みやすいため、明示的に残す。
     let has_group_by = matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"))
         && matches!(p.tokens.get(p.pos + 1), Some(Token::Keyword(Keyword::By)));
-    if has_group_by
-        || matches!(p.peek(), Some(Token::Keyword(Keyword::Order)))
-        || p.peek_ident_matches("USING")
-        || p.peek_ident_matches("DISTINCT")
-    {
+    if has_group_by || p.peek_ident_matches("USING") || p.peek_ident_matches("DISTINCT") {
         return Err(SqlSurfaceError::unsupported(
-            "GROUP BY/ORDER BY/USING PLAN/DISTINCT are not allowed inside a set operation branch",
+            "GROUP BY/USING PLAN/DISTINCT are not allowed inside a set operation branch",
         ));
     }
 
@@ -23675,9 +23707,8 @@ fn parse_set_branch(
             where_predicates,
             limit: crate::core::MAX_SEARCH_K as u32,
             limit_implicit: false,
-            // Issue #915（SQL-25）: 集合演算の枝は上の構文検査
-            // （`Keyword::Order` を明示的に拒否）でスカラー ORDER BY も
-            // 受理しないため、常に空。
+            // Issue #915（SQL-25）: 括弧なしの枝は枝内の ORDER BY を持たない
+            // （末尾の `ORDER BY` は集合全体のキーとして別に保持する。Issue #3266）ため常に空。
             order_by: Vec::new(),
             offset: 0,
             // Issue #930（SQL-30・TASK-214）: 集合演算の枝は `parse_select_list`
@@ -24143,13 +24174,49 @@ fn parse_set_operation(
     let mut p = Parser::new(tokens);
     let mut branch_count = 0usize;
     let tree = parse_set_expr(&mut p, lookup, 0, &mut branch_count)?;
+    // Issue #3266: 括弧なし末尾の `ORDER BY` は集合全体のキー（PG と同じ解釈）。句の順序は
+    // `ORDER BY` → `LIMIT` → `OFFSET` で、それ以外の並びは `expect_end_of_statement` が `42601`。
+    let scan_keys = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+        p.expect_keyword(Keyword::Order)?;
+        p.expect_keyword(Keyword::By)?;
+        p.parse_scalar_order_by()?
+    } else {
+        Vec::new()
+    };
     let limit = p.parse_optional_limit()?;
     let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
+    // 構文の誤り（`42601`）を先に確定させてから、式キーを `0A000` にする
+    // （PG の「集合演算の ORDER BY は結果列名だけ」に対応する分類）。
+    let mut order_by = Vec::with_capacity(scan_keys.len());
+    for key in scan_keys {
+        order_by.push(match key {
+            ScanOrderKey::Column { key, nulls } => SetOrderKey::Column {
+                name: key.column,
+                descending: key.descending,
+                nulls,
+            },
+            ScanOrderKey::Ordinal {
+                position,
+                descending,
+                nulls,
+            } => SetOrderKey::Ordinal {
+                position,
+                descending,
+                nulls,
+            },
+            ScanOrderKey::Expr { .. } => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "ORDER BY over a set operation result supports only output column names or positions",
+                ));
+            }
+        });
+    }
     Ok(ValidatedSetOperation {
         tree,
         limit,
         offset,
+        order_by,
     })
 }
 
@@ -28770,6 +28837,12 @@ fn recursive_cte_statement(
             // なければならない（`0A000`）。
             return Err(SqlSurfaceError::feature_not_supported(
                 "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT",
+            ));
+        }
+        // Issue #3266: 集合全体の `ORDER BY` はソート実行（#3267）まで未実装（fail-closed）。
+        Statement::SetOperation(v) if !v.order_by.is_empty() => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "ORDER BY over a set operation result is not supported yet",
             ));
         }
         Statement::Select(_)

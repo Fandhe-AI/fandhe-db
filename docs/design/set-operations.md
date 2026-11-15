@@ -50,7 +50,8 @@ spec 上、集合演算（SQL-29 (c)）の前提タスク TASK-213 は `JOIN`・
 ## 受理文法
 
 ```text
-top       := set_expr [LIMIT <n>] [;]
+top       := set_expr [ORDER BY <set_key> {, <set_key>}] [LIMIT <n>] [OFFSET <m>] [;]
+set_key   := (<出力列名> | <整数序数>) [ASC|DESC] [NULLS FIRST|LAST]   -- Issue #3266（構文・束縛のみ）
 set_expr  := set_term { (UNION [ALL] | EXCEPT) set_term }      -- 左結合
 set_term  := primary { INTERSECT primary }                     -- 左結合・UNION/EXCEPT より高優先
 primary   := branch | '(' set_expr ')'                         -- 括弧の入れ子深さは 4 まで（実装既定値）
@@ -74,13 +75,30 @@ Issue #1191 で次を受理する:
   （`LimitedBranch`。明示 `LIMIT` により切り詰め、`54000` にしない。集計の括弧付き枝は
   `GROUP BY` 句の `ORDER BY`／`LIMIT`）。
 - 落とし穴: 括弧なしの末尾 `ORDER BY`／`LIMIT` は PostgreSQL では**集合演算全体**に
-  掛かる。最後の枝の句と解釈すると結果が異なるため、全体に対する `ORDER BY` は `42601`
-  のまま（末尾 `LIMIT n` は従来どおり全体 `LIMIT`）。
+  掛かる。最後の枝の句と解釈すると結果が異なるため、枝の句としては扱わない。末尾 `LIMIT n`
+  は従来どおり全体 `LIMIT`。
+
+Issue #3266（SQL-29・SQL-56 のポインタ）で、括弧なし末尾の `ORDER BY` を**集合全体のキー**
+として構文解析し `ValidatedSetOperation::order_by` に保持する（最上位・最後の枝の直後だけ）。
+
+- キーは出力列名（左端の枝の列名）か整数序数。解決は `sql::set_op::resolve_order_keys`
+  （序数が範囲外は `42P10`、不一致は `42703`、複数一致は `42702`。名前の大文字小文字は広域取得の
+  `ORDER BY` と同じく区別する。枝の表にあっても出力に無い列は `42703`）。
+- 式キーは `0A000`（PG は結果列名しか許さない）。キー数の上限は広域取得と同じ 8（超過は `54000`）。
+- 判定順は、構文（`42601`）→ 全体 `LIMIT`／`OFFSET` の範囲（`22000`）→ 型整合（`42804`）→
+  キーの解決 → 関門。
+- **ソート実行は Issue #3267 まで未実装**のため、解決に成功したキーも `check_set_order_by` の関門が
+  `0A000` で拒否する（未ソートの行を返さない）。関門は `prepare`／`describe_columns` にあり、
+  実行・Describe・`EXPLAIN`（`ANALYZE` 含む）・`DECLARE CURSOR` が共有する。ビュー・InlineOnly の
+  CTE 本文・再帰 CTE のアンカー項は定義時に `0A000`。#3267 はこの関門を解決済みキーの返却へ
+  置き換える。
+- 次は従来どおり `42601`: 最後以外の枝の直後の `ORDER BY`、括弧内の入れ子の集合式の `ORDER BY`、
+  `LIMIT` の後の `ORDER BY`、キー無し・末尾カンマ、修飾名、距離演算子キー。
 
 以下はいずれも枝の中では `42601`:
 
 - 枝内の `<=>`（ベクトル順位付け）・`USING PLAN`・`USING MODE`・`HINT ORDER`・
-  `DISTINCT`、括弧なしの枝内 `ORDER BY`・`OFFSET`
+  `DISTINCT`、括弧なしの枝内 `OFFSET`（括弧なしの最後の枝の直後の `ORDER BY` は集合全体のキー。上記）
 - 式項目（`Computed` 投影。宣言的 UDF・組み込み関数呼び出し）: 束縛時に型を
   確定できないため fail-closed で拒否する
 
@@ -152,8 +170,8 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 
 ## スコープ外（Issue #929 の対象外事項）
 
-- `DISTINCT`・ベクトル順位付けを含む枝、集合演算の結果全体に対する `ORDER BY`
-  （集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）
+- `DISTINCT`・ベクトル順位付けを含む枝、集合演算の結果全体に対する `ORDER BY` のソート実行
+  （構文・束縛は Issue #3266 で対応済み、実行は Issue #3267。集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）
 - `INTERSECT ALL`／`EXCEPT ALL`
 - `COPY TO`・`EXPLAIN` での集合演算（`EXPLAIN` は Issue #2047、`DECLARE CURSOR` は Issue #3176 で対応済み。
   cursor の詳細は [sql-cursor.md](sql-cursor.md)。
