@@ -448,6 +448,48 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
 - **漏れ検出の確認**: 隔離 worktree で一時的にダミー variant を足すと engine ライブラリで 25 件
   （lib test を含め 26 件）の E0004 が出て、上記の関数と `kind_ordinal` を指した（確認後に戻して未コミット）。
 
+## Issue #3231 追記（VARCHAR[]・CHAR(n)[] を要素型として受理）
+
+親 #3228・TABLE-14・TABLE-31・TABLE-35 のポインタ。`ArrayElemType` に `Varchar(Option<u32>)`・`Bpchar(u32)` を
+追加した。専用の配列 OID（1015・1014）があるため TEXT へ写さず、型の区別を列宣言が持つ。
+
+- **値表現**: `ArrayValue::Text` を共有する（スカラーの TEXT・VARCHAR・CHAR が `Value::Text` を共有するのと同じ）。
+  物理フレームは TEXT 要素と同一で、型の区別は列宣言（`ArrayType::elem()`）だけが持つ。
+- **種別照合**: `row_codec::array_elem_kind_eq` は照合前に `Varchar`・`Bpchar` を `Text` の格納種別へ正規化する。
+  文字数の上限は書き込み前の正規化と codec の最後の砦が守る。
+- **カタログ param**: 固定フィールド数の文法にした。`varchar,<max_len>`（長さなし）・`varchar_n,<n>,<max_len>`・
+  `bpchar,<n>,<max_len>`。`parse_array_param` は「タグごとの固定フィールド数 + 1」を末尾の `d<N>` と読むため、
+  長さの有無でフィールド数が変わる文法は採らない。既存の型の param は 1 バイトも変えない。
+  旧バイナリは未知タグを `Invalid` で拒否する（fail-closed）。
+- **代入の意味**: 要素ごとにスカラーと同じ規則（`row_codec::normalize_char_array_value`。超過は `22001`・
+  超過部分が U+0020 のみなら切り詰め・`CHAR(n)` は空白詰め）。共有点は `sql::parser::convert_array_elements`
+  （配列リテラル・`ARRAY[...]`）、`sql::set_expr::expr_value_to_column_value`（UPDATE の SET 式・`INSERT ... SELECT`）、
+  `row_codec::normalize_char_length_value`（UPSERT の `EXCLUDED` 等）。配列の代入変換は
+  `cast::bind_array_assignment` が長さを変換ノードで扱わず（スカラーの `bind_scalar_assignment` と同じ分担）、
+  評価後の列値化へ任せる。codec の `validate_array_elements` が未正規化の値を拒否する最後の砦になる。
+- **明示 CAST の意味**: PG と同じく n 文字へ黙って切り詰め、`CHAR(n)` は空白詰めにする（`22001` にしない）。
+  `CHAR(n)[]` から `CHAR(n)` 以外の配列へ変換するときは、各要素の末尾の U+0020 を除く。
+- **DoS 対策**: `CHAR(n)` の空白詰めは、要素ごとの確保の前に累計バイト数を配列ペイロード上限で打ち切り `54000`
+  にする（代入と CAST の両方。`CHAR(10485760)[]` への多数要素による巨大確保を防ぐ）。
+- **一意キー**: `constraint::array_elem_tag` は `Varchar`・`Bpchar` を TEXT と同じタグ 0 にする。新規値の経路は
+  `ArrayValue::elem()`（Text）、既存行の経路は列宣言の要素型からタグを引くため、番号がずれると同値の重複が
+  UNIQUE を素通りする（fail-open）。`CHAR(n)` は詰め済みのため、`'{a}'` と `'{"a  "}'` は同じキーになる。
+  既存タグ 0〜13・マーカーは不変。
+- **比較・包含・量化比較**: `sql::array_ops` は Text・Varchar・Bpchar を 1 つの比較系として扱い、`CHAR(n)` の
+  被演算子は束縛段で「要素ごとに末尾空白を除いた `text[]`」への変換で包む（投影では包まず、空白詰めのまま返る）。
+- **配列関数**: 要素が `CHAR(n)` のみの配列関数（`array_append(c, 'x')` 等）は `text[]` として評価する。
+  `CHAR(n)[]` 列へ代入するとき列の格納形へ空白詰めされる。`ARRAY[...]` 構築子の `bpchar` のみの要素は従来どおり
+  `0A000`。
+- **wire**: OID は `_varchar`（1015）・`_bpchar`（1014）。typmod は PG の `atttypmod` と同じ `n + 4`
+  （長さなしの `VARCHAR[]`・他の配列は -1）。バイナリ形式は対象外のまま（`0A000`）。NoSQL（HTTP）の型名は
+  `varchar[]`・`bpchar[]`。
+- **ALTER COLUMN TYPE**: `TEXT[]` と `VARCHAR(n)[]`・`CHAR(n)[]` の間は代入変換として受理し、長すぎる行が
+  あれば `22001` で失敗する（スカラーと同じ）。
+- **PG との既知の差（セキュリティ影響なし）**: `array_agg(varchar 列)` は従来どおり `text[]`（1009）を返し、
+  `array_agg(char 列)` は `0A000` のまま。式から推論される配列型（`ARRAY['a'::varchar(3)]` 等）は `text[]` のまま
+  （値は同一）。`bpchar[]` 列そのものの ORDER BY は、U+0020 未満の文字を含む要素で順序が PG（末尾空白除去後の
+  比較）とずれうる（等価判定は正しい）。
+
 ## Issue #3230 追記（`SMALLINT[]` の受理）
 
 親 #3228・TABLE-14・TABLE-35 のポインタ。#3229 のチェックリストに従い、`SMALLINT[]`／`INT2[n]` を専用の

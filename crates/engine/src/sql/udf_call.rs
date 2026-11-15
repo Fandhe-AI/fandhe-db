@@ -8478,6 +8478,8 @@ fn scalar_numeric_kind(
             crate::catalog::ArrayElemType::Real => Some(NumericKind::Float4),
             // 残りは静的な数値種別を持たない（要素型の追加時にここで判断を強制する。Issue #3229）。
             crate::catalog::ArrayElemType::Text
+            | crate::catalog::ArrayElemType::Varchar(_)
+            | crate::catalog::ArrayElemType::Bpchar(_)
             | crate::catalog::ArrayElemType::Bool
             | crate::catalog::ArrayElemType::Double
             | crate::catalog::ArrayElemType::Date

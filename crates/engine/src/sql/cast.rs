@@ -399,7 +399,9 @@ impl CastType {
     }
 
     /// 配列の変換先・変換元としての要素型（`CastType::Array(elem)` の `elem`）を、行内表現を
-    /// 持つ `ArrayElemType` へ写す。対応が無い要素（`interval`・`varchar(n)`・`char(n)`・修飾子なしの `numeric`・ENUM）と、配列でない型は
+    /// 持つ `ArrayElemType` へ写す。`varchar`／`varchar(n)`／`char(n)`（Issue #3231）・`smallint`（Issue #3230）・`time`（Issue #3232）・`timestamptz`（Issue #3233）は対応した。
+    /// 対応が無い要素（`interval`・修飾子なしの `numeric`・
+    /// ENUM）と、配列でない型は
     /// `None`（束縛段が `0A000` にする。fail-closed）。
     pub fn array_elem_type(&self) -> Option<ArrayElemType> {
         let CastType::Array(elem) = self else {
@@ -425,13 +427,11 @@ impl CastType {
             CastType::Bytea => ArrayElemType::Bytea,
             CastType::Json => ArrayElemType::Json,
             CastType::Jsonb => ArrayElemType::Jsonb,
+            CastType::Varchar(len) => ArrayElemType::Varchar(*len),
+            CastType::Bpchar(n) => ArrayElemType::Bpchar(*n),
             // 対応する要素型が無い CAST 型（束縛段が `0A000` にする）。CastType の追加時・
             // 要素型の追加時にここで対応判断を強制する（Issue #3229）。
-            CastType::Numeric(None)
-            | CastType::Varchar(_)
-            | CastType::Bpchar(_)
-            | CastType::Interval
-            | CastType::Array(_) => return None,
+            CastType::Numeric(None) | CastType::Interval | CastType::Array(_) => return None,
         })
     }
 
@@ -543,6 +543,8 @@ pub(crate) fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
         ArrayElemType::Bytea => CastType::Bytea,
         ArrayElemType::Json => CastType::Json,
         ArrayElemType::Jsonb => CastType::Jsonb,
+        ArrayElemType::Varchar(len) => CastType::Varchar(len),
+        ArrayElemType::Bpchar(n) => CastType::Bpchar(n),
         ArrayElemType::Enum => return None,
     })
 }
@@ -1033,7 +1035,7 @@ fn cast_dst(target: &CastType) -> Option<CastDst> {
 }
 
 /// 変換ノードを組み立てる（引数 1 個の `BuiltinFn::Cast`）。
-fn cast_node(f: CastFn, arg: BoundExpr) -> BoundExpr {
+pub(crate) fn cast_node(f: CastFn, arg: BoundExpr) -> BoundExpr {
     BoundExpr::Builtin {
         f: BuiltinFn::Cast(f),
         args: vec![arg],
@@ -1197,6 +1199,14 @@ pub(super) fn bind_array_assignment(
             "column cannot be assigned an array with a different element type",
         ));
     }
+    // `VARCHAR(n)`／`CHAR(n)` 要素の長さは変換ノードでは扱わない。明示 CAST は n 超過を黙って
+    // 切り詰めるが、代入は `22001`（超過部分が半角空白のみなら切り詰め）・`CHAR(n)` は空白詰めで
+    // あり、評価後の列値化（`sql::set_expr::expr_value_to_column_value` の
+    // `normalize_char_array_value`）が担う（Issue #3231。`bind_scalar_assignment` のスカラーと同じ分担）。
+    let tgt_ty = match tgt_ty {
+        CastType::Varchar(Some(_)) | CastType::Bpchar(_) => CastType::Text,
+        other => other,
+    };
     let src_arr = CastType::Array(Box::new(src_ty));
     let tgt_arr = CastType::Array(Box::new(tgt_ty));
     let (Some(src), Some(dst)) = (
@@ -1810,16 +1820,15 @@ mod tests {
             (CastType::Bytea, ArrayElemType::Bytea),
             (CastType::Json, ArrayElemType::Json),
             (CastType::Jsonb, ArrayElemType::Jsonb),
+            // `varchar`／`varchar(n)`／`char(n)` は専用の要素型（Issue #3231）。
+            (CastType::Varchar(None), ArrayElemType::Varchar(None)),
+            (CastType::Varchar(Some(3)), ArrayElemType::Varchar(Some(3))),
+            (CastType::Bpchar(3), ArrayElemType::Bpchar(3)),
         ] {
             assert_eq!(arr(elem.clone()).array_elem_type(), Some(want), "{elem:?}");
             assert!(arr(elem).result_column_type().is_some());
         }
-        for elem in [
-            CastType::Interval,
-            CastType::Varchar(Some(3)),
-            CastType::Bpchar(3),
-            CastType::Numeric(None),
-        ] {
+        for elem in [CastType::Interval, CastType::Numeric(None)] {
             assert_eq!(arr(elem.clone()).array_elem_type(), None, "{elem:?}");
             assert_eq!(arr(elem).result_column_type(), None);
         }

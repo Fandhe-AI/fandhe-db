@@ -1419,6 +1419,8 @@ impl<'a> ArrayRef<'a> {
                 std::borrow::Cow::Owned(self.to_value()?.equality_payload()?),
             ),
             ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
             | ArrayElemType::Bool
             | ArrayElemType::Integer
             | ArrayElemType::BigInt
@@ -2043,13 +2045,26 @@ const MAX_ARRAY_PAYLOAD_LEN: u32 = MAX_TEXT_FIELD_LEN;
 /// [`ArrayValue::elem`] が `NUMERIC` で代表値しか返せないため、列宣言との照合は
 /// 完全一致ではなく種別一致で行う。
 pub(crate) fn array_elem_kind_eq(a: ArrayElemType, b: ArrayElemType) -> bool {
-    std::mem::discriminant(&a) == std::mem::discriminant(&b)
+    std::mem::discriminant(&array_elem_storage_kind(a))
+        == std::mem::discriminant(&array_elem_storage_kind(b))
+}
+
+/// 要素型を「格納種別」へ正規化する（Issue #3231）。`VARCHAR`／`CHAR(n)` は TEXT と同じ
+/// 物理表現（`ArrayValue::Text`）を共有するため、種別照合では `Text` として扱う。文字数の
+/// 上限・空白詰めは [`normalize_char_array_value`]・[`validate_array_elements`] が守る。
+fn array_elem_storage_kind(e: ArrayElemType) -> ArrayElemType {
+    match e {
+        ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => ArrayElemType::Text,
+        other => other,
+    }
 }
 
 /// 固定長要素型の 1 要素あたりのバイト幅（`TEXT` は可変長なので `None`）。
 fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
     match elem {
         ArrayElemType::Text
+        | ArrayElemType::Varchar(_)
+        | ArrayElemType::Bpchar(_)
         | ArrayElemType::Bytea
         | ArrayElemType::Json
         | ArrayElemType::Jsonb
@@ -2249,10 +2264,37 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
                 })?;
             }
         }
+        // `VARCHAR(n)[]`／`CHAR(n)[]`（Issue #3231）。書き込み経路は
+        // [`normalize_char_array_value`] で切り詰め・空白詰め済みにしてから encode へ渡す。
+        // ここは切り詰めなしの厳格判定で、未正規化の値を永続化させない最後の砦。
+        // エラーには型と n だけを含め、値は反射しない。
+        (ArrayElemType::Varchar(Some(n)), ArrayValue::Text(items)) => {
+            let limit = usize::try_from(n).unwrap_or(usize::MAX);
+            for text in items.iter().flatten() {
+                if text.len() > limit && text.chars().nth(limit).is_some() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array element too long for type character varying({n})"
+                    )));
+                }
+            }
+        }
+        (ArrayElemType::Bpchar(n), ArrayValue::Text(items)) => {
+            let limit = usize::try_from(n).unwrap_or(usize::MAX);
+            for text in items.iter().flatten() {
+                if text.len() < limit || text.chars().count() != limit {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array element of type character({n}) is not blank-padded"
+                    )));
+                }
+            }
+        }
         // 検査対象なしの組。全要素型を列挙し、要素型の追加時にコンパイルエラーで
         // 検証要否の判断を強制する（Issue #3229）。
         (
-            ArrayElemType::Text
+            ArrayElemType::Varchar(None)
+            | ArrayElemType::Varchar(Some(_))
+            | ArrayElemType::Bpchar(_)
+            | ArrayElemType::Text
             | ArrayElemType::Bool
             | ArrayElemType::Integer
             | ArrayElemType::BigInt
@@ -2634,12 +2676,14 @@ fn decode_array_elements(
     }
     let (nulls, rest) = split_array_null_bitmap(bytes, count as usize, flags)?;
     match elem {
-        ArrayElemType::Text => decode_var_array_elements(rest, &nulls, |b| {
-            std::str::from_utf8(b).map(str::to_string).map_err(|_| {
-                RowCodecError::Invalid("array text element is not valid UTF-8".to_string())
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => {
+            decode_var_array_elements(rest, &nulls, |b| {
+                std::str::from_utf8(b).map(str::to_string).map_err(|_| {
+                    RowCodecError::Invalid("array text element is not valid UTF-8".to_string())
+                })
             })
-        })
-        .map(ArrayValue::Text),
+            .map(ArrayValue::Text)
+        }
         ArrayElemType::Json => {
             decode_var_array_elements(rest, &nulls, decode_array_utf8).map(ArrayValue::Json)
         }
@@ -4758,15 +4802,71 @@ pub(crate) fn convert_char_family<'a>(
     fit_pad_char_length(to, source, limit)
 }
 
-/// [`fit_pad_char_length`] を `Value::Text` へその場適用する（切り詰め・空白詰め）。
+/// [`fit_pad_char_length`] を `Value::Text`／`Value::Array`（`VARCHAR(n)[]`・`CHAR(n)[]`）へ
+/// その場適用する（切り詰め・空白詰め）。
 pub(crate) fn normalize_char_length_value(
     column: &crate::catalog::ColumnDef,
     value: &mut Value,
 ) -> std::result::Result<(), CharLengthExceeded> {
-    if let Value::Text(t) = value {
-        let limit = usize::try_from(MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
-        let fitted = fit_pad_char_length(&column.ty, t, limit)?.into_owned();
-        *t = fitted;
+    match value {
+        Value::Text(t) => {
+            let limit = usize::try_from(MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
+            let fitted = fit_pad_char_length(&column.ty, t, limit)?.into_owned();
+            *t = fitted;
+        }
+        Value::Array(av) => {
+            if let ColumnType::Array(array_ty) = &column.ty {
+                normalize_char_array_value(array_ty, av)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `VARCHAR(n)[]`／`CHAR(n)[]` 列へ書き込む配列値の各要素を、スカラーの
+/// [`fit_pad_char_length`] と同じ規則で列の格納形へ正規化する（Issue #3231・TABLE-14・
+/// TABLE-31）。超過は `22001` 相当（超過部分が U+0020 のみなら切り詰め）、`CHAR(n)` は
+/// n 文字へ空白詰め。他の要素型・`Text` 以外の値は素通しする。多次元は平坦な要素列へ適用する。
+/// 詰め後の要素の累計バイト数を**確保の前に**配列ペイロード上限（`54000` 相当）で打ち切り、
+/// `CHAR(10485760)[]` への多数要素による巨大確保（DoS）を防ぐ。SQL 束縛段
+/// （`sql::parser::convert_array_elements`）と SET 式評価（`tenant`）が共有する単一の変換点。
+pub(crate) fn normalize_char_array_value(
+    array_ty: &ArrayType,
+    value: &mut ArrayValue,
+) -> std::result::Result<(), CharLengthExceeded> {
+    let (n, bpchar, elem_ty) = match array_ty.elem() {
+        ArrayElemType::Varchar(Some(n)) => (n, false, ColumnType::Varchar(Some(n))),
+        ArrayElemType::Bpchar(n) => (n, true, ColumnType::Bpchar(n)),
+        _ => return Ok(()),
+    };
+    let items = match value {
+        ArrayValue::Text(items) => items,
+        ArrayValue::Multi(m) => match m.inner.as_mut() {
+            ArrayValue::Text(items) => items,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let mut budget = usize::try_from(MAX_ARRAY_PAYLOAD_LEN).unwrap_or(usize::MAX);
+    let over = || CharLengthExceeded {
+        bpchar,
+        n,
+        pad_limit: true,
+    };
+    for slot in items.iter_mut() {
+        let Some(text) = slot else { continue };
+        let fitted = fit_pad_char_length(&elem_ty, text, budget)?;
+        let (len, owned) = match fitted {
+            std::borrow::Cow::Owned(s) => (s.len(), Some(s)),
+            std::borrow::Cow::Borrowed(b) => (b.len(), None),
+        };
+        budget = budget.checked_sub(len).ok_or_else(over)?;
+        match owned {
+            Some(s) => *text = s,
+            // 末尾空白の切り詰め（借用）。
+            None => text.truncate(len),
+        }
     }
     Ok(())
 }
@@ -6894,6 +6994,78 @@ mod tests {
             fit_pad_char_length(&ColumnType::Varchar(Some(5)), "a", lim).unwrap(),
             "a"
         );
+    }
+
+    /// `normalize_char_array_value`（Issue #3231）: 要素ごとの切り詰め・空白詰め・`22001`・
+    /// NULL 要素・多次元・累計上限（確保前の `54000`）。他の要素型・他の値は素通し。
+    #[test]
+    fn normalize_char_array_value_rules() {
+        let text = |items: &[Option<&str>]| {
+            ArrayValue::Text(items.iter().map(|s| s.map(str::to_string)).collect())
+        };
+        let varchar3 = ArrayType::new(ArrayElemType::Varchar(Some(3)), 8).expect("ty");
+        let bpchar3 = ArrayType::new(ArrayElemType::Bpchar(3), 8).expect("ty");
+
+        let mut v = text(&[Some("ab"), None, Some("abc   ")]);
+        normalize_char_array_value(&varchar3, &mut v).expect("fits");
+        assert_eq!(v, text(&[Some("ab"), None, Some("abc")]));
+        let mut v = text(&[Some("abcd")]);
+        let e = normalize_char_array_value(&varchar3, &mut v).expect_err("too long");
+        assert!(!e.to_string().contains("abcd"));
+
+        let mut c = text(&[Some("a"), None, Some("abc  ")]);
+        normalize_char_array_value(&bpchar3, &mut c).expect("fits");
+        assert_eq!(c, text(&[Some("a  "), None, Some("abc")]));
+        let mut c = text(&[Some("日")]);
+        normalize_char_array_value(&bpchar3, &mut c).expect("fits");
+        assert_eq!(c, text(&[Some("日  ")]));
+        assert!(normalize_char_array_value(&bpchar3, &mut text(&[Some("abcd")])).is_err());
+
+        // 多次元は平坦な要素列へ適用する。
+        let mut m = ArrayValue::with_dims(text(&[Some("a"), Some("b")]), vec![1, 2]).expect("dims");
+        normalize_char_array_value(&bpchar3, &mut m).expect("fits");
+        assert_eq!(m.flat(), &text(&[Some("a  "), Some("b  ")]));
+
+        // 要素型が文字系でない・値が Text でない場合は素通し。
+        let plain = ArrayType::new(ArrayElemType::Text, 8).expect("ty");
+        let mut t = text(&[Some("longer than three")]);
+        normalize_char_array_value(&plain, &mut t).expect("pass-through");
+        assert_eq!(t, text(&[Some("longer than three")]));
+
+        // 空白詰めの累計が配列ペイロード上限を超えるなら確保前に拒否する。
+        let big = ArrayType::new(ArrayElemType::Bpchar(MAX_TEXT_FIELD_LEN / 2), 8).expect("ty");
+        let mut b = text(&[Some("a"), Some("b"), Some("c")]);
+        let e = normalize_char_array_value(&big, &mut b).expect_err("over the payload limit");
+        assert!(e.pad_limit);
+    }
+
+    /// `validate_array_elements`（Issue #3231）の最後の砦: 未詰めの `CHAR(n)`・超過した
+    /// `VARCHAR(n)` は encode で拒否する（値は文言へ反射しない）。
+    #[test]
+    fn char_array_elements_are_rejected_when_not_normalized() {
+        let text =
+            |items: &[&str]| ArrayValue::Text(items.iter().map(|s| Some(s.to_string())).collect());
+        let varchar3 = ArrayType::new(ArrayElemType::Varchar(Some(3)), 8).expect("ty");
+        let bpchar3 = ArrayType::new(ArrayElemType::Bpchar(3), 8).expect("ty");
+        assert!(validate_array_elements(&varchar3, &text(&["ab", "abc"])).is_ok());
+        let e = validate_array_elements(&varchar3, &text(&["abcd"])).expect_err("too long");
+        assert!(!e.to_string().contains("abcd"));
+        assert!(validate_array_elements(&bpchar3, &text(&["ab "])).is_ok());
+        assert!(validate_array_elements(&bpchar3, &text(&["ab"])).is_err());
+        assert!(validate_array_elements(&bpchar3, &text(&["abcd"])).is_err());
+        // 種別照合は TEXT 系で共有する。
+        assert!(array_elem_kind_eq(
+            ArrayElemType::Text,
+            ArrayElemType::Varchar(Some(3))
+        ));
+        assert!(array_elem_kind_eq(
+            ArrayElemType::Text,
+            ArrayElemType::Bpchar(3)
+        ));
+        assert!(!array_elem_kind_eq(
+            ArrayElemType::Bytea,
+            ArrayElemType::Bpchar(3)
+        ));
     }
 
     /// `fit_char_length`（TABLE-31・Issue #1564）: 境界・マルチバイト・空白切り詰め・素通し。

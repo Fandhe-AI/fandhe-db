@@ -7206,6 +7206,13 @@ pub enum ArrayElemType {
     Jsonb,
     /// 名前付き `ENUM`（Issue #1357）。語彙は [`ArrayType::enum_def`] が保持する。
     Enum,
+    /// `VARCHAR`／`VARCHAR(n)`（Issue #3231・TABLE-14）。`None` は長さ制限なし。
+    /// 行内表現は TEXT と同一（長さ前置の UTF-8。`ArrayValue::Text` を共有）で、型の区別は
+    /// 列宣言だけが持つ。`Some(n)` は `1..=`[`MAX_CHAR_TYPE_LENGTH`] 文字。
+    Varchar(Option<u32>),
+    /// `CHAR(n)`（Issue #3231・TABLE-14）。行内表現は TEXT と同一で、各要素は書き込み時に
+    /// ちょうど `n` 文字へ空白詰めされる。`1..=`[`MAX_CHAR_TYPE_LENGTH`]。
+    Bpchar(u32),
     /// `SMALLINT`（Issue #3230）。行内表現は 2 バイト LE。OID は別（`_int2` = 1005）なので
     /// `Integer` へは丸めない。
     SmallInt,
@@ -7222,7 +7229,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 17] = [
+    pub const ALL_KINDS: [ArrayElemType; 19] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7240,6 +7247,8 @@ impl ArrayElemType {
         ArrayElemType::Json,
         ArrayElemType::Jsonb,
         ArrayElemType::Enum,
+        ArrayElemType::Varchar(Some(10)),
+        ArrayElemType::Bpchar(10),
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
         ArrayElemType::TimestampTz,
@@ -7265,9 +7274,11 @@ impl ArrayElemType {
             ArrayElemType::Json => 11,
             ArrayElemType::Jsonb => 12,
             ArrayElemType::Enum => 13,
-            ArrayElemType::SmallInt => 14,
-            ArrayElemType::Time => 15,
-            ArrayElemType::TimestampTz => 16,
+            ArrayElemType::Varchar(_) => 14,
+            ArrayElemType::Bpchar(_) => 15,
+            ArrayElemType::SmallInt => 16,
+            ArrayElemType::Time => 17,
+            ArrayElemType::TimestampTz => 18,
         }
     }
 
@@ -7291,6 +7302,9 @@ impl ArrayElemType {
             ArrayElemType::Json => "json",
             ArrayElemType::Jsonb => "jsonb",
             ArrayElemType::Enum => "enum",
+            ArrayElemType::Varchar(None) => "varchar",
+            ArrayElemType::Varchar(Some(_)) => "varchar_n",
+            ArrayElemType::Bpchar(_) => "bpchar",
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
             ArrayElemType::TimestampTz => "timestamptz",
@@ -7317,6 +7331,7 @@ impl ArrayElemType {
             "bytea" => Ok(ArrayElemType::Bytea),
             "json" => Ok(ArrayElemType::Json),
             "jsonb" => Ok(ArrayElemType::Jsonb),
+            "varchar" => Ok(ArrayElemType::Varchar(None)),
             other => Err(CatalogError::Invalid(format!(
                 "unsupported array element type: {other:?}"
             ))),
@@ -7371,7 +7386,11 @@ impl ArrayType {
             ArrayElemType::Numeric { precision, scale } => {
                 validate_numeric_precision_scale(precision, scale)?
             }
-            ArrayElemType::Text
+            ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n) => {
+                validate_char_type_length(n)?
+            }
+            ArrayElemType::Varchar(None)
+            | ArrayElemType::Text
             | ArrayElemType::Bool
             | ArrayElemType::Integer
             | ArrayElemType::BigInt
@@ -7466,6 +7485,9 @@ impl ArrayType {
                 format!("numeric,{precision},{scale},{}", self.max_len)
             }
             (ArrayElemType::Enum, Some(def)) => format!("enum,{},{}", def.name, self.max_len),
+            (ArrayElemType::Varchar(Some(n)) | ArrayElemType::Bpchar(n), _) => {
+                format!("{},{n},{}", self.elem.catalog_tag(), self.max_len)
+            }
             // `Enum` で語彙が無い組は構築経路（`new_enum` のみ）で作れないが、従来どおり
             // タグ形式へ落とす（出力はバイト単位で不変）。
             (ArrayElemType::Enum, None)
@@ -7482,6 +7504,7 @@ impl ArrayType {
                 | ArrayElemType::Bytea
                 | ArrayElemType::Json
                 | ArrayElemType::Jsonb
+                | ArrayElemType::Varchar(None)
                 | ArrayElemType::SmallInt
                 | ArrayElemType::Time
                 | ArrayElemType::TimestampTz,
@@ -7509,7 +7532,7 @@ fn parse_array_param(
     let elem_tag = fields.first().copied().unwrap_or("");
     let expected = match elem_tag {
         "numeric" => 4,
-        "enum" => 3,
+        "enum" | "varchar_n" | "bpchar" => 3,
         _ => 2,
     };
     // 末尾の `d<N>`（2 次元以上の宣言。Issue #1605）を先に切り離す。
@@ -7543,6 +7566,14 @@ fn parse_array_param(
             validate_identifier(name)?;
             let def = resolve_enum(name)?;
             ArrayType::new_enum(def, max_len)
+        }
+        ("varchar_n", [_, n, _]) => {
+            let n = parse_char_length_param("varchar", n)?;
+            ArrayType::new(ArrayElemType::Varchar(Some(n)), max_len)
+        }
+        ("bpchar", [_, n, _]) => {
+            let n = parse_char_length_param("bpchar", n)?;
+            ArrayType::new(ArrayElemType::Bpchar(n), max_len)
         }
         (other, _) => ArrayType::new(ArrayElemType::from_catalog_tag(other)?, max_len),
     }?;
@@ -8185,6 +8216,8 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Uuid
         | ArrayElemType::Numeric { .. }
         | ArrayElemType::Bytea
+        | ArrayElemType::Varchar(_)
+        | ArrayElemType::Bpchar(_)
         | ArrayElemType::SmallInt
         | ArrayElemType::Time
         | ArrayElemType::TimestampTz => false,
@@ -21028,6 +21061,68 @@ mod tests {
             ColumnType::from_catalog_fields("array", "enum,ghost,4", &mut array_resolver),
             Err(CatalogError::TypeNotFound(_))
         ));
+    }
+
+    /// Issue #3231: `VARCHAR`／`VARCHAR(n)`／`CHAR(n)` 要素の `param` は固定フィールド数の
+    /// 文法（`varchar,<max_len>`・`varchar_n,<n>,<max_len>`・`bpchar,<n>,<max_len>`）で往復し、
+    /// 非正準の長さ・範囲外・フィールドの過不足・`varchar` タグへの長さ混入は拒否する。
+    #[test]
+    fn array_varchar_and_bpchar_params_roundtrip_and_reject_malformed() {
+        for (elem, want) in [
+            (ArrayElemType::Varchar(None), "varchar,8"),
+            (ArrayElemType::Varchar(Some(3)), "varchar_n,3,8"),
+            (ArrayElemType::Bpchar(3), "bpchar,3,8"),
+        ] {
+            let ty = ColumnType::Array(ArrayType::new(elem, 8).expect("array ty"));
+            assert_eq!(ty.catalog_fields(), ("array", want.to_string()));
+            let decoded = ColumnType::from_catalog_fields("array", want, &mut array_resolver)
+                .expect("decode");
+            assert_eq!(decoded, ty, "{want}");
+            // 2 次元は末尾の `d2`。
+            let two = ColumnType::Array(
+                ArrayType::new(elem, 8)
+                    .and_then(|a| a.with_ndims(2))
+                    .expect("array ty"),
+            );
+            let two_param = format!("{want},d2");
+            assert_eq!(two.catalog_fields(), ("array", two_param.clone()));
+            assert_eq!(
+                ColumnType::from_catalog_fields("array", &two_param, &mut array_resolver)
+                    .expect("decode 2d"),
+                two
+            );
+        }
+        let max = MAX_CHAR_TYPE_LENGTH;
+        let beyond = MAX_CHAR_TYPE_LENGTH + 1;
+        let max_ok = format!("bpchar,{max},8");
+        assert!(ColumnType::from_catalog_fields("array", &max_ok, &mut array_resolver).is_ok());
+        let too_long = format!("bpchar,{beyond},8");
+        let too_long_v = format!("varchar_n,{beyond},8");
+        for bad in [
+            "varchar_n,03,8", // 先頭ゼロ
+            "bpchar,0,8",     // 範囲外
+            "varchar_n,0,8",  // 範囲外
+            "bpchar,3",       // max_len 欠落
+            "varchar_n,3",    // max_len 欠落
+            "bpchar,3,8,1",   // 余剰（`d<N>` でない）
+            "bpchar,3,08",    // max_len 非正準
+            "bpchar,-,8",     // 符号・非数字
+            "varchar,3,8",    // `varchar` タグへの長さ混入（2 次元と誤読されない）
+            "varchar",        // max_len 欠落
+            too_long.as_str(),
+            too_long_v.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    ColumnType::from_catalog_fields("array", bad, &mut array_resolver),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "param {bad:?} must be rejected"
+            );
+        }
+        // ENUM 依存の判定は新しい param を enum と誤認しない。
+        assert_eq!(array_param_enum_name("varchar_n,3,8").ok(), Some(None));
+        assert_eq!(array_param_enum_name("bpchar,3,8").ok(), Some(None));
     }
 
     /// Issue #3230: `SMALLINT[]` の param は `smallint,<max_len>`（2 次元は末尾 `d2`）で往復し、

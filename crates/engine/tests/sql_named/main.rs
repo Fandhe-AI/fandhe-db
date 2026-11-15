@@ -46,6 +46,7 @@ mod sql_alter_table_set_drop_default;
 mod sql_alter_table_set_not_null;
 mod sql_alter_table_unique_constraint;
 mod sql_arena_cache;
+mod sql_array_char_elements;
 mod sql_array_fn;
 mod sql_array_predicates;
 mod sql_binary_quantize;

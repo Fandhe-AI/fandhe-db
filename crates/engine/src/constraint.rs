@@ -2377,6 +2377,10 @@ fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
         crate::catalog::ArrayElemType::Json => 11,
         crate::catalog::ArrayElemType::Jsonb => 12,
         crate::catalog::ArrayElemType::Enum => 13,
+        // `VARCHAR`／`CHAR(n)` は TEXT と同じタグ 0 を共有する（Issue #3231）。新規値の経路
+        // （`ArrayValue::elem()` = Text）と既存行の経路（スキーマ由来の要素型）でタグがずれると
+        // 同値の重複が UNIQUE を素通りするため、番号は消費しない。
+        crate::catalog::ArrayElemType::Varchar(_) | crate::catalog::ArrayElemType::Bpchar(_) => 0,
         crate::catalog::ArrayElemType::SmallInt => 14,
         crate::catalog::ArrayElemType::Time => 15,
         crate::catalog::ArrayElemType::TimestampTz => 16,
@@ -5147,6 +5151,10 @@ mod tests {
             (E::Json, 11),
             (E::Jsonb, 12),
             (E::Enum, 13),
+            // `VARCHAR`／`CHAR(n)` は TEXT と同じタグ 0 を共有する（Issue #3231）。新規値の経路
+            // （`ArrayValue::elem()` = Text）と既存行の経路（列宣言の要素型）で同じキーになる。
+            (E::Varchar(Some(10)), 0),
+            (E::Bpchar(10), 0),
             // Issue #3230 の新規採番（既存値は振り直さない）。
             (E::SmallInt, 14),
             // Issue #3232 の新規採番（既存値は振り直さない）。
@@ -5162,8 +5170,12 @@ mod tests {
             let tag = array_elem_tag(elem);
             assert_eq!(tag, expected, "persisted tag must not be renumbered");
             assert!(tag < ARRAY_KEY_DIMS_MARK);
-            assert!(seen.insert(tag), "duplicate tag {tag}");
+            // TEXT の別名（`VARCHAR`／`CHAR(n)`）以外は互いに異なるタグを持つ。
+            if !matches!(elem, E::Varchar(_) | E::Bpchar(_)) {
+                assert!(seen.insert(tag), "duplicate tag {tag}");
+            }
         }
+        assert_eq!(array_elem_tag(E::Varchar(None)), array_elem_tag(E::Text));
         // 永続化されるマーカーの値も固定する（Issue #1605）。
         assert_eq!(ARRAY_KEY_NULL_MARK, 0x80);
         assert_eq!(ARRAY_KEY_DIMS_MARK, 0x40);

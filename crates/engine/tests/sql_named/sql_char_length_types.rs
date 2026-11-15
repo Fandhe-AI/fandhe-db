@@ -159,11 +159,15 @@ fn invalid_lengths_are_rejected_fail_closed_without_side_effects() {
     for sql in [
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR)",
         "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHARACTER)",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR(3)[])",
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR(3)[])",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
     }
+    // `VARCHAR(n)[]`・`CHAR(n)[]` は Issue #3231 で受理へ変わった（`sql_array_char_elements.rs`）。
+    // 長さなしの `CHAR[]` は要素型でも 0A000 のまま。
+    assert_eq!(
+        code(&core, "CREATE TABLE t (id BIGINT PRIMARY KEY, a CHAR[])"),
+        "0A000"
+    );
     ok(&core, "CREATE TABLE base (id BIGINT PRIMARY KEY, a INT)");
     assert_eq!(
         code(&core, "ALTER TABLE base ADD COLUMN b VARCHAR(0)"),
