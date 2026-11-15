@@ -1535,7 +1535,13 @@ impl EngineCore {
                 let lookup = InsertSchemaLookup::new(&self.storage);
                 if stmt.returning.is_some() {
                     Ok(crate::sql::SqlOutcome::Returning(
-                        self.execute_insert_returning_form(target, ctx, stmt, &lookup)?,
+                        self.execute_insert_returning_form(
+                            target,
+                            ctx,
+                            stmt,
+                            &lookup,
+                            session.udfs(),
+                        )?,
                     ))
                 } else {
                     Ok(crate::sql::SqlOutcome::Insert(
@@ -1546,7 +1552,7 @@ impl EngineCore {
             ParsedSql::Delete(DeleteStatement::SingleRow(v)) => {
                 if v.returning.is_some() {
                     Ok(crate::sql::SqlOutcome::Returning(
-                        self.execute_delete_returning_form(target, ctx, v)?,
+                        self.execute_delete_returning_form(target, ctx, v, session.udfs())?,
                     ))
                 } else {
                     Ok(crate::sql::SqlOutcome::Delete(

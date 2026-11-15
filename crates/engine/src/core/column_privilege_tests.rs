@@ -280,6 +280,35 @@ fn insert_needs_privilege_on_the_listed_columns() {
     );
 }
 
+/// RETURNING 内の UDF（Issue #3250）は、引数に書いた列の SELECT 権限と関数の EXECUTE 権限の
+/// 双方を呼び出しロールで判定する。いずれも書き込み前に `42501` で拒否し、行を残さない。
+#[test]
+fn returning_udf_needs_select_on_argument_columns_and_execute_on_function() {
+    let f = fx("colpriv-returning-udf");
+    f.admin_run("CREATE FUNCTION plus1(x) AS x + 1");
+    f.admin_run("GRANT INSERT (a, b, c) ON ca2 TO alice");
+    f.admin_run("GRANT SELECT (a) ON ca2 TO alice");
+    let alice_with_udfs = |sql: &str| {
+        let mut s = bound(f.alice, false);
+        f.core.load_session_udfs(&ctx(), &mut s).expect("load udfs");
+        code(f.core.execute_sql_in_session(&ctx(), &mut s, sql))
+    };
+    assert_eq!(
+        alice_with_udfs("INSERT INTO ca2 (a, b) VALUES (1, 2) RETURNING plus1(a) AS x"),
+        "ok"
+    );
+    assert_eq!(
+        alice_with_udfs("INSERT INTO ca2 (a, b) VALUES (1, 2) RETURNING plus1(c) AS x"),
+        "42501"
+    );
+    f.admin_run("REVOKE EXECUTE ON FUNCTION plus1 FROM PUBLIC");
+    f.admin_run("REVOKE EXECUTE ON FUNCTION plus1 FROM alice");
+    assert_eq!(
+        alice_with_udfs("INSERT INTO ca2 (a, b) VALUES (1, 2) RETURNING plus1(a) AS x"),
+        "42501"
+    );
+}
+
 #[test]
 fn on_conflict_on_constraint_needs_select_on_the_constraint_columns() {
     let f = fx("colpriv-conflict-constraint");

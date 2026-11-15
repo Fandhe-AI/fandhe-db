@@ -42,7 +42,8 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 `<投影>` は `*`・列名リスト（疑似列 `id` を含む）・`AS` 別名付き項目・スカラー式／組み込み関数
 （`SELECT` の `Projection::Columns`／`Projection::All`／`Projection::Items` を再利用。Issue #3249 で
 式・組み込み関数まで受理）。スカラーサブクエリ・集計関数は構文段・束縛段の両方で拒否する。
-UDF の呼び出しは、束縛段が空の UDF レジストリで解決して未定義関数として拒否する（受け皿 #3250）。
+UDF の呼び出しは、セッションの UDF レジストリで解決する（Issue #3250。種類ごとの扱いは
+「UDF の評価」節）。
 
 ## 受理・拒否表
 
@@ -55,7 +56,9 @@ UDF の呼び出しは、束縛段が空の UDF レジストリで解決して�
 | `... RETURNING id RETURNING body USING OPERATION_ID '...'`（重複） | `42601` |
 | `... RETURNING id AS rid, lang AS l USING OPERATION_ID '...'`（`AS` 別名付きの列参照。Issue #3248） | 受理（列名だけが別名になり、値・型は別名なしと同じ。別名の重複も受理） |
 | `... RETURNING vec_norm(embedding), id + 1 AS m USING OPERATION_ID '...'`（組み込み関数・スカラー式。Issue #3249） | 受理（結果の型・値・列名は同じ式の `SELECT` と一致する） |
-| `... RETURNING my_udf(lang) ...`（UDF 呼び出し） | `42883`（受け皿 #3250） |
+| `... RETURNING shout(lang) ...`（宣言的 UDF・WASM UDF。Issue #3250） | 受理（型・値・列名は同じ式の `SELECT` と一致する） |
+| `... RETURNING w(lang) ...`（`LANGUAGE sql｜plpgsql` 関数。書き込みを試みうる） | `0A000`（書き込み前。行・台帳を残さない。意図的な拒否） |
+| `... RETURNING my_udf(lang) ...`（未定義の関数） | `42883` |
 | `... RETURNING (SELECT ...) ...`・式の内側のサブクエリ・集計関数 | `42601`（他表を読む経路を作らない） |
 | `... RETURNING lang + 1 ...`（式の型エラー） | 書き込み前に `42883` 等（台帳は消費しない） |
 | 式の評価時エラー（`1 / 0` 等） | `22012` 等（commit 前に書き込みを中止。行・台帳は残らない。`TenantWriteError::ReturningExpressionFailed`） |
@@ -378,7 +381,7 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
 
 ## 式・組み込み関数の評価（Issue #3249・SQL-21 のポインタ）
 
-- 束縛は `bind_returning` が SELECT と同じ `bind_projection_with_literals`（空の UDF レジストリ・
+- 束縛は `bind_returning` が SELECT と同じ `bind_projection_with_literals`（UDF レジストリは Issue #3250 でセッションのものを渡す。
   ハイブリッド詳細不可）へ委譲する。結果の型（`result_ty`）・既定の列名は SELECT と同じ規則になる。
 - 評価は `sql::returning::ReturningProjector` が行う。式は文ごとに 1 回だけコンパイルし
   （`ExprProgram`）、行ごとには評価スタックを使い回す。セルへの写像とバイト予算は
@@ -390,5 +393,25 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
   評価しない）。採番列・`id` 省略の INSERT は払い出し値が commit 後にしか確定しないため、式項目と
   の組み合わせは書き込み前に `0A000` で拒否する（払い出し値を使った in-txn 投影への拡張は未対応）。
 - 列権限は、RETURNING が読む列（式の中の列識別子を含む）を SELECT 権限で判定する。
-- 未対応のまま残る面: UDF 呼び出し（#3250）、データ変更 CTE・ビューへの書き込み・
+- 未対応のまま残る面: データ変更 CTE・ビューへの書き込み・
   `UPDATE ... FROM`／`DELETE ... USING`・NoSQL への展開（#3251）、`RETURNING` 内の `$n`（位置判定で拒否）。
+
+## UDF の評価（Issue #3250・SQL-21 のポインタ）
+
+- 解決元: SQL 表層の DML 実行・Describe・EXPLAIN は、セッションの UDF レジストリで RETURNING を
+  束縛する（`sql::parser::bind_returning_with_udfs`）。レジストリは認証済みテナントのセッションの
+  ものだけで、他テナントの同名関数は見えず `42883` になる。UDF を解決しない経路（NoSQL・データ変更
+  CTE・ビュー書き込み。#3251）は従来の `bind_returning`（空のレジストリ＝未登録扱いの `42883`）のまま
+  で、fail-closed を保つ。
+- 種類ごとの扱い（いずれも書き込み前に決まり、台帳を消費しない）:
+  - 宣言的 UDF: 束縛時にインライン展開し、既存の式評価で評価する。
+  - WASM UDF: `WasmCall` として評価する。サンドボックスの上限・トラップの写像は `SELECT` と同じ。
+  - `LANGUAGE sql｜plpgsql` 関数: 揮発性によらず `0A000`。
+- 書き込み試行の拒否: RETURNING は write トランザクション内・commit 前に行ごとに投影する。そこで
+  ルーチン本体（DML を実行できる）を再入実行すると、書き込みの入れ子・トリガとの順序・台帳の一貫性
+  が未定義になるため、ルーチンは束縛段で拒否する。宣言的 UDF と WASM UDF は構造上書き込めない。
+  読み取り専用ルーチンを RETURNING で起動できるようにする拡張は未対応（受け皿の Issue は未起票）。
+- 権限: 関数の EXECUTE 権限は呼び出し元ロールで判定する（`42501`）。引数に書いた列は SELECT 列権限で
+  判定する。RLS の再判定は式の評価より前のままで、式は可視の確定行にしか届かない。
+- 評価時エラー（例: 0 除算の `22012`）は commit 前に abort し、行も台帳も残さない。
+- 採番列・`id` 省略の INSERT と式項目（UDF を含む）の組み合わせは従来どおり `0A000`。
