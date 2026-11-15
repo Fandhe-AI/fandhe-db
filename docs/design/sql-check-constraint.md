@@ -346,7 +346,10 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - `qty > '5'`（INTEGER 列に文字列リテラルの `Compare` 形）の受理。
 - `ALTER TABLE ADD/DROP CONSTRAINT CHECK` の `NOT VALID`／`VALIDATE
   CONSTRAINT` 形（Issue #1068 のスコープ外。同 Issue の設計ドキュメント参照）。
-- NoSQL 表層への DDL op（`create_table` 相当。CHECK の ALTER も同様に対象外）。
+- NoSQL 表層の CHECK: `create_table` の CHECK は Issue #1199 で結線済みで、Issue #3246 で
+  SQL と同じ拡張述語形（IN／BETWEEN／IS [NOT] NULL／OR／NOT／`<>`／LIKE）を受理する
+  （[nosql-ddl-mapping.md](nosql-ddl-mapping.md)）。NoSQL での CHECK の ALTER（`alter_table` の
+  add／drop constraint 相当）は受け皿 Issue なしの対象外のまま（要否は別途判断）。
 - `CHECK` 参照列への `ALTER COLUMN TYPE`: 拡大変換・一般変換は再束縛と全行再検証つきで受理済み（Issue #1427・#1637）。カタログのみの変更（VARCHAR(n) の拡大等）で CHECK 依存がある場合は述語の意味不変を論証していないため `2BP01` のまま（意図的に維持）。
 - `catalog.rs` の生書き込み API（`#[cfg(test)]` 限定・production では到達不能）は
   検査点を経由しない。Issue #1078 で、これら 3 API 自身が `CHECK` を含む制約付き
@@ -383,6 +386,11 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   NULL の逆向きケース・エラー文言の非漏えい）、`sql_alter_column_type_check_columns.rs`
   （拡大・一般変換・CharFamily の ALTER TYPE）、`table16_check_constraint.rs`（RENAME 追随と再オープン）、
   `wire_create_table.rs`（末尾 `;` 付きの ADD CONSTRAINT・RENAME・ALTER TYPE）。
+- Issue #3246: wire-server の `http/query/ddl.rs` 単体テスト（SQL とのパリティ行列・形の拒否の
+  `wire_code`）、`tests/http_nosql/nosql13_ddl.rs`（NoSQL `create_table` の拡張述語形・三値論理・
+  テナント越境・engine 拒否の SQL パリティ・末尾 `;` 付き SQL INSERT との混在）、
+  `tests/table_rls/table16_check_constraint.rs`（拡張述語形の越境・RLS 述語名の `OR`／`NOT`
+  への紛れ込み拒否・テナント列参照の `42703`）。
 - `crates/engine/src/sql/where_tree.rs`（三値評価器。Kleene の真理値表・`OR`
   群の短絡と UNKNOWN の伝播・非 NULL で UNKNOWN の葉と範囲外 index の
   `Internal`）。`check_constraint.rs` には置換前の `enforce`（連言ごとの NULL
