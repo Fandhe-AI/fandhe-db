@@ -267,10 +267,23 @@ impl EngineCore {
                 &req.statement_hash,
                 // INSERT 文トリガは 0 行でも 1 回発火する（Issue #1726）。RETURNING 付きでも同様で、
                 // 0 行を返しつつ文トリガを発火する（非空経路と同じ runtime を渡す）。
-                // `ON CONFLICT` 付きは非空と同じく UPSERT 未結線として INSERT・UPDATE トリガを
-                // `0A000` にする（台帳より前）。
-                if upsert_plan.is_some() {
-                    crate::tenant::LedgerOnlyTriggers::Upsert
+                // `ON CONFLICT` 付きは非空と同じく INSERT 文トリガと（`DO UPDATE` なら）UPDATE 文トリガを
+                // 1 回ずつ発火する（Issue #3191）。`RETURNING` 付きは未結線（トリガがあれば `0A000`）。
+                if let Some((_, conflict_action)) = &upsert_plan {
+                    crate::tenant::LedgerOnlyTriggers::Upsert {
+                        triggers: if returning.is_some() {
+                            None
+                        } else {
+                            Some(&bound_triggers)
+                        },
+                        update_set_columns: match conflict_action {
+                            crate::sql::parser::BoundConflictAction::DoUpdate {
+                                assignments,
+                                ..
+                            } => Some(assignments.iter().map(|(idx, _)| *idx).collect()),
+                            crate::sql::parser::BoundConflictAction::DoNothing => None,
+                        },
+                    }
                 } else {
                     crate::tenant::LedgerOnlyTriggers::Insert(Some(&bound_triggers))
                 },
@@ -312,6 +325,8 @@ impl EngineCore {
                     &bound,
                     self.ledger_mode,
                     &schema,
+                    // INSERT・UPDATE トリガを発火する（Issue #3191）。
+                    Some(&self.trigger_runtime.bind(self)),
                 )
                 .map(SqlOutcome::Insert),
                 Some(projection) => crate::sql::exec::execute_upsert_returning_in(
@@ -321,6 +336,8 @@ impl EngineCore {
                     self.ledger_mode,
                     &projection,
                     &schema,
+                    // `RETURNING` 付きのトリガ発火は未結線（トリガがあれば `0A000`）。
+                    None,
                 )
                 .map(SqlOutcome::Returning),
             };

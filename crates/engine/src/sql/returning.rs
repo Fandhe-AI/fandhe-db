@@ -164,10 +164,10 @@ pub(crate) fn column_meta(
         .iter()
         .map(|col| match col {
             ProjectedColumn::Id => Ok(ColumnMeta::Id),
-            // RETURNING は式・別名付き項目（`Projection::Items`）を構文段で拒否するため到達しない。
-            ProjectedColumn::AliasedId { .. } => Err(SqlSurfaceError::Internal {
-                detail: "aliased id is not supported in RETURNING".to_string(),
-            }),
+            // 別名付きの疑似列 `id`（Issue #3248）。通常 SELECT と同じ列メタを使う。
+            ProjectedColumn::AliasedId { name } => {
+                Ok(crate::sql::exec::aliased_id_column_meta(name))
+            }
             ProjectedColumn::HybridDetail { .. } => Err(SqlSurfaceError::Internal {
                 detail: "hybrid detail is not supported in RETURNING".to_string(),
             }),
@@ -209,11 +209,7 @@ pub(crate) fn project_row(
     for col in projection {
         let cell = match col {
             ProjectedColumn::Id => Cell::Integer(id),
-            ProjectedColumn::AliasedId { .. } => {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "aliased id is not supported in RETURNING".to_string(),
-                });
-            }
+            ProjectedColumn::AliasedId { .. } => Cell::Integer(id),
             ProjectedColumn::HybridDetail { .. } => {
                 return Err(SqlSurfaceError::Internal {
                     detail: "hybrid detail is not supported in RETURNING".to_string(),

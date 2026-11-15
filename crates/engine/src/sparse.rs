@@ -994,6 +994,43 @@ pub struct SparseIndex {
     /// 設定を使うことで、索引とクエリの非対称を構造的に作れなくする。共有の `Arc` は
     /// 索引ごとの所有ではないため [`Self::approx_heap_bytes`] には数えない。
     analysis: Arc<TextAnalysis>,
+    /// 構築時コーパスの最大 `DocId`（Issue #3221）。可視集合が恒等スロット列
+    /// [`VisibleDocs::SlotRange`] のとき「全文書が可視」を `O(1)` で確定する判定に使う。
+    /// 空コーパスは構築時に拒否されるため必ず 1 件以上から決まる。ヒープを持たない。
+    max_doc_id: DocId,
+    /// 全文書が可視のときの文書長合計（Issue #3221）。構築時の `total_len` と同じ値で、
+    /// [`VisibleBitmap`] の全可視形（[`VisibleBits::All`]）の統計に使う。この値と
+    /// `max_doc_id` はこの索引（＝テナント × 世代で分離された `SparseIndexCache` の
+    /// 1 エントリ）自身のコーパスだけから決まり、他テナントの索引からは参照されない。
+    full_visible_total_len: u64,
+}
+
+/// 可視集合の表現（Issue #3221）。hybrid 検索が毎クエリ構築していた
+/// `BTreeSet<DocId>` を、全可視の形では作らずに済ませるための crate 内部の型。
+///
+/// - `Set`: 従来どおりの一般の可視集合。
+/// - `SlotRange`: 可視集合が `0..len` の恒等スロット列そのものであることを、
+///   呼び出し元（`hybrid.rs`）が入力列を線形に確かめたうえで渡す。意味は
+///   `BTreeSet(0..len)` と完全に等しい（ビット一致の根拠）。
+#[derive(Clone, Copy)]
+pub(crate) enum VisibleDocs<'a> {
+    /// 一般の可視集合。
+    Set(&'a BTreeSet<DocId>),
+    /// `0..len` の恒等スロット列。
+    SlotRange {
+        /// 可視な DocId の個数（`DocId < len` が可視）。
+        len: u64,
+    },
+}
+
+impl VisibleDocs<'_> {
+    /// 可視集合が空か。
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Set(s) => s.is_empty(),
+            Self::SlotRange { len } => *len == 0,
+        }
+    }
 }
 
 /// [`SparseIndex::search_within`] が可視集合（`visible_ids`）を `doc_idx` 空間の
@@ -1006,13 +1043,23 @@ pub struct SparseIndex {
 /// 有界）でのみ決まり、untrusted な `visible_ids` の大きさで増幅しない
 /// （`.claude/rules/coding-rust.md`: untrusted 入力によるリソース確保の増幅防止）。
 struct VisibleBitmap {
-    /// `doc_idx / 64` を添字とするビット集合。ビット `doc_idx % 64` が立っている
-    /// 文書が可視。
-    words: Vec<u64>,
-    /// 可視文書数（`words` の立っているビット数）。
+    /// 可視ビット集合の実体。
+    bits: VisibleBits,
+    /// 可視文書数（立っているビット数）。
     n: usize,
     /// 可視文書の文書長合計（`avg_doc_len = total_len / n` の分子）。
     total_len: u64,
+}
+
+/// [`VisibleBitmap`] のビット集合の表現（Issue #3221）。
+enum VisibleBits {
+    /// 索引の全文書（`doc_idx < doc_count`）が可視。確保なし。
+    All {
+        /// 索引の文書数。
+        doc_count: usize,
+    },
+    /// `doc_idx / 64` を添字とするビット集合。ビット `doc_idx % 64` が立っている文書が可視。
+    Words(Vec<u64>),
 }
 
 impl VisibleBitmap {
@@ -1040,18 +1087,69 @@ impl VisibleBitmap {
             total_len = total_len.saturating_add(u64::from(doc_len));
         }
         Self {
-            words,
+            bits: VisibleBits::Words(words),
             n,
             total_len,
+        }
+    }
+
+    /// [`VisibleDocs`] から構築する（Issue #3221）。`Set` は [`Self::build`] そのもの。
+    /// `SlotRange { len }` は `BTreeSet(0..len)` と等価に扱い、`id_index`（SipHash）を引かない。
+    ///
+    /// - `index.max_doc_id < len`: 全文書が可視と確定。統計は構築時に固定した値を返し、
+    ///   確保も走査も行わない（`O(1)`）。
+    /// - それ以外: `doc_ids` を 1 回だけ添字走査して `DocId < len` の文書を立てる（`O(N)`）。
+    ///
+    /// 入力は呼び出し元が検証済みの恒等列だが、本関数は全可視の判定をデータ（`max_doc_id`・
+    /// `len`）から毎回行い、呼び出し元のフラグを信用しない。不成立なら可視集合は広がらず
+    /// 部分走査へ倒れる（fail-closed）。
+    fn build_docs(index: &SparseIndex, visible: VisibleDocs<'_>) -> Self {
+        match visible {
+            VisibleDocs::Set(s) => Self::build(index, s),
+            VisibleDocs::SlotRange { len } => {
+                if index.max_doc_id < len {
+                    return Self {
+                        bits: VisibleBits::All {
+                            doc_count: index.doc_ids.len(),
+                        },
+                        n: index.doc_ids.len(),
+                        total_len: index.full_visible_total_len,
+                    };
+                }
+                let word_count = index.doc_ids.len().div_ceil(64);
+                let mut words = vec![0u64; word_count];
+                let mut n = 0usize;
+                let mut total_len: u64 = 0;
+                for (idx, &doc_id) in index.doc_ids.iter().enumerate() {
+                    if doc_id >= len {
+                        continue;
+                    }
+                    let Some(word) = words.get_mut(idx / 64) else {
+                        continue;
+                    };
+                    *word |= 1u64 << (idx % 64);
+                    n = n.saturating_add(1);
+                    let doc_len = index.doc_len.get(idx).copied().unwrap_or(0);
+                    total_len = total_len.saturating_add(u64::from(doc_len));
+                }
+                Self {
+                    bits: VisibleBits::Words(words),
+                    n,
+                    total_len,
+                }
+            }
         }
     }
 
     /// `doc_idx` が可視ビットマップに含まれるか（範囲外は `false`。fail-closed）。
     fn contains(&self, doc_idx: u32) -> bool {
         let idx = doc_idx as usize;
-        match self.words.get(idx / 64) {
-            Some(word) => word & (1u64 << (idx % 64)) != 0,
-            None => false,
+        match &self.bits {
+            VisibleBits::All { doc_count } => idx < *doc_count,
+            VisibleBits::Words(words) => match words.get(idx / 64) {
+                Some(word) => word & (1u64 << (idx % 64)) != 0,
+                None => false,
+            },
         }
     }
 }
@@ -1531,6 +1629,12 @@ impl SparseIndex {
         let doc_count = u32::try_from(doc_len_by_idx.len()).unwrap_or(u32::MAX);
         let avg_doc_len = total_len as f64 / f64::from(doc_count);
 
+        // 全可視判定用の最大 DocId（Issue #3221）。空コーパスは冒頭で拒否済みだが、
+        // `None` でも `unwrap` せず構築失敗として fail-closed にする。
+        let Some(max_doc_id) = doc_ids_by_idx.iter().copied().max() else {
+            return Err(SparseError::EmptyCorpus);
+        };
+
         // 文書長クラス表の構築（Issue #391）。`doc_len_by_idx` の相異なる値を
         // 昇順・重複なしに並べたものが `len_classes`。各文書の `doc_len_class` は
         // その値が `len_classes` の何番目にあるかを二分探索で求める。`doc_len_by_idx`
@@ -1585,6 +1689,8 @@ impl SparseIndex {
             scratch_pool: Mutex::new(Vec::new()),
             prefix_vocab,
             analysis,
+            max_doc_id,
+            full_visible_total_len: total_len,
         })
     }
 
@@ -1815,7 +1921,7 @@ impl SparseIndex {
         // 索引自身の構築済みパラメータは `with_params` の定義域検査を通過済み。
         // クエリ時上書き専用の数値安全上限（`MAX_QUERY_K1`）は適用しない
         // （`k1 > 1e200` で構築した既存索引の挙動を変えない）。
-        self.score_within_checked(query, visible_ids, self.params())
+        self.score_within_checked(query, VisibleDocs::Set(visible_ids), self.params())
     }
 
     /// 構築時の `k1`・`b` を [`Bm25Params`] として返す。
@@ -1841,6 +1947,18 @@ impl SparseIndex {
         visible_ids: &BTreeSet<DocId>,
         params: Bm25Params,
     ) -> Result<SparseScored, SparseError> {
+        self.score_within_docs_with_params(query, VisibleDocs::Set(visible_ids), params)
+    }
+
+    /// [`Self::score_within_with_params`] の可視集合表現を [`VisibleDocs`] へ一般化した
+    /// crate 内部版（Issue #3221）。hybrid 検索（`hybrid.rs::sparse_refetch_loop`）が全可視の
+    /// 形で `BTreeSet` を作らずに呼ぶ。検証順序・結果は `Set` 経路と同一。
+    pub(crate) fn score_within_docs_with_params(
+        &self,
+        query: &str,
+        visible: VisibleDocs<'_>,
+        params: Bm25Params,
+    ) -> Result<SparseScored, SparseError> {
         // 索引自身のパラメータ（`hybrid_search` 経路が `params()` で渡す）は
         // `with_params` で検証済みのため、クエリ時上限 `MAX_QUERY_K1` を再適用しない。
         let params = if params == self.params() {
@@ -1848,7 +1966,7 @@ impl SparseIndex {
         } else {
             Bm25Params::new(params.k1, params.b)?
         };
-        self.score_within_checked(query, visible_ids, params)
+        self.score_within_checked(query, visible, params)
     }
 
     /// [`Self::score_within`]・[`Self::score_within_with_params`] 共通の本体。
@@ -1856,7 +1974,7 @@ impl SparseIndex {
     fn score_within_checked(
         &self,
         query: &str,
-        visible_ids: &BTreeSet<DocId>,
+        visible_ids: VisibleDocs<'_>,
         params: Bm25Params,
     ) -> Result<SparseScored, SparseError> {
         if query.len() > MAX_QUERY_BYTES {
@@ -1898,7 +2016,7 @@ impl SparseIndex {
             return Ok(empty());
         }
 
-        let bitmap = VisibleBitmap::build(self, visible_ids);
+        let bitmap = VisibleBitmap::build_docs(self, visible_ids);
         if bitmap.n == 0 {
             return Ok(empty());
         }
@@ -5097,5 +5215,158 @@ mod tests {
         let mut scored = idx.score_within_with_params("apple", &visible, p).unwrap();
         let ids: Vec<DocId> = scored.top(3).iter().map(|d| d.doc_id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    // ---------- Issue #3221: 全可視（SlotRange）経路の等価性 ----------
+
+    /// 欠番（本文 NULL 行を模す）を含む DocId で `n` 件のコーパスを作る。
+    fn slot_corpus(n: usize, gap_every: usize) -> Vec<(DocId, String)> {
+        let words = ["alpha", "beta", "gamma", "delta"];
+        let mut out = Vec::new();
+        let mut id: DocId = 0;
+        for i in 0..n {
+            if gap_every > 0 && i % gap_every == 0 {
+                id += 1; // 欠番
+            }
+            let text = format!(
+                "{} {} {}",
+                words[i % 4],
+                words[(i / 2) % 4],
+                "w ".repeat(i % 5)
+            );
+            out.push((id, text));
+            id += 1;
+        }
+        out
+    }
+
+    fn build_slot_index(corpus: &[(DocId, String)]) -> SparseIndex {
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
+        SparseIndex::build(&refs).unwrap()
+    }
+
+    fn score_bits(s: &mut SparseScored) -> Vec<(DocId, u64)> {
+        s.top(usize::MAX)
+            .iter()
+            .map(|d| (d.doc_id, d.score.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn slot_range_bitmap_matches_set_bitmap_for_all_lens() {
+        for &n in &[1usize, 63, 64, 65, 130] {
+            for &gap in &[0usize, 3] {
+                let corpus = slot_corpus(n, gap);
+                let idx = build_slot_index(&corpus);
+                let max_id = corpus.last().map(|(i, _)| *i).unwrap();
+                for len in [0u64, 1, 2, max_id / 2, max_id, max_id + 1, max_id + 5] {
+                    let set: BTreeSet<DocId> = (0..len).collect();
+                    let a = VisibleBitmap::build(&idx, &set);
+                    let b = VisibleBitmap::build_docs(&idx, VisibleDocs::SlotRange { len });
+                    assert_eq!(a.n, b.n, "n n={n} gap={gap} len={len}");
+                    assert_eq!(a.total_len, b.total_len, "total_len n={n} len={len}");
+                    for d in 0..(idx.doc_ids.len() as u32 + 70) {
+                        assert_eq!(a.contains(d), b.contains(d), "contains {d} n={n} len={len}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slot_range_scoring_is_bit_identical_to_set_scoring() {
+        let corpus = slot_corpus(70, 4);
+        let idx = build_slot_index(&corpus);
+        let max_id = corpus.last().map(|(i, _)| *i).unwrap();
+        let overridden = Bm25Params::new(2.5, 0.3).unwrap();
+        for len in [0u64, 10, max_id, max_id + 1, max_id + 9] {
+            let set: BTreeSet<DocId> = (0..len).collect();
+            for params in [idx.params(), overridden] {
+                for q in ["alpha", "alpha beta", "gamma w", "zzz"] {
+                    let mut a = idx.score_within_with_params(q, &set, params).unwrap();
+                    let mut b = idx
+                        .score_within_docs_with_params(q, VisibleDocs::SlotRange { len }, params)
+                        .unwrap();
+                    assert_eq!(score_bits(&mut a), score_bits(&mut b), "q={q:?} len={len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slot_range_overflowing_params_are_rejected_like_set_path() {
+        let corpus = slot_corpus(8, 0);
+        let idx = build_slot_index(&corpus);
+        let set: BTreeSet<DocId> = (0..8).collect();
+        let bad = Bm25Params {
+            k1: f64::MAX,
+            b: 0.5,
+        };
+        let a = idx.score_within_with_params("alpha", &set, bad);
+        let b = idx.score_within_docs_with_params("alpha", VisibleDocs::SlotRange { len: 8 }, bad);
+        assert!(a.is_err());
+        assert!(b.is_err());
+    }
+
+    #[test]
+    fn full_visible_stats_are_per_index_and_not_shared_across_tenants() {
+        // テナント・世代ごとに別の索引（キャッシュの別エントリ）になる前提で、
+        // 全可視の統計が各索引自身のコーパスだけから決まることを確認する。
+        let a = build_slot_index(&slot_corpus(5, 0));
+        let b = build_slot_index(&slot_corpus(40, 2));
+        assert_eq!(a.max_doc_id, 4);
+        assert_ne!(a.max_doc_id, b.max_doc_id);
+        let a_len: u64 = a.doc_len.iter().map(|&l| u64::from(l)).sum();
+        let b_len: u64 = b.doc_len.iter().map(|&l| u64::from(l)).sum();
+        assert_eq!(a.full_visible_total_len, a_len);
+        assert_eq!(b.full_visible_total_len, b_len);
+        let ba = VisibleBitmap::build_docs(&a, VisibleDocs::SlotRange { len: 5 });
+        let bb = VisibleBitmap::build_docs(&b, VisibleDocs::SlotRange { len: 1000 });
+        assert_eq!(ba.n, 5);
+        assert_eq!(bb.n, 40);
+        // 一方で全可視経路を使っても他方の結果は変わらない。
+        let all_a: BTreeSet<DocId> = (0..5).collect();
+        let before = a.search_within("alpha", 10, &all_a).unwrap();
+        let _ = b.score_within_docs_with_params(
+            "alpha",
+            VisibleDocs::SlotRange { len: 1000 },
+            b.params(),
+        );
+        let after = a.search_within("alpha", 10, &all_a).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn slot_range_text_query_matches_set_path() {
+        use crate::sparse::text_query::parse_text_query;
+        use crate::text_query_limits::TextQueryLimits;
+        let corpus = slot_corpus(70, 4);
+        let idx = build_slot_index(&corpus);
+        let max_id = corpus.last().map(|(i, _)| *i).unwrap();
+        let limits = TextQueryLimits::default();
+        for len in [0u64, 12, max_id + 1] {
+            let set: BTreeSet<DocId> = (0..len).collect();
+            for q in [
+                "alpha beta",
+                "alpha OR gamma",
+                "\"alpha beta\"",
+                "alp*",
+                "alpha -beta",
+            ] {
+                let parsed = parse_text_query(q).unwrap();
+                let mut a = idx
+                    .score_text_query_within(&parsed, &set, idx.params(), &limits)
+                    .unwrap();
+                let mut b = idx
+                    .score_text_query_within_docs(
+                        &parsed,
+                        VisibleDocs::SlotRange { len },
+                        idx.params(),
+                        &limits,
+                    )
+                    .unwrap();
+                assert_eq!(score_bits(&mut a), score_bits(&mut b), "q={q:?} len={len}");
+            }
+        }
     }
 }

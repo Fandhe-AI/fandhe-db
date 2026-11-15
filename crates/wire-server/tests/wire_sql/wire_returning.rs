@@ -102,6 +102,28 @@ fn wire_insert_returning_emits_row_description_data_row_and_insert_tag() {
     read_ready_for_query(&mut stream);
 }
 
+/// Issue #3248: `RETURNING id AS doc_id, lang AS l` の `RowDescription` 列名が別名になり、
+/// `DataRow`・コマンドタグは別名なしと同じ（SQL-21・SQL-42 のポインタ）。
+#[test]
+fn wire_insert_returning_as_alias_renames_row_description_columns() {
+    let (core, _guard) = new_core_with_docs_table();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') \
+         RETURNING id AS doc_id, lang AS l USING OPERATION_ID 'wire-insert-returning-alias'",
+    );
+
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["doc_id".to_string(), "l".to_string()]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![Some("1".to_string()), Some("ja".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+
 /// `RETURNING *` で投影したベクトル列の文字列表現は、同一行を `SELECT` した
 /// 場合の `DataRow` テキストと一致する（表層を跨いだエンコードの一致）。
 #[test]
