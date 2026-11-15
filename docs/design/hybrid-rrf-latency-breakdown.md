@@ -1945,3 +1945,11 @@ BM25・RRF 融合などコサイン以外の段が支配的なため、下げ幅
 
 A/B（p50 低下）は本 Issue の作業環境では計測していない（**未検証**）。変更前後の比較は
 `aggregate-regression-bisect/run_bisect_step.sh` の手順で専有環境での実測が必要。
+
+## Issue #3222: score_pass の len_norm キャッシュの配列化
+
+- `k1_len_norm_cache: HashMap<u32, f64>` を文書長クラス添字の `Vec<f64>`（番兵 NaN のビット比較で未計算を判定）へ置換。式・演算順は不変でスコアはビット一致
+- パスごとのリセットは `touched_classes` のスロットのみ番兵へ戻す `O(M)`（#391・#426 の計算量契約を維持）
+- 配列長は確保前に `classes <= n <= MAX_CORPUS_DOCS` を検査（違反時は空配列でヒット棄却）
+
+A/B（p50 低下。想定は約 0.09 ms で #3216 の base のばらつきより小さい）は本 Issue の作業環境では計測していない（**未検証**）。`aggregate-regression-bisect/run_bisect_step.sh` の手順で専有環境での実測が必要。
