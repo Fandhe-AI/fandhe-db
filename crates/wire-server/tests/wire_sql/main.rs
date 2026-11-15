@@ -75,6 +75,7 @@ mod wire_sql33_cosine_order;
 mod wire_sql42_aggregate_arith_types;
 mod wire_sql42_projection_alias;
 mod wire_sql42_projection_expr_types;
+mod wire_sql42_remainder;
 mod wire_sql43_from_less_select;
 mod wire_sql45_param_infer;
 mod wire_sql49_upsert_add_param;

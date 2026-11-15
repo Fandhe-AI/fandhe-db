@@ -592,7 +592,7 @@ pub(crate) fn id_bounds(
         }
         // `expr_index_predicate_from_expr` が比較演算子のみへ絞り込み済みのため到達
         // しない。
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => return None,
     })
 }
 
@@ -673,7 +673,7 @@ pub(crate) fn numeric_i64_bounds(
                 (Bound::Included(v), Bound::Included(v))
             }
         }
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => return None,
     })
 }
 

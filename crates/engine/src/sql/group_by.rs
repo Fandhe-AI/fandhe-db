@@ -1193,7 +1193,7 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
                 BinOp::Ge => ord != Ordering::Less,
                 BinOp::Le => ord != Ordering::Greater,
                 BinOp::Eq => ord == Ordering::Equal,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => false,
             }
         }
         Cell::Float(f) => match op {
@@ -1204,7 +1204,7 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
             BinOp::Eq => *f == literal,
             // 構文段（`allowlist::Parser::expect_cmp_op`）が算術演算子を HAVING の
             // 比較演算子として構造上生成しないため到達しない。
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => false,
         },
         // Issue #892（D8）: `SUM`/`AVG`/`MIN`/`MAX(<INTEGER>/<BIGINT>)` の結果
         // （`Cell::SignedInteger`）。`Cell::Integer`（`u64`。疑似列 `id`・
@@ -1219,7 +1219,7 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
                 BinOp::Ge => ord != Ordering::Less,
                 BinOp::Le => ord != Ordering::Greater,
                 BinOp::Eq => ord == Ordering::Equal,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => false,
             }
         }
         // Issue #2271・#2270（TABLE-13）: `SUM(<BIGINT>)`（scale 0）と整数 `AVG`（値ごとに
@@ -1234,7 +1234,7 @@ pub(crate) fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
                 BinOp::Ge => ord != Ordering::Less,
                 BinOp::Le => ord != Ordering::Greater,
                 BinOp::Eq => ord == Ordering::Equal,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => false,
             }
         }
         // 束縛段（`sql::parser::check_having_target_is_numeric`。Issue #892・
