@@ -849,21 +849,20 @@ fn distinct_on_returns_first_row_per_group_across_tenants() {
                     "{tenant} {allow_private} {sql}"
                 );
             }
-            // ORDER BY なし: キーごとに 1 行（どの行が代表かの決定性は #3262 の範囲）。
+            // ORDER BY なし: 実効キーは ON キー ASC・同点は id 昇順（契約は docs/design/select-distinct-on.md §6。
+            // 専用フィクスチャでの網羅は sql25_distinct_on_determinism.rs）。代表 id まで順序込みで固定する。
             let result = core
-                .execute_sql(&ctx, "SELECT DISTINCT ON (lang) lang FROM docs")
+                .execute_sql(&ctx, "SELECT DISTINCT ON (lang) lang, id FROM docs")
                 .expect("distinct on without order by");
-            let got: BTreeSet<String> = result
-                .rows
-                .iter()
-                .map(|r| as_text(&r.cells[0]).expect("lang"))
-                .collect();
-            assert_eq!(result.rows.len(), got.len(), "one row per key");
-            let want: BTreeSet<String> = oracle_distinct_langs(&visible)
+            let expected: Vec<(String, u64)> = oracle_representatives(&visible, false)
                 .into_iter()
-                .map(str::to_string)
+                .map(|(l, id)| (l.to_string(), id))
                 .collect();
-            assert_eq!(got, want);
+            assert_eq!(
+                text_and_id_rows(&result),
+                expected,
+                "{tenant} {allow_private}"
+            );
         }
     }
 }
