@@ -434,3 +434,46 @@ fn embedded_contexts_succeed_or_fail_closed() {
         }
     }
 }
+
+/// 疑似列 `id` は別名の有無にかかわらず集合演算の枝どうしで型互換になる（括弧付き枝も同じ）。
+#[test]
+fn aliased_and_plain_id_columns_are_compatible() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT id AS x FROM t UNION SELECT id FROM t",
+        "SELECT id FROM t UNION SELECT id AS x FROM t",
+        "(SELECT id AS x FROM t) UNION (SELECT id FROM t)",
+        "(SELECT id FROM t ORDER BY id LIMIT 2) UNION ALL (SELECT id AS x FROM t)",
+    ] {
+        let r = run(&core, &ctx, sql);
+        assert_eq!(r.columns.len(), 1, "{sql}");
+    }
+}
+
+/// 定数枝のルーチン呼び出しは Describe でも Execute と同じ `0A000` で拒否される。
+#[test]
+fn routine_call_in_const_branch_is_rejected_in_describe_and_execute() {
+    let (core, ctx, _g) = setup();
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx,
+        &mut session,
+        "CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$",
+    )
+    .expect("create function");
+    let sql = "SELECT f() UNION SELECT n FROM t";
+    let exec_code = match core.execute_sql_in_session(&ctx, &mut session, sql) {
+        Ok(o) => panic!("{sql:?} should be rejected, got {o:?}"),
+        Err(e) => e.wire_code().to_string(),
+    };
+    let described = core
+        .parse_sql(sql)
+        .and_then(|p| core.describe_parsed_in_session(&session, &p));
+    let desc_code = match described {
+        Ok(_) => panic!("{sql:?} must be rejected at describe time"),
+        Err(e) => e.wire_code().to_string(),
+    };
+    assert_eq!(exec_code, "0A000");
+    assert_eq!(desc_code, exec_code);
+}

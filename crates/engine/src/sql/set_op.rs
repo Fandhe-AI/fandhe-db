@@ -248,7 +248,11 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
         }
     }
     match (a, b) {
-        (ColumnMeta::Id, ColumnMeta::Id) => true,
+        // 疑似列 `id` は別名の有無（`Id`／`AliasedId`）にかかわらず同じ値域として互換にする。
+        (
+            ColumnMeta::Id | ColumnMeta::AliasedId { .. },
+            ColumnMeta::Id | ColumnMeta::AliasedId { .. },
+        ) => true,
         _ => match (static_type(a), static_type(b)) {
             // 整数型（SMALLINT／INTEGER／BIGINT）は PostgreSQL 同様に相互に互換とし、結果列は
             // 広い方へ拡大する（[`merge_columns`]。Issue #1560）。
@@ -1462,7 +1466,9 @@ fn describe_tree(
             // 定数枝もダミーフラグの区画を 1 枝分進める（`count_leaves` が葉として数えるため。
             // 進めないと後続の枝のフラグの対応がずれる）。
             let _ = branch_flags(dummy_equality_flags, width, next_leaf);
-            let bound = crate::sql::const_select::bind_describe(&branch.0, udfs)?;
+            // Execute（`eval_const_branch`／`validate_tree_types`）と同じ通常の `bind` を使い、
+            // ルーチン呼び出しの 0A000 拒否を Describe と Execute で一致させる。
+            let bound = crate::sql::const_select::bind(&branch.0, udfs)?;
             let columns = bound.columns();
             let has_vector = columns_have_vector(&columns);
             Ok((columns, has_vector))
