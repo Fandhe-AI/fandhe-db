@@ -1281,6 +1281,10 @@ pub enum SqlSurfaceError {
     /// SQL-57・Issue #1800）。束縛段が返す固定文言で、列名・値を含めない。可否は文だけで
     /// 決まり、行の内容に依存しない。
     AggregateOrderByNotInArguments,
+    /// `SELECT DISTINCT ON (...)` の式が `ORDER BY` の先頭キーと一致しない（`42P10`。Issue #3260・
+    /// SQL-25 のポインタ）。固定文言で、列名・値を含めない。可否は文だけで決まり、行の内容・
+    /// テナントに依存しない。
+    DistinctOnOrderByMismatch,
     /// DDL 文（`CREATE TABLE`・`DROP TABLE` 等。SQL-23、TASK-202・TASK-203、
     /// Issue #899・#902）を、DDL 実行権限（[`crate::sql::mode::SessionState::
     /// ddl_allowed`]）を持たないセッションが実行しようとした（ERR-2 拡張:
@@ -2123,7 +2127,8 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::CteColumnListTooLong { .. }
             | SqlSurfaceError::DerivedTableColumnListTooLong { .. }
             | SqlSurfaceError::OrderByPositionNotInSelectList { .. }
-            | SqlSurfaceError::AggregateOrderByNotInArguments => ErrorClass::InvalidColumnReference,
+            | SqlSurfaceError::AggregateOrderByNotInArguments
+            | SqlSurfaceError::DistinctOnOrderByMismatch => ErrorClass::InvalidColumnReference,
             SqlSurfaceError::InsufficientPrivilege
             | SqlSurfaceError::RelationPermissionDenied
             | SqlSurfaceError::ConflictTargetNotVisible
@@ -2470,6 +2475,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::AggregateOrderByNotInArguments => write!(
                 f,
                 "in an aggregate with DISTINCT, ORDER BY expressions must appear in argument list"
+            ),
+            SqlSurfaceError::DistinctOnOrderByMismatch => write!(
+                f,
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
             ),
             // テーブル名・ユーザー名を含めない固定文言（security.md P0。
             // `SqlSurfaceError::InsufficientPrivilege` ドキュメント参照）。
@@ -15454,8 +15463,9 @@ impl<'a> Parser<'a> {
     /// 落とす）。省略時は `Ok(None)`。投影は `SELECT` と同じ許可形状
     /// （[`Self::parse_select_list`]）を再利用するが、[`Projection::Items`] は
     /// 式項目（Issue #3249）まで受理する。ただしスカラーサブクエリ（`42601`）と集計関数
-    /// （選択リスト構文解析が `42601`。多層防御の `42803`）は拒否する。UDF 呼び出しは束縛段が空の
-    /// UDF レジストリで解決して未定義関数として拒否する（受け皿 #3250）。
+    /// （選択リスト構文解析が `42601`。多層防御の `42803`）は拒否する。UDF 呼び出しは束縛段が
+    /// セッションの UDF レジストリで解決する（Issue #3250。宣言的・WASM UDF は評価、
+    /// `LANGUAGE sql|plpgsql` 関数は書き込み前に `0A000`、未定義は `42883`）。
     /// `*` と他項目の併用は `0A000`（未対応）。
     fn parse_returning_clause(&mut self) -> Result<Option<Projection>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("RETURNING") {
@@ -24181,6 +24191,53 @@ fn parse_select_shape(
     }
 
     p.expect_keyword(Keyword::Select)?;
+    parse_select_shape_body(p, subquery_ctx)
+}
+
+/// `SELECT DISTINCT ON (<式>, ...) <SELECT リスト以降>` の構文解析（Issue #3260・SQL-25 の
+/// ポインタ。`validate_select_statement` の DISTINCT ON gate だけが呼ぶ）。`ON` リストを既存の
+/// 値式パーサで読み（個数は [`MAX_SCALAR_ORDER_KEYS`] 以下。超過は確保前に `54000`）、残りは
+/// [`parse_select_shape_body`] へ同じ [`Parser`] のまま渡す（トークン列を合成し直さないため
+/// 列参照の記録位置が壊れない）。
+fn parse_distinct_on_select(
+    tokens: &[Token],
+    subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<(Vec<Expr>, ParsedSelect), SqlSurfaceError> {
+    let mut p = Parser::new(tokens).with_nesting_limits(limits);
+    if let Some(depth) = subquery_ctx {
+        p = p.with_subquery_ctx(depth);
+    }
+    p.expect_keyword(Keyword::Select)?;
+    // `DISTINCT`・`ON` は呼び出し元が `is_distinct_on_head` で確認済み（どちらも文脈識別子）。
+    p.advance();
+    p.advance();
+    p.expect_punct('(')?;
+    let mut on_exprs: Vec<Expr> = Vec::new();
+    loop {
+        if on_exprs.len() >= MAX_SCALAR_ORDER_KEYS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many DISTINCT ON expressions",
+            ));
+        }
+        on_exprs.push(p.parse_value_expr(0)?);
+        if matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            continue;
+        }
+        break;
+    }
+    p.expect_punct(')')?;
+    let parsed = parse_select_shape_body(p, subquery_ctx)?;
+    Ok((on_exprs, parsed))
+}
+
+/// [`parse_select_shape`]・[`parse_distinct_on_select`] が共有する、`SELECT`（および
+/// `DISTINCT ON (...)`）消費後の本体。SELECT リスト以降を読んで広域取得／検索 SELECT へ振り分ける。
+fn parse_select_shape_body(
+    mut p: Parser<'_>,
+    subquery_ctx: Option<usize>,
+) -> Result<ParsedSelect, SqlSurfaceError> {
     // SQL-30・TASK-214（Issue #930）: ウィンドウ項目は SELECT リストの一部として
     // 通常項目と混在しうるため、`ORDER BY`／`USING PLAN` を伴う検索 SELECT 経路か
     // ランキング段を持たない広域取得かを判定する**前**にリストを読み終える必要が
@@ -24905,6 +24962,13 @@ fn parse_aggregate_shape(
 /// 意味論層（`sql::parser::bind_group_by_clause`）が担う（並べ替え不能な型
 /// `VECTOR` 等・未知列はいずれも `22000`）。
 fn parse_distinct_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
+    // Issue #3260: CTE 本文・WITH 主クエリなど `SELECT DISTINCT` 単純形を直接呼ぶ文脈で
+    // `DISTINCT ON (...)` を列名 `ON` と誤読して 42601 にせず、未対応文脈として明示的に拒否する。
+    if super::distinct::is_distinct_on_head(tokens, 1) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "SELECT DISTINCT ON is not supported in this context",
+        ));
+    }
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
@@ -29356,6 +29420,51 @@ fn select_range_contains_aggregate_call(tokens: &[Token], start: usize, item_onl
     false
 }
 
+/// `SELECT DISTINCT ON` の検証（[`validate_select_statement`] の gate から呼ぶ。Issue #3260）。
+/// 判定順序は 構文（42601）→ 個数上限（54000）→ FROM の関係（42P01）→ `ORDER BY` 先頭一致
+/// （42P10）→ 実行段未実装（0A000。Issue #3261 が置き換える）。未知列（42703）は束縛段の責務で、
+/// 本関数の判定順は PostgreSQL と差がある（`docs/design/select-distinct-on.md` に既知差として記録）。
+/// 集計・`GROUP BY`・`HAVING`・ウィンドウとの併用、距離順位付け形、`USING PLAN` は `0A000`。
+fn validate_distinct_on_select(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    subquery_ctx: Option<usize>,
+    limits: crate::nesting_limits::NestingLimits,
+) -> Result<Statement, SqlSurfaceError> {
+    let unsupported_combo = || {
+        SqlSurfaceError::feature_not_supported(
+            "SELECT DISTINCT ON cannot be combined with aggregates, GROUP BY, HAVING or window functions",
+        )
+    };
+    if tokens_contain_group_by(tokens)
+        || tokens_contain_window_over(tokens)
+        || has_top_level_having_clause(tokens)
+        || select_range_contains_aggregate_call(tokens, 1, false)
+    {
+        return Err(unsupported_combo());
+    }
+    let (on_exprs, parsed) = parse_distinct_on_select(tokens, subquery_ctx, limits)?;
+    let ParsedSelect::Scan(shape) = parsed else {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "SELECT DISTINCT ON is not supported with vector ranking or USING PLAN",
+        ));
+    };
+    // FROM の存在確認（テーブル・ビュー。ビュー別名の書き換えより前に、利用者が書いた名前で比較する）。
+    super::view::resolve_from(lookup, &shape.table_name)?;
+    if !shape.window_items.is_empty() || !shape.scalar_subquery_items.is_empty() {
+        return Err(unsupported_combo());
+    }
+    super::distinct::check_distinct_on_order_prefix(
+        &on_exprs,
+        &shape.projection,
+        &shape.order_by,
+        &shape.order_keys,
+    )?;
+    Err(SqlSurfaceError::feature_not_supported(
+        "SELECT DISTINCT ON is not supported yet",
+    ))
+}
+
 /// 通常 SELECT・集計 SELECT（`GROUP BY` の有無いずれも）・`SELECT DISTINCT`
 /// の脱糖形・広域取得（ビュー展開後の形を含む）の共有振り分け（TASK-166・
 /// SQL-13／TASK-167・SQL-14／SQL-25 (c)・TASK-209／Issue #454 の先読み判定と
@@ -29409,6 +29518,13 @@ fn validate_select_statement(
         {
             precheck_aggregate_filter_tokens(tokens, i.saturating_add(1))?;
         }
+    }
+    // Issue #3260（SQL-25 のポインタ）: `SELECT DISTINCT ON (...)`。構文・個数（54000）・FROM の
+    // 存在（42P01）・`ORDER BY` 先頭一致（42P10）を検証し、整合した文も行を返す実行段（Issue #3261）が
+    // 入るまでは通常の広域取得として黙って実行せず `0A000` で拒否する（fail-closed）。共有の検証経路に
+    // 置くため Parse／Describe・ビュー本文・カーソル等の入口は同じ分類になる。
+    if super::distinct::is_distinct_on_head(tokens, 1) {
+        return validate_distinct_on_select(tokens, lookup, subquery_ctx, limits);
     }
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
@@ -39872,6 +39988,79 @@ mod tests {
                 );
             }
             other => panic!("expected Aggregate statement, got {other:?}"),
+        }
+    }
+
+    /// Issue #3260: 列名 `on` は `DISTINCT` の直後でも従来どおり修飾子＋列名として解釈する
+    /// （3 番目のトークンが `(` でなければ DISTINCT ON ではない）。
+    #[test]
+    fn select_distinct_column_named_on_is_not_distinct_on() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT DISTINCT on FROM documents",
+            "SELECT DISTINCT on, lang FROM documents",
+        ] {
+            let err = validate_sql(sql, &lookup).err().map(|e| e.wire_code());
+            assert_ne!(err, Some("0A000"), "{sql}");
+            assert_ne!(err, Some("42P10"), "{sql}");
+        }
+    }
+
+    /// Issue #3260: DISTINCT ON の判定順序（構文 → 54000 → 42P01 → 42P10 → 0A000）。
+    // tracked: #3261（整合した文の 0A000 は行を返す実行段で置き換わる）
+    #[test]
+    fn distinct_on_classification_order() {
+        let lookup = catalog_with(&["documents"]);
+        let code = |sql: &str| validate_sql(sql, &lookup).err().map(|e| e.wire_code());
+        assert_eq!(
+            code("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang LIMIT 5"),
+            Some("0A000")
+        );
+        assert_eq!(
+            code("SELECT DISTINCT ON (lang) lang FROM documents ORDER BY id, lang LIMIT 5"),
+            Some("42P10")
+        );
+        assert_eq!(
+            code("SELECT DISTINCT ON (lang) lang FROM missing ORDER BY id"),
+            Some("42P01")
+        );
+        assert_eq!(
+            code("SELECT DISTINCT ON () lang FROM documents"),
+            Some("42601")
+        );
+        let many = ["lang"; MAX_SCALAR_ORDER_KEYS + 1].join(", ");
+        assert_eq!(
+            code(&format!("SELECT DISTINCT ON ({many}) lang FROM documents")),
+            Some("54000")
+        );
+        let at_limit = ["lang"; MAX_SCALAR_ORDER_KEYS].join(", ");
+        assert_eq!(
+            code(&format!(
+                "SELECT DISTINCT ON ({at_limit}) lang FROM documents"
+            )),
+            Some("0A000")
+        );
+        // 集計・GROUP BY との併用は PostgreSQL が受理する形のため 42601 ではなく 0A000。
+        assert_eq!(
+            code("SELECT DISTINCT ON (lang) lang, COUNT(*) FROM documents GROUP BY lang"),
+            Some("0A000")
+        );
+    }
+
+    /// Issue #3260: 未対応文脈（CTE 本文・JOIN・集合演算・派生表・FROM なし）の DISTINCT ON は
+    /// 通常のスキャンとして黙って実行されず、拒否のままであること（fail-closed）。
+    // tracked: #3259（これらの文脈での受理は親 Issue の範囲）
+    #[test]
+    fn distinct_on_in_unsupported_contexts_stays_rejected() {
+        let lookup = catalog_with(&["documents", "other"]);
+        for sql in [
+            "WITH c AS (SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang) SELECT * FROM c",
+            "SELECT DISTINCT ON (a.lang) a.lang FROM documents a JOIN other b ON a.id = b.id ORDER BY a.lang",
+            "SELECT DISTINCT ON (lang) lang FROM documents UNION SELECT lang FROM other",
+            "SELECT * FROM (SELECT DISTINCT ON (lang) lang FROM documents ORDER BY lang) t",
+            "SELECT DISTINCT ON (lang) 1",
+        ] {
+            assert!(validate_sql(sql, &lookup).is_err(), "{sql}");
         }
     }
 
