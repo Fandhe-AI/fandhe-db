@@ -27,6 +27,7 @@ mod sql3209_observe_value_inline;
 mod sql3211_aggregate_direct_observe;
 mod sql3213_count_star_visible_len;
 mod sql3214_id_fold;
+mod sql3263_sum_avg_distinct;
 mod sql41_bool_literal_where;
 mod sql42_aggregate_arith_projection;
 mod sql42_aggregate_expr_tree_projection;

@@ -281,7 +281,7 @@ fn sql25_distinct_rejections_are_fail_closed_and_connection_survives() {
         ("SELECT DISTINCT embedding FROM docs", "22000"),
         ("SELECT DISTINCT * FROM docs", "42601"),
         ("SELECT COUNT(DISTINCT *) FROM docs", "42601"),
-        ("SELECT SUM(DISTINCT id) FROM docs", "42601"),
+        ("SELECT SUM(DISTINCT embedding) FROM docs", "22000"),
         ("SELECT DISTINCT lang FROM docs GROUP BY lang", "42601"),
         (
             "EXPLAIN SELECT DISTINCT lang FROM docs USING PLAN(full_scan())",
@@ -298,6 +298,32 @@ fn sql25_distinct_rejections_are_fail_closed_and_connection_survives() {
     let _columns = read_row_description(&mut stream);
     let row = read_data_row(&mut stream);
     assert_eq!(row[0].as_deref(), Some("3"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #3263: `SUM(DISTINCT)`・`AVG(DISTINCT)` が psql 同様の末尾 `;` 付き単独送信でも通る。
+/// 可視 id は重複しないため、`AVG(DISTINCT id)` は同一接続の `AVG(id)` と一致する。
+#[test]
+fn sql3263_sum_avg_distinct_over_simple_query() {
+    let (core, _guard) = new_core_aggregate_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(&mut stream, "SELECT AVG(id) AS a FROM docs;");
+    let _ = read_row_description(&mut stream);
+    let expected_avg = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "SELECT SUM(DISTINCT id) AS s, AVG(DISTINCT id) AS a FROM docs;",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["s".to_string(), "a".to_string()]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("17"));
+    assert_eq!(row[1], expected_avg[0]);
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
