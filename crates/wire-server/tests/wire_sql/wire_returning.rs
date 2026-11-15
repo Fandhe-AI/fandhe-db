@@ -676,3 +676,114 @@ fn wire_returning_udf_extended_query_describes_and_executes() {
     assert_eq!(data_rows, 1);
     assert_eq!(tag, "INSERT 0 1");
 }
+// --- RETURNING の式・別名を各面へ展開（Issue #3251・SQL-21・SQL-53 のポインタ） ---
+
+/// データ変更 CTE・ビュー経由の UPDATE・`UPDATE ... FROM`・`DELETE ... USING` の `RETURNING` が、
+/// 式・別名・UDF つきでも psql と同じ末尾 `;` 付きの単独送信で `RowDescription`→`DataRow`*→
+/// `CommandComplete` の順に届く。
+#[test]
+fn wire_returning_expressions_over_cte_view_and_from_using_surfaces() {
+    let (core, _guard) = new_core_with_docs_and_langs();
+    let addr = spawn_with_ddl_user(core);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+    simple_ok(
+        &mut stream,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+        "CREATE FUNCTION",
+    );
+    simple_ok(
+        &mut stream,
+        "CREATE VIEW v_docs AS SELECT * FROM docs",
+        "CREATE VIEW",
+    );
+    for sql in [
+        insert_sql(1, "ja", "wire-expr-1"),
+        insert_sql(2, "en", "wire-expr-2"),
+        "INSERT INTO langs (id, lang, label) VALUES (1, 'ja', 'Japanese') \
+         USING OPERATION_ID 'wire-expr-l1'"
+            .to_string(),
+    ] {
+        simple_ok(&mut stream, &sql, "INSERT 0 1");
+    }
+
+    // データ変更 CTE
+    send_simple_query(
+        &mut stream,
+        "WITH u AS (UPDATE docs SET lang = 'fr' WHERE id = 1 \
+         RETURNING id AS rid, shout(lang) AS s, upper(lang)) \
+         SELECT rid, s, upper FROM u USING OPERATION_ID 'wire-expr-cte';",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["rid".to_string(), "s".to_string(), "upper".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![
+            Some("1".to_string()),
+            Some("FR".to_string()),
+            Some("FR".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    // ビュー経由の UPDATE
+    send_simple_query(
+        &mut stream,
+        "UPDATE v_docs SET lang = 'de' WHERE id = 1 RETURNING id AS rid, shout(lang) AS s \
+         USING OPERATION_ID 'wire-expr-view';",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["rid".to_string(), "s".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("DE".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    // UPDATE ... FROM（対象表の式・別名つき列参照）
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET lang = 'ja' FROM langs WHERE docs.id = langs.id \
+         RETURNING langs.label AS l, shout(docs.lang) AS s;",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["l".to_string(), "s".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("Japanese".to_string()), Some("JA".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    // DELETE ... USING
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.id = langs.id \
+         RETURNING docs.id AS i, upper(docs.lang);",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["i".to_string(), "upper".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("JA".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "DELETE 1");
+    read_ready_for_query(&mut stream);
+
+    // FROM／USING 側の列を式の中で参照する形は 0A000（接続は維持される）。
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.id = langs.id RETURNING upper(langs.label);",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+}

@@ -2009,7 +2009,8 @@ pub fn bind_column_projection(
 ///
 /// - UDF は解決しない（空の UDF レジストリ。未登録扱いで `42883`＝fail-closed）。セッションの
 ///   UDF レジストリで解決する SQL 表層の経路は [`bind_returning_with_udfs`]（Issue #3250）を使う。
-///   本関数の呼び出し元は UDF を解決しない経路（NoSQL・データ変更 CTE・ビュー書き込み。#3251）。
+///   本関数の呼び出し元は UDF を解決しない経路（NoSQL）だけ。データ変更 CTE・ビュー書き込み・
+///   FROM／USING 形は Issue #3251 でセッションのレジストリ付き版へ切り替え済み。
 /// - ハイブリッド検索の詳細関数（`hybrid_*()`）・スカラーサブクエリ・集計関数は拒否する。
 ///   構文段（`Parser::parse_returning_clause`）が同じ判定（[`crate::sql::allowlist::
 ///   returning_item_rejection`]）を行っており、`Validated*` を経ない呼び出し元が迂回できない

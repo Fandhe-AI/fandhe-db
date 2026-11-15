@@ -58,6 +58,10 @@ UDF の呼び出しは、セッションの UDF レジストリで解決する�
 | `... RETURNING vec_norm(embedding), id + 1 AS m USING OPERATION_ID '...'`（組み込み関数・スカラー式。Issue #3249） | 受理（結果の型・値・列名は同じ式の `SELECT` と一致する） |
 | `... RETURNING shout(lang) ...`（宣言的 UDF・WASM UDF。Issue #3250） | 受理（型・値・列名は同じ式の `SELECT` と一致する） |
 | `... RETURNING w(lang) ...`（`LANGUAGE sql｜plpgsql` 関数。書き込みを試みうる） | `0A000`（書き込み前。行・台帳を残さない。意図的な拒否） |
+| データ変更 CTE の副文・ビュー経由の INSERT／UPDATE／DELETE の `RETURNING` に別名・式・組み込み関数・宣言的／WASM UDF（Issue #3251） | 受理（基表 DML と同じ束縛・評価。ビューは公開名で書く。routine は `0A000`） |
+| `UPDATE ... FROM`／`DELETE ... USING` の `RETURNING` に、任意の relation の列への `AS` 別名と対象表の列だけを参照する式・関数・UDF（Issue #3251） | 受理 |
+| `UPDATE ... FROM`／`DELETE ... USING` の `RETURNING` の式の中で FROM／USING 側の列を参照する形（Issue #3251） | `0A000`（未対応。SET の式と同じ境界） |
+| NoSQL の `returning` に式・`AS` 別名・関数呼び出しの文字列（Issue #3251） | `42601`（対応しない。「各面への展開」節） |
 | `... RETURNING my_udf(lang) ...`（未定義の関数） | `42883` |
 | `... RETURNING (SELECT ...) ...`・式の内側のサブクエリ・集計関数 | `42601`（他表を読む経路を作らない） |
 | `... RETURNING lang + 1 ...`（式の型エラー） | 書き込み前に `42883` 等（台帳は消費しない） |
@@ -314,7 +318,7 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
 | 項目 | 方針 |
 | ---- | ---- |
 | 名前解決 | `sql::relation::BindingScope`（`relations[0]` = 対象表、以降 FROM／USING の宣言順）を再利用。第 2 の解決器は作らない |
-| 受理する形 | `*`・`<公開名>.*`・列参照（修飾あり・なし）の並び。式・関数呼び出し・`AS` 別名は従来どおり `42601` |
+| 受理する形 | `*`・`<公開名>.*`・列参照（修飾あり・なし）とその `AS` 別名（任意の relation・疑似列 `id` を含む）・対象表の列だけを参照する式・組み込み関数・UDF（Issue #3251）。`*`／`<公開名>.*` への `AS` は `42601` |
 | 裸の `*` | 対象表の展開に続けて FROM／USING の各表を宣言順に並べる（JOIN の `SELECT *` と同規則。採番方式の表は疑似列 `id` なし）。PG 17.11 の `RETURNING *`（UPDATE・DELETE とも対象表 → FROM／USING の全列）と列順が一致することを Issue #3204 で照合した |
 | 出力列名・型 | 修飾つきでも列名のみ。型は `ColumnMeta` |
 | 対象表の列 | `returning::project_row` へ委譲。対象表の列だけを参照する場合は従来と同じ列・行（単体テストで完全一致を固定） |
@@ -332,10 +336,11 @@ MAX_SCAN_RESULT_BYTES`・`sql::exec::MAX_CANDIDATE_SCALAR_BYTES` と同じ
   返す source 行は SET の評価に使った行と同じ（多重一致は走査順の先頭）。
 - **値の意味論**: UPDATE は更新後の対象値と一致した source 行、DELETE は削除前の対象値。source の列型は SET と違い制限しない（セルの複製のため）。
 - **応答**: `SqlOutcome::Returning`。`rows_affected` は書き込み層の実変更行数で、RLS 再判定で返却行数が減っても独立。Describe は同じ列を返す。
-- **PG 17.11 との照合**: 非修飾の両表共通列は `42702`、`<公開名>.*` は該当表の全列、`AS` 別名は本リポでは `42601`（受理範囲を広げない）。
+- **PG 17.11 との照合**: 非修飾の両表共通列は `42702`、`<公開名>.*` は該当表の全列、`AS` 別名は Issue #3251 で受理した（列名だけが別名になる）。
 - **併用**: `RETURNING ... USING OPERATION_ID` は台帳結線済み（#3203）で受理する。
 - **まだ拒否する形**: トリガのある対象表は `0A000`（単一表の `RETURNING` は Issue #3192 で発火するが、結合形は通過証を渡さない）。
-  FROM／USING が 2 表以上は変換器の `0A000`、式・関数・別名は `42601`（Phase 3）。FROM 側表の `SELECT` 権限が無いロールは `42501`（結合テストで固定）。
+  FROM／USING が 2 表以上は変換器の `0A000`、FROM／USING 側の列を式の中で参照する形は `0A000`（Issue #3251）。FROM 側表の
+  `SELECT` 権限が無いロールは `42501`（結合テストで固定）。
 
 ## 対象外・申し送り
 
@@ -376,8 +381,7 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
 - 構文段（`Parser::parse_returning_clause`）と束縛段（`bind_returning`）は判定関数
   `returning_item_rejection` を共有する（Issue #3249 で式を受理。サブクエリ・集計だけを拒否）。
 - 旧文言「function-call items」は誤解を招くため廃止し、原因別の文言へ分けた。
-- 未対応のまま残る面（受け皿 #3251）: データ変更 CTE（`0A000`）・ビューへの書き込み（`42601`）・
-  `UPDATE ... FROM`／`DELETE ... USING`（`42601`）・NoSQL への展開。
+- 他の面への展開は Issue #3251 で行った（「各面への展開」節）。
 
 ## 式・組み込み関数の評価（Issue #3249・SQL-21 のポインタ）
 
@@ -393,16 +397,15 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
   評価しない）。採番列・`id` 省略の INSERT は払い出し値が commit 後にしか確定しないため、式項目と
   の組み合わせは書き込み前に `0A000` で拒否する（払い出し値を使った in-txn 投影への拡張は未対応）。
 - 列権限は、RETURNING が読む列（式の中の列識別子を含む）を SELECT 権限で判定する。
-- 未対応のまま残る面: データ変更 CTE・ビューへの書き込み・
-  `UPDATE ... FROM`／`DELETE ... USING`・NoSQL への展開（#3251）、`RETURNING` 内の `$n`（位置判定で拒否）。
+- 各面への展開は Issue #3251（「各面への展開」節）。`RETURNING` 内の `$n` は位置判定で拒否する。
 
 ## UDF の評価（Issue #3250・SQL-21 のポインタ）
 
 - 解決元: SQL 表層の DML 実行・Describe・EXPLAIN は、セッションの UDF レジストリで RETURNING を
   束縛する（`sql::parser::bind_returning_with_udfs`）。レジストリは認証済みテナントのセッションの
-  ものだけで、他テナントの同名関数は見えず `42883` になる。UDF を解決しない経路（NoSQL・データ変更
-  CTE・ビュー書き込み。#3251）は従来の `bind_returning`（空のレジストリ＝未登録扱いの `42883`）のまま
-  で、fail-closed を保つ。
+  ものだけで、他テナントの同名関数は見えず `42883` になる。データ変更 CTE・ビュー書き込み・FROM／USING 形も
+  Issue #3251 で同じレジストリへ切り替えた。UDF を解決しない経路は NoSQL だけで、従来の `bind_returning`
+  （空のレジストリ＝未登録扱いの `42883`）のまま fail-closed を保つ。
 - 種類ごとの扱い（いずれも書き込み前に決まり、台帳を消費しない）:
   - 宣言的 UDF: 束縛時にインライン展開し、既存の式評価で評価する。
   - WASM UDF: `WasmCall` として評価する。サンドボックスの上限・トラップの写像は `SELECT` と同じ。
@@ -415,3 +418,23 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
   判定する。RLS の再判定は式の評価より前のままで、式は可視の確定行にしか届かない。
 - 評価時エラー（例: 0 除算の `22012`）は commit 前に abort し、行も台帳も残さない。
 - 採番列・`id` 省略の INSERT と式項目（UDF を含む）の組み合わせは従来どおり `0A000`。
+
+## 各面への展開（Issue #3251・SQL-21・SQL-53・NOSQL-22 のポインタ）
+
+基表 DML と同じ束縛（`bind_returning_with_udfs`）・評価（`ReturningProjector`）を各面から呼ぶ。第 2 の投影・評価器は作らない。
+
+| 面 | 受理する形 | 拒否のまま |
+| -- | ---------- | ---------- |
+| データ変更 CTE | 別名・式・組み込み関数・宣言的／WASM UDF（セッションのレジストリで解決）。外側は公開名（別名・既定名・列名リストの改名後）で引く | routine `0A000`・サブクエリ `42601`・集計・`*` と他項目の併用 `0A000`（基表と同じ）。公開名の重複は `42702` |
+| ビュー経由の INSERT／UPDATE／DELETE | 同上。公開名で書き、物理名へ写す。式の既定名は公開名から導き、物理名は漏れない | 非公開列 `42703`・`id` 別名の公開名を式で参照 `0A000`・INSTEAD OF トリガのビュー（従来どおり）・採番方式／`id` 省略 INSERT と式項目の併用 `0A000` |
+| `UPDATE ... FROM`／`DELETE ... USING` | 任意の relation の列への `AS` 別名、対象表の列だけを参照する式・関数・UDF | FROM／USING 側の列を式の中で参照する形 `0A000`（結合中間行を評価器へ渡す基盤が無い。SET の式と同じ境界）。非修飾の両表共通列は `42702` |
+| NoSQL `returning` | 変更しない（対応しない） | 式・別名の文字列は `42601`。根拠は `docs/spec/04-behavior/nosql-surface.md` NOSQL-22 と `docs/spec/04-behavior/records/pg-parity-gap-holds-2026-11-13.md` の項目 2（ポインタのみ） |
+
+- **順序（fail-closed）**: ビューは公開列の範囲検査を物理名への写像より前に行う（filter oracle を避ける）。データ変更 CTE は参照されない副文を
+  含む全副文の `RETURNING` を、最初の書き込みと台帳の事前照合より前にセッションのレジストリで束縛する（`42883`・`42703`・型エラー・
+  routine の `0A000` が書き込み前に確定する）。Describe は同じ事前束縛を通り、Execute とエラーが一致する。
+- **FROM／USING の評価**: 対象表側の出力列は 1 つの投影（式を含む）にまとめ、文ごとに 1 回作る `ReturningProjector` で行ごとに 1 回評価して
+  出力位置へ配る。FROM／USING 側のセルは従来どおり一致行のセルの複製。RLS の再判定は式の評価より前。評価時エラー（`22012` 等）は
+  元の SQLSTATE のまま透過し、書き込みを abort する。
+- **列権限（SQL-40）**: これらの面は列単位の付与だけでは通らず（判別できない形は全列要求の fail-closed）、表単位の権限があれば通る。
+- **受け皿**: FROM／USING 側の列を式の中で参照する形の将来対応は、SET の式の同種制限と同じ評価基盤を要する（#3296 の候補）。

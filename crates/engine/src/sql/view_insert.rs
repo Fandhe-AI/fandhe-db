@@ -24,11 +24,12 @@
 //! セッションの `PolicyContext` が決め、ビュー作成者の可視性は引き継がれない。
 
 use super::allowlist::{
-    ConflictTargetSpec, OnConflictAction, OnConflictClause, Projection, SqlSurfaceError,
-    TableLookup, UpsertAddOperand, UpsertValue, ValidatedInsert, ValidatedViewInsert, ViewWriteOp,
-    WherePredicate,
+    ConflictTargetSpec, OnConflictAction, OnConflictClause, Projection, SelectItem,
+    SqlSurfaceError, TableLookup, UpsertAddOperand, UpsertValue, ValidatedInsert,
+    ValidatedViewInsert, ViewWriteOp, WherePredicate,
 };
 use super::exec::ColumnMeta;
+use super::udf_call::Expr;
 use super::view::{resolve_from, Resolved};
 use super::view_updatable::{view_updatability, ViewUpdatability};
 
@@ -265,16 +266,15 @@ pub(crate) fn rewrite_returning(
 ) -> Result<(Option<Projection>, Option<Vec<String>>), SqlSurfaceError> {
     match returning {
         None => Ok((None, None)),
-        Some(Projection::Items(items)) => Err(SqlSurfaceError::unsupported(
-            if items
-                .iter()
-                .all(crate::sql::allowlist::is_returning_column_item)
-            {
-                "RETURNING column aliases are not supported on writes through a view yet"
-            } else {
-                "RETURNING expressions are not supported on writes through a view yet"
-            },
-        )),
+        // 別名付き列参照・式（Issue #3248・#3249・#3251）。基表 DML と同じ束縛段へ渡すため、
+        // 公開名での検査を先に行ってから物理名へ写し、出力名は別名で運ぶ（`public_names` は `None`）。
+        Some(Projection::Items(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(rewrite_returning_item(mapper, item)?);
+            }
+            Ok((Some(Projection::Items(out)), None))
+        }
         Some(Projection::All) => match mapper.columns {
             None => Ok((Some(Projection::All), None)),
             Some(public) => {
@@ -294,6 +294,62 @@ pub(crate) fn rewrite_returning(
                 .map(|c| mapper.physical(c))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((Some(Projection::Columns(physical)), Some(cols.clone())))
+        }
+    }
+}
+
+/// `RETURNING` の式項目 1 件を物理名へ写す（[`rewrite_returning`] の `Items` 腕）。
+/// 公開列の範囲検査（非公開列は `42703`。filter oracle を避けるため写像より前）→ 既定出力名の確定
+/// （書き換え前の式から）→ 物理名への写像（疑似列 `id` へ別名で写る公開名は `0A000`）の順。
+fn rewrite_returning_item(
+    mapper: &Mapper<'_>,
+    item: &SelectItem,
+) -> Result<SelectItem, SqlSurfaceError> {
+    match item {
+        SelectItem::Column(c) => {
+            let physical = mapper.physical(c)?;
+            Ok(if physical == *c {
+                SelectItem::Column(physical)
+            } else {
+                SelectItem::Expr {
+                    expr: Expr::Ident(physical),
+                    alias: Some(c.clone()),
+                }
+            })
+        }
+        SelectItem::Expr {
+            expr: Expr::Ident(name),
+            alias,
+        } => {
+            let physical = mapper.physical(name)?;
+            let alias = alias
+                .clone()
+                .or_else(|| (physical != *name).then(|| name.clone()));
+            Ok(match alias {
+                Some(a) => SelectItem::Expr {
+                    expr: Expr::Ident(physical),
+                    alias: Some(a),
+                },
+                None => SelectItem::Column(physical),
+            })
+        }
+        SelectItem::Expr { expr, alias } => {
+            if let Some(columns) = mapper.columns {
+                crate::sql::view::expr_columns_within(columns, expr)?;
+            }
+            let alias = Some(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| crate::sql::parser::default_expr_alias(expr)),
+            );
+            let expr = match mapper.map {
+                Some(map) => crate::sql::view_alias::rewrite_set_value(
+                    &crate::sql::view_alias::ColumnMap::new(map, !mapper.base_allocated),
+                    expr,
+                )?,
+                None => expr.clone(),
+            };
+            Ok(SelectItem::Expr { expr, alias })
         }
     }
 }

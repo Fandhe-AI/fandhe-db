@@ -570,8 +570,12 @@ fn with_returning(mut p: JoinedDmlPlan, items: Vec<DmlFromReturningItem>) -> Joi
     let (t, s) = (t_schema(), s_schema());
     let scope =
         BindingScope::new(vec![(TableRef::new("t"), &t), (TableRef::new("s"), &s)]).expect("scope");
-    let mut bound =
-        bind_from_returning(&DmlFromReturning { items }, &scope).expect("bind RETURNING");
+    let mut bound = bind_from_returning(
+        &DmlFromReturning { items },
+        &scope,
+        &crate::sql::udf_call::UdfRegistry::default(),
+    )
+    .expect("bind RETURNING");
     bound
         .assign_source_cells(|_, slot| p.source_cell_position(slot))
         .expect("assign");
@@ -634,6 +638,7 @@ fn returning_with_an_unresolved_source_position_fails_closed_without_side_effect
                 items: vec![col("s", "v")],
             },
             &scope,
+            &crate::sql::udf_call::UdfRegistry::default(),
         )
         .expect("bind"),
     );

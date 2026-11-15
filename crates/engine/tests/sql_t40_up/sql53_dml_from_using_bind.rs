@@ -494,14 +494,15 @@ fn rejected_forms_fail_closed_with_expected_codes() {
             "DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING id",
             "42702",
         ),
-        // RETURNING の式・別名（Phase 3 の担当。従来の RETURNING と同じ 42601）
+        // RETURNING の FROM／USING 側の列を式の中で参照する形は未対応（`0A000`。別名・対象表の式は #3251 で受理済み）
+        // tracked: #3296
         (
-            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang RETURNING docs.n AS m",
-            "42601",
+            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang RETURNING upper(langs.label)",
+            "0A000",
         ),
         (
             "DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING lower(langs.label)",
-            "42601",
+            "0A000",
         ),
         // PARTITIONED 併用
         (

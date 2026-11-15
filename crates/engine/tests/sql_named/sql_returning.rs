@@ -2044,11 +2044,10 @@ fn returning_udf_is_not_visible_across_sessions() {
     assert_eq!(count_star(&core, &alice, TABLE), 0);
 }
 
-/// データ更新 CTE の UPDATE／DELETE の RETURNING では UDF を評価せず、書き込み前に `42883` で
-/// 拒否する（参照されない CTE 本体でも UDF が実行されず、書き込みが残らない）。
-/// 実行段の空レジストリ化は CTE INSERT・単一行 DELETE と同じ fail-closed の揃え。
+/// データ変更 CTE の副文の RETURNING は、別名・式・宣言的 UDF を基表 DML と同じ束縛・評価で受理し、
+/// 外側の SELECT がその公開名で引ける（Issue #3251）。
 #[test]
-fn data_modifying_cte_returning_udf_is_rejected_without_writing() {
+fn data_modifying_cte_returning_expressions_and_udf_are_evaluated() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
@@ -2070,30 +2069,89 @@ fn data_modifying_cte_returning_udf_is_rejected_without_writing() {
         ),
     )
     .expect("seed");
-    for (i, sql) in [
-        format!(
-            "WITH u AS (UPDATE {TABLE} SET lang = 'fr' WHERE id = 1 RETURNING shout(lang)) \
-             SELECT id FROM {TABLE} USING OPERATION_ID 'op-cte-udf-u1'"
+    let out = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "WITH u AS (UPDATE {TABLE} SET lang = 'fr' WHERE id = 1 \
+             RETURNING id AS rid, shout(lang) AS s, upper(body)) \
+             SELECT rid, s, upper FROM u USING OPERATION_ID 'op-cte-udf-u1'"
         ),
-        format!(
-            "WITH u AS (UPDATE {TABLE} SET lang = 'fr' WHERE id > 0 RETURNING shout(lang)) \
-             SELECT id FROM {TABLE} USING OPERATION_ID 'op-cte-udf-u2'"
-        ),
-        format!(
+    )
+    .expect("update cte");
+    match out {
+        SqlOutcome::Query(q) => {
+            assert_eq!(q.rows.len(), 1);
+            assert_eq!(
+                q.rows[0].cells,
+                vec![
+                    Cell::Integer(1),
+                    Cell::Text("FR".to_string()),
+                    Cell::Text("HELLO".to_string())
+                ]
+            );
+        }
+        other => panic!("expected Query, got {other:?}"),
+    }
+    // 述語形 DELETE（参照されない副文）でも UDF が評価され、削除が確定する。
+    run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
             "WITH d AS (DELETE FROM {TABLE} WHERE id > 0 RETURNING shout(lang)) \
              SELECT id FROM {TABLE} USING OPERATION_ID 'op-cte-udf-d1'"
         ),
+    )
+    .expect("delete cte");
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+}
+
+/// データ変更 CTE の全副文の RETURNING は書き込み前に束縛される。未登録の関数（`42883`）・未知列
+/// （`42703`）・`LANGUAGE sql|plpgsql` 関数（`0A000`）は、参照されない副文でも先行副文の書き込みと
+/// 台帳より前に拒否され、行も台帳も残らない（Issue #3251）。
+// intentional: docs/design/sql-returning.md
+#[test]
+fn data_modifying_cte_returning_errors_are_decided_before_any_write() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION pw(x text) RETURNS text LANGUAGE plpgsql IMMUTABLE AS \
+         $$ BEGIN RETURN x; END $$",
+    );
+    run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hello') USING OPERATION_ID 'op-cte-pre-seed'"
+        ),
+    )
+    .expect("seed");
+    for (i, (ret, code)) in [
+        ("nope(lang)", "42883"),
+        ("lang || nope_col", "42703"),
+        ("pw(lang)", "0A000"),
     ]
     .iter()
     .enumerate()
     {
-        let err = run(&core, &alice, &mut session, sql).expect_err(sql);
-        // 現状は CTE 展開段（式 RETURNING は #3251 で対応予定）が 0A000 で先に拒否する。展開が
-        // 対応した後も、実行段は空レジストリのため 42883 で拒否される。どちらも書き込み前の拒否。
-        assert!(
-            ["0A000", "42883"].contains(&err.wire_code()),
-            "#{i} {sql}: {err}"
+        // 1 つ目の副文は有効な UPDATE（先に書き込まれてはならない）、2 つ目が無効な RETURNING。
+        let sql = format!(
+            "WITH a AS (UPDATE {TABLE} SET lang = 'fr' WHERE id = 1 RETURNING id), \
+             b AS (DELETE FROM {TABLE} WHERE id = 1 RETURNING {ret}) \
+             SELECT id FROM a USING OPERATION_ID 'op-cte-pre-{i}'"
         );
+        let err = run(&core, &alice, &mut session, &sql).expect_err(&sql);
+        assert_eq!(err.wire_code(), *code, "#{i} {sql}: {err}");
         assert_eq!(count_star(&core, &alice, TABLE), 1, "#{i}");
         let lang = run(
             &core,
@@ -2147,11 +2205,10 @@ fn returning_udf_in_explicit_transaction() {
     }
 }
 
-/// ビュー経由の UPDATE・述語 DELETE の RETURNING は UDF を評価せず `42883` で fail-closed
-/// （#3251。ビュー INSERT・単一行 DELETE と同じ契約。Describe と Execute の挙動を一致させる）。
-// intentional: docs/design/sql-returning.md
+/// ビュー経由の INSERT・UPDATE・DELETE の RETURNING は、別名・式・宣言的 UDF を基表 DML と同じ束縛・評価で
+/// 受理する（Issue #3251。UDF はセッションのレジストリで解決する）。出力名は公開名から導かれる。
 #[test]
-fn returning_udf_through_view_is_fail_closed() {
+fn returning_expressions_and_udf_through_view_are_evaluated() {
     let (core, path) = new_core_with_table();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice", true);
@@ -2163,38 +2220,148 @@ fn returning_udf_through_view_is_fail_closed() {
         &mut session,
         "CREATE FUNCTION shout(x) AS upper(x)",
     );
-    run(
-        &core,
-        &alice,
-        &mut session,
-        &format!(
-            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
-             (1, '[0.1,0.2]', 'ja', 'hello') USING OPERATION_ID 'op-udf-vseed'"
-        ),
-    )
-    .expect("seed");
     define(
         &core,
         &alice,
         &mut session,
         &format!("CREATE VIEW v_udf AS SELECT * FROM {TABLE}"),
     );
-    for sql in [
-        "UPDATE v_udf SET lang = 'fr' WHERE id = 1 RETURNING shout(lang) \
-         USING OPERATION_ID 'op-udf-vu'",
-        "UPDATE v_udf SET lang = 'fr' WHERE lang = 'ja' RETURNING shout(lang) \
-         USING OPERATION_ID 'op-udf-vup'",
-        "DELETE FROM v_udf WHERE lang = 'ja' RETURNING shout(lang) \
-         USING OPERATION_ID 'op-udf-vdp'",
+    let ins = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            "INSERT INTO v_udf (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hello') RETURNING shout(lang) AS s, upper(body) \
+             USING OPERATION_ID 'op-udf-vins'",
+        )
+        .expect("view insert"),
+    );
+    assert_eq!(
+        ins.result.rows[0].cells,
+        vec![Cell::Text("JA".into()), Cell::Text("HELLO".into())]
+    );
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            "UPDATE v_udf SET lang = 'fr' WHERE id = 1 RETURNING id AS rid, shout(lang) AS s \
+             USING OPERATION_ID 'op-udf-vu'",
+        )
+        .expect("view update single"),
+    );
+    assert_eq!(
+        upd.result.rows[0].cells,
+        vec![Cell::Integer(1), Cell::Text("FR".into())]
+    );
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            "UPDATE v_udf SET lang = 'de' WHERE lang = 'fr' RETURNING shout(lang) \
+             USING OPERATION_ID 'op-udf-vup'",
+        )
+        .expect("view update predicate"),
+    );
+    assert_eq!(upd.result.rows[0].cells, vec![Cell::Text("DE".into())]);
+    let del = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            "DELETE FROM v_udf WHERE lang = 'de' RETURNING shout(lang) AS s, id + 1 \
+             USING OPERATION_ID 'op-udf-vdp'",
+        )
+        .expect("view delete predicate"),
+    );
+    assert_eq!(
+        del.result.rows[0].cells,
+        vec![Cell::Text("DE".into()), Cell::Float(2.0)]
+    );
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+}
+
+/// 列を絞る・改名するビューの RETURNING 式は公開名で書き、出力名の既定も公開名から導かれて物理名が
+/// 漏れない。非公開列を式で参照すると `42703`、`LANGUAGE plpgsql` 関数は書き込み前に `0A000`
+/// （Issue #3251）。
+// intentional: docs/design/sql-returning.md
+#[test]
+fn returning_expressions_through_renaming_view_use_public_names() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION pw(x text) RETURNS text LANGUAGE plpgsql IMMUTABLE AS \
+         $$ BEGIN RETURN x; END $$",
+    );
+    define(
+        &core,
+        &alice,
+        &mut session,
+        &format!("CREATE VIEW v_ren (lng, txt) AS SELECT lang, body FROM {TABLE}"),
+    );
+    run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hi') USING OPERATION_ID 'op-ren-seed'"
+        ),
+    )
+    .expect("seed");
+    let out = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            "UPDATE v_ren SET lng = 'ja' WHERE lng = 'ja' \
+             RETURNING upper(lng), txt AS t2, lng USING OPERATION_ID 'op-ren-upd'",
+        )
+        .unwrap_or_else(|e| panic!("view rename update: {e}")),
+    );
+    let names: Vec<String> = out
+        .result
+        .columns
+        .iter()
+        .map(|c| match c {
+            engine::sql::exec::ColumnMeta::Scalar { name, .. }
+            | engine::sql::exec::ColumnMeta::Computed { name, .. } => name.clone(),
+            other => panic!("unexpected column {other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["upper", "t2", "lng"]);
+    assert_eq!(
+        out.result.rows[0].cells,
+        vec![
+            Cell::Text("JA".into()),
+            Cell::Text("hi".into()),
+            Cell::Text("ja".into())
+        ]
+    );
+    for (sql, code) in [
+        (
+            "UPDATE v_ren SET lng = 'x' WHERE lng = 'ja' RETURNING upper(lang)",
+            "42703",
+        ),
+        (
+            "UPDATE v_ren SET lng = 'x' WHERE lng = 'ja' RETURNING pw(lng)",
+            "0A000",
+        ),
+        (
+            "DELETE FROM v_ren WHERE lng = 'ja' RETURNING pw(lng)",
+            "0A000",
+        ),
     ] {
         let err = run(&core, &alice, &mut session, sql).expect_err(sql);
-        // 構文段が式を `42601` で拒否する形と、束縛段が空レジストリで `42883` に倒す形の
-        // どちらも fail-closed（UDF を評価して成功してはならない）。
-        assert!(
-            matches!(err.wire_code(), "42601" | "42883"),
-            "{sql}: {} {err}",
-            err.wire_code()
-        );
+        assert_eq!(err.wire_code(), code, "{sql}: {err}");
     }
     assert_eq!(count_star(&core, &alice, TABLE), 1);
 }
