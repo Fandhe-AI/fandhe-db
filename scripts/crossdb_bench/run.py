@@ -332,11 +332,24 @@ def main() -> int:
 
     # --- hybrid 深さ arm の品質指標（Issue #3225。定義は hybrid_depth.py・README 参照） ---
     # いずれも hybrid の BM25 関連性 recall ではない。算出不能は 0 とせず quality_unsupported に理由を残す。
+    # 深さ arm が 1 つも無い DB（pgvector・MySQL 等）では docs を読まない。読む場合も
+    # 行単位で id と topic だけを保持し、embedding を含む全文書をメモリへ二重展開しない。
     doc_topic: dict[int, str] = {}
-    if os.path.exists(docs_file):
-        for d in load_jsonl(docs_file):
-            if d.get("topic") is not None and d.get("id") is not None:
-                doc_topic[int(d["id"])] = d["topic"]
+    has_depth_arm = any(
+        isinstance(phases.get(a), dict) and not phases[a].get("unsupported") and phases[a].get("ids_per_query")
+        for a in DEPTH_ARMS
+    )
+    if has_depth_arm and os.path.exists(docs_file):
+        import json as _json
+
+        with open(docs_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = _json.loads(line)
+                if d.get("topic") is not None and d.get("id") is not None:
+                    doc_topic[int(d["id"])] = d["topic"]
     query_topics = [q.get("topic") for q in queries]
     depth200_ids = (phases.get("hybrid_rrf_depth200") or {}).get("ids_per_query")
     for arm in DEPTH_ARMS:
