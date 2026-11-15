@@ -695,15 +695,6 @@ fn where_predicates_contain_visible(predicates: &[WherePredicate]) -> bool {
     })
 }
 
-/// `predicates` が [`WherePredicate::Or`] を（直接またはネストした分岐の内部に）
-/// 1 つでも含むかどうかを判定する（TASK-208・Issue #912）。`CHECK (...)` 本体
-/// （[`Parser::parse_check_clause`]）が `OR` を明示的に拒否するために使う。
-fn where_predicates_contain_or(predicates: &[WherePredicate]) -> bool {
-    predicates
-        .iter()
-        .any(|predicate| matches!(predicate, WherePredicate::Or(_)))
-}
-
 /// `token` が `WHERE` 述語の範囲比較演算子（`< > <= >=`）トークンであれば
 /// 対応する [`CompareOp`] を返す（TABLE-13・TASK-199、Issue #891）。`=` は
 /// 既存の [`WherePredicate::Equality`] 判定が別腕で扱うためここには含めない。
@@ -9734,10 +9725,8 @@ impl<'a> Parser<'a> {
         // 比較・算術演算子でない）のときだけここで処理し、否定は
         // [`negate_conjunction`] で葉まで押し下げる（二値評価器の上に
         // `Not` を残さない）。値式グループ（`NOT (id + 1) > 5`）は葉の経路へ流す。
-        // CHECK 本体（TABLE-16）では従来どおり葉の経路で `42601` にする。
-        if !self.in_check_body
-            && matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT"))
-        {
+        // CHECK 本体（TABLE-16）も同じ経路を通る（Issue #3243）。
+        if matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NOT")) {
             let mut not_count = 0usize;
             while matches!(
                 self.tokens.get(self.pos.saturating_add(not_count)),
@@ -9899,14 +9888,6 @@ impl<'a> Parser<'a> {
                 self.advance();
                 negate_odd = !negate_odd;
             }
-            // CHECK 本体（TABLE-16）では `NOT ( ... )`・裸の `NOT <式比較>`・数値の
-            // `IN`／`BETWEEN` を従来どおり `42601` にする（脱糖後の形が
-            // `check_constraint` の許可形と区別できないため。Issue #1184）。
-            if self.in_check_body && matches!(self.peek(), Some(Token::Punct('('))) {
-                return Err(SqlSurfaceError::unsupported(
-                    "NOT ( ... ) grouping is not supported",
-                ));
-            }
             if let Some(inner) = self.try_parse_const_bool_leaf(extra_close_paren, set_operators) {
                 if negate_odd {
                     negate_conjunction(inner, &mut self.expr_node_budget)?
@@ -9973,10 +9954,6 @@ impl<'a> Parser<'a> {
                 } else {
                     vec![inner]
                 }
-            } else if self.in_check_body {
-                return Err(SqlSurfaceError::unsupported(
-                    "NOT must be followed by a supported predicate (not an expression)",
-                ));
             } else {
                 // 裸の `NOT <式比較>`（`NOT id > 1`・`NOT (id + 1) > 5`）。頂点の比較を
                 // 反転して葉へ押し下げる。
@@ -16441,7 +16418,7 @@ impl<'a> Parser<'a> {
         Ok((name, predicates))
     }
 
-    /// `CHECK ( <述語> )` の本体部分（`CHECK` キーワード・括弧・`OR` 拒否）を
+    /// `CHECK ( <述語> )` の本体部分（`CHECK` キーワード・括弧）を
     /// 消費する（TABLE-16・TASK-204、Issue #906）。[`Self::parse_check_clause`]
     /// （`CREATE TABLE`）と `ALTER TABLE ... ADD [CONSTRAINT <name>] CHECK (...)`
     /// （TASK-204、Issue #1068）の両方が、制約名の解決（列型キーワードとの
@@ -16457,15 +16434,8 @@ impl<'a> Parser<'a> {
         self.in_check_body = prev_in_check;
         let predicates = body?;
         self.expect_punct(')')?;
-        if where_predicates_contain_or(&predicates) {
-            // TASK-208・SQL-24（Issue #912）の対象は読み取り文・書き込み文の
-            // `WHERE` のみで、`CHECK (...)` 本体（TABLE-16）は含まない。
-            // 明示的に `42601` で拒否する（将来解禁する場合に備え、
-            // `render_predicate` 側は既に `Or` を網羅描画できる）。
-            return Err(SqlSurfaceError::unsupported(
-                "OR is not supported inside a CHECK clause",
-            ));
-        }
+        // `OR`・`NOT` は Issue #3243（TABLE-16・SQL-24）で受理する。否定は
+        // `negate_conjunction` で葉まで押し下げ済みで、構文木に `Not` 群は残らない。
         Ok(predicates)
     }
 
@@ -33447,14 +33417,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_or_inside_check_clause() {
-        let lookup = catalog_with(&["documents"]);
-        let err = validate_statement(
+    fn accepts_or_and_not_inside_check_clause() {
+        let parse = |sql: &str| {
+            let tokens = lexer::tokenize(sql).expect("tokenize");
+            validate_create_table_tokens(&tokens)
+        };
+        // Issue #3243: CHECK 本体の `OR`・`NOT` は受理する（三値評価は engine 側）。
+        for sql in [
             "CREATE TABLE t (kind TEXT, CHECK (kind = 'a' OR kind = 'b'))",
-            &lookup,
-        )
-        .expect_err("OR must remain rejected inside CHECK bodies");
-        assert_eq!(err.wire_code(), "42601");
+            "CREATE TABLE t (n INTEGER, CHECK (NOT (n = 0)))",
+            "CREATE TABLE t (kind TEXT, CHECK (NOT kind = 'a'))",
+            "CREATE TABLE t (n INTEGER, CHECK (NOT n > 1))",
+            "CREATE TABLE t (kind TEXT, CHECK (kind <> 'a'))",
+        ] {
+            parse(sql).unwrap_or_else(|e| panic!("{sql} must be accepted: {e:?}"));
+        }
+        // 禁止要素は OR／NOT の内側でも構文段で拒否する（`visible()` は RLS-7、式左辺の LIKE は 0A000）。
+        for sql in [
+            "CREATE TABLE t (a INTEGER, CHECK (a > 0 OR visible()))",
+            "CREATE TABLE t (a TEXT, CHECK (NOT lower(a) LIKE 'a%'))",
+        ] {
+            assert!(parse(sql).is_err(), "{sql} must be rejected");
+        }
     }
 
     // 許可された ORDER BY 関数の引数形状回帰テスト。
