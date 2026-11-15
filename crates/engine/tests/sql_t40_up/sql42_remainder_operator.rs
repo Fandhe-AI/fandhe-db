@@ -222,8 +222,25 @@ fn unsupported_operand_types_are_42883() {
         "SELECT n + r % 2 FROM t LIMIT 10",
         "SELECT s % 2 FROM t LIMIT 10",
         "SELECT embedding % 2 FROM t LIMIT 10",
+        // CASE／COALESCE／NULLIF で包んだ float8 も、直接の float8 と同じく 42883。
+        "SELECT COALESCE(7::float8, 0::float8) % 2",
+        "SELECT NULLIF(7::float8, 0::float8) % 2",
+        "SELECT CASE WHEN 1 = 1 THEN 7::float8 ELSE 0::float8 END % 2",
     ] {
         assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+}
+
+/// 小数リテラルの剰余は f64 の fmod（`0.3 % 0.1` が約 0.1）へ流さず fail-closed で拒否する（0A000）。
+#[test]
+fn decimal_literal_remainder_is_rejected_not_approximated() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT 0.3 % 0.1",
+        "SELECT 7.5 % 2",
+        "SELECT n FROM t WHERE 0.3 % 0.1 = 0",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
     }
 }
 

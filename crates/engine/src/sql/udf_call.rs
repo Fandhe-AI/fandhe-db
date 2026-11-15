@@ -7250,10 +7250,6 @@ pub(super) fn bind_expr_any(
                     _ => {}
                 }
             }
-            // Issue #3273: PG の `%` は float 型を受け付けない（`operator does not exist`）。
-            if *op == BinOp::Rem && (pg_float_operand(lhs, env) || pg_float_operand(rhs, env)) {
-                return Err(rem_operator_error());
-            }
             // Issue #1597: 比較だけは jsonb 結果のオペランドを受理する（算術は
             // 従来どおり `bind_expr_in` が `0A000` で拒否する）。
             let is_comparison = matches!(
@@ -7328,6 +7324,29 @@ pub(super) fn bind_expr_any(
                 reject_json_operand(lt)?;
                 reject_json_operand(rt)?;
             }
+            // Issue #3273・SQL-42: `%` の f64 レーンは、両被演算子が整数値と判定できる組だけを
+            // 受理する。PG の `%` は整数・numeric のみで、小数リテラル（`0.3 % 0.1` は numeric で 0）を
+            // f64 の fmod へ流すと値が変わり、float8 の式（CASE／COALESCE／NULLIF 経由を含む）は
+            // `42883` になるべきなので、束縛後の判定で整数と証明できない組は fail-closed で拒否する。
+            if *op == BinOp::Rem
+                && lt == ExprType::Scalar
+                && rt == ExprType::Scalar
+                && !(rem_integer_operand(lhs, &l, env) && rem_integer_operand(rhs, &r, env))
+            {
+                return Err(
+                    if matches!(&**lhs, Expr::Number(_)) && !rem_integer_operand(lhs, &l, env)
+                        || matches!(&**rhs, Expr::Number(_)) && !rem_integer_operand(rhs, &r, env)
+                    {
+                        SqlSurfaceError::FeatureNotSupported {
+                            detail:
+                                "remainder with a non-integer literal requires a numeric operand"
+                                    .to_string(),
+                        }
+                    } else {
+                        rem_operator_error()
+                    },
+                );
+            }
             // Issue #1539・SQL-42: 投影モードの `Scalar` 同士の算術は、オペランドの数値
             // 種別（整数／単精度／倍精度）から結果型を PostgreSQL に揃える。
             // Issue #2881: 整数モードの整数どうしの比較は i128 で丸めなく比較する。
@@ -7358,11 +7377,6 @@ pub(super) fn bind_expr_any(
             {
                 let lk = numeric_kind(lhs, &l, env);
                 let rk = numeric_kind(rhs, &r, env);
-                if *op == BinOp::Rem
-                    && (lk == Some(NumericKind::Float4) || rk == Some(NumericKind::Float4))
-                {
-                    return Err(rem_operator_error());
-                }
                 if let Some(kind) = combine_numeric_kind(lk, rk) {
                     let exact = env.exact_int
                         && matches!(
@@ -9490,23 +9504,45 @@ fn rem_operator_error() -> SqlSurfaceError {
     SqlSurfaceError::undefined_function("operator does not exist: unsupported operand types for %")
 }
 
-/// 式が PostgreSQL で float4／float8 と判定できる被演算子か（Issue #3273）。PG の `%` は
-/// smallint／integer／bigint／numeric だけなので、`bind_expr` の `Rem` 束縛が `42883` で拒否する。
-/// 判定できるのは REAL／DOUBLE 列・float 型への明示 CAST・それらを含む算術のみ
-/// （関数の戻り値等は判定できず f64 の fmod で計算する既知の差分）。
-fn pg_float_operand(expr: &Expr, env: &BindEnv<'_>) -> bool {
+/// `%` の f64 レーンの被演算子が整数値と証明できるか（Issue #3273）。束縛済みの数値種別
+/// （[`projection_kind`]。CASE／COALESCE／NULLIF の分岐型を透過する）が整数なら真。それ以外は
+/// 構文で、整数リテラル・整数列・疑似列 `id`・整数型への CAST と、それらの `+ - * %` だけを真とする
+/// （`/` は f64 の真の除算になりうるため含めない）。float8・小数リテラル・不明な型は偽（fail-closed）。
+fn rem_integer_operand(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> bool {
+    if matches!(
+        projection_kind(expr, bound, env.schema),
+        ProjKind::Num(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8)
+    ) {
+        return true;
+    }
+    rem_integer_syntax(expr, env)
+}
+
+fn rem_integer_syntax(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    use crate::sql::cast::CastType;
     match expr {
-        Expr::Ident(_) => float_column_ident(expr, env),
-        Expr::Call { name, .. } => is_typed_float_name(name),
-        Expr::Cast { ty, .. } => matches!(
-            ty,
-            crate::sql::cast::CastType::Float4 | crate::sql::cast::CastType::Float8
-        ),
+        Expr::Number(raw) => classify_exact_int_literal(raw).is_some(),
+        Expr::Ident(name) => {
+            if env.params.contains_key(name.to_ascii_lowercase().as_str()) {
+                return false;
+            }
+            match env
+                .schema
+                .and_then(|s| s.columns.iter().find(|c| &c.name == name))
+            {
+                Some(c) => matches!(
+                    c.ty,
+                    ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+                ),
+                None => name.eq_ignore_ascii_case("id"),
+            }
+        }
+        Expr::Cast { ty, .. } => matches!(ty, CastType::Int2 | CastType::Int4 | CastType::Int8),
         Expr::Binary {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem,
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Rem,
             lhs,
             rhs,
-        } => pg_float_operand(lhs, env) || pg_float_operand(rhs, env),
+        } => rem_integer_syntax(lhs, env) && rem_integer_syntax(rhs, env),
         _ => false,
     }
 }
@@ -15475,6 +15511,28 @@ mod tests {
         let cast = call("float8", vec![num("1.5")]);
         assert_eq!(rem(cast, num("2")).unwrap_err().wire_code(), "42883");
         assert!(rem(num("7"), num("2")).is_ok());
+        // 小数リテラル（PG では numeric の剰余）は f64 の fmod へ流さず拒否する。
+        assert_eq!(
+            rem(num("0.3"), num("0.1")).unwrap_err().wire_code(),
+            "0A000"
+        );
+        assert_eq!(
+            rem(ident("id"), num("2.5")).unwrap_err().wire_code(),
+            "0A000"
+        );
+        // CASE／COALESCE／NULLIF で包んだ float8 も結果型から拒否する。
+        let f8 = || call("float8", vec![num("7")]);
+        let co = Expr::Coalesce(vec![f8(), f8()]);
+        assert_eq!(rem(co, num("2")).unwrap_err().wire_code(), "42883");
+        let ni = Expr::NullIf(Box::new(f8()), Box::new(num("0")));
+        assert_eq!(rem(ni, num("2")).unwrap_err().wire_code(), "42883");
+        let case = Expr::Case {
+            whens: vec![(bin(BinOp::Eq, num("1"), num("1")), f8())],
+            else_result: Some(Box::new(f8())),
+        };
+        assert_eq!(rem(case, num("2")).unwrap_err().wire_code(), "42883");
+        // 整数の COALESCE は受理する。
+        assert!(rem(Expr::Coalesce(vec![num("7"), num("1")]), num("2")).is_ok());
     }
 
     /// Issue #1560: smallint 同士の算術は smallint（i16 の溢れは 22003）、混在は広い方。
