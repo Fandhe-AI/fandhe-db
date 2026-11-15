@@ -12,9 +12,10 @@
 //! `CompiledChecks` は書き込み時の単一検査点 `constraint::enforce_row_constraints_in_txn`
 //! （`tenant.rs` の全書き込み関数が行の書き込み後・commit 前に呼ぶ。明示
 //! トランザクション中の書き込みも同じ検査点を通る）が呼ぶ実行時コンパイル・評価
-//! 本体で、`row_codec::scan_scalar_columns_masked`（宣言的フィルタ側）・
-//! `sql::expr_program::ExprProgram`（式フィルタ側。TASK-79・SQL-9 の既存
-//! コンパイラをそのまま再利用）で評価する。
+//! 本体で、`row_codec::scan_scalar_columns_masked`（参照列のデコード）と
+//! `sql::where_tree::BoundConjunction::eval_three_valued`（述語木の Kleene 三値評価。
+//! 葉は WHERE と共有する `MetadataFilter::eval`・`ExprProgram::eval`。Issue #3242）で
+//! 評価する。違反は FALSE のときだけで、UNKNOWN は合格とする。
 //!
 //! `CHECK` の式比較（`WherePredicate::Expression`）で参照できるのは疑似列
 //! `id`・`VECTOR` 列（`vec_norm`/`vec_sum`/`vec_div` 経由）・INTEGER/BIGINT/
@@ -26,8 +27,9 @@
 use crate::catalog::{CheckConstraint, TableSchema};
 use crate::declarative_filter::MetadataFilter;
 use crate::sql::allowlist::{ParsedCheck, SqlSurfaceError, WherePredicate};
-use crate::sql::expr_program::{ExprProgram, StackValue};
-use crate::sql::udf_call::{self, Expr, ExprValue, ValueFunctionKind};
+use crate::sql::expr_program::StackValue;
+use crate::sql::udf_call::{self, Expr, ValueFunctionKind};
+use crate::sql::where_tree::{BoundConjunction, Truth};
 use crate::tenant::TenantWriteError;
 
 /// `predicates` を `sql::allowlist::Parser::parse_where`／`parse_check_body` と
@@ -577,9 +579,8 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
             }
             WherePredicate::Expression(expr) => reject_forbidden_expr(expr)?,
             // SQL-24（TASK-208 ポインタ）: `IN`／`BETWEEN`／`IS [NOT] NULL`／`NOT`
-            // は CHECK 制約では未対応のまま拒否する（`enforce` の
-            // 「NULL なら常に合格」という短絡が `IS NOT NULL` の意味と相容れない
-            // ため。TABLE-16 の既存挙動は不変。対応は別 Issue へ申し送り）。
+            // は CHECK 制約では未対応のまま拒否する（TABLE-16 の既存挙動は不変。
+            // 評価器は三値化済みで、解禁は #3243・#3244 で扱う）。
             WherePredicate::InList { .. }
             | WherePredicate::Between { .. }
             | WherePredicate::IsNull { .. }
@@ -1197,12 +1198,10 @@ pub(crate) struct CompiledChecks {
 
 struct CompiledCheck {
     name: String,
-    conjuncts: Vec<CompiledConjunct>,
-}
-
-enum CompiledConjunct {
-    Declarative(MetadataFilter),
-    Expr { program: ExprProgram },
+    /// 述語木（AND の連言＋入れ子の OR 群）。WHERE と同じ束縛結果を保持し、
+    /// [`BoundConjunction::eval_three_valued`] で三値評価する（OR 群を捨てると
+    /// 評価器が OR を解禁されたとき無検査で通る fail-open になるため保持する）。
+    predicate: BoundConjunction,
 }
 
 impl CompiledChecks {
@@ -1225,7 +1224,7 @@ impl CompiledChecks {
                     .map_err(corrupt_check)?;
             reject_forbidden_elements(&predicates).map_err(corrupt_check)?;
             let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-            let (metadata_filters, expr_filters, _rls_predicate_present, _or_filters) =
+            let (metadata_filters, expr_filters, _rls_predicate_present, or_filters) =
                 crate::sql::parser::bind_check_predicates(&predicates, schema, &mut node_budget)
                     .map_err(corrupt_check)?;
 
@@ -1241,28 +1240,14 @@ impl CompiledChecks {
                 ))));
             }
 
-            let mut conjuncts = Vec::with_capacity(metadata_filters.len() + expr_filters.len());
-            for filter in metadata_filters {
-                if let Some(slot) = column_mask.get_mut(filter.column_index()) {
-                    *slot = true;
-                }
-                conjuncts.push(CompiledConjunct::Declarative(filter));
-            }
-            for expr in &expr_filters {
-                // Issue #919・SQL-26: 式述語が参照する `TEXT` 列も
-                // `column_mask` へ反映する（`enforce` の `scan_scalar_columns_masked`
-                // 呼び出しがこのマスクを使ってデコードするため、反映漏れは
-                // マスク外参照＝実 NULL との取り違えという fail-closed 判定に
-                // 落ちる）。
-                udf_call::mark_referenced_scalar_columns(expr, &mut column_mask);
-                conjuncts.push(CompiledConjunct::Expr {
-                    program: ExprProgram::compile(expr),
-                });
-            }
+            // 列マスクは OR 群の内側を含めて算出する（マスク漏れは NULL 扱いで合格する
+            // fail-open になるため。`BoundConjunction::mark_scalar_column_mask` 参照）。
+            let predicate = BoundConjunction::new(metadata_filters, expr_filters, or_filters);
+            predicate.mark_scalar_column_mask(&mut column_mask);
 
             compiled.push(CompiledCheck {
                 name: check.name.clone(),
-                conjuncts,
+                predicate,
             });
         }
         Ok(Some(CompiledChecks {
@@ -1273,11 +1258,10 @@ impl CompiledChecks {
 
     /// `id`・`embedding`・`metadata`（`row_codec::encode_scalar_columns` が
     /// 書いた正規レイアウト）を持つ 1 行を全 `CHECK` に対して検査する。
-    /// 三値論理（SQL 標準）: 連言（宣言的フィルタ・式のいずれも）の参照列・
-    /// 参照ベクトルが NULL（`scanned` が `None`、または `VECTOR` 列参照時に
-    /// `dim == 0`）なら UNKNOWN としてスキップし、非 NULL で不一致
-    /// （`matches() == false` または式評価が `Bool(false)`）のときのみ違反と
-    /// する。AND 連結のため「いずれかの連言が FALSE なら違反」と同値。
+    /// 述語木を Kleene の三値論理で評価する（`where_tree::BoundConjunction::
+    /// eval_three_valued`。葉の評価器は WHERE と共有）。FALSE のときだけ違反
+    /// （23514）とし、UNKNOWN（NULL を含む比較等）は合格とする（PG 互換。
+    /// TABLE-16・SQL-26 ポインタ）。
     ///
     /// 呼び出し元（`constraint::enforce_row_constraints_in_txn`）は台帳照合
     /// （`ledger::record_in_txn`）・行の書き込みの**後**、テーブル世代 bump・commit
@@ -1299,69 +1283,23 @@ impl CompiledChecks {
                     TenantWriteError::Catalog(crate::catalog::CatalogError::Invalid(e.to_string()))
                 })?;
         let mut expr_scratch: Vec<StackValue> = Vec::new();
-        // Issue #919・SQL-26: `column_mask` は `TEXT` 参照を反映済み
-        // （`CompiledChecks::compile` 参照）。
         for check in &self.checks {
-            for conjunct in &check.conjuncts {
-                let satisfied_or_unknown = match conjunct {
-                    CompiledConjunct::Declarative(filter) => {
-                        match scanned.get(filter.column_index()).copied().flatten() {
-                            // 参照列が NULL: UNKNOWN としてスキップ（違反にしない）。
-                            None => true,
-                            Some(value) => filter.matches(Some(value)),
-                        }
-                    }
-                    CompiledConjunct::Expr { program } => {
-                        // `VECTOR` 列が NULL（`dim == 0`）の行を式が実際に参照する
-                        // 場合の NULL（UNKNOWN）伝播は `program.eval` 自身
-                        // （`ExprStep::PushVector` の空スライス判定。
-                        // `sql::expr_program` 参照）が行う（codex-review P1 指摘
-                        // 対応: 静的な式木走査（`references_embedding`）による
-                        // 事前判定は `CASE` の選ばれない分岐に embedding 参照が
-                        // あるだけの行まで誤って UNKNOWN 扱いにしていたため撤去
-                        // し、評価時点の判定へ一本化した）。
-                        match program.eval(id, embedding, &scanned, &mut expr_scratch) {
-                            Ok(ExprValue::Bool(b)) => b,
-                            // UNKNOWN（NULL）は充足扱いにする（Issue #919・
-                            // SQL-26（AC2）と Issue #921・SQL-26 の共有契約。
-                            // PostgreSQL 互換。上の `Declarative` 腕「参照列
-                            // NULL は違反にしない」と同じ意図的判断——NULL を
-                            // 返す式を書けるのは DDL 権限を持つ主体のみのため
-                            // 制約の迂回にはならない）。
-                            Ok(ExprValue::Null) => true,
-                            Ok(_) => {
-                                // 束縛段（`bind_where_predicates`）が式述語の
-                                // 型を Bool に限定済みのため到達しない。防御的に
-                                // `Internal`（`XX000`）として fail-closed に
-                                // 拒否する（通常の式評価と同じ分類に委譲する
-                                // 契約は保ったまま、型不変条件が崩れた場合は
-                                // 内部事象として扱う）。
-                                return Err(TenantWriteError::CheckEvaluationFailed(
-                                    SqlSurfaceError::Internal {
-                                        detail:
-                                            "CHECK predicate expression did not evaluate to Bool"
-                                                .to_string(),
-                                    },
-                                ));
-                            }
-                            // オーナー判断（2026-09-28・Issue #1075、ERR-6・
-                            // SQL-26・TABLE-16 ポインタ）: 0 除算・`BIGINT` 精度
-                            // 超過等の式評価エラーを、通常の式評価（`WHERE`／
-                            // `SELECT` と共有する `ExprProgram`）と同じ
-                            // `SqlSurfaceError`（＝同じ `wire_code`）のまま
-                            // 呼び出し元へ透過させる（以前は `XX000` へ丸めて
-                            // いた）。PostgreSQL と同様、CHECK 評価中のエラーは
-                            // 制約違反（`23514`）ではなく式評価エラーとして
-                            // 返す。
-                            Err(e) => return Err(TenantWriteError::CheckEvaluationFailed(e)),
-                        }
-                    }
-                };
-                if !satisfied_or_unknown {
+            match check
+                .predicate
+                .eval_three_valued(&scanned, id, embedding, &mut expr_scratch)
+            {
+                // FALSE のときだけ違反（最初に違反した制約名で打ち切る）。
+                Ok(Truth::False) => {
                     return Err(TenantWriteError::CheckViolation {
                         constraint: check.name.clone(),
                     });
                 }
+                // UNKNOWN は PG 互換で合格（TABLE-16・SQL-26 ポインタ）。
+                Ok(Truth::True | Truth::Unknown) => {}
+                // オーナー判断（2026-09-28・Issue #1075）: 0 除算・`BIGINT` 精度超過等の
+                // 式評価エラーは 23514 へ丸めず元の `wire_code` のまま透過する。
+                // 評価器の不変条件違反は `Internal`（XX000）で fail-closed。
+                Err(e) => return Err(TenantWriteError::CheckEvaluationFailed(e)),
             }
         }
         Ok(())
@@ -1550,9 +1488,9 @@ mod tests {
 
     /// SQL-24（TASK-208 ポインタ）: `IN`／`BETWEEN`／`IS [NOT] NULL`／`NOT` は
     /// 構文段（`sql::allowlist`）では受理されるが、CHECK 制約の構築時に
-    /// `reject_forbidden_elements` が `42601` で拒否する（`enforce` の
-    /// 「NULL なら常に合格」という短絡が `IS NOT NULL` の意味と相容れない
-    /// ため。TABLE-16 の既存挙動は不変のまま）。
+    /// `reject_forbidden_elements` が `42601` で拒否する（TABLE-16 の既存挙動は
+    /// 不変のまま。評価器は三値化済みで、解禁は後続 Issue で扱う）。
+    /// tracked: #3243, #3244
     #[test]
     fn validate_and_build_rejects_new_sql24_predicate_forms() {
         for sql in [
@@ -2287,5 +2225,388 @@ mod tests {
                 value: "a'b".to_string(),
             }]
         );
+    }
+
+    // ---- Issue #3242: 三値論理評価への置き換えの差分テスト・NULL 意味論 ----
+
+    /// 置き換え前の `enforce`（連言ごとの NULL 短絡）の参照実装。置換後の述語木
+    /// （`metadata_filters`／`expr_filters`。式は再コンパイル）から再構成し、
+    /// 新しい `enforce` と許可形で結果が一致することを差分テストで固定する。
+    fn enforce_legacy_reference(
+        compiled: &CompiledChecks,
+        schema: &TableSchema,
+        id: u64,
+        embedding: &[f32],
+        metadata: &[u8],
+    ) -> Result<(), TenantWriteError> {
+        let scanned = crate::row_codec::scan_scalar_columns_masked(
+            schema,
+            metadata,
+            Some(&compiled.column_mask),
+        )
+        .expect("scan");
+        let mut scratch: Vec<StackValue> = Vec::new();
+        for check in &compiled.checks {
+            let mut satisfied_or_unknown = true;
+            for filter in &check.predicate.metadata_filters {
+                let ok = match scanned.get(filter.column_index()).copied().flatten() {
+                    None => true,
+                    Some(value) => filter.matches(Some(value)),
+                };
+                if !ok {
+                    satisfied_or_unknown = false;
+                    break;
+                }
+            }
+            if satisfied_or_unknown {
+                for expr in &check.predicate.expr_filters {
+                    let program = crate::sql::expr_program::ExprProgram::compile(expr);
+                    match program.eval(id, embedding, &scanned, &mut scratch) {
+                        Ok(udf_call::ExprValue::Bool(false)) => {
+                            satisfied_or_unknown = false;
+                            break;
+                        }
+                        Ok(udf_call::ExprValue::Bool(true) | udf_call::ExprValue::Null) => {}
+                        Ok(_) => panic!("non-bool"),
+                        Err(e) => return Err(TenantWriteError::CheckEvaluationFailed(e)),
+                    }
+                }
+            }
+            if !satisfied_or_unknown {
+                return Err(TenantWriteError::CheckViolation {
+                    constraint: check.name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn outcome(r: Result<(), TenantWriteError>) -> String {
+        match r {
+            Ok(()) => "ok".to_string(),
+            Err(TenantWriteError::CheckViolation { constraint }) => format!("viol:{constraint}"),
+            Err(TenantWriteError::CheckEvaluationFailed(e)) => format!("err:{}", e.wire_code()),
+            Err(other) => format!("other:{other:?}"),
+        }
+    }
+
+    fn compile_docs(ddl_body: &str) -> (TableSchema, CompiledChecks) {
+        let v = parse_create_table(&format!("CREATE TABLE docs ({ddl_body})"));
+        let checks = validate_and_build(&schema_of(&v), &v.checks).expect("must validate");
+        let schema = schema_of(&v).with_checks(checks);
+        let compiled = CompiledChecks::compile(&schema)
+            .expect("compile")
+            .expect("checks present");
+        (schema, compiled)
+    }
+
+    /// 1 行を新旧の評価器で検査し、結果が期待値と一致し、かつ新旧が一致することを確かめる。
+    fn assert_row(
+        schema: &TableSchema,
+        compiled: &CompiledChecks,
+        row: &[Value],
+        embedding: &[f32],
+        expected: &str,
+    ) {
+        let metadata = crate::row_codec::encode_scalar_columns(schema, row).expect("encode");
+        let new = outcome(compiled.enforce(schema, 1, embedding, &metadata));
+        let old = outcome(enforce_legacy_reference(
+            compiled, schema, 1, embedding, &metadata,
+        ));
+        assert_eq!(new, old, "new/legacy diverged for {row:?}");
+        assert_eq!(new, expected, "unexpected outcome for {row:?}");
+    }
+
+    fn t(s: &str) -> Value {
+        Value::Text(s.to_string())
+    }
+
+    fn int(v: i32) -> Value {
+        Value::Integer(v)
+    }
+
+    /// 許可形の判定結果が置換前後で一致する（差分テスト。NULL・充足・違反・境界値）。
+    #[test]
+    fn three_valued_enforce_matches_legacy_on_permitted_forms() {
+        let n = Value::Null;
+        let kind_v = "viol:docs_kind_check";
+        type Case<'a> = (&'a str, Vec<(Vec<Value>, &'a str)>);
+        let cases: Vec<Case<'_>> = vec![
+            (
+                "kind TEXT CHECK (kind = 'a')",
+                vec![
+                    (vec![t("a")], "ok"),
+                    (vec![t("b")], kind_v),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "kind TEXT CHECK (kind LIKE 'a%')",
+                vec![
+                    (vec![t("ab")], "ok"),
+                    (vec![t("b")], kind_v),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "kind TEXT CHECK (kind LIKE '%a_c%')",
+                vec![
+                    (vec![t("xabcx")], "ok"),
+                    (vec![t("xx")], kind_v),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "flag BOOLEAN CHECK (flag = true)",
+                vec![
+                    (vec![Value::Bool(true)], "ok"),
+                    (vec![Value::Bool(false)], "viol:docs_flag_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "flag BOOLEAN CHECK (flag)",
+                vec![
+                    (vec![Value::Bool(true)], "ok"),
+                    (vec![Value::Bool(false)], "viol:docs_flag_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "d DATE CHECK (d >= '2020-01-01')",
+                vec![
+                    (vec![Value::Date(18262)], "ok"),
+                    (vec![Value::Date(18261)], "viol:docs_d_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "qty INTEGER CHECK (qty > 0)",
+                vec![
+                    (vec![int(1)], "ok"),
+                    (vec![int(0)], "viol:docs_qty_check"),
+                    (vec![int(i32::MIN)], "viol:docs_qty_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "n BIGINT CHECK (n >= 5)",
+                vec![
+                    (vec![Value::BigInt(5)], "ok"),
+                    (vec![Value::BigInt(4)], "viol:docs_n_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "r REAL CHECK (r < 1.5)",
+                vec![
+                    (vec![Value::Real(1.0)], "ok"),
+                    (vec![Value::Real(2.0)], "viol:docs_r_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "x DOUBLE PRECISION CHECK (x < 1.5)",
+                vec![
+                    (vec![Value::Double(1.0)], "ok"),
+                    (vec![Value::Double(2.0)], "viol:docs_x_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "a INTEGER, b INTEGER, CHECK (a < b)",
+                vec![
+                    (vec![int(1), int(2)], "ok"),
+                    (vec![int(2), int(1)], "viol:docs_check"),
+                    (vec![n.clone(), int(1)], "ok"),
+                    (vec![int(1), n.clone()], "ok"),
+                    (vec![n.clone(), n.clone()], "ok"),
+                ],
+            ),
+            (
+                "a INTEGER, b INTEGER, CHECK (a + b > 10)",
+                vec![
+                    (vec![int(6), int(6)], "ok"),
+                    (vec![int(1), int(1)], "viol:docs_check"),
+                    (vec![n.clone(), int(1)], "ok"),
+                ],
+            ),
+            (
+                "qty INTEGER, CHECK (100 / qty > 1)",
+                vec![
+                    (vec![int(5)], "ok"),
+                    (vec![int(200)], "viol:docs_check"),
+                    (vec![int(0)], "err:22012"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "qty INTEGER, CHECK (NULLIF(qty, 0) > 0)",
+                vec![
+                    (vec![int(3)], "ok"),
+                    (vec![int(0)], "ok"),
+                    (vec![int(-3)], "viol:docs_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "kind TEXT, CHECK (length(kind) > 2)",
+                vec![
+                    (vec![t("abc")], "ok"),
+                    (vec![t("a")], "viol:docs_check"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            (
+                "kind TEXT, qty INTEGER, CHECK (kind = 'a' AND qty > 0)",
+                vec![
+                    (vec![t("a"), int(5)], "ok"),
+                    (vec![t("a"), int(-1)], "viol:docs_check"),
+                    (vec![n.clone(), int(5)], "ok"),
+                    (vec![n.clone(), int(-1)], "viol:docs_check"),
+                    (vec![t("b"), int(5)], "viol:docs_check"),
+                    (vec![t("a"), n.clone()], "ok"),
+                    (vec![n.clone(), n.clone()], "ok"),
+                ],
+            ),
+            (
+                "qty INTEGER, CHECK (qty > 0), CHECK (qty < 10)",
+                vec![
+                    (vec![int(5)], "ok"),
+                    (vec![int(-1)], "viol:docs_check"),
+                    (vec![int(11)], "viol:docs_check_2"),
+                    (vec![n.clone()], "ok"),
+                ],
+            ),
+            // UNKNOWN の連言の後に評価エラーが出る組み合わせ（エラー順序の不変）。
+            (
+                "kind TEXT, qty INTEGER, CHECK (kind = 'a' AND 100 / qty > 1)",
+                vec![
+                    (vec![n.clone(), int(0)], "err:22012"),
+                    (vec![t("b"), int(0)], "viol:docs_check"),
+                    (vec![t("a"), int(5)], "ok"),
+                ],
+            ),
+        ];
+        for (ddl, rows) in &cases {
+            let (schema, compiled) = compile_docs(ddl);
+            for (row, expected) in rows {
+                assert_row(&schema, &compiled, row, &[], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn three_valued_enforce_matches_legacy_on_vector_builtin() {
+        let (schema, compiled) =
+            compile_docs("embedding VECTOR(3), CHECK (vec_norm(embedding) < 10)");
+        let row = [Value::Vector(vec![0.0, 0.0, 0.0])];
+        assert_row(&schema, &compiled, &row, &[1.0, 0.0, 0.0], "ok");
+        assert_row(
+            &schema,
+            &compiled,
+            &row,
+            &[100.0, 0.0, 0.0],
+            "viol:docs_check",
+        );
+        // VECTOR 列が NULL（dim == 0）なら UNKNOWN で合格。
+        assert_row(&schema, &compiled, &[Value::Null], &[], "ok");
+    }
+
+    /// OR 群を持つ述語木を直接組む（OR は SQL からはまだ到達できない。#3243 の回帰ガード）。
+    fn compiled_with_or_group() -> (TableSchema, CompiledChecks) {
+        use crate::declarative_filter::FilterOp;
+        use crate::sql::where_tree::BoundOrGroup;
+        let (schema, _) = compile_docs("a TEXT, b TEXT, CHECK (a = 'x')");
+        let branch = |col: usize, v: &str| {
+            BoundConjunction::new(
+                vec![MetadataFilter::for_test(
+                    col,
+                    FilterOp::Equals(v.to_string()),
+                )],
+                vec![],
+                vec![],
+            )
+        };
+        let predicate = BoundConjunction::new(
+            vec![],
+            vec![],
+            vec![BoundOrGroup::new(vec![branch(0, "x"), branch(1, "y")])],
+        );
+        let mut column_mask = vec![false; schema.columns.len()];
+        predicate.mark_scalar_column_mask(&mut column_mask);
+        (
+            schema,
+            CompiledChecks {
+                checks: vec![CompiledCheck {
+                    name: "or_check".to_string(),
+                    predicate,
+                }],
+                column_mask,
+            },
+        )
+    }
+
+    /// OR 群の内側の列が `column_mask` に入る（漏れるとマスク外＝NULL 扱いで合格する fail-open）。
+    #[test]
+    fn or_group_columns_are_included_in_column_mask() {
+        let (_, compiled) = compiled_with_or_group();
+        assert_eq!(compiled.column_mask, vec![true, true]);
+    }
+
+    #[test]
+    fn or_group_is_evaluated_with_three_valued_logic() {
+        let (schema, compiled) = compiled_with_or_group();
+        // TRUE OR FALSE / FALSE OR TRUE は合格。
+        assert_row(&schema, &compiled, &[t("x"), t("z")], &[], "ok");
+        assert_row(&schema, &compiled, &[t("z"), t("y")], &[], "ok");
+        // FALSE OR UNKNOWN は UNKNOWN で合格。
+        assert_row_new_only(&schema, &compiled, &[t("z"), Value::Null], "ok");
+        // FALSE OR FALSE は違反。
+        assert_row_new_only(&schema, &compiled, &[t("z"), t("z")], "viol:or_check");
+    }
+
+    /// 参照実装が OR 群を持たないため、OR 群の試験は新評価器の結果だけを確かめる。
+    fn assert_row_new_only(
+        schema: &TableSchema,
+        compiled: &CompiledChecks,
+        row: &[Value],
+        expected: &str,
+    ) {
+        let metadata = crate::row_codec::encode_scalar_columns(schema, row).expect("encode");
+        assert_eq!(
+            outcome(compiled.enforce(schema, 1, &[], &metadata)),
+            expected,
+            "unexpected outcome for {row:?}"
+        );
+    }
+
+    /// 非 NULL の値に対して葉が UNKNOWN になる（型不一致）場合は合格にせず `XX000`。
+    #[test]
+    fn non_null_unknown_leaf_fails_closed_as_internal() {
+        use crate::declarative_filter::FilterOp;
+        let (schema, mut compiled) = compile_docs("a TEXT, CHECK (a = 'x')");
+        // TEXT 列に BOOLEAN 用の述語を当てた不整合な木を作る。
+        compiled.checks[0].predicate = BoundConjunction::new(
+            vec![MetadataFilter::for_test(0, FilterOp::BoolEquals(true))],
+            vec![],
+            vec![],
+        );
+        assert_row_new_only(&schema, &compiled, &[t("x")], "err:XX000");
+        // NULL の値なら同じ葉でも UNKNOWN＝合格。
+        assert_row_new_only(&schema, &compiled, &[Value::Null], "ok");
+    }
+
+    /// 宣言的フィルタの列が復号範囲外なら NULL 扱いで合格にせず `XX000`。
+    #[test]
+    fn out_of_range_column_index_fails_closed_as_internal() {
+        use crate::declarative_filter::FilterOp;
+        let (schema, mut compiled) = compile_docs("a TEXT, CHECK (a = 'x')");
+        compiled.checks[0].predicate = BoundConjunction::new(
+            vec![MetadataFilter::for_test(7, FilterOp::IsNull)],
+            vec![],
+            vec![],
+        );
+        assert_row_new_only(&schema, &compiled, &[t("x")], "err:XX000");
     }
 }
