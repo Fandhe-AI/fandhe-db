@@ -5,7 +5,7 @@
 依存追加なし: Python 標準ライブラリの `http.client`（keep-alive の 1 TCP
 接続を使い回す）・`json` のみで REST API を叩く。
 
-自作 DB の `<#>`（負の内積の昇順＝内積の降順。SQL-33）に合わせ、`dense_vector` フィールドは `similarity: dot_product`
+recall 正解の内積（自作 DB の `<=>` とは正規化済みフィクスチャで順位が一致。SQL-33）に合わせ、`dense_vector` フィールドは `similarity: dot_product`
 （フィクスチャの embedding は単位ノルムのため要件を満たす）で作る。RLS 相当は、
 自作 DB の現行契約（実機確認: どのテナントの wire セッションからも
 `visibility = 'public'` の行のみが可視。private 行は所有テナント自身からも

@@ -780,6 +780,140 @@ fn add_check_with_or_and_not_revalidates_existing_rows_and_enforces() {
     assert_eq!(err.wire_code(), "23514");
 }
 
+/// Issue #3245: 新しい述語形（`IN`／`NOT IN`／`BETWEEN`／`NOT BETWEEN`／`IS [NOT] NULL`／
+/// 分岐内 `IS NULL` を含む `OR`／`NOT (group)`／`NOT LIKE`）の `ADD CHECK` が、別テナントの
+/// 既存行を含めて三値評価で再検証される（違反は `23514`。エラー文言に行の値・テナント名を
+/// 含めない。拒否後は痕跡が残らず同名で再度追加できる）。
+#[test]
+fn add_check_new_predicate_forms_revalidate_existing_rows_of_other_tenants() {
+    let (core, path) = new_core("alter-check-new-forms-violate");
+    let _guard = CleanupGuard(path);
+    let owner = ctx("owner");
+    let other = ctx("othertenant");
+    let mut session = ddl_session();
+    create_docs_table(&core, &mut session, &owner);
+    // 別テナントの行（owner からは不可視。ADD の再検証は全テナントを走査する）。
+    exec(
+        &core,
+        &mut session,
+        &other,
+        "INSERT INTO docs (id, a, qty) VALUES (1, 'zzsecret', 5) USING OPERATION_ID 'op-o1'",
+    )
+    .expect("insert other tenant row");
+    exec(
+        &core,
+        &mut session,
+        &other,
+        "INSERT INTO docs (id, a, qty) VALUES (2, NULL, NULL) USING OPERATION_ID 'op-o2'",
+    )
+    .expect("insert other tenant null row");
+
+    // a = 'zzsecret'・qty = 5 の行と、全列 NULL の行が両方とも適合しなければ違反になる。
+    // 下の述語は 1 行目で違反する（または 2 行目の NULL で `IS NOT NULL` が違反する）。
+    let violating = [
+        "a IN ('p', 'q')",
+        "a NOT IN ('zzsecret', 'q')",
+        "qty IN (1, 2)",
+        "qty NOT IN (5, 6)",
+        "qty BETWEEN 10 AND 20",
+        "qty NOT BETWEEN 1 AND 9",
+        "a IS NULL",
+        "a IS NOT NULL",
+        "a IS NULL OR qty < 0",
+        "NOT (qty > 1 AND qty < 9)",
+        "a NOT LIKE 'zz%'",
+    ];
+    for predicate in violating {
+        let sql = format!("ALTER TABLE docs ADD CONSTRAINT new_ck CHECK ({predicate})");
+        let err = exec(&core, &mut session, &owner, &sql)
+            .expect_err(&format!("existing violating row must reject: {predicate}"));
+        assert_eq!(err.wire_code(), "23514", "{predicate}");
+        let msg = err.client_message();
+        assert!(
+            !msg.contains("zzsecret"),
+            "{predicate}: leaked value: {msg}"
+        );
+        assert!(
+            !msg.contains("othertenant"),
+            "{predicate}: leaked tenant: {msg}"
+        );
+    }
+    // 拒否は痕跡を残さない（同名の追加が `42710` にならず成功する）。
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE docs ADD CONSTRAINT new_ck CHECK (a IS NULL OR a IS NOT NULL)",
+    )
+    .expect("rejected ADD CHECK must leave no trace");
+}
+
+/// Issue #3245: UNKNOWN（NULL 入力）は CHECK では合格（三値評価）。全行が NULL の表への
+/// `IN`／`NOT IN`／`BETWEEN`／`NOT BETWEEN`／`NOT LIKE`／`NOT (group)` の ADD は成功し、
+/// `IS NOT NULL` だけが `23514` になる。追加後は以後の書き込みで強制される。
+#[test]
+fn add_check_new_predicate_forms_pass_unknown_but_is_not_null_rejects() {
+    let (core, path) = new_core("alter-check-new-forms-unknown");
+    let _guard = CleanupGuard(path.clone());
+    let owner = ctx("owner");
+    let mut session = ddl_session();
+    create_docs_table(&core, &mut session, &owner);
+    exec(
+        &core,
+        &mut session,
+        &owner,
+        "INSERT INTO docs (id, a, qty) VALUES (1, NULL, NULL) USING OPERATION_ID 'op-1'",
+    )
+    .expect("insert null row");
+
+    let err = exec(
+        &core,
+        &mut session,
+        &owner,
+        "ALTER TABLE docs ADD CONSTRAINT nn_ck CHECK (qty IS NOT NULL)",
+    )
+    .expect_err("IS NOT NULL must reject a NULL row");
+    assert_eq!(err.wire_code(), "23514");
+
+    let passing = [
+        ("c1", "a IN ('p', 'q')"),
+        ("c2", "a NOT IN ('p', 'q')"),
+        ("c3", "qty IN (1, 2)"),
+        ("c4", "qty NOT IN (5, 6)"),
+        ("c5", "qty BETWEEN 1 AND 9"),
+        ("c6", "qty NOT BETWEEN 1 AND 9"),
+        ("c7", "a NOT LIKE 'zz%'"),
+        ("c8", "NOT (qty > 1 AND qty < 9)"),
+        ("c9", "qty IS NULL"),
+    ];
+    for (name, predicate) in passing {
+        let sql = format!("ALTER TABLE docs ADD CONSTRAINT {name} CHECK ({predicate})");
+        exec(&core, &mut session, &owner, &sql)
+            .unwrap_or_else(|e| panic!("UNKNOWN must pass for {predicate}: {e:?}"));
+    }
+
+    // 追加後の書き込みで強制される（5 は `qty IN (1, 2)` を満たさない）。
+    let err = core
+        .execute_insert_sql(
+            &owner,
+            "INSERT INTO docs (id, a, qty) VALUES (2, 'p', 5) USING OPERATION_ID 'op-2'",
+        )
+        .expect_err("added IN check must reject");
+    assert_eq!(err.wire_code(), "23514");
+    drop(core);
+
+    // 再オープン後も強制される。
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let err = core
+        .execute_insert_sql(
+            &owner,
+            "INSERT INTO docs (id, a, qty) VALUES (3, 'p', 5) USING OPERATION_ID 'op-3'",
+        )
+        .expect_err("check must still be enforced after reopen");
+    assert_eq!(err.wire_code(), "23514");
+}
+
 // --- 永続化 ------------------------------------------------------------------
 
 /// 追加した CHECK はストレージ再オープン後も効く。
