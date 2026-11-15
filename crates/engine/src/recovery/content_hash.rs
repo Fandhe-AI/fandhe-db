@@ -2596,7 +2596,7 @@ fn push_dml_where_predicate(
             });
             push_dml_subquery_tokens(b, inner_tokens)?;
         }
-        // 行値比較（SQL-9・Issue #3255）。述語形 DML は束縛ゲート（#3256 まで `0A000`）より先に
+        // 行値比較（SQL-9・Issue #3255）。述語形 DML は束縛ゲート（行値は束縛段で展開される）より先に
         // content hash が計算されうるため、Internal にせず新タグ 19（変更禁止）で直列化する。
         // 直列化順は「演算子の判別子（`ArrayCmpOp::hash_tag`）→ 左辺成分数（u32 LE）→ 左辺の各成分式
         // → 右辺成分数（u32 LE）→ 右辺の各成分式」。演算子・成分順・成分数の違いは別ハッシュになる。

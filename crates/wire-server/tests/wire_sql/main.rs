@@ -48,6 +48,7 @@ mod wire_restore_generation;
 mod wire_result_rows_cap;
 mod wire_returning;
 mod wire_role_ddl;
+mod wire_row_compare;
 mod wire_row_lock;
 mod wire_row_security;
 mod wire_row_security_setting;

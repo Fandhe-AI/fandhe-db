@@ -3308,6 +3308,20 @@ fn bind_where_predicates_recursive(
     rewrite_total: &mut usize,
     allow_text_range_rewrite: bool,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    // 行値比較（SQL-9・Issue #3256）: 束縛の前に既存の述語（比較葉・`Or`・連言）へ展開し、以降は
+    // 通常の比較と同じ書き換え・束縛を通す（`sql::row_compare`）。`Or` 分岐は再帰でここへ戻る。
+    let lowered;
+    let where_predicates: &[WherePredicate] = if where_predicates.iter().any(|p| {
+        matches!(
+            p,
+            WherePredicate::RowCompare { .. } | WherePredicate::Not(_)
+        )
+    }) {
+        lowered = crate::sql::row_compare::lower_top_level(where_predicates, node_budget)?;
+        &lowered
+    } else {
+        where_predicates
+    };
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
     let mut expr_filters = Vec::new();
@@ -3445,14 +3459,12 @@ fn bind_where_predicates_recursive(
                     )?);
                 }
             }
-            // 行値比較 `(a, b) <op> (c, d)`（SQL-9・Issue #3255）: 構文段は受理するが、評価
-            // （辞書式・三値論理）は #3256 の担当のため、それまでは束縛段のこの単一ゲートで `0A000`
-            // にして止める（fail-closed。式述語・RLS 述語との組み合わせでも評価経路へ流さない）。
-            // tracked: #3256
+            // 行値比較（SQL-9・Issue #3256）は関数先頭で `sql::row_compare` が既存の述語木へ展開済みで、
+            // ここへは届かない。届いたら不変条件違反として fail-closed にする。
             WherePredicate::RowCompare { .. } => {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "row value comparison is not supported yet",
-                ));
+                return Err(SqlSurfaceError::Internal {
+                    detail: "row comparison reached binding unlowered".to_string(),
+                });
             }
             WherePredicate::Expression(expr) => {
                 // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの単純比較は宣言的
