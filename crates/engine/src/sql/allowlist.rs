@@ -15308,7 +15308,7 @@ impl<'a> Parser<'a> {
         self.advance();
         let projection = self.parse_select_list()?;
         if matches!(projection, Projection::All) && matches!(self.peek(), Some(Token::Punct(','))) {
-            // `RETURNING *, a` のように `*` と他の項目を併用する形は未対応（Issue #3248 の対象外）。
+            // `RETURNING *, a` のように `*` と他の項目を併用する形は未対応（Issue #3248 の対象外・対応しない。理由は docs/design/sql-returning.md）。
             return Err(SqlSurfaceError::feature_not_supported(
                 "RETURNING * combined with other items is not supported yet",
             ));

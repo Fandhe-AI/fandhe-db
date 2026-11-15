@@ -57,7 +57,7 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 | `... RETURNING id AS rid, lang AS l USING OPERATION_ID '...'`（`AS` 別名付きの列参照。Issue #3248） | 受理（列名だけが別名になり、値・型は別名なしと同じ。別名の重複も受理） |
 | `... RETURNING vec_norm(embedding) USING OPERATION_ID '...'`（式・関数呼び出し項目） | `42601`（文言は「列参照と `AS` 別名のみ・式は未対応」。式の受け皿は #3249） |
 | `... RETURNING lang l ...`（`AS` を省いた別名） | `42601` |
-| `... RETURNING *, lang AS l ...`（`*` と他の項目の併用） | `0A000`（Issue #3248 の対象外。未起票） |
+| `... RETURNING *, lang AS l ...`（`*` と他の項目の併用） | `0A000`（Issue #3248 の対象外。`*` の展開と個別項目の併用は出力列の重複・順序の扱いを別途決める必要があり、現行は fail-closed で拒否したまま据え置く（対応しない。需要が出た時点でユーザー承認のうえ起票する）） |
 | `TRUNCATE TABLE <table> ... RETURNING *` | `42601`（`TRUNCATE` は対象外） |
 | ファイル形 `INSERT`（`path`/`body` 列指定）＋ `RETURNING` | `42601`（束縛段。サーバー側チャンク化行を返す応答形が未定義のため fail-closed） |
 | 述語つき `DELETE ... WHERE <非 id 述語> RETURNING ...` | 受理（Issue #1182。削除前の値を返す） |
