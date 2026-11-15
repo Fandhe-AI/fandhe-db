@@ -1399,3 +1399,36 @@ analysis-20260918.md` §3.6 の durability 契約差）・`scan_where_nosort_k50
 438.3µs は sqlite-vec（in-process・197.0µs）の約 2.2 倍にとどまり、
 2026-09-18 時点の分析（engine 内部コストは sqlite-vec と同水準、差は
 wire 経由の測定条件）と整合する。
+
+## Issue #3225: hybrid の取得深さを揃えた arm と recall の並記
+
+production コード・依存・CI の変更なし（ハーネスのみ）。速度だけで勝敗を決めないよう、self と Redis の hybrid を同じ取得深さで計測し、p50 と品質指標を並べる。
+
+### 条件差（既存 arm と新 arm）
+
+| arm | self | Redis | 語の結合 |
+| --- | --- | --- | --- |
+| `hybrid_rrf`（既存・不変） | pool_depth 200（既定）・初回 fetch_k 400 | K=50・WINDOW=50（`CROSSDB_REDIS_HYBRID_WINDOW` で診断上書き可） | self は OR（BM25 合算）。Redis は `hybrid_text_conjunction` で記録 |
+| `bulk_hybrid_k200`（既存・不変） | pool_depth 200・Top-200 | K=200・WINDOW=200 | 同上 |
+| `hybrid_rrf_depth50`（新） | `window => 50`・初回 fetch_k 100 | K=100・WINDOW=50 | 同上 |
+| `hybrid_rrf_depth200`（新） | `window => 200`・初回 fetch_k 400 | K=400・WINDOW=200 | 同上 |
+
+- 対応は「Redis の WINDOW = self の pool_depth、Redis の K = self の初回 fetch_k（2 x pool_depth）」。self の `window` 引数は SEARCH-13 のポインタ（`docs/design/hybrid-tuning-parameters.md` §8・§9）。両 arm とも `window` を明示する
+- 既存 2 arm と環境変数は過去スコアボードとの連続性のため変えない。新 arm は env で変わらない固定値
+- テキスト前処理も異なる。Redis は `isalnum` の語だけ残して 200 文字で切る。self は小文字化・CJK のユニグラム／バイグラム・ストップワード除去。Redis の既定トークナイザの CJK 扱いは未確認
+- 語の結合: self は演算子なしの通常語を OR で扱う。Redis の `@body:(t1 t2 ...)` が AND か OR かは `hybrid_text_conjunction` フェーズ（`FT.EXPLAIN` の INTERSECT／UNION と AND 形・OR 形の一致件数）で実測して記録する。本 Issue では対称化しない（Redis が AND と確認できた場合は別 Issue の候補）
+- 対象は self と Redis のみ。pgvector・sqlite-vec（LIMIT 50 プール）・LanceDB・MongoDB には新 arm を足さない
+
+### 品質指標の定義と限界
+
+| 指標 | 定義 | 測らないもの |
+| --- | --- | --- |
+| `dense_gt_recall_at_10`（`_strict` 併記） | hybrid 上位 10 件と内積総当たり正解の一致率（同点許容） | BM25 側の関連性。hybrid の真の正解集合ではない |
+| `overlap_at_10_vs_depth200`（depth50 のみ） | 同じ DB の depth200 arm 上位 10 件との重なり | 絶対的な良し悪し（浅さによる変化量だけ） |
+| `topic_hit_rate_at_10` | クエリの `topic` と一致する返却文書の割合 | 文書単位の関連性。topic が無い fixture では `null` と理由を記録 |
+
+フィールド名を `recall_at_10` そのものにしないのは、関連性 recall との読み違えを避けるため。
+
+### 計測結果と主 arm の判断
+
+未検証。本変更では実機計測（N=5 交互ラウンド）を行っておらず、数値は記録していない。主 arm の判断は保留とし、次回の計測で次の基準により決める。depth50 で、どちらかの DB の `dense_gt_recall_at_10` または `overlap_at_10_vs_depth200` がノイズを超えて下がる場合は depth200 を主とする。下がらない場合は、既存スコアボードと連続する depth50 を主とする。計測は `docs/design/benchmark-judgement-policy.md` の規約（min-of-N・median・run-to-run 幅）に従う。
