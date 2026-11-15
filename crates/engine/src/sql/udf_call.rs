@@ -6412,20 +6412,26 @@ pub(crate) fn case_condition_exprs<'a>(
     }
 }
 
-/// 式木に `clock_timestamp()` 呼び出しが含まれるか（単純 CASE の被演算子の 1 回評価の保証に
-/// 使う。Issue #3279）。分岐ごとに被演算子を束縛し直すため、呼び出しごとに壁時計を読む関数が
-/// 含まれると PostgreSQL の「1 回だけ評価」と食い違う。
-fn contains_clock_timestamp_call(expr: &Expr) -> bool {
-    let mut stack: Vec<&Expr> = vec![expr];
-    while let Some(e) = stack.pop() {
-        if let Expr::Call { name, .. } = e {
-            if name.eq_ignore_ascii_case("clock_timestamp") {
-                return true;
-            }
-        }
-        crate::sql::allowlist::push_expr_children(e, &mut stack);
+thread_local! {
+    /// `clock_timestamp()` を束縛した累計回数（Issue #3279）。単純 CASE の被演算子が（宣言的 UDF の
+    /// 本体経由を含め）壁時計を読むかを、束縛の前後の差で判定する。束縛は同期・同一スレッド内で完結する。
+    static CLOCK_TIMESTAMP_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// 単純 CASE の一致しない分岐の片側を束縛する（裸の `NULL` は [`BoundExpr::Null`]。1 ノード課金）。
+fn bind_null_side(
+    e: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    if matches!(e, Expr::Null) {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        Ok(BoundExpr::Null)
+    } else {
+        Ok(bind_expr_in(e, env, node_budget)?.0)
     }
-    false
 }
 
 /// 束縛段で `CASE` を束縛する（対象ビヘイビア: SQL-26）。`sql::allowlist::Parser` が構文段で
@@ -6445,10 +6451,17 @@ fn bind_case(
         ));
     }
     if let Some(op) = operand {
-        if whens.len() > 1 && contains_clock_timestamp_call(op) {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: "clock_timestamp() as a simple CASE operand with multiple WHEN branches is not supported".to_string(),
-            });
+        // 被演算子は分岐ごとに束縛し直す。壁時計を読む被演算子（宣言的 UDF の本体経由を含む）は
+        // 1 回評価の契約と食い違うため、束縛を 1 度試行して `clock_timestamp()` の束縛有無で判定する。
+        if whens.len() > 1 && !matches!(op, Expr::Null) {
+            let before = CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get);
+            let mut probe_budget = *node_budget;
+            bind_expr_in(op, env, &mut probe_budget)?;
+            if CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get) != before {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "clock_timestamp() as a simple CASE operand with multiple WHEN branches is not supported".to_string(),
+                });
+            }
         }
     }
     bind_with_case_nesting(env, |env| {
@@ -6461,16 +6474,23 @@ fn bind_case(
                 (Some(conds), Some(op)) => match conds.get(idx).and_then(Option::as_ref) {
                     Some(lowered) => bind_expr_in(lowered, env, node_budget)?,
                     None => {
-                        // 一致しない分岐でも、NULL でない側は通常どおり束縛して列の存在・型・
-                        // 権限を検査する（存在オラクルにせず、検索形と同じ拒否を保つ）。
-                        let other = if matches!(op, Expr::Null) { cond } else { op };
-                        if !matches!(other, Expr::Null) {
-                            bind_expr_in(other, env, node_budget)?;
-                        }
+                        // 一致しない分岐（NULL を含む）でも、NULL でない側を束縛して列の存在・型・
+                        // 権限を検査し、評価時も `x = NULL`／`NULL = v` として両辺を評価する
+                        // （`eval_binary` は両辺の評価後に NULL を伝播するため、被演算子の実行時
+                        // エラー〔22012 等〕を検索形と同じく保つ）。
+                        let l = bind_null_side(op, env, node_budget)?;
+                        let r = bind_null_side(cond, env, node_budget)?;
                         *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
                             SqlSurfaceError::payload_too_large("expression is too large")
                         })?;
-                        (BoundExpr::Null, ExprType::Bool)
+                        (
+                            BoundExpr::Binary {
+                                op: BinOp::Eq,
+                                lhs: Box::new(l),
+                                rhs: Box::new(r),
+                            },
+                            ExprType::Bool,
+                        )
                     }
                 },
                 _ => bind_expr_in(cond, env, node_budget)?,
@@ -10219,6 +10239,9 @@ fn bind_call(
     }
 
     if let Some(builtin) = builtin_from_name(name) {
+        if matches!(builtin, BuiltinFn::ClockTimestamp) {
+            CLOCK_TIMESTAMP_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
+        }
         let (param_types, ret) = builtin_signature(builtin);
         if args.len() != param_types.len() {
             return Err(SqlSurfaceError::undefined_function(format!(

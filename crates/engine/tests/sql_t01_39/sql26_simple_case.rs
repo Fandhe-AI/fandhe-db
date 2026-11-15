@@ -396,6 +396,35 @@ fn clock_timestamp_operand_is_rejected_when_it_could_be_reread() {
     );
 }
 
+/// 宣言的 UDF の本体経由の `clock_timestamp()` も、複数 WHEN の被演算子では拒否する（分岐ごとに
+/// 壁時計を読み直さない）。
+#[test]
+fn clock_timestamp_via_declarative_udf_operand_is_rejected() {
+    let (core, mut s, _g) = setup("sql26_simple_case_clock_udf");
+    run(&core, &mut s, "CREATE FUNCTION tick() AS clock_timestamp()");
+    assert_eq!(
+        code(
+            &core,
+            &mut s,
+            "SELECT CASE tick() WHEN '2000-01-01 00:00:00'::timestamp THEN 1 \
+             WHEN '2001-01-01 00:00:00'::timestamp THEN 2 END"
+        ),
+        "0A000"
+    );
+}
+
+/// NULL を含む分岐でも被演算子の実行時評価は保たれる（検索形と同じく 22012）。
+#[test]
+fn null_branch_still_evaluates_the_operand() {
+    let (core, mut s, _g) = setup("sql26_simple_case_null_eval");
+    for sql in [
+        "SELECT CASE 1 / (a - 1) WHEN NULL THEN 1 ELSE 2 END FROM t",
+        "SELECT CASE 1 / (a - 1) WHEN NULL THEN 1 WHEN 5 THEN 3 ELSE 2 END FROM t",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "22012", "{sql}");
+    }
+}
+
 #[test]
 fn check_constraint_view_and_update_round_trip() {
     let (core, mut s, _g) = setup("sql26_simple_case_persist");

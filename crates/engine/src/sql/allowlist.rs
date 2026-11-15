@@ -7569,32 +7569,50 @@ impl<'a> Parser<'a> {
         if self.quoted_null.contains(&pos) {
             return false;
         }
-        let mut depth: usize = 0;
+        // 括弧の深さと入れ子の `CASE ... END` の深さは別カウンタで数える（列名 `case`・`end` が
+        // 括弧内に現れても、入れ子の CASE と取り違えて括弧の対応を崩さないため）。
+        let mut parens: usize = 0;
+        let mut cases: usize = 0;
         let mut i = first;
         let end = first.saturating_add(CASE_START_SCAN_LIMIT);
         while i < end {
             let Some(tok) = self.tokens.get(i) else {
                 return false;
             };
+            let top = parens == 0 && cases == 0;
             match tok {
-                Token::Punct('(' | '[') => depth = depth.saturating_add(1),
+                Token::Punct('(' | '[') => parens = parens.saturating_add(1),
                 Token::Punct(')' | ']') => {
-                    if depth == 0 {
+                    if parens == 0 {
                         return false;
                     }
-                    depth -= 1;
+                    parens -= 1;
                 }
-                Token::Punct(',' | ';') if depth == 0 => return false,
-                Token::Keyword(_) if depth == 0 => return false,
+                Token::Punct(',' | ';') if top => return false,
+                Token::Keyword(_) if top => return false,
                 Token::Ident(_) => {
                     if word_at(i, "CASE") {
-                        depth = depth.saturating_add(1);
+                        // 直後が WHEN か被演算子の開始なら入れ子の CASE、`)` `,` や演算子なら列名 `case`。
+                        let nested = word_at(i.saturating_add(1), "WHEN")
+                            || matches!(
+                                self.tokens.get(i.saturating_add(1)),
+                                Some(
+                                    Token::Ident(_)
+                                        | Token::Number(_)
+                                        | Token::StringLiteral(_)
+                                        | Token::Punct('(')
+                                )
+                            );
+                        if nested {
+                            cases = cases.saturating_add(1);
+                        }
                     } else if word_at(i, "END") {
-                        if depth == 0 {
+                        if cases > 0 {
+                            cases -= 1;
+                        } else if parens == 0 {
                             return false;
                         }
-                        depth -= 1;
-                    } else if depth == 0 {
+                    } else if top {
                         if word_at(i, "WHEN") {
                             return true;
                         }
@@ -44681,6 +44699,32 @@ mod tests {
                 SelectItem::Expr { expr: Expr::Ident(name), .. } if name == "case"
             )
         );
+    }
+
+    /// 括弧内の列名 `case` は入れ子の CASE と取り違えない（Issue #3279 のレビュー指摘）。
+    #[test]
+    fn simple_case_operand_may_mention_column_named_case_or_end() {
+        let lookup = catalog_with(&["documents"]);
+        for operand in ["(case)", "vec_norm(case)", "(end)", "(case + end)"] {
+            let sql = format!(
+                "SELECT CASE {operand} WHEN 1 THEN 2 END FROM documents \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+            );
+            let stmt = validate_statement(&sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(
+                matches!(
+                    &select_expr_items(&stmt)[0],
+                    SelectItem::Expr {
+                        expr: Expr::Case {
+                            operand: Some(_),
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "{sql}"
+            );
+        }
     }
 
     /// 単純 CASE の分岐数の上限は検索形と同じ（`54000`）。
