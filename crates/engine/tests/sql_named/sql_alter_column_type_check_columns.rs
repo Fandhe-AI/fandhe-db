@@ -341,3 +341,124 @@ fn widening_persists_and_works_with_primary_key() {
         &format!("INSERT INTO t (id, code) VALUES (4, {WIDE}) USING OPERATION_ID 'w'"),
     );
 }
+
+/// Issue #3245: 新しい述語形（`IN`／`NOT BETWEEN`／`IS NOT NULL`／`NOT IN`／`BETWEEN`）を持つ
+/// CHECK の列を拡大・縮小・一般変換するときの受理・再検証・拒否。拒否（`XX000` 以外）は
+/// 表を変えず、受理後も強制され、再オープン後も維持される。
+#[test]
+fn new_predicate_forms_follow_alter_column_type() {
+    let (core, path) = new_core("ackc-new-forms");
+    let _g = CleanupGuard(path.clone());
+    let o = ctx("o");
+    ok(
+        &core,
+        &o,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, qty INTEGER, note TEXT, s BIGINT, \
+         CONSTRAINT q_in CHECK (qty IN (1, 5)), \
+         CONSTRAINT q_btw CHECK (qty NOT BETWEEN 100 AND 200), \
+         CONSTRAINT n_nn CHECK (note IS NOT NULL), \
+         CONSTRAINT n_in CHECK (note NOT IN ('bad')), \
+         CONSTRAINT s_b CHECK (s BETWEEN 0 AND 100))",
+    );
+    ok(
+        &core,
+        &o,
+        "INSERT INTO t (id, qty, note, s) VALUES (1, 5, 'a', 50) USING OPERATION_ID 'a1'",
+    );
+
+    // 一般変換: `USING` で値を変えて CHECK に違反させると 23514 で表は変わらない。
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "ALTER TABLE t ALTER COLUMN qty TYPE BIGINT USING qty + 10"
+        ),
+        "23514"
+    );
+    // INTEGER→TEXT は数値比較を束縛できず（束縛段の拒否）、`XX000` にはならず表は変わらない。
+    let err = exec(&core, &o, "ALTER TABLE t ALTER COLUMN qty TYPE TEXT").expect_err("bind error");
+    assert_ne!(err.wire_code(), "XX000");
+    // TEXT→INTEGER も範囲比較を束縛できない（`NOT IN ('bad')` の文字列要素）。
+    let err = exec(
+        &core,
+        &o,
+        "ALTER TABLE t ALTER COLUMN note TYPE INTEGER USING 1",
+    )
+    .expect_err("bind error");
+    assert_ne!(err.wire_code(), "XX000");
+    // 失敗した変換は表を変えない: 型は INTEGER のまま、強制も不変。
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO t (id, qty, note, s) VALUES (9, 7, 'a', 1) USING OPERATION_ID 'x1'"
+        ),
+        "23514"
+    );
+
+    // 拡大変換（INTEGER→BIGINT）後も IN／NOT BETWEEN が強制される。
+    ok(&core, &o, "ALTER TABLE t ALTER COLUMN qty TYPE BIGINT");
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO t (id, qty, note, s) VALUES (9, 150, 'a', 1) USING OPERATION_ID 'x2'"
+        ),
+        "23514"
+    );
+    // BIGINT→SMALLINT（SMALLINT 範囲検証）: 範囲内の既存値なら CHECK を再検証して受理する。
+    ok(&core, &o, "ALTER TABLE t ALTER COLUMN s TYPE SMALLINT");
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO t (id, qty, note, s) VALUES (9, 1, 'a', 101) USING OPERATION_ID 'x3'"
+        ),
+        "23514"
+    );
+    // 一般変換で CHECK 範囲外になる値は 23514 で拒否される（s BETWEEN 0 AND 100）。
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "ALTER TABLE t ALTER COLUMN s TYPE INTEGER USING s + 1000"
+        ),
+        "23514"
+    );
+    // CharFamily（TEXT→VARCHAR(n)）: 文字列 IS NOT NULL／NOT IN は受理され、以後も強制される。
+    ok(
+        &core,
+        &o,
+        "ALTER TABLE t ALTER COLUMN note TYPE VARCHAR(10)",
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO t (id, qty, note, s) VALUES (9, 1, 'bad', 1) USING OPERATION_ID 'x4'"
+        ),
+        "23514"
+    );
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO t (id, qty, s) VALUES (9, 1, 1) USING OPERATION_ID 'x5'"
+        ),
+        "23514"
+    );
+    drop(core);
+
+    // 再オープン後も強制が維持される。
+    let storage = Storage::open(&path).expect("reopen storage");
+    assert_eq!(col_type(&storage, "t", "qty"), ColumnType::BigInt);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert_eq!(
+        code(
+            &core,
+            &o,
+            "INSERT INTO t (id, qty, note, s) VALUES (9, 7, 'a', 1) USING OPERATION_ID 'x6'"
+        ),
+        "23514"
+    );
+}

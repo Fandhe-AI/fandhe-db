@@ -342,6 +342,93 @@ fn or_expanded_check_records_dependency_and_follows_rename() {
     }
 }
 
+/// Issue #3245: 新しい述語形（文字列 `IN`・`BETWEEN`・`IS NOT NULL`・分岐内 `IS NULL` の `OR`・
+/// `NOT LIKE`・裸の `NOT bool_col`・`NOT IN`）の参照列を `RENAME COLUMN` した後も、CHECK が新しい
+/// 列名で強制される（旧名と同じ文字列リテラル `'kind'` は置換されない）。再オープン後も同じ。
+#[test]
+fn new_predicate_forms_follow_rename_column() {
+    let (core, path) = new_core("check-3245-rename");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (kind TEXT CHECK (kind IN ('kind', 'x')), \
+         n INTEGER CHECK (n BETWEEN 1 AND 9), \
+         m INTEGER CHECK (m IS NOT NULL), \
+         p INTEGER CHECK (p IS NULL OR p > 0), \
+         t TEXT CHECK (t NOT LIKE 'zz%'), \
+         f BOOLEAN CHECK (NOT f), \
+         u TEXT CHECK (u NOT IN ('u')))",
+    )
+    .expect("create table");
+    for (old, new) in [
+        ("kind", "kind2"),
+        ("n", "n2"),
+        ("m", "m2"),
+        ("p", "p2"),
+        ("t", "t2"),
+        ("f", "f2"),
+        ("u", "u2"),
+    ] {
+        core.execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            &format!("ALTER TABLE docs RENAME COLUMN {old} TO {new}"),
+        )
+        .unwrap_or_else(|e| panic!("rename {old} must succeed: {e:?}"));
+    }
+
+    let check = |core: &EngineCore, tag: &str| {
+        // 列ごとに 1 つだけ違反させた VALUES 句（kind2, n2, m2, p2, t2, f2, u2 の順）。
+        let rows: [(&str, &str); 7] = [
+            ("kind2", "'zzz', 5, 1, 1, 'ok', false, 'ok'"),
+            ("n2", "'kind', 10, 1, 1, 'ok', false, 'ok'"),
+            ("m2", "'kind', 5, NULL, 1, 'ok', false, 'ok'"),
+            ("p2", "'kind', 5, 1, -1, 'ok', false, 'ok'"),
+            ("t2", "'kind', 5, 1, 1, 'zzx', false, 'ok'"),
+            ("f2", "'kind', 5, 1, 1, 'ok', true, 'ok'"),
+            ("u2", "'kind', 5, 1, 1, 'ok', false, 'u'"),
+        ];
+        for (i, (col, values)) in rows.iter().enumerate() {
+            let sql = format!(
+                "INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES ({}, {values}) USING OPERATION_ID '{tag}{i}'",
+                100 + i
+            );
+            let err = core
+                .execute_insert_sql(&alice, &sql)
+                .expect_err(&format!("{col} violation must be rejected"));
+            assert_eq!(err.wire_code(), "23514", "{col}");
+        }
+        core.execute_insert_sql(
+            &alice,
+            &format!("INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES (1, 'kind', 5, 1, NULL, 'ok', false, 'ok') USING OPERATION_ID '{tag}ok'"),
+        )
+        .expect("satisfying row");
+    };
+    check(&core, "a");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    // 再オープン後も新しい列名で強制される（INSERT が id 重複でなく CHECK で拒否される）。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES (2, 'zzz', 5, 1, 1, 'ok', false, 'ok') USING OPERATION_ID 'z1'",
+        )
+        .expect_err("kind2 IN check after reopen");
+    assert_eq!(err.wire_code(), "23514");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES (3, 'kind', 5, NULL, 1, 'ok', false, 'ok') USING OPERATION_ID 'z2'",
+        )
+        .expect_err("m2 IS NOT NULL check after reopen");
+    assert_eq!(err.wire_code(), "23514");
+}
+
 /// Issue #3244: `ALTER TABLE ADD CHECK` も新しい形を受け付け、以降の INSERT で強制される。
 #[test]
 fn alter_table_add_check_accepts_in_between_is_null() {
