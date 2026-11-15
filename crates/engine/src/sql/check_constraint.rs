@@ -116,7 +116,7 @@ fn render_predicate(predicate: &WherePredicate, consts: bool) -> String {
         }
         WherePredicate::Not(inner) => format!("NOT {}", render_predicate(inner, consts)),
         // 数値の `IN`／`BETWEEN` の展開で生じる `Or`（Issue #3244）を括弧付きで描く。利用者が
-        // 書いた `OR` は構文段（`parse_where_or`）が拒否する。
+        // 書いた `OR` も受理済み（Issue #3243）で、同じ枝で描く。
         WherePredicate::Or(branches) => {
             if consts && branches.is_empty() {
                 return "FALSE".to_string();

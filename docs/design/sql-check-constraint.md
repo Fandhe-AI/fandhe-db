@@ -53,8 +53,8 @@ CREATE TABLE <table> (
 保持・永続化する（`n IN (1, 2)` は `(n = 1 OR n = 2)`、`n BETWEEN 1 AND 3` は
 `n >= 1 AND n <= 3` として保存される。PG も `BETWEEN` は展開して保存する）。この展開で生じる
 `Or` は許可し、`reject_forbidden_elements` は各分岐へ再帰して `visible()`・非組み込み関数・
-サブクエリが分岐に隠れても拒否する。利用者が書いた `OR` は構文段（`parse_where_or`）が `42601`
-で拒否する（#3243）。
+サブクエリが分岐に隠れても拒否する。利用者が書いた `OR`・`NOT` も受理済みで
+ある（#3243）。
 
 **数値列の式参照（Issue #1075・TABLE-16 ポインタ）**: `sql::udf_call::
 bind_expr_in` の `Expr::Ident` 分岐は、束縛環境の列参照ポリシー
