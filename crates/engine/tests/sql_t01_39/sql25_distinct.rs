@@ -731,3 +731,78 @@ fn having_can_reference_count_distinct_alias() {
     assert_eq!(as_text(&result.rows[0].cells[0]).as_deref(), Some("ja"));
     assert_eq!(as_integer(&result.rows[0].cells[1]), 3);
 }
+
+// --- SELECT DISTINCT ON（Issue #3260）: 構文解析・ORDER BY 先頭一致・fail-closed ----------
+
+/// 全テナント（private 許可の有無を含む）で同一の SQLSTATE・文言になること（可否は文だけで決まり、
+/// 行の内容・他テナントの存在に依存しない）を確認する補助。
+fn distinct_on_outcome_is_tenant_independent(sql: &str) -> (String, String) {
+    let path = unique_db_path("sql25-distinct-on");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let _truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let mut seen: Option<(String, String)> = None;
+    for tenant in TENANTS {
+        for allow_private in [false, true] {
+            let ctx = ctx_for(tenant, allow_private);
+            let err = core
+                .execute_sql(&ctx, sql)
+                .expect_err("DISTINCT ON must not return rows in this stage");
+            let outcome = (err.wire_code().to_string(), err.to_string());
+            match &seen {
+                Some(prev) => assert_eq!(prev, &outcome, "outcome must not depend on tenant"),
+                None => seen = Some(outcome),
+            }
+        }
+    }
+    seen.expect("at least one tenant")
+}
+
+#[test]
+fn distinct_on_with_mismatched_order_by_is_42p10_for_every_tenant() {
+    for sql in [
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY id, lang LIMIT 10",
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY id LIMIT 10",
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY id, lang;",
+    ] {
+        let (code, msg) = distinct_on_outcome_is_tenant_independent(sql);
+        assert_eq!(code, "42P10", "{sql}");
+        assert_eq!(
+            msg,
+            "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
+        );
+    }
+}
+
+// tracked: #3261（行を返す実行段。整合した文は構文・先頭一致の検証を通過した後 0A000 で拒否する）
+#[test]
+fn distinct_on_with_matching_order_by_passes_validation_then_fails_closed_0a000() {
+    for sql in [
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang LIMIT 10",
+        "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang DESC, id LIMIT 10;",
+        "SELECT DISTINCT ON (lang) lang FROM docs LIMIT 10",
+    ] {
+        let (code, _msg) = distinct_on_outcome_is_tenant_independent(sql);
+        assert_eq!(code, "0A000", "{sql}");
+    }
+}
+
+#[test]
+fn distinct_on_syntax_errors_and_limits_are_classified() {
+    let many = ["lang"; 9].join(", ");
+    for (sql, expected) in [
+        ("SELECT DISTINCT ON () lang FROM docs", "42601"),
+        ("SELECT DISTINCT ON (lang lang FROM docs", "42601"),
+        ("SELECT DISTINCT ON (lang,) lang FROM docs", "42601"),
+        ("SELECT DISTINCT ON (lang) FROM docs", "42601"),
+        (
+            &format!("SELECT DISTINCT ON ({many}) lang FROM docs ORDER BY lang"),
+            "54000",
+        ),
+        ("SELECT DISTINCT ON (lang) lang FROM nope", "42P01"),
+    ] {
+        let (code, _msg) = distinct_on_outcome_is_tenant_independent(sql);
+        assert_eq!(code, expected, "{sql}");
+    }
+}
