@@ -65,6 +65,10 @@ def topic_hit_rate(
         return None, "queries と返却 id の件数が一致しない、または空"
     if not doc_topic or any(t is None for t in query_topics):
         return None, "docs または queries に topic が無い"
+    # 評価対象 id（上位 k 件）のラベル欠損は不一致ではなく算出不能（品質低下と誤読させない）
+    for ids in ids_per_q:
+        if any(i not in doc_topic for i in ids[:k]):
+            return None, "返却文書の一部に topic ラベルが無い"
     total = 0.0
     for ids, qt in zip(ids_per_q, query_topics):
         total += sum(1 for i in ids[:k] if doc_topic.get(i) == qt) / k

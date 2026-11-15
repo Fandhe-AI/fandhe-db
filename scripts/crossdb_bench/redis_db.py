@@ -322,10 +322,14 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     phases["group_by_having"] = {**stats, "result": last}
 
     # --- hybrid_rrf: FT.HYBRID（SEARCH 句=全文・VSIM 句=KNN・COMBINE RRF） ---
+    def _hybrid_terms(qt):
+        """hybrid 本体と語結合診断が共有する前処理（英数語を空白連結し 200 文字で切る）。"""
+        return " ".join(t for t in qt.split() if t.isalnum())[:200] or "the"
+
     def _hybrid_once(i, k, window):
         """K・WINDOW を引数に取る hybrid 1 回分（可視フィルタは常に前置する）。"""
         qv, qt = query_vecs[i], query_texts[i]
-        terms = " ".join(t for t in qt.split() if t.isalnum())[:200] or "the"
+        terms = _hybrid_terms(qt)
         sq = HybridSearchQuery(f"(@visibility:{{public}}) @body:({terms})")
         vq = HybridVsimQuery(
             "@embedding",
@@ -376,19 +380,19 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             phases[arm] = unsupported(f"FT.HYBRID が利用できない: {e}")
 
     # --- hybrid_text_conjunction（Issue #3225）: @body:(t1 t2 ...) の結合が AND か OR かの診断 ---
-    def _terms(qt):
-        return [t for t in qt.split() if t.isalnum()][:200] or ["the"]
+    def _conj_expr(qt, sep):
+        """本体と同じ前処理・同じ可視フィルタの全文条件。sep は語の結合子（空白＝AND、`|`＝OR）。"""
+        terms = sep.join(_hybrid_terms(qt).split())
+        return f"(@visibility:{{public}}) @body:({terms})"
 
     def _total(expr):
         q = Query(expr).paging(0, 0).dialect(2)
         return int(r.ft(INDEX).search(q).total)
 
-    explain_raw = r.execute_command(
-        "FT.EXPLAIN", INDEX, f"@body:({' '.join(_terms(query_texts[0]))})", "DIALECT", "2"
-    )
+    explain_raw = r.execute_command("FT.EXPLAIN", INDEX, _conj_expr(query_texts[0], " "), "DIALECT", "2")
     explain_text = explain_raw.decode(errors="replace") if isinstance(explain_raw, bytes) else str(explain_raw)
-    and_counts = sorted(_total(f"@body:({' '.join(_terms(qt))})") for qt in query_texts)
-    or_counts = sorted(_total(f"@body:({'|'.join(_terms(qt))})") for qt in query_texts)
+    and_counts = sorted(_total(_conj_expr(qt, " ")) for qt in query_texts)
+    or_counts = sorted(_total(_conj_expr(qt, "|")) for qt in query_texts)
 
     def _dist(xs):
         return {"min": xs[0], "median": xs[len(xs) // 2], "max": xs[-1]} if xs else None

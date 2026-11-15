@@ -54,6 +54,11 @@ class MetricsTest(unittest.TestCase):
         self.assertIsNone(rate)
         self.assertTrue(reason)
 
+    def test_partial_label_missing_is_none_with_reason(self):
+        rate, reason = hd.topic_hit_rate([[1, 99]], {1: "a"}, ["a"], k=2)
+        self.assertIsNone(rate)
+        self.assertTrue(reason)
+
     def test_classify_explain(self):
         self.assertEqual(hd.classify_explain("INTERSECT {\n a\n b\n}"), "INTERSECT")
         self.assertEqual(hd.classify_explain("UNION {\n a\n b\n}"), "UNION")
