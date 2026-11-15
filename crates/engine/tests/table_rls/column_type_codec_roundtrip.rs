@@ -104,6 +104,7 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::SmallInt => "smallint",
         ArrayElemType::Time => "time",
         ArrayElemType::Bit(_) => "bit",
+        ArrayElemType::Interval => "interval",
     }
 }
 
@@ -1553,6 +1554,28 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
                 Some(86_400_000_000),
             ]),
         ),
+        // Issue #3234: `INTERVAL[]`（月・日・マイクロ秒の三要素。符号違い・境界値を含む）。
+        (
+            ArrayElemType::Interval,
+            ArrayValue::Interval(vec![
+                Some(engine::datetime::Interval {
+                    months: 1,
+                    days: -2,
+                    micros: 3_000_000,
+                }),
+                None,
+                Some(engine::datetime::Interval {
+                    months: i32::MIN,
+                    days: i32::MIN,
+                    micros: i64::MIN + 1,
+                }),
+                Some(engine::datetime::Interval {
+                    months: i32::MAX,
+                    days: i32::MAX,
+                    micros: i64::MAX - 1,
+                }),
+            ]),
+        ),
         // Issue #3235: `BIT(n)[]`（宣言長 `n` の要素。端数ビットを含む）。
         (
             ArrayElemType::Bit(4),
@@ -1614,6 +1637,7 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::SmallInt(_) => ArrayValue::SmallInt(vec![]),
             ArrayValue::Time(_) => ArrayValue::Time(vec![]),
             ArrayValue::Bit(_) => ArrayValue::Bit(vec![]),
+            ArrayValue::Interval(_) => ArrayValue::Interval(vec![]),
             ArrayValue::BigInt(_) => ArrayValue::BigInt(vec![]),
             ArrayValue::Real(_) => ArrayValue::Real(vec![]),
             ArrayValue::Double(_) => ArrayValue::Double(vec![]),

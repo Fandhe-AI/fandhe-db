@@ -139,6 +139,9 @@ pub(crate) fn render(
         ArrayValue::Time(v) => render_items(v, sep, &mut out, |t, o| {
             push_quoted(o, &crate::datetime::format_time(*t))
         })?,
+        ArrayValue::Interval(v) => render_items(v, sep, &mut out, |x, o| {
+            push_quoted(o, &crate::datetime::format_interval(x))
+        })?,
         ArrayValue::Uuid(v) => {
             render_items(v, sep, &mut out, |u, o| push_quoted(o, &u.to_string()))?
         }

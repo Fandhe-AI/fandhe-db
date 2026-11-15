@@ -573,6 +573,39 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
 - **据え置いた面（対象外）**: `VARBIT[]`・`BIT VARYING[]`、`bit[]` の比較・包含・並べ替え・集計・CAST（スカラー BIT の
   解禁に合わせて別 Issue）、配列のバイナリ形式（TABLE-35 (4)・WIRE-14）、NoSQL DDL の `element_type: "bit"`。
 
+## Issue #3234 追記（INTERVAL[] を要素型として受理）
+
+親 #3228・TABLE-14・TABLE-34・TABLE-35 のポインタ。`ArrayElemType` に `Interval` を追加した。専用の配列 OID
+（`_interval` = 1187）があるため Text 等へ写さない。
+
+- **値表現**: `ArrayValue::Interval(Vec<Option<Interval>>)`。要素は月・日・マイクロ秒を独立に持ち、派生 `PartialEq` は
+  生の三要素の一致（codec の往復用）。SQL の等価はスカラー INTERVAL と同じ正規化キー（1 か月 = 30 日。
+  `interval_cmp_key`）で判定する。
+- **行内表現**: 要素ごとに固定幅 16 バイト（`months: i32 LE`・`days: i32 LE`・`micros: i64 LE`）。encode・decode の
+  両方で番兵（±infinity の予約値）を `Invalid` で拒否する。行バイトと content hash は生の三要素のまま
+  （`1 mon` と `30 days` は別バイト・別ハッシュ。`datetime/interval.rs` の契約どおり）。
+- **カタログ param**: `interval,<max_len>`（2 次元以上は末尾に `d<N>`）。既存の型の param は 1 バイトも変えない。
+- **凍結タグ**: 一意キーの要素タグ・正準序数・content hash の要素型タグはいずれも **17**（`constraint.rs` が TIMESTAMPTZ・
+  INTERVAL 用に予約していた番号のうち INTERVAL 側。既存値は振り直さない）。永続されない `kind_ordinal` は 19、
+  `ALL_KINDS` は 20 件、`WireType::ALL` は 41 件。
+- **正規化等価**: `equality_payload`（UNIQUE キー・集合演算・宣言的フィルタが経由する）は要素ごとに
+  `interval_cmp_key` の i128 BE 16 バイトを積む。保存側（`ArrayRef`）は値へ復号してから同じ関数で正準化するので
+  新規値と既存行の経路は一致し、`{1 mon}` と `{30 days}` は UNIQUE で `23505` になる。`array_ops` の比較キーも
+  `Key::Interval(i128)` で、`=`・`<>`・`@>`・`<@`・`&&`・`ANY`／`ALL` がスカラーと同じ意味になる。
+- **テキスト**: 出力は `format_interval`（IntervalStyle=postgres）を `array_out` の引用規則で包む
+  （`{"1 day",NULL,"1 mon 02:00:00"}`）。入力は列束縛と同じ `bind_datetime_literal`（書式不正 `22007`・
+  フィールドあふれ `22015`・範囲外 `22008`・`infinity` `0A000`）。
+- **SQL 表層**: CREATE／ALTER ADD COLUMN・INSERT・UPDATE・UPSERT・列 DEFAULT・配列リテラル・`ARRAY[...]` 構築子・
+  添字（`interval`）・スライス・`CAST(... AS interval[])`・`array_agg(<interval 列>)` を受理する。整数配列から
+  `interval[]` への CAST は規則表の `×`（`42846`）のまま。
+- **fail-closed の面**: `INTERVAL(p)[]`・フィールド制限付き（`INTERVAL YEAR TO MONTH[]` 等）は構文段で `0A000`。
+  `interval[]` を含む集合演算は scalar INTERVAL と同じ側に置いて `0A000`。`array_agg(DISTINCT／ORDER BY <interval>)` は
+  スカラーの式キー並べ替えが未対応のため `0A000`。ALTER COLUMN TYPE による要素型変更は拡張しない。
+- **wire**: `WireType::IntervalArray`（OID 1187・`_interval`。typmod は -1）。バイナリ形式は対象外のまま（`0A000`）。
+  Parse で 1187 を宣言した場合も `0A000`。NoSQL（HTTP）の型名は `interval[]`、要素は `"1 day"` の JSON 文字列。
+- **据え置いた面（対象外）**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14）、`INTERVAL(p)[]`・フィールド制限付き配列、
+  集合演算（スカラー INTERVAL の解禁に合わせる）。
+
 ## Issue #3258 追記（LIKE の量化形）
 
 `<式> [NOT] LIKE|ILIKE ANY|SOME|ALL (<配列式>)` と `~~` 系演算子（TABLE-35・SQL-9 のポインタ）は

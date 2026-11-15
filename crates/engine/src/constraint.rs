@@ -2383,8 +2383,10 @@ fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
         crate::catalog::ArrayElemType::Varchar(_) | crate::catalog::ArrayElemType::Bpchar(_) => 0,
         crate::catalog::ArrayElemType::SmallInt => 14,
         crate::catalog::ArrayElemType::Time => 15,
-        // Issue #3235 の新規採番。16・17 は並行する TIMESTAMPTZ・INTERVAL の要素型が使う。
+        // Issue #3235 の新規採番。16 は並行する TIMESTAMPTZ の要素型が使う。
         crate::catalog::ArrayElemType::Bit(_) => 18,
+        // Issue #3234 の新規採番（INTERVAL）。
+        crate::catalog::ArrayElemType::Interval => 17,
     }
 }
 
@@ -5162,6 +5164,8 @@ mod tests {
             (E::Time, 15),
             // Issue #3235 の新規採番（既存値は振り直さない）。
             (E::Bit(4), 18),
+            // Issue #3234 の新規採番（既存値は振り直さない）。
+            (E::Interval, 17),
         ];
         // 全要素型を網羅していること（要素型の追加時に永続タグの決定を強制する。Issue #3229）。
         assert_eq!(elems.len(), E::ALL_KINDS.len());

@@ -386,6 +386,10 @@ fn write_array(
             quoted(out, &engine::datetime::format_time(*v));
             Ok(())
         })?,
+        ArrayValue::Interval(items) => each!(out, items, |out, v| {
+            quoted(out, &engine::datetime::format_interval(v));
+            Ok(())
+        })?,
         ArrayValue::Uuid(items) => each!(out, items, |out, v| {
             quoted(out, &v.to_string());
             Ok(())
@@ -513,6 +517,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
                 engine::catalog::ArrayElemType::Varchar(_) => "varchar[]",
                 engine::catalog::ArrayElemType::Bpchar(_) => "bpchar[]",
                 engine::catalog::ArrayElemType::Bit(_) => "bit[]",
+                engine::catalog::ArrayElemType::Interval => "interval[]",
             },
         },
     }
@@ -1105,6 +1110,19 @@ mod tests {
                 "time[]",
                 V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)]),
                 r#"["10:00:00",null,"24:00:00"]"#,
+            ),
+            (
+                ArrayElemType::Interval,
+                "interval[]",
+                V::Interval(vec![
+                    Some(engine::datetime::Interval {
+                        months: 0,
+                        days: 1,
+                        micros: 0,
+                    }),
+                    None,
+                ]),
+                r#"["1 day",null]"#,
             ),
             (
                 ArrayElemType::Bit(4),
