@@ -399,7 +399,7 @@ impl CastType {
     }
 
     /// 配列の変換先・変換元としての要素型（`CastType::Array(elem)` の `elem`）を、行内表現を
-    /// 持つ `ArrayElemType` へ写す。対応が無い要素（`time`・`timestamptz`・
+    /// 持つ `ArrayElemType` へ写す。対応が無い要素（`timestamptz`・
     /// `interval`・`varchar(n)`・`char(n)`・修飾子なしの `numeric`・ENUM）と、配列でない型は
     /// `None`（束縛段が `0A000` にする。fail-closed）。
     pub fn array_elem_type(&self) -> Option<ArrayElemType> {
@@ -416,6 +416,7 @@ impl CastType {
             CastType::Float8 => ArrayElemType::Double,
             CastType::Date => ArrayElemType::Date,
             CastType::Timestamp => ArrayElemType::Timestamp,
+            CastType::Time => ArrayElemType::Time,
             CastType::Uuid => ArrayElemType::Uuid,
             CastType::Numeric(Some((precision, scale))) => ArrayElemType::Numeric {
                 precision: *precision,
@@ -429,7 +430,6 @@ impl CastType {
             CastType::Numeric(None)
             | CastType::Varchar(_)
             | CastType::Bpchar(_)
-            | CastType::Time
             | CastType::TimestampTz
             | CastType::Interval
             | CastType::Array(_) => return None,
@@ -537,6 +537,7 @@ pub(crate) fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
         ArrayElemType::Double => CastType::Float8,
         ArrayElemType::Date => CastType::Date,
         ArrayElemType::Timestamp => CastType::Timestamp,
+        ArrayElemType::Time => CastType::Time,
         ArrayElemType::Uuid => CastType::Uuid,
         ArrayElemType::Numeric { precision, scale } => CastType::Numeric(Some((precision, scale))),
         ArrayElemType::Bytea => CastType::Bytea,
@@ -1779,7 +1780,7 @@ mod tests {
         assert_eq!(arr(CastType::Int4).expr_type(), Some(ExprType::Array));
         assert_eq!(arr(CastType::Int2).expr_type(), Some(ExprType::Array));
         // 対応する要素型の無い配列は式の型を持たない（束縛段が `0A000` にする）。
-        assert_eq!(arr(CastType::Time).expr_type(), None);
+        assert_eq!(arr(CastType::TimestampTz).expr_type(), None);
         assert_eq!(arr(CastType::Numeric(None)).expr_type(), None);
     }
 
@@ -1796,6 +1797,7 @@ mod tests {
             (CastType::Float8, ArrayElemType::Double),
             (CastType::Date, ArrayElemType::Date),
             (CastType::Timestamp, ArrayElemType::Timestamp),
+            (CastType::Time, ArrayElemType::Time),
             (CastType::Uuid, ArrayElemType::Uuid),
             (
                 CastType::Numeric(Some((10, 2))),
@@ -1812,7 +1814,6 @@ mod tests {
             assert!(arr(elem).result_column_type().is_some());
         }
         for elem in [
-            CastType::Time,
             CastType::TimestampTz,
             CastType::Interval,
             CastType::Varchar(Some(3)),

@@ -54,7 +54,7 @@
 //! - `ColumnMeta::Scalar{ty: Json}` → `json`（OID 114, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Jsonb}` → `jsonb`（OID 3802, typlen -1。同上）
 //! - `ColumnMeta::Scalar{ty: Array(<要素型>)}`／式の配列結果 → PostgreSQL の配列型 OID
-//!   （`_int4`=1007・`_text`=1009 など 14 種。typlen -1。次元数は OID に影響しない。
+//!   （`_int4`=1007・`_text`=1009 など 15 種。typlen -1。次元数は OID に影響しない。
 //!   テキスト形式のみで、バイナリは `0A000`。TABLE-35・WIRE-13・WIRE-14・Issue #1606）
 //! - `ColumnMeta::Scalar{ty: Enum(_)}`／`Array(<ENUM>)` → `text`
 //!   （OID 25。ENUM は組み込み OID を持たない据え置き判断。WIRE-13・TASK-200・Issue #895）
@@ -591,6 +591,9 @@ wire_type_enum! {
         /// `ColumnMeta::Scalar{ty: Array(<timestamp>)}`（`_timestamp`。TABLE-35・WIRE-13・Issue #1606）。
         /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
         TimestampArray,
+        /// `ColumnMeta::Scalar{ty: Array(<time>)}`（`_time`=1183。TABLE-35・WIRE-13・Issue #3232）。
+        /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        TimeArray,
         /// `ColumnMeta::Scalar{ty: Array(<uuid>)}`（`_uuid`。TABLE-35・WIRE-13・Issue #1606）。
         /// 次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
         UuidArray,
@@ -650,6 +653,7 @@ impl WireType {
             WireType::Float8Array => 1022,
             WireType::DateArray => 1182,
             WireType::TimestampArray => 1115,
+            WireType::TimeArray => 1183,
             WireType::UuidArray => 2951,
             WireType::NumericArray => 1231,
             WireType::ByteaArray => 1001,
@@ -680,6 +684,7 @@ impl WireType {
             | WireType::Float8Array
             | WireType::DateArray
             | WireType::TimestampArray
+            | WireType::TimeArray
             | WireType::UuidArray
             | WireType::NumericArray
             | WireType::ByteaArray
@@ -732,6 +737,7 @@ impl WireType {
             WireType::Float8Array => "_float8",
             WireType::DateArray => "_date",
             WireType::TimestampArray => "_timestamp",
+            WireType::TimeArray => "_time",
             WireType::UuidArray => "_uuid",
             WireType::NumericArray => "_numeric",
             WireType::ByteaArray => "_bytea",
@@ -790,6 +796,7 @@ impl WireType {
             | WireType::Float8Array
             | WireType::DateArray
             | WireType::TimestampArray
+            | WireType::TimeArray
             | WireType::UuidArray
             | WireType::NumericArray
             | WireType::ByteaArray
@@ -849,6 +856,7 @@ impl WireType {
             | WireType::Float8Array
             | WireType::DateArray
             | WireType::TimestampArray
+            | WireType::TimeArray
             | WireType::UuidArray
             | WireType::NumericArray
             | WireType::ByteaArray
@@ -1087,6 +1095,7 @@ fn array_wire_type(elem: engine::catalog::ArrayElemType) -> WireType {
         E::Double => WireType::Float8Array,
         E::Date => WireType::DateArray,
         E::Timestamp => WireType::TimestampArray,
+        E::Time => WireType::TimeArray,
         E::Uuid => WireType::UuidArray,
         E::Numeric { .. } => WireType::NumericArray,
         E::Bytea => WireType::ByteaArray,
@@ -2239,6 +2248,10 @@ mod tests {
             r#"{"1970-01-01 00:00:01",NULL}"#
         );
         assert_eq!(
+            text_of(ArrayValue::Time(vec![Some(0), None, Some(86_400_000_000)])),
+            "{00:00:00,NULL,24:00:00}"
+        );
+        assert_eq!(
             text_of(ArrayValue::Uuid(vec![
                 Some(engine::uuid::Uuid::from_bytes([0x11; 16])),
                 None
@@ -2894,7 +2907,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 36);
+        assert_eq!(WireType::ALL.len(), 37);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2920,7 +2933,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 36] = [
+        let expected: [(WireType, i32, i16, &str); 37] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -2950,6 +2963,7 @@ mod tests {
             (WireType::Float8Array, 1022, -1, "_float8"),
             (WireType::DateArray, 1182, -1, "_date"),
             (WireType::TimestampArray, 1115, -1, "_timestamp"),
+            (WireType::TimeArray, 1183, -1, "_time"),
             (WireType::UuidArray, 2951, -1, "_uuid"),
             (WireType::NumericArray, 1231, -1, "_numeric"),
             (WireType::ByteaArray, 1001, -1, "_bytea"),
@@ -2970,8 +2984,9 @@ mod tests {
     #[test]
     fn array_columns_advertise_postgres_array_oids() {
         use engine::catalog::{ArrayElemType as E, ArrayType, ColumnType};
-        let cases: [(E, i32); 4] = [
+        let cases: [(E, i32); 5] = [
             (E::SmallInt, 1005),
+            (E::Time, 1183),
             (E::Integer, 1007),
             (E::Text, 1009),
             (E::Jsonb, 3807),
@@ -3016,6 +3031,7 @@ mod tests {
                 E::Double => (1022, "_float8"),
                 E::Date => (1182, "_date"),
                 E::Timestamp => (1115, "_timestamp"),
+                E::Time => (1183, "_time"),
                 E::Uuid => (2951, "_uuid"),
                 E::Numeric { .. } => (1231, "_numeric"),
                 E::Bytea => (1001, "_bytea"),

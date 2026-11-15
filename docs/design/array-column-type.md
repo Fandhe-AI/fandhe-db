@@ -468,3 +468,27 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
   `ALTER COLUMN TYPE` の配列要素型変更は既存の配列どうしの判定に従い拡張しない（fail-closed）。
 - **対象外**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14。対応しない）。VARCHAR・TIME・TIMESTAMPTZ・INTERVAL・BIT の
   各要素型は #3231〜#3235。
+
+## Issue #3232 追記（`TIME[]` の受理）
+
+親 #3228・TABLE-14・TABLE-35 のポインタ。#3229 のチェックリストと #3230 の手順に従い、`TIME[]`／`TIME[n]`／
+`TIME WITHOUT TIME ZONE[]` を専用の要素型 `ArrayElemType::Time` として受理した（別 OID の `_time`=1183 を公告する
+ため `Timestamp` へは丸めない）。Issue #1569 で拒否していた形の反転。
+
+- **値表現**: `ArrayValue::Time(Vec<Option<i64>>)`。0 時起点のマイクロ秒で、スカラー `Value::Time` と同じ。範囲は
+  `00:00:00`〜`24:00:00`（両端を含む）。変換点（配列リテラル・CAST・`ARRAY[...]`・`array_agg`・NoSQL の JSON 束縛）
+  の範囲外は `22008`、書式不正は `22007`（スカラー `TIME` と同じ契約）。
+- **行内表現**: 固定幅 8 バイト LE（`Timestamp` と同形）。encode・decode の両方で範囲を検証し、範囲外は Invalid で
+  fail-closed（破損データを黙って丸めない）。
+- **凍結値（新規採番。既存値は振り直さない）**: カタログ param のタグ `time`、`constraint::array_elem_tag` と
+  `canonical_parts` の序数と content hash の要素型タグはいずれも 15（0x40 の次元マーカー未満）。
+- **wire**: `WireType::TimeArray`（OID 1183・typlen -1・`_time`）。テキスト形式のみで、バイナリは従来の配列と同じく
+  `0A000`。Parse で 1183 を宣言した場合は従来どおり `0A000`。NoSQL の `element_type: "time"` も受理し、要素は JSON
+  文字列のみ（それ以外は `42601`）、応答の型名は `time[]`。
+- **副次的に受理した面**: 要素がすべて time の `ARRAY[...]`（他の型との混在は `42804`）、time 列の `array_agg`、
+  `CAST(... AS time[])`（整数配列からは規則表どおり `42846`）、添字（結果型 time）・スライス、time 左辺の量化比較
+  （`t = ANY(arr)`・型なしリテラル配列。以前は `0A000`）、`TIME[] UNIQUE`（`23505`）。
+- **据え置いた面**: `TIME(p)[]`・`TIMETZ[]`・`TIME WITH TIME ZONE[]` は `0A000` のまま。`ALTER COLUMN TYPE` の配列要素型
+  変更は既存の配列どうしの判定に従い拡張しない（fail-closed）。スカラー `TIME` の UNIQUE／PRIMARY KEY は変更なし。
+- **対象外**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14。対応しない）。VARCHAR・TIMESTAMPTZ・INTERVAL・BIT の
+  各要素型は #3231・#3233〜#3235。

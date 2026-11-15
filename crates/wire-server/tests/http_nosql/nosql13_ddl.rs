@@ -819,9 +819,9 @@ fn create_table_smallint_column_binds_range_and_accepts_array_element() {
 }
 
 /// Issue #1571（TABLE-32・NOSQL-13）: `create_table`／`add_column` の型名 `"time"` が受理され、
-/// 範囲外・書式不正は拒否、配列要素型としての `"time"` は 0A000 のまま（副作用なし）。
+/// 範囲外・書式不正は拒否。配列要素型としての `"time"` も Issue #3232（TABLE-14）で受理される。
 #[test]
-fn create_table_time_column_binds_and_rejects_array_element() {
+fn create_table_time_column_binds_and_accepts_array_element() {
     let (core, _guard) = new_core();
     let session = ddl_session(core);
     let resp = query(
@@ -849,9 +849,35 @@ fn create_table_time_column_binds_and_rejects_array_element() {
     assert_eq!(add.status, 200, "got: {add:?}");
     let arr = query(
         &session,
-        br#"{"op":"create_table","table":"tm2","columns":[{"name":"a","type":"array","element_type":"time","max_len":4}]}"#,
+        br#"{"op":"create_table","table":"tm2","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"time","max_len":4}
+    ]}"#,
     );
-    assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
+    assert_eq!(arr.status, 200, "got: {arr:?}");
+    let arr_ok = query(
+        &session,
+        br#"{"op":"insert","table":"tm2","rows":[{"id":1,"embedding":[0.1,0.2],"a":["10:00:00",null,"24:00:00"]}],"operation_id":"tm2-1"}"#,
+    );
+    assert_eq!(arr_ok.status, 200, "got: {arr_ok:?}");
+    let arr_oor = query(
+        &session,
+        br#"{"op":"insert","table":"tm2","rows":[{"id":2,"embedding":[0.1,0.2],"a":["24:00:01"]}],"operation_id":"tm2-2"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_oor),
+        "22008",
+        "got: {arr_oor:?}"
+    );
+    let arr_ty = query(
+        &session,
+        br#"{"op":"insert","table":"tm2","rows":[{"id":3,"embedding":[0.1,0.2],"a":[1]}],"operation_id":"tm2-3"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_ty),
+        "42601",
+        "got: {arr_ty:?}"
+    );
 }
 
 /// Issue #1577（TABLE-33・NOSQL-13）: `create_table`／`add_column` の型名 `"timestamptz"` が

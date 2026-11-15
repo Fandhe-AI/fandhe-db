@@ -150,14 +150,13 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Double => ArrayElemType::Double,
                 ColumnType::Date => ArrayElemType::Date,
                 ColumnType::Timestamp => ArrayElemType::Timestamp,
-                // `time[]` は別 OID（1183）のため Integer 等へ丸めず拒否する（Issue #1569）。
+                // `time[]` は別 OID（1183）を持つ専用の要素型へ写す（Issue #3232。Timestamp 等へ丸めると
+                // 型の区別が失われる。Issue #1569 で拒否していた形を受理へ反転した）。
+                ColumnType::Time => ArrayElemType::Time,
                 // `timestamptz[]` も別 OID（1185）のため拒否する（Issue #1574）。
                 // `interval[]` も別 OID（1187）のため拒否する（Issue #1579）。
                 // `bit[]` も別 OID（1561）のため拒否する（Issue #2021）。
-                ColumnType::Time
-                | ColumnType::TimestampTz
-                | ColumnType::Interval
-                | ColumnType::Bit(_) => {
+                ColumnType::TimestampTz | ColumnType::Interval | ColumnType::Bit(_) => {
                     return Err(SqlSurfaceError::FeatureNotSupported {
                         detail: "this array element type is not supported yet".to_string(),
                     })
@@ -1218,6 +1217,21 @@ mod tests {
             match to_static_column_type(&ty).expect(raw) {
                 StaticColumnType::Resolved(ColumnType::Array(a)) => {
                     assert_eq!(a.elem(), ArrayElemType::SmallInt, "for {raw:?}");
+                }
+                other => panic!("unexpected static type for {raw:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #3232: `TIME[]` 系の綴りは専用の要素型 `Time` へ写る。`TIME(p)[]`・`TIMETZ[]` は
+    /// 従来どおり構文段で `0A000`。
+    #[test]
+    fn time_array_spellings_map_to_time_element_type() {
+        for raw in ["TIME[]", "TIME[3]", "TIME WITHOUT TIME ZONE[]"] {
+            let (ty, _) = parse_type(raw).expect(raw);
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::Time, "for {raw:?}");
                 }
                 other => panic!("unexpected static type for {raw:?}: {other:?}"),
             }
