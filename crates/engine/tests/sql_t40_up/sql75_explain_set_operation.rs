@@ -367,21 +367,34 @@ fn works_inside_explicit_transaction() {
         .expect("commit");
 }
 
-/// 括弧なし末尾 `ORDER BY`（集合全体のキー。Issue #3266）は `EXPLAIN`・`EXPLAIN ANALYZE` でも
-/// 実行と同じ分類になる（ソート実行は #3267 まで `0A000`。解決できないキーは `42703`／`42P10`）。
-// tracked: #3267
+/// 括弧なし末尾 `ORDER BY`（集合全体のキー。Issue #3266・#3267）は `EXPLAIN`・`EXPLAIN ANALYZE` でも
+/// 実行と同じ分類になる。成功する形は全体 `sort` 段（キー数のみ）を `limit` 段と `set_operation`
+/// 段の間に出し、解決できないキーは `42703`／`42P10`、式キーは `0A000`（意図的な拒否）。
+// intentional: docs/design/set-operations.md
 #[test]
 fn trailing_order_by_is_classified_like_execution() {
     let (core, _g) = seeded("x75s-order-by");
     for prefix in ["EXPLAIN", "EXPLAIN ANALYZE"] {
         for (tail, want) in [
-            ("ORDER BY k", "0A000"),
-            ("ORDER BY 1 DESC NULLS FIRST LIMIT 1", "0A000"),
             ("ORDER BY nope", "42703"),
             ("ORDER BY 2", "42P10"),
+            ("ORDER BY lower(k)", "0A000"),
         ] {
             let sql = format!("{prefix} SELECT k FROM a UNION SELECT k FROM b {tail}");
             assert_eq!(code(&core, &sql), want, "{sql}");
         }
+        for tail in ["ORDER BY k", "ORDER BY 1 DESC NULLS FIRST LIMIT 1"] {
+            let sql = format!("{prefix} SELECT k FROM a UNION SELECT k FROM b {tail}");
+            assert!(run(&core, "tenant-a", &sql).is_ok(), "{sql}");
+        }
     }
+    let plan_lines = plan(
+        &core,
+        "EXPLAIN SELECT k FROM a UNION SELECT k FROM b ORDER BY 1 DESC LIMIT 1",
+    );
+    let text = plan_lines.join("\n");
+    let limit = text.find("limit").expect("limit stage");
+    let sort = text.find("sort_keys: 1").expect("sort stage");
+    let set_op = text.find("set_operation").expect("set_operation stage");
+    assert!(limit < sort && sort < set_op, "{text}");
 }

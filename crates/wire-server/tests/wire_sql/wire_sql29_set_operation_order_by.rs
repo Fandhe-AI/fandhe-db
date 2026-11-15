@@ -2,8 +2,9 @@
 //! SQL-56・WIRE-12）が PostgreSQL wire v3 の簡易・拡張クエリ経路で契約どおりの `ErrorResponse`
 //! （SQLSTATE）になることを固定する結合テスト。
 //!
-//! 構文と束縛を通ったキーは、ソート実行（Issue #3267）までは `0A000`（`42601` ではない）。
-//! 解決できないキーは `42703`／`42P10`。拒否の後は `ReadyForQuery` が返り接続は継続する。
+//! 構文と束縛を通ったキーは合成結果を安定ソートして返す（Issue #3267。`OFFSET`／`LIMIT`／
+//! `FETCH FIRST` を含む）。式キーは `0A000`、解決できないキーは `42703`／`42P10`。拒否の後は
+//! `ReadyForQuery` が返り接続は継続する。
 //! 分類の確定オラクルは `crates/engine/tests/sql_t01_39/sql29_set_operations.rs`（in-process）で、
 //! 本ファイルは同じ規則を wire フレーミング越しに再確認する。
 
@@ -102,15 +103,40 @@ fn first_error_code_until_ready(s: &mut Stream) -> Option<String> {
     }
 }
 
-/// 簡易クエリ: 関門の形は `0A000`、解決できないキーは `42703`／`42P10`。各エラーの後も接続は継続する。
-// tracked: #3267
+/// 簡易クエリ: 全体 `ORDER BY` はソート順の行を返す（末尾 `;`・`OFFSET`／`LIMIT`／`FETCH` を含む）。
+/// 誤りの形は従来の SQLSTATE のままで、各エラーの後も接続は継続する。
 #[test]
-fn set_operation_order_by_simple_query_classification_and_recovery() {
+fn set_operation_order_by_simple_query_sorts_and_classifies() {
     let (core, _guard) = new_core();
     let (mut stream, _users_path) = spawn_with_alice(core);
+    for (sql, expected_rows) in [
+        (format!("{BASE} ORDER BY 1;"), vec!["en", "ja"]),
+        (format!("{BASE} ORDER BY lang DESC"), vec!["ja", "en"]),
+        (format!("{BASE} ORDER BY lang DESC LIMIT 1"), vec!["ja"]),
+        (format!("{BASE} ORDER BY lang OFFSET 1"), vec!["ja"]),
+        (
+            format!("{BASE} ORDER BY lang FETCH FIRST 1 ROWS ONLY"),
+            vec!["en"],
+        ),
+    ] {
+        send_simple_query(&mut stream, &sql);
+        let columns = read_row_description(&mut stream);
+        assert_eq!(columns, vec!["lang".to_string()], "{sql}");
+        for want in &expected_rows {
+            assert_eq!(
+                read_data_row(&mut stream),
+                vec![Some((*want).to_string())],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            read_command_complete(&mut stream),
+            format!("SELECT {}", expected_rows.len()),
+            "{sql}"
+        );
+        read_ready_for_query(&mut stream);
+    }
     for (sql, expected) in [
-        (format!("{BASE} ORDER BY 1;"), "0A000"),
-        (format!("{BASE} ORDER BY lang DESC LIMIT 1"), "0A000"),
         (format!("{BASE} ORDER BY nope;"), "42703"),
         (format!("{BASE} ORDER BY 3"), "42P10"),
         (format!("{BASE} ORDER BY lower(lang)"), "0A000"),
@@ -133,15 +159,57 @@ fn set_operation_order_by_simple_query_classification_and_recovery() {
     read_ready_for_query(&mut stream);
 }
 
-/// 拡張クエリ: Describe と Execute が同じ分類を返す（Describe と Execute の受理・拒否の一致）。
-// tracked: #3267
+/// `ReadyForQuery` までのメッセージを読み、`DataRow`（`D`）の先頭列の値と `T` の有無・最初の
+/// `ErrorResponse` の SQLSTATE を返す。
+fn drain_until_ready(s: &mut Stream) -> (Vec<String>, bool, Option<String>) {
+    let mut rows = Vec::new();
+    let mut described = false;
+    let mut code = None;
+    loop {
+        let (kind, body) = read_message(s);
+        match kind {
+            b'T' => described = true,
+            b'D' => {
+                // 本体: 列数(2) + 値長(4) + 値。
+                let value = body.get(6..).unwrap_or(&[]);
+                rows.push(String::from_utf8_lossy(value).to_string());
+            }
+            b'E' if code.is_none() => {
+                let text = String::from_utf8_lossy(&body).to_string();
+                code = text
+                    .split('\0')
+                    .find_map(|f| f.strip_prefix('C').map(str::to_string));
+            }
+            b'Z' => return (rows, described, code),
+            _ => {}
+        }
+    }
+}
+
+/// 拡張クエリ: Describe の列と Execute の行が一致し（ソート順）、誤りの形は Describe と Execute で
+/// 同じ SQLSTATE を返す。
 #[test]
 fn set_operation_order_by_extended_query_describe_matches_execute() {
     let (core, _guard) = new_core();
     let (mut stream, _users_path) = spawn_with_alice(core);
+    // 成功する形。
+    let sql = format!("{BASE} ORDER BY lang DESC");
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("ok", &sql, 0));
+    send_length_prefixed_message(&mut stream, b'D', &describe_statement_body("ok"));
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    let (rows, described, code) = drain_until_ready(&mut stream);
+    assert!(rows.is_empty() && described && code.is_none(), "describe");
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("", &sql, 0));
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("", ""));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    let (rows, _, code) = drain_until_ready(&mut stream);
+    assert_eq!(code, None);
+    assert_eq!(rows, vec!["ja".to_string(), "en".to_string()]);
+    // 誤りの形。
     for (i, (sql, expected)) in [
-        (format!("{BASE} ORDER BY 1"), "0A000"),
         (format!("{BASE} ORDER BY nope"), "42703"),
+        (format!("{BASE} ORDER BY lower(lang)"), "0A000"),
     ]
     .into_iter()
     .enumerate()
