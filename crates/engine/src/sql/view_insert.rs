@@ -265,8 +265,16 @@ pub(crate) fn rewrite_returning(
 ) -> Result<(Option<Projection>, Option<Vec<String>>), SqlSurfaceError> {
     match returning {
         None => Ok((None, None)),
-        Some(Projection::Items(_)) => Err(SqlSurfaceError::unsupported(
-            "RETURNING does not support function-call items",
+        Some(Projection::Items(items)) => Err(SqlSurfaceError::unsupported(
+            if items
+                .iter()
+                .all(crate::sql::allowlist::is_returning_column_item)
+            {
+                "RETURNING column aliases are not supported on writes through a view yet"
+            } else {
+                "RETURNING supports only column references with optional AS aliases; \
+                 expressions are not supported yet"
+            },
         )),
         Some(Projection::All) => match mapper.columns {
             None => Ok((Some(Projection::All), None)),

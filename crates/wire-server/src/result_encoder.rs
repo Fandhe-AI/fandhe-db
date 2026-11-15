@@ -1064,7 +1064,8 @@ fn scalar_wire_type(ty: &engine::catalog::ColumnType) -> WireType {
 }
 
 /// 配列の要素型から配列型の [`WireType`] を引く（[`scalar_wire_type`] から呼ばれる。
-/// 次元数は OID に影響しない。TABLE-35・Issue #1606）。
+/// 次元数は OID に影響しない。TABLE-35・Issue #1606）。要素型 → OID の対応はここと
+/// [`WireType::oid`] の 1 か所だけが持つ（engine は OID を持たない。Issue #3229）。
 #[deny(clippy::wildcard_enum_match_arm)]
 fn array_wire_type(elem: engine::catalog::ArrayElemType) -> WireType {
     use engine::catalog::ArrayElemType as E;
@@ -2975,6 +2976,50 @@ mod tests {
                 ty: Some(ty),
             };
             assert_eq!(column_wire_type(&computed).oid(), oid);
+        }
+    }
+
+    /// Issue #3229: 全配列要素型（`ArrayElemType::ALL_KINDS`）と配列 OID・型名の対応を固定する。
+    /// OID 数値の単一情報源は [`WireType::oid`] で、engine 側は OID を持たない。要素型の追加時は
+    /// `array_wire_type` の網羅 match（コンパイルエラー）と本表の両方を更新する。
+    #[test]
+    fn every_array_elem_type_maps_to_a_distinct_array_oid() {
+        use engine::catalog::{ArrayElemType as E, ArrayType, ColumnType};
+        let mut seen = std::collections::BTreeSet::new();
+        for elem in E::ALL_KINDS {
+            let (oid, name) = match elem {
+                E::Text => (1009, "_text"),
+                E::Bool => (1000, "_bool"),
+                E::Integer => (1007, "_int4"),
+                E::BigInt => (1016, "_int8"),
+                E::Real => (1021, "_float4"),
+                E::Double => (1022, "_float8"),
+                E::Date => (1182, "_date"),
+                E::Timestamp => (1115, "_timestamp"),
+                E::Uuid => (2951, "_uuid"),
+                E::Numeric { .. } => (1231, "_numeric"),
+                E::Bytea => (1001, "_bytea"),
+                E::Json => (199, "_json"),
+                E::Jsonb => (3807, "_jsonb"),
+                // ENUM[] は語彙を公告できないため text として公告する。
+                E::Enum => (25, "text"),
+            };
+            let wire = array_wire_type(elem);
+            assert_eq!(wire.oid(), oid, "{elem:?}");
+            assert_eq!(wire.pg_type_name(), name, "{elem:?}");
+            assert!(WireType::ALL.contains(&wire), "{elem:?}");
+            if elem != E::Enum {
+                assert!(seen.insert(oid), "duplicate array OID {oid}");
+            }
+            // 列メタ経由（`column_wire_type`）でも同じ公告になる（Enum は ArrayType::new 非対応）。
+            if elem != E::Enum {
+                let ty = ColumnType::Array(ArrayType::new(elem, 4).expect("array type"));
+                let meta = ColumnMeta::Scalar {
+                    name: "a".to_string(),
+                    ty,
+                };
+                assert_eq!(column_wire_type(&meta), wire, "{elem:?}");
+            }
         }
     }
 

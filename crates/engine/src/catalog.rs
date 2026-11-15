@@ -7209,9 +7209,57 @@ pub enum ArrayElemType {
 }
 
 impl ArrayElemType {
+    /// 全要素型の代表値を `kind_ordinal` 順に並べた一覧（Issue #3229・TABLE-14）。
+    /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
+    /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
+    /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
+    pub const ALL_KINDS: [ArrayElemType; 14] = [
+        ArrayElemType::Text,
+        ArrayElemType::Bool,
+        ArrayElemType::Integer,
+        ArrayElemType::BigInt,
+        ArrayElemType::Real,
+        ArrayElemType::Double,
+        ArrayElemType::Date,
+        ArrayElemType::Timestamp,
+        ArrayElemType::Uuid,
+        ArrayElemType::Numeric {
+            precision: 10,
+            scale: 2,
+        },
+        ArrayElemType::Bytea,
+        ArrayElemType::Json,
+        ArrayElemType::Jsonb,
+        ArrayElemType::Enum,
+    ];
+
+    /// 種別の序数（[`ArrayElemType::ALL_KINDS`] の添字）。ワイルドカード無しの網羅 match の
+    /// ため、要素型の追加時にここでコンパイルエラーとなり `ALL_KINDS` の更新へ誘導する。
+    /// 永続化される値ではない（永続値は `catalog_tag`／`constraint::array_elem_tag`）。
+    #[deny(clippy::wildcard_enum_match_arm)]
+    pub const fn kind_ordinal(self) -> usize {
+        match self {
+            ArrayElemType::Text => 0,
+            ArrayElemType::Bool => 1,
+            ArrayElemType::Integer => 2,
+            ArrayElemType::BigInt => 3,
+            ArrayElemType::Real => 4,
+            ArrayElemType::Double => 5,
+            ArrayElemType::Date => 6,
+            ArrayElemType::Timestamp => 7,
+            ArrayElemType::Uuid => 8,
+            ArrayElemType::Numeric { .. } => 9,
+            ArrayElemType::Bytea => 10,
+            ArrayElemType::Json => 11,
+            ArrayElemType::Jsonb => 12,
+            ArrayElemType::Enum => 13,
+        }
+    }
+
     /// カタログ v2 の `param` フィールド内で使う要素型タグ（Issue #888 D-A2）。
     /// `Numeric`／`Enum` は追加フィールド（p,s／型名）を伴うため
     /// [`ArrayType::catalog_param`] が組み立てる。
+    #[deny(clippy::wildcard_enum_match_arm)]
     fn catalog_tag(&self) -> &'static str {
         match self {
             ArrayElemType::Text => "text",
@@ -7255,6 +7303,15 @@ impl ArrayElemType {
     }
 }
 
+// `ALL_KINDS[i].kind_ordinal() == i` をビルド時に固定する（並べ違い・追加漏れの検出）。
+const _: () = {
+    let mut i = 0;
+    while i < ArrayElemType::ALL_KINDS.len() {
+        assert!(ArrayElemType::ALL_KINDS[i].kind_ordinal() == i);
+        i += 1;
+    }
+};
+
 /// 配列列 1 個の宣言（要素型＋要素数上限＋宣言次元数。TABLE-14・TASK-198、Issue #888・#1605）。
 /// フィールドを private にし [`ArrayType::new`]／[`ArrayType::new_enum`] のみを
 /// 構築経路とすることで、上限の範囲検証（`1..=MAX_ARRAY_ELEMENTS`）を経ない値を
@@ -7293,7 +7350,18 @@ impl ArrayType {
             ArrayElemType::Numeric { precision, scale } => {
                 validate_numeric_precision_scale(precision, scale)?
             }
-            _ => {}
+            ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb => {}
         }
         Ok(Self {
             elem,
@@ -7374,7 +7442,24 @@ impl ArrayType {
                 format!("numeric,{precision},{scale},{}", self.max_len)
             }
             (ArrayElemType::Enum, Some(def)) => format!("enum,{},{}", def.name, self.max_len),
-            (elem, _) => format!("{},{}", elem.catalog_tag(), self.max_len),
+            // `Enum` で語彙が無い組は構築経路（`new_enum` のみ）で作れないが、従来どおり
+            // タグ形式へ落とす（出力はバイト単位で不変）。
+            (ArrayElemType::Enum, None)
+            | (
+                ArrayElemType::Text
+                | ArrayElemType::Bool
+                | ArrayElemType::Integer
+                | ArrayElemType::BigInt
+                | ArrayElemType::Real
+                | ArrayElemType::Double
+                | ArrayElemType::Date
+                | ArrayElemType::Timestamp
+                | ArrayElemType::Uuid
+                | ArrayElemType::Bytea
+                | ArrayElemType::Json
+                | ArrayElemType::Jsonb,
+                _,
+            ) => format!("{},{}", self.elem.catalog_tag(), self.max_len),
         };
         // 2 次元以上のときだけ末尾に `d<N>` を足す。1 次元は従来の param をバイト単位で
         // 変えない（Issue #1605。旧バイナリは末尾フィールドを max_len の非正準として拒否する）。
@@ -8058,11 +8143,22 @@ fn normalize_dropped_column_type(ty: ColumnType) -> ColumnType {
 
 /// 配列の要素が TEXT と同じ物理フレーム（長さ前置＋UTF-8 本文）を持ち、かつ
 /// 墓標では `TEXT[]` へ正規化しなければならない要素型か（Issue #1357）。
+#[deny(clippy::wildcard_enum_match_arm)]
 fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
-    matches!(
-        elem,
-        ArrayElemType::Enum | ArrayElemType::Json | ArrayElemType::Jsonb
-    )
+    match elem {
+        ArrayElemType::Enum | ArrayElemType::Json | ArrayElemType::Jsonb => true,
+        ArrayElemType::Text
+        | ArrayElemType::Bool
+        | ArrayElemType::Integer
+        | ArrayElemType::BigInt
+        | ArrayElemType::Real
+        | ArrayElemType::Double
+        | ArrayElemType::Date
+        | ArrayElemType::Timestamp
+        | ArrayElemType::Uuid
+        | ArrayElemType::Numeric { .. }
+        | ArrayElemType::Bytea => false,
+    }
 }
 
 /// 墓標（削除済み列）に残してはならない、フレーム等価でない型か（TABLE-19 D1・D2）。
@@ -28085,5 +28181,50 @@ mod tests {
         storage.drop_table("docs").expect("drop table");
         assert!(!physical_exists("g2"), "DROP TABLE removes the table");
         assert!(storage.list_indexes().expect("list").is_empty());
+    }
+
+    /// Issue #3229: 全要素型（`ALL_KINDS`）についてカタログ param が往復する。
+    /// `Enum` は語彙の解決を要するため別経路のテストが担う。
+    #[test]
+    fn array_catalog_param_roundtrips_for_all_non_enum_kinds() {
+        for elem in ArrayElemType::ALL_KINDS {
+            if elem == ArrayElemType::Enum {
+                continue;
+            }
+            for ndims in [1u8, 2] {
+                let ty = ArrayType::new(elem, 8)
+                    .expect("valid array type")
+                    .with_ndims(ndims)
+                    .expect("valid ndims");
+                let param = ty.catalog_param();
+                let back = parse_array_param(&param, &mut |_| {
+                    Err(CatalogError::Invalid("no enum".to_string()))
+                })
+                .expect("param must parse back");
+                assert_eq!(back, ty, "param {param:?}");
+            }
+        }
+    }
+
+    /// Issue #3229: `ALL_KINDS` の並びと `kind_ordinal`・`ArrayType::new` の受理規則。
+    #[test]
+    fn array_elem_all_kinds_are_ordered_and_enum_needs_definition() {
+        for (i, elem) in ArrayElemType::ALL_KINDS.iter().enumerate() {
+            assert_eq!(elem.kind_ordinal(), i);
+            let built = ArrayType::new(*elem, 4);
+            assert_eq!(built.is_err(), *elem == ArrayElemType::Enum);
+        }
+    }
+
+    /// Issue #3229: 墓標で `TEXT[]` へ正規化する要素型は Enum・Json・Jsonb のみ。
+    #[test]
+    fn text_framed_array_elems_are_enum_json_jsonb_only() {
+        for elem in ArrayElemType::ALL_KINDS {
+            let expected = matches!(
+                elem,
+                ArrayElemType::Enum | ArrayElemType::Json | ArrayElemType::Jsonb
+            );
+            assert_eq!(is_text_framed_array_elem(elem), expected, "{elem:?}");
+        }
     }
 }

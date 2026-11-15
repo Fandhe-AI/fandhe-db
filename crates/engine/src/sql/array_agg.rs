@@ -474,7 +474,25 @@ fn elem_from_scalar(
         (ArrayElemType::Bytea, S::Bytes(b)) => Elem::Bytea(try_clone_bytes(b)?),
         (ArrayElemType::Json, S::Json(s)) => Elem::Json(try_clone_str(s)?),
         (ArrayElemType::Jsonb, S::Json(s)) => Elem::Jsonb(try_clone_str(s)?),
-        _ => return Err(mismatch()),
+        // 組が合わない場合と `Enum`（array_agg 非対応）は mismatch。全要素型を列挙し、
+        // 要素型の追加時にコンパイルエラーで対応判断を強制する（Issue #3229）。
+        (
+            ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Enum,
+            _,
+        ) => return Err(mismatch()),
     })
 }
 
@@ -509,7 +527,24 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
         (ArrayElemType::Bytea, ExprValue::Bytes(b)) => Elem::Bytea(try_clone_bytes(&b)?),
         (ArrayElemType::Json, ExprValue::JsonText(s)) => Elem::Json(try_clone_str(&s)?),
         (ArrayElemType::Jsonb, ExprValue::Json(s)) => Elem::Jsonb(try_clone_str(&s)?),
-        _ => return Err(mismatch()),
+        // 全要素型を列挙する理由は `elem_from_scalar` と同じ（Issue #3229）。
+        (
+            ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Enum,
+            _,
+        ) => return Err(mismatch()),
     }))
 }
 

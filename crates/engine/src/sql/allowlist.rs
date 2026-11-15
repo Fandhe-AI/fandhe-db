@@ -4922,6 +4922,21 @@ pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
         .ok()
 }
 
+/// `RETURNING` 句の項目として受理できる形か（Issue #3248・SQL-21 のポインタ）。
+/// 裸の列参照、または `AS <別名>` 付きの列参照だけを受理し、式・関数呼び出しは拒否する。
+/// 構文段（`Parser::parse_returning_clause`）と束縛段（`sql::parser::bind_returning`）が
+/// 同じ判定を共有する単一情報源。別名は出力列名を替えるだけで、値・型・読む列は別名なしと同じ。
+pub(crate) fn is_returning_column_item(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Column(_) => true,
+        SelectItem::Expr {
+            expr: Expr::Ident(name),
+            alias: Some(_),
+        } => !is_scalar_subquery_placeholder_name(name),
+        SelectItem::Expr { .. } => false,
+    }
+}
+
 /// 名前が埋め込みスカラーサブクエリの内部名の接頭辞を持つか（添字が不正でも真。漏えい防止の判定用）。
 pub(crate) fn is_scalar_subquery_placeholder_name(name: &str) -> bool {
     name.starts_with(SCALAR_SUBQUERY_PLACEHOLDER_PREFIX)
@@ -5646,8 +5661,8 @@ pub struct ValidatedInsert {
     /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
     pub operation_id: Option<OperationId>,
     /// `RETURNING` 句（Issue #873・SQL-21）。省略時は `None`。`USING OPERATION_ID`
-    /// 句の直前にのみ置ける（[`Parser::parse_returning_clause`] 参照）。関数呼び出し
-    /// 項目（[`Projection::Items`]）はここには到達しない（構造検証段で `42601`）。
+    /// 句の直前にのみ置ける（[`Parser::parse_returning_clause`] 参照）。式項目
+    /// は構造検証段で `42601`。[`Projection::Items`] は別名付き列参照だけ（Issue #3248）。
     pub returning: Option<Projection>,
     /// `ON CONFLICT (<col>[, <col>]*) DO NOTHING | DO UPDATE SET ...`
     /// （SQL-20・TASK-193、Issue #872。対象列を UNIQUE 制約列へ拡張:
@@ -15278,19 +15293,28 @@ impl<'a> Parser<'a> {
     /// [`Self::parse_operation_id_clause`] の直前で呼ぶ。それより後ろに置いた
     /// `RETURNING` は `expect_end_of_statement` が余剰トークンとして `42601` へ
     /// 落とす）。省略時は `Ok(None)`。投影は `SELECT` と同じ許可形状
-    /// （[`Self::parse_select_list`]）を再利用するが、関数呼び出し項目
-    /// （[`Projection::Items`]）はここでは受理しない（`RETURNING` が返す行は
-    /// 書き込み結果そのものであり、式評価のためのセッション UDF レジストリを
-    /// 持たないこのパーサー段では意味を持たないため）。
+    /// （[`Self::parse_select_list`]）を再利用するが、[`Projection::Items`] は
+    /// 別名付き列参照（Issue #3248。[`is_returning_column_item`]）だけを受理し、式項目は
+    /// `42601` で拒否する（`RETURNING` が返す行は書き込み結果そのものであり、式評価のための
+    /// セッション UDF レジストリを持たないこのパーサー段では意味を持たないため。受け皿 #3249）。
+    /// `*` と他項目の併用は `0A000`（未対応）。
     fn parse_returning_clause(&mut self) -> Result<Option<Projection>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("RETURNING") {
             return Ok(None);
         }
         self.advance();
         let projection = self.parse_select_list()?;
-        if matches!(projection, Projection::Items(_)) {
+        if matches!(projection, Projection::All) && matches!(self.peek(), Some(Token::Punct(','))) {
+            // `RETURNING *, a` のように `*` と他の項目を併用する形は未対応（Issue #3248 の対象外・対応しない。理由は docs/design/sql-returning.md）。
+            return Err(SqlSurfaceError::feature_not_supported(
+                "RETURNING * combined with other items is not supported yet",
+            ));
+        }
+        if matches!(&projection, Projection::Items(items) if !items.iter().all(is_returning_column_item))
+        {
             return Err(SqlSurfaceError::unsupported(
-                "RETURNING does not support function-call items",
+                "RETURNING supports only column references with optional AS aliases; \
+                 expressions are not supported yet",
             ));
         }
         Ok(Some(projection))
@@ -15334,7 +15358,8 @@ impl<'a> Parser<'a> {
             };
             if self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))) {
                 return Err(SqlSurfaceError::unsupported(
-                    "RETURNING does not support aliases or function-call items",
+                    "RETURNING aliases and expressions are not supported with UPDATE ... FROM \
+                     or DELETE ... USING yet",
                 ));
             }
             items.push(item);
@@ -34724,6 +34749,59 @@ mod tests {
         )
         .expect_err("function-call RETURNING items must be rejected");
         assert_eq!(err.wire_code(), "42601");
+        assert!(
+            !err.to_string().contains("function-call"),
+            "message must not mislead: {err}"
+        );
+    }
+
+    /// Issue #3248: `AS` 別名付きの列参照は受理し、別名なしの裸の列だけなら `Columns` のまま。
+    #[test]
+    fn accepts_returning_column_aliases_as_items() {
+        let lookup = catalog_with(&["documents"]);
+        let aliased = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             RETURNING id AS rid, embedding AS e, id AS rid USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("aliased column RETURNING must be accepted");
+        assert!(matches!(
+            aliased.returning,
+            Some(Projection::Items(ref items)) if items.len() == 3
+        ));
+        let plain = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+             RETURNING id, embedding USING OPERATION_ID 'op-0001'",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect("plain columns");
+        assert!(matches!(plain.returning, Some(Projection::Columns(_))));
+    }
+
+    /// Issue #3248: 式・暗黙の別名・`AS` だけ・`*` との併用は拒否する（式は 42601、`*` 併用は 0A000）。
+    #[test]
+    fn rejects_returning_expressions_implicit_alias_and_star_combination() {
+        let lookup = catalog_with(&["documents"]);
+        for (items, code) in [
+            ("id + 1", "42601"),
+            ("id rid", "42601"),
+            ("id AS", "42601"),
+            ("*, id AS rid", "0A000"),
+        ] {
+            let err = validate_insert(
+                &format!(
+                    "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+                     RETURNING {items} USING OPERATION_ID 'op-0001'"
+                ),
+                &lookup,
+                LedgerMode::Ledgered,
+            )
+            .expect_err(items);
+            assert_eq!(err.wire_code(), code, "{items}");
+            assert!(!err.to_string().contains("function-call"), "{items}");
+        }
     }
 
     #[test]

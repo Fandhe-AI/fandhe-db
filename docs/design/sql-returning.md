@@ -54,13 +54,16 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 | `... USING OPERATION_ID '...' RETURNING id` | `42601`（`USING` 句より後ろ。余剰トークン） |
 | `... RETURNING USING OPERATION_ID '...'`（投影なし） | `42601` |
 | `... RETURNING id RETURNING body USING OPERATION_ID '...'`（重複） | `42601` |
-| `... RETURNING vec_norm(embedding) USING OPERATION_ID '...'`（関数呼び出し項目） | `42601` |
+| `... RETURNING id AS rid, lang AS l USING OPERATION_ID '...'`（`AS` 別名付きの列参照。Issue #3248） | 受理（列名だけが別名になり、値・型は別名なしと同じ。別名の重複も受理） |
+| `... RETURNING vec_norm(embedding) USING OPERATION_ID '...'`（式・関数呼び出し項目） | `42601`（文言は「列参照と `AS` 別名のみ・式は未対応」。式の受け皿は #3249） |
+| `... RETURNING lang l ...`（`AS` を省いた別名） | `42601` |
+| `... RETURNING *, lang AS l ...`（`*` と他の項目の併用） | `0A000`（Issue #3248 の対象外。`*` の展開と個別項目の併用は出力列の重複・順序の扱いを別途決める必要があり、現行は fail-closed で拒否したまま据え置く（対応しない。需要が出た時点でユーザー承認のうえ起票する）） |
 | `TRUNCATE TABLE <table> ... RETURNING *` | `42601`（`TRUNCATE` は対象外） |
 | ファイル形 `INSERT`（`path`/`body` 列指定）＋ `RETURNING` | `42601`（束縛段。サーバー側チャンク化行を返す応答形が未定義のため fail-closed） |
 | 述語つき `DELETE ... WHERE <非 id 述語> RETURNING ...` | 受理（Issue #1182。削除前の値を返す） |
 | 単一行・述語形いずれの `UPDATE ... RETURNING ...`（セッション経路） | 受理（Issue #1182。更新後の値を返す） |
 | `INSERT ... ON CONFLICT ... RETURNING ...` | 受理（Issue #1182。挿入行・`DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない。所有だが不可視な衝突先は `DO NOTHING` ではスキップ、`DO UPDATE` では `42501`。下記「UPSERT の衝突先が不可視の場合」節） |
-| 未知列・式項目の `RETURNING`（全 DML） | 書き込み前に `22000`／`42601`（台帳は消費しない） |
+| 未知列・式項目の `RETURNING`（全 DML） | 書き込み前に `42703`／`42601`（台帳は消費しない） |
 | `EngineCore::execute_insert_sql`／`execute_insert_sql_batch`／`execute_delete_sql`／`execute_update_sql`（非セッション入口）＋ `RETURNING` | `42601`（検証直後・書き込み前。台帳は消費しない。`RETURNING` を黙って落とす fail-open を避ける） |
 | 明示トランザクション内（`BEGIN ... COMMIT`）の単一行・述語形 `UPDATE ... RETURNING`、述語形 `DELETE ... RETURNING`、UPSERT の `RETURNING` | 受理（Issue #1272・#1273。autocommit と同じ契約。詳細は `explicit-transaction.md`） |
 
@@ -356,3 +359,15 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
   分割実行 DML、COPY、NoSQL、生の行 API、トリガ本体内の `RETURNING`。
 - **テスト**: `core/trigger_returning_tests.rs`、`tests/table_rls/table45_trigger_fire.rs`、
   `crates/wire-server/tests/wire_sql/wire_trigger_fire.rs`（末尾 `;` の単独送信・拡張クエリ）。
+
+## `AS` 別名の受理（Issue #3248・SQL-21・SQL-42 のポインタ）
+
+- 基表への INSERT・UPDATE・DELETE・UPSERT の `RETURNING` は、裸の列参照（疑似列 `id` を含む）と
+  `AS <別名>` 付きの列参照を受理する。束縛は SELECT と同じ `resolve_projected_column` を共有し
+  （第 2 の投影実装を作らない）、`id AS rid` は `ProjectedColumn::AliasedId`、実列は別名を列名にした
+  `Column` へ解決する。別名は出力列名を替えるだけで、読む列・行・RLS の再判定・列権限は別名なしと同じ。
+- 構文段（`Parser::parse_returning_clause`）と束縛段（`bind_returning`）は判定関数
+  `is_returning_column_item` を共有する。式は `42601`（受け皿 #3249）。
+- 旧文言「function-call items」は誤解を招くため廃止し、原因別の文言へ分けた。
+- 未対応のまま残る面（受け皿 #3251）: データ変更 CTE（`0A000`）・ビューへの書き込み（`42601`）・
+  `UPDATE ... FROM`／`DELETE ... USING`（`42601`）・NoSQL への展開。

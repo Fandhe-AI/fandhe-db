@@ -1952,10 +1952,10 @@ pub fn bind_column_projection(
 /// `DELETE`（単一行・述語形）・`UPDATE`（単一行・述語形）の全形が実行結線済みのため、
 /// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を
 /// [`bind_column_projection`] と同じ [`bind_projection`] へ委譲する（第 2 の
-/// 投影実装を作らない）。UDF レジストリを持たないため `Projection::Items`
-/// （関数呼び出し項目）は多層防御として `42601` で拒否する——`sql::allowlist::
-/// Parser::parse_returning_clause` が構造検証段で既に同じ判定を行っており、
-/// 通常はここへ到達しない契約。
+/// 投影実装を作らない）。`Projection::Items` は別名付き列参照（Issue #3248）だけを
+/// 受理し、式項目は多層防御として `42601` で拒否する——`sql::allowlist::
+/// Parser::parse_returning_clause` が構造検証段で既に同じ判定
+/// （`is_returning_column_item`）を行っており、通常は式はここへ到達しない契約。
 pub fn bind_returning(
     returning: Option<&Projection>,
     schema: &TableSchema,
@@ -1963,10 +1963,30 @@ pub fn bind_returning(
     let Some(projection) = returning else {
         return Ok(None);
     };
-    if matches!(projection, Projection::Items(_)) {
-        return Err(SqlSurfaceError::unsupported(
-            "RETURNING does not support function-call items",
-        ));
+    if let Projection::Items(items) = projection {
+        // 別名付きの列参照だけを `resolve_projected_column` で直接束縛する（Issue #3248）。
+        // `bind_projection` へ Items を渡すと式・ハイブリッド詳細が出うるため経由しない。
+        let mut cols = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                crate::sql::allowlist::SelectItem::Column(name) => {
+                    cols.push(resolve_projected_column(name, name, schema)?);
+                }
+                crate::sql::allowlist::SelectItem::Expr {
+                    expr: Expr::Ident(name),
+                    alias: Some(alias),
+                } if !crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) => {
+                    cols.push(resolve_projected_column(name, alias, schema)?);
+                }
+                crate::sql::allowlist::SelectItem::Expr { .. } => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "RETURNING supports only column references with optional AS aliases; \
+                         expressions are not supported yet",
+                    ));
+                }
+            }
+        }
+        return Ok(Some(cols));
     }
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     bind_projection(
@@ -9161,7 +9181,19 @@ fn resolve_array_agg_input(
                         .to_string(),
                 })
             }
-            _ => {}
+            // 比較・順序づけに支障のない要素型。要素型の追加時に判断を強制する（Issue #3229）。
+            ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Enum => {}
         }
     }
     let mut keys: Vec<StringAggOrderKey> =
