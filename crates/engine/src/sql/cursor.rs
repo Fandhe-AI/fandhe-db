@@ -702,7 +702,15 @@ mod tests {
     /// Issue #3176: 集合演算（UNION／UNION ALL／INTERSECT／EXCEPT）を受理する。
     #[test]
     fn declare_accepts_set_operation_inner_select() {
-        for op in ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"] {
+        for op in [
+            "UNION",
+            "UNION ALL",
+            "UNION DISTINCT",
+            "INTERSECT",
+            "INTERSECT ALL",
+            "INTERSECT DISTINCT",
+            "EXCEPT",
+        ] {
             let sql = format!("SELECT id FROM documents {op} SELECT id FROM documents LIMIT 5");
             let inner = inner_of(&sql).unwrap_or_else(|e| panic!("{op} rejected: {e:?}"));
             assert!(matches!(inner, Statement::SetOperation(_)), "{op}");
