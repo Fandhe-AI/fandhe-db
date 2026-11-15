@@ -60,7 +60,8 @@
   `validate_sql` から切り出した公開トークン列版。純粋なリファクタリング）が
   返す `Statement::Scan`（広域取得。SQL-15・Issue #454）のみを受理する
   （第 2 の SELECT パーサーを持たない）。順位付き `SELECT`（`ORDER BY`／
-  `USING PLAN`）・集計は `42601`。
+  `USING PLAN`）は `42601`。集計 `SELECT`（`Statement::Aggregate`）は Issue #3253 で受理する
+  （下の「Issue #3253」節）。
 - テーブル形 `COPY <table> [(<col>, ...)] TO STDOUT`（Issue #1771・WIRE-22 (5)・SQL-34 ポインタ）:
   括弧形と同じ `ValidatedCopyTo`（`table_form = true`）で表し、内側の `ValidatedScan` は
   `SELECT *`（列リスト付きなら列投影）相当を直接組み立てる（トークンの合成・第 2 の SELECT
@@ -503,3 +504,16 @@ Issue #1773 の実装に対し、失敗要因と COPY の位置の組み合わ�
 - 既知の相違: `Failed` 中の `COMMIT` は `25P02` で `'E'` のまま（PostgreSQL は `ROLLBACK` タグを返す。
   既存の fail-closed 契約を維持）。
 - 対象外: COPY 位置での commit 後 panic の緊急応答検査（新しい障害注入点が必要）。
+
+## Issue #3253: COPY (集計 SELECT) TO STDOUT（SQL-34・WIRE-22 ポインタ）
+
+- 構文段: `validate_copy_to_tokens` が `Statement::Aggregate` も受理する。`ValidatedCopyTo.inner` は
+  `CopyToSource`（`Scan`／`Aggregate`）へ変わった（公開型の破壊的変更。テーブル形は常に `Scan`）。
+- 実行段: `EngineCore::run_copy_to_scan` が集計を、通常の SELECT の集計アームから切り出した
+  `run_validated_aggregate` へ渡す（サブクエリ解決・RLS・グループ数上限を共有し、第 2 の実行器を持たない）。
+  結果列が HALFVEC／INT8VEC／SPARSEVEC なら `0A000`、結果件数が `--max-result-rows` を超えれば
+  明示 `LIMIT` や単一行集計を含め無条件に `54000`（CopyOutResponse より前に確定。部分出力なし）。
+- 権限ゲート: 括弧形は集計も通常の SELECT と同じ列走査規則（`ColumnSpec::Scan`）。
+- 拒否の維持: 順位付き SELECT・`USING PLAN`・JOIN・集合演算・評価後射影が要る CTE・WHERE 中の
+  サブクエリは従来どおり `42601`。評価後射影を要しない CTE は通常の SELECT と同じく集計へ畳まれて受理される。
+- wire-server のコード変更なし（`QueryResult` 汎用の符号化をそのまま使う）。

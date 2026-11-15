@@ -5145,8 +5145,11 @@ mod tests {
             (E::Jsonb, 12),
             (E::Enum, 13),
         ];
+        // 全要素型を網羅していること（要素型の追加時に永続タグの決定を強制する。Issue #3229）。
+        assert_eq!(elems.len(), E::ALL_KINDS.len());
         let mut seen = std::collections::BTreeSet::new();
         for (elem, expected) in elems {
+            assert_eq!(E::ALL_KINDS[elem.kind_ordinal()], elem);
             let tag = array_elem_tag(elem);
             assert_eq!(tag, expected, "persisted tag must not be renumbered");
             assert!(tag < ARRAY_KEY_DIMS_MARK);

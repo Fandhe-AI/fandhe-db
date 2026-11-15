@@ -422,3 +422,28 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
 - **上限の CLI**: `--max-array-elements`（#1548）が多次元の宣言にも効くことを wire 結合テスト
   （`wire_array_multidim_output.rs`）で固定した。式の結果や中間値の総数へ設定値を通すことは
   engine 横断の変更のため対象外（現状は定数 1024 で、既定値の挙動は一致）。
+
+## Issue #3229 追記（要素型追加の土台）
+
+親 #3228・TABLE-14・TABLE-35 のポインタ。`ArrayElemType` に要素型を足す子 Issue（#3230〜#3235）の前提として、
+漏れをコンパイルエラーで検出できる形に整えた。挙動（受理する型・SQLSTATE・wire の OID・永続化表現）は不変。
+
+- **一覧と序数**: `ArrayElemType::ALL_KINDS`（全種別の代表値）と `kind_ordinal`（ワイルドカード無しの網羅 match）。
+  `const` assert が両者の並びを固定し、型を足すと `kind_ordinal` で E0004 になる。
+- **網羅化した関数**（`_ =>` や `matches!` を網羅 match へ置換。内側に `_` を持たない関数には
+  `#[deny(clippy::wildcard_enum_match_arm)]`）: `ArrayType::new`・`ArrayType::catalog_param`・
+  `is_text_framed_array_elem`（catalog）、`ArrayRef::equality_payload`・`validate_array_elements`（row_codec）、
+  `elem_from_scalar`・`elem_from_expr`・`collect` 系（array_agg）、`ArrayIndex` の `NumericKind`（udf_call）、
+  array_agg の DISTINCT／ORDER BY 判定（parser）、`comparable_elem`・`is_float_elem`・`lhs_kinds_for`（array_ops）、
+  `array_elem_lacks_equality`（recursive_eval）、`CastType::array_elem_type`（cast）。
+- **もともと網羅済み**: `catalog_tag`、`ddl_export/table.rs`、`array_fixed_width`、`array_elem_tag`、
+  `elem_cast_type`／`elem_cast_src`／`elem_cast_dst`、`values_to_array`、wire の `array_wire_type`・
+  `nosql_type_name`・`array_literal_text`。
+- **コンパイラで強制できない箇所**: `from_catalog_tag`（文字列 match）・`parse_array_param` の `expected`。
+  往復テスト（`ALL_KINDS` 全件）で守る。
+- **凍結値**: `catalog_tag` の文字列（カタログ v2 の param）と `constraint::array_elem_tag` の番号 0〜13
+  （`user_uniq` 索引キーの一部）は変えない。新しい型には 14 以降（0x80 未満）を振る。
+- **OID**: 要素型 → OID の対応は wire の `array_wire_type` と `WireType::oid` の 1 か所だけ。engine は
+  OID を持たない。全要素型の対応は `result_encoder.rs` のテストで固定した。
+- **漏れ検出の確認**: 隔離 worktree で一時的にダミー variant を足すと engine ライブラリで 25 件
+  （lib test を含め 26 件）の E0004 が出て、上記の関数と `kind_ordinal` を指した（確認後に戻して未コミット）。
