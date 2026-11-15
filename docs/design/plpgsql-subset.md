@@ -1115,3 +1115,12 @@ BEFORE STATEMENT・ループ後の AFTER ROW・AFTER STATEMENT・別表への `D
 - 同じ表の行ループ中の本体 `DELETE` は `0A000`（BEFORE INSERT で同じ表の既存行を消す「置換」パターンを含む）
 - `DELETE ... RETURNING`・`USING`・ビュー・データ変更 CTE・一時表・SCHEMA 修飾の対象のトリガ本体での対応（受け皿の Issue は無い。要対応事項）
 - 本体 `UPDATE` は #3186、wire 経由の E2E は #3185、RLS・台帳・crash の網羅的な再検証は #3188 で実施済み（[trigger-ledger-consistency.md](trigger-ledger-consistency.md)）
+
+## Issue #3190 追記（行トリガの `WHEN` の評価経路）
+
+TABLE-45・SQL-68 ポインタ。`CREATE TRIGGER ... WHEN (<条件>)` の評価は新しい評価器を作らず、このサブセットの
+条件評価（`CorePlHost::eval_cond`）を使う。`core/trigger_when.rs` が保存済みの条件テキストを
+`BEGIN IF (<条件>) THEN RETURN NEW; END IF; RETURN NULL; END`（DELETE は `RETURN OLD`）へ合成し、
+`run_trigger_with_handle` を `may_write: false` で呼ぶ。`TriggerOutcome::Proceed` が TRUE、`Skip` が
+FALSE・NULL。三値論理・数値の規則・NEW／OLD の束縛は通常のトリガ本体と同一。条件の形は条件式の節
+（`IF`・`WHILE` と同じ）に従い、`IS DISTINCT FROM` など評価できない形は発火時に `0A000`。

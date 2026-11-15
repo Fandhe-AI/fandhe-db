@@ -121,7 +121,7 @@ pub const SETUP: &[&str] = &[
      '[]', '{}', '00000000-0000-0000-0000-000000000000', 0, 'sad', '{}', '{}', '[0,0,0]')",
     // 後段のオブジェクト（行の投入後に作る）。
     "CREATE TRIGGER audited_trg BEFORE INSERT OR UPDATE OF note ON app.audited \
-     FOR EACH ROW EXECUTE FUNCTION trg('a', 'it''s')",
+     FOR EACH ROW WHEN (NEW.note IS NOT NULL AND NEW.note <> 'x') EXECUTE FUNCTION trg('a', 'it''s')",
     "CREATE POLICY pol_sel ON parent FOR SELECT USING (id > 0)",
     "CREATE POLICY pol_res ON parent AS RESTRICTIVE FOR SELECT USING (id < 1000)",
     "CREATE POLICY pol_ins ON parent FOR INSERT WITH CHECK (id > 0)",

@@ -170,3 +170,15 @@ TASK-170 が新設・main へマージされたため（fandhe-db-spec#12）、�
 ## 追記（Issue #1795）: LIMIT 省略との関係
 
 「`LIMIT` 必須」は SQL-34 の確定を受けて Issue #1796 で改訂済み（`LIMIT` 省略・`LIMIT ALL` を受理）。省略時は結果行数上限（`54000`）で有界にし、走査行数上限とは別軸として扱う。判定位置・SQLSTATE・カーソルとの関係は [limit-omitted-result-cap.md](limit-omitted-result-cap.md) を参照。
+
+## 追記（Issue #3223）: ヘッダの二重デコードの解消
+
+`with_visible_row` は RLS 判定のために `decode_row_header` を呼んだうえで、`Fast`／`DimAndScalar` 段では
+`decode_row_dim_and_metadata_borrowed`（内部で再度 `decode_row_header`）を呼んでいた。tenant 文字列の UTF-8
+検証が行ごとに 2 回走っていたため、dim 以降だけを検証する `decode_row_dim_and_metadata_body_borrowed(buf, offset)`
+を切り出し、ヘッダのデコード結果の offset を渡す形にした（`Embedding` 段の `decode_row_body_into` と同じ形）。
+検査の内容と順序（RLS → TABLE-12 → 本体 → 次元 → スカラー → 再判定）・破損時の fail-closed は不変。
+既存のラッパー関数は他の呼び出し元向けに残している。
+
+- 回帰ガード: `sql::scan::tests::scan_decodes_header_once_per_row`（走査行ごとのヘッダデコード回数）
+- 性能: 同一ホスト A/B による p50 改善幅は未検証（受け入れ条件 1 は後続で実測する）
