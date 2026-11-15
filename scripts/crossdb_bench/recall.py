@@ -1,7 +1,7 @@
 """Recall@10 の正解集合（ground truth）を作る配線検算ユーティリティ。
 
 `docs25k.jsonl` から RLS 相当で可視な行の embedding を numpy に乗せ、内積
-（自作 DB の `<#>` と同じ順位＝内積の降順。`crates/engine/src/kernel.rs` の
+（自作 DB の `<=>`〔コサイン〕とは L2 正規化済みフィクスチャで同じ順位＝内積の降順。`crates/engine/src/kernel.rs` の
 「スコアは内積」に合わせる）で 200 クエリそれぞれの正解を計算する。
 
 可視性モデル（実機確認済みの現行契約）: 自作 DB はどのテナントの wire
@@ -125,6 +125,37 @@ def build_ground_truth(
             )
         )
     return strict_top_k, tie_boundaries
+
+
+def fixture_norm_stats(docs_path: str, queries: list[dict]) -> dict:
+    """可視 doc とクエリの L2 ノルムの偏差を集計する（Issue #3224）。
+
+    自作 DB の kNN は `<=>`（コサイン）、他 DB と本モジュールの正解は内積で、両者の順位は
+    ベクトルが単位ノルムのときだけ一致する。その前提が崩れていないかを `run.py` が
+    `meta.fixture_norm` へ記録するための観測用（検査のみで計測値は変えない）。
+    戻り値: `max_abs_norm_deviation`（max |‖v‖−1|。ゼロノルム除く）・`zero_norm_docs`・
+    `zero_norm_queries`・`visible_docs`。
+    """
+    docs = load_jsonl(docs_path)
+    visible = [d["embedding"] for d, m in zip(docs, _visible_mask(docs)) if m]
+    q = [x["embedding"] for x in queries]
+
+    def stats(vectors: list) -> tuple[float, int]:
+        if not vectors:
+            return 0.0, 0
+        norms = np.linalg.norm(np.array(vectors, dtype=np.float64), axis=1)
+        zero = norms == 0
+        dev = np.abs(norms[~zero] - 1.0)
+        return (float(dev.max()) if dev.size else 0.0), int(zero.sum())
+
+    d_dev, d_zero = stats(visible)
+    q_dev, q_zero = stats(q)
+    return {
+        "max_abs_norm_deviation": max(d_dev, q_dev),
+        "zero_norm_docs": d_zero,
+        "zero_norm_queries": q_zero,
+        "visible_docs": len(visible),
+    }
 
 
 def recall_at_k(returned_ids_per_query: list[list[int]], ground_truth: list[list[int]]) -> float:

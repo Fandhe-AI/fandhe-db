@@ -237,7 +237,7 @@ class KnnReachesHnswTests(unittest.TestCase):
             self.assertTrue(self_hnsw.knn_reaches_hnsw({"engine": "hnsw", "ann_plan": plan}))
 
     def test_opclass_mismatch_with_hnsw_engine_does_not_reach(self) -> None:
-        # --config hnsw + `<#>`: engine は hnsw のまま plain scan に倒れる（Issue #2952）
+        # opclass 不一致: engine は hnsw のまま plain scan に倒れる（Issue #2952）
         plan = {"engine": "hnsw", "ann_plan": "plain_scan_opclass_mismatch"}
         self.assertFalse(self_hnsw.knn_reaches_hnsw(plan))
 
