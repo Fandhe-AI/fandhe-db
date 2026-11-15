@@ -1754,6 +1754,26 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Time),
+        // `BIT(n)[]`（Issue #3235）。各要素はスカラー BIT 列と同じ束縛（文字種違反 `22P02`・長さ
+        // 不一致 `22026`。空白詰めはしない）。非 NULL 要素数 × 要素バイト幅が配列ペイロード上限を
+        // 超えるなら確保前に `54000` にする（巨大 `n` × 多要素の DoS 防止）。
+        E::Bit(n) => {
+            let width = crate::bit_string::byte_len_for_bits(n).unwrap_or(usize::MAX) as u64;
+            if (raw_elements.iter().filter(|e| e.is_some()).count() as u64).saturating_mul(width)
+                > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN)
+            {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "array of bit(n) elements exceeds the maximum array payload length",
+                ));
+            }
+            map_all(&raw_elements, |raw| match bind_bit_literal(NAME, n, raw)? {
+                Value::Bit(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "bit array element bound to a different value type".to_string(),
+                }),
+            })
+            .map(ArrayValue::Bit)
+        }
         E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
             Value::Uuid(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
@@ -9264,6 +9284,13 @@ fn resolve_array_agg_input(
             ArrayElemType::Bytea => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
                     detail: "DISTINCT or ORDER BY over bytea in array_agg is not supported yet"
+                        .to_string(),
+                })
+            }
+            // スカラー BIT は比較・順序づけが未解禁（cast-only）。配列要素も同じ側に置く（Issue #3235）。
+            ArrayElemType::Bit(_) => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "DISTINCT or ORDER BY over bit in array_agg is not supported yet"
                         .to_string(),
                 })
             }
