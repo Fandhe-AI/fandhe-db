@@ -564,6 +564,48 @@ fn array_source_kind(elem: Option<ArrayElemType>) -> SourceKind {
     }
 }
 
+/// 型なしリテラル（文字列・`NULL`）を `BIT(n)[]` として束縛する（Issue #3235。配列どうしの等値比較の
+/// 相手側。`BIT(n)` 要素は [`CastType`] を持たないため [`bind_string_literal_as`] を通れない）。
+/// 入力関数は実行時と同じ `CastFn`（テキスト → 配列）で、形式不正・長さ不一致は束縛時に報告する。
+pub(super) fn bind_bit_array_literal(
+    lit: &Expr,
+    elem: ArrayElemType,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    match lit {
+        Expr::Null => {
+            charge_node(node_budget)?;
+            Ok(BoundExpr::Null)
+        }
+        Expr::String(s) => {
+            if crate::sql::udf_call::in_check_binding() {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "array operators are not supported in a CHECK constraint".to_string(),
+                });
+            }
+            if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "string literal exceeds the maximum TEXT field length",
+                ));
+            }
+            charge_node(node_budget)?;
+            charge_node(node_budget)?;
+            let f = CastFn {
+                from: CastSrc::Text,
+                to: CastDst::Array(elem),
+            };
+            crate::sql::cast_value::apply_cast(
+                f,
+                crate::sql::udf_call::ExprValue::Text(std::borrow::Cow::Borrowed(s)),
+            )?;
+            Ok(cast_node(f, BoundExpr::Text(s.to_string())))
+        }
+        _ => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "array predicates on this element type are not supported".to_string(),
+        }),
+    }
+}
+
 /// 束縛済みの配列式が `BIT(n)` 要素の配列なら、その要素型（`n` つき）を返す（Issue #3235）。
 /// 要素の CAST の型を持たない `BIT(n)[]` は [`source_cast_kind`] では `SourceKind::Bit` になり
 /// 要素型を取り出せないため、添字（`v[1]`）の束縛がこの関数で `n` を得る。

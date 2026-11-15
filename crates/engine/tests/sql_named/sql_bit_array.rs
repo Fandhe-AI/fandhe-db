@@ -351,6 +351,42 @@ fn equality_is_length_aware_and_ordering_is_rejected() {
     assert!(exec(&core, "SELECT id FROM a WHERE v < '{1010}' LIMIT 10").is_err());
 }
 
+/// 式経路（列どうし・型なしリテラルを左右どちらに置く形）の等値比較も、列対リテラルと同じく
+/// 受理して正準ペイロードで判定する。順序比較・包含は `0A000` のまま（Issue #3235）。
+#[test]
+fn expression_equality_between_columns_and_literals_is_accepted() {
+    let (_p, _g, core) = setup("ba-expr-eq");
+    ok(
+        &core,
+        "INSERT INTO a (id, v, w) VALUES (3, '{1111}', '{1111}') USING OPERATION_ID 'i3'",
+    );
+    let n = |sql: &str| count(&core, "alice", sql);
+    assert_eq!(n("SELECT id FROM a WHERE v = w LIMIT 10"), 1);
+    assert_eq!(n("SELECT id FROM a WHERE v <> w LIMIT 10"), 1);
+    assert_eq!(n("SELECT id FROM a WHERE v = '{1111}' LIMIT 10"), 1);
+    assert_eq!(n("SELECT id FROM a WHERE '{1111}' = v LIMIT 10"), 1);
+    assert_eq!(
+        n("SELECT id FROM a WHERE '{1010,NULL,0101}' = v LIMIT 10"),
+        1
+    );
+    assert_eq!(n("SELECT id FROM a WHERE NOT (v = w) LIMIT 10"), 1);
+    // 宣言の長さが異なる配列どうし・長さの違う要素のリテラルは拒否する。
+    assert!(exec(&core, "SELECT id FROM a WHERE v = c LIMIT 10").is_err());
+    assert_eq!(
+        code(&core, "SELECT id FROM a WHERE '{10100000}' = v LIMIT 10"),
+        "22026"
+    );
+    for sql in [
+        "SELECT id FROM a WHERE v < w LIMIT 10",
+        "SELECT id FROM a WHERE v >= w LIMIT 10",
+        "SELECT id FROM a WHERE v @> w LIMIT 10",
+        "SELECT id FROM a WHERE v && w LIMIT 10",
+        "SELECT id FROM a WHERE v <@ '{1111}' LIMIT 10",
+    ] {
+        assert_eq!(code(&core, sql), "0A000", "{sql}");
+    }
+}
+
 #[test]
 fn identical_declaration_assignment_is_accepted_and_others_are_rejected() {
     let (_p, _g, core) = setup("ba-assign");
