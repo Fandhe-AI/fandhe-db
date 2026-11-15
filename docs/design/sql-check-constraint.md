@@ -72,16 +72,32 @@ TEXT／VECTOR／INTEGER／BIGINT 列のみ宣言できる（REAL/DOUBLE 列は R
 ## D1. 三値論理（SQL 標準・PostgreSQL 準拠）
 
 CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NULL）は通過させる
-（AND 連結のため「いずれかの連言が FALSE なら違反」と同値）。
+（Issue #3242。TABLE-16・SQL-24・SQL-26 のポインタ）。評価は述語木
+（AND の連言と入れ子の `OR` 群）を Kleene の三値論理で行う
+（`sql::where_tree::BoundConjunction::eval_three_valued`）。
 
-- 宣言的フィルタ: 参照列の値が `None`（NULL）なら UNKNOWN としてスキップし、
-  非 NULL で `matches() == false` のときのみ違反とする（`matches_all` は NULL
-  を不一致扱いするため使わず、`MetadataFilter::matches` を連言ごとに直接
-  呼ぶ）。
-- 式フィルタ: `VECTOR` 列を参照する式は、その行の embedding が NULL
-  （`dim == 0`）なら UNKNOWN としてスキップする（`sql/scan.rs` の `WHERE` 式
-  評価と同じ判断。現状 CREATE TABLE の `VECTOR` 列は常に non-null のため
-  実際には到達しないが、将来の拡張に備えた防御的処理）。
+- 葉の評価器は WHERE と共有する（宣言的フィルタは `MetadataFilter::eval`、式は
+  `ExprProgram::eval`。第 2 の葉評価器を作らない）。WHERE 側の二値 `matches` は
+  UNKNOWN の葉で打ち切るため、三値版は別メソッドとして並べ、WHERE 側の評価順・
+  エラー順序は変えない。
+- 連言は `metadata_filters` → `expr_filters` → `or_groups` の順に評価し、FALSE で
+  打ち切る。UNKNOWN は記録して評価を続ける（旧評価と同じ順序のため、許可形の
+  合否・違反した制約名・式評価エラーの `wire_code` は置換前後で一致する）。
+- 「列が NULL なら合格」という列単位の短絡は持たない。NULL は葉へ渡して評価する
+  （`IS NULL`／`IS NOT NULL` などを正しく扱うための前提）。
+- 非 NULL の値に対して葉が UNKNOWN になる場合（型不一致・壊れた格納値）と、列
+  インデックスが復号範囲外の場合は、合格にも `23514` にもせず `Internal`（`XX000`）
+  で拒否する。UNKNOWN＝合格にすると黙って通り、FALSE に写すと `NOT` を付けたとき
+  TRUE へ反転し得るため。単一検査点からは到達しない不変条件違反で、旧実装は
+  型不一致を `23514` にしていたが、正常な入力の結果は変わらない。
+- 式が Bool／NULL 以外を返した場合も `XX000`。式評価エラー（0 除算等）は元の
+  `wire_code` のまま透過する（D1'）。
+- `bind_check_predicates` が返す `OR` 群は捨てずに保持し、`column_mask` へ
+  再帰的に反映する（マスク漏れはマスク外＝NULL 扱いで合格する fail-open）。
+  構文段・`reject_forbidden_elements` の拒否範囲は据え置きで、`OR`・`NOT`・`IN`・
+  `BETWEEN`・`IS [NOT] NULL` の解禁は #3243・#3244 で扱う。
+- `VECTOR` 列を参照する式は、その行の embedding が NULL（`dim == 0`）なら
+  `ExprProgram::eval` が NULL（UNKNOWN）を返す（`ExprStep::PushVector`）。
 
 ## D1'. 数値列比較の評価規則（Issue #1075・TABLE-16 ポインタ）
 
@@ -314,6 +330,11 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   compile/enforce・三値論理・数値列比較〔INTEGER/BIGINT/REAL/DOUBLE の
   合否・列マスク OR の fail-open 回帰ガード・BIGINT 精度超過・0 除算の
   fail-closed・数値列以外は引き続き拒否〕）。
+- `crates/engine/src/sql/where_tree.rs`（三値評価器。Kleene の真理値表・`OR`
+  群の短絡と UNKNOWN の伝播・非 NULL で UNKNOWN の葉と範囲外 index の
+  `Internal`）。`check_constraint.rs` には置換前の `enforce`（連言ごとの NULL
+  短絡）を参照実装としてテスト内に残し、許可形の行列（NULL・充足・違反・境界値・
+  UNKNOWN の後の評価エラー）で新旧の結果が一致することを差分テストで固定する。
 - `crates/engine/src/sql/udf_call.rs`・`crates/engine/src/sql/
   expr_program.rs`（`ColumnRefPolicy`・`BoundExpr::ColumnRef` の束縛・
   評価差分テスト。既定ポリシーでの回帰確認を含む）。
