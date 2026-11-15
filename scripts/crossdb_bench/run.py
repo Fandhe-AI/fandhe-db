@@ -26,6 +26,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import load_jsonl, write_result  # noqa: E402
+from hybrid_depth import DEPTH_ARMS, overlap_at_k, summary_line, topic_hit_rate  # noqa: E402
 from recall import build_ground_truth, recall_at_k, recall_at_k_tie_tolerant  # noqa: E402
 
 DB_MODULES = [
@@ -321,9 +322,44 @@ def main() -> int:
             "reason": "vector_knn が unsupported、または docs ファイルが見つからない",
         }
 
+    # --- hybrid 深さ arm の品質指標（Issue #3225。定義は hybrid_depth.py・README 参照） ---
+    # いずれも hybrid の BM25 関連性 recall ではない。算出不能は 0 とせず quality_unsupported に理由を残す。
+    doc_topic: dict[int, str] = {}
+    if os.path.exists(docs_file):
+        for d in load_jsonl(docs_file):
+            if d.get("topic") is not None and d.get("id") is not None:
+                doc_topic[int(d["id"])] = d["topic"]
+    query_topics = [q.get("topic") for q in queries]
+    depth200_ids = (phases.get("hybrid_rrf_depth200") or {}).get("ids_per_query")
+    for arm in DEPTH_ARMS:
+        ph = phases.get(arm)
+        if not isinstance(ph, dict) or ph.get("unsupported"):
+            continue
+        arm_ids = ph.get("ids_per_query")
+        if not arm_ids:
+            ph["quality_unsupported"] = "ids_per_query が無い"
+            continue
+        if os.path.exists(docs_file):
+            strict_top_k, tie_boundaries = build_ground_truth(docs_file, queries, k=10)
+            ph["dense_gt_recall_at_10"] = recall_at_k_tie_tolerant(arm_ids, tie_boundaries, k=10)
+            ph["dense_gt_recall_at_10_strict"] = recall_at_k(arm_ids, strict_top_k)
+        else:
+            ph["quality_unsupported"] = "docs ファイルが見つからない"
+        rate, reason = topic_hit_rate(arm_ids, doc_topic, query_topics, k=10)
+        ph["topic_hit_rate_at_10"] = rate
+        if reason:
+            ph["topic_hit_rate_reason"] = reason
+        if arm == "hybrid_rrf_depth50":
+            ph["overlap_at_10_vs_depth200"] = overlap_at_k(arm_ids, depth200_ids or [], k=10)
+
     # ids_per_query は正解照合専用の中間データであり、結果 JSON を肥大化させるため保存しない。
     if isinstance(knn_phase, dict) and "ids_per_query" in knn_phase:
         del knn_phase["ids_per_query"]
+    for arm in DEPTH_ARMS:
+        ph = phases.get(arm)
+        if isinstance(ph, dict):
+            ph.pop("ids_per_query", None)
+            print(summary_line(arm, ph))
 
     out_path = write_result(args.out_dir, args.db, args.config, meta, phases)
     print(f"wrote: {out_path}")
