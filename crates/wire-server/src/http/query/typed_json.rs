@@ -237,7 +237,7 @@ fn push_array_element(out: &mut String, text: &str, quote: bool) {
     out.push('"');
 }
 
-/// `ARRAY` 列（`TEXT`／`BOOLEAN`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
+/// `ARRAY` 列（`TEXT`／`BOOLEAN`／`SMALLINT`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
 /// `DATE`／`TIMESTAMP`／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
 /// 向け配列直列化。要素種別を
 /// `array_ty.elem()` に応じて検証したうえで `{...}` テキストを組み立てる。
@@ -273,7 +273,8 @@ pub fn array_literal_text(
                 push_array_element(&mut out, if *b { "true" } else { "false" }, true)
             }
             (
-                ArrayElemType::Integer
+                ArrayElemType::SmallInt
+                | ArrayElemType::Integer
                 | ArrayElemType::BigInt
                 | ArrayElemType::Real
                 | ArrayElemType::Double,
@@ -333,7 +334,8 @@ pub fn array_literal_text(
                 ))
             }
             (
-                ArrayElemType::Integer
+                ArrayElemType::SmallInt
+                | ArrayElemType::Integer
                 | ArrayElemType::BigInt
                 | ArrayElemType::Real
                 | ArrayElemType::Double,
@@ -848,6 +850,10 @@ mod tests {
             engine::sql::parser::parse_array_literal(&text, array_ty).expect("engine parse")
         };
         assert_eq!(
+            parse(ArrayElemType::SmallInt, "[1,null,-3]"),
+            V::SmallInt(vec![Some(1), None, Some(-3)])
+        );
+        assert_eq!(
             parse(ArrayElemType::Integer, "[1,null,-3]"),
             V::Integer(vec![Some(1), None, Some(-3)])
         );
@@ -885,6 +891,7 @@ mod tests {
         let ty = |elem| ArrayType::new(elem, 8).expect("valid array type");
         for (elem, item) in [
             (ArrayElemType::Integer, JsonValue::String("1".to_string())),
+            (ArrayElemType::SmallInt, JsonValue::String("1".to_string())),
             (ArrayElemType::Double, JsonValue::Bool(true)),
             (ArrayElemType::Date, num("1")),
             (ArrayElemType::Uuid, JsonValue::Bool(false)),

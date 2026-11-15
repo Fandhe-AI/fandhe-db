@@ -112,6 +112,7 @@ mod sql_scan_pk_point;
 mod sql_scan_public_api;
 mod sql_session_timezone;
 mod sql_set_default_insert_resend;
+mod sql_smallint_array;
 mod sql_smallint_column;
 mod sql_smallint_query;
 mod sql_smallint_widening;

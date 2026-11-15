@@ -762,9 +762,9 @@ fn create_table_vector_nullable_accepts_null_and_not_null_rejects_with_23502() {
 }
 
 /// Issue #1561（TABLE-30・NOSQL-13）: `create_table` の型名 `"smallint"` が受理され、
-/// 範囲外値は 22003、配列要素型としての `"smallint"` は拒否のまま（0A000）。
+/// 範囲外値は 22003。配列要素型としての `"smallint"` も Issue #3230（TABLE-14）で受理される。
 #[test]
-fn create_table_smallint_column_binds_range_and_rejects_array_element() {
+fn create_table_smallint_column_binds_range_and_accepts_array_element() {
     let (core, _guard) = new_core();
     let session = ddl_session(core);
     let resp = query(
@@ -787,9 +787,35 @@ fn create_table_smallint_column_binds_range_and_rejects_array_element() {
     assert_eq!(http_common::wire_code_of(&oor), "22003", "got: {oor:?}");
     let arr = query(
         &session,
-        br#"{"op":"create_table","table":"sm2","columns":[{"name":"a","type":"array","element_type":"smallint","max_len":4}]}"#,
+        br#"{"op":"create_table","table":"sm2","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"smallint","max_len":4}
+    ]}"#,
     );
-    assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
+    assert_eq!(arr.status, 200, "got: {arr:?}");
+    let arr_ok = query(
+        &session,
+        br#"{"op":"insert","table":"sm2","rows":[{"id":1,"embedding":[0.1,0.2],"a":[1,null,32767]}],"operation_id":"sm2-1"}"#,
+    );
+    assert_eq!(arr_ok.status, 200, "got: {arr_ok:?}");
+    let arr_oor = query(
+        &session,
+        br#"{"op":"insert","table":"sm2","rows":[{"id":2,"embedding":[0.1,0.2],"a":[32768]}],"operation_id":"sm2-2"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_oor),
+        "22003",
+        "got: {arr_oor:?}"
+    );
+    let arr_ty = query(
+        &session,
+        br#"{"op":"insert","table":"sm2","rows":[{"id":3,"embedding":[0.1,0.2],"a":["1"]}],"operation_id":"sm2-3"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_ty),
+        "42601",
+        "got: {arr_ty:?}"
+    );
 }
 
 /// Issue #1571（TABLE-32・NOSQL-13）: `create_table`／`add_column` の型名 `"time"` が受理され、

@@ -243,6 +243,8 @@ pub enum ArrayValue {
     Text(Vec<Option<String>>),
     Bool(Vec<Option<bool>>),
     Integer(Vec<Option<i32>>),
+    /// `SMALLINT[]`（Issue #3230）。`Integer` と別 variant にして型の区別（OID 1005）を保つ。
+    SmallInt(Vec<Option<i16>>),
     BigInt(Vec<Option<i64>>),
     Real(Vec<Option<f32>>),
     Double(Vec<Option<f64>>),
@@ -429,6 +431,7 @@ impl ArrayValue {
                 if *b { "t" } else { "f" }.to_string()
             }),
             ArrayValue::Integer(items) => bounded(items, dims, max_len, |v| v.to_string()),
+            ArrayValue::SmallInt(items) => bounded(items, dims, max_len, |v| v.to_string()),
             ArrayValue::BigInt(items) => bounded(items, dims, max_len, |v| v.to_string()),
             ArrayValue::Real(items) => bounded(items, dims, max_len, |v| {
                 crate::scalar_float::format_real(*v)
@@ -478,6 +481,7 @@ impl ArrayValue {
             (ArrayValue::Text(a), ArrayValue::Text(b)) => ArrayValue::Text(join(a, b)),
             (ArrayValue::Bool(a), ArrayValue::Bool(b)) => ArrayValue::Bool(join(a, b)),
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => ArrayValue::Integer(join(a, b)),
+            (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => ArrayValue::SmallInt(join(a, b)),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => ArrayValue::BigInt(join(a, b)),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => ArrayValue::Real(join(a, b)),
             (ArrayValue::Double(a), ArrayValue::Double(b)) => ArrayValue::Double(join(a, b)),
@@ -540,6 +544,7 @@ impl ArrayValue {
             | (ArrayValue::Enum(a), ArrayValue::Enum(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Bool(a), ArrayValue::Bool(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => {
                 eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
@@ -602,6 +607,7 @@ impl ArrayValue {
             ArrayValue::Text(v) => ArrayValue::Text(pick(v, keep)),
             ArrayValue::Bool(v) => ArrayValue::Bool(pick(v, keep)),
             ArrayValue::Integer(v) => ArrayValue::Integer(pick(v, keep)),
+            ArrayValue::SmallInt(v) => ArrayValue::SmallInt(pick(v, keep)),
             ArrayValue::BigInt(v) => ArrayValue::BigInt(pick(v, keep)),
             ArrayValue::Real(v) => ArrayValue::Real(pick(v, keep)),
             ArrayValue::Double(v) => ArrayValue::Double(pick(v, keep)),
@@ -631,6 +637,7 @@ impl ArrayValue {
             | ArrayValue::Enum(v) => v.clone(),
             ArrayValue::Bool(v) => map(v, |b| if *b { "t" } else { "f" }.to_string()),
             ArrayValue::Integer(v) => map(v, |x| x.to_string()),
+            ArrayValue::SmallInt(v) => map(v, |x| x.to_string()),
             ArrayValue::BigInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Real(v) => map(v, |x| crate::scalar_float::format_real(*x)),
             ArrayValue::Double(v) => map(v, |x| crate::scalar_float::format_double(*x)),
@@ -676,6 +683,7 @@ macro_rules! array_dispatch {
             ArrayValue::Text($items) => $body,
             ArrayValue::Bool($items) => $body,
             ArrayValue::Integer($items) => $body,
+            ArrayValue::SmallInt($items) => $body,
             ArrayValue::BigInt($items) => $body,
             ArrayValue::Real($items) => $body,
             ArrayValue::Double($items) => $body,
@@ -707,6 +715,7 @@ impl ArrayValue {
             ArrayValue::Text(_) => ArrayElemType::Text,
             ArrayValue::Bool(_) => ArrayElemType::Bool,
             ArrayValue::Integer(_) => ArrayElemType::Integer,
+            ArrayValue::SmallInt(_) => ArrayElemType::SmallInt,
             ArrayValue::BigInt(_) => ArrayElemType::BigInt,
             ArrayValue::Real(_) => ArrayElemType::Real,
             ArrayValue::Double(_) => ArrayElemType::Double,
@@ -758,6 +767,7 @@ impl ArrayValue {
             ArrayValue::Text(v) => cut!(Text, v),
             ArrayValue::Bool(v) => cut!(Bool, v),
             ArrayValue::Integer(v) => cut!(Integer, v),
+            ArrayValue::SmallInt(v) => cut!(SmallInt, v),
             ArrayValue::BigInt(v) => cut!(BigInt, v),
             ArrayValue::Real(v) => cut!(Real, v),
             ArrayValue::Double(v) => cut!(Double, v),
@@ -826,6 +836,7 @@ impl ArrayValue {
                 .saturating_mul(std::mem::size_of::<Option<Decimal>>()),
             ArrayValue::Bool(v) => v.len().saturating_mul(std::mem::size_of::<Option<bool>>()),
             ArrayValue::Integer(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
+            ArrayValue::SmallInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i16>>()),
             ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::Real(v) => v.len().saturating_mul(std::mem::size_of::<Option<f32>>()),
             ArrayValue::Double(v) => v.len().saturating_mul(std::mem::size_of::<Option<f64>>()),
@@ -857,6 +868,8 @@ impl ArrayValue {
             ArrayValue::Json(_) => 11,
             ArrayValue::Jsonb(_) => 12,
             ArrayValue::Enum(_) => 13,
+            // Issue #3230 の新規採番。
+            ArrayValue::SmallInt(_) => 14,
             // `flat()` は `Multi` を返さない。
             ArrayValue::Multi(_) => {
                 return Err(RowCodecError::Invalid(
@@ -1355,6 +1368,7 @@ impl<'a> ArrayRef<'a> {
             | ArrayElemType::Date
             | ArrayElemType::Timestamp
             | ArrayElemType::Uuid
+            | ArrayElemType::SmallInt
             | ArrayElemType::Bytea
             | ArrayElemType::Enum => Ok(std::borrow::Cow::Borrowed(self.bytes)),
         }
@@ -1981,6 +1995,7 @@ fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
         | ArrayElemType::Enum => None,
         ArrayElemType::Numeric { .. } => Some(16),
         ArrayElemType::Bool => Some(1),
+        ArrayElemType::SmallInt => Some(2),
         ArrayElemType::Integer | ArrayElemType::Real | ArrayElemType::Date => Some(4),
         ArrayElemType::BigInt | ArrayElemType::Double | ArrayElemType::Timestamp => Some(8),
         ArrayElemType::Uuid => Some(16),
@@ -2185,6 +2200,7 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
             | ArrayElemType::Bytea
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
+            | ArrayElemType::SmallInt
             | ArrayElemType::Enum,
             _,
         ) => {}
@@ -2286,6 +2302,11 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
             }
         }
         ArrayValue::Integer(items) => {
+            for v in items.iter().flatten() {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::SmallInt(items) => {
             for v in items.iter().flatten() {
                 buf.extend_from_slice(&v.to_le_bytes());
             }
@@ -2573,6 +2594,10 @@ fn decode_array_elements(
             Ok(i32::from_le_bytes(array_le_bytes::<4>(c)?))
         })
         .map(ArrayValue::Integer),
+        ArrayElemType::SmallInt => decode_fixed_array_elements(rest, &nulls, 2, |c| {
+            Ok(i16::from_le_bytes(array_le_bytes::<2>(c)?))
+        })
+        .map(ArrayValue::SmallInt),
         ArrayElemType::BigInt => decode_fixed_array_elements(rest, &nulls, 8, |c| {
             Ok(i64::from_le_bytes(array_le_bytes::<8>(c)?))
         })
@@ -7764,6 +7789,66 @@ mod tests {
         let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
         let decoded = decode_row(&schema, &encoded).expect("decode");
         assert_eq!(decoded.values, values);
+    }
+
+    /// Issue #3230: `SMALLINT[]` は固定幅 2 バイトで往復する（NULL 要素・空配列・境界値・2 次元）。
+    /// 壊れたフレーム（幅の不一致）は Invalid で fail-closed。
+    #[test]
+    fn smallint_array_roundtrips_with_fixed_two_byte_width() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "a",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::SmallInt, 8).expect("array ty"),
+                    ),
+                    true,
+                ),
+                ColumnDef::new(
+                    "b",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::SmallInt, 8)
+                            .and_then(|a| a.with_ndims(2))
+                            .expect("array ty"),
+                    ),
+                    true,
+                ),
+            ],
+        );
+        let flat = ArrayValue::SmallInt(vec![Some(i16::MIN), None, Some(0), Some(i16::MAX)]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::SmallInt(vec![Some(1), Some(2), Some(3), Some(4)]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::SmallInt(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        // 要素幅 2 バイトの本文: NULL ビットマップ 1 バイト + 非 NULL 3 要素 x 2 バイト。
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 14);
+        assert_eq!(payload.len(), 1 + 3 * 2);
+        // 型違い（Integer の値を SMALLINT[] 列へ）は拒否する。
+        let bad = vec![
+            Value::Array(ArrayValue::Integer(vec![Some(1)])),
+            Value::Null,
+        ];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 幅 2 の列として壊れた長さ（奇数バイト）は復号で Invalid になる。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::SmallInt, &[0u8, 1, 2], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
     }
 
     #[test]

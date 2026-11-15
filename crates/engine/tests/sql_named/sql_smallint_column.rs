@@ -2,8 +2,8 @@
 //!
 //! production 経路（`EngineCore::execute_sql_in_session`）で、(1) 型がカタログへ永続化され再オープン
 //! 後も復元されること、(2) INSERT・UPDATE SET・UPSERT・COPY・列 DEFAULT の値束縛が
-//! `-32768..=32767` 外を `22003` で拒否し副作用を残さないこと、(3) 未解禁の機能
-//! （配列）が fail-closed に拒否されること、を固定する。述語・集計・索引は
+//! `-32768..=32767` 外を `22003` で拒否し副作用を残さないこと、(3) 配列要素としての `SMALLINT[]` が
+//! 受理されること（Issue #3230）、を固定する。述語・集計・索引は
 //! Issue #1559 で解禁済み（`sql_smallint_query.rs`）。
 
 use engine::catalog::ColumnType;
@@ -217,29 +217,23 @@ fn upsert_is_range_checked_on_both_sides() {
     assert!(rows(&core, "SELECT id, n FROM t LIMIT 10")[0].contains("SignedInteger(5)"));
 }
 
-/// 未解禁の機能（配列）は INTEGER 扱いで黙って通さず fail-closed に拒否する。
-/// 述語・集計・ORDER BY／GROUP BY・SET 式は #1559、PK／UNIQUE・型変更は #1560 で解禁済み
-/// （`sql_smallint_query.rs`・`sql_smallint_widening.rs`）。
+/// 配列要素としての `SMALLINT[]`／`INT2[n]` は専用の要素型として受理し（Issue #3230。
+/// 以前は `0A000` で固定していた）、INTEGER 扱いで黙って丸めない。述語・集計・
+/// ORDER BY／GROUP BY・SET 式は #1559、PK／UNIQUE・型変更は #1560 で解禁済み
+/// （`sql_smallint_query.rs`・`sql_smallint_widening.rs`）。詳細は `sql_smallint_array.rs`。
 #[test]
-fn features_not_yet_enabled_are_rejected_fail_closed() {
-    let (_p, _g, core) = open("si-failclosed");
+fn smallint_array_columns_are_accepted_as_their_own_element_type() {
+    let (_p, _g, core) = open("si-array");
     ok(
         &core,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, n SMALLINT, m INTEGER)",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, n SMALLINT[])",
     );
+    ok(&core, "CREATE TABLE b (id BIGINT PRIMARY KEY, n INT2[3])");
     ok(
         &core,
-        "INSERT INTO t (id, n, m) VALUES (1, 5, 5) USING OPERATION_ID 'i1'",
+        "INSERT INTO a (id, n) VALUES (1, '{1,2}') USING OPERATION_ID 'i1'",
     );
-    for (sql, want) in [
-        (
-            "CREATE TABLE a (id BIGINT PRIMARY KEY, n SMALLINT[])",
-            "0A000",
-        ),
-        ("CREATE TABLE a (id BIGINT PRIMARY KEY, n INT2[3])", "0A000"),
-    ] {
-        assert_eq!(code(&core, sql), want, "{sql}");
-    }
+    assert_eq!(rows(&core, "SELECT id FROM a LIMIT 10").len(), 1);
 }
 
 /// Issue #1560: PK／UNIQUE の解禁と SMALLINT↔INTEGER の型変更の受理。

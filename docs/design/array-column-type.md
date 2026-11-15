@@ -447,3 +447,24 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
   OID を持たない。全要素型の対応は `result_encoder.rs` のテストで固定した。
 - **漏れ検出の確認**: 隔離 worktree で一時的にダミー variant を足すと engine ライブラリで 25 件
   （lib test を含め 26 件）の E0004 が出て、上記の関数と `kind_ordinal` を指した（確認後に戻して未コミット）。
+
+## Issue #3230 追記（`SMALLINT[]` の受理）
+
+親 #3228・TABLE-14・TABLE-35 のポインタ。#3229 のチェックリストに従い、`SMALLINT[]`／`INT2[n]` を専用の
+要素型 `ArrayElemType::SmallInt` として受理した（別 OID の `_int2`=1005 を公告するため `Integer` へは丸めない）。
+
+- **値表現**: `ArrayValue::SmallInt(Vec<Option<i16>>)`。範囲（`-32768..=32767`）は型で保証し、変換点
+  （配列リテラル・CAST・`ARRAY[...]`・`array_agg`・NoSQL の JSON 束縛）の範囲外は `22003`。
+- **行内表現**: 固定幅 2 バイト LE（新しい要素型タグなので既存のバイト列は不変）。壊れた幅は Invalid で fail-closed。
+- **凍結値（新規採番。既存値は振り直さない）**: カタログ param のタグ `smallint`、`constraint::array_elem_tag`
+  と `canonical_parts` の序数と content hash の要素型タグはいずれも 14（0x40 の次元マーカー未満）。
+- **wire**: `WireType::Int2Array`（OID 1005・typlen -1・`_int2`）。テキスト形式のみで、バイナリは従来の配列と同じく
+  `0A000`。Parse で 1005 を宣言した場合は従来どおり `0A000`（`declared_param_type_for_oid` の単体テストで固定）。
+  NoSQL の `element_type: "smallint"` も受理し、応答の型名は `smallint[]`。
+- **副次的に受理した面**: 要素がすべて smallint の `ARRAY[...]`（結果は `smallint[]`。int4 との混在は従来どおり int4）、
+  smallint 列の `array_agg`、`CAST(... AS smallint[])`、添字（結果型 smallint）・スライス。
+- **据え置いた面**: 左辺が smallint で右辺が型なしリテラルの量化比較（`array_ops::lhs_elem_cast_type`）は従来どおり
+  integer[] として解釈する（既存の受理形の結果が変わるため）。`smallint[]` と `integer[]` の直接比較は `42883` のまま。
+  `ALTER COLUMN TYPE` の配列要素型変更は既存の配列どうしの判定に従い拡張しない（fail-closed）。
+- **対象外**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14。対応しない）。VARCHAR・TIME・TIMESTAMPTZ・INTERVAL・BIT の
+  各要素型は #3231〜#3235。
