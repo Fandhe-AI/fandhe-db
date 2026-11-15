@@ -12,6 +12,7 @@ mod temp_db;
 
 mod nosql_bound_returning_public_api;
 mod search12_hybrid_text_syntax;
+mod search13_bm25_len_norm_array_parity;
 mod search13_hybrid_tuning_exec;
 mod search13_hybrid_tuning_explain;
 mod search14_ts_headline;
