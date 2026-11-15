@@ -378,28 +378,25 @@ pub(crate) fn check_branch_type_compatibility(
 
 /// 列メタデータに `INTERVAL`／`BIT(n)`／`HALFVEC(N)` 列が含まれるか（集合演算の fail-closed 判定。
 /// Issue #1579・#2021・#2014）。
+///
+/// `INTERVAL` 要素の配列（`interval[]`。Issue #3234）もスカラー INTERVAL と同じ側に置いて拒否する
+/// （配列の等価ペイロードは正規化キーだが、集合演算の対応はスカラーの解禁と揃える。fail-closed）。
 fn columns_have_interval(columns: &[ColumnMeta]) -> bool {
-    columns.iter().any(|c| {
-        matches!(
-            c,
-            ColumnMeta::Scalar {
-                ty: ColumnType::Interval
-                    | ColumnType::Bit(_)
-                    | ColumnType::HalfVec(_)
-                    | ColumnType::Int8Vec(_)
-                    | ColumnType::SparseVec(_),
-                ..
-            } | ColumnMeta::Computed {
-                ty: Some(
-                    ColumnType::Interval
-                        | ColumnType::Bit(_)
-                        | ColumnType::HalfVec(_)
-                        | ColumnType::Int8Vec(_)
-                        | ColumnType::SparseVec(_),
-                ),
-                ..
-            }
-        )
+    fn is_blocked(ty: &ColumnType) -> bool {
+        match ty {
+            ColumnType::Interval
+            | ColumnType::Bit(_)
+            | ColumnType::HalfVec(_)
+            | ColumnType::Int8Vec(_)
+            | ColumnType::SparseVec(_) => true,
+            ColumnType::Array(a) => a.elem() == crate::catalog::ArrayElemType::Interval,
+            _ => false,
+        }
+    }
+    columns.iter().any(|c| match c {
+        ColumnMeta::Scalar { ty, .. } => is_blocked(ty),
+        ColumnMeta::Computed { ty: Some(ty), .. } => is_blocked(ty),
+        _ => false,
     })
 }
 
