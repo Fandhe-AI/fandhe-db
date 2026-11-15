@@ -388,3 +388,247 @@ fn hybrid_queries_on_different_text_columns_do_not_share_cache_entry() {
     );
     assert_eq!(stats.hits, 0);
 }
+// --- Issue #3221: 全可視 hybrid の BTreeSet／可視ビットマップ再構築を省く経路 ------------
+//
+// 最適化対象の形（フィルタなし・恒等スロット列・キャッシュヒット）の結果が、最適化の
+// 効かない従来経路（`docs_o` 表。先頭スロットに WHERE で除外する行を置き、可視スロット
+// 列を非恒等にする）と、行 id・スコア・結果列の型・行数までビット一致することを固定する。
+
+fn create_pair_tables(storage: &Storage) {
+    for name in ["docs", "docs_o"] {
+        storage
+            .create_table(&TableSchema::new(
+                name,
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, true),
+                    ColumnDef::new("lang", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table");
+    }
+}
+
+fn ctx_of(tenant: &str) -> PolicyContext {
+    PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn insert_lang_row(
+    storage: &Storage,
+    table: &str,
+    tenant: &str,
+    id: u64,
+    emb: [f32; 2],
+    body: Option<&str>,
+    lang: &str,
+) {
+    let value = match body {
+        Some(b) => Value::Text(b.to_string()),
+        None => Value::Null,
+    };
+    engine::tenant::insert_typed_row(
+        storage,
+        table,
+        &ctx_of(tenant),
+        id,
+        Visibility::Private,
+        &[
+            Value::Vector(emb.to_vec()),
+            value,
+            Value::Text(lang.to_string()),
+        ],
+        &engine::recovery::required_op_id::OperationId::parse(&format!(
+            "sparse-cache-3221-{table}-{tenant}-{id}"
+        ))
+        .expect("valid operation_id"),
+    )
+    .expect("insert row");
+}
+
+/// 同じ行を `docs`（最適化対象）と `docs_o`（先頭に除外行を持つ従来経路のオラクル）へ入れる。
+fn seed_pair(storage: &Storage, tenant: &str, rows: &[(u64, [f32; 2], Option<&str>)]) {
+    insert_lang_row(
+        storage,
+        "docs_o",
+        tenant,
+        0,
+        [1.0, 0.0],
+        Some("vector database vector database"),
+        "x",
+    );
+    for (id, emb, body) in rows {
+        insert_lang_row(storage, "docs", tenant, *id, *emb, *body, "en");
+        insert_lang_row(storage, "docs_o", tenant, *id, *emb, *body, "en");
+    }
+}
+
+fn sql_fast(q: &str) -> String {
+    format!("SELECT * FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, '{q}') LIMIT 6")
+}
+
+fn sql_oracle(q: &str) -> String {
+    format!(
+        "SELECT * FROM docs_o WHERE lang = 'en' \
+         ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, '{q}') LIMIT 6"
+    )
+}
+
+fn assert_bit_identical(a: &QueryResult, b: &QueryResult, label: &str) {
+    assert_eq!(a.columns.len(), b.columns.len(), "{label}: columns");
+    assert_eq!(
+        format!("{:?}", a.columns),
+        format!("{:?}", b.columns),
+        "{label}: column types"
+    );
+    assert_eq!(a.rows.len(), b.rows.len(), "{label}: row count");
+    for (x, y) in a.rows.iter().zip(b.rows.iter()) {
+        assert_eq!(x.id, y.id, "{label}: id");
+        assert_eq!(x.score.to_bits(), y.score.to_bits(), "{label}: score bits");
+        assert_eq!(x.cells.len(), y.cells.len(), "{label}: cells");
+    }
+}
+
+#[test]
+fn issue3221_all_visible_hybrid_is_bit_identical_to_filtered_path() {
+    let path = unique_db_path("sparse-cache-3221-bit");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    create_pair_tables(&storage);
+    seed_pair(
+        &storage,
+        "tenant-a",
+        &[
+            (1, [1.0, 0.0], Some("rust vector database")),
+            (2, [0.0, 1.0], Some("unrelated topic")),
+            (3, [0.9, 0.1], Some("vector database engine")),
+            (4, [0.1, 0.9], None),
+            (5, [0.5, 0.5], Some("database")),
+        ],
+    );
+    let core = new_core(storage);
+    let ctx = ctx_of("tenant-a");
+
+    for q in ["vector database", "database", "nomatchterm"] {
+        let first = core.execute_sql(&ctx, &sql_fast(q)).expect("first");
+        let second = core
+            .execute_sql(&ctx, &sql_fast(q))
+            .expect("second (cache hit)");
+        let oracle = core.execute_sql(&ctx, &sql_oracle(q)).expect("oracle");
+        assert_bit_identical(&first, &oracle, q);
+        assert_bit_identical(&second, &oracle, q);
+    }
+    let stats = core.sparse_index_cache_stats();
+    assert!(stats.hits >= 3, "second runs must hit the cache: {stats:?}");
+}
+
+#[test]
+fn issue3221_all_null_bodies_and_empty_table_match_oracle() {
+    let path = unique_db_path("sparse-cache-3221-null");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    create_pair_tables(&storage);
+    // docs_o の除外行だけ（docs 側は空表）。全行 NULL の表は別テナントで作る。
+    seed_pair(&storage, "tenant-empty", &[]);
+    seed_pair(
+        &storage,
+        "tenant-null",
+        &[(11, [1.0, 0.0], None), (12, [0.0, 1.0], None)],
+    );
+    let core = new_core(storage);
+    for tenant in ["tenant-empty", "tenant-null"] {
+        let ctx = ctx_of(tenant);
+        let fast = core
+            .execute_sql(&ctx, &sql_fast("vector database"))
+            .expect("fast");
+        let again = core
+            .execute_sql(&ctx, &sql_fast("vector database"))
+            .expect("fast again");
+        let oracle = core
+            .execute_sql(&ctx, &sql_oracle("vector database"))
+            .expect("oracle");
+        assert_bit_identical(&fast, &oracle, tenant);
+        assert_bit_identical(&again, &oracle, tenant);
+    }
+}
+
+#[test]
+fn issue3221_tenants_alternating_stay_isolated_and_match_oracle() {
+    let path = unique_db_path("sparse-cache-3221-tenant");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    create_pair_tables(&storage);
+    seed_pair(
+        &storage,
+        "tenant-a",
+        &[
+            (1, [1.0, 0.0], Some("vector database tenant-a-secret")),
+            (2, [0.0, 1.0], Some("other")),
+        ],
+    );
+    seed_pair(
+        &storage,
+        "tenant-b",
+        &[
+            (21, [1.0, 0.0], Some("vector database public info")),
+            (22, [0.2, 0.8], Some("vector")),
+            (23, [0.5, 0.5], Some("database engine")),
+        ],
+    );
+    let core = new_core(storage);
+    let (a, b) = (ctx_of("tenant-a"), ctx_of("tenant-b"));
+    let q = "vector database";
+    for round in 0..3 {
+        for ctx in [&a, &b, &a, &b] {
+            let fast = core.execute_sql(ctx, &sql_fast(q)).expect("fast");
+            let oracle = core.execute_sql(ctx, &sql_oracle(q)).expect("oracle");
+            assert_bit_identical(&fast, &oracle, &format!("round {round}"));
+        }
+    }
+    let ids_a = result_ids(&core.execute_sql(&a, &sql_fast(q)).expect("a"));
+    let ids_b = result_ids(&core.execute_sql(&b, &sql_fast(q)).expect("b"));
+    assert!(ids_a.iter().all(|i| *i < 10), "tenant-a leaked: {ids_a:?}");
+    assert!(ids_b.iter().all(|i| *i >= 20), "tenant-b leaked: {ids_b:?}");
+}
+
+#[test]
+fn issue3221_generation_change_rebuilds_and_matches_oracle() {
+    let path = unique_db_path("sparse-cache-3221-gen");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    create_pair_tables(&storage);
+    seed_pair(
+        &storage,
+        "tenant-a",
+        &[
+            (1, [1.0, 0.0], Some("vector database")),
+            (2, [0.0, 1.0], Some("unrelated")),
+        ],
+    );
+    let core = new_core(storage);
+    let ctx = ctx_of("tenant-a");
+    let q = "vector database";
+    core.execute_sql(&ctx, &sql_fast(q)).expect("warm");
+    core.execute_sql(&ctx, &sql_fast(q)).expect("hit");
+    let misses_before = core.sparse_index_cache_stats().misses;
+
+    for table in ["docs", "docs_o"] {
+        core.execute_insert_sql(
+            &ctx,
+            &format!(
+                "INSERT INTO {table} (id, embedding, body, lang) VALUES \
+                 (7, '[1.0,0.0]', 'vector database vector database', 'en') \
+                 USING OPERATION_ID 'sparse-cache-3221-gen-{table}-7'"
+            ),
+        )
+        .expect("insert");
+    }
+    let fast = core.execute_sql(&ctx, &sql_fast(q)).expect("after insert");
+    let oracle = core.execute_sql(&ctx, &sql_oracle(q)).expect("oracle");
+    assert_bit_identical(&fast, &oracle, "after insert");
+    assert!(result_ids(&fast).contains(&7), "new row must be visible");
+    assert!(
+        core.sparse_index_cache_stats().misses > misses_before,
+        "generation change must rebuild the index"
+    );
+}

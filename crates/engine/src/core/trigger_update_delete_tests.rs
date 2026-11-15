@@ -836,7 +836,7 @@ fn partitioned_trigger_failure_aborts_only_that_chunk_and_resend_resumes() {
     assert!(read_rows(&core, &a, "trg").iter().all(|r| r.2 == 7));
 }
 
-// 発火に未対応の経路（UPSERT・生の行 API）は 0A000。台帳は消費されない。RETURNING 付きの UPDATE／DELETE は
+// 発火に未対応の経路（RETURNING 付き UPSERT・生の行 API）は 0A000。台帳は消費されない。RETURNING 付きの UPDATE／DELETE は
 // 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 #[test]
 fn unwired_paths_are_guarded() {
@@ -851,7 +851,7 @@ fn unwired_paths_are_guarded() {
     );
 
     let upsert = "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-                  ON CONFLICT (id) DO UPDATE SET n = 2 USING OPERATION_ID 'g5'";
+                  ON CONFLICT (id) DO UPDATE SET n = 2 RETURNING id USING OPERATION_ID 'g5'";
     assert_eq!(code(&core, &a, upsert), "0A000", "{upsert}");
     let op = crate::recovery::required_op_id::OperationId::parse("op-raw").expect("op");
     let err = crate::tenant::delete_row(&core.storage, "trg", &a, 1, &op).unwrap_err();

@@ -443,7 +443,7 @@ fn default_invoker_rejects_non_trigger_function() {
 
 // 文トリガ（INSERT）の発火は `trigger_statement_tests.rs`（Issue #1726）で固定する。
 
-// 発火に未対応の経路（生の型付き挿入・UPSERT）は、INSERT トリガのある表で `0A000`。RETURNING 付きの INSERT は
+// 発火に未対応の経路（生の型付き挿入・RETURNING 付き UPSERT）は、INSERT トリガのある表で `0A000`。RETURNING 付きの INSERT は
 // 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 // 台帳は消費されない（同じ operation_id を、トリガを消した後の経路で使える）。
 #[test]
@@ -457,7 +457,7 @@ fn unwired_paths_are_guarded_without_consuming_ledger() {
         &core,
         &a,
         "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-ups'",
+         ON CONFLICT (id) DO NOTHING RETURNING id USING OPERATION_ID 'op-ups'",
     )
     .unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
