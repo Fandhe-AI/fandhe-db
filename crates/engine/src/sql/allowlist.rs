@@ -18172,7 +18172,7 @@ pub(crate) fn parse_cte_select_body(
     inner: &[Token],
     limits: crate::nesting_limits::NestingLimits,
 ) -> Result<(super::cte::CteBody, Option<super::cte::CteBodyTail>), SqlSurfaceError> {
-    match parse_view_body(inner) {
+    match parse_simple_body_with(inner, BodyPredicateTable::CteStrict) {
         Ok(body) => Ok((super::cte::CteBody::Select(body), None)),
         // SQL-62・Issue #1863: 集計・`GROUP BY`／`HAVING`・`SELECT DISTINCT` の本文は
         // 既存の集計許可パーサーで解析する（判定は通常 SELECT の入口と同じ述語）。
@@ -18216,7 +18216,7 @@ fn parse_cte_aggregate_body(
             "WITH TIES is not supported in a CTE body",
         ));
     }
-    check_view_body_predicates(&shape.where_predicates)?;
+    check_body_predicates_with(&shape.where_predicates, BodyPredicateTable::CteStrict)?;
     Ok(super::cte::CteAggregateBody {
         table_name: shape.table_name,
         items: shape.items,
@@ -18266,7 +18266,7 @@ fn parse_cte_body_with_tail(
             "CTE body with ORDER BY/LIMIT does not support expression projection items",
         ));
     }
-    check_view_body_predicates(&shape.where_predicates)?;
+    check_body_predicates_with(&shape.where_predicates, BodyPredicateTable::CteStrict)?;
     super::parser::validate_search_offset(shape.offset)?;
     Ok((
         ParsedViewBody {
@@ -18284,10 +18284,62 @@ fn parse_cte_body_with_tail(
     ))
 }
 
-/// CTE・ビュー本文の `WHERE` 述語が単純形（宣言的な比較・前方一致・恒偽）だけかを検査する。
-/// [`parse_view_body`] と CTE 本文の tail 解析（[`Parser::parse_with_clause`]・Issue #1862）が
-/// 共有する唯一の判定表で、それ以外の述語は `42601`（fail-closed）。
-fn check_view_body_predicates(where_predicates: &[WherePredicate]) -> Result<(), SqlSurfaceError> {
+/// 本文の `WHERE` 述語の判定表の種別（Issue #3238）。ビュー本文（View）と、CTE 本文・
+/// FROM の派生表本文（CteStrict）で受理範囲を分ける。CTE 本文と派生表は同じ
+/// [`parse_cte_select_body`] を共有するため、View 側の拡大が及ばないよう呼び出し側で明示する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyPredicateTable {
+    /// ビュー本文（`CREATE VIEW`・`CREATE MATERIALIZED VIEW`・格納済み本文の再検証）。
+    /// 宣言的な葉・`IN`／`BETWEEN`／`IS NULL`・組み込み関数だけの式述語・`NOT`／`OR` を受理する。
+    View,
+    /// CTE 本文・派生表本文。従来の狭い判定表（宣言的な比較・前方一致・恒偽のみ）を据え置く。
+    CteStrict,
+}
+
+/// ビュー本文の `WHERE` 述語 1 件（`Not`／`Or` の内側は再帰）が View 表で受理できるか。
+/// 網羅的な `match` で、述語形が増えたときに検査漏れでコンパイルエラーになる（fail-closed）。
+/// 式述語は組み込み関数だけを呼ぶものに限り（[`udf_call::first_non_builtin_call`]）、
+/// セッション UDF・未知の関数・現在時刻関数・`json_*` は `42601`。`visible()` 等の UDF 述語・
+/// 式左辺の `LIKE`・サブクエリ系は `Or` 分岐や `NOT` の内側でも `42601`。
+fn check_view_body_pred_leaf(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
+    let rejected =
+        || SqlSurfaceError::unsupported("view body WHERE predicate form is not supported");
+    match pred {
+        WherePredicate::Equality { .. }
+        | WherePredicate::BoolEquality { .. }
+        | WherePredicate::BoolColumn { .. }
+        | WherePredicate::Compare { .. }
+        | WherePredicate::InList { .. }
+        | WherePredicate::Between { .. }
+        | WherePredicate::IsNull { .. } => Ok(()),
+        WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => Ok(()),
+        WherePredicate::Expression(e) => {
+            if super::udf_call::first_non_builtin_call(e).is_none() {
+                Ok(())
+            } else {
+                Err(rejected())
+            }
+        }
+        WherePredicate::Not(inner) => check_view_body_pred_leaf(inner),
+        // Issue #1526・SQL-41 ポインタ: 分岐 0 個の `Or` は恒偽（列を参照しない）。
+        // 非空の `Or` は全分岐の全葉を同じ規則で再帰判定し、述語を 1 件も落とさない。
+        WherePredicate::Or(branches) => branches
+            .iter()
+            .flatten()
+            .try_for_each(check_view_body_pred_leaf),
+        WherePredicate::PredicateCall { .. }
+        | WherePredicate::Prefix { .. }
+        | WherePredicate::InSubquery { .. }
+        | WherePredicate::Exists { .. }
+        | WherePredicate::ScalarSubqueryCompare { .. }
+        | WherePredicate::QuantifiedSubqueryCompare { .. }
+        | WherePredicate::IdCompare { .. }
+        | WherePredicate::CorrelatedExists(_) => Err(rejected()),
+    }
+}
+
+/// CTE 本文・派生表本文の従来の判定表（[`BodyPredicateTable::CteStrict`]）。
+fn check_cte_body_predicates(where_predicates: &[WherePredicate]) -> Result<(), SqlSurfaceError> {
     for pred in where_predicates {
         match pred {
             WherePredicate::Equality { .. }
@@ -18295,37 +18347,17 @@ fn check_view_body_predicates(where_predicates: &[WherePredicate]) -> Result<(),
             | WherePredicate::BoolColumn { .. }
             | WherePredicate::Compare { .. } => {}
             WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => {}
-            // SQL-24（TASK-208 ポインタ）: ビュー本体の `WHERE` は本 Issue の
-            // スコープ外のまま据え置く（fail-closed。対応は別 Issue へ申し送り）。
+            // Issue #1526・SQL-41 ポインタ: 恒偽（分岐 0 個の `Or`）は列を参照しない。
+            WherePredicate::Or(branches) if branches.is_empty() => {}
             WherePredicate::PredicateCall { .. }
             | WherePredicate::Prefix { .. }
             | WherePredicate::Expression(_)
             | WherePredicate::InList { .. }
             | WherePredicate::Between { .. }
             | WherePredicate::IsNull { .. }
-            | WherePredicate::Not(_) => {
-                return Err(SqlSurfaceError::unsupported(
-                    "view body WHERE predicate form is not supported",
-                ));
-            }
-            // Issue #1526・SQL-41 ポインタ: 恒偽（`WHERE FALSE`・`AND FALSE`・`NOT TRUE` が
-            // 畳まれた分岐 0 個の `Or`）は列を参照せず、単純ビューとして受理しても
-            // 公開列・テナント境界の検査面を広げない。保存時は `FALSE` として描画し再解析で戻る。
-            WherePredicate::Or(branches) if branches.is_empty() => {}
-            WherePredicate::Or(_) => {
-                // TASK-208・SQL-24（Issue #912）の対象は SQL-19 の書き込み文と
-                // 読み取り SELECT で、TABLE-18 のビュー定義文本体は含まない
-                // （ビューに対する**外側クエリ**の OR は `sql::view::resolve_from`
-                // 経由で通常どおり受理される。ここで拒否するのは定義文本体のみ）。
-                return Err(SqlSurfaceError::unsupported(
-                    "view body WHERE predicate form is not supported",
-                ));
-            }
-            // Issue #927・SQL-29 (a)・TASK-213: `CREATE VIEW` 本体は `Parser::new`
-            // の既定（`subquery_ctx == None`）で解析するため、`parse_where` 自体が
-            // サブクエリ構文を `42601` で拒否し、ここへ到達しない
-            // （fail-closed の防御的経路）。
-            WherePredicate::InSubquery { .. }
+            | WherePredicate::Not(_)
+            | WherePredicate::Or(_)
+            | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
@@ -18340,12 +18372,34 @@ fn check_view_body_predicates(where_predicates: &[WherePredicate]) -> Result<(),
     Ok(())
 }
 
+/// 本文の `WHERE` 述語が `table` の判定表に収まるかを検査する（それ以外は `42601`。fail-closed）。
+/// ビュー本文は [`parse_view_body`]、CTE 本文は [`parse_cte_select_body`] 系 3 経路が呼ぶ。
+fn check_body_predicates_with(
+    where_predicates: &[WherePredicate],
+    table: BodyPredicateTable,
+) -> Result<(), SqlSurfaceError> {
+    match table {
+        BodyPredicateTable::View => where_predicates
+            .iter()
+            .try_for_each(check_view_body_pred_leaf),
+        BodyPredicateTable::CteStrict => check_cte_body_predicates(where_predicates),
+    }
+}
+
 /// [`ParsedViewBody`] の構造検証本体。`CREATE VIEW` の本文パース
 /// （[`Parser::parse_create_view`]）と、格納済みビュー定義の再検証
 /// （`sql::view::resolve_from` が [`crate::catalog::ViewDef::body_sql`] を
 /// 再トークン化して渡す。第 2 の SQL パーサーを作らない設計）の双方が共有する
 /// 唯一の実装。
 pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSurfaceError> {
+    parse_simple_body_with(tokens, BodyPredicateTable::View)
+}
+
+/// [`parse_view_body`] の本体。`table` で `WHERE` 述語の判定表（ビュー用／CTE・派生表用）を選ぶ。
+fn parse_simple_body_with(
+    tokens: &[Token],
+    table: BodyPredicateTable,
+) -> Result<ParsedViewBody, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
     p.expect_keyword(Keyword::Select)?;
     let projection = p.parse_select_list()?;
@@ -18362,7 +18416,7 @@ pub(crate) fn parse_view_body(tokens: &[Token]) -> Result<ParsedViewBody, SqlSur
     } else {
         Vec::new()
     };
-    check_view_body_predicates(&where_predicates)?;
+    check_body_predicates_with(&where_predicates, table)?;
     p.expect_end_of_statement()?;
     Ok(ParsedViewBody {
         table_name,
@@ -18513,7 +18567,9 @@ pub(crate) fn classify_view_body(
 ///   `Aggregate` の組み込み関数だけの式述語は**保留**して通す。保留した本文は
 ///   `catalog::Storage::create_view` が実カタログ（`Resolved`）で必ず再検証する。
 /// - `Resolved`: 実カタログ越しの検証（`create_view` の書き込み Tx 内・参照時の
-///   `sql::view::reparse_buffered_body`）。`Scan`／`Aggregate` の式述語は常に `42601`。
+///   `sql::view::reparse_buffered_body`）。Issue #3238 以降は `Structural` と同じく、
+///   トップレベルの `Scan`／`Aggregate` の組み込み関数だけの式述語を受理する
+///   （UDF・未知関数・サブクエリ内側の式述語は `42601` のまま）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewBodyCheck {
     Structural,
@@ -18525,9 +18581,9 @@ pub(crate) enum ViewBodyCheck {
 /// なる（組み込み関数はレジストリより先に解決され、同名 UDF は登録できない）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BodyExprPolicy {
-    /// 式述語は常に `42601`（単純形・テーブル直下本文・サブクエリ内側・集合演算の枝）。
+    /// 式述語は常に `42601`（サブクエリ内側・集合演算の枝。Issue #3238 以降、テーブル直下本文は含まない）。
     Reject,
-    /// 組み込み関数だけを呼ぶ式述語を受理する（連鎖本文、および構造検証での保留）。
+    /// 組み込み関数だけを呼ぶ式述語を受理する（テーブル直下・連鎖本文のトップレベル）。
     BuiltinOnly,
 }
 
@@ -18576,12 +18632,23 @@ pub(crate) fn check_buffered_body_shape(
     check: ViewBodyCheck,
     out: &mut Vec<String>,
 ) -> Result<(), SqlSurfaceError> {
-    // トップレベルの `Scan`／`Aggregate` の式述語は、構造検証では保留（組み込み関数のみ
-    // 受理）、実カタログ検証では拒否（テーブル直下の本文は式述語を持てない）。
+    // Issue #3238: トップレベルの `Scan`／`Aggregate` の組み込み関数だけの式述語は、
+    // 構造検証・実カタログ検証のどちらでも受理する（`check` の段を問わない。段の区別は
+    // 保留→再検証の構造として残す）。サブクエリ内側は [`check_body_subquery`] が `Reject` で呼ぶ。
     let top_policy = match check {
-        ViewBodyCheck::Structural => BodyExprPolicy::BuiltinOnly,
-        ViewBodyCheck::Resolved => BodyExprPolicy::Reject,
+        ViewBodyCheck::Structural | ViewBodyCheck::Resolved => BodyExprPolicy::BuiltinOnly,
     };
+    check_buffered_body_shape_with(stmt, lookup, top_policy, out)
+}
+
+/// [`check_buffered_body_shape`] の本体。トップレベルの式述語の扱い `top_policy` を引数に取り、
+/// サブクエリ内側の検査（[`check_body_subquery`]）は `Reject` を明示して呼ぶ。
+fn check_buffered_body_shape_with(
+    stmt: &Statement,
+    lookup: &impl TableLookup,
+    top_policy: BodyExprPolicy,
+    out: &mut Vec<String>,
+) -> Result<(), SqlSurfaceError> {
     match stmt {
         // Issue #1796・SQL-34: 本文の `LIMIT` 省略・`LIMIT ALL` は従来どおり `42601`
         // （ビュー・CTAS・matview の本文の暗黙上限は #1853／#2212 の範囲。受理範囲を広げない）。
@@ -18925,7 +18992,7 @@ fn check_body_subquery(
     let inner = validate_sql_tokens_with_subquery_ctx(inner_tokens, lookup, depth)?;
     match (&inner, scalar) {
         (Statement::Scan(_), _) | (Statement::Aggregate(_), true) => {
-            check_buffered_body_shape(&inner, lookup, ViewBodyCheck::Resolved, out)
+            check_buffered_body_shape_with(&inner, lookup, BodyExprPolicy::Reject, out)
         }
         _ => Err(body_form_unsupported()),
     }
@@ -18980,6 +19047,23 @@ pub(crate) fn render_stored_simple_view_body(
         .map_err(|_| SqlSurfaceError::unsupported("view body is not supported"))?;
     if super::lexer::stored_body_needs_bool_literal_marker(&rendered_tokens) {
         sql.insert_str(0, super::lexer::STORED_BODY_BOOL_LITERAL_MARKER);
+    }
+    // Issue #3238・往復ガード（fail-closed）: 保存形を参照時と同じ経路（`tokenize_stored_view_body`
+    // → `parse_view_body`）で再解析し、元の AST と一致しない描画は保存しない。式述語を含む本文で
+    // 描画と再解析がずれると、保存後に別の意味へ化けるため。ゾーンなし `TIMESTAMPTZ` リテラルは
+    // 描画が UTC 確定形になるので、比較側の元 AST も同じ形へ正規化する（CHECK 制約と同じ手順）。
+    // 失敗の文言は固定で、本文の値を含めない。
+    let roundtrip_failed =
+        || SqlSurfaceError::unsupported("view body WHERE predicate form is not supported");
+    let stored_tokens =
+        super::lexer::tokenize_stored_view_body(&sql).map_err(|_| roundtrip_failed())?;
+    let reparsed = parse_view_body(&stored_tokens).map_err(|_| roundtrip_failed())?;
+    let mut expected = body.clone();
+    crate::sql::check_constraint::normalize_session_local_predicates(
+        &mut expected.where_predicates,
+    );
+    if reparsed != expected {
+        return Err(roundtrip_failed());
     }
     Ok(sql)
 }
@@ -19136,20 +19220,45 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         // `parse_view_body` が構造的に拒否するため到達しない
         // （`render_view_body` は常に [`parse_view_body`] の出力のみを描画する）。
         WherePredicate::PredicateCall { name } => format!("{name}()"),
-        WherePredicate::Expression(_)
-        | WherePredicate::InList { .. }
-        | WherePredicate::Between { .. }
-        | WherePredicate::IsNull { .. }
-        | WherePredicate::Not(_) => String::new(),
+        // Issue #3238: ビュー本文が受理する式述語・`IN`／`BETWEEN`／`IS NULL`・`NOT` の描画。
+        // 列名は [`render_column_name`] で引用規則を通し、式は CHECK 制約と共有の式描画器を使う。
+        // 描画結果が再解析と一致するかは [`render_stored_simple_view_body`] の往復ガードが検証する。
+        WherePredicate::Expression(expr) => {
+            crate::sql::check_constraint::render_expression_predicate(expr)
+        }
+        WherePredicate::InList { column, values } => {
+            let items: Vec<String> = values
+                .iter()
+                .map(|v| format!("'{}'", escape_string_literal(v)))
+                .collect();
+            format!("{} IN ({})", render_column_name(column), items.join(", "))
+        }
+        WherePredicate::Between { column, low, high } => format!(
+            "{} BETWEEN '{}' AND '{}'",
+            render_column_name(column),
+            escape_string_literal(low),
+            escape_string_literal(high)
+        ),
+        WherePredicate::IsNull { column, negated } => format!(
+            "{} IS {}NULL",
+            render_column_name(column),
+            if *negated { "NOT " } else { "" }
+        ),
+        WherePredicate::Not(inner) => format!("NOT {}", render_where_predicate(inner)),
         // 分岐 0 個の恒偽は `FALSE` で描画する（`()` は再解析できない。Issue #1526）。
         WherePredicate::Or(branches) if branches.is_empty() => "FALSE".to_string(),
-        // 非空の `Or` は `parse_view_body` が拒否するため現時点では到達しない。将来の
-        // ビュー本体 OR 解禁（別 Issue）に備え、往復可能な形で網羅描画だけ
-        // 先に用意しておく（TASK-208・Issue #912）。
+        // 非空の `Or` はビュー本文の判定表（`View`）が受理するため到達する。保存時の
+        // 描画→再解析の往復ガードが、この描画結果と元 AST の一致を検証する
+        // （TASK-208・Issue #912・Issue #3238）。
         WherePredicate::Or(branches) => {
             let rendered_branches: Vec<String> = branches
                 .iter()
                 .map(|branch| {
+                    // 空の AND 枝は常真（`OR TRUE`）。空文字のまま結合すると再解析不能な
+                    // `(a OR )` になるため `TRUE` で描画する。
+                    if branch.is_empty() {
+                        return "TRUE".to_string();
+                    }
                     let rendered: Vec<String> = branch.iter().map(render_where_predicate).collect();
                     rendered.join(" AND ")
                 })
@@ -44143,10 +44252,18 @@ mod body_expr_policy_tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// Issue #3238: 実カタログ検証（`Resolved`）でも、テーブル直下の組み込み関数だけの式述語は受理し、
+    /// 非組み込み関数（未知の名前）は `42601`。
+    // intentional: docs/design/create-view.md
     #[test]
-    fn resolved_rejects_top_level_expression_predicate() {
-        let err = classify(
+    fn resolved_accepts_builtin_top_level_expression_predicate_and_rejects_non_builtin() {
+        classify(
             "SELECT id FROM x WHERE lower(lang) = 'ja' LIMIT 5",
+            ViewBodyCheck::Resolved,
+        )
+        .expect("builtin expression is accepted");
+        let err = classify(
+            "SELECT id FROM x WHERE myfn(lang) = 'ja' LIMIT 5",
             ViewBodyCheck::Resolved,
         )
         .err()
@@ -44154,17 +44271,171 @@ mod body_expr_policy_tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    // intentional: docs/design/create-view.md
     #[test]
     fn subquery_inner_and_set_branch_expression_predicates_stay_rejected() {
-        for sql in [
-            "SELECT id FROM x WHERE id IN (SELECT id FROM y WHERE lower(lang) = 'ja' LIMIT 5) LIMIT 5",
-            "(SELECT id FROM x WHERE lower(lang) = 'ja') UNION (SELECT id FROM y)",
-        ] {
-            let err = classify(sql, ViewBodyCheck::Structural)
+        for check in [ViewBodyCheck::Structural, ViewBodyCheck::Resolved] {
+            for sql in [
+                "SELECT id FROM x WHERE id IN (SELECT id FROM y WHERE lower(lang) = 'ja' LIMIT 5) LIMIT 5",
+                "(SELECT id FROM x WHERE lower(lang) = 'ja') UNION (SELECT id FROM y)",
+            ] {
+                let err = classify(sql, check)
+                    .err()
+                    .unwrap_or_else(|| panic!("{sql} should be rejected"));
+                assert_eq!(err.wire_code(), "42601", "{sql}");
+            }
+        }
+    }
+
+    fn parse_simple(sql: &str) -> Result<ParsedViewBody, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql).expect("tokenize");
+        parse_view_body(&tokens)
+    }
+
+    /// Issue #3238: 単純形ビュー本文が受理する `WHERE` 述語（式述語・`IS NULL`・`OR`・`IN`・
+    /// `BETWEEN`・`NOT`・`<>`・組み込み関数）と、`OR`／`NOT` の内側を含めて拒否する形。
+    // intentional: docs/design/create-view.md
+    #[test]
+    fn simple_body_accepts_expression_predicates_and_rejects_non_builtin_forms() {
+        let accepted = [
+            "SELECT * FROM t WHERE n > 3",
+            "SELECT * FROM t WHERE n > 3;",
+            "SELECT * FROM t WHERE n IS NULL",
+            "SELECT * FROM t WHERE n IS NOT NULL",
+            "SELECT * FROM t WHERE s <> 'a'",
+            "SELECT * FROM t WHERE s = 'a' OR n > 3",
+            "SELECT * FROM t WHERE n + 1 > 3",
+            "SELECT * FROM t WHERE n IN (1, 2)",
+            "SELECT * FROM t WHERE s NOT IN ('a')",
+            "SELECT * FROM t WHERE n BETWEEN 1 AND 5",
+            "SELECT * FROM t WHERE NOT (s = 'a' OR n > 3)",
+            "SELECT * FROM t WHERE lower(s) = 'a'",
+            "SELECT * FROM t WHERE COALESCE(n, 0) > 1",
+            "SELECT * FROM t WHERE n > 3 OR n IS NULL",
+        ];
+        for sql in accepted {
+            parse_simple(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        let rejected = [
+            "SELECT * FROM t WHERE myfn(n) > 1",
+            "SELECT * FROM t WHERE s = 'a' OR myfn(n) > 1",
+            "SELECT * FROM t WHERE NOT (myfn(n) > 1)",
+            "SELECT * FROM t WHERE now() > n",
+            "SELECT * FROM t WHERE current_date > n",
+            "SELECT * FROM t WHERE json_typeof(n) = 'a'",
+            "SELECT * FROM t WHERE visible()",
+            "SELECT * FROM t WHERE s = 'a' OR visible()",
+            "SELECT * FROM t WHERE lower(s) LIKE 'a%'",
+            "SELECT * FROM t WHERE n = 1 OR lower(s) LIKE 'a%'",
+            "SELECT * FROM t WHERE n IN (SELECT n FROM u)",
+            "SELECT * FROM t WHERE n > 3 LIMIT 5",
+        ];
+        for sql in rejected {
+            let err = parse_simple(sql)
                 .err()
-                .unwrap_or_else(|| panic!("{sql} should be rejected"));
+                .unwrap_or_else(|| panic!("{sql} accepted"));
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    /// Issue #3238: CTE 本文・派生表本文の判定表は据え置き（`n > 3`・`OR` は `42601`）。
+    // intentional: docs/design/create-view.md
+    #[test]
+    fn cte_body_predicate_table_stays_strict() {
+        let limits = crate::nesting_limits::NestingLimits::default();
+        for sql in [
+            "SELECT * FROM t WHERE n > 3",
+            "SELECT * FROM t WHERE s = 'a' OR s = 'b'",
+            "SELECT * FROM t WHERE n IS NULL",
+        ] {
+            let tokens = lexer::tokenize(sql).expect("tokenize");
+            let err = parse_cte_select_body(&tokens, limits)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} accepted"));
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+        let tokens = lexer::tokenize("SELECT * FROM t WHERE s = 'a'").expect("tokenize");
+        parse_cte_select_body(&tokens, limits).expect("simple equality is accepted");
+    }
+
+    /// Issue #3238: 受理形すべてで「保存描画 → `tokenize_stored_view_body` → `parse_view_body`」が
+    /// 元の AST（ゾーンなし TIMESTAMPTZ は UTC 確定形へ正規化）に戻る。
+    #[test]
+    fn simple_body_expression_predicates_round_trip() {
+        for sql in [
+            "SELECT * FROM t WHERE n > 3",
+            "SELECT * FROM t WHERE n IS NOT NULL",
+            "SELECT s FROM t WHERE s <> 'it''s'",
+            "SELECT * FROM t WHERE s = 'a' OR n > 3",
+            "SELECT * FROM t WHERE n + 1 > 3 AND n * 2 <= 10",
+            "SELECT * FROM t WHERE n IN (1, 2) AND s IN ('a', 'b''c')",
+            "SELECT * FROM t WHERE n BETWEEN 1 AND 5",
+            "SELECT * FROM t WHERE NOT (s = 'a' OR n > 3)",
+            "SELECT * FROM t WHERE lower(s) = 'a'",
+            "SELECT * FROM t WHERE COALESCE(n, 0) > -1",
+            "SELECT * FROM t WHERE CASE WHEN n > 1 THEN 1 ELSE 0 END = 1",
+            "SELECT * FROM t WHERE n > 1.5",
+            "SELECT * FROM t WHERE CAST(n AS BIGINT) > 3",
+            "SELECT * FROM t WHERE s = 'a' OR FALSE",
+            "SELECT * FROM t WHERE n > 3 OR n IS NULL",
+            "SELECT * FROM t WHERE \"current_date\" > 3",
+        ] {
+            let body = parse_simple(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            let stored = render_stored_simple_view_body(&body)
+                .unwrap_or_else(|e| panic!("{sql}: render {e:?}"));
+            let retokens = lexer::tokenize_stored_view_body(&stored).expect("retokenize");
+            let reparsed = parse_view_body(&retokens).expect("reparse");
+            let mut expected = body.clone();
+            crate::sql::check_constraint::normalize_session_local_predicates(
+                &mut expected.where_predicates,
+            );
+            assert_eq!(reparsed, expected, "{sql} -> {stored}");
+        }
+    }
+
+    /// Issue #3238: 真偽語・時刻語と同名の引用列を式・`IN`・`IS NULL` に置いた本文と、ゾーンなし／
+    /// ありの `TIMESTAMPTZ` リテラルは、保存描画が元の AST へ戻る（正規化後）か、往復ガードが
+    /// `42601` で拒否する。黙って別の意味で保存されることはない。
+    // intentional: docs/design/create-view.md
+    #[test]
+    fn quoted_reserved_names_and_timestamptz_round_trip_or_are_refused() {
+        for sql in [
+            "SELECT * FROM t WHERE \"true\" IN ('a')",
+            "SELECT * FROM t WHERE \"false\" IS NULL",
+            "SELECT * FROM t WHERE \"current_date\" IS NOT NULL",
+            "SELECT * FROM t WHERE \"true\" + 1 > 3",
+            "SELECT * FROM t WHERE \"current_date\" + 1 > 3 OR n IS NULL",
+            "SELECT * FROM t WHERE ts > TIMESTAMPTZ '2024-01-01 00:00:00'",
+            "SELECT * FROM t WHERE ts > TIMESTAMPTZ '2024-01-01 00:00:00+09'",
+        ] {
+            let Ok(body) = parse_simple(sql) else {
+                continue;
+            };
+            let Ok(stored) = render_stored_simple_view_body(&body) else {
+                // 往復ガードによる拒否（fail-closed）。
+                continue;
+            };
+            let retokens = lexer::tokenize_stored_view_body(&stored).expect("retokenize");
+            let reparsed = parse_view_body(&retokens).expect("reparse");
+            let mut expected = body.clone();
+            crate::sql::check_constraint::normalize_session_local_predicates(
+                &mut expected.where_predicates,
+            );
+            assert_eq!(reparsed, expected, "{sql} -> {stored}");
+        }
+    }
+
+    /// Issue #3238: 描画が再解析と一致しない AST は `42601` で保存を拒否する（往復ガード）。
+    // intentional: docs/design/create-view.md
+    #[test]
+    fn round_trip_guard_rejects_non_round_trippable_body() {
+        let mut body = parse_simple("SELECT * FROM t WHERE n > 3").expect("parse");
+        // UDF 述語は `parse_view_body` が拒否するため、描画しても再解析できない。
+        body.where_predicates.push(WherePredicate::PredicateCall {
+            name: "visible".to_string(),
+        });
+        let err = render_stored_simple_view_body(&body).expect_err("rejected");
+        assert_eq!(err.wire_code(), "42601");
     }
 
     /// 単純形ビュー本文の列改名（TABLE-38 のポインタ、Issue #1621）。投影・全述語形の列を

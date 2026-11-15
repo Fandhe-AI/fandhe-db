@@ -288,8 +288,9 @@ fn temp_table_inherits_configured_limits() {
     .expect("within limit");
 }
 
-/// JOIN の WHERE・HAVING・CASE の条件・ビュー本体・式索引は本 Issue の対象外で、
-/// 黙って誤評価せず `42601` で fail-closed になる。
+/// JOIN の WHERE・HAVING・CASE の条件・式索引は本 Issue の対象外で、
+/// 黙って誤評価せず `42601` で fail-closed になる。ビュー本体の `WHERE` は Issue #3238 以降、
+/// 組み込み関数だけの式述語として受理し、結果は基表への直接実行と一致する。
 /// （サブクエリ内側の素の Scan は Issue #1853 で `LIMIT` 省略を受理したため、通常の WHERE と同じく評価される。）
 #[test]
 fn other_contexts_fail_closed() {
@@ -302,10 +303,26 @@ fn other_contexts_fail_closed() {
     ] {
         assert_eq!(exec(&core, "tenant-a", q).expect_err(q), "42601", "{q}");
     }
-    for q in [
-        "CREATE VIEW v AS SELECT id FROM t WHERE s ~ 'a'",
-        "CREATE INDEX ix ON t ((s ~ 'a'))",
-    ] {
-        assert_eq!(ddl(&core, q).expect_err(q), "42601", "{q}");
-    }
+    assert_eq!(
+        ddl(&core, "CREATE INDEX ix ON t ((s ~ 'a'))").expect_err("expression index"),
+        "42601"
+    );
+    ddl(&core, "CREATE VIEW v AS SELECT id FROM t WHERE s ~ 'a'").expect("view body accepts ~");
+    let via_view = match exec(&core, "tenant-a", "SELECT id FROM v LIMIT 100").expect("view") {
+        SqlOutcome::Query(r) => {
+            let mut v: Vec<u64> = r
+                .rows
+                .iter()
+                .map(|row| match row.cells.first() {
+                    Some(Cell::Integer(n)) => *n,
+                    Some(Cell::SignedInteger(n)) => u64::try_from(*n).expect("non-negative id"),
+                    other => panic!("expected id cell, got {other:?}"),
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        }
+        other => panic!("expected Query, got {other:?}"),
+    };
+    assert_eq!(via_view, ids(&core, "s ~ 'a'"));
 }
