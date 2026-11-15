@@ -281,7 +281,7 @@ def parse_explain_rows(rows: list[str]) -> dict:
     """`EXPLAIN` の返却行から `engine`／`ann_plan` を例外なしで取り出す。
 
     `verify_explain_rows` と違い検証しない（欠けた項目は `None`）。実際の kNN 形
-    SQL（`ORDER BY embedding <#> ...`）が HNSW に到達するかを記録するための
+    SQL（`ORDER BY embedding <=> ...`）が HNSW に到達するかを記録するための
     観測用で、`self_db.py` の `ann_probe.knn_operator_plan` と
     `knn_reaches_hnsw` 判定に使う（Issue #2952）。
     """
@@ -296,7 +296,7 @@ HNSW_REACHED_ANN_PLANS = frozenset({"hnsw_full_visible", "hnsw_subset"})
 def knn_reaches_hnsw(plan: dict) -> bool:
     """`parse_explain_rows` の結果から kNN が実際に HNSW 索引へ到達するかを返す。
 
-    `engine:` は構成上のエンジン種別で、`<#>` では opclass 不一致により
+    `engine:` は構成上のエンジン種別で、演算子が HNSW の対応 metric 外（opclass 不一致）だと
     `plain_scan_opclass_mismatch` へ倒れても `hnsw` のままになる。そのため
     `ann_plan` が `hnsw_full_visible`／`hnsw_subset` のときだけ真とし、
     plain_scan 系・欠落は偽（fail-closed）とする（Issue #2952）。

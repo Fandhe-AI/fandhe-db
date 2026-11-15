@@ -122,7 +122,7 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
   `common.py::public_only_where` 相当）を模倣しているだけで、ポリシー強制の
   実コストは払っていない。
 - **pgvector の HNSW 索引が使われていない可能性**（Issue #661）: `explain`
-  フェーズ（`WHERE visibility='public' ORDER BY <#> LIMIT 10` と同形のクエリ）の
+  フェーズ（`WHERE visibility='public' ORDER BY <=> LIMIT 10` と同形のクエリ）の
   `sample_output` は `pgvector_exact.json`・`pgvector_hnsw.json`（いずれも
   `docs/design/bench-data/crossdb-20260908/results/`）で完全同一の実行計画
   （`Bitmap Index Scan on docs_visibility_idx` → `Bitmap Heap Scan`
@@ -1021,6 +1021,20 @@ plain_scan_opclass_mismatch`）。上記の `ann_probe` はコサイン既定の
 実際の kNN 形の `EXPLAIN` は `ann_probe.knn_operator_plan` に記録し、到達しない
 ときは `hnsw_index_warm` を unsupported・`ef_search` を `null` とする。本節と
 下記の過去の hnsw 計測値は `<=>` 時点のもので、書き換えていない。
+
+**Issue #3224 の注記（`<=>` へ復帰）**: self の kNN を `<#>` から `<=>`（コサイン）へ戻した
+（SQL-33）。理由は 2 つで、(1) `<#>` は HNSW の対応 metric 外のため `--config hnsw` が
+ANN に到達しなかった、(2) `USING MODE 'precision'` だけ `<#>` と併用できず `<=>` の例外が
+残っていた。復帰で全 kNN 形が同じ演算子になり例外は無くなった。前提のコサイン経路の並列化
+（#3215）は完了済み。他 DB と recall 正解は内積のまま変えない。フィクスチャが L2 正規化済みなら
+コサインと内積の順位は一致するため。実データ確認（docs 25,000 行・可視 23,000 行・128 次元、
+クエリ 200 本）: 最大 |‖v‖−1| = 8.7e-8、ゼロノルムは doc・クエリとも 0 件。以降の run は
+`meta.fixture_norm` に同じ集計を記録する。
+**bisect の注意**: `vector_knn` など kNN 系フェーズの値は、`<#>` 切り替えのコミット
+（b0fec8aa）と本復帰のコミットをまたいで直接比較できない（演算子とカーネル経路が違う）。
+前後 A/B（同一ホスト・N≥5 ペア）と hnsw 構成での `knn_reaches_hnsw=true`・`recall_at_10` の
+実測は、この共有環境では実施しておらず**未検証**（実測しないため数値は載せない。専有環境での
+再測定は #3226 の担当）。
 
 ### `hnsw_index_warm`（索引構築の実行証跡）
 
