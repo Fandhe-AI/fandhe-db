@@ -37,7 +37,7 @@ use super::text_query::{
 };
 use super::{
     tokenize_analyzed, Bm25Params, Candidate, DocId, ScoreScope, SparseIndex, SparseScored, TermId,
-    TextAnalysis, VisibleBitmap,
+    TextAnalysis, VisibleBitmap, VisibleDocs,
 };
 use crate::text_query_limits::TextQueryLimits;
 
@@ -281,6 +281,19 @@ impl SparseIndex {
         params: Bm25Params,
         limits: &TextQueryLimits,
     ) -> Result<SparseScored, TextSearchError> {
+        self.score_text_query_within_docs(query, VisibleDocs::Set(visible_ids), params, limits)
+    }
+
+    /// [`Self::score_text_query_within`] の可視集合表現を [`VisibleDocs`] へ一般化した
+    /// crate 内部版（Issue #3221）。hybrid 検索が全可視の形で `BTreeSet` を作らずに呼ぶ。
+    /// 入口検証の順序・結果は `Set` 経路と同一。
+    pub(crate) fn score_text_query_within_docs(
+        &self,
+        query: &TextQuery,
+        visible_ids: VisibleDocs<'_>,
+        params: Bm25Params,
+        limits: &TextQueryLimits,
+    ) -> Result<SparseScored, TextSearchError> {
         let params = if params == self.params() {
             params
         } else {
@@ -302,7 +315,7 @@ impl SparseIndex {
         if plans.is_empty() || visible_ids.is_empty() {
             return Ok(empty());
         }
-        let bitmap = VisibleBitmap::build(self, visible_ids);
+        let bitmap = VisibleBitmap::build_docs(self, visible_ids);
         if bitmap.n == 0 {
             return Ok(empty());
         }
