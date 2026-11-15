@@ -331,6 +331,31 @@ fn row_compare_type_matching_follows_scalar_comparison() {
     ] {
         assert_eq!(ids(&core, "alice", sql), want, "{sql}");
     }
+    // 文字列リテラル形の DATE 成分もスカラの `d <op> '<lit>'` と同じ宣言的経路で評価する（両向き・<>）。
+    for (sql, want) in [
+        (
+            "SELECT id FROM y WHERE (d, i) < ('2024-03-01', 5) LIMIT 10",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM y WHERE ('2024-03-01', i) > (d, 0) LIMIT 10",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM y WHERE (d, i) = ('2024-06-01', 2) LIMIT 10",
+            vec![2],
+        ),
+        (
+            "SELECT id FROM y WHERE (d, i) <> ('2024-06-01', 2) LIMIT 10",
+            vec![1],
+        ),
+        (
+            "SELECT id FROM y WHERE (d, i) >= ('2024-01-01', 1) LIMIT 10",
+            vec![1, 2],
+        ),
+    ] {
+        assert_eq!(ids(&core, "alice", sql), want, "{sql}");
+    }
     // 型の組が通常の比較で拒否されるなら、行値でも同じコードで拒否される。
     let scalar = code(&core, "SELECT id FROM y WHERE i = 'abc' LIMIT 10");
     assert_eq!(

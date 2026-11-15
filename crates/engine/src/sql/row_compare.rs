@@ -83,6 +83,44 @@ fn bool_literal(e: &Expr) -> Option<bool> {
     }
 }
 
+/// `<col> <op> '<lit>'`（または逆向き）を宣言的な `Equality`／`Compare` へ写す。
+/// 列は裸の識別子（真偽値リテラルを除く）に限る。該当しなければ `None`（式レーンへ回す）。
+fn declarative_leaf(op: BinOp, l: &Expr, r: &Expr) -> Option<WherePredicate> {
+    use crate::sql::allowlist::CompareOp;
+    let (column, value, op) = match (l, r) {
+        (Expr::Ident(c), Expr::String(v)) if bool_literal(l).is_none() => (c, v, op),
+        (Expr::String(v), Expr::Ident(c)) if bool_literal(r).is_none() => {
+            let flipped = match op {
+                BinOp::Lt => BinOp::Gt,
+                BinOp::Le => BinOp::Ge,
+                BinOp::Gt => BinOp::Lt,
+                BinOp::Ge => BinOp::Le,
+                other => other,
+            };
+            (c, v, flipped)
+        }
+        _ => return None,
+    };
+    let cmp = match op {
+        BinOp::Eq => {
+            return Some(WherePredicate::Equality {
+                column: column.clone(),
+                value: value.clone(),
+            })
+        }
+        BinOp::Lt => CompareOp::Lt,
+        BinOp::Le => CompareOp::Le,
+        BinOp::Gt => CompareOp::Gt,
+        BinOp::Ge => CompareOp::Ge,
+        _ => return None,
+    };
+    Some(WherePredicate::Compare {
+        column: column.clone(),
+        op: cmp,
+        value: value.clone(),
+    })
+}
+
 /// 比較葉 1 件を作る。`<col> = TRUE|FALSE`（どちらの向きでも）は通常の比較と同じく
 /// 宣言的な `BoolEquality` にする（BOOLEAN 列は式内で束縛できないため）。
 /// それ以外の BOOLEAN 成分・INTERVAL 成分は通常の比較と同じ束縛エラー（fail-closed）になる。
@@ -105,6 +143,14 @@ fn leaf(
                 value,
             });
         }
+    }
+    // 列 × 文字列リテラルは、スカラの WHERE（`allowlist` の列比較葉）と同じ宣言的な型経路
+    // （`Equality`／`Compare`）にする。DATE・TIMESTAMP・INTERVAL・ENUM・UUID・BYTEA の
+    // 文字列リテラル比較は式レーンでは束縛できないため。逆向き（`'lit' < col`）は演算子を
+    // 反転して同じ葉へ写す（意味は同値）。
+    if let Some(pred) = declarative_leaf(op, l, r) {
+        charge(budget, 1)?;
+        return Ok(pred);
     }
     charge(
         budget,
