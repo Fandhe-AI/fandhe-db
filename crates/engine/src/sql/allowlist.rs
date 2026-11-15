@@ -8455,7 +8455,12 @@ impl<'a> Parser<'a> {
                 ),
                 // SQL-57・Issue #1809: `COUNT(DISTINCT (a + b))`・`COUNT(DISTINCT -n)` も修飾子と読む
                 // （数値・文字列リテラルは従来どおり対象外。`COUNT(distinct)` の列名互換を保つ）。
-                AggregateFunc::Count => {
+                // Issue #3263: `SUM`／`AVG`／`MIN`／`MAX` の `DISTINCT` も同じ読み。
+                AggregateFunc::Count
+                | AggregateFunc::Sum
+                | AggregateFunc::Avg
+                | AggregateFunc::Min
+                | AggregateFunc::Max => {
                     matches!(after_distinct, Some(Token::Punct('(' | '-' | '+')))
                 }
                 _ => false,
@@ -8469,13 +8474,22 @@ impl<'a> Parser<'a> {
         if distinct
             && !matches!(
                 func,
-                AggregateFunc::Count | AggregateFunc::StringAgg | AggregateFunc::ArrayAgg
+                AggregateFunc::Count
+                    | AggregateFunc::Sum
+                    | AggregateFunc::Avg
+                    | AggregateFunc::Min
+                    | AggregateFunc::Max
+                    | AggregateFunc::StringAgg
+                    | AggregateFunc::ArrayAgg
             )
         {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is only allowed inside COUNT(DISTINCT ...), string_agg and array_agg",
+                "DISTINCT is only allowed inside COUNT, SUM, AVG, MIN, MAX, string_agg and array_agg",
             ));
         }
+        // Issue #3263: `MIN`／`MAX(DISTINCT x)` は重複除去が結果に影響しないため、解析直後に
+        // 非 DISTINCT 形へ畳む（状態・予算を持たせず、同一文の `MIN(x)` とアキュムレータを共有する）。
+        let distinct = distinct && !matches!(func, AggregateFunc::Min | AggregateFunc::Max);
         let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
             if func != AggregateFunc::Count {
                 return Err(SqlSurfaceError::unsupported(
@@ -38610,7 +38624,7 @@ mod tests {
         assert_eq!(code("SELECT string_agg(*) FROM documents"), "42601");
         assert_eq!(code("SELECT sum(a, b) FROM documents"), "42601");
         assert_eq!(code("SELECT count(a ORDER BY a) FROM documents"), "42601");
-        assert_eq!(code("SELECT sum(DISTINCT a) FROM documents"), "42601");
+        assert_eq!(code("SELECT variance(DISTINCT a) FROM documents"), "42601");
         let keys = ["a"; MAX_SCALAR_ORDER_KEYS + 1].join(", ");
         assert_eq!(
             code(&format!(
@@ -39737,12 +39751,45 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// Issue #3263（SQL-25）: `SUM`／`AVG`／`MIN`／`MAX(DISTINCT)` を受理する。`MIN`／`MAX` は
+    /// 解析直後に非 DISTINCT 形へ畳まれる（`distinct == false`）。`(`・符号の続く形も修飾子と読む。
     #[test]
-    fn rejects_sum_distinct() {
+    fn accepts_sum_avg_min_max_distinct_modifier() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT SUM(DISTINCT id) FROM documents", &lookup)
-            .expect_err("DISTINCT is only allowed inside COUNT");
-        assert_eq!(err.wire_code(), "42601");
+        for (sql, expect_distinct) in [
+            ("SELECT SUM(DISTINCT id) FROM documents", true),
+            ("SELECT AVG(DISTINCT id) FROM documents", true),
+            ("SELECT SUM(DISTINCT (id + 1)) FROM documents", true),
+            ("SELECT SUM(DISTINCT -id) FROM documents", true),
+            ("SELECT MIN(DISTINCT id) FROM documents", false),
+            ("SELECT MAX(DISTINCT id) FROM documents", false),
+        ] {
+            let agg = expect_aggregate(sql, &lookup);
+            assert_eq!(
+                expect_agg_item(&agg.items()[0]).distinct,
+                expect_distinct,
+                "{sql}"
+            );
+        }
+        // 列名 `distinct` の互換は維持する。
+        let agg = expect_aggregate("SELECT SUM(distinct) FROM documents", &lookup);
+        assert!(!expect_agg_item(&agg.items()[0]).distinct);
+    }
+
+    /// Issue #3263: DISTINCT を受理しない集計は従来どおり `42601`（`*`・ウィンドウも同様）。
+    #[test]
+    fn rejects_distinct_in_non_supporting_aggregates() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT variance(DISTINCT id) FROM documents",
+            "SELECT stddev(DISTINCT id) FROM documents",
+            "SELECT bool_and(DISTINCT id) FROM documents",
+            "SELECT every(DISTINCT id) FROM documents",
+            "SELECT SUM(DISTINCT *) FROM documents",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
     }
 
     /// `distinct` という列名の後方互換（SQL-25 (c) 追加前の既存解釈を維持する）。
