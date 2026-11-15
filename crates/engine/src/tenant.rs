@@ -3389,7 +3389,9 @@ fn apply_upsert_assignments(
                 })?;
                 crate::sql::upsert_add::eval_upsert_add(
                     &column.ty,
-                    column.nullable,
+                    // 遅延時は NOT NULL 検査も後回しにする（BEFORE UPDATE が NULL を補正・スキップできる。
+                    // 最終 NEW の encode が NOT NULL を厳格に検査する）。
+                    column.nullable || defer_value_validation,
                     &column.name,
                     current,
                     rhs,

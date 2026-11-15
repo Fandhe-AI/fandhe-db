@@ -519,3 +519,63 @@ fn set_result_is_validated_after_before_update() {
     assert_eq!(code(&core3, &a, UPSERT_NULLING), "23502");
     assert_eq!(read_rows(&core3, &a, "trg"), vec![(1, "x".to_string(), 10)]);
 }
+
+// 加算式（`n = n + EXCLUDED.d`）の NULL 結果も他の SET 値と同じく BEFORE ROW UPDATE の後に検査される。
+// BEFORE が NEW.n を補正すれば成功し、NULL のまま残れば最終 NEW が NOT NULL 違反（23502）になる。
+#[test]
+fn add_result_null_is_validated_after_before_update() {
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+    const ADD_NULL: &str = "INSERT INTO addt (id, embedding, a, n, d) \
+        VALUES (1, '[9.0,0.0]', 'x', 1, NULL) \
+        ON CONFLICT (id) DO UPDATE SET n = n + EXCLUDED.d";
+    let a = ctx("tenant-a");
+    for fix in [true, false] {
+        let dir = crate::test_util::temp_db::tempdir();
+        let (core, _c) = core_with(
+            dir.path(),
+            Box::new(move |c| {
+                let mut row = c.new_row.to_vec();
+                if fix
+                    && c.tg_when() == "BEFORE"
+                    && c.tg_level() == "ROW"
+                    && c.tg_op() == "UPDATE"
+                    && matches!(row.get(2), Some(Value::Null))
+                {
+                    row[2] = Value::BigInt(7);
+                }
+                Ok(TriggerOutcome::Proceed(row))
+            }),
+        );
+        core.storage
+            .create_table(&TableSchema::new(
+                "addt",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("a", ColumnType::Text, true),
+                    ColumnDef::new("n", ColumnType::BigInt, false),
+                    ColumnDef::new("d", ColumnType::BigInt, true),
+                ],
+            ))
+            .expect("create addt");
+        run(
+            &core,
+            &a,
+            "INSERT INTO addt (id, embedding, a, n, d) VALUES (1, '[1.0,0.0]', 'x', 10, 1)",
+        )
+        .expect("seed");
+        add_trigger(
+            &core.storage,
+            "tenant-a",
+            "addt",
+            &trig("f_br", TriggerTiming::Before, TriggerLevel::Row, UPD),
+        );
+        if fix {
+            let out = run(&core, &a, ADD_NULL).expect("fixed by BEFORE UPDATE");
+            assert_eq!(super::trigger_insert_tests::rows_affected(out), 1);
+            assert_eq!(read_rows(&core, &a, "addt"), vec![(1, "x".to_string(), 7)]);
+        } else {
+            assert_eq!(code(&core, &a, ADD_NULL), "23502");
+            assert_eq!(read_rows(&core, &a, "addt"), vec![(1, "x".to_string(), 10)]);
+        }
+    }
+}
