@@ -423,7 +423,16 @@ impl CastType {
             CastType::Bytea => ArrayElemType::Bytea,
             CastType::Json => ArrayElemType::Json,
             CastType::Jsonb => ArrayElemType::Jsonb,
-            _ => return None,
+            // 対応する要素型が無い CAST 型（束縛段が `0A000` にする）。CastType の追加時・
+            // 要素型の追加時にここで対応判断を強制する（Issue #3229）。
+            CastType::Int2
+            | CastType::Numeric(None)
+            | CastType::Varchar(_)
+            | CastType::Bpchar(_)
+            | CastType::Time
+            | CastType::TimestampTz
+            | CastType::Interval
+            | CastType::Array(_) => return None,
         })
     }
 
@@ -1932,5 +1941,22 @@ mod tests {
                 .wire_code(),
             "54000"
         );
+    }
+
+    /// Issue #3229: 配列要素型 ⇔ CAST 型の写像が全要素型で往復する（Enum は対象外で `None`）。
+    #[test]
+    fn array_elem_cast_mapping_roundtrips_for_all_kinds() {
+        for elem in ArrayElemType::ALL_KINDS {
+            if elem == ArrayElemType::Enum {
+                assert!(elem_cast_type(elem).is_none());
+                assert!(crate::sql::cast_value::elem_cast_src(elem).is_none());
+                assert!(crate::sql::cast_value::elem_cast_dst(elem).is_none());
+                continue;
+            }
+            let ct = elem_cast_type(elem).expect("non-enum element has a cast type");
+            assert_eq!(CastType::Array(Box::new(ct)).array_elem_type(), Some(elem));
+            assert!(crate::sql::cast_value::elem_cast_src(elem).is_some());
+            assert!(crate::sql::cast_value::elem_cast_dst(elem).is_some());
+        }
     }
 }

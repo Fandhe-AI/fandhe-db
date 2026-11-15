@@ -1346,7 +1346,17 @@ impl<'a> ArrayRef<'a> {
             ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Jsonb => Ok(
                 std::borrow::Cow::Owned(self.to_value()?.equality_payload()?),
             ),
-            _ => Ok(std::borrow::Cow::Borrowed(self.bytes)),
+            ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Bytea
+            | ArrayElemType::Enum => Ok(std::borrow::Cow::Borrowed(self.bytes)),
         }
     }
 
@@ -2159,7 +2169,25 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
                 })?;
             }
         }
-        _ => {}
+        // 検査対象なしの組。全要素型を列挙し、要素型の追加時にコンパイルエラーで
+        // 検証要否の判断を強制する（Issue #3229）。
+        (
+            ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Enum,
+            _,
+        ) => {}
     }
     Ok(())
 }

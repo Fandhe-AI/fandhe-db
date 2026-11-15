@@ -9180,7 +9180,19 @@ fn resolve_array_agg_input(
                         .to_string(),
                 })
             }
-            _ => {}
+            // 比較・順序づけに支障のない要素型。要素型の追加時に判断を強制する（Issue #3229）。
+            ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Enum => {}
         }
     }
     let mut keys: Vec<StringAggOrderKey> =

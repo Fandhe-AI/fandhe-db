@@ -420,3 +420,137 @@ fn wire_multi_dimensional_array_roundtrips_and_rejects_ragged_literals() {
     expect_error_response_with_sqlstate(&mut stream, "22P02");
     read_ready_for_query(&mut stream);
 }
+/// Issue #3229（要素型追加の土台）の回帰: 既存の全 13 種の配列要素型が、末尾 `;` 付きの単独
+/// 簡易クエリ（psql と同じ送り方）で往復し、`RowDescription` が要素型ごとの配列 OID を公告する
+/// （TABLE-14・TABLE-35・WIRE-13）。別テナントからは 0 行で、OID は同じ（RLS 相当の境界は不変）。
+#[test]
+fn wire_all_existing_array_elem_types_roundtrip_with_oids_and_tenant_isolation() {
+    // (列名, 要素型, 期待 OID, 挿入リテラル, 期待テキスト)
+    let cases: Vec<(&str, ArrayElemType, i32, &str, &str)> = vec![
+        ("c_text", ArrayElemType::Text, 1009, "{a,b}", "{a,b}"),
+        ("c_bool", ArrayElemType::Bool, 1000, "{t,f}", "{t,f}"),
+        ("c_int", ArrayElemType::Integer, 1007, "{1,2}", "{1,2}"),
+        ("c_big", ArrayElemType::BigInt, 1016, "{3,4}", "{3,4}"),
+        ("c_real", ArrayElemType::Real, 1021, "{1.5}", "{1.5}"),
+        ("c_dbl", ArrayElemType::Double, 1022, "{2.5}", "{2.5}"),
+        (
+            "c_date",
+            ArrayElemType::Date,
+            1182,
+            "{2024-01-02}",
+            "{2024-01-02}",
+        ),
+        (
+            "c_ts",
+            ArrayElemType::Timestamp,
+            1115,
+            r#"{"2024-01-02 03:04:05"}"#,
+            r#"{"2024-01-02 03:04:05"}"#,
+        ),
+        (
+            "c_uuid",
+            ArrayElemType::Uuid,
+            2951,
+            "{00000000-0000-0000-0000-000000000001}",
+            "{00000000-0000-0000-0000-000000000001}",
+        ),
+        (
+            "c_num",
+            ArrayElemType::Numeric {
+                precision: 10,
+                scale: 2,
+            },
+            1231,
+            "{1.5}",
+            "{1.50}",
+        ),
+        (
+            "c_bytea",
+            ArrayElemType::Bytea,
+            1001,
+            r#"{"\\x0102"}"#,
+            r#"{"\\x0102"}"#,
+        ),
+        (
+            "c_json",
+            ArrayElemType::Json,
+            199,
+            r#"{"{\"a\":1}"}"#,
+            r#"{"{\"a\":1}"}"#,
+        ),
+        (
+            "c_jsonb",
+            ArrayElemType::Jsonb,
+            3807,
+            r#"{"{\"a\":1}"}"#,
+            r#"{"{\"a\":1}"}"#,
+        ),
+    ];
+
+    let path = temp_db::unique_db_path("wire-array-all-elem-types");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let mut columns = vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)];
+    for (name, elem, ..) in &cases {
+        columns.push(ColumnDef::new(
+            *name,
+            ColumnType::Array(ArrayType::new(*elem, 4).expect("array ty")),
+            true,
+        ));
+    }
+    storage
+        .create_table(&TableSchema::new("allarr", columns))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addrs = spawn_with_users(
+        core,
+        &[
+            ("alice", "tenant-alice", "pw-alice"),
+            ("bob", "tenant-bob", "pw-bob"),
+        ],
+    );
+    let names: Vec<&str> = cases.iter().map(|c| c.0).collect();
+    let select = format!(
+        "SELECT {} FROM allarr WHERE id = 1 LIMIT 1;",
+        names.join(", ")
+    );
+
+    let mut alice = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+    let insert = format!(
+        "INSERT INTO allarr (id, embedding, {}) VALUES (1, '[0.1,0.2]', {}) USING OPERATION_ID 'op-all'",
+        names.join(", "),
+        cases
+            .iter()
+            .map(|c| format!("'{}'", c.3))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    send_simple_query(&mut alice, &insert);
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(&mut alice, &select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(desc.len(), cases.len());
+    for ((name, oid), case) in desc.iter().zip(&cases) {
+        assert_eq!(name, case.0);
+        assert_eq!(*oid, case.2, "OID of {name}");
+    }
+    let row = read_data_row(&mut alice);
+    for (cell, case) in row.iter().zip(&cases) {
+        assert_eq!(cell.as_deref(), Some(case.4), "value of {}", case.0);
+    }
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    // 別テナントは同じ OID を見るが行は見えない。
+    let mut bob = authenticate_to_ready_for_query(addrs[0], "bob", "pw-bob");
+    send_simple_query(&mut bob, &select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}
