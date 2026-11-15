@@ -24385,6 +24385,13 @@ fn parse_set_limited_branch(
         ));
     }
     reject_aggregate_in_branch_items(&shape.projection)?;
+    // select list の値サブクエリは枝では束縛しない（fail-closed。Issue #3270。式項目の
+    // 受理解禁で、従来の一括拒否が担っていた経路が素通りしないようにする）。
+    if !shape.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries in the select list are not allowed inside a set operation branch",
+        ));
+    }
     // Issue #1188: 式キーの `ORDER BY` は集合演算の枝では非対応（式キーを含む文は
     // `order_by` が空になるため、黙って渡すと並べ替えなしで LIMIT が適用される）。
     // 列キー（`NULLS FIRST|LAST` 付きを含む）は `bind_scan` が処理できるため拒否しない。

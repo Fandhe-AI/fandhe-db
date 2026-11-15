@@ -241,13 +241,16 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
         match m {
             ColumnMeta::Scalar { ty, .. } => Some(ty),
             ColumnMeta::Computed { ty: Some(ty), .. } => Some(ty),
-            ColumnMeta::AliasedId { .. } => Some(&crate::sql::exec::ALIASED_ID_TYPE),
-            ColumnMeta::Id | ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
-                None
-            }
+            ColumnMeta::Id
+            | ColumnMeta::AliasedId { .. }
+            | ColumnMeta::Computed { ty: None, .. }
+            | ColumnMeta::Record { .. } => None,
         }
     }
     match (a, b) {
+        // 疑似列 `id`（`Cell::Integer`）は通常の NUMERIC 列（`Cell::Numeric`）と行キーのタグが
+        // 異なり、同値でも重複除去・交差・差が誤るため、`id` 同士以外とは互換にしない
+        // （fail-closed。`42804`。`Id` が従来そうである扱いへ `AliasedId` も揃える）。
         // 疑似列 `id` は別名の有無（`Id`／`AliasedId`）にかかわらず同じ値域として互換にする。
         (
             ColumnMeta::Id | ColumnMeta::AliasedId { .. },
@@ -1501,6 +1504,24 @@ mod tests {
     use crate::storage::{Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
     use redb::ReadableDatabase;
+
+    /// Issue #3270 レビュー対応: 別名付き `id`（`Cell::Integer`）と NUMERIC 列（`Cell::Numeric`）は
+    /// 行キーのタグが異なるため互換にしない。`id` 同士は別名の有無にかかわらず互換。
+    #[test]
+    fn aliased_id_is_incompatible_with_numeric_but_compatible_with_id() {
+        let aliased = ColumnMeta::AliasedId { name: "x".into() };
+        let numeric = ColumnMeta::Scalar {
+            name: "amount".into(),
+            ty: ColumnType::Numeric {
+                precision: 20,
+                scale: 0,
+            },
+        };
+        assert!(!columns_compatible(&aliased, &numeric));
+        assert!(!columns_compatible(&numeric, &aliased));
+        assert!(columns_compatible(&aliased, &ColumnMeta::Id));
+        assert!(columns_compatible(&aliased, &aliased));
+    }
 
     fn text_schema(name: &str) -> TableSchema {
         TableSchema::new(
