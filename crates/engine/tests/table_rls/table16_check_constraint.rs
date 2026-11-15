@@ -178,7 +178,8 @@ fn create_table_rejects_check_calling_visible() {
 
 /// Issue #1184: WHERE で受理する `NOT ( ... )`・数値の `IN`／`BETWEEN` は、CHECK 本体
 /// （TABLE-16）では従来どおり `42601` のまま（脱糖後の形が CHECK の許可形と区別
-/// できず、受理範囲が黙って広がるのを防ぐ）。
+/// できず、受理範囲が黙って広がるのを防ぐ。解禁は後続 Issue で扱う）。
+/// tracked: #3243, #3244
 #[test]
 fn create_table_rejects_not_group_and_numeric_in_between_in_check() {
     let (core, path) = new_core("check-1184-forms");
@@ -1305,4 +1306,50 @@ fn select_where_numeric_column_expression_is_accepted() {
         "SELECT id FROM docs WHERE qty > 0 LIMIT 100",
     )
     .expect("numeric column expression in WHERE must be accepted");
+}
+/// Issue #3242・TABLE-16・SQL-26: CHECK は三値論理で評価され、NULL を含む比較は UNKNOWN で
+/// 合格し、FALSE のときだけ `23514` になる。psql が送る末尾 `;` 付きの単独文でも同じ。
+/// 違反した文は副作用（行）を残さない。
+#[test]
+fn check_null_comparison_passes_and_false_is_rejected_with_trailing_semicolon() {
+    let (core, path) = new_core("check-3242-three-valued");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, b INTEGER, CHECK (a < b));",
+    )
+    .expect("CREATE TABLE with trailing semicolon should succeed");
+
+    for (id, values) in [
+        (1, "NULL, 5"),
+        (2, "5, NULL"),
+        (3, "NULL, NULL"),
+        (4, "1, 2"),
+    ] {
+        core.execute_insert_sql(
+            &alice,
+            &format!(
+                "INSERT INTO docs (id, a, b) VALUES ({id}, {values}) USING OPERATION_ID 'op-{id}';"
+            ),
+        )
+        .unwrap_or_else(|e| panic!("row {values} must pass (UNKNOWN or TRUE): {e:?}"));
+    }
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (5, 9, 1) USING OPERATION_ID 'op-5';",
+        )
+        .expect_err("FALSE comparison must be rejected");
+    assert_eq!(err.wire_code(), "23514");
+
+    // 違反した行は残らず、合格した 4 行だけが見える。
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
+        4
+    );
 }
