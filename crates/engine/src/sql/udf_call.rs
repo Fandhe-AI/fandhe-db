@@ -13198,6 +13198,13 @@ fn apply_vector_scalar_op<'a>(
 mod tests {
     use super::*;
 
+    /// SQL-57・Issue #3264: `json_agg`・`jsonb_agg` も集計関数名として予約される。
+    #[test]
+    fn json_agg_is_a_reserved_function_name() {
+        assert!(is_reserved_function_name("json_agg"));
+        assert!(is_reserved_function_name("JSONB_AGG"));
+    }
+
     /// SQL-57・Issue #1801: `array_agg` も集計関数名として予約され、同名の UDF は定義できない。
     #[test]
     fn array_agg_is_a_reserved_function_name() {

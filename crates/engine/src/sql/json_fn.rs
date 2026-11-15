@@ -330,7 +330,7 @@ fn scan_error(_: crate::json::JsonError) -> SqlSurfaceError {
 }
 
 /// `out` へ追記する（長さ上限を超える場合は確保前に `54000`）。
-fn push_checked(out: &mut String, piece: &str) -> Result<(), SqlSurfaceError> {
+pub(crate) fn push_checked(out: &mut String, piece: &str) -> Result<(), SqlSurfaceError> {
     let new_len = out.len().checked_add(piece.len()).ok_or_else(too_large)?;
     if new_len > MAX_JSON_FIELD_LEN {
         return Err(too_large());

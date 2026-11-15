@@ -197,6 +197,7 @@ pub mod insert_explain;
 pub(crate) mod insert_select;
 pub(crate) mod int8vec_knn;
 pub(crate) mod interval_arith;
+pub(crate) mod json_agg;
 pub(crate) mod matview;
 pub mod record_text;
 pub(crate) mod recursive_cte;

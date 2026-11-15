@@ -585,6 +585,73 @@ fn wire_jsonb_containment_operators_work_over_extended_query() {
         assert_eq!(value, Some(b"t".to_vec()), "{expr}");
     }
 }
+/// Issue #3264（SQL-57）: `json_agg`／`jsonb_agg` の結果列は json（OID 114）／jsonb（OID 3802）として
+/// RowDescription に載り、末尾 `;` 付きの単独送信（simple query）と extended query の両方で
+/// 同じ JSON テキストが届く。入力なしは NULL。
+#[test]
+fn wire_json_agg_advertises_type_oids_and_returns_json_text() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = common::spawn_server_with_engine(&users_path, core);
+    let mut alice = common::authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+
+    for (i, body) in [r#"{"a":1}"#, r#"{"a":2}"#].iter().enumerate() {
+        common::send_simple_query(
+            &mut alice,
+            &format!(
+                "INSERT INTO docs (id, embedding, docb) VALUES ({}, '[0.1,0.2,0.3]', '{body}') \
+                 USING OPERATION_ID 'op-agg-{i}'",
+                i + 1
+            ),
+        );
+        assert_eq!(common::read_command_complete(&mut alice), "INSERT 0 1");
+        common::read_ready_for_query(&mut alice);
+    }
+
+    common::send_simple_query(
+        &mut alice,
+        "SELECT json_agg(docb ORDER BY id) AS a, jsonb_agg(docb ORDER BY id) AS b FROM docs;",
+    );
+    assert_eq!(
+        common::read_row_description_with_oids(&mut alice),
+        vec![("a".to_string(), 114), ("b".to_string(), 3802)]
+    );
+    assert_eq!(
+        common::read_data_row(&mut alice),
+        vec![
+            Some(r#"[{"a":1}, {"a":2}]"#.to_string()),
+            Some(r#"[{"a":1},{"a":2}]"#.to_string()),
+        ]
+    );
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    // 入力なしは NULL。
+    common::send_simple_query(&mut alice, "SELECT json_agg(docb) FROM docs WHERE id = 99;");
+    common::read_row_description(&mut alice);
+    assert_eq!(common::read_data_row(&mut alice), vec![None]);
+    common::read_command_complete(&mut alice);
+    common::read_ready_for_query(&mut alice);
+
+    // extended query（Parse/Bind/Execute）。
+    let sql = "SELECT json_agg(docb ORDER BY id) FROM docs";
+    common::send_length_prefixed_message(&mut alice, b'P', &common::parse_body("sj", sql, 0));
+    common::send_length_prefixed_message(&mut alice, b'B', &common::bind_body("pj", "sj"));
+    common::send_length_prefixed_message(&mut alice, b'E', &common::execute_body("pj", 0));
+    common::send_length_prefixed_message(&mut alice, b'S', &[]);
+    let mut value = None;
+    loop {
+        let (kind, body) = common::read_message(&mut alice);
+        match kind {
+            b'1' | b'2' | b'C' => {}
+            b'D' => value = body.get(6..).map(|b| b.to_vec()),
+            b'Z' => break,
+            other => panic!("unexpected message {other:?}"),
+        }
+    }
+    assert_eq!(value, Some(br#"[{"a":1}, {"a":2}]"#.to_vec()));
+}
+
 #[test]
 fn wire_text_null_and_json_null_literal_are_distinguishable() {
     let (core, _guard) = new_core();
