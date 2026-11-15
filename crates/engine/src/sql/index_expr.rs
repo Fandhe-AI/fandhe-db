@@ -705,6 +705,24 @@ fn static_type_of(
         .map(|(_, ty)| ty)
 }
 
+/// 分岐式の各枝の配列要素型を統合する。`TIMESTAMPTZ` を含む枝があればそれ、無ければ最初に判明した要素型。
+fn merge_branch_elems<'a>(
+    branches: impl Iterator<Item = &'a Expr>,
+    schema: &crate::catalog::TableSchema,
+) -> Option<crate::catalog::ArrayElemType> {
+    let mut found = None;
+    for b in branches {
+        match array_source_elem(b, schema) {
+            Some(crate::catalog::ArrayElemType::TimestampTz) => {
+                return Some(crate::catalog::ArrayElemType::TimestampTz);
+            }
+            Some(e) if found.is_none() => found = Some(e),
+            _ => {}
+        }
+    }
+    found
+}
+
 /// `CAST` の被演算子が配列のとき、その要素型（列参照・配列への `CAST`・`ARRAY[..]` から解決できる範囲）。
 /// 解決できなければ `None`（TZ 依存の判定は要素型が分かる経路でだけ働く）。
 fn array_source_elem(
@@ -718,6 +736,13 @@ fn array_source_elem(
             _ => None,
         }),
         Expr::Cast { ty, .. } => ty.array_elem_type(),
+        // 分岐式は各枝の要素型を再帰評価し、`TIMESTAMPTZ` が 1 つでもあればそれを採る（fail-closed。Issue #3233）。
+        Expr::Coalesce(items) => merge_branch_elems(items.iter(), schema),
+        Expr::NullIf(a, b) => merge_branch_elems([a.as_ref(), b.as_ref()].into_iter(), schema),
+        Expr::Case { whens, else_result } => merge_branch_elems(
+            whens.iter().map(|(_, r)| r).chain(else_result.as_deref()),
+            schema,
+        ),
         Expr::ArrayConstructor(items) => items
             .iter()
             .any(|i| static_type_of(i, schema) == Some(crate::sql::udf_call::ExprType::TimestampTz))
@@ -1260,6 +1285,19 @@ mod tests {
             "CAST(array_cat(tz_arr, tz_arr) AS text)",
         ] {
             assert_eq!(bind_code(sql), "42P17", "{sql}");
+        }
+    }
+
+    /// 分岐式（`COALESCE`／`CASE`／`NULLIF`）経由の `TIMESTAMPTZ[]` の文字列変換は immutable として受理されない
+    /// （束縛段で配列列が拒否される場合も含め、`ok` にならないこと。fail-closed。Issue #3233）。
+    #[test]
+    fn timestamptz_array_cast_via_branch_expr_is_rejected() {
+        for sql in [
+            "CAST(COALESCE(tz_arr, tz_arr) AS text)",
+            "CAST(CASE WHEN n > 0 THEN tz_arr ELSE tz_arr END AS text)",
+            "CAST(NULLIF(tz_arr, tz_arr) AS text)",
+        ] {
+            assert_ne!(bind_code(sql), "ok", "{sql}");
         }
     }
 
