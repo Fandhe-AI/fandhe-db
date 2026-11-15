@@ -370,3 +370,46 @@ fn column_named_distinct_keeps_existing_projection_semantics_over_wire() {
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
+
+/// Issue #3260: `SELECT DISTINCT ON` は簡易クエリ（psql 風の末尾 `;` を含む）・拡張クエリの
+/// どちらでも 42601 ではなく、先頭一致違反は 42P10、整合した文は実行段未実装の 0A000 で拒否され、
+/// いずれも `ReadyForQuery` は `I` に戻り接続は維持される。
+// tracked: #3261（行を返す実行段が入るまで整合した文は 0A000）
+#[test]
+fn distinct_on_is_classified_over_simple_and_extended_and_connection_survives() {
+    let (core, _guard) = new_core_aggregate_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    for (sql, expected_sqlstate) in [
+        (
+            "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang;",
+            "0A000",
+        ),
+        (
+            "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY id, lang;",
+            "42P10",
+        ),
+        (
+            "SELECT DISTINCT ON (lang) lang FROM docs ORDER BY lang",
+            "0A000",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, expected_sqlstate);
+        assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
+
+        send_length_prefixed_message(&mut stream, b'P', &parse_body("", sql, 0));
+        send_length_prefixed_message(&mut stream, b'B', &bind_body("", ""));
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
+        send_length_prefixed_message(&mut stream, b'S', &[]);
+        expect_error_response_with_sqlstate(&mut stream, expected_sqlstate);
+        assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
+    }
+
+    send_simple_query(&mut stream, "SELECT COUNT(DISTINCT lang) AS n FROM docs");
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("3"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
