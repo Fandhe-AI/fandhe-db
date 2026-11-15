@@ -7842,10 +7842,12 @@ impl<'a> Parser<'a> {
                 self.parse_projection_infix(0)?
             }
             // Issue #1593: `'1'::int` のように文字列リテラルへ `::` が続く形だけ式項目として扱う。
+            // Issue #3276（SQL-42）: `'x' || col` の文字列連結も式項目として扱う（束縛段が
+            // text 連結か jsonb 連結かを振り分ける。構文木は従来どおり `JsonAccess { Concat }`）。
             Some(Token::StringLiteral(_))
                 if matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::TypeCast | Token::BitDistanceOp(_))
+                    Some(Token::TypeCast | Token::BitDistanceOp(_) | Token::Concat)
                 ) =>
             {
                 self.parse_projection_infix(0)?

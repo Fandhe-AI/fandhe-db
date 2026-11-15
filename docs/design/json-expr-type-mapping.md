@@ -101,7 +101,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （[multi-row-dml-operation-id.md](multi-row-dml-operation-id.md)。`jsonb - x` は `Binary Sub` で区別）。
 - 対象外: `jsonb - text[]` の SQL 表層（text[] を書く手段のキャスト・`ARRAY[...]` 待ち。評価関数
   `json::jsonb_delete_keys` は用意済み）、`#-` のパスの NULL 要素（`22004` の分類が未実装のため
-  `0A000`）、`UPDATE ... SET` への jsonb 式の代入、text／json の `||`、ORDER BY の式キー、
+  `0A000`）、`UPDATE ... SET` への jsonb 式の代入、json の `||`・非 text の暗黙連結（text 同士は #3276 で実装済み。残りは #3278）、ORDER BY の式キー、
   `$n` の型推論、NoSQL の filter。
 
 ## Issue #1599 での変更（スカラー関数）

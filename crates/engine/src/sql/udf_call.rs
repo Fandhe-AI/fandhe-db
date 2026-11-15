@@ -1969,6 +1969,10 @@ pub enum BuiltinFn {
     /// `concat(a: Text, b: Text) -> Text`。可変長 `CONCAT` は束縛段
     /// （[`bind_call`]）でこの 2 引数版の左畳み込みへ展開する。
     Concat2,
+    /// `a || b`（text 連結演算子。Issue #3276・SQL-42）。`concat` と違い strict
+    /// （NULL が 1 つでもあれば NULL）。演算子専用で関数名からは呼べない
+    /// （`builtin_from_name` は返さない）。結果長は確保前に検査する。
+    TextConcat,
     /// `trim(s: Text) -> Text`（半角空白のみ除去。PostgreSQL 既定）。
     Trim,
     /// `replace(s: Text, from: Text, to: Text) -> Text`。
@@ -2521,7 +2525,9 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
             &[ExprType::Text, ExprType::Text, ExprType::Scalar],
             ExprType::Text,
         ),
-        BuiltinFn::Concat2 => (&[ExprType::Text, ExprType::Text], ExprType::Text),
+        BuiltinFn::Concat2 | BuiltinFn::TextConcat => {
+            (&[ExprType::Text, ExprType::Text], ExprType::Text)
+        }
         BuiltinFn::Trim => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Replace => (
             &[ExprType::Text, ExprType::Text, ExprType::Text],
@@ -2689,6 +2695,7 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Rpad3
         | BuiltinFn::SplitPart
         | BuiltinFn::Concat2
+        | BuiltinFn::TextConcat
         | BuiltinFn::Trim
         | BuiltinFn::Replace
         | BuiltinFn::Position
@@ -7963,6 +7970,56 @@ fn concat_not_supported() -> SqlSurfaceError {
     }
 }
 
+/// `||` の text 連結束縛（Issue #3276・SQL-42）。両オペランドの型が text（型なしリテラル・
+/// 裸の NULL を含む）に揃うときだけ [`BuiltinFn::TextConcat`] に束縛して返す。jsonb・非 text が
+/// 絡むときは `Ok(None)` を返し、予算を戻して呼び出し元の従来経路（jsonb 連結／拒否）へ流す。
+/// オペランドの束縛順は従来と同じ（リテラルでない側を先）で、名前解決・型系のエラーは変わらない。
+fn try_bind_text_concat(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<Option<(BoundExpr, ExprType)>, SqlSurfaceError> {
+    let saved_budget = *node_budget;
+    let bind_one = |expr: &Expr,
+                    env: &mut BindEnv<'_>,
+                    budget: &mut usize|
+     -> Result<(BoundExpr, Option<ExprType>), SqlSurfaceError> {
+        match expr {
+            Expr::Null | Expr::String(_) => bind_null_aware(expr, env, budget),
+            _ => {
+                let (b, t) = bind_json_concat_operand(expr, env, budget)?;
+                Ok((b, Some(t)))
+            }
+        }
+    };
+    let is_lit = |e: &Expr| matches!(e, Expr::String(_) | Expr::Null);
+    let (l, r) = if is_lit(lhs) && !is_lit(rhs) {
+        let r = bind_one(rhs, env, node_budget)?;
+        let l = bind_one(lhs, env, node_budget)?;
+        (l, r)
+    } else {
+        let l = bind_one(lhs, env, node_budget)?;
+        let r = bind_one(rhs, env, node_budget)?;
+        (l, r)
+    };
+    let text_like = |t: &Option<ExprType>| matches!(t, None | Some(ExprType::Text));
+    if !(text_like(&l.1) && text_like(&r.1)) {
+        *node_budget = saved_budget;
+        return Ok(None);
+    }
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    Ok(Some((
+        BoundExpr::Builtin {
+            f: BuiltinFn::TextConcat,
+            args: vec![l.0, r.0],
+        },
+        ExprType::Text,
+    )))
+}
+
 /// jsonb の連結・パス削除演算子（`||` `#-`。Issue #2181・TABLE-25）の束縛。
 /// `||` は両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として解釈）のみ受理し、
 /// 文字列連結に当たる組は `0A000`、型の合わない組は `42883`。`#-` は左辺 jsonb（`json` 列は
@@ -8024,6 +8081,11 @@ fn bind_json_modify(
             },
             ExprType::Json,
         ));
+    }
+    // `||`。text／varchar／型なしリテラル／NULL だけの組は strict な text 連結
+    // （Issue #3276・SQL-42）。jsonb が絡む組・非 text の組は従来の jsonb 経路へ流す。
+    if let Some(done) = try_bind_text_concat(lhs, rhs, env, node_budget)? {
+        return Ok(done);
     }
     // `||`。
     let lhs_is_literal = matches!(lhs, Expr::String(_));
@@ -12468,6 +12530,19 @@ pub(crate) fn apply_builtin<'a>(
                 _ => Ok(ExprValue::Null),
             }
         }
+        BuiltinFn::TextConcat => {
+            // strict: NULL は冒頭の一律ガードで返済み。長さは確保前に検査する（#3276）。
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_text_or_null_arg(args, 1)?,
+            ) {
+                (Some(a), Some(b)) => {
+                    let out = string_fn::concat_strict(&a, &b)?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
         BuiltinFn::Concat2 => {
             let a = take_text_or_null_arg(args, 0)?.unwrap_or(Cow::Borrowed(""));
             let b = take_text_or_null_arg(args, 1)?.unwrap_or(Cow::Borrowed(""));
@@ -14408,6 +14483,7 @@ mod tests {
             BuiltinFn::Rpad3,
             BuiltinFn::SplitPart,
             BuiltinFn::Concat2,
+            BuiltinFn::TextConcat,
             BuiltinFn::Trim,
             BuiltinFn::Replace,
             BuiltinFn::Position,

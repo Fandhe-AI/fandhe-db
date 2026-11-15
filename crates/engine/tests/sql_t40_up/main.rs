@@ -37,6 +37,7 @@ mod sql42_projection_infix_expr;
 mod sql42_projection_result_types;
 mod sql42_remainder_operator;
 mod sql42_set_op_expr_projection;
+mod sql42_text_concat_operator;
 mod sql43_from_less_select;
 mod sql44_from_alias;
 mod sql44_qualified_star;
