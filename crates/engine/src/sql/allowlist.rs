@@ -624,6 +624,7 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
+            | Token::Punct('%')
             | Token::RegexMatch
             | Token::RegexMatchCi
             | Token::RegexNotMatch
@@ -7767,7 +7768,7 @@ impl<'a> Parser<'a> {
                     && !self.quoted_null.contains(&self.pos)
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('[' | '(')));
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
-                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '%' | '['))
                         || matches!(t, Token::TypeCast)
                         || is_json_operator_token(t)
                         || matches!(t, Token::BitDistanceOp(_))
@@ -7792,8 +7793,10 @@ impl<'a> Parser<'a> {
                     if self.peek_ident_matches("COLLATE")
                         || self.peek_at_time_zone()
                         || self.peek().is_some_and(|t| {
-                            matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
-                                || is_json_operator_token(t)
+                            matches!(
+                                t,
+                                Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast
+                            ) || is_json_operator_token(t)
                                 || matches!(t, Token::BitDistanceOp(_))
                         })
                     {
@@ -8980,7 +8983,7 @@ impl<'a> Parser<'a> {
                     || self.is_value_function_keyword_at(self.pos)
                     || matches!(next, Some(Token::Punct('(')))
                     || next.is_some_and(|t| {
-                        matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                        matches!(t, Token::Punct('+' | '-' | '*' | '/' | '%' | '['))
                             || matches!(t, Token::TypeCast)
                             || is_json_operator_token(t)
                     })
@@ -9049,8 +9052,10 @@ impl<'a> Parser<'a> {
                 if self.peek_ident_matches("COLLATE")
                     || self.peek_at_time_zone()
                     || self.peek().is_some_and(|t| {
-                        matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
-                            || is_json_operator_token(t)
+                        matches!(
+                            t,
+                            Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast
+                        ) || is_json_operator_token(t)
                     })
                 {
                     return self.parse_aggregate_expr_item(Some(head));
@@ -9085,7 +9090,7 @@ impl<'a> Parser<'a> {
             if self.allow_aggregate_expr_items
                 && matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                    Some(Token::Punct('+' | '-' | '*' | '/' | '%'))
                 )
             {
                 return self.parse_aggregate_expr_item(None);
@@ -11983,7 +11988,7 @@ impl<'a> Parser<'a> {
         self.parse_mul_rest(lhs, depth)
     }
 
-    /// 乗除算ループ（`* /`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
+    /// 乗除算・剰余ループ（`* / %`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
     fn parse_mul_rest(&mut self, lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         // 先頭の関数呼び出しを先に読み終えた投影項目から継続する場合も、後置 `COLLATE` を
         // 一次式の直後として受理する（`parse_primary_expr` 経由では適用済みで冪等）。
@@ -11994,6 +11999,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
                 Some(Token::Punct('/')) => BinOp::Div,
+                Some(Token::Punct('%')) => BinOp::Rem,
                 _ => break,
             };
             self.advance();
@@ -13754,7 +13760,7 @@ impl<'a> Parser<'a> {
         matches!(self.peek(), Some(Token::Ident(_) | Token::Number(_)))
             && matches!(
                 self.tokens.get(self.pos + 1),
-                Some(Token::Punct('+' | '-' | '*' | '/'))
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%'))
             )
     }
 
@@ -14273,7 +14279,7 @@ impl<'a> Parser<'a> {
             let lit = self.expect_literal()?;
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(lit);
@@ -14367,7 +14373,7 @@ impl<'a> Parser<'a> {
             let lit = self.expect_literal()?;
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(SetValue::Literal(lit));
@@ -35309,19 +35315,29 @@ mod tests {
         }
     }
 
-    /// SQL-42・Issue #1521: lexer が `%`／単独 `#` を字句化しても、構文段は受理しない
-    /// （fail-closed）。変更前後で 42601 は同じ。
+    /// SQL-42・Issue #1521: 単独 `#`（ビット XOR）と、右辺の無い末尾 `%` は構文段が受理しない
+    /// （fail-closed）。`%` の二項演算は Issue #3273 で受理に変わった（別テストで固定）。
     #[test]
-    fn rejects_percent_and_hash_tokens_as_syntax_error() {
+    fn rejects_hash_token_and_dangling_percent_as_syntax_error() {
         for sql in [
-            "SELECT * FROM documents WHERE n % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
             "SELECT * FROM documents WHERE n # 1 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT n % 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT * FROM documents ORDER BY n % 2 LIMIT 5",
             "SELECT * FROM documents WHERE lang = 'ja' %",
             "SELECT * FROM documents WHERE lang = 'ja' #",
         ] {
             assert_rejected_as_syntax_error(sql);
+        }
+    }
+
+    /// SQL-42・Issue #3273: `%` は WHERE・投影・ORDER BY で `BinOp::Rem` の二項式として受理する。
+    #[test]
+    fn accepts_percent_as_remainder_operator() {
+        for sql in [
+            "SELECT * FROM documents WHERE n % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT n % 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents WHERE (n) % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        ] {
+            let lookup = catalog_with(&["documents"]);
+            validate_statement(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"));
         }
     }
 
@@ -43622,6 +43638,40 @@ mod tests {
         ));
     }
 
+    /// Issue #3273・SQL-42: `%` は `* /` と同じ優先度・左結合で、単項マイナスより低い。
+    #[test]
+    fn projection_remainder_precedence_and_associativity() {
+        assert_eq!(first_expr("n % 2"), bin(BinOp::Rem, ident("n"), num("2")));
+        assert_eq!(
+            first_expr("n+1%2"),
+            bin(BinOp::Add, ident("n"), bin(BinOp::Rem, num("1"), num("2")))
+        );
+        assert_eq!(
+            first_expr("n*2%3"),
+            bin(BinOp::Rem, bin(BinOp::Mul, ident("n"), num("2")), num("3"))
+        );
+        assert_eq!(
+            first_expr("7%3*2"),
+            bin(BinOp::Mul, bin(BinOp::Rem, num("7"), num("3")), num("2"))
+        );
+        assert_eq!(first_expr("-7%3"), bin(BinOp::Rem, num("-7"), num("3")));
+        assert_eq!(
+            first_expr("-n%3"),
+            bin(BinOp::Rem, bin(BinOp::Sub, num("0"), ident("n")), num("3"))
+        );
+        assert_eq!(
+            first_expr("abs(n)%2"),
+            bin(
+                BinOp::Rem,
+                Expr::Call {
+                    name: "abs".to_string(),
+                    args: vec![ident("n")]
+                },
+                num("2")
+            )
+        );
+    }
+
     #[test]
     fn projection_infix_keeps_existing_projections() {
         let stmt = scan_items("n, lang").expect("accepted");
@@ -43671,7 +43721,7 @@ mod tests {
 
     #[test]
     fn projection_infix_rejections() {
-        for list in ["n % 2", "'a' + n", "n +", "(n"] {
+        for list in ["n %", "% 2", "'a' + n", "n +", "(n"] {
             let r = scan_items(list);
             assert_eq!(r.expect_err(list).wire_code(), "42601", "{list}");
         }

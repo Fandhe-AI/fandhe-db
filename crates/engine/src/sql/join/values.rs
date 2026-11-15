@@ -265,7 +265,7 @@ pub(super) fn op_holds(op: BinOp, ord: Ordering) -> bool {
         BinOp::Le => ord != Ordering::Greater,
         BinOp::Gt => ord == Ordering::Greater,
         BinOp::Ge => ord != Ordering::Less,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => false,
     }
 }
 

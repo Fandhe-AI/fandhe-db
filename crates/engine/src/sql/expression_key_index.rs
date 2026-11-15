@@ -669,7 +669,7 @@ fn comparison_bounds<K: Copy>(op: BinOp, k: K) -> Option<(Bound<K>, Bound<K>)> {
         BinOp::Ge => (Bound::Included(k), Bound::Unbounded),
         BinOp::Lt => (Bound::Unbounded, Bound::Excluded(k)),
         BinOp::Le => (Bound::Unbounded, Bound::Included(k)),
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => return None,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => return None,
     })
 }
 
