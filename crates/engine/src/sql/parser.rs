@@ -2761,7 +2761,8 @@ fn declarative_leaf_to_filter(
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
-        | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::Internal {
+        | WherePredicate::CorrelatedExists(_)
+        | WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
         }),
@@ -3402,6 +3403,15 @@ fn bind_where_predicates_recursive(
                         node_budget,
                     )?);
                 }
+            }
+            // 行値比較 `(a, b) <op> (c, d)`（SQL-9・Issue #3255）: 構文段は受理するが、評価
+            // （辞書式・三値論理）は #3256 の担当のため、それまでは束縛段のこの単一ゲートで `0A000`
+            // にして止める（fail-closed。式述語・RLS 述語との組み合わせでも評価経路へ流さない）。
+            // tracked: #3256
+            WherePredicate::RowCompare { .. } => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "row value comparison is not supported yet",
+                ));
             }
             WherePredicate::Expression(expr) => {
                 // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの単純比較は宣言的
@@ -12220,6 +12230,12 @@ pub(crate) fn collect_where_predicate_idents(
             // 外側の列は構築時にインデックスへ解決済みで、識別子としては現れない。
             WherePredicate::CorrelatedExists(_) => {}
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
+            // 行値比較（#3255）: 全成分の列参照を集める（取りこぼすと別名衝突判定が fail-open になる）。
+            WherePredicate::RowCompare { lhs, rhs, .. } => {
+                for e in lhs.iter().chain(rhs.iter()) {
+                    collect_expr_idents(e, out);
+                }
+            }
             // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
             // と同じ理由: 否定越しの列参照見落としを防ぐ）。
             WherePredicate::Not(inner) => {

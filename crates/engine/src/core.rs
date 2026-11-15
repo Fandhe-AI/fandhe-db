@@ -1883,7 +1883,8 @@ fn reject_unsupported_predicate_dml_conjunction(
                 | WherePredicate::ScalarSubqueryCompare { .. }
                 | WherePredicate::QuantifiedSubqueryCompare { .. }
                 | WherePredicate::IdCompare { .. }
-                | WherePredicate::CorrelatedExists(_) => return Err(unsupported()),
+                | WherePredicate::CorrelatedExists(_)
+                | WherePredicate::RowCompare { .. } => return Err(unsupported()),
             },
             // 列 × 数値リテラルの比較の形に限る（`Call` 等は持ち込ませない）。
             WherePredicate::Expression(expr) => match expr {
@@ -1914,7 +1915,8 @@ fn reject_unsupported_predicate_dml_conjunction(
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => return Err(unsupported()),
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => return Err(unsupported()),
         }
     }
     Ok(())
