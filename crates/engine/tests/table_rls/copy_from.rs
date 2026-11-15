@@ -198,6 +198,54 @@ fn copy_from_stdin_text_format_inserts_all_rows_atomically() {
     assert_eq!(ids, vec![1, 2]);
 }
 
+/// Issue #3252: 列リスト省略は全列（`id` 先頭・宣言順）を補う。text／CSV で取り込める。
+#[test]
+fn copy_from_stdin_omitted_column_list_expands_to_all_columns() {
+    let (core, path) = open_engine("copy-from-omit-cols");
+    let _guard = CleanupGuard(path);
+
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &format!("COPY {TABLE} FROM STDIN USING OPERATION_ID 'omit-1'"),
+        &[b"1\t[1.0,0.0]\tja\t\\N\n"],
+    )
+    .expect("omitted column list is accepted");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &format!("COPY {TABLE} FROM STDIN WITH (FORMAT csv) USING OPERATION_ID 'omit-2';"),
+        &[b"2,\"[0.0,1.0]\",en,memo\n"],
+    )
+    .expect("csv omitted column list is accepted");
+    assert_eq!(outcome.rows_affected, 1);
+
+    let mut ids = read_back_ids(&core, "acme");
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2]);
+    let cells = select_cells(&core, "acme", TABLE, 2, "lang, note");
+    assert_eq!(cells.len(), 2);
+}
+
+/// Issue #3252: 補った列数とフィールド数が合わなければ 22000 で、行は 1 件も書かれない。
+#[test]
+fn copy_from_stdin_omitted_column_list_rejects_field_count_mismatch() {
+    let (core, path) = open_engine("copy-from-omit-cols-mismatch");
+    let _guard = CleanupGuard(path);
+
+    let err = run_copy_from(
+        &core,
+        "acme",
+        &format!("COPY {TABLE} FROM STDIN USING OPERATION_ID 'omit-3'"),
+        &[b"1\t[1.0,0.0]\tja\n"],
+    )
+    .expect_err("too few fields must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert!(read_back_ids(&core, "acme").is_empty());
+}
+
 // ---------------------------------------------------------------------
 // FROM STDIN: binary 形式の取り込み口（WIRE-23・Issue #1769）。フレーム解析と型変換は
 // wire-server の担当で、engine へは `feed_fields` が正規テキストのレコードを渡す。

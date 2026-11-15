@@ -15,7 +15,7 @@
 //!   見つからなければ `42P01` で拒否する（`read.rs` の `require_relations_bits` の規則をそのまま使う）。
 //! - 列単位の付与（Issue #2083。`columns.rs`）: `FROM` は列リストの列への INSERT、`TO` のテーブル形は列リスト
 //!   （省略時は全列）への SELECT、問い合わせ形は単一 relation なら名指しした列への SELECT（それ以外は全列）。
-//!   従来方式の表の疑似列 `id`（`FROM` の列リストは必ず含む）は表単位でしか満たせない。
+//!   従来方式の表の疑似列 `id`（`FROM` の列リスト省略時は全列扱いで含む）は表単位でしか満たせない。
 //! - 拒否は固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
 use crate::catalog::privilege::{PRIV_INSERT, PRIV_SELECT};

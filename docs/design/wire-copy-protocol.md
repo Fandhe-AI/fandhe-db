@@ -51,8 +51,10 @@
 
 ### 許可リスト（`sql::allowlist::validate_copy`）
 
-- `FROM STDIN` 形は列リスト必須（`id` を含むこと。テーブル形の全列省略は
-  `42601`）。`operation_id` 必須化ガード（`LedgerMode::require`）はカタログ
+- `FROM STDIN` 形の列リストは省略できる（Issue #3252・WIRE-17・WIRE-22・SQL-34 ポインタ）。省略時は
+  束縛段（`CopyInSession::new`）が表のスキーマから全列を補い、並びは表形 `COPY t TO STDOUT` と同じ
+  （従来方式・移行済み表は疑似列 `id` が先頭）。権限は全列扱い、`HEADER MATCH` の照合対象も補完後の列。
+  列を持たない表は `0A000`、`()` は `42601`。列リストを書く場合は従来どおり（従来方式の表は `id` を含むこと）。`operation_id` 必須化ガード（`LedgerMode::require`）はカタログ
   照会より前（`validate_insert` と同じ順序）。
 - `TO STDOUT` 形の内側 `SELECT` は、`validate_sql_tokens`（本 Issue で
   `validate_sql` から切り出した公開トークン列版。純粋なリファクタリング）が
