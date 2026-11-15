@@ -371,6 +371,27 @@ fn upsert_fires_insert_and_update_triggers_with_and_without_semicolon() {
     );
 }
 
+// BEFORE INSERT が競合鍵を書き換えて同じ既存行へ 2 回当たる DO UPDATE は、内部エラー（`XX000`）ではなく
+// 利用者起因の `22000` で文全体を拒否し、行は変わらない。
+#[test]
+fn upsert_do_update_hitting_same_row_twice_is_rejected_with_22000() {
+    let (_g, core) = open("t45fire-upsert-dup");
+    upsert_tables(&core, "t1");
+    func(&core, "t1", "pin", "BEGIN NEW.k := 1; RETURN NEW; END");
+    ok(&core, "t1", "INSERT INTO s.uq (k, n) VALUES (1, 1)");
+    upsert_trigger(&core, "t1", "tb", "BEFORE INSERT FOR EACH ROW", "pin");
+    assert_eq!(
+        code(
+            &core,
+            "t1",
+            "INSERT INTO s.uq (k, n) VALUES (2, 5), (3, 6) \
+             ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.n",
+        ),
+        "22000"
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM s.uq"), vec![1]);
+}
+
 // DO UPDATE が親キーを書き換えると、参照アクション（ON UPDATE CASCADE）で書き換わる子表の行トリガも
 // 子行ごとに発火する（実行モデルの D8: 黙って飛ばさない）。子表だけにトリガがある場合と、親側にも
 // UPDATE トリガがある場合の両方。

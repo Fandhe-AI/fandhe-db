@@ -39,6 +39,7 @@ use super::{
 use crate::catalog::{map_row_table_error, CatalogError, TableSchema};
 use crate::policy::PolicyContext;
 use crate::row_codec::Value;
+use crate::sql::allowlist::SqlSurfaceError;
 use crate::storage::change_log::CaptureWriteTxn as _;
 use crate::storage::{RowInput, Visibility};
 use crate::trigger::call::TriggerOp;
@@ -319,8 +320,10 @@ pub(super) fn upsert_rows_with_triggers(
                 })?;
                 // 同じ文の中で既に書いた行へ当たったら、2 度目の変更を拒否する（fail-closed）。
                 if touched.contains(&write_id) {
-                    return Err(internal(
-                        "duplicate ON CONFLICT target key within the same UPSERT statement",
+                    return Err(TenantWriteError::TriggerFailed(
+                        SqlSurfaceError::invalid_input(
+                            "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                        ),
                     ));
                 }
                 // 既存行への利用者定義ポリシーの USING（所有 ∩ 可視の後、WHERE の前。従来経路と同順）。
