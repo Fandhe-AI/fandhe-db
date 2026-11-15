@@ -451,13 +451,14 @@ fn intersect_all_multiplicity_ignores_other_tenants_rows() {
 }
 
 #[test]
-fn explicit_distinct_matches_default_union_and_intersect() {
+fn explicit_distinct_matches_default_set_operators() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
     for (explicit, plain) in [
         ("UNION DISTINCT", "UNION"),
         ("INTERSECT DISTINCT", "INTERSECT"),
+        ("EXCEPT DISTINCT", "EXCEPT"),
     ] {
         let a = run(
             &core,
@@ -482,6 +483,9 @@ fn quantifier_followed_by_another_quantifier_is_rejected() {
         "SELECT lang FROM docs INTERSECT ALL DISTINCT SELECT lang FROM other_docs",
         "SELECT lang FROM docs INTERSECT ALL ALL SELECT lang FROM other_docs",
         "SELECT lang FROM docs UNION DISTINCT ALL SELECT lang FROM other_docs",
+        "SELECT lang FROM docs EXCEPT ALL DISTINCT SELECT lang FROM other_docs",
+        "SELECT lang FROM docs EXCEPT ALL ALL SELECT lang FROM other_docs",
+        "SELECT lang FROM docs EXCEPT DISTINCT ALL SELECT lang FROM other_docs",
     ] {
         assert_eq!(
             run_err(&core, "tenant-a", sql).wire_code(),
@@ -492,29 +496,114 @@ fn quantifier_followed_by_another_quantifier_is_rejected() {
 }
 
 #[test]
-fn except_distinct_stays_rejected() {
+fn except_all_keeps_difference_multiplicity() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
+    let tenant_ctx = ctx("tenant-a");
     let core = new_core(storage);
-    let err = run_err(
-        &core,
-        "tenant-a",
-        "SELECT lang FROM docs EXCEPT DISTINCT SELECT lang FROM other_docs",
+    // docs {ja,en,ja} / other_docs {en,fr}: en が相殺され、ja は 2 件とも残る（左の順序）。
+    let sql = "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs";
+    assert_eq!(langs(&run(&core, "tenant-a", sql)), vec!["ja", "ja"]);
+    // 右にだけ現れる fr は左右を入れ替えると残る。
+    assert_eq!(
+        langs(&run(
+            &core,
+            "tenant-a",
+            "SELECT lang FROM other_docs EXCEPT ALL SELECT lang FROM docs"
+        )),
+        vec!["fr"]
     );
-    assert_eq!(err.wire_code(), "42601");
+    // other_docs に ja を 1 件足すと、左の ja が 1 件だけ相殺される。
+    let storage = core_storage_reseed(&tenant_ctx, 1);
+    let core1 = new_core(storage.0);
+    let _g1 = CleanupGuard(storage.1);
+    assert_eq!(langs(&run(&core1, "tenant-a", sql)), vec!["ja"]);
+    // 右の件数が左以上なら 0 件（ja x3 で ja も en も消える）。
+    let storage = core_storage_reseed(&tenant_ctx, 3);
+    let core3 = new_core(storage.0);
+    let _g3 = CleanupGuard(storage.1);
+    assert!(langs(&run(&core3, "tenant-a", sql)).is_empty());
+}
+
+/// `seeded_two_tables` に、other_docs へ ja を `extra` 件足したものを返す。
+fn core_storage_reseed(tenant_ctx: &PolicyContext, extra: u64) -> (Storage, std::path::PathBuf) {
+    let (storage, path) = seeded_two_tables();
+    for id in 20..(20 + extra) {
+        insert_row(&storage, OTHER, tenant_ctx, id, "ja", Visibility::Public);
+    }
+    (storage, path)
 }
 
 #[test]
-fn except_all_is_rejected() {
+fn except_all_multiplicity_ignores_other_tenants_rows() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let other = ctx("tenant-b");
+    for id in 100..110 {
+        insert_row(&storage, DOCS, &other, id, "ja", Visibility::Private);
+        insert_row(&storage, OTHER, &other, id, "ja", Visibility::Private);
+    }
+    let core = new_core(storage);
+    let sql = "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs";
+    assert_eq!(langs(&run(&core, "tenant-a", sql)), vec!["ja", "ja"]);
+}
+
+#[test]
+fn except_all_chains_and_precedence() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let sorted = |sql: &str| {
+        let mut v = langs(&run(&core, "tenant-a", sql));
+        v.sort();
+        v
+    };
+    // 左結合: (docs EXCEPT ALL other_docs) EXCEPT docs => ja,ja から ja,ja を引いて 0 件。
+    assert!(sorted(
+        "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs EXCEPT SELECT lang FROM docs"
+    )
+    .is_empty());
+    // (docs UNION ALL other_docs) EXCEPT ALL docs => en,fr。
+    assert_eq!(
+        sorted("SELECT lang FROM docs UNION ALL SELECT lang FROM other_docs EXCEPT ALL SELECT lang FROM docs"),
+        vec!["en", "fr"]
+    );
+    // INTERSECT が先に結合: docs EXCEPT ALL (other_docs INTERSECT docs) => ja,ja（en が相殺）。
+    assert_eq!(
+        sorted("SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs INTERSECT SELECT lang FROM docs"),
+        vec!["ja", "ja"]
+    );
+    // 括弧で結果が変わる: docs EXCEPT ALL (other_docs UNION ALL docs) => 0 件。
+    assert!(sorted(
+        "SELECT lang FROM docs EXCEPT ALL (SELECT lang FROM other_docs UNION ALL SELECT lang FROM docs)"
+    )
+    .is_empty());
+}
+
+#[test]
+fn except_all_with_limit_keeps_leading_row() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let result = run(
+        &core,
+        "tenant-a",
+        "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs LIMIT 1",
+    );
+    assert_eq!(langs(&result), vec!["ja"]);
+}
+
+#[test]
+fn vector_column_with_except_all_is_rejected() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
     let err = run_err(
         &core,
         "tenant-a",
-        "SELECT lang FROM docs EXCEPT ALL SELECT lang FROM other_docs",
+        "SELECT embedding FROM docs EXCEPT ALL SELECT embedding FROM other_docs",
     );
-    assert_eq!(err.wire_code(), "42601");
+    assert_eq!(err.wire_code(), "22000");
 }
 
 #[test]
