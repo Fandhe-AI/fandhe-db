@@ -121,10 +121,15 @@ Issue #3270（SQL-42 のポインタ）で、`FROM` あり枝の式項目（リ�
 （`SELECT 7 UNION SELECT y FROM b`）を `SetTree::ConstBranch` として受理する。定数枝は
 `sql::const_select` の束縛・実行をそのまま使い、表を読まないので RLS の対象行を持たない。
 定数枝の集計項目・`WHERE`／`HAVING`、括弧付きの `LIMIT`／`OFFSET` は `42601`、ルーチン呼び出し・
-スキーマ関数は束縛段が `0A000`。全枝が定数の集合演算（`SELECT 1 UNION SELECT 2`）と、式射影の枝・
-定数枝を含む集合演算の `EXPLAIN` は `0A000`（EXPLAIN は Issue #3271 で対応予定）。ビュー本文の
-定数枝・式枝は `42601`。型の決まらない `NULL`・文字列リテラルを他の枝の型へ解決する規則は
+スキーマ関数は束縛段が `0A000`。全枝が定数の集合演算（`SELECT 1 UNION SELECT 2`）とその
+`EXPLAIN` は `0A000`。ビュー本文の定数枝・式枝は `42601`。型の決まらない `NULL`・文字列リテラルを他の枝の型へ解決する規則は
 持たず、型が一致しなければ `42804`。
+
+Issue #3271 で、式射影の枝・定数枝を含む集合演算の結果（`INTERSECT`／`EXCEPT`・`ALL` を含む）と
+`EXPLAIN`（`ANALYZE`・`VERBOSE`・`FORMAT JSON` を含む）を対応済みにした。EXPLAIN は、式射影の枝を
+通常の `scan` 葉（単一表の `EXPLAIN` と同じく射影の中身は描画しない）、定数枝を葉 `result`
+（`source: constant`。`cte_explain` と共通の語彙）として描画する。`relation:` の序数は位置ベースで、
+定数枝も葉の位置を 1 つ消費する（`SELECT 7 UNION SELECT k FROM a` の `scan` は `relation: 2`）。
 
 全体に対する `LIMIT <n>` は任意（`1..=core::MAX_SEARCH_K`。範囲外は
 `22000`）。範囲検証は `sql::set_op::execute` が全枝の走査より前に行い、
@@ -194,16 +199,20 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 - `INTERSECT ALL`／`EXCEPT ALL` の右辺の出現数表も文全体の累計バイト予算に計上する（超過は `54000`）。
 - 全体の `LIMIT n` は、この順序の先頭から n 件。
 
-## スコープ外（Issue #929 の対象外事項）
+## スコープ外（Issue #929・#3270・#3271 の対象外事項）
 
 - `DISTINCT`・ベクトル順位付けを含む枝（集合演算の結果全体に対する `ORDER BY` は構文・束縛を
   Issue #3266、実行を Issue #3267 で対応済み。集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）。
   全体 `ORDER BY` の未対応は、比較できない型・ICU 照合のキー、`FETCH ... WITH TIES`（いずれも
   `0A000`／`42601`。親 Issue #3265 の配下で追跡）
-- `COPY TO`・`EXPLAIN` での集合演算（`EXPLAIN` は Issue #2047、`DECLARE CURSOR` は Issue #3176 で対応済み。
-  cursor の詳細は [sql-cursor.md](sql-cursor.md)。
-  詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md)）、明示トランザクション
-  内での実行（いずれも既存の既定経路で `42601`／`0A000` に自然に落ちる）
+- 式射影の枝・定数枝（Issue #3270・#3271 で結果と `EXPLAIN` を対応済み）の残る未対応（受け皿の Issue は未定）:
+  全枝が定数の集合演算とその `EXPLAIN`（`0A000`）、定数枝の集計・`WHERE`／`HAVING`・括弧付き定数枝の
+  `LIMIT`／`OFFSET`（`42601`）、型の決まらない `NULL`・文字列リテラルの型解決（`42703`／`42804`）、
+  ビュー本文の定数枝・式枝（`42601`）、枝内の窓関数・式 `ORDER BY` キー（`42601`）
+- `COPY TO`、明示トランザクション内での実行（既存の既定経路で `42601`／`0A000` に自然に落ちる）。
+  `EXPLAIN` は Issue #2047、`DECLARE CURSOR` は Issue #3176 で対応済み（cursor の詳細は
+  [sql-cursor.md](sql-cursor.md)、`EXPLAIN` は
+  [explain-search-engine-exposure.md](explain-search-engine-exposure.md)）
 - NoSQL（HTTP）表層での集合演算（spec 上も非対応）
 - サブクエリと CTE（#927・#928）、`JOIN` を含む複数テーブル計画基盤
   （#924〜#926）、RLS-10 の横断検証（#931）

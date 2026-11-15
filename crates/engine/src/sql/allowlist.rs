@@ -23901,21 +23901,15 @@ pub(crate) fn aggregate_has_unrendered_explain_shape(v: &ValidatedAggregate) -> 
         || super::subquery::aggregate_has_filter_subquery(v)
 }
 
-/// 枝の投影に式項目（`SelectItem::Expr`）を含むか（Issue #3270。別名付きの列参照も式項目として数える）。
-fn scan_has_expr_projection(scan: &ValidatedScan) -> bool {
-    matches!(&scan.projection, Projection::Items(items)
-        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })))
-}
-
 /// 集合演算木のいずれかの枝が [`scan_has_unrendered_explain_shape`]／
 /// [`aggregate_has_unrendered_explain_shape`] に当たるか。
 pub(crate) fn set_tree_has_unrendered_explain_shape(tree: &SetTree) -> bool {
     match tree {
-        // Issue #3270: 式射影の枝・定数枝の EXPLAIN は未対応（0A000。後続 Issue #3271）。
         SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => {
-            scan_has_unrendered_explain_shape(scan) || scan_has_expr_projection(scan)
+            scan_has_unrendered_explain_shape(scan)
         }
-        SetTree::ConstBranch(_) => true,
+        // Issue #3271: 定数枝は葉 `result`（`source: constant`）として描画できる。
+        SetTree::ConstBranch(_) => false,
         SetTree::AggregateBranch(agg) => aggregate_has_unrendered_explain_shape(&agg.0),
         SetTree::Op { left, right, .. } => {
             set_tree_has_unrendered_explain_shape(left)
@@ -29763,12 +29757,6 @@ fn validate_sql_tokens_impl(
                 if set_tree_has_value_subqueries(&validated.tree) {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for queries with value subqueries",
-                    ));
-                }
-                // Issue #3270: 式射影の枝・定数枝を含む集合演算の EXPLAIN は未対応（後続 Issue #3271）。
-                if set_tree_has_unrendered_explain_shape(&validated.tree) {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "EXPLAIN is not supported for set operations with expression or FROM-less branches",
                     ));
                 }
                 return Ok(Statement::Explain(ExplainTarget::SetOperation(validated)));
@@ -43486,15 +43474,15 @@ mod tests {
     }
 
     #[test]
-    fn set_op_tree_with_expression_or_const_branch_is_unrendered_for_explain() {
-        let plain = set_op_of("SELECT n FROM t UNION SELECT n FROM u").expect("accepted");
-        assert!(!set_tree_has_unrendered_explain_shape(&plain.tree));
+    fn set_op_tree_with_expression_or_const_branch_is_rendered_for_explain() {
+        // Issue #3271: 式射影の枝・定数枝は EXPLAIN で描画できる（未描画形ではない）。
         for sql in [
+            "SELECT n FROM t UNION SELECT n FROM u",
             "SELECT n+1 FROM t UNION SELECT n FROM u",
             "SELECT 7 UNION SELECT n FROM u",
         ] {
             let v = set_op_of(sql).expect("accepted");
-            assert!(set_tree_has_unrendered_explain_shape(&v.tree), "{sql}");
+            assert!(!set_tree_has_unrendered_explain_shape(&v.tree), "{sql}");
         }
     }
 

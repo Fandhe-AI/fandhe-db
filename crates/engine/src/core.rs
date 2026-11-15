@@ -17177,8 +17177,8 @@ impl EngineCore {
         )?;
         let mut leaf_lines = Vec::with_capacity(leaves.len());
         for leaf in &leaves {
-            match &leaf.scan {
-                Some(bound) => {
+            match &leaf.source {
+                crate::sql::set_op::BoundSetLeafSource::Scan(bound) => {
                     let schema =
                         schemas
                             .get(&leaf.table)
@@ -17188,7 +17188,11 @@ impl EngineCore {
                     let gins = Self::gin_decls_for_explain(read_txn, bound)?;
                     leaf_lines.push(Self::scan_explain_lines(schema, bound, &gins));
                 }
-                None => leaf_lines.push(crate::sql::set_op::aggregate_branch_explain_lines()),
+                crate::sql::set_op::BoundSetLeafSource::Aggregate => {
+                    leaf_lines.push(crate::sql::set_op::aggregate_branch_explain_lines())
+                }
+                // 定数枝は表を読まない。走査分類の行は無く、葉 `result` は固定語彙のみ。
+                crate::sql::set_op::BoundSetLeafSource::Constant => leaf_lines.push(Vec::new()),
             }
         }
         crate::sql::set_op_explain::explain_tree(validated, &leaves, leaf_lines)

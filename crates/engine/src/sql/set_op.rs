@@ -800,7 +800,7 @@ fn validate_tree_types(
                         has_offset: bound.offset != 0,
                         aggregate: None,
                     },
-                    scan: Some(bound),
+                    source: BoundSetLeafSource::Scan(Box::new(bound)),
                 });
             }
             Ok((columns, has_vector))
@@ -826,22 +826,31 @@ fn validate_tree_types(
                         has_offset: grouped.is_some_and(|g| g.offset != 0),
                         aggregate: Some(aggregate_shape(&bound)),
                     },
-                    scan: None,
+                    source: BoundSetLeafSource::Aggregate,
                 });
             }
             Ok((columns, has_vector))
         }
         SetTree::ConstBranch(branch) => {
-            // EXPLAIN（`leaves` を渡す経路）は構文段が定数枝を 0A000 にするため到達しない。
-            // 到達したら葉の対応が崩れるので fail-closed にする。
-            if leaves.is_some() {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "FROM-less branch reached the set operation EXPLAIN path".to_string(),
-                });
-            }
+            // 束縛を先に行い、束縛エラー（ルーチン呼び出しの 0A000 等）を実行・EXPLAIN で同じ順序・
+            // `wire_code` にする（Issue #3271）。
             let bound = crate::sql::const_select::bind(&branch.0, udfs)?;
             let columns = bound.columns();
             let has_vector = columns_have_vector(&columns);
+            if let Some(out) = leaves {
+                // 定数枝は表を読まない葉。表名は空・段なしの形で積む（EXPLAIN は葉 `result`）。
+                out.push(BoundSetLeaf {
+                    table: String::new(),
+                    shape: LeafShape {
+                        limited: false,
+                        sort_keys: 0,
+                        has_limit: false,
+                        has_offset: false,
+                        aggregate: None,
+                    },
+                    source: BoundSetLeafSource::Constant,
+                });
+            }
             Ok((columns, has_vector))
         }
         SetTree::Op { op, left, right } => {
@@ -1059,8 +1068,20 @@ pub(crate) struct BoundSetLeaf {
     pub(crate) table: String,
     /// 段の木に必要な枝の形（項目数・有無のみ。値は持たない）。
     pub(crate) shape: LeafShape,
-    /// スキャン枝の束縛結果（実行と同じ `bind_scan`）。集計枝は `None`。
-    pub(crate) scan: Option<crate::sql::parser::BoundScan>,
+    /// 葉の種別（「`None` なら集計」といった暗黙の契約を避け、種別を型で明示する）。
+    pub(crate) source: BoundSetLeafSource,
+}
+
+/// [`BoundSetLeaf`] の種別（Issue #3271）。`core.rs` が走査分類の行を作る分岐と、
+/// `sql::set_op_explain` が葉を描画する分岐の根拠になる。
+#[derive(Debug)]
+pub(crate) enum BoundSetLeafSource {
+    /// スキャン枝（式射影を含む。実行と同じ `bind_scan` の結果）。
+    Scan(Box<crate::sql::parser::BoundScan>),
+    /// 集計枝。
+    Aggregate,
+    /// `FROM` なしの定数枝（表を読まない。EXPLAIN は葉 `result`）。
+    Constant,
 }
 
 /// 枝の形（SQL-75 (5): 件数・有無のみで LIMIT／OFFSET の値は持たない）。

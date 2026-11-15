@@ -217,6 +217,8 @@ fn json_matches_text_for_every_plan_shape() {
         "SELECT k FROM a UNION SELECT k FROM b",
         "SELECT k FROM a UNION SELECT k FROM b INTERSECT SELECT k FROM c LIMIT 5",
         "(SELECT k FROM a UNION SELECT k FROM b) INTERSECT SELECT k FROM c",
+        "SELECT 7 UNION SELECT k FROM a",
+        "SELECT k+1 FROM a EXCEPT ALL SELECT k FROM b",
         "WITH w AS (SELECT k FROM a ORDER BY k LIMIT 2) SELECT k FROM w",
         "WITH w AS MATERIALIZED (SELECT k FROM a) SELECT k FROM w",
         "WITH RECURSIVE w AS (SELECT k FROM a) SELECT k FROM w",
