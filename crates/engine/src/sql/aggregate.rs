@@ -1693,6 +1693,70 @@ impl Accumulator {
         }
     }
 
+    /// Issue #3214: 可視 id スライスの畳み込み結果を反映する（`observe_id` を件数分呼ぶ結果と
+    /// 同値。id は非負なので逐次 `checked_add` の失敗は総和が u64 を超えることと同値）。
+    /// [`is_visible_id_fold`] が許す形以外のアキュムレータは実装バグとして fail-closed。
+    fn absorb_id_stats(&mut self, stats: &IdSliceStats) -> Result<(), SqlSurfaceError> {
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(stats.count).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::IdSum(sum) => {
+                if stats.count == 0 {
+                    return Ok(());
+                }
+                let add = u64::try_from(stats.sum).map_err(|_| {
+                    SqlSurfaceError::numeric_out_of_range("SUM(id) exceeds u64 range")
+                })?;
+                let next = match sum {
+                    None => add,
+                    Some(cur) => cur.checked_add(add).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range("SUM(id) exceeds u64 range")
+                    })?,
+                };
+                *sum = Some(next);
+                Ok(())
+            }
+            Accumulator::IdAvg { sum, count } => {
+                if stats.count == 0 {
+                    return Ok(());
+                }
+                let add = u64::try_from(stats.sum).map_err(|_| {
+                    SqlSurfaceError::numeric_out_of_range("AVG(id) exceeds u64 range")
+                })?;
+                let next = match sum {
+                    None => add,
+                    Some(cur) => cur.checked_add(add).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range("AVG(id) exceeds u64 range")
+                    })?,
+                };
+                *sum = Some(next);
+                *count = count.checked_add(stats.count).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("AVG(id) row count exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::IdMin(m) => {
+                if let Some(v) = stats.min {
+                    *m = Some(m.map_or(v, |cur| cur.min(v)));
+                }
+                Ok(())
+            }
+            Accumulator::IdMax(m) => {
+                if let Some(v) = stats.max {
+                    *m = Some(m.map_or(v, |cur| cur.max(v)));
+                }
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "absorb_id_stats on an incompatible accumulator",
+            )),
+        }
+    }
+
     fn observe_id(&mut self, id: u64) -> Result<(), SqlSurfaceError> {
         match self {
             Accumulator::Count(n) => {
@@ -2775,6 +2839,47 @@ pub(crate) fn execute_aggregate_with_group_limits(
                 .snapshot()
                 .and_then(|snap| access.cache.lookup(access.storage, snap, &bound.table, ctx))
             {
+                // Issue #3213: 純粋な `COUNT(*)` だけなら件数は可視 id スライス長で確定する。
+                // スライスは RLS・TABLE-12 検査済みの可視行の正確な集合で、キャッシュは同一
+                // テーブル世代・同一 ctx でのみ命中する（`VisibleCacheAccess::lookup` の契約。
+                // ポリシー適用表と書き込み Tx は上流で `visible_cache = None`）。行ごとの
+                // 観測を省き、中断確認（Issue #3208）は非空のとき先頭の 1 回だけ維持する。
+                if is_pure_count_star(bound, &accumulators) {
+                    let ids = snapshot.visible_ids();
+                    if !ids.is_empty() {
+                        crate::interrupt::RowCheck::new().tick()?;
+                    }
+                    let n = u64::try_from(ids.len())
+                        .map_err(|_| accumulator_bug("visible id count exceeds u64 range"))?;
+                    for accumulator in accumulators.iter_mut() {
+                        accumulator.observe_present_n(n)?;
+                    }
+                    return finish_aggregate_result(
+                        accumulators,
+                        bound,
+                        schema,
+                        0,
+                        max_result_bytes,
+                    );
+                }
+                // Issue #3214: `SUM`／`AVG`／`MIN`／`MAX(id)`（と `COUNT(*)`／`COUNT(id)`）だけなら
+                // 可視 id スライスを 1 パスで畳み込み、結果を項目順に各アキュムレータへ反映する。
+                // 前提（RLS・TABLE-12 検査済みの同一 ctx・同一世代）は上の Issue #3213 と同じ。
+                // 形が外れる場合（FILTER・DISTINCT・式・列・分散系など）は従来の行ループのまま。
+                if is_visible_id_fold(bound, &accumulators) {
+                    let needs = IdFoldNeeds::of(&accumulators);
+                    let stats = fold_visible_ids(snapshot.visible_ids(), needs)?;
+                    for accumulator in accumulators.iter_mut() {
+                        accumulator.absorb_id_stats(&stats)?;
+                    }
+                    return finish_aggregate_result(
+                        accumulators,
+                        bound,
+                        schema,
+                        0,
+                        max_result_bytes,
+                    );
+                }
                 let mut expr_scratch: Vec<StackValue> = Vec::new();
                 let empty_vector = RowVector {
                     dim: 0,
@@ -3437,6 +3542,111 @@ fn finish_aggregate_result(
     })
 }
 
+/// Issue #3214: 可視 id スライスの畳み込み結果（件数・総和・最小・最大）。
+#[derive(Debug, PartialEq, Eq)]
+struct IdSliceStats {
+    count: u64,
+    sum: u128,
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
+/// Issue #3214: 畳み込みで計算が必要な統計（不要な走査を省くための要求集合）。
+#[derive(Clone, Copy)]
+struct IdFoldNeeds {
+    sum: bool,
+    minmax: bool,
+}
+
+impl IdFoldNeeds {
+    fn of(accumulators: &[Accumulator]) -> Self {
+        Self {
+            sum: accumulators
+                .iter()
+                .any(|a| matches!(a, Accumulator::IdSum(_) | Accumulator::IdAvg { .. })),
+            minmax: accumulators
+                .iter()
+                .any(|a| matches!(a, Accumulator::IdMin(_) | Accumulator::IdMax(_))),
+        }
+    }
+}
+
+/// Issue #3214: 可視 id スライスを [`ROW_CHECK_INTERVAL`] 件ごとのチャンクで 1 パスに畳み込む。
+/// 呼び出し元は `execute_aggregate_with_group_limits` の Fast 分岐（キャッシュ命中時）。
+/// 中断確認（Issue #3208・#1952）はチャンク先頭で行い、非空なら必ず 1 回評価する。
+/// 総和は `u128` で持つため（id は `u64`・件数は `usize` 上限）オーバーフローしない。
+fn fold_visible_ids(ids: &[u64], needs: IdFoldNeeds) -> Result<IdSliceStats, SqlSurfaceError> {
+    let count = u64::try_from(ids.len())
+        .map_err(|_| accumulator_bug("visible id count exceeds u64 range"))?;
+    let mut check = crate::interrupt::RowCheck::new();
+    let mut sum: u128 = 0;
+    let mut min = u64::MAX;
+    let mut max = u64::MIN;
+    for chunk in ids.chunks(crate::interrupt::ROW_CHECK_INTERVAL as usize) {
+        check.check_chunk()?;
+        if needs.sum {
+            sum += chunk.iter().map(|&id| u128::from(id)).sum::<u128>();
+        }
+        if needs.minmax {
+            for &id in chunk {
+                min = min.min(id);
+                max = max.max(id);
+            }
+        }
+    }
+    let nonempty = !ids.is_empty();
+    Ok(IdSliceStats {
+        count,
+        sum,
+        min: (nonempty && needs.minmax).then_some(min),
+        max: (nonempty && needs.minmax).then_some(max),
+    })
+}
+
+/// Issue #3214: 可視 id スライスの畳み込みで確定してよい形かの判定。全項目が `DISTINCT`・
+/// `FILTER` なしで、`COUNT(*)`／`COUNT(id)`／`SUM`／`AVG`／`MIN`／`MAX(id)` のいずれかのときだけ真。
+/// それ以外（`GROUPING()`・分散系・式・列・文字列集計など）は偽で従来経路（fail-closed）。
+fn is_visible_id_fold(
+    bound: &crate::sql::parser::BoundAggregate,
+    accumulators: &[Accumulator],
+) -> bool {
+    !bound.items.is_empty()
+        && accumulators.len() == bound.items.len()
+        && accumulators.iter().zip(&bound.items).all(|(a, item)| {
+            !item.distinct
+                && item.filter.is_none()
+                && matches!(
+                    (a, &item.input),
+                    (
+                        Accumulator::Count(_),
+                        AggregateInput::AllVisible | AggregateInput::IdU64
+                    ) | (
+                        Accumulator::IdSum(_)
+                            | Accumulator::IdAvg { .. }
+                            | Accumulator::IdMin(_)
+                            | Accumulator::IdMax(_),
+                        AggregateInput::IdU64
+                    )
+                )
+        })
+}
+
+/// Issue #3213: 可視 id キャッシュ経路で件数のみ加算してよい形かの判定。
+/// 全項目が `COUNT(*)`（`DISTINCT`・`FILTER` なし）で、アキュムレータも全て `Count` のとき
+/// だけ真。`count_star_only` が許容する `GROUPING()` はここでは除外する（厳格化）。
+fn is_pure_count_star(
+    bound: &crate::sql::parser::BoundAggregate,
+    accumulators: &[Accumulator],
+) -> bool {
+    count_star_only(&bound.items)
+        && accumulators
+            .iter()
+            .all(|a| matches!(a, Accumulator::Count(_)))
+        && bound.items.iter().all(|i| {
+            matches!(i.input, AggregateInput::AllVisible) && !i.distinct && i.filter.is_none()
+        })
+}
+
 /// Issue #475: `GROUP BY` なし・索引対応述語のみの `WHERE` を持つ集計を、
 /// Issue #660 系（索引経路の残存コスト削減）: 集計項目がすべて `COUNT(*)`
 /// （[`AggregateInput::AllVisible`]）だけで構成されるかを判定する。
@@ -4032,6 +4242,80 @@ fn capture_scalar_index_snapshot(
 
 #[cfg(test)]
 mod tests {
+    // Issue #3214: 畳み込み＋反映が従来の逐次 observe と一致すること。
+    fn fold_via_stats(ids: &[u64], func: AggregateFunc) -> Result<Cell, SqlSurfaceError> {
+        let mut acc = Accumulator::new(func, &AggregateInput::IdU64)?;
+        let needs = IdFoldNeeds::of(std::slice::from_ref(&acc));
+        let stats = fold_visible_ids(ids, needs)?;
+        acc.absorb_id_stats(&stats)?;
+        acc.finish()
+    }
+
+    fn fold_via_rows(ids: &[u64], func: AggregateFunc) -> Result<Cell, SqlSurfaceError> {
+        let mut acc = Accumulator::new(func, &AggregateInput::IdU64)?;
+        for &id in ids {
+            acc.observe_id(id)?;
+        }
+        acc.finish()
+    }
+
+    #[test]
+    fn id_fold_matches_row_loop() {
+        let n = crate::interrupt::ROW_CHECK_INTERVAL as u64;
+        let long = |len: u64| (0..len).map(|i| i * 3 + 1).collect::<Vec<_>>();
+        let cases: Vec<Vec<u64>> = vec![
+            vec![],
+            vec![0],
+            vec![7],
+            vec![u64::MAX],
+            vec![u64::MAX, 0],
+            vec![u64::MAX - 1, 1],
+            vec![u64::MAX, 1],
+            vec![u64::MAX, u64::MAX],
+            long(n - 1),
+            long(n),
+            long(n + 1),
+            long(n * 2 + 5),
+        ];
+        for ids in &cases {
+            for func in [
+                AggregateFunc::Sum,
+                AggregateFunc::Avg,
+                AggregateFunc::Min,
+                AggregateFunc::Max,
+                AggregateFunc::Count,
+            ] {
+                let a = fold_via_stats(ids, func);
+                let b = fold_via_rows(ids, func);
+                match (a, b) {
+                    (Ok(x), Ok(y)) => assert_eq!(format!("{x:?}"), format!("{y:?}")),
+                    (Err(x), Err(y)) => assert_eq!(x.to_string(), y.to_string()),
+                    (x, y) => panic!("mismatch {func:?} len={}: {x:?} vs {y:?}", ids.len()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn id_fold_sum_and_avg_error_order_follows_item_order() {
+        let ids = [u64::MAX, 1];
+        let stats = fold_visible_ids(
+            &ids,
+            IdFoldNeeds {
+                sum: true,
+                minmax: false,
+            },
+        )
+        .unwrap();
+        let mut accs = [
+            Accumulator::new(AggregateFunc::Avg, &AggregateInput::IdU64).unwrap(),
+            Accumulator::new(AggregateFunc::Sum, &AggregateInput::IdU64).unwrap(),
+        ];
+        let first = accs[0].absorb_id_stats(&stats).unwrap_err();
+        assert_eq!(first.wire_code(), "22003");
+        assert!(first.to_string().contains("AVG(id)"), "{first}");
+    }
+
     use super::*;
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::sql::allowlist::AggregateFunc;

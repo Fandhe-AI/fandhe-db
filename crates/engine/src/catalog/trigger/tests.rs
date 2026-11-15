@@ -118,6 +118,48 @@ fn blob_roundtrip_and_golden_bytes() {
     assert_eq!(encode_trigger_def(&plain).expect("encode"), golden);
 }
 
+// INSTEAD OF（Issue #3193）は timing タグ `2`。版は据え置きで、ROW・`UPDATE OF`／`WHEN` なしの形だけが
+// 保存でき、未知のタグは固定文言の `CorruptSchema` で拒否される（旧バイナリが読む場合も同じ扱い）。
+#[test]
+fn instead_of_timing_tag_roundtrips_and_shape_is_enforced() {
+    let mut d = tdef("trg", "f");
+    d.id = 3;
+    d.timing = TriggerTiming::InsteadOf;
+    d.update_of.clear();
+    let bytes = encode_trigger_def(&d).expect("encode");
+    assert_eq!(bytes[0], TRIGGER_DEF_VERSION);
+    // 版(1)・id(8)・owner(1) の次が timing。
+    assert_eq!(bytes[10], 2);
+    assert_eq!(decode_trigger_def("trg", &bytes).expect("decode"), d);
+
+    let mut unknown = bytes.clone();
+    unknown[10] = 3;
+    assert!(matches!(
+        decode_trigger_def("trg", &unknown),
+        Err(CatalogError::CorruptSchema(_))
+    ));
+
+    // 文トリガ・`UPDATE OF`・`WHEN` を持つ INSTEAD OF は保存も復号もできない。
+    let mut stmt = d.clone();
+    stmt.level = TriggerLevel::Statement;
+    assert!(matches!(
+        encode_trigger_def(&stmt),
+        Err(CatalogError::Invalid(_))
+    ));
+    let mut of = d.clone();
+    of.update_of = vec!["a".to_string()];
+    assert!(matches!(
+        encode_trigger_def(&of),
+        Err(CatalogError::Invalid(_))
+    ));
+    let mut when = d.clone();
+    when.when_sql = Some("a > 1".to_string());
+    assert!(matches!(
+        encode_trigger_def(&when),
+        Err(CatalogError::Invalid(_))
+    ));
+}
+
 #[test]
 fn corrupt_blobs_fail_closed_with_fixed_message() {
     let mut d = tdef("trg", "f");

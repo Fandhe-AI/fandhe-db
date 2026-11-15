@@ -1068,6 +1068,38 @@ fn output_order_does_not_depend_on_internal_schema_ids() {
 }
 
 #[test]
+fn instead_of_triggers_on_views_survive_the_round_trip() {
+    // ビューへの INSTEAD OF トリガ（TABLE-45・Issue #3193）は、ビューの CREATE（PreData）の後に
+    // PostData で書き出され、復元先でも同じ定義になる。
+    let dump = assert_round_trip(
+        "instead-of",
+        "tenant-a",
+        &[
+            "CREATE SCHEMA zz",
+            "CREATE TABLE zz.t (a INTEGER, b TEXT)",
+            "CREATE VIEW zz.v AS SELECT a, b FROM zz.t LIMIT 10",
+            "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
+            "CREATE TRIGGER tg_i INSTEAD OF INSERT OR DELETE ON zz.v FOR EACH ROW EXECUTE FUNCTION trg('x')",
+        ],
+    );
+    let (section, sql) = dump
+        .iter()
+        .find(|(_, s)| s.contains("INSTEAD OF"))
+        .expect("INSTEAD OF trigger must be dumped");
+    assert_eq!(*section, DdlSection::PostData);
+    assert!(sql.contains("ON zz.v FOR EACH ROW"), "{sql}");
+    let view_pos = dump
+        .iter()
+        .position(|(_, s)| s.starts_with("CREATE VIEW zz.v"))
+        .expect("view dumped");
+    let trigger_pos = dump
+        .iter()
+        .position(|(_, s)| s.contains("INSTEAD OF"))
+        .expect("trigger dumped");
+    assert!(view_pos < trigger_pos);
+}
+
+#[test]
 fn role_password_verifier_survives_the_round_trip_unchanged() {
     // 復元側の CREATE ROLE ... PASSWORD は、事前ハッシュ済みの検証子をそのまま保存し、平文として
     // 再ハッシュしない（再ハッシュすると salt が変わり、元のパスワードで認証できなくなる）。

@@ -93,6 +93,12 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         "一意性・参照整合性・CHECK の検査。テナント内の全行で判定する（ポリシーで隠れた行も含む。親 #2272 の規則）",
     ),
     (
+        "constraint/referential_triggers.rs",
+        3,
+        Class::NonRead,
+        "参照アクションが書き換える子行の読み書き（Issue #3284）。テナント内の全行が対象で（constraint.rs と同じ規則）、利用者へ行を返さない",
+    ),
+    (
         "gin_index.rs",
         2,
         Class::NonRead,

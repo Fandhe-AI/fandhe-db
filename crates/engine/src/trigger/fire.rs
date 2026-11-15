@@ -182,6 +182,58 @@ pub(crate) fn fire_before_row_delete(
     Ok(outcome.is_some())
 }
 
+/// `triggers`（INSTEAD OF・ROW。名前のバイト順）を、ビューへの書き込み 1 行に対して順に発火する
+/// （Issue #3193。`sql` の `INSERT`／`UPDATE`／`DELETE` が `core::view_instead_of` から行ごとに呼ぶ）。
+/// 前のトリガが返した行を次のトリガの NEW とする（INSERT・UPDATE）。DELETE は返却行を使わない。
+/// `Ok(None)` は `NULL` 返却（その行は処理済みに数えず、後続のトリガも呼ばない。PostgreSQL と同じ）、
+/// `Ok(Some(row))` は最終 NEW（DELETE は空）。`schema` はビューの公開列から合成した行型。
+/// 呼び出し元は redb の表ハンドルを 1 つも開かずに呼ぶこと（D5）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire_instead_of_row(
+    runtime: &TriggerRuntime,
+    writes: &TriggerWriteHandle<'_>,
+    view: &str,
+    schema: &TableSchema,
+    triggers: &[TriggerDef],
+    op: TriggerOp,
+    old: Option<&[Value]>,
+    new_row: Vec<Value>,
+) -> Result<Option<Vec<Value>>, SqlSurfaceError> {
+    let mut row = new_row;
+    for trigger in triggers {
+        crate::interrupt::check()?;
+        if trigger.when_sql.is_some() {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: WHEN_UNSUPPORTED.to_string(),
+            });
+        }
+        let outcome = runtime.invoke(&TriggerCall {
+            trigger_name: &trigger.name,
+            function_key: &trigger.function_key,
+            table: view,
+            schema,
+            op,
+            level: TriggerLevel::Row,
+            old_row: old,
+            new_row: &row,
+            args: &trigger.tg_args,
+            timing: TriggerTiming::InsteadOf,
+            writes,
+            host: runtime.host(),
+        })?;
+        match outcome {
+            TriggerOutcome::Skip => return Ok(None),
+            TriggerOutcome::Proceed(next) => {
+                if op != TriggerOp::Delete {
+                    check_returned_row(schema, &next)?;
+                    row = next;
+                }
+            }
+        }
+    }
+    Ok(Some(row))
+}
+
 /// `triggers`（AFTER・ROW のみ。カタログ順）を、変更した 1 行に対して順に発火する（Issue #1724・#1725）。
 /// INSERT は `old = None`・`new_row` が最終 NEW、UPDATE は `(OLD, 最終 NEW)`、DELETE は `old = Some` と
 /// 空の `new_row`。戻り値（`Proceed`・`Skip`）は無視し、返却行の構造も検査しない（実行モデルの D3）。

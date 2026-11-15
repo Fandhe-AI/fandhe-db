@@ -383,3 +383,75 @@ fn handle_without_runtime_keeps_0a000() {
     let err = handle.insert_row("c1", None, &row).unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
 }
+// (k) ビューの INSTEAD OF トリガ本体が書いた表の AFTER ROW トリガが、遅延 FK を持つ子表へ書く入れ子でも、
+// 遅延 FK の検査は autocommit は文末・明示 Tx は COMMIT 時に行われる（Issue #3193。親行を同一 Tx の後続文で足せる）。
+#[test]
+fn view_instead_of_nested_trigger_follows_deferred_fk_timing() {
+    use crate::catalog::trigger::TriggerEvents;
+    let dir = tempdir();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let core = EngineCore::from_storage(
+        open_storage(dir.path()),
+        Box::new(crate::kernel::CpuScalarProvider),
+    )
+    .with_trigger_invoker_for_test(Arc::new(FnInvoker {
+        behavior: Box::new(|c| {
+            match c.table {
+                "vv" => c.writes.insert_row("c1", None, c.new_row)?,
+                "c1" => c
+                    .writes
+                    .insert_row("fk_child", None, &[Value::BigInt(999)])?,
+                _ => {}
+            }
+            Ok(TriggerOutcome::Proceed(c.new_row.to_vec()))
+        }),
+        calls,
+    }));
+    let sys = ctx("tenant-a");
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE TABLE fk_parent (k BIGINT PRIMARY KEY)",
+        "CREATE TABLE fk_child (parent_id BIGINT REFERENCES fk_parent DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE VIEW vv AS SELECT embedding, a, n FROM plain_a LIMIT 100",
+    ] {
+        core.execute_sql_in_session(&sys, &mut s, sql).expect(sql);
+    }
+    let mut instead = trigger_def("iv", TriggerTiming::InsteadOf, TriggerLevel::Row);
+    instead.events = TriggerEvents::from_bits(TriggerEvents::INSERT).expect("events");
+    add_trigger(&core.storage, "tenant-a", "vv", &instead);
+    add_trigger(&core.storage, "tenant-a", "c1", &after_row("t1"));
+    let ins = "INSERT INTO vv (embedding, a, n) VALUES ('[1.0,0.0]', 'x', 1)";
+
+    // autocommit: 親が無いので文末の検査で 23503。全体が取り消される。
+    let err = run(&core, &sys, ins).unwrap_err();
+    assert_eq!(err.wire_code(), "23503");
+    assert_no_rows(&core, &["c1", "fk_child"]);
+
+    // 明示 Tx: 親を後続文で足せば COMMIT が通る。
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        ins,
+        "INSERT INTO fk_parent (k) VALUES (999)",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&sys, &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    assert_eq!(count(&core, &sys, "fk_child"), 1);
+
+    // 明示 Tx: 親が無ければ COMMIT で 23503。
+    core.execute_sql_in_txn(&sys, &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&sys, &mut s, &mut txn, "DELETE FROM fk_child")
+        .expect("clean");
+    core.execute_sql_in_txn(&sys, &mut s, &mut txn, "DELETE FROM fk_parent")
+        .expect("clean");
+    core.execute_sql_in_txn(&sys, &mut s, &mut txn, ins)
+        .expect("deferred check waits for COMMIT");
+    let e = core
+        .execute_sql_in_txn(&sys, &mut s, &mut txn, "COMMIT")
+        .expect_err("deferred FK violation");
+    assert_eq!(e.wire_code(), "23503");
+}

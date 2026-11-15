@@ -233,6 +233,14 @@ impl RowCheck {
         self.left = ROW_CHECK_INTERVAL - 1;
         check_due()
     }
+
+    /// スライス畳み込み用のチャンク境界確認（Issue #3214）。間引きカウンタを介さず即時に評価する。
+    /// 呼び出し側が [`ROW_CHECK_INTERVAL`] 件ごとのチャンクの先頭で 1 回呼ぶことで、行ごとの
+    /// `tick` と同じ確認間隔（最大遅延）を保ち、非空スライスでは先頭で必ず評価される。
+    #[inline]
+    pub(crate) fn check_chunk(&mut self) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        check_due()
+    }
 }
 
 /// [`RowCheck::tick`] の評価点。間引きを通さず即時に判定する。

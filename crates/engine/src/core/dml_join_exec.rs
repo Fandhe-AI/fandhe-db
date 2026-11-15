@@ -49,8 +49,9 @@ fn not_supported(detail: &str) -> SqlSurfaceError {
 /// `returning_rows` は計画が `RETURNING` を持つときの返却行（持たなければ `None`）。
 pub(crate) struct JoinedDmlOutcome {
     pub(crate) rows_affected: u64,
-    // Issue #3204（FROM 側列参照の RETURNING）が読むまで SQL 経路では未使用。
-    #[allow(dead_code)]
+    // SQL 経路の RETURNING は `JoinedProbe` の共有ハンドルから直接読むため、本フィールドを読むのは
+    // 単体テスト（`dml_join_exec_tests`）だけ。本番ビルドへ死んだ値を持ち込まないよう `cfg(test)` に限る。
+    #[cfg(test)]
     pub(crate) matches: Vec<(u64, u32)>,
     pub(crate) returning_rows: Option<Vec<ResultRow>>,
 }
@@ -272,6 +273,7 @@ impl EngineCore {
         };
         Ok(JoinedDmlOutcome {
             rows_affected,
+            #[cfg(test)]
             matches: probe.matches_sorted()?,
             returning_rows: plan.returning.is_some().then_some(returning_rows),
         })
