@@ -2044,6 +2044,71 @@ fn returning_udf_is_not_visible_across_sessions() {
     assert_eq!(count_star(&core, &alice, TABLE), 0);
 }
 
+/// データ更新 CTE の UPDATE／DELETE の RETURNING では UDF を評価せず、書き込み前に `42883` で
+/// 拒否する（参照されない CTE 本体でも UDF が実行されず、書き込みが残らない）。
+/// 実行段の空レジストリ化は CTE INSERT・単一行 DELETE と同じ fail-closed の揃え。
+#[test]
+fn data_modifying_cte_returning_udf_is_rejected_without_writing() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+    );
+    run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hello') USING OPERATION_ID 'op-cte-udf-seed'"
+        ),
+    )
+    .expect("seed");
+    for (i, sql) in [
+        format!(
+            "WITH u AS (UPDATE {TABLE} SET lang = 'fr' WHERE id = 1 RETURNING shout(lang)) \
+             SELECT id FROM {TABLE} USING OPERATION_ID 'op-cte-udf-u1'"
+        ),
+        format!(
+            "WITH u AS (UPDATE {TABLE} SET lang = 'fr' WHERE id > 0 RETURNING shout(lang)) \
+             SELECT id FROM {TABLE} USING OPERATION_ID 'op-cte-udf-u2'"
+        ),
+        format!(
+            "WITH d AS (DELETE FROM {TABLE} WHERE id > 0 RETURNING shout(lang)) \
+             SELECT id FROM {TABLE} USING OPERATION_ID 'op-cte-udf-d1'"
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let err = run(&core, &alice, &mut session, sql).expect_err(sql);
+        // 現状は CTE 展開段（式 RETURNING は #3251 で対応予定）が 0A000 で先に拒否する。展開が
+        // 対応した後も、実行段は空レジストリのため 42883 で拒否される。どちらも書き込み前の拒否。
+        assert!(
+            ["0A000", "42883"].contains(&err.wire_code()),
+            "#{i} {sql}: {err}"
+        );
+        assert_eq!(count_star(&core, &alice, TABLE), 1, "#{i}");
+        let lang = run(
+            &core,
+            &alice,
+            &mut session,
+            &format!("SELECT lang FROM {TABLE} LIMIT 5"),
+        )
+        .expect("select lang");
+        match lang {
+            SqlOutcome::Query(q) => assert_eq!(q.rows[0].cells, vec![Cell::Text("ja".to_string())]),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+}
+
 /// 明示 Tx 内の UDF 付き RETURNING は ROLLBACK で行が残らず、COMMIT で残る。
 #[test]
 fn returning_udf_in_explicit_transaction() {

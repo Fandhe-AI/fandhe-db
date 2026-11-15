@@ -281,7 +281,8 @@ impl EngineCore {
                         session,
                         form,
                         pre_update,
-                        session.udfs(),
+                        // CTE 本体は外側プランの束縛を通らない場合があるため、UDF は評価せず空レジストリで 42883 に倒す（fail-closed）。
+                        &crate::sql::udf_call::UdfRegistry::default(),
                     )
                     .map(|o| Some(o.result))
                 } else {
@@ -310,7 +311,8 @@ impl EngineCore {
                         session,
                         v,
                         pre_delete,
-                        session.udfs(),
+                        // 同上（参照されない CTE 本体で UDF が評価され書き込みが残るのを防ぐ）。
+                        &crate::sql::udf_call::UdfRegistry::default(),
                     )
                     .map(|o| Some(o.result))
                 } else {
