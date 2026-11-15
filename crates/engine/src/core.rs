@@ -20528,7 +20528,12 @@ impl EngineCore {
                         .execute_delete_form(make_target(), ctx, v)
                         .map(crate::sql::SqlOutcome::Delete),
                     DeleteStatement::Predicate(v) if v.returning().is_some() => self
-                        .execute_predicate_delete_returning_form(make_target(), ctx, session, v)
+                        .execute_view_predicate_delete_returning_form(
+                            make_target(),
+                            ctx,
+                            session,
+                            v,
+                        )
                         .map(returning),
                     DeleteStatement::Predicate(v) => self
                         .execute_predicate_delete_form(make_target(), ctx, session, v)
@@ -20565,7 +20570,7 @@ impl EngineCore {
                     ValidatedUpdateForm::Predicate(v) => v.returning().is_some(),
                 };
                 if has_returning {
-                    self.execute_update_returning_form(
+                    self.execute_view_update_returning_form(
                         make_target(),
                         ctx,
                         session,
@@ -21569,7 +21574,34 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.execute_predicate_delete_returning_form_pre(target, ctx, session, stmt, None)
+        self.execute_predicate_delete_returning_form_pre(
+            target,
+            ctx,
+            session,
+            stmt,
+            None,
+            session.udfs(),
+        )
+    }
+
+    /// [`Self::execute_predicate_delete_returning_form`] のビュー経由版。`RETURNING` の束縛に
+    /// 空レジストリを渡し UDF を解決しない（#3251。未登録扱い 42883 で fail-closed。ビュー INSERT・
+    /// 単一行 DELETE と同じ契約）。
+    fn execute_view_predicate_delete_returning_form(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_predicate_delete_returning_form_pre(
+            target,
+            ctx,
+            session,
+            stmt,
+            None,
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
     }
 
     /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
@@ -21582,12 +21614,13 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedPredicateDelete,
         pre: Option<Option<crate::sql::allowlist::ValidatedPredicateDelete>>,
+        returning_udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
         let returning = crate::sql::parser::bind_returning_with_udfs(
             stmt.returning(),
             &schema,
-            session.udfs(),
+            returning_udfs,
         )?
         .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
             detail: "execute_predicate_delete_returning_form called without RETURNING".to_string(),
@@ -21922,7 +21955,26 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.execute_update_returning_form_pre(target, ctx, session, stmt, None)
+        self.execute_update_returning_form_pre(target, ctx, session, stmt, None, session.udfs())
+    }
+
+    /// [`Self::execute_update_returning_form`] のビュー経由版。`RETURNING` の束縛に空レジストリを
+    /// 渡し UDF を解決しない（#3251。未登録扱い 42883 で fail-closed）。
+    fn execute_view_update_returning_form(
+        &self,
+        target: crate::tenant::WriteTarget<'_>,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        stmt: &crate::sql::allowlist::ValidatedUpdateForm,
+    ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        self.execute_update_returning_form_pre(
+            target,
+            ctx,
+            session,
+            stmt,
+            None,
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
     }
 
     /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の
@@ -21935,6 +21987,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
         pre: Option<Option<crate::sql::allowlist::ValidatedPredicateUpdate>>,
+        returning_udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::ValidatedUpdateForm;
 
@@ -21944,7 +21997,7 @@ impl EngineCore {
         };
         let schema = self.load_table_schema_for_dml(table_name)?;
         let returning =
-            crate::sql::parser::bind_returning_with_udfs(projection, &schema, session.udfs())?
+            crate::sql::parser::bind_returning_with_udfs(projection, &schema, returning_udfs)?
                 .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {
                     detail: "execute_update_returning_form called without RETURNING".to_string(),
                 })?;

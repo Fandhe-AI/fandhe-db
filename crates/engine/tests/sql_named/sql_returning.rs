@@ -2081,3 +2081,55 @@ fn returning_udf_in_explicit_transaction() {
         assert_eq!(count_star(&core, &alice, TABLE), expected, "{end}");
     }
 }
+
+/// ビュー経由の UPDATE・述語 DELETE の RETURNING は UDF を評価せず `42883` で fail-closed
+/// （#3251。ビュー INSERT・単一行 DELETE と同じ契約。Describe と Execute の挙動を一致させる）。
+// intentional: docs/design/sql-returning.md
+#[test]
+fn returning_udf_through_view_is_fail_closed() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+    );
+    run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hello') USING OPERATION_ID 'op-udf-vseed'"
+        ),
+    )
+    .expect("seed");
+    define(
+        &core,
+        &alice,
+        &mut session,
+        &format!("CREATE VIEW v_udf AS SELECT * FROM {TABLE}"),
+    );
+    for sql in [
+        "UPDATE v_udf SET lang = 'fr' WHERE id = 1 RETURNING shout(lang) \
+         USING OPERATION_ID 'op-udf-vu'",
+        "UPDATE v_udf SET lang = 'fr' WHERE lang = 'ja' RETURNING shout(lang) \
+         USING OPERATION_ID 'op-udf-vup'",
+        "DELETE FROM v_udf WHERE lang = 'ja' RETURNING shout(lang) \
+         USING OPERATION_ID 'op-udf-vdp'",
+    ] {
+        let err = run(&core, &alice, &mut session, sql).expect_err(sql);
+        // 構文段が式を `42601` で拒否する形と、束縛段が空レジストリで `42883` に倒す形の
+        // どちらも fail-closed（UDF を評価して成功してはならない）。
+        assert!(
+            matches!(err.wire_code(), "42601" | "42883"),
+            "{sql}: {} {err}",
+            err.wire_code()
+        );
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+}

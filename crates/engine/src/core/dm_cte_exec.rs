@@ -275,8 +275,15 @@ impl EngineCore {
                     ValidatedUpdateForm::Predicate(v) => v.returning().is_some(),
                 };
                 if has_returning {
-                    self.execute_update_returning_form_pre(target, ctx, session, form, pre_update)
-                        .map(|o| Some(o.result))
+                    self.execute_update_returning_form_pre(
+                        target,
+                        ctx,
+                        session,
+                        form,
+                        pre_update,
+                        session.udfs(),
+                    )
+                    .map(|o| Some(o.result))
                 } else {
                     self.execute_predicate_update_form_pre(target, ctx, session, form, pre_update)
                         .map(|_| None)
@@ -298,7 +305,12 @@ impl EngineCore {
             DmlStatement::Delete(crate::sql::allowlist::DeleteStatement::Predicate(v)) => {
                 if v.returning().is_some() {
                     self.execute_predicate_delete_returning_form_pre(
-                        target, ctx, session, v, pre_delete,
+                        target,
+                        ctx,
+                        session,
+                        v,
+                        pre_delete,
+                        session.udfs(),
                     )
                     .map(|o| Some(o.result))
                 } else {
