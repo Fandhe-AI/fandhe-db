@@ -705,6 +705,27 @@ fn static_type_of(
         .map(|(_, ty)| ty)
 }
 
+/// `CAST` の被演算子が配列のとき、その要素型（列参照・配列への `CAST`・`ARRAY[..]` から解決できる範囲）。
+/// 解決できなければ `None`（TZ 依存の判定は要素型が分かる経路でだけ働く）。
+fn array_source_elem(
+    e: &Expr,
+    schema: &crate::catalog::TableSchema,
+) -> Option<crate::catalog::ArrayElemType> {
+    use crate::catalog::{ArrayElemType, ColumnType};
+    match e {
+        Expr::Ident(name) => schema.columns.iter().find_map(|c| match &c.ty {
+            ColumnType::Array(at) if &c.name == name => Some(at.elem()),
+            _ => None,
+        }),
+        Expr::Cast { ty, .. } => ty.array_elem_type(),
+        Expr::ArrayConstructor(items) => items
+            .iter()
+            .any(|i| static_type_of(i, schema) == Some(crate::sql::udf_call::ExprType::TimestampTz))
+            .then_some(ArrayElemType::TimestampTz),
+        _ => None,
+    }
+}
+
 /// 時刻・間隔型（文字列との相互変換が `DateStyle`／`IntervalStyle` に依存する型）か。
 fn is_datetime_type(ty: crate::sql::udf_call::ExprType) -> bool {
     use crate::sql::udf_call::ExprType;
@@ -854,12 +875,33 @@ pub(crate) fn check_bound_index_expression_determinism(
         Expr::Collate { expr, .. } => rec(expr),
         Expr::Cast { expr: inner, ty } => {
             let src = ty_of(inner);
-            let src_tz = src == Some(ExprType::TimestampTz);
-            let dst_tz = matches!(ty, crate::sql::cast::CastType::TimestampTz);
+            // 配列は要素型で判定する（`TIMESTAMPTZ[]` ⇔ 文字列・naive 日時配列の変換も TZ 依存。Issue #3233）。
+            let src_elem = array_source_elem(inner, schema);
+            let dst_elem = match ty {
+                crate::sql::cast::CastType::Array(e) => Some(e.as_ref()),
+                _ => None,
+            };
+            let src_tz = src == Some(ExprType::TimestampTz)
+                || src_elem == Some(crate::catalog::ArrayElemType::TimestampTz);
+            let dst_tz = matches!(ty, crate::sql::cast::CastType::TimestampTz)
+                || dst_elem.is_some_and(|e| matches!(e, crate::sql::cast::CastType::TimestampTz));
             // 文字列リテラル等も含め、`TIMESTAMPTZ` への変換は評価時のセッション TZ に依存する。
             let tz_conversion = (src_tz && !dst_tz) || (dst_tz && !src_tz);
+            let src_elem_datetime = src_elem.is_some_and(|e| {
+                use crate::catalog::ArrayElemType as E;
+                matches!(e, E::Date | E::Time | E::Timestamp | E::TimestampTz)
+            });
+            let src_elem_text = src_elem.is_some_and(|e| {
+                use crate::catalog::ArrayElemType as E;
+                matches!(e, E::Text | E::Varchar(_) | E::Bpchar(_))
+            });
+            let dst_elem_text = dst_elem.is_some_and(cast_is_text_family);
+            let dst_elem_datetime = dst_elem.is_some_and(cast_is_datetime);
             let text_datetime = (cast_is_text_family(ty) && src.is_some_and(is_datetime_type))
-                || (cast_is_datetime(ty) && src == Some(ExprType::Text));
+                || (cast_is_datetime(ty) && src == Some(ExprType::Text))
+                || (cast_is_text_family(ty) && src_elem_datetime)
+                || (dst_elem_datetime && (src == Some(ExprType::Text) || src_elem_text))
+                || (dst_elem_text && src_elem_datetime);
             if tz_conversion || text_datetime {
                 return Err(not_immutable());
             }
@@ -1068,7 +1110,7 @@ mod tests {
     // --- 束縛段（Issue #1648） -------------------------------------------------------
 
     fn bind_schema() -> crate::catalog::TableSchema {
-        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
         TableSchema::new(
             "t",
             vec![
@@ -1079,6 +1121,21 @@ mod tests {
                 ColumnDef::new("at", ColumnType::Timestamp, true),
                 ColumnDef::new("at_tz", ColumnType::TimestampTz, true),
                 ColumnDef::new("flag", ColumnType::Boolean, true),
+                ColumnDef::new(
+                    "tz_arr",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::TimestampTz, 8).unwrap()),
+                    true,
+                ),
+                ColumnDef::new(
+                    "ts_arr",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Timestamp, 8).unwrap()),
+                    true,
+                ),
+                ColumnDef::new(
+                    "txt_arr",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Text, 8).unwrap()),
+                    true,
+                ),
             ],
         )
     }
@@ -1164,6 +1221,20 @@ mod tests {
             "CAST(n AS text)",
         ] {
             assert_eq!(bind_code(immutable), "ok", "{immutable}");
+        }
+    }
+
+    /// `TIMESTAMPTZ[]` と文字列・naive 日時配列の相互変換はセッション TZ に依存し、式索引では `42P17`（Issue #3233）。
+    #[test]
+    fn timestamptz_array_cast_is_not_immutable() {
+        for sql in [
+            "CAST(tz_arr AS text)",
+            "CAST(tz_arr AS timestamp[])",
+            "CAST(ts_arr AS timestamptz[])",
+            "CAST(txt_arr AS timestamptz[])",
+            "CAST(lang AS timestamptz[])",
+        ] {
+            assert_eq!(bind_code(sql), "42P17", "{sql}");
         }
     }
 
