@@ -151,7 +151,7 @@ python scripts/crossdb_bench/run.py --db self --config hnsw \
 | キー | 内容 |
 | --- | --- |
 | `phases.ann_probe` | 上記 3. の `EXPLAIN` 検証結果（`engine`/`hnsw_params`/`ann_plan`/生の行） |
-| `phases.ann_probe.knn_operator_plan` | 実際の kNN 形（`<#>`）の `EXPLAIN` から抜いた `engine`/`ann_plan`。`<#>` は現行 HNSW の対応 metric 外で厳密全走査になり（`plain_scan_opclass_mismatch`）、`USING PLAN` の `ann_probe` とは経路が違う。到達しないとき `hnsw_index_warm` は unsupported・`ef_search` は `null` |
+| `phases.ann_probe.knn_operator_plan` | 実際の kNN 形（`<=>`）の `EXPLAIN` から抜いた `engine`/`ann_plan`。kNN の演算子が HNSW の対応 metric 外だと厳密全走査になり（`plain_scan_opclass_mismatch`）、`USING PLAN` の `ann_probe` とは経路が違う観測用。到達しないとき `hnsw_index_warm` は unsupported・`ef_search` は `null` |
 | `phases.hnsw_index_warm` | 索引構築を含む初回 `vector_knn` 相当クエリの単発計時（`first_query_us`。informational。kNN が HNSW に到達しない構成では unsupported） |
 | `phases.bulk_knn_k*`/`bulk_knn_where_k200` | `ef_search`/`ef_effective`（`ef.max(k)`。`hnsw.rs::search_masked_with` の契約からの導出値） |
 | `phases.bulk_hybrid_k200` | `ef_search`/`dense_fetch_k_initial`/`dense_fetch_k_may_expand`（直後の段落参照。`ef_effective` は常に `null`） |
@@ -446,10 +446,11 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 - **fsync 等の永続化設定は未変更**: 公平性のためではなく、単に「素の Docker
   イメージ・デフォルト設定」を比較対象にする方針のため。本番運用のチューニング
   差は本ベンチの対象外。
-- **距離指標**: 自作 DB は `<#>`（負の内積の昇順＝内積の降順。
-  `crates/engine/src/kernel.rs`「スコアは内積」参照。Issue #2952・SQL-33）。
-  `<=>` はコサイン距離なので DB 間比較には使わない。`mode_precision` だけは
-  `<#>` との併用が engine で `0A000` となるため `<=>` のまま（self 専用フェーズ）。
+- **距離指標**: 自作 DB は全 kNN 形で `<=>`（コサイン距離。SQL-33。Issue #3224 で
+  Issue #2952 の `<#>` から戻した。`<#>` は HNSW の対応 metric 外で hnsw 構成が
+  厳密全走査になるため）。他 DB と recall 正解（numpy 内積）は内積のままで、
+  フィクスチャが L2 正規化済みのためコサインと順位が一致する（`recall.py` の
+  `fixture_norm_stats` を `meta.fixture_norm` に記録）。
   pgvector は `<#>`（負の内積）、Qdrant は
   `Distance.DOT`、LanceDB は `metric="dot"` に揃えている。sqlite-vec の
   vec0 は内積相当の `distance_metric` を持たない（実機確認: `l2`/`l1`/`cosine`
@@ -495,7 +496,7 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 従来の厳密一致版（同点は決定的だが恣意的な順序で 10 件に切ったうえで完全一致
 を要求する）は `recall_at_10_strict` として引き続き記録する。exact 構成でも
 同点境界の順序差により 1.0 未満になり得る（sqlite-vec は距離指標がコサイン
-近似のため、同点構造自体が自作 DB〔内積〕と異なりさらに低くなり得る）。
+近似のため、同点構造自体が自作 DB〔コサイン〕と異なりさらに低くなり得る）。
 
 ## 既知の unsupported 項目（スモークテストで確認済み）
 
