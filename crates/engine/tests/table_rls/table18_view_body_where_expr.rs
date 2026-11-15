@@ -550,26 +550,315 @@ fn aliased_and_updatable_views_keep_or_body_predicates() {
     }
 }
 
-/// 式述語つきビューが依存する表の列の `RENAME COLUMN` は、現状 fail-closed で拒否する（意味を
-/// 変えた本文を保存しない）。追随は #3239。
-// tracked: #3239
-#[test]
-fn rename_column_under_expression_view_is_refused_fail_closed() {
-    let (core, _g) = open_core("view-where-expr-rename", false);
-    ddl(
-        &core,
-        "CREATE VIEW vr AS SELECT * FROM t WHERE n > 3 OR n IS NULL",
-    )
-    .expect("vr");
-    let before = ids(&core, "alice", "SELECT id FROM vr LIMIT 100");
-    let res = ddl(&core, "ALTER TABLE t RENAME COLUMN n TO m");
-    assert!(
-        res.is_err(),
-        "rename must be refused while the view depends on it"
-    );
-    assert_eq!(ids(&core, "alice", "SELECT id FROM vr LIMIT 100"), before);
+/// 投影に `id` を含まないビューの結果行（セル列の文字列表現。順不同比較用に整列）。
+fn cells_of(core: &EngineCore, tenant: &str, sql: &str) -> Vec<String> {
+    let mut v: Vec<String> = run(core, tenant, sql)
+        .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        .rows
+        .iter()
+        .map(|r| format!("{:?}", r.cells))
+        .collect();
+    v.sort();
+    v
 }
 
+/// 述語中の識別子 `from`（語単位）を `to` へ置換する（直接実行のオラクル側の改名後 SQL を作る）。
+fn rename_word(pred: &str, from: &str, to: &str) -> String {
+    let mut out = String::new();
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        out.push_str(if word == from { to } else { word.as_str() });
+        word.clear();
+    };
+    for ch in pred.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
+/// 式述語つきビューが依存する表の列の `RENAME COLUMN` は本文を追随させ（Issue #3239）、
+/// 改名後もビュー経由の結果が改名前・改名後の述語での直接実行と一致する。再オープン後も同じ。
+/// 旧名での外側参照は未知列（42703）。
+#[test]
+fn rename_column_under_expression_view_follows_and_keeps_results() {
+    let path = unique_db_path("view-where-expr-rename");
+    let _guard = CleanupGuard(path.clone());
+    let mut before = Vec::new();
+    {
+        let core = open_at(&path, false);
+        for (i, (pred, _)) in cases().iter().enumerate() {
+            ddl(
+                &core,
+                &format!("CREATE VIEW v{i} AS SELECT * FROM t WHERE {pred}"),
+            )
+            .unwrap_or_else(|e| panic!("{pred}: {e:?}"));
+        }
+        for tenant in TENANTS {
+            for i in 0..cases().len() {
+                before.push(ids(
+                    &core,
+                    tenant,
+                    &format!("SELECT id FROM v{i} LIMIT 100"),
+                ));
+            }
+        }
+        ddl(&core, "ALTER TABLE t RENAME COLUMN n TO m").expect("rename follows");
+        let mut k = 0;
+        for tenant in TENANTS {
+            for (i, (pred, _)) in cases().iter().enumerate() {
+                let via = ids(&core, tenant, &format!("SELECT id FROM v{i} LIMIT 100"));
+                assert_eq!(via, before[k], "tenant={tenant} pred={pred}");
+                let renamed = rename_word(pred, "n", "m");
+                let direct = ids(
+                    &core,
+                    tenant,
+                    &format!("SELECT id FROM t WHERE {renamed} LIMIT 100"),
+                );
+                assert_eq!(via, direct, "direct tenant={tenant} pred={renamed}");
+                k += 1;
+            }
+        }
+        let err = run(&core, "alice", "SELECT id FROM t WHERE n > 3 LIMIT 100")
+            .expect_err("old name is unknown");
+        assert_eq!(err.wire_code(), "42703");
+    }
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut k = 0;
+    for tenant in TENANTS {
+        for i in 0..cases().len() {
+            let via = ids(&core, tenant, &format!("SELECT id FROM v{i} LIMIT 100"));
+            assert_eq!(via, before[k], "reopen tenant={tenant} v{i}");
+            k += 1;
+        }
+    }
+}
+
+/// 改名列を参照しない式述語ビューは、その列を改名しても成功し結果が変わらない。
+#[test]
+fn rename_unreferenced_column_keeps_expression_view() {
+    let (core, _g) = open_core("view-where-expr-rename-unref", false);
+    ddl(
+        &core,
+        "CREATE VIEW vu AS SELECT * FROM t WHERE lower(s) = 'c'",
+    )
+    .expect("vu");
+    let before = ids(&core, "alice", "SELECT id FROM vu LIMIT 100");
+    ddl(&core, "ALTER TABLE t RENAME COLUMN n TO m").expect("rename");
+    assert_eq!(ids(&core, "alice", "SELECT id FROM vu LIMIT 100"), before);
+}
+
+/// 連鎖（式述語つき単純形の上に式述語つき単純形）で両段が追随し、表 RENAME も追随する。
+#[test]
+fn rename_column_and_table_follow_chained_expression_views() {
+    let (core, _g) = open_core("view-where-expr-rename-chain", false);
+    ddl(
+        &core,
+        "CREATE VIEW c1 AS SELECT * FROM t WHERE n > 1 OR n IS NULL",
+    )
+    .expect("c1");
+    ddl(
+        &core,
+        "CREATE VIEW c2 AS SELECT * FROM c1 WHERE n BETWEEN 2 AND 10 OR n IS NULL",
+    )
+    .expect("c2");
+    let want: Vec<Vec<u64>> = TENANTS
+        .iter()
+        .map(|t| ids(&core, t, "SELECT id FROM c2 LIMIT 100"))
+        .collect();
+    ddl(&core, "ALTER TABLE t RENAME COLUMN n TO m").expect("rename column");
+    ddl(&core, "ALTER TABLE t RENAME TO t2").expect("rename table");
+    for (tenant, want) in TENANTS.iter().zip(&want) {
+        assert_eq!(&ids(&core, tenant, "SELECT id FROM c2 LIMIT 100"), want);
+    }
+}
+
+/// 更新可能ビューの本文述語は改名後も DML で保たれる（WITH CHECK OPTION の述語も追随する）。
+#[test]
+fn rename_column_keeps_updatable_view_check_option() {
+    let (core, _g) = open_core("view-where-expr-rename-check", false);
+    ddl(
+        &core,
+        "CREATE VIEW uc AS SELECT * FROM t WHERE n IS NULL OR n > 3 WITH CHECK OPTION",
+    )
+    .expect("uc");
+    ddl(&core, "ALTER TABLE t RENAME COLUMN n TO m").expect("rename");
+    let touched = run_outcome(
+        &core,
+        "alice",
+        "UPDATE uc SET s = 'upd' WHERE id >= 1 USING OPERATION_ID 'op-3239-a'",
+    );
+    assert!(touched.is_ok(), "{touched:?}");
+    assert_eq!(
+        ids(&core, "alice", "SELECT id FROM t WHERE s = 'upd' LIMIT 100"),
+        vec![2, 3]
+    );
+}
+
+// intentional: docs/design/create-view.md
+/// 評価後射影形（`LIMIT` 付き）の式述語ビューが列を読む場合の `RENAME COLUMN` は従来どおり
+/// `0A000` で、ビューも表も変わらない。
+#[test]
+fn rename_column_under_buffered_expression_view_is_refused() {
+    let (core, _g) = open_core("view-where-expr-rename-buffered", false);
+    ddl(
+        &core,
+        "CREATE VIEW vb AS SELECT * FROM t WHERE n > 3 OR n IS NULL LIMIT 5",
+    )
+    .expect("vb");
+    let before = ids(&core, "alice", "SELECT id FROM vb LIMIT 100");
+    let err = match ddl(&core, "ALTER TABLE t RENAME COLUMN n TO m") {
+        Err(e) => e,
+        Ok(o) => panic!("must be refused: {o:?}"),
+    };
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(ids(&core, "alice", "SELECT id FROM vb LIMIT 100"), before);
+    assert!(run(&core, "alice", "SELECT id FROM t WHERE n > 3 LIMIT 100").is_ok());
+}
+
+/// 再オープン後の参照: `LIMIT` 付き本文・評価後射影形の上の単純形の段・
+/// 列別名つきビューの外側からの式述語が、再オープンの前後で一致する。
+#[test]
+fn buffered_and_aliased_expression_views_persist_across_reopen() {
+    let path = unique_db_path("view-where-expr-reopen-buffered");
+    let _guard = CleanupGuard(path.clone());
+    let queries = [
+        "SELECT id FROM vl LIMIT 100",
+        "SELECT id FROM vs2 LIMIT 100",
+        "SELECT x FROM va WHERE x > 3 OR y = 'a' LIMIT 100",
+    ];
+    let snapshot = |core: &EngineCore| -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        for tenant in TENANTS {
+            for q in queries {
+                let mut rows: Vec<String> = run(core, tenant, q)
+                    .unwrap_or_else(|e| panic!("{q}: {e:?}"))
+                    .rows
+                    .iter()
+                    .map(|r| format!("{}:{:?}", r.id, r.cells))
+                    .collect();
+                rows.sort();
+                out.push(rows);
+            }
+        }
+        out
+    };
+    let expected = {
+        let core = open_at(&path, false);
+        for sql in [
+            "CREATE VIEW vl AS SELECT * FROM t WHERE n > 3 OR n IS NULL LIMIT 50",
+            "CREATE VIEW vs2 AS SELECT * FROM vl WHERE n IN (1, 5, 10) OR s = 'b'",
+            "CREATE VIEW va (x, y) AS SELECT n, s FROM t WHERE n > 3 OR n IS NULL",
+        ] {
+            if let Err(e) = ddl(&core, sql) {
+                panic!("{sql}: {e:?}");
+            }
+        }
+        snapshot(&core)
+    };
+    let storage = Storage::open(&path).expect("reopen");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    assert_eq!(snapshot(&core), expected);
+}
+
+// intentional: docs/design/create-view.md
+/// 式・`OR` の枝・`NOT` の内側・`IN`／`BETWEEN`／`IS NULL` だけで列を参照するビューがあるとき、
+/// その列の `DROP COLUMN` は依存エラーで拒否され、表もビューも変わらない。
+#[test]
+fn drop_column_referenced_only_inside_expression_predicates_is_rejected() {
+    for (i, pred) in [
+        "n + 1 > 3",
+        "s = 'a' OR n > 3",
+        "NOT (s = 'a' OR n > 3)",
+        "n IN (1, 2)",
+        "n BETWEEN 1 AND 5",
+        "n IS NULL",
+        "COALESCE(n, 0) > 1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let (core, _g) = open_core(&format!("view-where-expr-drop-{i}"), false);
+        ddl(
+            &core,
+            &format!("CREATE VIEW vd AS SELECT s FROM t WHERE {pred}"),
+        )
+        .expect("vd");
+        let before = cells_of(&core, "alice", "SELECT s FROM vd LIMIT 100");
+        let err = match ddl(&core, "ALTER TABLE t DROP COLUMN n") {
+            Err(e) => e,
+            Ok(o) => panic!("{pred}: must be refused: {o:?}"),
+        };
+        assert_eq!(err.wire_code(), "2BP01", "{pred}");
+        assert_eq!(
+            cells_of(&core, "alice", "SELECT s FROM vd LIMIT 100"),
+            before
+        );
+        assert!(
+            run(&core, "alice", "SELECT n FROM t LIMIT 1").is_ok(),
+            "{pred}"
+        );
+    }
+}
+
+// intentional: docs/design/create-view.md
+/// 式述語だけで列を参照するビューがあるとき、`USING` を伴う一般変換の `ALTER COLUMN TYPE` は
+/// `0A000` で拒否され何も変わらない。値を変えない拡大の後もビューは同じ結果を返す。
+#[test]
+fn alter_type_with_expression_view_dependency_is_guarded() {
+    let (core, _g) = open_core("view-where-expr-alter-type", false);
+    ddl(
+        &core,
+        "CREATE VIEW vt2 AS SELECT s FROM t WHERE n + 1 > 3 OR n IS NULL",
+    )
+    .expect("vt2");
+    let before = cells_of(&core, "alice", "SELECT s FROM vt2 LIMIT 100");
+    let err = match ddl(
+        &core,
+        "ALTER TABLE t ALTER COLUMN n TYPE BIGINT USING n * 2",
+    ) {
+        Err(e) => e,
+        Ok(o) => panic!("must be refused: {o:?}"),
+    };
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(
+        cells_of(&core, "alice", "SELECT s FROM vt2 LIMIT 100"),
+        before
+    );
+    ddl(&core, "ALTER TABLE t ALTER COLUMN n TYPE BIGINT").expect("widen");
+    assert_eq!(
+        cells_of(&core, "alice", "SELECT s FROM vt2 LIMIT 100"),
+        before
+    );
+}
+
+/// 改名後も本文の `OR` は可視性を広げない（他テナントの private 行の有無で結果が変わらない）。
+#[test]
+fn rename_keeps_tenant_boundary_for_or_body() {
+    let (plain, _g1) = open_core("view-where-expr-rename-tenant-a", false);
+    let (extra, _g2) = open_core("view-where-expr-rename-tenant-b", true);
+    for core in [&plain, &extra] {
+        ddl(
+            core,
+            "CREATE VIEW vo AS SELECT * FROM t WHERE s = 'a' OR n IS NULL",
+        )
+        .expect("vo");
+        ddl(core, "ALTER TABLE t RENAME COLUMN n TO m").expect("rename");
+    }
+    for tenant in ["alice", "carol"] {
+        assert_eq!(
+            ids(&plain, tenant, "SELECT id FROM vo LIMIT 100"),
+            ids(&extra, tenant, "SELECT id FROM vo LIMIT 100"),
+            "tenant={tenant}"
+        );
+    }
+}
 /// 本文の `OR TRUE`（空の AND 枝）が保存時往復検証を通り、全行を返すビューとして作成できる
 /// （Issue #3238 のレビュー指摘。描画が `(n = 1 OR )` にならない）。
 #[test]

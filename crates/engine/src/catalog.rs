@@ -2624,7 +2624,9 @@ fn rewrite_views_for_renamed_table_in_txn(
 /// `table` を読む、または改名元を公開する単純形ビューを読む場合は `FeatureNotSupported`
 /// （`0A000`）で拒否する（fail-closed）。再検証できない本文・公開列の導出失敗も拒否。
 /// 追随後の本文が [`MAX_VIEW_BODY_BYTES`] を超えれば `54000`。計画をすべて確定してから
-/// 書き込むため、拒否時にビュー定義は変更されない。[`Storage::alter_table_rename_column`]
+/// 書き込むため、拒否時にビュー定義は変更されない。式述語つき本文（`OR`・`IN`・`BETWEEN`・
+/// `IS NULL`・式・組み込み関数。Issue #3239）は共有の走査器で追随し、追随できない形（往復ガード
+/// 不一致・View 表の外の形）は `0A000` にそろえる。[`Storage::alter_table_rename_column`]
 /// から、スキーマ書き込みの前に同一 write txn で呼ばれる。`schema` は改名前のもの。
 fn rewrite_views_for_renamed_column_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -2712,13 +2714,15 @@ fn rewrite_views_for_renamed_column_in_txn(
         let tokens =
             crate::sql::lexer::tokenize_stored_view_body(&def.body_sql).map_err(|_| refused())?;
         let mut parsed = parse_view_body(&tokens).map_err(|_| refused())?;
+        // Issue #3239: 追随できない形（往復ガード不一致・予約名への改名で意味が化ける等）は
+        // 関数ドキュメントの契約どおり 0A000 に統一する（42601 のまま返さない）。
         let changed = crate::sql::allowlist::rename_column_in_view_body(&mut parsed, old, new)
-            .map_err(AlterCheckError::Sql)?;
+            .map_err(|_| refused())?;
         if !changed {
             continue;
         }
         let body_sql = crate::sql::allowlist::render_stored_simple_view_body(&parsed)
-            .map_err(AlterCheckError::Sql)?;
+            .map_err(|_| refused())?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(AlterCheckError::Sql(SqlSurfaceError::payload_too_large(
                 "view body exceeds the allowed size after column rename",
@@ -23739,6 +23743,49 @@ mod tests {
     }
 
     /// 単純形ビューの保存本文が AST 経由で書き換わり、reopen 後も保持される。改名元を
+    /// 式述語つきの単純形ビュー本文（`OR`・`IN`・`BETWEEN`・`IS NULL`・式・関数）も列改名に追随し、
+    /// 関数名・リテラルは書き換わらず、再オープン後も本文が参照できる（TABLE-38 のポインタ、
+    /// Issue #3239）。
+    #[test]
+    fn alter_table_rename_column_rewrites_expression_predicate_view_bodies() {
+        let path = unique_db_path("rename-column-view-expr");
+        let _guard = CleanupGuard(path.clone());
+        {
+            let storage = Storage::open(&path).expect("open storage");
+            storage
+                .create_table(&TableSchema::new(
+                    "docs",
+                    vec![
+                        ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                        ColumnDef::new("kind", ColumnType::Text, true),
+                        ColumnDef::new("qty", ColumnType::Integer, true),
+                    ],
+                ))
+                .expect("docs");
+            storage
+                .create_view(
+                    "v_expr",
+                    "docs",
+                    "SELECT kind FROM docs WHERE lower(kind) = 'kind' OR qty + 1 > 3 \
+                     OR qty IN (1, 2) OR qty BETWEEN 5 AND 9 OR kind IS NULL",
+                )
+                .expect("v_expr");
+            storage
+                .alter_table_rename_column("docs", "kind", "lang")
+                .expect("rename follows expression view");
+        }
+        let storage = Storage::open(&path).expect("reopen");
+        let body = storage
+            .view_definition("v_expr")
+            .expect("get")
+            .expect("some")
+            .body_sql;
+        assert!(body.contains("lower(lang) = 'kind'"), "{body}");
+        assert!(body.contains("lang IS NULL"), "{body}");
+        assert!(body.starts_with("SELECT lang FROM docs"), "{body}");
+        assert!(!body.contains("lower(kind)"), "{body}");
+    }
+
     /// 公開しないビュー・無関係な表のビューは本文がバイト単位で不変（TABLE-38 のポインタ、
     /// Issue #1621）。
     #[test]
