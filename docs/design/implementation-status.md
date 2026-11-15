@@ -2075,6 +2075,8 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #3191（feat(engine): INSERT ... ON CONFLICT でのトリガ発火。TABLE-45 ポインタ）**: 依存・unsafe・公開 API の変更なし。`tenant::upsert_typed_rows_*` と `sql::exec::execute_upsert_*_in` に通過証（`Option<&TriggerRuntime>`）を足し、INSERT・UPDATE トリガのある表に限って行ループを `tenant/trigger_upsert.rs` へ差し替える（トリガの無い表は従来経路のままバイト不変）。SET 適用は従来経路と共有の `apply_upsert_assignments` へ抽出した。`LedgerOnlyTriggers::Upsert` は INSERT 文トリガと（DO UPDATE なら）UPDATE 文トリガを 0 行でも 1 回ずつ発火する。`RETURNING` 付き・NoSQL は `0A000` のまま。拒否を固定していた既存テストは対応後の挙動へ更新し、`trigger_upsert_tests.rs`・`table45_trigger_fire.rs`・`wire_trigger_fire.rs` を追加した。設計記録は [trigger-upsert.md](trigger-upsert.md)。
 
+**Issue #3190（feat(engine): CREATE TRIGGER の WHEN 条件を有効化。TABLE-45・SQL-68・RLS-10 ポインタ）**: 依存・unsafe・公開 API の変更なし。構文段 `sql/allowlist/trigger.rs` が `WHEN (<式>)` を読み、トークン検査 `validate_when_tokens`（サブクエリ・非組み込み関数・現在時刻関数・`NEW`／`OLD` 以外の修飾名・裸の列名・`;`・`$n` を拒否、括弧の深さとトークン数に上限）の後、正規化テキストを `TriggerDef.when_sql` に保存する（blob の版は不変）。定義時の意味検査 `core/trigger_when.rs` が `42P17`（INSERT と OLD・DELETE と NEW・文トリガと列参照）・存在しない列・合成本体の分類を行い、文トリガの `WHEN` は `0A000`。発火時は `TriggerHost::eval_trigger_when` が保存値を再検査して `IF (<条件>) THEN RETURN NEW/OLD` の合成本体を既存の条件評価で `may_write: false` 実行し（TRUE のみ発火、FALSE・NULL は不発火、評価エラーは文全体の失敗）、`trigger::fire` の BEFORE ROW（直前の NEW で評価）・AFTER ROW に結線した。論理ダンプは `WHEN (...)` を出力し往復する。評価器が扱えない形（`IS DISTINCT FROM` 等）は発火時 `0A000`（fail-closed）。結合テスト `table45_trigger_when`・wire の `wire_trigger_fire` に追加。設計記録: [trigger-execution-model.md](trigger-execution-model.md) D7。
+
 **Issue #3283（feat(engine): 分割実行 DML の対象表の行トリガを発火させる。TABLE-45・SQL-19・SQL-32・RECOVER-11 ポインタ）**: 依存・unsafe・公開 API の変更なし。分割実行の各チャンクが、対象表の BEFORE／AFTER ROW トリガを通常経路と共有する適用段（`update_rows_with_triggers`／`delete_rows_with_triggers`）で発火する（`WriteTarget::Autocommit`）。文トリガ・参照アクションの子表のトリガ・NoSQL 表層（通過証 `None`）は固定文言の `0A000` のまま。カーソルは消費した候補数（`TriggeredDml::consumed`）で進め、別表だけを書いたチャンクは停止点記録で commit する。適用段に任意の `should_stop` を足し、保持時間・期限を行境界で判定する。保証範囲（発火回数・timing 内の順序・単一チャンクの完全一致）と差分は [trigger-partitioned-dml.md](trigger-partitioned-dml.md)。
 
 **Issue #3209（perf(engine): `Accumulator::observe_value` のインライン化を復元。#2761 の是正。SQL-25・SQL-57 ポインタ）**: 依存の変更なし。本体を `#[inline(always)]` の `observe_value_inline` へ分け、`observe_value` は window 向けの薄い入口にした。集計経路の `_` 腕は inline 版を直接呼ぶ。結合テストは `sql3209_observe_value_inline.rs`。A/B の壁時計・アセンブリ確認は未検証。詳細は [aggregate-loop-regression.md](aggregate-loop-regression.md)。
@@ -2092,3 +2094,12 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 **Issue #3214（perf(engine): SUM／AVG／MIN／MAX(id) を u64 スライスの畳み込みにする。SQL-25・SQL-71 のポインタ）**: 依存・unsafe・公開 API の変更なし。可視 id キャッシュ命中時の Fast 経路で、`COUNT(*)`／`COUNT(id)`／`SUM`／`AVG`／`MIN`／`MAX(id)` だけの集計（`DISTINCT`・`FILTER` なし）を `fold_visible_ids` の 1 パス畳み込みと `Accumulator::absorb_id_stats` に置き換えた（`is_visible_id_fold`。対象外の形は従来の行ループ）。中断確認は `RowCheck::check_chunk` で `ROW_CHECK_INTERVAL` 件ごと。テナント境界の前提（RLS 検査済み・同一 ctx・同一世代のキャッシュ命中のみ）は #3213 と同じ。固定した検査は `aggregate.rs` の差分単体テストと `sql_t40_up/sql3214_id_fold.rs`。参考計測は `agg_multi` 0.022 ms（共有機・本変更後のみ）。crossdb ハーネスでの A/B は未検証。詳細は `docs/design/aggregate-loop-regression.md`。
 
 **Issue #3217（perf(engine): 行ノルム² をスナップショット世代単位で常駐キャッシュ。SQL-33・CORE-3 のポインタ）**: 依存・unsafe・公開 API の変更なし。`SqlArenaSnapshot` に遅延初期化の行ノルム²（行数 × 4 バイト。`approx_heap_bytes` に算入）を持たせ、キャッシュヒットした `<=>` 全走査（WHERE なし・マスクなし・走査 arena がスナップショット自身）と hybrid の密側で C2 入力として渡す。それ以外の形は従来経路。固定した検査は `arena_cache.rs` の単体テストと `sql_named/sql_arena_cache.rs` の `resident_row_norms_*`（距離のビット一致・世代更新後の再計算・WHERE 縮約 arena・テナント分離・hybrid）。p50 低下の A/B は未検証。詳細は [hybrid-rrf-latency-breakdown.md](hybrid-rrf-latency-breakdown.md)。
+
+## Issue #3223: scan の decode_row_header 二重デコードの解消
+
+`sql/scan.rs::with_visible_row` の `Fast`／`DimAndScalar` 段で、RLS 判定のヘッダデコードの offset を
+`storage::decode_row_dim_and_metadata_body_borrowed(buf, offset)` へ渡し、行ごとのヘッダ（tenant の UTF-8 検証）
+デコードを 1 回にした。検査の順序・fail-closed は不変。単体・結合テストを追加。同一ホスト A/B の実測は未検証。
+詳細は `docs/design/wide-retrieval-scan.md` の追記節。
+
+**Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。

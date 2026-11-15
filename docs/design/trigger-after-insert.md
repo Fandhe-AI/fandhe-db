@@ -76,7 +76,7 @@ AFTER が失敗すれば台帳エントリも破棄され、D10 の「全トリ�
 - トリガ内の書き込み先に INSERT トリガがある場合は `0A000`（PostgreSQL は入れ子で発火）
 - AFTER の `WHEN` は `0A000`（実行モデルの引き継ぎ表では D7 の AFTER 側が #1724 に割り当てられているが、
   カタログ DDL が `WHEN` を `0A000` で拒否しており、評価は #1725 の作業項目だったが、#1725 では見送り、
-  `WHEN` は引き続き `0A000`。詳細は [trigger-update-delete.md](trigger-update-delete.md)）
+  `WHEN` は引き続き `0A000` だった（Issue #3190 で行トリガの `WHEN` を有効化済み。実行モデルの D7 の実装記録を参照）。詳細は [trigger-update-delete.md](trigger-update-delete.md)）
 - 区間外の明示 Tx 経路では、トリガが書いた表の遅延 FK を文の終わりに検査する
 
 ## 後続への引き継ぎ

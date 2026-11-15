@@ -48,9 +48,9 @@ use crate::trigger::write_handle::TriggerWriteHandle;
 /// AFTER ROW に渡す変更（書いた順）。
 enum AfterEvent {
     /// 挿入した行の最終 NEW。
-    Insert(Vec<Value>),
-    /// 更新した行の（OLD, 最終 NEW）。
-    Update(Vec<Value>, Vec<Value>),
+    Insert(Vec<Value>, Vec<usize>),
+    /// 更新した行の（OLD, 最終 NEW, `WHEN` が TRUE だったトリガの位置）。
+    Update(Vec<Value>, Vec<Value>, Vec<usize>),
 }
 
 fn reserve_err() -> TenantWriteError {
@@ -450,8 +450,22 @@ pub(super) fn upsert_rows_with_triggers(
                 written_ids.push(write_id);
                 updated_write_ids.push(write_id);
                 touched.insert(write_id);
-                if update_after.is_some() {
-                    after_queue.push(AfterEvent::Update(old_values, final_row));
+                // AFTER ROW の WHEN は行の変更時に評価し、TRUE のトリガだけをキューへ積む（D7）。
+                if let Some(plan) = update_after {
+                    let selected = crate::trigger::fire::select_after_row(
+                        plan.runtime,
+                        writes,
+                        table,
+                        schema,
+                        &plan.after,
+                        TriggerOp::Update,
+                        Some(&old_values),
+                        &final_row,
+                    )
+                    .map_err(TenantWriteError::TriggerFailed)?;
+                    if !selected.is_empty() {
+                        after_queue.push(AfterEvent::Update(old_values, final_row, selected));
+                    }
                 }
             }
             ConflictState::Absent => {
@@ -485,8 +499,21 @@ pub(super) fn upsert_rows_with_triggers(
                     .ok_or_else(|| internal("upsert inserted row counter overflow"))?;
                 written_ids.push(insert_id);
                 touched.insert(insert_id);
-                if insert_after.is_some() {
-                    after_queue.push(AfterEvent::Insert(new_values));
+                if let Some(plan) = insert_after {
+                    let selected = crate::trigger::fire::select_after_row(
+                        plan.runtime,
+                        writes,
+                        table,
+                        schema,
+                        &plan.after,
+                        TriggerOp::Insert,
+                        None,
+                        &new_values,
+                    )
+                    .map_err(TenantWriteError::TriggerFailed)?;
+                    if !selected.is_empty() {
+                        after_queue.push(AfterEvent::Insert(new_values, selected));
+                    }
                 }
             }
         }
@@ -562,24 +589,28 @@ pub(super) fn upsert_rows_with_triggers(
     // AFTER ROW（段 6）。変更の順 × トリガ名のバイト順。
     for event in &after_queue {
         match (event, insert_after, update_after) {
-            (AfterEvent::Insert(new_row), Some(plan), _) => {
-                crate::trigger::fire::fire_after_row_insert(
+            (AfterEvent::Insert(new_row, selected), Some(plan), _) => {
+                crate::trigger::fire::invoke_after_row(
                     plan.runtime,
                     writes,
                     table,
                     schema,
                     &plan.after,
+                    selected,
+                    TriggerOp::Insert,
+                    None,
                     new_row,
                 )
                 .map_err(TenantWriteError::TriggerFailed)?;
             }
-            (AfterEvent::Update(old, new_row), _, Some(plan)) => {
-                crate::trigger::fire::fire_after_row(
+            (AfterEvent::Update(old, new_row, selected), _, Some(plan)) => {
+                crate::trigger::fire::invoke_after_row(
                     plan.runtime,
                     writes,
                     table,
                     schema,
                     &plan.after,
+                    selected,
                     TriggerOp::Update,
                     Some(old),
                     new_row,

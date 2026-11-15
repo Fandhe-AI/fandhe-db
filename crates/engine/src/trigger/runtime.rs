@@ -90,6 +90,16 @@ impl<'h> TriggerRuntime<'h> {
         self.host
     }
 
+    /// 行トリガの `WHEN` 条件を評価する入口（Issue #3190）。`true` のときだけ関数を呼ぶ。
+    /// 深さの計数はしない（関数本体を実行しない読み取り専用の評価のため）。
+    pub(super) fn eval_when(
+        &self,
+        call: &TriggerCall<'_>,
+        when_sql: &str,
+    ) -> Result<bool, SqlSurfaceError> {
+        self.invoker.eval_when(call, when_sql)
+    }
+
     /// トリガ関数を 1 回呼ぶ唯一の入口。深さが上限に達していれば呼び出し口に触れず `54001`。
     /// 深さは呼び出しの間だけ +1 され、戻り（エラー・panic を含む）で必ず戻る。
     pub(super) fn invoke(&self, call: &TriggerCall<'_>) -> Result<TriggerOutcome, SqlSurfaceError> {
