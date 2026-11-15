@@ -673,7 +673,8 @@ fn bind_quantified_like(
             | ArrayElemType::Bytea
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
-            | ArrayElemType::Enum => {
+            | ArrayElemType::Enum
+            | ArrayElemType::Bit(_) => {
                 return Err(SqlSurfaceError::undefined_function(
                     "operator does not exist: LIKE/ILIKE on a non-text array element",
                 ))
