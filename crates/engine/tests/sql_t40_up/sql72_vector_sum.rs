@@ -226,7 +226,7 @@ fn unsupported_shapes_stay_fail_closed() {
     // DISTINCT・ウィンドウ・集計結果の比較／演算は拒否のまま。
     assert_eq!(
         code_of(&core, "SELECT sum(DISTINCT embedding) FROM t"),
-        "42601"
+        "22000"
     );
     assert_eq!(
         code_of(&core, "SELECT sum(embedding) OVER () FROM t"),

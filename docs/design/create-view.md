@@ -913,5 +913,27 @@ SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコ�
   `CREATE VIEW` と `RENAME COLUMN`・`RENAME TABLE` の再描画が共有する。
 - **MATERIALIZED VIEW**: 本文の許可形は `CREATE VIEW` と同じ（Issue #1668 追記）ため、受理範囲も同じく広がる。
 - **連鎖**: 単純形の段が Buffered ビューの上に重なる場合は既存の `check_buffered_outer_pred` を使う（変更なし。ILIKE は従来どおり `0A000`）。
-- **据え置き**: 作成時の `CatalogError::Invalid` の文言分離・越境試験の網羅は #3240、式述語つきビューの `RENAME COLUMN` 追随
-  （現状は新しい形を `rename_column_in_view_body` が fail-closed で拒否）・参照時の再検証の網羅は #3239。
+- **据え置き**: 作成時の `CatalogError::Invalid` の文言分離・越境試験の網羅は #3240。式述語つきビューの `RENAME COLUMN` 追随・
+  参照時の再検証の網羅は #3239 で対応済み（下の「Issue #3239 追記」）。
+
+## Issue #3239 追記: 式述語つきビューの参照時再検証と列改名の追随（実装記録）
+
+TABLE-18・TABLE-38・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ。
+
+- **列改名の追随**: `rename_column_in_view_body` は `WHERE` を共有の走査器 `check_constraint::map_predicate_columns`
+  （CHECK の列改名・ビュー列別名と同じ。第 2 の走査器は作らない）で書き換える。式述語・`IN`・`BETWEEN`・`IS NULL`・`NOT`・
+  `OR` を 1 回の走査で一括写像するため連鎖置換は起きず、関数名は写像されない。事前に網羅的な `match`（`_` なし）で
+  View 表の受理形か確かめ、`Projection::Items` と受理外の形は `Err`（fail-closed）。保存時は従来どおり
+  `render_stored_simple_view_body` の往復ガードを通し、意味が化ける本文（予約名への改名等）は保存しない。
+- **拒否の SQLSTATE**: 追随できない形（評価後射影形・列別名つき・往復不一致・再検証不能）は `0A000`、追随後の本文が
+  サイズ上限を超えれば `54000`、参照時の本文の破損は従来どおり固定文言の `XX000`。拒否時は計画確定前のためビュー定義・
+  スキーマとも変わらない。表の `RENAME` は表名の写像だけで、式述語つき本文でも追随する。
+- **参照時の再検証**: `reparse_stored_body`／`reparse_buffered_body`・`view_alias::rewrite_where` は作成時と同じ経路を通り、
+  述語形ごとの分岐を持たない。再オープン後・連鎖・`LIMIT` 付き本文・列別名つきビューの外側からの式述語を結合テストで固定した。
+- **依存検査**: `DROP COLUMN` は式・`OR` の枝・`NOT` の内側・`IN`／`BETWEEN`／`IS NULL` だけで参照される列も依存として
+  拒否する（`2BP01`）。`ALTER COLUMN TYPE` は `USING` を伴う一般変換だけビュー依存を `0A000` で拒否し、拡大・整数の
+  再タグ付けは従来どおり検査しない（ビューは参照時に現スキーマで束縛し直す）。
+- **`Not` 再帰の堅牢化**: `check_predicate_columns_within` は `Not(inner)` の内側を常に再帰検査する。構文段は否定を葉まで
+  押し下げるため `Not(Expression)`／`Not(Or)` は通常生成されないが、現れても否定越しに非公開列を素通りさせない。
+- **対象外**: 評価後射影形・列別名つきビューの `RENAME` 追随（従来どおり `0A000`。#1659 の後続課題）、MATERIALIZED VIEW が
+  参照する表の列 `RENAME`（暫定ガードの `0A000`）、`CatalogError::Invalid` の文言分離と越境試験の網羅（#3240）。
