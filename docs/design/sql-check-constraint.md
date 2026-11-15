@@ -303,6 +303,15 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   変わらない。加えて同一 txn 内で変更列を参照する CHECK を新スキーマで再コンパイルし、
   全テナント・全可視性の既存行を再検証する（違反は `23514`、評価エラーは透過、
   拒否時は commit しない）。
+- 新しい述語形の追随（Issue #3245）：`IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL`／`OR`／`NOT`
+  の `ADD CONSTRAINT` 再検証・`RENAME COLUMN`・`ALTER COLUMN TYPE` は、三値評価（Issue #3242）
+  と同じ経路で全テナント・全可視性の既存行を再検証する（UNKNOWN は合格、`IS NOT NULL` だけが
+  NULL を違反にする）。述語形の走査（`reject_vector_family_null_tests`・`referenced_column_names`
+  の内部走査・`normalize_session_local_predicates`）はワイルドカード腕を使わず variant を列挙し、
+  述語形の追加時の追随漏れをコンパイルエラーにする。`referenced_column_names` が宣言的な葉で
+  列名を重ねて push しないのは、束縛済みフィルタと OR 群が依存列を収集するため（記録列の網羅
+  検査と順序を変えない）。束縛できない型変更（INTEGER→TEXT 等）は `XX000` ではなく束縛エラー
+  （`42883`・`22000`）で拒否され表は変わらない。
 - 索引宣言（TASK-206・INDEX-7、Issue #908）との関係: `alter_table_drop_column` は
   削除列を含む索引宣言を同一 write トランザクションで掃除するが、CHECK 参照列の
   拒否はその掃除より前に判定し commit しないため、拒否時は索引宣言も一切変わら
@@ -338,7 +347,7 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - `ALTER TABLE ADD/DROP CONSTRAINT CHECK` の `NOT VALID`／`VALIDATE
   CONSTRAINT` 形（Issue #1068 のスコープ外。同 Issue の設計ドキュメント参照）。
 - NoSQL 表層への DDL op（`create_table` 相当。CHECK の ALTER も同様に対象外）。
-- `CHECK` 参照列への `ALTER COLUMN TYPE` の許可（現状は安全側で拒否）。
+- `CHECK` 参照列への `ALTER COLUMN TYPE`: 拡大変換・一般変換は再束縛と全行再検証つきで受理済み（Issue #1427・#1637）。カタログのみの変更（VARCHAR(n) の拡大等）で CHECK 依存がある場合は述語の意味不変を論証していないため `2BP01` のまま（意図的に維持）。
 - `catalog.rs` の生書き込み API（`#[cfg(test)]` 限定・production では到達不能）は
   検査点を経由しない。Issue #1078 で、これら 3 API 自身が `CHECK` を含む制約付き
   テーブルへの書き込みを fail-closed に拒否するガードを追加したため、検査点を
@@ -370,6 +379,10 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   三値評価・OR 展開の依存列と列マスク・未対応形の `wire_code` 固定）、
   `tests/table_rls/table16_check_constraint.rs`（INSERT・UPDATE・`ALTER TABLE ADD CHECK`・
   DROP／RENAME COLUMN の依存）、wire-server の `wire_create_table.rs`（末尾 `;` 付き単独文）。
+- Issue #3245: `sql_alter_table_check_constraint.rs`（新しい述語形の ADD 再検証・別テナント行・
+  NULL の逆向きケース・エラー文言の非漏えい）、`sql_alter_column_type_check_columns.rs`
+  （拡大・一般変換・CharFamily の ALTER TYPE）、`table16_check_constraint.rs`（RENAME 追随と再オープン）、
+  `wire_create_table.rs`（末尾 `;` 付きの ADD CONSTRAINT・RENAME・ALTER TYPE）。
 - `crates/engine/src/sql/where_tree.rs`（三値評価器。Kleene の真理値表・`OR`
   群の短絡と UNKNOWN の伝播・非 NULL で UNKNOWN の葉と範囲外 index の
   `Internal`）。`check_constraint.rs` には置換前の `enforce`（連言ごとの NULL
