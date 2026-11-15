@@ -2093,6 +2093,17 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #3217（perf(engine): 行ノルム² をスナップショット世代単位で常駐キャッシュ。SQL-33・CORE-3 のポインタ）**: 依存・unsafe・公開 API の変更なし。`SqlArenaSnapshot` に遅延初期化の行ノルム²（行数 × 4 バイト。`approx_heap_bytes` に算入）を持たせ、キャッシュヒットした `<=>` 全走査（WHERE なし・マスクなし・走査 arena がスナップショット自身）と hybrid の密側で C2 入力として渡す。それ以外の形は従来経路。固定した検査は `arena_cache.rs` の単体テストと `sql_named/sql_arena_cache.rs` の `resident_row_norms_*`（距離のビット一致・世代更新後の再計算・WHERE 縮約 arena・テナント分離・hybrid）。p50 低下の A/B は未検証。詳細は [hybrid-rrf-latency-breakdown.md](hybrid-rrf-latency-breakdown.md)。
 
+**Issue #3222（perf(engine): score_pass の len_norm キャッシュを配列にする。親 #3218・SEARCH-13・RLS-8 のポインタ）**: 依存・unsafe・公開 API の変更なし。`ScoreScratch` の `k1 * len_norm` キャッシュを `HashMap<u32, f64>` から文書長クラス添字の `Vec<f64>`（未計算は専用ペイロードの番兵 NaN のビット比較）へ置換し、ヒットごとの SipHash 計算を除いた。式・演算順は不変（スコアはビット一致）。復元は `touched_classes` に記録したスロットだけを番兵へ戻す `O(M)` で、返却時と `score_pass` 冒頭の 2 重に行い、パスをまたぐ可視外統計の混入を防ぐ。配列長は `classes <= n <= MAX_CORPUS_DOCS` を確保前に検査し（違反時は空配列でヒットを棄却する fail-closed）、`approx_heap_bytes` は配列の実確保量で見積もる。テスト: `sparse::tests::len_norm_slots_do_not_leak_across_passes`・`scratch_len_norm_array_is_bounded_by_len_classes`・`scratch_pool_returns_all_zero_and_bounded`（更新）、SQL 結合 `sql_named/search13_bm25_len_norm_array_parity.rs`（テナント境界・k1／b 連続切替・22000 拒否）。A/B（hybrid_rrf p50 低下。想定幅は約 0.09 ms）は本作業環境では計測していない（**未検証**）。
+
+**Issue #3225（chore(bench): hybrid ベンチの条件を揃えて recall を並記。SEARCH-13 のポインタ）**: production コード・依存・unsafe・CI の変更なし。crossdb ハーネスに self と Redis で取得深さを揃えた `hybrid_rrf_depth50`／`hybrid_rrf_depth200` と、Redis の語の結合診断 `hybrid_text_conjunction` を追加し、`dense_gt_recall_at_10`・`overlap_at_10_vs_depth200`・`topic_hit_rate_at_10` を結果 JSON と stdout に並べる。既存の `hybrid_rrf`・`bulk_hybrid_k200` の条件は不変。純ロジックは `scripts/crossdb_bench/hybrid_depth.py`、検査は `scripts/tests/test_crossdb_hybrid_depth.py`。条件差の記録は `docs/design/crossdb-bench.md`。実機計測は未実施（未検証）。
+
+## Issue #3223: scan の decode_row_header 二重デコードの解消
+
+`sql/scan.rs::with_visible_row` の `Fast`／`DimAndScalar` 段で、RLS 判定のヘッダデコードの offset を
+`storage::decode_row_dim_and_metadata_body_borrowed(buf, offset)` へ渡し、行ごとのヘッダ（tenant の UTF-8 検証）
+デコードを 1 回にした。検査の順序・fail-closed は不変。単体・結合テストを追加。同一ホスト A/B の実測は未検証。
+詳細は `docs/design/wide-retrieval-scan.md` の追記節。
+
 **Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。
 
 **Issue #3238（feat(engine): VIEW 本文 WHERE の式述語（IS NULL・OR・数値比較・組み込み関数）を受理。TABLE-18・TABLE-42・TABLE-43・RLS-10 (b) のポインタ）**: 依存・unsafe・公開 API の変更なし。単純形ビュー本文の判定表を CTE／派生表用と分離して拡大し、`LIMIT` 付き Buffered 本文のトップレベル式述語は `Resolved` でも組み込み関数だけを受理する。保存時は描画→再解析の往復ガードで意味が変わる本文を `42601` で拒否する。UDF・未知関数・現在時刻関数・`visible()`・サブクエリ・式左辺 LIKE は従来どおり `42601`。`RENAME COLUMN` 追随の網羅は #3239、文言分離・越境試験は #3240。詳細は [create-view.md](create-view.md) の「Issue #3238 追記」。
