@@ -2038,6 +2038,8 @@ pub(crate) fn encode_row_into(buf: &mut Vec<u8>, row: &RowInput<'_>) -> Result<(
 /// フォローアップ）。行を所有化して保持する必要がある場合（[`decode_row`] が
 /// `Row` を構築する場合）は、呼び出し元が明示的に `.to_string()` する。
 pub(crate) fn decode_row_header(buf: &[u8]) -> Result<(&str, Visibility, usize)> {
+    #[cfg(test)]
+    decode_probe::record_header_decode();
     let version = *buf
         .first()
         .ok_or_else(|| StorageError::Codec("row buffer is empty".to_string()))?;
@@ -2131,6 +2133,7 @@ pub(crate) mod decode_probe {
     thread_local! {
         static EMBEDDING_DECODES: Cell<u64> = const { Cell::new(0) };
         static DIM_AND_METADATA_DECODES: Cell<u64> = const { Cell::new(0) };
+        static HEADER_DECODES: Cell<u64> = const { Cell::new(0) };
     }
 
     /// 計数のスナップショット。
@@ -2140,6 +2143,8 @@ pub(crate) mod decode_probe {
         pub(crate) embedding: u64,
         /// 構造検証のみの借用デコード回数（`decode_row_dim_and_metadata_borrowed`）。
         pub(crate) dim_and_metadata: u64,
+        /// 行ヘッダのデコード回数（`decode_row_header`。Issue #3223）。
+        pub(crate) header: u64,
     }
 
     impl DecodeCounts {
@@ -2148,6 +2153,7 @@ pub(crate) mod decode_probe {
             DecodeCounts {
                 embedding: self.embedding - before.embedding,
                 dim_and_metadata: self.dim_and_metadata - before.dim_and_metadata,
+                header: self.header - before.header,
             }
         }
     }
@@ -2160,10 +2166,15 @@ pub(crate) mod decode_probe {
         DIM_AND_METADATA_DECODES.with(|c| c.set(c.get() + 1));
     }
 
+    pub(crate) fn record_header_decode() {
+        HEADER_DECODES.with(|c| c.set(c.get() + 1));
+    }
+
     pub(crate) fn snapshot() -> DecodeCounts {
         DecodeCounts {
             embedding: EMBEDDING_DECODES.with(Cell::get),
             dim_and_metadata: DIM_AND_METADATA_DECODES.with(Cell::get),
+            header: HEADER_DECODES.with(Cell::get),
         }
     }
 }
@@ -2315,9 +2326,24 @@ pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
 /// embedding を `Vec<f32>` へ確保する必要がある場合は
 /// [`decode_row_embedding_and_metadata_into`] を使う。
 pub(crate) fn decode_row_dim_and_metadata_borrowed(buf: &[u8]) -> Result<(u32, &[u8])> {
+    let (_tenant_id, _visibility, offset) = decode_row_header(buf)?;
+    decode_row_dim_and_metadata_body_borrowed(buf, offset)
+}
+
+/// [`decode_row_dim_and_metadata_borrowed`] の本体部（dim 以降）だけを検証する版。
+/// `offset` は同じ `buf` に対する [`decode_row_header`] の返り値でなければならない。
+///
+/// 呼び出し文脈: `sql/scan.rs::with_visible_row` が RLS 判定のために既にヘッダを
+/// デコードしているため、offset を受け渡してヘッダ（tenant の UTF-8 検証を含む）の
+/// 二重デコードを避ける（Issue #3223。[`decode_row_body_into`] と対になる形）。
+/// 検証内容・順序・エラーは従来のラッパー経由と同一で、`offset` が範囲外でも
+/// `get()`・checked 演算で `Err` になり panic しない。
+pub(crate) fn decode_row_dim_and_metadata_body_borrowed(
+    buf: &[u8],
+    mut offset: usize,
+) -> Result<(u32, &[u8])> {
     #[cfg(test)]
     decode_probe::record_dim_and_metadata_decode();
-    let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
 
     let dim_field_end = offset
         .checked_add(4)
@@ -3156,6 +3182,44 @@ mod tests {
         let mut scratch: Vec<f32> = Vec::new();
         assert!(decode_row(rowid::RowId::from_legacy_id(1), truncated).is_err());
         assert!(decode_row_embedding_and_metadata_into(truncated, &mut scratch).is_err());
+    }
+
+    // Issue #3223: ヘッダ 1 回デコード + offset 受け渡しの本体デコードが、
+    // ラッパー（ヘッダ込み）と正常・破損の両面で同じ結果になることの固定。
+    #[test]
+    fn decode_row_dim_and_metadata_body_borrowed_matches_wrapper() {
+        let buf = sample_row(&[1.0, 2.0, 3.0], b"payload");
+        let (_t, _v, offset) = decode_row_header(&buf).expect("header");
+        let via_body = decode_row_dim_and_metadata_body_borrowed(&buf, offset).expect("body");
+        let via_wrapper = decode_row_dim_and_metadata_borrowed(&buf).expect("wrapper");
+        assert_eq!(via_body, via_wrapper);
+
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        assert_eq!(offset, dim_offset);
+
+        // embedding 途中切れ・metadata 途中切れ・末尾余剰・metadata_len 上限超過。
+        let mut cases: Vec<Vec<u8>> = vec![
+            buf[..dim_offset + 4 + 4].to_vec(),
+            buf[..buf.len() - 1].to_vec(),
+        ];
+        let mut trailing = buf.clone();
+        trailing.push(0);
+        cases.push(trailing);
+        let meta_len_offset = dim_offset + 4 + 3 * 4;
+        let mut huge = buf.clone();
+        huge[meta_len_offset..meta_len_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(huge);
+        let mut huge_dim = buf.clone();
+        huge_dim[dim_offset..dim_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(huge_dim);
+        for case in &cases {
+            assert!(decode_row_dim_and_metadata_borrowed(case).is_err());
+            let (_t, _v, off) = decode_row_header(case).expect("header ok");
+            assert!(decode_row_dim_and_metadata_body_borrowed(case, off).is_err());
+        }
+        // 範囲外 offset でも panic せず Err。
+        assert!(decode_row_dim_and_metadata_body_borrowed(&buf, usize::MAX).is_err());
+        assert!(decode_row_dim_and_metadata_body_borrowed(&buf, buf.len() + 10).is_err());
     }
 
     // --- decode_row_dim_and_metadata_borrowed / verify_row_key_tenant（Issue #350） ---

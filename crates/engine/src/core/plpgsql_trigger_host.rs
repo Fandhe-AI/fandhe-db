@@ -98,6 +98,17 @@ impl TriggerHost for EngineCore {
         self.invoke_trigger_inner(call)
             .map_err(|e| self.scrub_error(ctx, e))
     }
+
+    /// 行トリガの `WHEN` 条件の評価（Issue #3190。`core::trigger_when`）。エラーは出口で `scrub_error`。
+    fn eval_trigger_when(
+        &self,
+        call: &TriggerCall<'_>,
+        when_sql: &str,
+    ) -> Result<bool, SqlSurfaceError> {
+        let ctx = call.writes.policy_context();
+        self.eval_trigger_when_inner(call, when_sql)
+            .map_err(|e| self.scrub_error(ctx, e))
+    }
 }
 
 impl EngineCore {
@@ -166,7 +177,7 @@ impl EngineCore {
 
     /// 表キーを（`TG_TABLE_NAME`, `TG_TABLE_SCHEMA`）へ。裸の名前は `public`、SCHEMA 配下の内部キー
     /// `#<id>.<name>` は呼び出しテナントの SCHEMA 名へ逆引きする（失敗時は `#<id>.` を落とした名前）。
-    fn trigger_table_display(&self, ctx: &PolicyContext, key: &str) -> (String, String) {
+    pub(super) fn trigger_table_display(&self, ctx: &PolicyContext, key: &str) -> (String, String) {
         if !key.starts_with('#') {
             return (key.to_string(), "public".to_string());
         }
