@@ -9624,6 +9624,22 @@ fn rem_harden_operand(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> B
                 args,
             }
         }
+        // GREATEST／LEAST の各引数も同様に硬化する（整数と証明できる引数だけ。構文木と束縛木の
+        // 引数個数が対応しない場合は硬化せず、そのまま返す）。
+        BoundExpr::MinMax { op, args } => {
+            let src = match expr {
+                Some(Expr::Call { args: a, .. }) if a.len() == args.len() => Some(a),
+                _ => None,
+            };
+            BoundExpr::MinMax {
+                op,
+                args: args
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, a)| rem_harden_checked(src.and_then(|s| s.get(i)), a, env))
+                    .collect(),
+            }
+        }
         other => other,
     }
 }

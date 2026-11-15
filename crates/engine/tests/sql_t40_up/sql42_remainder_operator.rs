@@ -301,8 +301,19 @@ fn where_remainder_hardens_wrapper_interiors() {
         "SELECT abs(CAST(b*b+1 AS bigint) - CAST(b*b AS bigint)) % 2 FROM t",
         "SELECT COALESCE(CAST(((b*b+1)-(b*b)) AS bigint), 0) % 2 FROM t",
         "SELECT COALESCE(((b*b+1)-(b*b)), 0) % 2 FROM t",
+        "SELECT greatest(CAST((b*b+1)-(b*b) AS bigint), 0) % 2 FROM t",
+        "SELECT least(CAST((b*b+1)-(b*b) AS bigint), 5) % 2 FROM t",
     ] {
         assert_eq!(code(&core, &ctx, sql), "22003", "{sql}");
+    }
+    // WHERE 側の GREATEST／LEAST も誤一致させず必ず拒否する（numeric からの CAST が未対応の
+    // 0A000 か精度検査の 22003。fail-closed であれば経路は問わない）。
+    for sql in [
+        "SELECT id FROM t WHERE greatest(CAST((b*b+1)-(b*b) AS bigint), 0) % 2 = 0",
+        "SELECT id FROM t WHERE least(CAST((b*b+1)-(b*b) AS bigint), 5) % 2 = 0",
+    ] {
+        let c = code(&core, &ctx, sql);
+        assert!(c == "22003" || c == "0A000", "{sql}: {c}");
     }
     // 厳密な範囲のラッパーは従来どおり評価する。
     let r = run(
