@@ -2027,7 +2027,9 @@ pub fn bind_column_projection(
 /// [`bind_projection_with_literals`] へ委譲する（第 2 の投影実装を作らない。Issue #3249 で
 /// スカラー式・組み込み関数まで受理）。式の型・列名・NULL 規則は SELECT と一致する。
 ///
-/// - UDF 呼び出しは空の UDF レジストリで解決するため未定義関数として拒否する（受け皿 #3250）。
+/// - UDF は解決しない（空の UDF レジストリ。未登録扱いで `42883`＝fail-closed）。セッションの
+///   UDF レジストリで解決する SQL 表層の経路は [`bind_returning_with_udfs`]（Issue #3250）を使う。
+///   本関数の呼び出し元は UDF を解決しない経路（NoSQL・データ変更 CTE・ビュー書き込み。#3251）。
 /// - ハイブリッド検索の詳細関数（`hybrid_*()`）・スカラーサブクエリ・集計関数は拒否する。
 ///   構文段（`Parser::parse_returning_clause`）が同じ判定（[`crate::sql::allowlist::
 ///   returning_item_rejection`]）を行っており、`Validated*` を経ない呼び出し元が迂回できない
@@ -2037,6 +2039,25 @@ pub fn bind_column_projection(
 pub fn bind_returning(
     returning: Option<&Projection>,
     schema: &TableSchema,
+) -> Result<Option<Vec<ProjectedColumn>>, SqlSurfaceError> {
+    bind_returning_with_udfs(
+        returning,
+        schema,
+        &crate::sql::udf_call::UdfRegistry::default(),
+    )
+}
+
+/// [`bind_returning`] のセッション UDF レジストリ付き版（Issue #3250・SQL-21 のポインタ）。
+///
+/// SQL 表層の DML 実行・Describe が、セッションの [`crate::sql::udf_call::UdfRegistry`] で
+/// RETURNING 内の UDF を解決するために呼ぶ。宣言的 UDF はインライン展開、WASM UDF は
+/// `WasmCall` として束縛される。`LANGUAGE sql|plpgsql` 関数は書き込みを伴いうるため、
+/// `udf_call::bind_call` が `0A000` で拒否する（書き込み前＝行・台帳を消費しない）。
+/// EXECUTE 権限は呼び出し元が張る `FunctionAclScope` の区間内で判定される。
+pub(crate) fn bind_returning_with_udfs(
+    returning: Option<&Projection>,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<Option<Vec<ProjectedColumn>>, SqlSurfaceError> {
     let Some(projection) = returning else {
         return Ok(None);
@@ -2053,7 +2074,7 @@ pub fn bind_returning(
     let cols = bind_projection_with_literals(
         projection,
         schema,
-        &crate::sql::udf_call::UdfRegistry::default(),
+        udfs,
         &mut node_budget,
         &LiteralSkip::NONE,
         false,
@@ -8823,8 +8844,21 @@ fn resolve_aggregate_item_input(
     if item.func.is_grouping() {
         return resolve_grouping_input(item, group_by_columns, key_exprs_norm, schema);
     }
-    if item.distinct {
+    if item.distinct && item.func == crate::sql::allowlist::AggregateFunc::Count {
         resolve_count_distinct_input(&item.arg, schema, udfs, node_budget)
+    } else if item.distinct {
+        // Issue #3263: `SUM`／`AVG(DISTINCT)` は非 DISTINCT と同じ型検査で束縛し、DISTINCT キーを
+        // 定義できない VECTOR 系入力だけを `22000` で拒否する（`COUNT(DISTINCT <VECTOR>)` と同契約）。
+        let input = resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)?;
+        if matches!(
+            input,
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+        ) {
+            return Err(SqlSurfaceError::invalid_input(
+                "VECTOR has no canonical equality and cannot be used with DISTINCT aggregates",
+            ));
+        }
+        Ok(input)
     } else {
         resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)
     }

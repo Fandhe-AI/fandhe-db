@@ -236,3 +236,27 @@ TABLE-12 のキー/ヘッダ tenant 整合検査・`decode_row_dim_and_metadata_
 - 整数系の式の結果型（`sum(k * 2)` は式エンジンの f64 のため double。PG は bigint）。
 - 比較式を裸で引数にする形（`count(n > 1)`。bool 系以外）、ウィンドウ集計・ビュー本体の式引数。
 - `FILTER` 句との併用（別 Issue の担当）。
+
+## Issue #3263 追記: `SUM`／`AVG`／`MIN`／`MAX(DISTINCT)`（SQL-25 のポインタ）
+
+- **受理範囲**: `SUM`・`AVG(DISTINCT <式>)` を受理する（GROUP BY・`FILTER`・`HAVING`・集計式の
+  有無を問わない）。`MIN`／`MAX(DISTINCT)` は重複除去が結果に影響しないため、構文段で
+  非 DISTINCT 形へ畳み、状態も予算も持たせない。
+- **畳み込み方式**: `Accumulator::DistinctFold` は、正準化キーが初めて現れたときだけ値を通常の
+  `SUM`／`AVG` 状態へ渡す（初出畳み込み）。確定時に集合を反復しないので、浮動小数の加算順は
+  走査順で決まり実行間で揺れない。PG はソート後に畳むため、REAL／DOUBLE の和は丸め誤差の範囲で
+  加算順が異なりうる（テストは正確に表せる値に限る）。
+- **キーの同一視**: DOUBLE の `0.0` と `-0.0`、NaN 同士は 1 値。INTERVAL は正規化キー
+  （`1 mon` と `30 days` は同じ値）で、代表値は最初に観測した値。
+- **予算**: `COUNT(DISTINCT)` と同じクエリ全体共有の `DistinctBudget`（100,000 件・16 MiB）。
+  新規キーのみ計上し、超過は `54000`。
+- **SQLSTATE**: VECTOR 系の入力は `22000`（`COUNT(DISTINCT <VECTOR>)` と同契約）、
+  TEXT など型の合わない入力は非 DISTINCT と同じ `42883`、`SUM(DISTINCT *)`・ウィンドウ・
+  JOIN 集計・分散系・`bool_and` 系の DISTINCT は `42601`。
+- **テナント境界**: 観測は RLS 可視判定の後段のみ。他テナントの値は重複判定にも入らない。
+
+### 対象外（追跡）
+
+- JOIN 集計・ウィンドウ集計・分散系・`bool_and` 系の DISTINCT（`42601` のまま。受け皿は未確定）。
+- NoSQL（HTTP）表層の集計の DISTINCT。
+- `SUM`／`AVG(DISTINCT <VECTOR>)`（VECTOR の正準等価が未定義のため `22000`）。

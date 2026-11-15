@@ -83,7 +83,7 @@ impl EngineCore {
             ExplainDml::Delete(stmt) => {
                 let schema = self.load_table_schema_for_dml(stmt.table_name())?;
                 // 通常実行（returning_form_pre）と同じ順序で RETURNING を先に束縛し、wire_code を一致させる。
-                crate::sql::parser::bind_returning(stmt.returning(), &schema)?;
+                crate::sql::parser::bind_returning_with_udfs(stmt.returning(), &schema, udfs)?;
                 let (bound, _hash) = Self::prepare_predicate_delete(stmt, stmt, &schema, udfs)?;
                 ExplainDmlShape {
                     assignments: None,
@@ -95,7 +95,7 @@ impl EngineCore {
             ExplainDml::Update(stmt) => {
                 let schema = self.load_table_schema_for_dml(stmt.table_name())?;
                 // 通常実行（returning_form_pre）と同じ順序で RETURNING を先に束縛し、wire_code を一致させる。
-                crate::sql::parser::bind_returning(stmt.returning(), &schema)?;
+                crate::sql::parser::bind_returning_with_udfs(stmt.returning(), &schema, udfs)?;
                 let set_columns: Vec<&str> =
                     stmt.assignments().iter().map(|(n, _)| n.as_str()).collect();
                 let _sparsevec_limits_scope = self.sparsevec_limits_scope();

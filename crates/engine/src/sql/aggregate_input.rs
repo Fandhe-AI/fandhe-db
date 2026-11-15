@@ -413,7 +413,7 @@ impl AggregateRowValue<'_> {
                     "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
                 ))
             }
-            // `sum(DISTINCT <vector>)` は構文層が拒否済みで到達しない（Issue #2038）。
+            // `sum(DISTINCT <vector>)` は束縛段が `22000` で拒否済みで到達しない（Issue #2038・#3263）。
             AggregateRowValue::Vector(_) => {
                 return Err(accumulator_bug(
                     "COUNT(DISTINCT) accumulator observed a VECTOR value",

@@ -546,6 +546,7 @@ pub(crate) fn bind(
     stmt: &ValidatedInsertSelect,
     schema: &TableSchema,
     source: &[ColumnMeta],
+    udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundInsertSelectTarget, SqlSurfaceError> {
     // 列リスト省略（Issue #2613）は、内側の出力列数に応じて表の宣言順の先頭列へ展開する
     // （`VALUES` 形と同じ共有ヘルパー。束縛と同じスキーマのスナップショットで展開する）。
@@ -629,7 +630,8 @@ pub(crate) fn bind(
         .enumerate()
         .filter_map(|(i, p)| (!*p).then_some(i))
         .collect();
-    let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), schema)?;
+    let returning =
+        crate::sql::parser::bind_returning_with_udfs(stmt.returning.as_ref(), schema, udfs)?;
     Ok(BoundInsertSelectTarget {
         columns,
         slots,
@@ -771,6 +773,20 @@ mod tests {
 #[cfg(test)]
 mod bind_tests {
     use super::*;
+
+    /// テスト用の薄い包み（UDF を解決しない空のレジストリで `super::bind` を呼ぶ）。
+    fn bind(
+        stmt: &ValidatedInsertSelect,
+        schema: &TableSchema,
+        source: &[ColumnMeta],
+    ) -> Result<BoundInsertSelectTarget, SqlSurfaceError> {
+        super::bind(
+            stmt,
+            schema,
+            source,
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
     use crate::catalog::{ColumnDef, RowIdentity};
     use crate::sql::allowlist::{InsertSelectShape, Statement};
 
