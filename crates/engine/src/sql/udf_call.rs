@@ -9565,7 +9565,74 @@ fn rem_harden_operand(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> B
             }
             BoundExpr::Builtin { f, args }
         }
+        // CASE／COALESCE／NULLIF／abs の内部も同様に硬化する（整数と証明できる枝・引数だけ。
+        // 丸めを持つ中間 f64 が最終値だけ小さくなって誤一致するのを防ぐ。CASE の条件部は値に
+        // ならないため対象外）。構文木と束縛木の形が対応しない場合は硬化せず `Cast` と同じ扱い。
+        BoundExpr::Case { whens, else_result } => {
+            let (ws, els) = match expr {
+                Some(Expr::Case {
+                    whens: ws,
+                    else_result: els,
+                }) if ws.len() == whens.len() => (Some(ws), els.as_deref()),
+                _ => (None, None),
+            };
+            let whens = whens
+                .into_iter()
+                .enumerate()
+                .map(|(i, (c, r))| {
+                    let r = rem_harden_checked(ws.map(|w| &w[i].1), r, env);
+                    (c, r)
+                })
+                .collect();
+            let else_result = Box::new(rem_harden_checked(els, *else_result, env));
+            BoundExpr::Case { whens, else_result }
+        }
+        BoundExpr::Coalesce(args) => {
+            let src = match expr {
+                Some(Expr::Coalesce(a)) if a.len() == args.len() => Some(a),
+                _ => None,
+            };
+            BoundExpr::Coalesce(
+                args.into_iter()
+                    .enumerate()
+                    .map(|(i, a)| rem_harden_checked(src.map(|s| &s[i]), a, env))
+                    .collect(),
+            )
+        }
+        BoundExpr::NullIf { lhs, rhs } => {
+            let (le, re) = match expr {
+                Some(Expr::NullIf(a, b)) => (Some(&**a), Some(&**b)),
+                _ => (None, None),
+            };
+            BoundExpr::NullIf {
+                lhs: Box::new(rem_harden_checked(le, *lhs, env)),
+                rhs: Box::new(rem_harden_checked(re, *rhs, env)),
+            }
+        }
+        BoundExpr::Builtin {
+            f: BuiltinFn::Abs,
+            mut args,
+        } => {
+            if let (Some(Expr::Call { args: src, .. }), 1) = (expr, args.len()) {
+                if src.len() == 1 {
+                    let a = args.remove(0);
+                    args.push(rem_harden_checked(src.first(), a, env));
+                }
+            }
+            BoundExpr::Builtin {
+                f: BuiltinFn::Abs,
+                args,
+            }
+        }
         other => other,
+    }
+}
+
+/// ラッパー内部の枝・引数用: 整数と証明できる場合だけ [`rem_harden_operand`] を適用する。
+fn rem_harden_checked(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> BoundExpr {
+    match expr {
+        Some(x) if rem_integer_operand(x, &e, env) => rem_harden_operand(Some(x), e, env),
+        _ => e,
     }
 }
 

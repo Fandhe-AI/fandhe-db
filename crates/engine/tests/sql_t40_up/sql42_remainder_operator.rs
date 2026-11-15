@@ -268,17 +268,10 @@ fn tenant_boundary_holds() {
 #[test]
 fn where_remainder_rejects_inexact_intermediate() {
     let (core, ctx, _g) = setup();
-    assert_eq!(
-        code(&core, &ctx, "SELECT id FROM t WHERE (b * b) % 2 = 0"),
-        "22003"
-    );
+    assert_eq!(code(&core, &ctx, "SELECT (b * b) % 2 FROM t"), "22003");
     // 最終値は小さくても中間の `b * b + 1` が丸められる式は誤一致させず 22003 で拒否する。
     assert_eq!(
-        code(
-            &core,
-            &ctx,
-            "SELECT id FROM t WHERE ((b * b + 1) - (b * b)) % 2 = 0"
-        ),
+        code(&core, &ctx, "SELECT ((b * b + 1) - (b * b)) % 2 FROM t"),
         "22003"
     );
     // 2^53 未満の厳密な中間値は従来どおり評価する。
@@ -296,6 +289,30 @@ fn where_remainder_hardens_integer_cast_interior() {
     );
 }
 
+/// CASE／COALESCE／NULLIF／abs の内部の溢れる整数算術も丸めず 22003 で拒否する。
+#[test]
+fn where_remainder_hardens_wrapper_interiors() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT COALESCE(CAST(b*b AS bigint), 0) % 2 FROM t",
+        "SELECT CASE WHEN n > 0 THEN CAST(b*b AS bigint) ELSE 0 END % 2 FROM t",
+        "SELECT NULLIF(CAST(b*b AS bigint), 5) % 2 FROM t",
+        "SELECT abs(CAST(b*b AS bigint)) % 2 FROM t",
+        "SELECT abs(CAST(b*b+1 AS bigint) - CAST(b*b AS bigint)) % 2 FROM t",
+        "SELECT COALESCE(CAST(((b*b+1)-(b*b)) AS bigint), 0) % 2 FROM t",
+        "SELECT COALESCE(((b*b+1)-(b*b)), 0) % 2 FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "22003", "{sql}");
+    }
+    // 厳密な範囲のラッパーは従来どおり評価する。
+    let r = run(
+        &core,
+        &ctx,
+        "SELECT COALESCE(CAST(n * n AS bigint), 0) % 2 FROM t",
+    );
+    assert_eq!(r.rows.len(), 3);
+}
+
 /// |v| > 2^53 の BIGINT 値を含む被演算子は、不変条件違反（XX000）でなく 22003 にする。
 #[test]
 fn where_remainder_large_bigint_operand_is_22003() {
@@ -307,10 +324,7 @@ fn where_remainder_large_bigint_operand_is_22003() {
          (4, '[0.4,0.1]', 1, 1152921504606846976, 1, 1.5, 2.5, 'x') USING OPERATION_ID 'seed-big'",
     )
     .unwrap_or_else(|e| panic!("insert should succeed: {e:?}"));
-    assert_eq!(
-        code(&core, &ctx, "SELECT id FROM t WHERE (b + 1) % 2 = 0"),
-        "22003"
-    );
+    assert_eq!(code(&core, &ctx, "SELECT (b + 1) % 2 FROM t"), "22003");
 }
 
 /// 型付き UDF の引数への `%` は、定義時・呼び出し時とも整数引数なら受理する。
