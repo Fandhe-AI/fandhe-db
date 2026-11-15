@@ -88,6 +88,7 @@ mod table16_primary_key;
 mod table17_foreign_key;
 mod table18_buffered_outer;
 mod table18_view;
+mod table18_view_body_where_expr;
 mod table19_drop_alter_column;
 mod table23_id_ref_fk_actions;
 mod table23_id_ref_fk_ledger;

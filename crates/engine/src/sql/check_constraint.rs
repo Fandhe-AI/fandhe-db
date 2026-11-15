@@ -143,7 +143,7 @@ fn render_predicate(predicate: &WherePredicate, consts: bool) -> String {
 /// （`sql::allowlist::Parser::parse_where` が構造的に保証する）。頂点の比較は
 /// 括弧で囲まず、両辺の算術部分式のみ [`render_expr`] が丸括弧を付けて
 /// レンダリングする。
-fn render_expression_predicate(expr: &Expr) -> String {
+pub(crate) fn render_expression_predicate(expr: &Expr) -> String {
     match expr {
         Expr::Binary { op, lhs, rhs } => {
             format!(
@@ -444,7 +444,7 @@ fn normalize_session_local_expr(expr: &mut Expr) {
 }
 
 /// [`normalize_session_local_expr`] を述語列へ適用する（式を持たない述語は無変更）。
-fn normalize_session_local_predicates(predicates: &mut [WherePredicate]) {
+pub(crate) fn normalize_session_local_predicates(predicates: &mut [WherePredicate]) {
     for predicate in predicates {
         match predicate {
             WherePredicate::Expression(e) => normalize_session_local_expr(e),

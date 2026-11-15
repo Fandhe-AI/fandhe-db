@@ -1000,9 +1000,11 @@ fn chained_expression_views_keep_dependency_checks() {
     ddl(&core, "DROP VIEW top_docs").expect("drop lower");
 }
 
-/// Issue #1436: 拒否（fail-closed）。非組み込み関数・セッション UDF・テーブル直下や単純形ビュー
-/// 経由の本文の式述語は `42601` で、何も永続化されない。非公開の `id` を式述語で参照する連鎖本文は
-/// 参照時に `22000`。
+/// Issue #1436: 拒否（fail-closed）。非組み込み関数・セッション UDF の式述語は `42601` で、
+/// 何も永続化されない（Issue #3238 以降、組み込み関数だけの式述語はテーブル直下・単純形ビュー経由・
+/// 集計の本文でも受理するため、受理側は `table_direct_builtin_body_predicates_match_direct_execution`）。
+/// 非公開の `id` を式述語で参照する連鎖本文は参照時に `42703`。
+// intentional: docs/design/create-view.md
 #[test]
 fn chained_body_expression_predicates_fail_closed() {
     let (core, _g) = open_core("buffered-outer-expr-reject", false);
@@ -1020,28 +1022,10 @@ fn chained_body_expression_predicates_fail_closed() {
         )
         .expect_err("session udf in body");
     assert_eq!(err.wire_code(), "42601");
-    for (name, sql) in [
-        (
-            "u2",
-            "CREATE VIEW u2 AS SELECT id FROM top_docs WHERE no_such_fn(lang) = 'ja' LIMIT 5",
-        ),
-        (
-            "u3",
-            "CREATE VIEW u3 AS SELECT id FROM docs WHERE lower(lang) = 'ja' LIMIT 5",
-        ),
-        (
-            "u4",
-            "CREATE VIEW u4 AS SELECT id FROM s_simple WHERE lower(lang) = 'ja' LIMIT 5",
-        ),
-        (
-            "u5",
-            "CREATE VIEW u5 AS SELECT lang, COUNT(*) AS c FROM docs WHERE lower(lang) = 'ja' GROUP BY lang",
-        ),
-    ] {
-        let err = ddl(&core, sql).expect_err(name);
-        assert_eq!(err.wire_code(), "42601", "sql={sql}");
-    }
-    for name in ["u1", "u2", "u3", "u4", "u5"] {
+    let sql = "CREATE VIEW u2 AS SELECT id FROM top_docs WHERE no_such_fn(lang) = 'ja' LIMIT 5";
+    let err = ddl(&core, sql).expect_err("unknown function");
+    assert_eq!(err.wire_code(), "42601", "sql={sql}");
+    for name in ["u1", "u2"] {
         let err = run(&core, "alice", &format!("SELECT * FROM {name} LIMIT 1"))
             .expect_err("not persisted");
         assert_eq!(err.wire_code(), "42P01", "name={name}");
@@ -1059,6 +1043,57 @@ fn chained_body_expression_predicates_fail_closed() {
     .expect("created; rejected at reference time");
     let err = run(&core, "alice", "SELECT * FROM no_id_w LIMIT 1").expect_err("hidden id");
     assert_eq!(err.wire_code(), "42703");
+}
+
+/// Issue #3238: テーブル直下・単純形ビュー経由・集計の本文でも、組み込み関数だけの式述語を受理する。
+/// 結果は同じ SELECT の直接実行と一致し、組み込み関数でない呼び出しを `OR` 分岐に混ぜても `42601`。
+// intentional: docs/design/create-view.md
+#[test]
+fn table_direct_builtin_body_predicates_match_direct_execution() {
+    let (core, _g) = open_core("buffered-outer-expr-direct", false);
+    ddl(&core, "CREATE VIEW s_simple AS SELECT id, lang FROM docs").expect("s_simple");
+    let cases = [
+        ("u3", "SELECT id FROM docs WHERE lower(lang) = 'ja' LIMIT 5"),
+        (
+            "u4",
+            "SELECT id FROM s_simple WHERE lower(lang) = 'ja' LIMIT 5",
+        ),
+        (
+            "u5",
+            "SELECT lang, COUNT(*) AS c FROM docs WHERE lower(lang) = 'ja' GROUP BY lang",
+        ),
+    ];
+    for (name, body) in cases {
+        ddl(&core, &format!("CREATE VIEW {name} AS {body}"))
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    }
+    for tenant in TENANTS {
+        for (name, body) in cases {
+            let direct = run(&core, tenant, body).unwrap_or_else(|e| panic!("{body}: {e:?}"));
+            let via = run(&core, tenant, &format!("SELECT * FROM {name} LIMIT 100"))
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(cells(&via), cells(&direct), "tenant={tenant} view={name}");
+        }
+        // 独立オラクル: u3 の件数は、可視な ja 行数と本文の LIMIT 5 の小さい方。
+        let ja = run(
+            &core,
+            tenant,
+            "SELECT id FROM docs WHERE lang = 'ja' LIMIT 100",
+        )
+        .expect("ja")
+        .rows
+        .len();
+        let u3 = run(&core, tenant, "SELECT id FROM u3 LIMIT 100").expect("u3");
+        assert_eq!(u3.rows.len(), ja.min(5), "tenant={tenant} u3");
+    }
+    let err = ddl(
+        &core,
+        "CREATE VIEW u6 AS SELECT id FROM docs WHERE lang = 'ja' OR no_such_fn(lang) = 'x' LIMIT 5",
+    )
+    .expect_err("non-builtin in OR branch");
+    assert_eq!(err.wire_code(), "42601");
+    let err = run(&core, "alice", "SELECT * FROM u6 LIMIT 1").expect_err("not persisted");
+    assert_eq!(err.wire_code(), "42P01");
 }
 
 /// Issue #1436: 式述語つきの連鎖ビューは再オープン後も同じ結果で参照できる。
