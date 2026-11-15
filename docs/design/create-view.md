@@ -10,6 +10,8 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 `MATERIALIZED VIEW`（TABLE-42）は本ファイル末尾の「Issue #1668 追記」にまとめる。以降の節は
 非マテリアライズドビューの記録である。更新可能ビュー（TABLE-43。関連ポインタ SQL-49・
 RLS-10 (b)・ERR-6 の `55000`）は末尾の「Issue #1675 追記」にまとめる。
+本文 `WHERE` の受理方針（式述語・`OR`・`IS NULL` 等への拡大。Issue #3237）は末尾の
+「Issue #3237 追記」にまとめる。
 
 ## 概要
 
@@ -36,6 +38,8 @@ DROP VIEW <name>
   いずれも構造的に受理しない（`42601`）。使える単純述語は
   `Equality`／`Prefix`／`BoolEquality`／`BoolColumn`／`Compare`（列 対
   リテラル）のみ。
+  （受理範囲は Issue #3237 の方針に従い #3238 で拡大する。末尾「Issue #3237 追記」参照。
+  それまでは本記述が現行の挙動である。）
 - `DROP VIEW` は単一ビュー名（`IF EXISTS` 付きも可。Issue #1614、[drop-table.md](drop-table.md) の「Issue #1614 追記」）の指定のみを受理し、
   `CASCADE`／`RESTRICT` は Issue #1641 で受理に変わった（[drop-table.md](drop-table.md) の「Issue #1641 追記」）。複数名指定は `42601`。
 - 拡張クエリプロトコルの `$n` を含む `CREATE VIEW`／`DROP VIEW` は Parse 時点で
@@ -254,6 +258,7 @@ JOIN 本文の辺はテーブルに限る。本文の大きさの上限（64 KiB
   依存検査（`2BP01`）・RLS（本文は参照セッションの `PolicyContext` で評価）は不変。
   単純形の段（`LIMIT` なしの列射影）は式述語を持てず、式述語つきの連鎖本文は `LIMIT` 付きの行形か
   集計形で書く。
+  （この制約は Issue #3237 の方針で解除する。実装は #3238。末尾「Issue #3237 追記」参照。）
 - 単純形 → 評価後射影形: `resolve_from` が連鎖の各段（単純形）を、下位の本文の上に重ねた行形の
   `BufferedView`（`LIMIT` なし）として内側から畳み込む。各段の列スコープは下位の結果列に対する
   外側の検査（`22000`／`42702`）で担保する。式項目・UDF 述語を持つ段は作成時に `42601`。
@@ -809,3 +814,84 @@ SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコ�
 ビューに書き込みテナント自身の `INSTEAD OF` トリガ（該当イベント）があれば、更新可能性の判定より先にトリガへ
 振り分ける（自動書き換えより優先。更新可能ビューでも同じ）。自動更新不可（`55000`）の判定は、テナントを
 持てる実行段・Describe へ移した。詳細は [trigger-instead-of.md](trigger-instead-of.md)。
+
+## Issue #3237 追記: VIEW 本文 WHERE の受理方針
+
+関連ポインタ: TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b)。本節は方針の決定記録であり、
+コードは変更しない。実装は #3238（受理の拡張）・#3239（参照時の再検証と `RENAME` 追随）・#3240（エラー文言と
+越境試験）が直列で担う。
+
+### 背景
+
+- 単純形（`sql::allowlist::parse_view_body` → `check_view_body_predicates`）が受理する述語は
+  `Equality`／`BoolEquality`／`BoolColumn`／`Compare`（列と文字列リテラル）／裸の列の `LIKE`／恒偽に限られる
+- 整数・浮動小数との比較（`n > 3`）は `WherePredicate::Expression` として解析されるため拒否される
+- `LIMIT` なしの本文は評価後射影形（Buffered）へも落ちない。`check_buffered_body_shape` が
+  `limit_implicit` を構文段で拒否する（#1796）
+- `LIMIT` 付きでも、最上位の Scan／Aggregate は `ViewBodyCheck::Resolved` で `BodyExprPolicy::Reject` になる
+
+### LIMIT なし本文の扱い
+
+**決定: 単純形（インライン展開）のまま保持し、単純形の許可リストを広げる。Buffered へは回さない。**
+
+1. Buffered は `LIMIT` の省略を構文段で拒否する（#1796）
+2. Buffered にすると `ResultLimits` の既定上限で本文が打ち切られ、選択的な外側 `WHERE` の対象行が
+   黙って欠ける（「Issue #1659 追記」に記録済み）
+3. 更新可能ビュー（TABLE-43）と `WITH CHECK OPTION` は、単純形のインライン展開
+   （`Resolved::View` の `view_predicates`／`check_predicates`）が前提で、Buffered 側は自動更新できない
+
+### 受理形・拒否形
+
+| 位置 | 受理 | 拒否（SQLSTATE） | 備考 |
+| ---- | ---- | ---------------- | ---- |
+| (A) 単純形本文（`LIMIT` なし。`FROM` はテーブルか単純形ビュー）の `WHERE` | 従来: `Equality`／`BoolEquality`／`BoolColumn`／`Compare`／裸の列の `LIKE`・`ILIKE`／恒偽。新規: `InList`／`Between`／`IsNull`／`Not`（構文段で葉まで押し下げた後の形）／非空の `Or`（各分岐を同じ規則で再帰判定）／`Expression` のうち `udf_call::first_non_builtin_call` が `None`（組み込み関数のみ） | 非組み込み呼び出しを含む `Expression`（セッション UDF・WASM UDF・未知の名前）、`PredicateCall`（`visible()` 等）、サブクエリ系（`InSubquery`／`Exists`／`ScalarSubqueryCompare`／`QuantifiedSubqueryCompare`）、`IdCompare`、`CorrelatedExists`、式左辺の `LIKE`／`ILIKE`（`42601`） | 投影の式項目（`Projection::Items`）は従来どおり `42601`。本件の範囲は `WHERE` だけ |
+| (B) 単純形の段が Buffered ビューの上に重なる連鎖 | (A) で受理した形は `check_buffered_outer_pred` でも受理される。ただし `ILIKE`（裸の列を含む）は例外で、`check_buffered_outer_pred` が `case_insensitive: true` を `0A000` で拒否する既存契約を維持する（合成スキーマが元列の照合を保持せず、ICU 照合を黙って ASCII 比較へ変えないため。受理には照合伝搬が要るので本件の範囲外） | (A) と同じ。加えて `ILIKE` は `0A000` | 「単純形の段は式述語を持てない」（Issue #1436）を解除する。`check_simple_layer_over_buffered` が作成時に同じ規則で検査し、作れても参照時に必ず失敗する定義を作らない |
+| (C) Buffered 本文（`LIMIT`・集計等）の最上位 Scan／Aggregate | `ViewBodyCheck::Resolved` の最上位を `BodyExprPolicy::Reject` から `BuiltinOnly` へ変え、`LIMIT` の有無で受理形が食い違わないようにする | 非組み込み呼び出し等（`42601`） | |
+| (D) Buffered 本文の集合演算の枝・サブクエリの内側 | 受理形は拡大しない | 従来どおり `Reject` を維持（`42601`） | fail-closed。Resolved を一律に変えず、サブクエリ内側（`check_body_subquery`）を明示的に `Reject` で検査する、と #3238 へ指示する |
+| (E) CTE 本文（#1862） | 現状の判定表のまま | 現状のまま | `check_view_body_predicates` は CTE 本文の解析と共有されるため、判定表を「ビュー本文用」と「CTE 本文用」に分けるか方針を引数で渡す。CTE 側の拡大は対象外 |
+
+### UDF の判定位置
+
+- 定義時: 単純形は `parse_view_body` の述語検査で `first_non_builtin_call` を判定し、Buffered は
+  `check_body_pred` の `BuiltinOnly` で判定する。どちらも `42601`
+- 参照時: 単純形は `reparse_stored_body` が同じ `parse_view_body` を、Buffered は `reparse_buffered_body` が
+  `classify_view_body`（`Resolved`）を通る。どちらも束縛より前に同じ判定が働き、参照セッションの
+  UDF レジストリで束縛されることはない
+- 参照時の失敗は既存の格納本文再検証の契約に揃え、**本文を含まない固定文言の `XX000`**（`corrupt_view_error`）とする。
+  通常の定義経路では到達せず、カタログ破損・公開 API 経由の不正な格納・版の食い違いのときだけ到達する。
+  利用者の文の構文誤り（`42601`）と区別する
+
+### Structural の保留の扱い
+
+`ViewBodyCheck::Structural` の保留（#1436）と `catalog::Storage::create_view` の `Resolved` 再検証は維持する。
+最上位の扱いは両段とも `BuiltinOnly` で揃うが、連鎖の判別・relation 一覧・深さ検査に実カタログでの再検証が
+要るため、再検証は残す。冗長になる部分の整理は対象外とする。
+
+### テナント境界と互換性
+
+- 本文の述語は外側の述語・RLS と AND で合成される。RLS は参照セッションの `PolicyContext` で実行段が独立に
+  適用するため、本文の `OR` が可視性を広げることはない（RLS-10 (b)）。`PredicateCall` は拒否のまま
+- `WITH CHECK OPTION` の束縛は空の UDF レジストリで行い、`visible()` とサブクエリは `0A000` のまま
+- 格納済み本文の分類（Simple／Buffered）は変わらない。`LIMIT` 付き・集計・`JOIN`・CTE・集合演算・サブクエリを含む本文は
+  `parse_view_body` の構造段で必ず失敗するため、述語の許可リストを広げても Buffered 格納済みの本文が Simple へ移らない
+- 保存形式は `render_view_body` の出力だけで、AST から正規化描画する（未検証文字列を連結しない）。
+  `render_where_predicate` は現状 `Expression`／`InList`／`Between`／`IsNull`／`Not` を空文字列で描画するため、
+  新しい形を空文字列のまま格納することを禁じ、「描画 → 再トークン化 → `parse_view_body`」の往復を #3238 の受入に含める
+
+### 実装の割り振り
+
+| Issue | 内容 |
+| ----- | ---- |
+| #3238 | 判定表の拡張と CTE との分離／`Resolved` 最上位の `BuiltinOnly` 化（サブクエリ内側は `Reject` 維持）／`render_where_predicate` の網羅と往復の固定／`check_simple_layer_over_buffered` との整合 |
+| #3239 | `reparse_buffered_body`・`rename_column_in_view_body`・`view_alias::rewrite_where` を新しい形に網羅させる／`DROP COLUMN`・`ALTER COLUMN TYPE` の依存検査（式木内の列参照を含む）／再起動後の参照 |
+| #3240 | `CatalogError::Invalid` の文言を原因ごとに分ける／他テナント越境の試験 |
+
+### 対象外
+
+- 式左辺の `LIKE`／`ILIKE`: 今回は受理しない。`check_buffered_outer_pred` が拒否するため、連鎖の有無で挙動が分かれることを避ける。対応しない
+- 投影の式項目・集計引数の式: 本件は `WHERE` のみ。対応しない
+- 集合演算の枝とサブクエリ内側の式述語: fail-closed のため `Reject` を維持。対応しない
+- CTE 本文の判定表の拡大: 対応しない（本件の範囲外）
+- `JOIN` 本文の `LIMIT` 必須と両辺テーブル限定: #3236 で対象外と明記済み
+- `ALTER VIEW`: 従来から対象外
+- `Structural`／`Resolved` の冗長な再検証の整理: 対応しない（挙動に影響しない整理のため）
