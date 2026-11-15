@@ -7347,6 +7347,13 @@ pub(super) fn bind_expr_any(
                     },
                 );
             }
+            // `%` の被演算子の中間演算（`+ - * / %`）は f64 の丸めを剰余へ持ち込まないため、
+            // 各演算を整数の checked 演算（|v| <= 2^53 を超えれば 22003）へ置き換える。
+            let (l, r) = if *op == BinOp::Rem && lt == ExprType::Scalar && rt == ExprType::Scalar {
+                (rem_harden_operand(l), rem_harden_operand(r))
+            } else {
+                (l, r)
+            };
             // Issue #1539・SQL-42: 投影モードの `Scalar` 同士の算術は、オペランドの数値
             // 種別（整数／単精度／倍精度）から結果型を PostgreSQL に揃える。
             // Issue #2881: 整数モードの整数どうしの比較は i128 で丸めなく比較する。
@@ -9516,6 +9523,24 @@ fn rem_integer_operand(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> boo
         return true;
     }
     rem_integer_syntax(expr, env)
+}
+
+/// `%` の被演算子に含まれる `+ - * / %` の [`BoundExpr::Binary`] を、整数の checked 演算
+/// （[`BuiltinFn::TypedArith`] の `Int8`。各演算の結果が 2^53 を超えれば `22003`）へ再帰的に
+/// 置き換える（Issue #3273）。f64 レーンでは `((b*b+1)-(b*b)) % 2` のように、最終値だけを見ても
+/// 中間の丸めを検出できないため、各中間演算で精度を保証する。葉（列・リテラル・CAST 等）は不変。
+fn rem_harden_operand(e: BoundExpr) -> BoundExpr {
+    match e {
+        BoundExpr::Binary {
+            op: op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem),
+            lhs,
+            rhs,
+        } => BoundExpr::Builtin {
+            f: BuiltinFn::TypedArith(op, NumericKind::Int8),
+            args: vec![rem_harden_operand(*lhs), rem_harden_operand(*rhs)],
+        },
+        other => other,
+    }
 }
 
 fn rem_integer_syntax(expr: &Expr, env: &BindEnv<'_>) -> bool {

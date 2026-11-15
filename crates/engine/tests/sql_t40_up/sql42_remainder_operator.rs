@@ -272,6 +272,15 @@ fn where_remainder_rejects_inexact_intermediate() {
         code(&core, &ctx, "SELECT id FROM t WHERE (b * b) % 2 = 0"),
         "22003"
     );
+    // 最終値は小さくても中間の `b * b + 1` が丸められる式は誤一致させず 22003 で拒否する。
+    assert_eq!(
+        code(
+            &core,
+            &ctx,
+            "SELECT id FROM t WHERE ((b * b + 1) - (b * b)) % 2 = 0"
+        ),
+        "22003"
+    );
     // 2^53 未満の厳密な中間値は従来どおり評価する。
     let r = run(&core, &ctx, "SELECT id FROM t WHERE (n * n) % 2 = 1");
     assert_eq!(r.rows.len(), 3);
