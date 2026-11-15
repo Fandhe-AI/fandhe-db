@@ -1997,10 +1997,14 @@ fn push_partitioned_time_zone(
     schema: &crate::catalog::TableSchema,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
     let depends = b.is_tz_dependent()
-        || schema
-            .columns
-            .iter()
-            .any(|c| matches!(c.ty, crate::catalog::ColumnType::TimestampTz));
+        || schema.columns.iter().any(|c| match &c.ty {
+            crate::catalog::ColumnType::TimestampTz => true,
+            // `TIMESTAMPTZ[]` の offset なしリテラルも既定 TZ で解釈される（Issue #3233）。
+            crate::catalog::ColumnType::Array(a) => {
+                a.elem() == crate::catalog::ArrayElemType::TimestampTz
+            }
+            _ => false,
+        });
     if depends {
         let tz = crate::datetime::current_session_time_zone();
         if tz.display() != "UTC" {

@@ -9321,6 +9321,15 @@ fn resolve_array_agg_input(
         node_budget,
         item.func.default_alias(),
     )?;
+    // TIMESTAMPTZ の JSON 化は未対応。確定時の XX000 ではなく束縛時に 0A000 で拒否する（Issue #3233）。
+    if !matches!(output, ArrayAggOutput::Array) && elem == ArrayElemType::TimestampTz {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "{} over timestamptz is not supported yet",
+                item.func.default_alias()
+            ),
+        });
+    }
     let orders_by_value = item.distinct || item.order_by.iter().any(|k| k.expr == *value_expr);
     if orders_by_value {
         match elem {
