@@ -548,6 +548,9 @@ fn view_where_predicates_follow_rename() {
         "CREATE VIEW v_like AS SELECT id FROM docs WHERE note LIKE 'a%'",
         "CREATE VIEW v_cmp AS SELECT id FROM docs WHERE qty >= '3'",
         "CREATE VIEW v_false AS SELECT id FROM docs WHERE FALSE",
+        // Issue #3239: 式述語つき本文も追随する。
+        "CREATE VIEW v_expr AS SELECT id FROM docs WHERE qty + 1 > 3 OR note IS NULL",
+        "CREATE VIEW v_in AS SELECT id FROM docs WHERE qty IN (1, 5) OR note = 'zz'",
     ] {
         run(&core, &mut session, sql).expect("create view");
     }
@@ -568,6 +571,8 @@ fn view_where_predicates_follow_rename() {
         ("v_like", 1),
         ("v_cmp", 1),
         ("v_false", 0),
+        ("v_expr", 1),
+        ("v_in", 2),
     ] {
         let out = core
             .execute_sql(&ctx(), &format!("SELECT id FROM {view} LIMIT 100"))

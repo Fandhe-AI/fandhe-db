@@ -8813,8 +8813,21 @@ fn resolve_aggregate_item_input(
     if item.func.is_grouping() {
         return resolve_grouping_input(item, group_by_columns, key_exprs_norm, schema);
     }
-    if item.distinct {
+    if item.distinct && item.func == crate::sql::allowlist::AggregateFunc::Count {
         resolve_count_distinct_input(&item.arg, schema, udfs, node_budget)
+    } else if item.distinct {
+        // Issue #3263: `SUM`／`AVG(DISTINCT)` は非 DISTINCT と同じ型検査で束縛し、DISTINCT キーを
+        // 定義できない VECTOR 系入力だけを `22000` で拒否する（`COUNT(DISTINCT <VECTOR>)` と同契約）。
+        let input = resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)?;
+        if matches!(
+            input,
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+        ) {
+            return Err(SqlSurfaceError::invalid_input(
+                "VECTOR has no canonical equality and cannot be used with DISTINCT aggregates",
+            ));
+        }
+        Ok(input)
     } else {
         resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)
     }

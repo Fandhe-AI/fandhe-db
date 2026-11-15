@@ -854,9 +854,10 @@ fn check_predicate_columns_within(
         WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none() => {
             expr_columns_within(columns, lhs)
         }
-        WherePredicate::Not(inner) if matches!(inner.as_ref(), WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none()) => {
-            check_predicate_columns_within(columns, inner)
-        }
+        // Issue #3239: `NOT` は内側を常に再帰検査する。構文段は否定を葉まで押し下げるため
+        // `Not(Expression)`／`Not(Or)` は通常生成されないが、現れても否定越しに非公開列を
+        // 素通りさせない（fail-closed。DROP COLUMN／ALTER TYPE の依存検査にも効く）。
+        WherePredicate::Not(inner) => check_predicate_columns_within(columns, inner),
         // 行値比較（#3255）: 全成分の列参照を検査する（非公開列の漏えい防止。評価は #3256）。
         WherePredicate::RowCompare { lhs, rhs, .. } => lhs
             .iter()
@@ -1091,6 +1092,34 @@ mod tests {
         )
         .expect_err("NOT-wrapped reference to a hidden column must be rejected");
         assert!(matches!(err, SqlSurfaceError::UndefinedColumn { .. }));
+    }
+
+    /// 手で組んだ `Not(Expression)`／`Not(Or)`（構文段は生成しない形）でも、否定越しに
+    /// 非公開列を参照すれば拒否する（Issue #3239・堅牢化）。
+    #[test]
+    fn check_columns_within_view_rejects_hidden_column_through_not_of_compound() {
+        let view_columns = vec!["id".to_string()];
+        let hidden_eq = || WherePredicate::Equality {
+            column: "hidden".to_string(),
+            value: "x".to_string(),
+        };
+        let not_expr = WherePredicate::Not(Box::new(WherePredicate::Expression(Expr::Binary {
+            op: crate::sql::udf_call::BinOp::Gt,
+            lhs: Box::new(Expr::Ident("hidden".to_string())),
+            rhs: Box::new(Expr::Number("1".to_string())),
+        })));
+        let not_or = WherePredicate::Not(Box::new(WherePredicate::Or(vec![
+            vec![WherePredicate::BoolColumn {
+                column: "id".to_string(),
+            }],
+            vec![hidden_eq()],
+        ])));
+        for pred in [not_expr, not_or] {
+            let err =
+                check_columns_within_view(Some(&view_columns), &Projection::All, &[pred], &[])
+                    .expect_err("hidden column behind NOT must be rejected");
+            assert!(matches!(err, SqlSurfaceError::UndefinedColumn { .. }));
+        }
     }
 
     /// 固定のビュー定義群を返すテスト用 lookup（テーブルは `docs` のみ）。
