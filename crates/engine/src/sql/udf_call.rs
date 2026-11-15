@@ -8475,7 +8475,18 @@ fn scalar_numeric_kind(
             crate::catalog::ArrayElemType::Integer => Some(NumericKind::Int4),
             crate::catalog::ArrayElemType::BigInt => Some(NumericKind::Int8),
             crate::catalog::ArrayElemType::Real => Some(NumericKind::Float4),
-            _ => None,
+            // 残りは静的な数値種別を持たない（要素型の追加時にここで判断を強制する。Issue #3229）。
+            crate::catalog::ArrayElemType::Text
+            | crate::catalog::ArrayElemType::Bool
+            | crate::catalog::ArrayElemType::Double
+            | crate::catalog::ArrayElemType::Date
+            | crate::catalog::ArrayElemType::Timestamp
+            | crate::catalog::ArrayElemType::Uuid
+            | crate::catalog::ArrayElemType::Numeric { .. }
+            | crate::catalog::ArrayElemType::Bytea
+            | crate::catalog::ArrayElemType::Json
+            | crate::catalog::ArrayElemType::Jsonb
+            | crate::catalog::ArrayElemType::Enum => None,
         },
         // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
         BoundExpr::JsonFn {
