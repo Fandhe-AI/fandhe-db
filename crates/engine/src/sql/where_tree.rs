@@ -23,6 +23,61 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::udf_call::{self, BoundExpr, ExprValue};
 
+/// SQL の三値論理（Kleene）の真理値。`CHECK` 制約の述語木評価
+/// （`sql::check_constraint::CompiledChecks::enforce`）が使う（TABLE-16・SQL-24 ポインタ）。
+///
+/// 二値の [`BoundOrGroup::matches`]（WHERE 用。UNKNOWN の葉で即座に打ち切る）とは別に、
+/// 葉の評価器（[`MetadataFilter::eval`]・[`ExprProgram::eval`]）だけを共有する
+/// 三値版の木評価器（`eval_three_valued`）の戻り値型。違反扱いにするのは
+/// [`Truth::False`] のときだけで、[`Truth::Unknown`] は PG 互換で合格として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+impl Truth {
+    /// `Option<bool>`（`None` は UNKNOWN）から変換する。
+    pub(crate) fn from_option(v: Option<bool>) -> Self {
+        match v {
+            Some(true) => Truth::True,
+            Some(false) => Truth::False,
+            None => Truth::Unknown,
+        }
+    }
+
+    /// Kleene の `AND`（FALSE が優先、次に UNKNOWN）。
+    #[cfg(test)]
+    pub(crate) fn and(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::False, _) | (_, Truth::False) => Truth::False,
+            (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+            _ => Truth::True,
+        }
+    }
+
+    /// Kleene の `OR`（TRUE が優先、次に UNKNOWN）。
+    #[cfg(test)]
+    pub(crate) fn or(self, other: Truth) -> Truth {
+        match (self, other) {
+            (Truth::True, _) | (_, Truth::True) => Truth::True,
+            (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+            _ => Truth::False,
+        }
+    }
+
+    /// Kleene の `NOT`（UNKNOWN は UNKNOWN のまま）。
+    #[cfg(test)]
+    pub(crate) fn not(self) -> Truth {
+        match self {
+            Truth::True => Truth::False,
+            Truth::False => Truth::True,
+            Truth::Unknown => Truth::Unknown,
+        }
+    }
+}
+
 /// `OR` で結ぶ分岐の集合（束縛済み）。分岐は 2 個以上（構文段
 /// （[`crate::sql::allowlist::Parser::parse_where_or`]）が 1 個の場合は
 /// 親の列へ平坦化するため、束縛対象として渡ってくる時点で常に 2 個以上）。
@@ -86,6 +141,40 @@ impl BoundOrGroup {
             }
         }
         Ok(false)
+    }
+
+    /// 本 OR 群を三値論理で評価する（`CHECK` 用。TABLE-16 ポインタ）。分岐は宣言順に評価し、
+    /// TRUE が出た時点で打ち切る。それ以外は UNKNOWN が 1 つでもあれば UNKNOWN、
+    /// 無ければ FALSE（分岐 0 個は FALSE）。評価エラーは透過する。
+    pub(crate) fn eval_three_valued(
+        &self,
+        scanned: &[Option<ScalarRef<'_>>],
+        id: u64,
+        embedding: &[f32],
+        scratch: &mut Vec<StackValue>,
+    ) -> Result<Truth, SqlSurfaceError> {
+        let mut unknown = false;
+        for branch in &self.branches {
+            match branch.eval_three_valued(scanned, id, embedding, scratch)? {
+                Truth::True => return Ok(Truth::True),
+                Truth::Unknown => unknown = true,
+                Truth::False => {}
+            }
+        }
+        Ok(if unknown {
+            Truth::Unknown
+        } else {
+            Truth::False
+        })
+    }
+
+    /// 本 OR 群（入れ子を含む）が参照するスカラー列を `mask` へ反映する。
+    /// マスク漏れは「マスク外の列が NULL 扱いで合格」という fail-open になるため、
+    /// `CHECK` の列マスク算出（`CompiledChecks::compile`）は必ずこれを通す。
+    pub(crate) fn mark_scalar_column_mask(&self, mask: &mut [bool]) {
+        for branch in &self.branches {
+            branch.mark_scalar_column_mask(mask);
+        }
     }
 
     /// `self`（またはネストした分岐）が `WHERE` の式述語で `VECTOR` 列
@@ -320,6 +409,81 @@ impl BoundConjunction {
         Ok(true)
     }
 
+    /// 1 分岐（`AND` の連言）を三値論理で評価する（`CHECK` 用。TABLE-16・SQL-24 ポインタ）。
+    ///
+    /// 評価順は `metadata_filters` → `expr_filters` → `or_groups`（[`Self::matches`] と同じ）。
+    /// FALSE が出た時点で打ち切り、UNKNOWN は記録して評価を続ける。全件評価して FALSE が
+    /// 無ければ、UNKNOWN が 1 つでもあれば UNKNOWN、無ければ TRUE。
+    ///
+    /// fail-closed の規則:
+    /// - 宣言的フィルタの列が `scanned` の範囲外 → `Internal`（NULL と取り違えて合格させない）
+    /// - 非 NULL の値に対して葉が UNKNOWN（型不一致・壊れた格納値）→ `Internal`
+    ///   （UNKNOWN＝合格にすると黙って通り、FALSE に写すと `NOT` で TRUE へ反転し得るため）
+    /// - 式が Bool／NULL 以外 → `Internal`。式評価エラー（0 除算等）は元の分類のまま透過
+    pub(crate) fn eval_three_valued(
+        &self,
+        scanned: &[Option<ScalarRef<'_>>],
+        id: u64,
+        embedding: &[f32],
+        scratch: &mut Vec<StackValue>,
+    ) -> Result<Truth, SqlSurfaceError> {
+        let mut unknown = false;
+        for filter in &self.metadata_filters {
+            let value =
+                scanned
+                    .get(filter.column_index())
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "predicate references a column outside the decoded row".to_string(),
+                    })?;
+            let leaf = filter.eval(*value);
+            if leaf.is_none() && value.is_some() {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "predicate evaluated to UNKNOWN on a non-NULL column value".to_string(),
+                });
+            }
+            match Truth::from_option(leaf) {
+                Truth::False => return Ok(Truth::False),
+                Truth::Unknown => unknown = true,
+                Truth::True => {}
+            }
+        }
+        for program in &self.expr_programs {
+            match program.eval(id, embedding, scanned, scratch)? {
+                ExprValue::Bool(true) => {}
+                ExprValue::Bool(false) => return Ok(Truth::False),
+                ExprValue::Null => unknown = true,
+                _ => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "predicate expression did not evaluate to Bool".to_string(),
+                    });
+                }
+            }
+        }
+        for group in &self.or_groups {
+            match group.eval_three_valued(scanned, id, embedding, scratch)? {
+                Truth::False => return Ok(Truth::False),
+                Truth::Unknown => unknown = true,
+                Truth::True => {}
+            }
+        }
+        Ok(if unknown { Truth::Unknown } else { Truth::True })
+    }
+
+    /// 本連言（入れ子の OR 群を含む）が参照するスカラー列を `mask` へ反映する。
+    pub(crate) fn mark_scalar_column_mask(&self, mask: &mut [bool]) {
+        for filter in &self.metadata_filters {
+            if let Some(slot) = mask.get_mut(filter.column_index()) {
+                *slot = true;
+            }
+        }
+        for expr in &self.expr_filters {
+            udf_call::mark_referenced_scalar_columns(expr, mask);
+        }
+        for group in &self.or_groups {
+            group.mark_scalar_column_mask(mask);
+        }
+    }
+
     pub(crate) fn references_embedding(&self) -> bool {
         self.expr_filters.iter().any(udf_call::references_embedding)
             || self
@@ -491,5 +655,119 @@ mod tests {
         assert_eq!(folded_values(&ok).map(|v| v.len()), Some(256));
         let over = BoundOrGroup::new(vec![in_text(0, &refs), eq(0, "zzz"), eq(0, "yyy")]);
         assert!(over.as_same_column_text_in().is_none());
+    }
+
+    // ---- Issue #3242: 三値評価器 ----
+
+    #[test]
+    fn truth_tables_follow_kleene_logic() {
+        use Truth::{False as F, True as T, Unknown as U};
+        for (a, b, and, or) in [
+            (T, T, T, T),
+            (T, F, F, T),
+            (T, U, U, T),
+            (F, F, F, F),
+            (F, U, F, U),
+            (U, U, U, U),
+        ] {
+            assert_eq!(a.and(b), and, "{a:?} AND {b:?}");
+            assert_eq!(b.and(a), and, "{b:?} AND {a:?}");
+            assert_eq!(a.or(b), or, "{a:?} OR {b:?}");
+            assert_eq!(b.or(a), or, "{b:?} OR {a:?}");
+        }
+        assert_eq!(T.not(), F);
+        assert_eq!(F.not(), T);
+        assert_eq!(U.not(), U);
+        assert_eq!(Truth::from_option(None), U);
+        assert_eq!(Truth::from_option(Some(true)), T);
+        assert_eq!(Truth::from_option(Some(false)), F);
+    }
+
+    fn eval3(conj: &BoundConjunction, row: &[Option<ScalarRef<'_>>]) -> Truth {
+        eval3_result(conj, row).expect("eval")
+    }
+
+    fn eval3_result(
+        conj: &BoundConjunction,
+        row: &[Option<ScalarRef<'_>>],
+    ) -> Result<Truth, SqlSurfaceError> {
+        conj.eval_three_valued(row, 1, &[], &mut Vec::new())
+    }
+
+    fn text_row<'a>(vals: &[Option<&'a str>]) -> Vec<Option<ScalarRef<'a>>> {
+        vals.iter().map(|v| v.map(ScalarRef::Text)).collect()
+    }
+
+    #[test]
+    fn or_group_short_circuits_on_true_and_propagates_unknown() {
+        let group = |a: &str, b: &str| {
+            BoundConjunction::new(
+                vec![],
+                vec![],
+                vec![BoundOrGroup::new(vec![eq(0, a), eq(1, b)])],
+            )
+        };
+        // TRUE OR _ は TRUE。
+        assert_eq!(
+            eval3(&group("x", "y"), &text_row(&[Some("x"), Some("z")])),
+            Truth::True
+        );
+        // FALSE OR UNKNOWN は UNKNOWN。
+        assert_eq!(
+            eval3(&group("x", "y"), &text_row(&[Some("z"), None])),
+            Truth::Unknown
+        );
+        // FALSE OR FALSE は FALSE。
+        assert_eq!(
+            eval3(&group("x", "y"), &text_row(&[Some("z"), Some("z")])),
+            Truth::False
+        );
+        // 空の OR 群は FALSE。
+        let empty = BoundConjunction::new(vec![], vec![], vec![BoundOrGroup::new(vec![])]);
+        assert_eq!(eval3(&empty, &[]), Truth::False);
+    }
+
+    #[test]
+    fn conjunction_false_wins_over_unknown() {
+        let conj = BoundConjunction::new(
+            vec![
+                MetadataFilter::for_test(0, FilterOp::Equals("x".into())),
+                MetadataFilter::for_test(1, FilterOp::Equals("y".into())),
+            ],
+            vec![],
+            vec![],
+        );
+        assert_eq!(eval3(&conj, &text_row(&[None, Some("z")])), Truth::False);
+        assert_eq!(eval3(&conj, &text_row(&[None, Some("y")])), Truth::Unknown);
+        assert_eq!(
+            eval3(&conj, &text_row(&[Some("x"), Some("y")])),
+            Truth::True
+        );
+        // IS NULL は NULL 値に対して TRUE（葉の三値評価を共有している）。
+        let is_null = BoundConjunction::new(
+            vec![MetadataFilter::for_test(0, FilterOp::IsNull)],
+            vec![],
+            vec![],
+        );
+        assert_eq!(eval3(&is_null, &text_row(&[None])), Truth::True);
+        assert_eq!(eval3(&is_null, &text_row(&[Some("a")])), Truth::False);
+    }
+
+    #[test]
+    fn non_null_unknown_leaf_and_out_of_range_index_are_internal_errors() {
+        let mismatched = BoundConjunction::new(
+            vec![MetadataFilter::for_test(0, FilterOp::BoolEquals(true))],
+            vec![],
+            vec![],
+        );
+        assert!(matches!(
+            eval3_result(&mismatched, &text_row(&[Some("x")])),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
+        let out_of_range = eq(5, "x");
+        assert!(matches!(
+            eval3_result(&out_of_range, &text_row(&[Some("x")])),
+            Err(SqlSurfaceError::Internal { .. })
+        ));
     }
 }
