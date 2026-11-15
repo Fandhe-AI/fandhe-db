@@ -19175,6 +19175,11 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
             let rendered_branches: Vec<String> = branches
                 .iter()
                 .map(|branch| {
+                    // 空の AND 枝は常真（`OR TRUE`）。空文字のまま結合すると再解析不能な
+                    // `(a OR )` になるため `TRUE` で描画する。
+                    if branch.is_empty() {
+                        return "TRUE".to_string();
+                    }
                     let rendered: Vec<String> = branch.iter().map(render_where_predicate).collect();
                     rendered.join(" AND ")
                 })

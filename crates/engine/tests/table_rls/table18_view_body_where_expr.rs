@@ -569,3 +569,18 @@ fn rename_column_under_expression_view_is_refused_fail_closed() {
     );
     assert_eq!(ids(&core, "alice", "SELECT id FROM vr LIMIT 100"), before);
 }
+
+/// 本文の `OR TRUE`（空の AND 枝）が保存時往復検証を通り、全行を返すビューとして作成できる
+/// （Issue #3238 のレビュー指摘。描画が `(n = 1 OR )` にならない）。
+#[test]
+fn body_or_true_creates_and_returns_all_rows() {
+    let (core, _g) = open_core("view-where-expr-or-true", false);
+    ddl(
+        &core,
+        "CREATE VIEW vt AS SELECT * FROM t WHERE n = 1 OR TRUE",
+    )
+    .expect("or true");
+    let all = ids(&core, "alice", "SELECT id FROM t LIMIT 100");
+    let via_view = ids(&core, "alice", "SELECT id FROM vt LIMIT 100");
+    assert_eq!(via_view, all);
+}
