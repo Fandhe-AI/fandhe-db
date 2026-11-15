@@ -265,6 +265,19 @@ fn insert_needs_privilege_on_the_listed_columns() {
         f.alice("INSERT INTO ca2 (a, b) VALUES (1, 2) RETURNING c"),
         "42501"
     );
+    // RETURNING の式が読む列も SELECT 権限で判定する（Issue #3249）。
+    assert_eq!(
+        f.alice("INSERT INTO ca2 (a, b) VALUES (1, 2) RETURNING a + 1"),
+        "ok"
+    );
+    assert_eq!(
+        f.alice("INSERT INTO ca2 (a, b) VALUES (1, 2) RETURNING a + c"),
+        "42501"
+    );
+    assert_eq!(
+        f.alice("INSERT INTO ca2 (a, b) VALUES (1, 2) RETURNING abs(c) AS x"),
+        "42501"
+    );
 }
 
 #[test]

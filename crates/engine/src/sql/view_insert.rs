@@ -272,8 +272,7 @@ pub(crate) fn rewrite_returning(
             {
                 "RETURNING column aliases are not supported on writes through a view yet"
             } else {
-                "RETURNING supports only column references with optional AS aliases; \
-                 expressions are not supported yet"
+                "RETURNING expressions are not supported on writes through a view yet"
             },
         )),
         Some(Projection::All) => match mapper.columns {

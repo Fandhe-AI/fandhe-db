@@ -124,6 +124,37 @@ fn wire_insert_returning_as_alias_renames_row_description_columns() {
     read_ready_for_query(&mut stream);
 }
 
+/// Issue #3249: `RETURNING` のスカラー式・組み込み関数が wire 越しに評価される。末尾 `;` 付きの
+/// 単独送信でも通り、`RowDescription` の列名（別名・既定名）と `DataRow` が同じ式の `SELECT` と
+/// 一致する（SQL-21・SQL-42 のポインタ）。
+#[test]
+fn wire_insert_returning_scalar_expressions_match_select() {
+    let (core, _guard) = new_core_with_docs_table();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') \
+         RETURNING id + 1 AS m, upper(lang) USING OPERATION_ID 'wire-insert-returning-expr';",
+    );
+    let columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id + 1 AS m, upper(lang) FROM docs");
+    let select_columns = read_row_description(&mut stream);
+    let select_row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    assert_eq!(columns, vec!["m".to_string(), "upper".to_string()]);
+    assert_eq!(columns, select_columns);
+    assert_eq!(row, vec![Some("2".to_string()), Some("JA".to_string())]);
+    assert_eq!(row, select_row);
+}
+
 /// `RETURNING *` で投影したベクトル列の文字列表現は、同一行を `SELECT` した
 /// 場合の `DataRow` テキストと一致する（表層を跨いだエンコードの一致）。
 #[test]

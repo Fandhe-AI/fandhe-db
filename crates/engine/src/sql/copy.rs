@@ -1100,6 +1100,26 @@ impl CopyInSession {
         Ok(())
     }
 
+    /// 列リスト省略の `COPY <t> FROM STDIN` の全列補完（Issue #3252・WIRE-17・WIRE-22・SQL-34）。
+    /// 並びは COPY TO のテーブル形（`SELECT *`）と同じ（疑似列 `id` が先頭、続けて宣言順）で、
+    /// 出力をそのまま取り込める。列を持たない表と、疑似列 `id` と実カラム `id` が衝突する表は、
+    /// 解釈が曖昧になるため 0A000 で拒否する（fail-closed）。`new` からのみ呼ばれる。
+    fn expand_all_columns(schema: &TableSchema) -> Result<Vec<String>, SqlSurfaceError> {
+        let columns = crate::catalog::lookup_star_columns_of(schema);
+        if columns.is_empty() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY without a column list requires at least one column",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !columns.iter().all(|c| seen.insert(c.as_str())) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY without a column list is ambiguous for this table",
+            ));
+        }
+        Ok(columns)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table: String,
@@ -1124,6 +1144,13 @@ impl CopyInSession {
                 "COPY quote or escape cannot be newline or carriage return",
             ));
         }
+        // 列リスト省略（Issue #3252）は束縛段で全列へ補う。事前検証・HEADER 照合・binary の列数は
+        // すべて補完後の列を見る。
+        let columns = if columns.is_empty() {
+            Self::expand_all_columns(&schema)?
+        } else {
+            columns
+        };
         Self::validate_columns_against_schema(&columns, &schema, defer_not_null)?;
         Ok(Self {
             splitter: Box::new(RecordSplitter::with_options(format, &options)),

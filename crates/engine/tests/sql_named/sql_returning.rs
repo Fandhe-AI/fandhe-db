@@ -1459,9 +1459,9 @@ fn returning_duplicate_aliases_yield_two_same_named_columns() {
     }
 }
 
-/// 式・暗黙の別名・未知の列・`*` の併用は書き込み前に拒否し、台帳も消費しない。
-/// 文言に旧来の誤解を招く表現（function-call）を含まない。
-// tracked: #3249
+/// 暗黙の別名・未知の列・未定義関数（UDF 呼び出しを含む。受け皿 #3250）・サブクエリ・集計は
+/// 書き込み前に拒否し、台帳も消費しない。文言に旧来の誤解を招く表現（function-call）を含まない。
+// tracked: #3250
 #[test]
 fn returning_unsupported_items_are_rejected_before_writing() {
     let (core, path) = new_core_with_table();
@@ -1469,10 +1469,14 @@ fn returning_unsupported_items_are_rejected_before_writing() {
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
     for (items, code) in [
-        ("lang || 'x'", "42601"),
-        ("upper(lang)", "42601"),
         ("lang l", "42601"),
         ("nope AS n", "42703"),
+        ("my_udf(lang)", "42883"),
+        ("(SELECT 1)", "42601"),
+        ("count(*)", "42601"),
+        ("*, lang", "0A000"),
+        // 束縛時の型エラー（TEXT + 整数）。
+        ("lang + 1", "42883"),
     ] {
         let err = run(
             &core,
@@ -1486,7 +1490,7 @@ fn returning_unsupported_items_are_rejected_before_writing() {
         )
         .expect_err(items);
         assert!(!err.to_string().contains("function-call"), "{items}: {err}");
-        assert_eq!(err.wire_code(), code, "{items}");
+        assert_eq!(err.wire_code(), code, "{items}: {err}");
         assert_eq!(count_star(&core, &alice, TABLE), 0, "{items}");
     }
     // 台帳が消費されていないため、同じ operation_id で正常に実行できる。
@@ -1504,4 +1508,266 @@ fn returning_unsupported_items_are_rejected_before_writing() {
         .expect("ledger must be unconsumed"),
     );
     assert_eq!(ok.rows_affected, 1);
+}
+
+// ---------------------------------------------------------------------
+// RETURNING のスカラー式・組み込み関数（Issue #3249・SQL-21）
+// ---------------------------------------------------------------------
+
+/// RETURNING・SELECT の双方で評価する式リスト（型・値・列名の一致を検証する）。
+const EXPRS: &str = "upper(lang) AS u, length(body) + 1 AS n, lower(body) AS s, \
+                     vec_norm(embedding) AS vn, length(body) * 2";
+
+fn select_exprs(core: &EngineCore, ctx: &PolicyContext) -> engine::sql::exec::QueryResult {
+    core.execute_sql(ctx, &format!("SELECT {EXPRS} FROM {TABLE} LIMIT 10"))
+        .expect("select exprs")
+}
+
+fn assert_matches_select(
+    out: &engine::sql::exec::ReturningOutcome,
+    select: &engine::sql::exec::QueryResult,
+) {
+    assert_eq!(out.result.columns, select.columns);
+    assert_eq!(out.result.rows.len(), select.rows.len());
+    for (a, b) in out.result.rows.iter().zip(select.rows.iter()) {
+        assert_eq!(a.cells, b.cells);
+    }
+}
+
+/// INSERT／UPDATE（単一行・述語形）／UPSERT／DELETE の RETURNING 式は、書き込み後（DELETE は
+/// 削除前）の行に対する同じ式の SELECT と、列メタ（名前・型）・値が一致する。
+#[test]
+fn returning_expressions_match_select_for_every_dml() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+
+    let ins = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.3,0.4]', 'ja', 'hello') RETURNING {EXPRS} \
+                 USING OPERATION_ID 'op-e-ins'"
+            ),
+        )
+        .expect("insert returning expr"),
+    );
+    assert_eq!(ins.rows_affected, 1);
+    assert_matches_select(&ins, &select_exprs(&core, &alice));
+    assert_eq!(
+        ins.result.rows[0].cells[0],
+        Cell::Text("JA".to_string()),
+        "upper(lang)"
+    );
+    assert_eq!(ins.result.rows[0].cells[2], Cell::Text("hello".to_string()));
+
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET body = 'hello world' WHERE id = 1 RETURNING {EXPRS} \
+                 USING OPERATION_ID 'op-e-upd1'"
+            ),
+        )
+        .expect("single-row update returning expr"),
+    );
+    assert_matches_select(&upd, &select_exprs(&core, &alice));
+
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'en' WHERE lang = 'ja' RETURNING {EXPRS} \
+                 USING OPERATION_ID 'op-e-upd2'"
+            ),
+        )
+        .expect("predicate update returning expr"),
+    );
+    assert_eq!(upd.rows_affected, 1);
+    assert_matches_select(&upd, &select_exprs(&core, &alice));
+
+    // UPSERT（衝突 → DO UPDATE、新規 → 挿入）。
+    let ups = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.3,0.4]', 'fr', 'bonjour'), (2, '[0.5,0.6]', 'de', 'hallo') \
+                 ON CONFLICT (id) DO UPDATE SET lang = 'es' RETURNING {EXPRS} \
+                 USING OPERATION_ID 'op-e-ups'"
+            ),
+        )
+        .expect("upsert returning expr"),
+    );
+    assert_eq!(ups.result.rows.len(), 2);
+    let select = select_exprs(&core, &alice);
+    assert_eq!(ups.result.columns, select.columns);
+    let mut got: Vec<_> = ups.result.rows.iter().map(|r| r.cells.clone()).collect();
+    let mut want: Vec<_> = select.rows.iter().map(|r| r.cells.clone()).collect();
+    got.sort_by_key(|c| format!("{c:?}"));
+    want.sort_by_key(|c| format!("{c:?}"));
+    assert_eq!(got, want);
+
+    // DELETE は削除前の値を返す。
+    let before = select_exprs(&core, &alice);
+    let del = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'es' RETURNING {EXPRS} \
+                 USING OPERATION_ID 'op-e-del'"
+            ),
+        )
+        .expect("delete returning expr"),
+    );
+    assert_eq!(del.rows_affected, 1);
+    assert_eq!(del.result.columns, before.columns);
+    assert_eq!(del.result.rows.len(), 1);
+    assert!(before
+        .rows
+        .iter()
+        .any(|r| r.cells == del.result.rows[0].cells));
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+}
+
+/// 束縛時の型エラーでは書き込みが起きず、台帳も消費されない（同じ operation_id で再実行できる）。
+#[test]
+fn returning_expression_bind_error_writes_nothing_and_keeps_ledger() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "hello", "op-seed");
+
+    let err = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING lang + 1 \
+             USING OPERATION_ID 'op-bind-err'"
+        ),
+    )
+    .expect_err("type error");
+    assert_eq!(err.wire_code(), "42883");
+    let r = core
+        .execute_sql(&alice, &format!("SELECT lang FROM {TABLE}"))
+        .expect("select");
+    assert_eq!(r.rows[0].cells, vec![Cell::Text("ja".to_string())]);
+    let ok = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 RETURNING upper(lang) \
+                 USING OPERATION_ID 'op-bind-err'"
+            ),
+        )
+        .expect("ledger unconsumed"),
+    );
+    assert_eq!(ok.result.rows[0].cells, vec![Cell::Text("EN".to_string())]);
+}
+
+/// 評価時エラー（0 除算 `22012`）は commit 前に書き込みを中止する。UPDATE 前の値・DELETE 対象行が
+/// 残り、台帳も消費されない。
+#[test]
+fn returning_expression_eval_error_aborts_write_and_keeps_ledger() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "hello", "op-seed");
+
+    let err = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "UPDATE {TABLE} SET lang = 'en' WHERE id = 1 \
+             RETURNING 1 / (length(body) - length(body)) USING OPERATION_ID 'op-eval-upd'"
+        ),
+    )
+    .expect_err("division by zero");
+    assert_eq!(err.wire_code(), "22012");
+    let err = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "DELETE FROM {TABLE} WHERE lang = 'ja' \
+             RETURNING 1 / (length(body) - length(body)) USING OPERATION_ID 'op-eval-del'"
+        ),
+    )
+    .expect_err("division by zero");
+    assert_eq!(err.wire_code(), "22012");
+    let err = run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (2, '[0.1,0.2]', 'x', 'y') \
+             RETURNING 1 / (length(body) - length(body)) USING OPERATION_ID 'op-eval-ins'"
+        ),
+    )
+    .expect_err("division by zero");
+    assert_eq!(err.wire_code(), "22012");
+    let r = core
+        .execute_sql(&alice, &format!("SELECT lang FROM {TABLE}"))
+        .expect("select");
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].cells, vec![Cell::Text("ja".to_string())]);
+    // 台帳は消費されていない。
+    let ok = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'ja' RETURNING upper(lang) \
+                 USING OPERATION_ID 'op-eval-del'"
+            ),
+        )
+        .expect("ledger unconsumed"),
+    );
+    assert_eq!(ok.rows_affected, 1);
+}
+
+/// 他テナントの行は RETURNING 式の対象にも結果にも現れない。
+#[test]
+fn returning_expressions_never_touch_other_tenant_rows() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    let mut session = SessionState::default();
+    seed(&core, &alice, 1, "ja", "a", "op-a");
+    seed(&core, &bob, 2, "ja", "b", "op-b");
+    let out = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET body = 'z' WHERE lang = 'ja' RETURNING upper(body) AS b \
+                 USING OPERATION_ID 'op-iso'"
+            ),
+        )
+        .expect("update"),
+    );
+    assert_eq!(out.result.rows.len(), 1);
+    assert_eq!(out.result.rows[0].cells, vec![Cell::Text("Z".to_string())]);
 }

@@ -514,6 +514,14 @@ pub enum TenantWriteError {
     /// **BREAKING CHANGE**（Issue #1544）: variant を追加した（本 enum は
     /// `#[non_exhaustive]` ではないため網羅的 `match` の下流は追随が必要）。
     SetExpressionEvaluationFailed(SqlSurfaceError),
+    /// `RETURNING` の式項目の評価が失敗した（Issue #3249。0 除算 `22012`・範囲外 `22003` 等）。
+    /// 投影は write トランザクション内・commit 前に行うため、この `Err` で書き込みは abort され
+    /// 行・台帳は残らない。[`TenantWriteError::SetExpressionEvaluationFailed`] と同じく内側の
+    /// [`SqlSurfaceError`] を保持して、同じ式を SELECT したときと同じ `wire_code` で返す。
+    /// 評価対象は RLS 再判定を通った自テナントの可視行だけで、`Display`／`Debug` は行の値を含めない。
+    /// **BREAKING CHANGE**（Issue #3249）: variant を追加した（本 enum は `#[non_exhaustive]` では
+    /// ないため網羅的 `match` の下流は追随が必要）。
+    ReturningExpressionFailed(SqlSurfaceError),
     /// `INSERT` の `nextval`／`currval`（`VALUES` 要素・列 `DEFAULT`）の採番・解決が失敗した
     /// （TABLE-24・Issue #1690）。未定義の SEQUENCE は `42P01`（`Catalog(TableNotFound)`）で別に返し、
     /// ここには上限到達 `2200H`・`currval` 未定義 `55000`・列型の範囲外 `22003`・対応しない
@@ -790,6 +798,9 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
+            TenantWriteError::ReturningExpressionFailed(inner) => {
+                crate::error_format::ClassifiedError::error_class(inner)
+            }
             TenantWriteError::SequenceEvaluationFailed(inner) => {
                 crate::error_format::ClassifiedError::error_class(inner)
             }
@@ -917,6 +928,9 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::SetExpressionEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
+            TenantWriteError::ReturningExpressionFailed(inner) => {
+                write!(f, "{}", inner.client_message())
+            }
             TenantWriteError::SequenceEvaluationFailed(inner) => {
                 write!(f, "{}", inner.client_message())
             }
@@ -992,6 +1006,9 @@ impl std::fmt::Debug for TenantWriteError {
             }
             TenantWriteError::SetExpressionEvaluationFailed(_) => {
                 f.write_str("SetExpressionEvaluationFailed(<redacted>)")
+            }
+            TenantWriteError::ReturningExpressionFailed(_) => {
+                f.write_str("ReturningExpressionFailed(<redacted>)")
             }
             TenantWriteError::SequenceEvaluationFailed(_) => {
                 f.write_str("SequenceEvaluationFailed(<redacted>)")
