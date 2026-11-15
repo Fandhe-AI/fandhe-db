@@ -3,7 +3,7 @@
 //! 実 `Storage`＋`CpuScalarProvider` を `EngineCore::execute_sql_in_session` 経由で使い、
 //! 式射影の枝・定数枝の値と結果列、型の統一（`42804`）、未対応形の fail-closed、
 //! テナント境界（不可視行を式が評価しない）、Describe と Execute の一致、
-//! 埋め込み文脈での fail-closed を固定する。EXPLAIN・網羅的な結果テストは Issue #3271。
+//! 埋め込み文脈での fail-closed を固定する。INTERSECT／EXCEPT の網羅的な結果テストは Issue #3271 で追加（EXPLAIN は sql75_explain_set_operation）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -340,9 +340,8 @@ fn unsupported_forms_stay_fail_closed() {
         // NULL リテラルは定数式 SELECT と同じく未対応（引用付き "NULL" は列参照）。
         ("SELECT NULL UNION SELECT y FROM b", "42703"),
         ("SELECT \"NULL\" UNION SELECT y FROM b", "42703"),
-        // EXPLAIN は未対応（tracked: #3271）。
-        ("EXPLAIN SELECT 7 UNION SELECT y FROM b", "0A000"),
-        ("EXPLAIN SELECT n+1 FROM t UNION SELECT n FROM t", "0A000"),
+        // 全枝が定数の集合演算の EXPLAIN。
+        ("EXPLAIN SELECT 1 UNION SELECT 2", "0A000"),
     ] {
         assert_eq!(code(&core, &ctx, sql), expected, "{sql}");
     }
@@ -372,6 +371,8 @@ fn describe_matches_execute_columns() {
         "SELECT n+1 AS m FROM t UNION SELECT n FROM t",
         "SELECT n FROM t UNION ALL SELECT 1 UNION SELECT n+2 FROM t",
         "SELECT n AS x FROM t EXCEPT SELECT 1;",
+        "SELECT n+1 FROM t INTERSECT ALL SELECT y FROM b",
+        "SELECT 7 EXCEPT ALL SELECT y FROM b",
     ] {
         let parsed = core.parse_sql(sql).expect("parse_sql should succeed");
         let described = core
@@ -476,4 +477,78 @@ fn routine_call_in_const_branch_is_rejected_in_describe_and_execute() {
     };
     assert_eq!(exec_code, "0A000");
     assert_eq!(desc_code, exec_code);
+}
+
+#[test]
+fn intersect_and_except_with_expression_and_const_branches() {
+    let (core, ctx, _g) = setup();
+    // t: n = 1,2,3 / b: y = 3,4,5。
+    for (sql, want) in [
+        ("SELECT n+1 FROM t INTERSECT SELECT y FROM b", vec![3, 4]),
+        (
+            "SELECT n+1 FROM t INTERSECT ALL SELECT y FROM b",
+            vec![3, 4],
+        ),
+        ("SELECT 4 INTERSECT SELECT y FROM b", vec![4]),
+        ("SELECT y FROM b INTERSECT SELECT 9", vec![]),
+        ("SELECT y FROM b EXCEPT SELECT 3", vec![4, 5]),
+        ("SELECT y FROM b EXCEPT ALL SELECT 3", vec![4, 5]),
+        ("SELECT 3 EXCEPT SELECT y FROM b", vec![]),
+        ("SELECT 7 EXCEPT SELECT y FROM b", vec![7]),
+        ("SELECT n+1 FROM t EXCEPT SELECT y-2 FROM b", vec![4]),
+        // 多重集合の件数（min／max 規則）。
+        ("SELECT n*0 FROM t INTERSECT ALL SELECT 0", vec![0]),
+        ("SELECT n*0 FROM t EXCEPT ALL SELECT 0", vec![0, 0]),
+        (
+            "SELECT n FROM t UNION ALL SELECT n FROM t EXCEPT ALL SELECT n*1 FROM t",
+            vec![1, 2, 3],
+        ),
+        // INTERSECT は UNION より強く結合し、括弧で束ね直せる。
+        (
+            "SELECT n FROM t UNION SELECT y FROM b INTERSECT SELECT 4",
+            vec![1, 2, 3, 4],
+        ),
+        (
+            "(SELECT n FROM t UNION SELECT y FROM b) INTERSECT SELECT 4",
+            vec![4],
+        ),
+        // 末尾 `;`。
+        ("SELECT y+1 FROM b EXCEPT SELECT 4;", vec![5, 6]),
+    ] {
+        let r = run(&core, &ctx, sql);
+        assert_eq!(sorted_ints(&r), want, "{sql}");
+    }
+}
+
+#[test]
+fn overall_order_by_over_expression_alias() {
+    let (core, ctx, _g) = setup();
+    let r = run(
+        &core,
+        &ctx,
+        "SELECT n+1 AS m FROM t UNION SELECT y FROM b ORDER BY m DESC LIMIT 2",
+    );
+    let got: Vec<i64> = r
+        .rows
+        .iter()
+        .map(|row| match row.cells.first() {
+            Some(Cell::SignedInteger(i)) => *i,
+            other => panic!("expected SignedInteger, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(got, vec![5, 4]);
+    let r = run(&core, &ctx, "SELECT 7 UNION SELECT y FROM b ORDER BY 1");
+    assert_eq!(sorted_ints(&r), vec![3, 4, 5, 7]);
+}
+
+#[test]
+fn intersect_and_except_ignore_other_tenants() {
+    let (core, ctx, _g) = setup();
+    // t2 の n=9・y=77 は交差・差のどちらにも効かない。
+    let r = run(&core, &ctx, "SELECT n FROM t INTERSECT SELECT 9");
+    assert!(sorted_ints(&r).is_empty());
+    let r = run(&core, &ctx, "SELECT n+1 FROM t EXCEPT SELECT 77");
+    assert_eq!(sorted_ints(&r), vec![2, 3, 4]);
+    let r = run(&core, &ctx_for("t2"), "SELECT y FROM b INTERSECT SELECT 3");
+    assert!(sorted_ints(&r).is_empty());
 }

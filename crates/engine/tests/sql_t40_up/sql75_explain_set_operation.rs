@@ -398,3 +398,173 @@ fn trailing_order_by_is_classified_like_execution() {
     let set_op = text.find("set_operation").expect("set_operation stage");
     assert!(limit < sort && sort < set_op, "{text}");
 }
+/// 定数枝の葉 `result`（Issue #3271）。`relation:` 行は持たない。
+fn result_leaf(depth: usize) -> Vec<String> {
+    let pad = "  ".repeat(depth - 1);
+    vec![
+        format!("{pad}-> result"),
+        format!("{pad}   source: constant"),
+    ]
+}
+
+#[test]
+fn expression_branch_renders_like_a_plain_scan() {
+    let (core, _g) = seeded("x75s-expr");
+    let got = plan(&core, "EXPLAIN SELECT k+1 FROM a UNION SELECT k FROM b");
+    let want = concat(vec![
+        strs(&["set_operation", "set_operator: union"]),
+        scan(1, 1),
+        scan(1, 2),
+    ]);
+    assert_eq!(got, want);
+}
+
+#[test]
+fn const_branch_renders_a_result_leaf_and_consumes_an_ordinal() {
+    let (core, _g) = seeded("x75s-const");
+    let got = plan(&core, "EXPLAIN SELECT 7 UNION SELECT k FROM a");
+    assert_eq!(
+        got,
+        concat(vec![
+            strs(&["set_operation", "set_operator: union"]),
+            result_leaf(1),
+            scan(1, 2)
+        ])
+    );
+    let got = plan(&core, "EXPLAIN SELECT k FROM a UNION SELECT 7");
+    assert_eq!(
+        got,
+        concat(vec![
+            strs(&["set_operation", "set_operator: union"]),
+            scan(1, 1),
+            result_leaf(1)
+        ])
+    );
+}
+
+#[test]
+fn every_operator_accepts_const_and_expression_branches() {
+    let (core, _g) = seeded("x75s-expr-ops");
+    for (kw, token) in [
+        ("UNION", "union"),
+        ("UNION ALL", "union_all"),
+        ("INTERSECT", "intersect"),
+        ("INTERSECT ALL", "intersect_all"),
+        ("EXCEPT", "except"),
+        ("EXCEPT ALL", "except_all"),
+    ] {
+        let sql = format!("EXPLAIN SELECT 7 {kw} SELECT k+0 FROM b");
+        let want = concat(vec![
+            strs(&["set_operation", &format!("set_operator: {token}")]),
+            result_leaf(1),
+            scan(1, 2),
+        ]);
+        assert_eq!(plan(&core, &sql), want, "{sql}");
+        let sql = format!("EXPLAIN SELECT k*1 FROM b {kw} SELECT 7");
+        let want = concat(vec![
+            strs(&["set_operation", &format!("set_operator: {token}")]),
+            scan(1, 1),
+            result_leaf(1),
+        ]);
+        assert_eq!(plan(&core, &sql), want, "{sql}");
+    }
+}
+
+#[test]
+fn nested_expression_branches_render() {
+    let (core, _g) = seeded("x75s-expr-nest");
+    let got = plan(
+        &core,
+        "EXPLAIN (SELECT 7 UNION SELECT k FROM a) INTERSECT SELECT k+0 FROM b",
+    );
+    let want = concat(vec![
+        strs(&["set_operation", "set_operator: intersect"]),
+        op(1, "union"),
+        result_leaf(2),
+        scan(2, 2),
+        scan(1, 3),
+    ]);
+    assert_eq!(got, want);
+}
+
+#[test]
+fn limited_expression_branch_and_overall_order_by_render() {
+    let (core, _g) = seeded("x75s-expr-limited");
+    let got = plan(
+        &core,
+        "EXPLAIN (SELECT k+1 AS m FROM a ORDER BY m LIMIT 2) UNION SELECT 0 ORDER BY 1 LIMIT 1",
+    );
+    let want = concat(vec![strs(&[
+        "limit",
+        "limit: present",
+        "offset: none",
+        "-> sort",
+        "   sort_keys: 1",
+        "  -> set_operation",
+        "     set_operator: union",
+        "    -> limit",
+        "       limit: present",
+        "       offset: none",
+        "      -> sort",
+        "         sort_keys: 1",
+        "        -> scan",
+        "           relation: 1",
+        "           scalar_plan: plain_scan",
+        "           access_path: full_scan",
+        "    -> result",
+        "       source: constant",
+    ])]);
+    assert_eq!(got, want);
+}
+
+#[test]
+fn expression_and_const_explain_parity_and_independence() {
+    let (core, _g) = seeded("x75s-expr-parity");
+    for body in [
+        "SELECT 7 UNION SELECT v FROM a",
+        "SELECT 1 UNION SELECT 2",
+        "SELECT 7 WHERE true UNION SELECT k FROM a",
+        "SELECT zzz+1 FROM a UNION SELECT k FROM b",
+        "SELECT k FROM a UNION SELECT 7 UNION SELECT k FROM nope",
+    ] {
+        assert_eq!(
+            code(&core, body),
+            code(&core, &format!("EXPLAIN {body}")),
+            "{body}"
+        );
+    }
+    assert_eq!(code(&core, "EXPLAIN SELECT 1 UNION SELECT 2"), "0A000");
+    // テナント・データに依存しない。
+    let sql = "EXPLAIN SELECT k+1 FROM a UNION SELECT 7";
+    assert_eq!(lines(&core, "tenant-a", sql), lines(&core, "tenant-b", sql));
+    // EXPLAIN は式を評価しない（実行は 0 除算、EXPLAIN は成功）。
+    assert!(run(&core, "tenant-a", "SELECT 10/(k-2) FROM a UNION SELECT 0").is_err());
+    assert!(!plan(&core, "EXPLAIN SELECT 10/(k-2) FROM a UNION SELECT 0").is_empty());
+}
+
+#[test]
+fn explain_analyze_runs_expression_and_const_branches() {
+    let (core, _g) = seeded("x75s-expr-analyze");
+    let out = lines(
+        &core,
+        "tenant-a",
+        "EXPLAIN ANALYZE SELECT 7 UNION SELECT k+1 FROM a",
+    );
+    assert!(out.iter().any(|l| l.contains("result")), "{out:?}");
+}
+
+#[test]
+fn recursive_anchor_with_const_or_expression_set_operation_is_fail_closed_or_rendered() {
+    let (core, _g) = seeded("x75s-expr-anchor");
+    for sql in [
+        "EXPLAIN WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT k FROM a UNION ALL SELECT n+1 FROM r WHERE n < 3) SELECT n FROM r",
+        "EXPLAIN WITH RECURSIVE r(n) AS (SELECT k+1 FROM a UNION SELECT k FROM b UNION ALL SELECT n+1 FROM r WHERE n < 3) SELECT n FROM r",
+    ] {
+        if let Err(c) = run(&core, "tenant-a", sql) {
+            assert!(
+                matches!(c.as_str(), "42601" | "0A000"),
+                "{sql}: unexpected {c}"
+            );
+        }
+    }
+}

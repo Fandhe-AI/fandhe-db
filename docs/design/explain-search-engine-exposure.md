@@ -432,6 +432,10 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
 - **語彙（JOIN と同じ閉じた集合・安定契約）**: `set_operation` の属性は `set_operator: union|union_all|intersect|intersect_all|except|except_all`。
   `scan` は `relation: <n>`（葉の左からの 1 始まりの序数）に続けて `scalar_plan:`／`access_path:`
   （`scan_explain_lines` を共有。枝ごとに PK 点検索 → GIN → 全走査）。ほかは JOIN の段と同じ意味。
+- **式射影の枝・定数枝（Issue #3271）**: 式射影の枝は通常の `scan`（射影の中身は単一表の `EXPLAIN` と同じく
+  描画しない）。`FROM` なしの定数枝は葉 `result`（`source: constant`。`cte_explain` と共通で、リテラル値・式・
+  表名は出さない）。`relation:` の序数は位置ベースで、定数枝も葉の位置を 1 つ消費する（`result` 葉自体は
+  `relation:` を持たない）。全枝が定数の木は構文段が `0A000`。
 - **集計の枝の走査分類**: 実行器は可視ビットマップのキャッシュ・arena・スカラー索引を渡さない（常に全走査）ため、
   `plain_scan`／`full_scan` に固定する。実行器の隣（`set_op::aggregate_branch_explain_lines`）に置き、
   実行器へキャッシュや索引を配線するときは一緒に変える（矛盾した出力を出さない）。
