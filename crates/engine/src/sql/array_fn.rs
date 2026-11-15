@@ -157,6 +157,10 @@ fn bind_array_arg<'e>(
         SourceKind::Array(None) => Err(unsupported(
             "an array function on an array of this element type is not supported",
         )),
+        // `BIT(n)[]` の配列関数は未対応（Issue #3235）。配列でない引数の `42883` と区別して `0A000`。
+        SourceKind::Bit if ty == ExprType::Array => Err(unsupported(
+            "an array function on an array of this element type is not supported",
+        )),
         _ => Err(no_such_function(name)),
     }
 }

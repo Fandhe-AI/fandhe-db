@@ -248,6 +248,10 @@ pub enum ArrayValue {
     /// `TIME[]`（Issue #3232）。0 時起点のマイクロ秒。`Timestamp` と別 variant にして型の区別
     /// （OID 1183）を保つ。
     Time(Vec<Option<i64>>),
+    /// `BIT(n)[]`（Issue #3235・TABLE-48）。各要素は宣言長 `n` ビットの [`BitString`]。`Text` と別
+    /// variant にして型の区別（OID 1561）を保つ。`n` は値自体では保持せず（空配列・全 NULL 配列から
+    /// 復元できない）、正は列宣言の [`ArrayElemType::Bit`] 側にある。
+    Bit(Vec<Option<crate::bit_string::BitString>>),
     BigInt(Vec<Option<i64>>),
     Real(Vec<Option<f32>>),
     Double(Vec<Option<f64>>),
@@ -451,6 +455,8 @@ impl ArrayValue {
             ArrayValue::Time(items) => bounded(items, dims, max_len, |v| {
                 quote_pg_array_text_elem(&crate::datetime::format_time(*v))
             }),
+            // `0`・`1` だけなので引用は不要。
+            ArrayValue::Bit(items) => bounded(items, dims, max_len, |v| v.format_text()),
             ArrayValue::Uuid(items) => bounded(items, dims, max_len, |v| v.to_string()),
             // NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を含むため常に引用・
             // エスケープされ PostgreSQL と同形の `"\\x0102"` になる）、JSON／JSONB／ENUM は
@@ -489,6 +495,7 @@ impl ArrayValue {
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => ArrayValue::Integer(join(a, b)),
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => ArrayValue::SmallInt(join(a, b)),
             (ArrayValue::Time(a), ArrayValue::Time(b)) => ArrayValue::Time(join(a, b)),
+            (ArrayValue::Bit(a), ArrayValue::Bit(b)) => ArrayValue::Bit(join(a, b)),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => ArrayValue::BigInt(join(a, b)),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => ArrayValue::Real(join(a, b)),
             (ArrayValue::Double(a), ArrayValue::Double(b)) => ArrayValue::Double(join(a, b)),
@@ -520,6 +527,10 @@ impl ArrayValue {
                 .iter()
                 .flatten()
                 .fold(0usize, |acc, b| acc.saturating_add(b.len())),
+            ArrayValue::Bit(v) => v
+                .iter()
+                .flatten()
+                .fold(0usize, |acc, b| acc.saturating_add(b.as_bytes().len())),
             _ => 0,
         }
     }
@@ -553,6 +564,7 @@ impl ArrayValue {
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Time(a), ArrayValue::Time(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Bit(a), ArrayValue::Bit(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => {
                 eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
@@ -617,6 +629,7 @@ impl ArrayValue {
             ArrayValue::Integer(v) => ArrayValue::Integer(pick(v, keep)),
             ArrayValue::SmallInt(v) => ArrayValue::SmallInt(pick(v, keep)),
             ArrayValue::Time(v) => ArrayValue::Time(pick(v, keep)),
+            ArrayValue::Bit(v) => ArrayValue::Bit(pick(v, keep)),
             ArrayValue::BigInt(v) => ArrayValue::BigInt(pick(v, keep)),
             ArrayValue::Real(v) => ArrayValue::Real(pick(v, keep)),
             ArrayValue::Double(v) => ArrayValue::Double(pick(v, keep)),
@@ -648,6 +661,7 @@ impl ArrayValue {
             ArrayValue::Integer(v) => map(v, |x| x.to_string()),
             ArrayValue::SmallInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Time(v) => map(v, |x| crate::datetime::format_time(*x)),
+            ArrayValue::Bit(v) => map(v, |x| x.format_text()),
             ArrayValue::BigInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Real(v) => map(v, |x| crate::scalar_float::format_real(*x)),
             ArrayValue::Double(v) => map(v, |x| crate::scalar_float::format_double(*x)),
@@ -695,6 +709,7 @@ macro_rules! array_dispatch {
             ArrayValue::Integer($items) => $body,
             ArrayValue::SmallInt($items) => $body,
             ArrayValue::Time($items) => $body,
+            ArrayValue::Bit($items) => $body,
             ArrayValue::BigInt($items) => $body,
             ArrayValue::Real($items) => $body,
             ArrayValue::Double($items) => $body,
@@ -710,6 +725,16 @@ macro_rules! array_dispatch {
             ArrayValue::Multi(_) => $nested,
         }
     };
+}
+
+#[cfg(test)]
+impl ArrayValue {
+    /// テスト用: 行バイトと同形の要素本文（`write_array_elements_payload` の出力）。
+    fn flat_element_bytes_for_test(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_array_elements_payload(&mut buf, self).expect("payload");
+        buf
+    }
 }
 
 impl ArrayValue {
@@ -728,6 +753,15 @@ impl ArrayValue {
             ArrayValue::Integer(_) => ArrayElemType::Integer,
             ArrayValue::SmallInt(_) => ArrayElemType::SmallInt,
             ArrayValue::Time(_) => ArrayElemType::Time,
+            // `n` は代表値（先頭の非 NULL 要素の長さ。無ければ 1）。長さの正は列宣言側にあり、
+            // 照合は種別比較（[`array_elem_kind_eq`]）と [`validate_array_elements`] が担う。
+            ArrayValue::Bit(items) => ArrayElemType::Bit(
+                items
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map_or(1, crate::bit_string::BitString::bit_len),
+            ),
             ArrayValue::BigInt(_) => ArrayElemType::BigInt,
             ArrayValue::Real(_) => ArrayElemType::Real,
             ArrayValue::Double(_) => ArrayElemType::Double,
@@ -781,6 +815,7 @@ impl ArrayValue {
             ArrayValue::Integer(v) => cut!(Integer, v),
             ArrayValue::SmallInt(v) => cut!(SmallInt, v),
             ArrayValue::Time(v) => cut!(Time, v),
+            ArrayValue::Bit(v) => cut!(Bit, v),
             ArrayValue::BigInt(v) => cut!(BigInt, v),
             ArrayValue::Real(v) => cut!(Real, v),
             ArrayValue::Double(v) => cut!(Double, v),
@@ -851,6 +886,14 @@ impl ArrayValue {
             ArrayValue::Integer(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
             ArrayValue::SmallInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i16>>()),
             ArrayValue::Time(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
+            ArrayValue::Bit(items) => {
+                let payload: usize = items.iter().flatten().map(|b| b.as_bytes().len()).sum();
+                payload.saturating_add(
+                    items
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Option<crate::bit_string::BitString>>()),
+                )
+            }
             ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::Real(v) => v.len().saturating_mul(std::mem::size_of::<Option<f32>>()),
             ArrayValue::Double(v) => v.len().saturating_mul(std::mem::size_of::<Option<f64>>()),
@@ -886,6 +929,8 @@ impl ArrayValue {
             ArrayValue::SmallInt(_) => 14,
             // Issue #3232 の新規採番。
             ArrayValue::Time(_) => 15,
+            // Issue #3235 の新規採番（TIMESTAMPTZ・INTERVAL の採番値と重ならない 18）。
+            ArrayValue::Bit(_) => 18,
             // `flat()` は `Multi` を返さない。
             ArrayValue::Multi(_) => {
                 return Err(RowCodecError::Invalid(
@@ -936,6 +981,16 @@ impl ArrayValue {
                     buf.extend_from_slice(canonical.as_bytes());
                 }
             }
+            // 行バイトは宣言長 `n` から幅が決まるため要素ごとの長さを持たないが、`bit(4)` の
+            // `1000` と `bit(8)` の `10000000` は同じ 0x80 になる。等価ペイロードには要素ごとに
+            // ビット長（u32 LE）を積み、長さ違いの衝突を防ぐ（新規タグのため既存バイト列は不変）。
+            ArrayValue::Bit(items) => {
+                write_array_null_bitmap(&mut buf, self);
+                for b in items.iter().flatten() {
+                    buf.extend_from_slice(&b.bit_len().to_le_bytes());
+                    buf.extend_from_slice(b.as_bytes());
+                }
+            }
             _ => write_array_elements_payload(&mut buf, self)?,
         }
         Ok(buf)
@@ -946,9 +1001,10 @@ impl ArrayValue {
     /// は実際のペイロードを組み立てて長さを返す（予算見積もりと実バイト数を一致させる）。
     pub(crate) fn canonical_payload_len(&self) -> Result<usize> {
         match self {
-            ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Jsonb(_) => {
-                Ok(self.equality_payload()?.len())
-            }
+            ArrayValue::Numeric(_)
+            | ArrayValue::Json(_)
+            | ArrayValue::Jsonb(_)
+            | ArrayValue::Bit(_) => Ok(self.equality_payload()?.len()),
             ArrayValue::Multi(m) => Ok(self
                 .dims_header_len()
                 .saturating_add(m.inner.canonical_payload_len()?)),
@@ -1372,9 +1428,13 @@ impl<'a> ArrayRef<'a> {
     /// （呼び出し元が fail-closed に扱う）。
     pub(crate) fn equality_payload(&self) -> Result<std::borrow::Cow<'a, [u8]>> {
         match self.elem {
-            ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Jsonb => Ok(
-                std::borrow::Cow::Owned(self.to_value()?.equality_payload()?),
-            ),
+            // `BIT(n)` は等価ペイロードへ要素ごとのビット長を積むため、値へ復号して正準化する。
+            ArrayElemType::Numeric { .. }
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Bit(_) => Ok(std::borrow::Cow::Owned(
+                self.to_value()?.equality_payload()?,
+            )),
             ArrayElemType::Text
             | ArrayElemType::Varchar(_)
             | ArrayElemType::Bpchar(_)
@@ -2034,6 +2094,8 @@ fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
         | ArrayElemType::Timestamp
         | ArrayElemType::Time => Some(8),
         ArrayElemType::Uuid => Some(16),
+        // `BIT(n)`（Issue #3235）: MSB 先頭で `ceil(n / 8)` バイト（詰め物ビットは 0）。
+        ArrayElemType::Bit(n) => crate::bit_string::byte_len_for_bits(n),
     }
 }
 
@@ -2084,6 +2146,15 @@ fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u3
                     RowCodecError::Invalid("array element length overflow".to_string())
                 })?;
                 total = total.checked_add(entry).ok_or_else(|| {
+                    RowCodecError::Invalid("array payload length overflow".to_string())
+                })?;
+            }
+        }
+        // `BIT(n)[]`: 要素ごとの実バイト長を数える（宣言幅との一致は
+        // [`validate_array_elements`] が検査する。確保前に累計を `u32` で打ち切る）。
+        ArrayValue::Bit(items) => {
+            for item in items.iter().flatten() {
+                total = total.checked_add(item.as_bytes().len()).ok_or_else(|| {
                     RowCodecError::Invalid("array payload length overflow".to_string())
                 })?;
             }
@@ -2243,6 +2314,17 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
                 }
             }
         }
+        // `BIT(n)[]`（Issue #3235）。各要素は宣言長 `n` ビットちょうどで、詰め物ビットは 0
+        // （`BitString` の構築時不変条件）。長さ違いは永続化させない。値は文言へ反射しない。
+        (ArrayElemType::Bit(n), ArrayValue::Bit(items)) => {
+            for b in items.iter().flatten() {
+                if b.bit_len() != n {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array element length does not match type bit({n})"
+                    )));
+                }
+            }
+        }
         // 検査対象なしの組。全要素型を列挙し、要素型の追加時にコンパイルエラーで
         // 検証要否の判断を強制する（Issue #3229）。
         (
@@ -2264,6 +2346,7 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Bit(_)
             | ArrayElemType::Enum,
             _,
         ) => {}
@@ -2430,6 +2513,12 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
             }
         }
         ArrayValue::Uuid(items) => {
+            for v in items.iter().flatten() {
+                buf.extend_from_slice(v.as_bytes());
+            }
+        }
+        // 幅は列宣言の `n` が決める。要素の長さ照合は [`validate_array_elements`] が担う。
+        ArrayValue::Bit(items) => {
             for v in items.iter().flatten() {
                 buf.extend_from_slice(v.as_bytes());
             }
@@ -2731,6 +2820,19 @@ fn decode_array_elements(
             Ok(Uuid::from_bytes(array_le_bytes::<16>(c)?))
         })
         .map(ArrayValue::Uuid),
+        // `BIT(n)`: 幅は宣言長から決まる。詰め物ビットが非 0 の破損データは `from_parts` が
+        // 拒否する（黙って受理しない）。
+        ArrayElemType::Bit(n) => {
+            let width = crate::bit_string::byte_len_for_bits(n).ok_or_else(|| {
+                RowCodecError::Invalid("array BIT element width overflow".to_string())
+            })?;
+            decode_fixed_array_elements(rest, &nulls, width, |c| {
+                crate::bit_string::BitString::from_parts(n, c.to_vec()).map_err(|_| {
+                    RowCodecError::Invalid("persisted array BIT element is malformed".to_string())
+                })
+            })
+            .map(ArrayValue::Bit)
+        }
     }
 }
 
@@ -8138,6 +8240,106 @@ mod tests {
             decode_array_elements(ArrayElemType::Time, &[0u8, 1, 2, 3, 4, 5, 6, 7], 1, 0),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    /// Issue #3235: `BIT(n)[]` は要素ごとに固定幅 `ceil(n / 8)` バイトで往復する（NULL 要素・空配列・
+    /// 端数ビット・2 次元）。長さ違い・型違い・詰め物ビット非 0・壊れた幅は encode／decode とも
+    /// Invalid で fail-closed。等価ペイロードはビット長を含み、同じバイト列でも長さ違いは別になる。
+    #[test]
+    fn bit_array_roundtrips_with_fixed_width_and_rejects_corruption() {
+        use crate::bit_string::BitString as B;
+        let bit = |s: &str| B::parse_text(s, s.len() as u32).expect("bit");
+        for n in [4u32, 9] {
+            let schema = TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new(
+                        "a",
+                        ColumnType::Array(ArrayType::new(ArrayElemType::Bit(n), 8).expect("ty")),
+                        true,
+                    ),
+                    ColumnDef::new(
+                        "b",
+                        ColumnType::Array(
+                            ArrayType::new(ArrayElemType::Bit(n), 8)
+                                .and_then(|a| a.with_ndims(2))
+                                .expect("ty"),
+                        ),
+                        true,
+                    ),
+                ],
+            );
+            let one = |c: char| c.to_string().repeat(n as usize);
+            let flat = ArrayValue::Bit(vec![Some(bit(&one('1'))), None, Some(bit(&one('0')))]);
+            let multi = ArrayValue::with_dims(
+                ArrayValue::Bit(vec![
+                    Some(bit(&one('1'))),
+                    Some(bit(&one('0'))),
+                    Some(bit(&one('1'))),
+                    Some(bit(&one('0'))),
+                ]),
+                vec![2, 2],
+            )
+            .expect("dims");
+            for values in [
+                vec![Value::Array(flat.clone()), Value::Array(multi)],
+                vec![Value::Array(ArrayValue::Bit(vec![])), Value::Null],
+            ] {
+                let encoded =
+                    encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+                let decoded = decode_row(&schema, &encoded).expect("decode");
+                assert_eq!(decoded.values, values);
+            }
+            // 本文: NULL ビットマップ 1 バイト + 非 NULL 2 要素 x ceil(n/8) バイト。
+            let width = usize::try_from(n.div_ceil(8)).expect("width");
+            let payload = flat.equality_payload().expect("payload");
+            assert_eq!(payload.len(), 1 + 2 * (4 + width));
+            assert_eq!(
+                array_elements_byte_len(ArrayElemType::Bit(n), &flat).expect("len") as usize,
+                1 + 2 * width
+            );
+            // 長さ違いの要素・型違いの値は encode で拒否する。
+            for bad in [
+                ArrayValue::Bit(vec![Some(bit("1"))]),
+                ArrayValue::Text(vec![Some("1".to_string())]),
+            ] {
+                let values = vec![Value::Array(bad), Value::Null];
+                assert!(matches!(
+                    encode_row(&schema, "tenant-a", Visibility::Public, &values),
+                    Err(RowCodecError::Invalid(_))
+                ));
+            }
+        }
+        // 詰め物ビットが非 0 の永続バイト列（bit(4) の 0x0F）は decode で Invalid。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Bit(4), &[0x0F], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+        assert!(decode_array_elements(ArrayElemType::Bit(4), &[0xF0], 1, 0).is_ok());
+        // 幅が合わない本文（bit(9) は 2 バイト必要）は Invalid。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Bit(9), &[0xFF], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // `bit(4)` の `1000` と `bit(8)` の `10000000` は同じ 0x80 でも等価ペイロードが異なる。
+        let a = ArrayValue::Bit(vec![Some(bit("1000"))]);
+        let b = ArrayValue::Bit(vec![Some(bit("10000000"))]);
+        assert_eq!(
+            a.flat_element_bytes_for_test(),
+            b.flat_element_bytes_for_test()
+        );
+        assert_ne!(
+            a.equality_payload().expect("a"),
+            b.equality_payload().expect("b")
+        );
+        // 保存側（ArrayRef）の等価ペイロードは値側と一致する。
+        let mut raw = Vec::new();
+        write_array_elements_payload(&mut raw, &a).expect("payload");
+        let r = ArrayRef::from_owned(ArrayElemType::Bit(4), 1, 0, &raw);
+        assert_eq!(
+            r.equality_payload().expect("ref").into_owned(),
+            a.equality_payload().expect("a")
+        );
     }
 
     #[test]
