@@ -1069,33 +1069,44 @@ enum ScoreScope<'a> {
     Visible(&'a VisibleBitmap),
 }
 
+/// `k1_len_norm` の未計算スロットを表す番兵 NaN のビット列（Issue #3222）。
+/// 判定は `to_bits()` のビット比較で行う。`k1` は有限かつ 0 以上、`b` は
+/// `[0, 1]`、母数 avgdl は `f64::MIN_POSITIVE` 以上へ丸めるため、`k1 * len_norm`
+/// は NaN にならない（`+inf` にはなり得るが番兵とは別ビット）。仮に NaN が
+/// 生じてもハードウェアの正準 NaN はこの専用ペイロードと一致しない。
+const LEN_NORM_UNSET_BITS: u64 = 0x7FF8_0000_DEAD_0001;
+
 /// [`SparseIndex::score_pass`] が呼び出し間で使い回すスクラッチ一式（Issue #546。
 /// 親 #545・#390 レビュー指摘「N 非依存化フォローアップ」への対応）。
 ///
 /// 不変条件（プールへ返却する時点・プールから取り出した直後のいずれでも成立）:
 /// `acc` の全要素は `0.0`、`touched`・`visible_hits`・`touched_classes` は空
-/// （`clear()` 済みで capacity は保持）、`k1_len_norm_cache` は空。
+/// （`clear()` 済みで capacity は保持）、`k1_len_norm` の全要素は未計算の番兵
+/// （[`LEN_NORM_UNSET_BITS`]）。
 /// [`SparseIndex::release_scratch`] がこの不変条件を回復してからプールへ戻す
 /// （`touched` に記録された `doc_idx` のみをゼロ戻しする。「`acc[idx] == 0.0`
 /// ⇔ 未加算」という [`SparseIndex::score_pass`] の不変条件により、`touched` に
 /// 載っていない要素は既に `0.0` であるため、全要素走査によるゼロクリアと結果は
-/// 同一）。`k1_len_norm_cache` も同様に `touched_classes`（初めて `entry` へ
-/// 挿入した文書長クラスを記録した列。Issue #546 レビュー指摘・PR #565: 巨大な
-/// `HashMap::clear()` は要素数でなく確保済み容量に比例するため、多数の相異なる
-/// 文書長クラスにヒットしたクエリの後で 1 件しかヒットしない後続クエリが返却
-/// されても容量分のコストを毎回払ってしまう）を使い、[`ScoreScratch::
-/// clear_len_norm_cache`] でタッチしたキーだけを `remove` することで
-/// `O(M)`（`M` = そのパスで実際にタッチした文書長クラス数）を維持する。
+/// 同一）。`k1_len_norm` も同様に `touched_classes`（初めて値を書いた文書長
+/// クラスを記録した列。Issue #546 レビュー指摘・PR #565）を使い、[`ScoreScratch::
+/// clear_len_norm_cache`] でタッチしたスロットにだけ番兵を書き戻すことで
+/// `O(M)`（`M` = そのパスで実際にタッチした文書長クラス数）を維持する
+/// （配列全体の埋め直しは行わない。Issue #3222: 旧 `HashMap<u32, f64>` の
+/// SipHash 計算を文書長クラス添字の配列参照へ置き換えた）。
 #[derive(Debug)]
 struct ScoreScratch {
     acc: Vec<f64>,
     touched: Vec<u32>,
     visible_hits: Vec<(u32, u32)>,
-    k1_len_norm_cache: HashMap<u32, f64>,
-    /// `k1_len_norm_cache` へ初めて挿入した文書長クラスを挿入順に記録した列
-    /// （Issue #546 レビュー指摘・PR #565）。`k1_len_norm_cache` のキー集合と
+    /// 文書長クラス（`doc_len_class` の値。`0..len_classes.len()` の密な添字）
+    /// ごとの `k1 * len_norm` の遅延キャッシュ（Issue #3222）。未計算スロットは
+    /// [`LEN_NORM_UNSET_BITS`] のビット列を持つ番兵 NaN で表す。長さは
+    /// [`ScoreScratch::new_for`] が `len_classes.len()`（<= 文書数）へ固定する。
+    k1_len_norm: Vec<f64>,
+    /// `k1_len_norm` へ初めて値を書いた文書長クラスを記録した列
+    /// （Issue #546 レビュー指摘・PR #565）。番兵以外のスロットの集合と
     /// 常に一致し、[`ScoreScratch::clear_len_norm_cache`] が `O(M)` での
-    /// クリアに使う。
+    /// 番兵復元に使う。
     touched_classes: Vec<u32>,
     /// `doc_idx` を添字とする「このパスで既に `touched` へ記録したか」の
     /// 世代カウンタ（`hnsw.rs::VisitedScratch` と同型の epoch 方式。codex-review
@@ -1129,8 +1140,15 @@ struct ScoreScratch {
 }
 
 impl ScoreScratch {
-    /// 索引の文書数 `n`（`doc_ids.len()`）に対応する全ゼロの新規スクラッチを
+    /// 索引の文書数 `n`（`doc_ids.len()`）と文書長クラス数 `classes`
+    /// （`len_classes.len()`）に対応する全ゼロの新規スクラッチを
     /// 確保する（[`SparseIndex::acquire_scratch`] のプール枯渇時フォールバック）。
+    ///
+    /// `k1_len_norm` の長さは確保前に `classes <= n <= MAX_CORPUS_DOCS` を検査する
+    /// （無制限確保の禁止）。索引構築上は `len_classes` が `doc_len_by_idx` の
+    /// dedup であるため常に成立する（到達不能な防御）が、破れた場合は長さ 0 で
+    /// 確保し、ヒットループの `get_mut` が `None` となって該当ヒットを棄却する
+    /// （fail-closed）。
     ///
     /// `touched`・`visible_hits` は `Vec::with_capacity(n)` で容量を `n` に
     /// 固定する（codex-review 指摘・PR #565: 空 `Vec::new()` から `push` で
@@ -1142,16 +1160,21 @@ impl ScoreScratch {
     /// すれば以後の `push` で `n` を超えて再確保されることはなく、
     /// [`SparseIndex::approx_heap_bytes`] が計上する「容量 `n` ぶん」の
     /// 見積もりと実際の確保量が常に一致する。
-    fn new_for(n: usize) -> Self {
+    fn new_for(n: usize, classes: usize) -> Self {
+        let classes = if classes <= n && n <= MAX_CORPUS_DOCS {
+            classes
+        } else {
+            0
+        };
         Self {
             acc: vec![0.0; n],
             touched: Vec::with_capacity(n),
             visible_hits: Vec::with_capacity(n),
-            k1_len_norm_cache: HashMap::new(),
+            k1_len_norm: vec![f64::from_bits(LEN_NORM_UNSET_BITS); classes],
             // 相異なる文書長クラス数（`len_classes.len()`）は文書数 `n` を
             // 超えないため、`touched`/`visible_hits` と同じ理由で容量を `n` へ
             // 固定する（Issue #546 レビュー指摘・PR #565）。
-            touched_classes: Vec::with_capacity(n),
+            touched_classes: Vec::with_capacity(classes),
             // `doc_idx` ごとに厳密 1 要素（`n` 個）の世代カウンタ。全要素 `0`
             // 初期化のため `epoch` の初期値 `0` とは呼び出し前の
             // `wrapping_add(1)` で確実に区別する（codex-review 指摘・PR #565）。
@@ -1160,16 +1183,20 @@ impl ScoreScratch {
         }
     }
 
-    /// `k1_len_norm_cache` を `touched_classes` に記録された文書長クラスだけを
-    /// `remove` することでクリアする（Issue #546 レビュー指摘・PR #565）。
-    /// `HashMap::clear()` は確保済み容量（過去に大きく育った制御領域）に比例する
-    /// 処理量になり得るため、実際にタッチしたキー集合（`O(M)`）だけを取り除く。
-    /// `touched_classes` は `k1_len_norm_cache` のキー集合と 1 対 1 に対応する
-    /// （挿入は必ず `entry().or_insert_with` の `Vacant` 分岐でのみ行われ、その
-    /// 場でだけ `touched_classes` へ記録するため）。
+    /// `k1_len_norm` を、`touched_classes` に記録された文書長クラスのスロットだけ
+    /// 番兵へ戻すことでクリアする（Issue #546 レビュー指摘・PR #565・Issue #3222）。
+    /// 配列全体の埋め直しは `len_classes.len()` に比例するため行わず、実際に
+    /// タッチしたクラス集合（`O(M)`）だけを復元する。`touched_classes` は番兵
+    /// 以外のスロット集合と 1 対 1 に対応する（書き込みはヒットループの 1 箇所で、
+    /// その場で `touched_classes` へ記録するため）。パスをまたぐ値の残留は
+    /// 可視集合外の統計の混入（RLS 縮約契約違反）になるため、返却時と
+    /// `score_pass` 冒頭の 2 重で必ず呼ぶ。
     fn clear_len_norm_cache(&mut self) {
+        let unset = f64::from_bits(LEN_NORM_UNSET_BITS);
         for class in self.touched_classes.drain(..) {
-            self.k1_len_norm_cache.remove(&class);
+            if let Some(slot) = self.k1_len_norm.get_mut(class as usize) {
+                *slot = unset;
+            }
         }
     }
 }
@@ -1240,31 +1267,31 @@ const MAX_SCORE_SCRATCH_POOL: usize = 4;
 
 impl SparseIndex {
     /// スクラッチプールから 1 本取り出す（[`Self::score_pass`] の入口）。プールが
-    /// 空、または取り出したスクラッチの `acc` 長がこの索引の文書数と不一致
+    /// 空、または取り出したスクラッチの `acc` 長・`k1_len_norm` 長がこの索引の
+    /// 文書数・文書長クラス数と不一致
     /// （通常到達しないが、fail-closed のため明示的に検証する）の場合は
     /// [`ScoreScratch::new_for`] で新規確保する。ロックは pop のみの短時間保持。
     fn acquire_scratch(&self) -> ScoreScratch {
         let n = self.doc_ids.len();
+        let classes = self.len_classes.len();
         let popped = self
             .scratch_pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop();
         match popped {
-            Some(s) if s.acc.len() == n => s,
-            _ => ScoreScratch::new_for(n),
+            Some(s) if s.acc.len() == n && s.k1_len_norm.len() == classes => s,
+            _ => ScoreScratch::new_for(n, classes),
         }
     }
 
     /// スクラッチをプールへ返却する（[`ScorePass::drop`] から呼ばれる）。返却前に
     /// `touched` に記録された `doc_idx` のみをゼロ戻しし（[`ScoreScratch`] の
     /// 不変条件を回復）、`touched`/`visible_hits` は `clear()`（capacity は
-    /// 維持し次回確保コストを避ける）。`k1_len_norm_cache` は
+    /// 維持し次回確保コストを避ける）。`k1_len_norm` は
     /// [`ScoreScratch::clear_len_norm_cache`] で `touched_classes` に記録された
-    /// キーのみを `remove` する（Issue #546 レビュー指摘・PR #565: `HashMap::
-    /// clear()` は確保済み容量に比例するため、多数の文書長クラスにヒットした
-    /// 過去のクエリの容量が残ったまま `clear()` すると、後続の小さいクエリの
-    /// 返却コストまで肥大化する）。プールが [`MAX_SCORE_SCRATCH_POOL`] に
+    /// スロットのみを番兵へ戻す（Issue #546 レビュー指摘・PR #565・Issue #3222:
+    /// 配列全体の埋め直しは文書長クラス数に比例するため行わない）。プールが [`MAX_SCORE_SCRATCH_POOL`] に
     /// 達していれば返却せず破棄する（有界プール）。ロックは push のみの短時間
     /// 保持。
     fn release_scratch(&self, mut scratch: ScoreScratch) {
@@ -1947,7 +1974,7 @@ impl SparseIndex {
     /// ヒットごとの `len_norm`（`1-b+b*doc_len/avgdl` 由来の `k1 * len_norm`）は
     /// クエリ内で `avgdl`（母数 `n`／`avg_doc_len`。[`ScoreScope`] により変わる）が
     /// 確定した後は文書長のみに依存するため、文書長クラス（[`Self::len_classes`]）
-    /// ごとに実際にヒットループでタッチした時点で 1 回だけ計算し `HashMap` へ
+    /// ごとに実際にヒットループでタッチした時点で 1 回だけ計算し、クラス添字の配列へ
     /// キャッシュする（tantivy の fieldnorm 量子化に相当。ただし本実装はロッシー
     /// 量子化をせず「相異なる文書長 = クラス」の厳密写像とする。式・演算順は旧来の
     /// インライン計算と完全に同一であるため `denominator` は旧実装とビット一致
@@ -2024,17 +2051,17 @@ impl SparseIndex {
 
         // 索引の寿命内で使い回すスクラッチを取り出す（Issue #546）。
         // [`Self::acquire_scratch`]/[`Self::release_scratch`] の不変条件により
-        // `acc` は全要素 `0.0`・`touched`/`visible_hits`/`k1_len_norm_cache` は
-        // 空の状態で渡ってくるが、防御的に（呼び出し元・プール実装の変更に対する
+        // `acc` は全要素 `0.0`・`touched`/`visible_hits` は空・`k1_len_norm` は
+        // 全要素番兵の状態で渡ってくるが、防御的に（呼び出し元・プール実装の変更に対する
         // 縮退耐性として）ここでも軽量なフィールド（`touched`/`visible_hits`/
-        // `k1_len_norm_cache`。全要素走査を要する `acc` は対象外）を明示的に
+        // `k1_len_norm`。全要素走査を要する `acc` は対象外）を明示的に
         // クリアし、母数の異なる前回パスの値が混入しないことを構造的に保証する
         // （テナント縮約契約〔RLS 相当〕を壊さないための多重防御）。
-        // `k1_len_norm_cache` は `HashMap::clear()` ではなく
+        // `k1_len_norm` は全体の埋め直しではなく
         // [`ScoreScratch::clear_len_norm_cache`]（`touched_classes` に記録した
-        // キーのみ `remove`）を使う（Issue #546 レビュー指摘・PR #565: この
-        // 防御的クリアはパス毎に必ず実行されるため、`clear()` のまま残すと
-        // 確保済み容量に比例するコストを毎クエリ払ってしまう）。
+        // スロットのみ番兵へ復元）を使う（Issue #546 レビュー指摘・PR #565・
+        // Issue #3222: この防御的クリアはパス毎に必ず実行されるため、配列全体の
+        // 走査では文書長クラス数に比例するコストを毎クエリ払ってしまう）。
         let mut scratch = self.acquire_scratch();
         scratch.touched.clear();
         scratch.visible_hits.clear();
@@ -2050,7 +2077,7 @@ impl SparseIndex {
         // 指摘（PR #426）に対応し、ヒットループ内で実際にタッチしたクラスのみを
         // 遅延計算してキャッシュする方式へ変更した。式・演算順（`k1_len_norm[c]`
         // は旧実装の `self.k1 * len_norm` と同一算出）は不変のため `denominator` は
-        // 引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class` →
+        // 引き続きビット一致する。配列スロットの値は決定的に定まる（`class` →
         // 一意な `f64`）ためスコア自体の決定性に影響しない。
         let k1_plus_1 = params.k1 + 1.0;
 
@@ -2074,7 +2101,7 @@ impl SparseIndex {
             acc,
             touched,
             visible_hits,
-            k1_len_norm_cache,
+            k1_len_norm,
             touched_classes,
             visited_epoch,
             epoch,
@@ -2122,20 +2149,23 @@ impl SparseIndex {
                 let Some(&len) = self.len_classes.get(class as usize) else {
                     continue;
                 };
-                // `entry` の `Vacant` 分岐でのみ新規キーを挿入し、その場で
-                // `touched_classes` へ記録する（Issue #546 レビュー指摘・
-                // PR #565）。`touched_classes` が `k1_len_norm_cache` のキー集合と
-                // 1 対 1 に対応するのはこの 1 箇所だけが挿入経路であるため。
-                let kln = match k1_len_norm_cache.entry(class) {
-                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let value = params.k1
-                            * (1.0 - params.b
-                                + params.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
-                        entry.insert(value);
-                        touched_classes.push(class);
-                        value
-                    }
+                // 文書長クラス添字の配列スロットが番兵のときだけ計算して書き込み、
+                // その場で `touched_classes` へ記録する（Issue #546 レビュー指摘・
+                // PR #565・Issue #3222）。`touched_classes` が番兵以外のスロット
+                // 集合と 1 対 1 に対応するのはこの 1 箇所だけが書き込み経路で
+                // あるため。範囲外は fail-closed で当該ヒットを棄却する。
+                let Some(slot) = k1_len_norm.get_mut(class as usize) else {
+                    continue;
+                };
+                let kln = if slot.to_bits() == LEN_NORM_UNSET_BITS {
+                    let value = params.k1
+                        * (1.0 - params.b
+                            + params.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
+                    *slot = value;
+                    touched_classes.push(class);
+                    value
+                } else {
+                    *slot
                 };
                 let f = f64::from(tf);
                 let numerator = f * k1_plus_1;
@@ -2283,24 +2313,30 @@ impl SparseIndex {
         // レビュー指摘・PR #565: 以前は空 `Vec::new()` から `push` で育てており、
         // 標準ライブラリの倍々戦略により最終容量が `N` を超えうる〔`N` が
         // 2 の冪+1 付近だと最大で概ね `2N` 弱まで〕過小計上の余地があった）・
-        // `k1_len_norm_cache`（`HashMap<u32, f64>`。相異なる文書長クラス数 =
-        // `len_classes.len()` が上限）。`N = MAX_CORPUS_DOCS`（100,000）のとき
-        // 1 本あたり概算 (8 + 4 + 4 + 8) × 100,000 ≈ 2.4 MB、
-        // `MAX_SCORE_SCRATCH_POOL`（4 本）で約 9.6 MB／索引。
+        // `visited_epoch`（8）・`k1_len_norm`（`Vec<f64>`。長さ =
+        // `len_classes.len()` で `new_for` が確保前に固定する。Issue #3222）。
+        // `N = MAX_CORPUS_DOCS`（100,000）・全文書長が相異なる最悪ケースで
+        // 1 本あたり概算 (8 + 4 + 8 + 4 + 8 + 8) × 100,000 ≈ 4.0 MB、
+        // `MAX_SCORE_SCRATCH_POOL`（4 本）で約 16 MB／索引。
         // `MAX_SPARSE_CACHE_TOTAL_BYTES`（= `MAX_ARENA_TOTAL_BYTES` = 1 GiB）に
         // 対し十分小さい桁に収まる。
         let n = self.doc_ids.len();
         let scratch_acc = n.saturating_mul(std::mem::size_of::<f64>());
         let scratch_touched = n.saturating_mul(std::mem::size_of::<u32>());
         let scratch_visible_hits = n.saturating_mul(std::mem::size_of::<(u32, u32)>());
-        let scratch_touched_classes = n.saturating_mul(std::mem::size_of::<u32>());
+        let scratch_touched_classes = self
+            .len_classes
+            .len()
+            .min(n)
+            .saturating_mul(std::mem::size_of::<u32>());
         // `touched` への重複記録防止用の世代カウンタ（[`ScoreScratch::
         // visited_epoch`]。codex-review 指摘・PR #565）。`touched` と同じ `n`
         // 要素だが `u64` のため 1 要素あたり 8 バイト。
         let scratch_visited_epoch = n.saturating_mul(std::mem::size_of::<u64>());
-        let scratch_len_norm_cache = self.len_classes.len().saturating_mul(
-            std::mem::size_of::<(u32, f64)>().saturating_add(Self::HASHMAP_ENTRY_OVERHEAD_BYTES),
-        );
+        let scratch_len_norm_cache = self
+            .len_classes
+            .len()
+            .saturating_mul(std::mem::size_of::<f64>());
         let scratch_one = scratch_acc
             .saturating_add(scratch_touched)
             .saturating_add(scratch_visible_hits)
@@ -3589,7 +3625,7 @@ mod tests {
     #[test]
     fn scratch_pool_returns_all_zero_and_bounded() {
         // ヒットありクエリを複数回実行した後、プール内に残る全スクラッチの
-        // `acc` が全ゼロ・`touched`/`visible_hits`/`k1_len_norm_cache` が空・
+        // `acc` が全ゼロ・`touched`/`visible_hits` が空・`k1_len_norm` が全番兵・
         // プール長が MAX_SCORE_SCRATCH_POOL 以下であることを検証する
         // （release_scratch がゼロ戻し・clear を確実に行っている根拠）。
         let docs: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma")];
@@ -3608,7 +3644,14 @@ mod tests {
             );
             assert!(scratch.touched.is_empty());
             assert!(scratch.visible_hits.is_empty());
-            assert!(scratch.k1_len_norm_cache.is_empty());
+            assert_eq!(scratch.k1_len_norm.len(), idx.len_classes.len());
+            assert!(
+                scratch
+                    .k1_len_norm
+                    .iter()
+                    .all(|v| v.to_bits() == LEN_NORM_UNSET_BITS),
+                "プールへ返却されたスクラッチの k1_len_norm が全番兵でない"
+            );
             assert!(scratch.touched_classes.is_empty());
         }
     }
@@ -3714,7 +3757,10 @@ mod tests {
 
         {
             let mut pool = idx.scratch_pool.lock().unwrap();
-            pool.push(ScoreScratch::new_for(idx.doc_ids.len() + 1));
+            pool.push(ScoreScratch::new_for(
+                idx.doc_ids.len() + 1,
+                idx.len_classes.len(),
+            ));
         }
 
         let result = idx.search("alpha beta", 10).unwrap();
@@ -4912,6 +4958,87 @@ mod tests {
             let again = idx.score_within("alpha beta", &visible).unwrap();
             assert_eq!(bits(&base), bits(&again));
         }
+    }
+
+    /// Issue #3222: 1 本の索引（プールのスクラッチを再利用）で可視集合・params を
+    /// 変えながら連続採点しても、各回の結果が新規 build 直後の索引とビット一致する
+    /// （`k1_len_norm` のスロットがパスをまたいで残り、可視外の母数統計が混入しない
+    /// ことの回帰。RLS 縮約契約）。
+    #[test]
+    fn len_norm_slots_do_not_leak_across_passes() {
+        let corpus = generate_mixed_corpus(400);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let reused = SparseIndex::build(&refs).unwrap();
+        let all: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+        let half: BTreeSet<DocId> = refs
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|i| i % 2 == 0)
+            .collect();
+        let third: BTreeSet<DocId> = refs
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|i| i % 3 == 0)
+            .collect();
+        let none: BTreeSet<DocId> = BTreeSet::new();
+        let bits = |s: &SparseScored| -> Vec<(DocId, u64)> {
+            s.candidates
+                .iter()
+                .map(|c| (c.doc_id, c.score.to_bits()))
+                .collect()
+        };
+        let params = [
+            reused.params(),
+            Bm25Params::new(0.0, 0.5).unwrap(),
+            Bm25Params::new(1.5, 0.0).unwrap(),
+            Bm25Params::new(1.5, 1.0).unwrap(),
+            Bm25Params::new(MAX_QUERY_K1, 0.75).unwrap(),
+        ];
+        for round in 0..2 {
+            for vis in [&all, &half, &third, &none, &half] {
+                for p in params {
+                    for q in ["alpha beta", "alpha", "gamma delta alpha"] {
+                        let fresh = SparseIndex::build(&refs).unwrap();
+                        let got = reused.score_within_with_params(q, vis, p).unwrap();
+                        let want = fresh.score_within_with_params(q, vis, p).unwrap();
+                        assert_eq!(bits(&got), bits(&want), "round={round} q={q} p={p:?}");
+                    }
+                }
+            }
+        }
+        let pool = reused.scratch_pool.lock().unwrap();
+        for scratch in pool.iter() {
+            assert!(scratch.touched_classes.is_empty());
+            assert!(scratch
+                .k1_len_norm
+                .iter()
+                .all(|v| v.to_bits() == LEN_NORM_UNSET_BITS));
+        }
+    }
+
+    /// Issue #3222: 配列長は確保前の上限検査で `classes <= n` に抑えられ、
+    /// 違反時は空配列（ヒット棄却の fail-closed）になる。長さの合わない
+    /// スクラッチはプールから再利用されない。
+    #[test]
+    fn scratch_len_norm_array_is_bounded_by_len_classes() {
+        assert_eq!(ScoreScratch::new_for(10, 3).k1_len_norm.len(), 3);
+        assert_eq!(ScoreScratch::new_for(10, 11).k1_len_norm.len(), 0);
+        assert_eq!(
+            ScoreScratch::new_for(MAX_CORPUS_DOCS + 1, 1)
+                .k1_len_norm
+                .len(),
+            0
+        );
+        let docs: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma delta")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        {
+            let mut pool = idx.scratch_pool.lock().unwrap();
+            pool.push(ScoreScratch::new_for(idx.doc_ids.len(), 0));
+        }
+        let got = idx.search("beta", 10).unwrap();
+        assert_eq!(got.len(), 2);
+        let s = idx.acquire_scratch();
+        assert_eq!(s.k1_len_norm.len(), idx.len_classes.len());
     }
 
     /// Issue #2121: `Bm25Params::new` の定義域・数値安全上限・境界値。
