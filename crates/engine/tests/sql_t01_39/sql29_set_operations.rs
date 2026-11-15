@@ -415,27 +415,91 @@ fn vector_column_with_union_all_is_accepted() {
 // ---------- 構文拒否（42601） ----------
 
 #[test]
-fn intersect_all_is_rejected() {
+fn intersect_all_keeps_min_multiplicity() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
+    let tenant_ctx = ctx("tenant-a");
+    // docs: ja,en,ja / other_docs: en,fr + ja x3 => ja は min(2,3)=2、en は min(1,1)=1。
+    for id in 20..23 {
+        insert_row(&storage, OTHER, &tenant_ctx, id, "ja", Visibility::Public);
+    }
     let core = new_core(storage);
-    let err = run_err(
+    let result = run(
         &core,
         "tenant-a",
         "SELECT lang FROM docs INTERSECT ALL SELECT lang FROM other_docs",
     );
-    assert_eq!(err.wire_code(), "42601");
+    let mut got = langs(&result);
+    got.sort();
+    assert_eq!(got, vec!["en", "ja", "ja"]);
 }
 
 #[test]
-fn union_distinct_is_rejected() {
+fn intersect_all_multiplicity_ignores_other_tenants_rows() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    // tenant-b の非公開な同値重複行を大量に入れても tenant-a の多重度は変わらない。
+    let other = ctx("tenant-b");
+    for id in 100..110 {
+        insert_row(&storage, DOCS, &other, id, "ja", Visibility::Private);
+        insert_row(&storage, OTHER, &other, id, "ja", Visibility::Private);
+    }
+    let core = new_core(storage);
+    let sql = "SELECT lang FROM docs INTERSECT ALL SELECT lang FROM other_docs";
+    // tenant-a: docs {ja,en,ja} / other_docs {en,fr} => en のみ。
+    assert_eq!(langs(&run(&core, "tenant-a", sql)), vec!["en"]);
+}
+
+#[test]
+fn explicit_distinct_matches_default_union_and_intersect() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for (explicit, plain) in [
+        ("UNION DISTINCT", "UNION"),
+        ("INTERSECT DISTINCT", "INTERSECT"),
+    ] {
+        let a = run(
+            &core,
+            "tenant-a",
+            &format!("SELECT lang FROM docs {explicit} SELECT lang FROM other_docs"),
+        );
+        let b = run(
+            &core,
+            "tenant-a",
+            &format!("SELECT lang FROM docs {plain} SELECT lang FROM other_docs"),
+        );
+        assert_eq!(langs(&a), langs(&b), "{explicit}");
+    }
+}
+
+#[test]
+fn quantifier_followed_by_another_quantifier_is_rejected() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    for sql in [
+        "SELECT lang FROM docs INTERSECT ALL DISTINCT SELECT lang FROM other_docs",
+        "SELECT lang FROM docs INTERSECT ALL ALL SELECT lang FROM other_docs",
+        "SELECT lang FROM docs UNION DISTINCT ALL SELECT lang FROM other_docs",
+    ] {
+        assert_eq!(
+            run_err(&core, "tenant-a", sql).wire_code(),
+            "42601",
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn except_distinct_stays_rejected() {
     let (storage, path) = seeded_two_tables();
     let _guard = CleanupGuard(path);
     let core = new_core(storage);
     let err = run_err(
         &core,
         "tenant-a",
-        "SELECT lang FROM docs UNION DISTINCT SELECT lang FROM other_docs",
+        "SELECT lang FROM docs EXCEPT DISTINCT SELECT lang FROM other_docs",
     );
     assert_eq!(err.wire_code(), "42601");
 }
