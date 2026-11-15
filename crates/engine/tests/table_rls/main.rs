@@ -21,6 +21,7 @@ mod copy_from;
 mod copy_from_options;
 mod copy_options_parse;
 mod copy_prepared;
+mod copy_to_aggregate;
 mod copy_to_table;
 mod insert_multi_row;
 mod insert_without_vector_column;

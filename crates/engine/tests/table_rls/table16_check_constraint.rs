@@ -179,21 +179,15 @@ fn create_table_rejects_check_calling_visible() {
 /// Issue #1184: WHERE で受理する `NOT ( ... )`・数値の `IN`／`BETWEEN` は、CHECK 本体
 /// （TABLE-16）では従来どおり `42601` のまま（脱糖後の形が CHECK の許可形と区別
 /// できず、受理範囲が黙って広がるのを防ぐ。解禁は後続 Issue で扱う）。
-/// tracked: #3243, #3244
+/// tracked: #3244
 #[test]
-fn create_table_rejects_not_group_and_numeric_in_between_in_check() {
+fn create_table_rejects_numeric_in_and_between_in_check() {
     let (core, path) = new_core("check-1184-forms");
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
 
-    for cond in [
-        "NOT (kind = 'a')",
-        "NOT (n > 1)",
-        "NOT n > 1",
-        "n IN (1, 2)",
-        "n BETWEEN 1 AND 3",
-    ] {
+    for cond in ["n IN (1, 2)", "n BETWEEN 1 AND 3"] {
         let err = core
             .execute_sql_in_session_legacy(
                 &alice,
@@ -203,6 +197,243 @@ fn create_table_rejects_not_group_and_numeric_in_between_in_check() {
             .expect_err("new WHERE-only forms must be rejected in CHECK");
         assert_eq!(err.wire_code(), "42601", "{cond}");
     }
+}
+
+/// Issue #3243: `NOT` の 3 形（グループ・グループ内の式比較・裸の式比較）は受理する。
+#[test]
+fn create_table_accepts_not_forms_in_check() {
+    let (core, path) = new_core("check-3243-not-forms");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    for (i, cond) in [
+        "NOT (kind = 'a')",
+        "NOT (n > 1)",
+        "NOT n > 1",
+        "kind <> 'a'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        core.execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            &format!("CREATE TABLE docs{i} (kind TEXT, n INTEGER, CHECK ({cond}))"),
+        )
+        .unwrap_or_else(|e| panic!("{cond} must be accepted: {e:?}"));
+    }
+}
+
+fn sql_insert(core: &EngineCore, alice: &PolicyContext, sql: &str) -> Result<(), String> {
+    core.execute_insert_sql(alice, sql)
+        .map(|_| ())
+        .map_err(|e| e.wire_code().to_string())
+}
+
+/// Issue #3243: 末尾 `;` 付きの `OR` CHECK は三値論理で評価される。UNKNOWN は合格、FALSE だけ
+/// `23514`。違反は副作用ゼロ（同じ `operation_id` を適合行で再送できる）。
+#[test]
+fn or_check_follows_three_valued_logic_via_sql() {
+    let (core, path) = new_core("check-3243-or-truth");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, b INTEGER, CHECK (a > 0 OR b > 0));",
+    )
+    .expect("create table");
+
+    // TRUE OR UNKNOWN / FALSE OR UNKNOWN / UNKNOWN OR UNKNOWN は合格。
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 1) USING OPERATION_ID 'o1';",
+    )
+    .expect("T OR U");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (2, -1) USING OPERATION_ID 'o2';",
+    )
+    .expect("F OR U");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id) VALUES (3) USING OPERATION_ID 'o3';",
+    )
+    .expect("U OR U");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (4, -1, 1) USING OPERATION_ID 'o4';",
+    )
+    .expect("F OR T");
+
+    // FALSE OR FALSE は違反。メッセージに値・id は含まない。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (5, -1, -1) USING OPERATION_ID 'o5';",
+        )
+        .expect_err("F OR F must violate");
+    assert_eq!(err.wire_code(), "23514");
+    assert!(!err.client_message().contains("-1"));
+    // 副作用ゼロ: 同じ operation_id を適合行で再送すると成功する。
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (5, 1, -1) USING OPERATION_ID 'o5';",
+    )
+    .expect("resend with the same operation_id and a valid row must succeed");
+
+    // UPDATE で違反へ変えると 23514。
+    let mut s = SessionState::default();
+    let err = core
+        .execute_sql_in_session_legacy(
+            &alice,
+            &mut s,
+            "UPDATE docs SET a = -2 WHERE id = 5 USING OPERATION_ID 'u1';",
+        )
+        .expect_err("UPDATE into F OR F must violate");
+    assert_eq!(err.wire_code(), "23514");
+}
+
+/// Issue #3243: `NOT (a = 0)`（`a < 0 OR a > 0` へ脱糖）の三値評価。
+#[test]
+fn not_check_follows_three_valued_logic_via_sql() {
+    let (core, path) = new_core("check-3243-not-truth");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, CHECK (NOT (a = 0)));",
+    )
+    .expect("create table");
+    assert_eq!(
+        sql_insert(
+            &core,
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (1, 0) USING OPERATION_ID 'o1';"
+        ),
+        Err("23514".to_string())
+    );
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id) VALUES (2) USING OPERATION_ID 'o2';",
+    )
+    .expect("NOT UNKNOWN is UNKNOWN and passes");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (3, 1) USING OPERATION_ID 'o3';",
+    )
+    .expect("a = 1");
+}
+
+/// Issue #3243: `OR` の内側だけで参照する列は依存列として記録され、`DROP COLUMN` は拒否される
+/// （取りこぼすと CHECK を黙って壊す fail-open）。`RENAME COLUMN`・`ALTER COLUMN TYPE` 後も
+/// CHECK は機能し続ける。
+#[test]
+fn or_check_dependency_is_tracked_for_drop_rename_and_alter_type() {
+    let (core, path) = new_core("check-3243-dependency");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER, kind TEXT, note TEXT, \
+         CHECK (kind = 'a' OR qty > 0), CHECK (NOT (qty = 0)));",
+    )
+    .expect("create table");
+
+    for col in ["kind", "qty"] {
+        let err = core
+            .execute_sql_in_session_legacy(
+                &alice,
+                &mut session,
+                &format!("ALTER TABLE docs DROP COLUMN {col}"),
+            )
+            .expect_err("dropping a column referenced only inside OR must be rejected");
+        assert_eq!(err.wire_code(), "2BP01", "{col}");
+    }
+
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN kind TO kind2",
+    )
+    .expect("rename");
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT",
+    )
+    .expect("alter type");
+    // FALSE OR FALSE（kind2 <> 'a' かつ qty <= 0）は NOT (qty = 0) 側の都合で qty = 0 を避ける。
+    assert_eq!(
+        sql_insert(
+            &core,
+            &alice,
+            "INSERT INTO docs (id, qty, kind2) VALUES (1, -1, 'b') USING OPERATION_ID 'o1';"
+        ),
+        Err("23514".to_string())
+    );
+    assert_eq!(
+        sql_insert(
+            &core,
+            &alice,
+            "INSERT INTO docs (id, qty, kind2) VALUES (2, 0, 'a') USING OPERATION_ID 'o2';"
+        ),
+        Err("23514".to_string())
+    );
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, qty, kind2) VALUES (3, 5, 'b') USING OPERATION_ID 'o3';",
+    )
+    .expect("satisfies both");
+}
+
+/// Issue #3243: 別テナントの行は CHECK の評価に影響しない（書き込み行のスカラー列だけを読む）。
+#[test]
+fn or_check_is_evaluated_per_row_regardless_of_other_tenants() {
+    let (core, path) = new_core("check-3243-tenant");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, b INTEGER, CHECK (a > 0 OR b > 0));",
+    )
+    .expect("create table");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (1, 1, 1) USING OPERATION_ID 'o1';",
+    )
+    .expect("alice ok");
+    assert_eq!(
+        sql_insert(
+            &core,
+            &bob,
+            "INSERT INTO docs (id, a, b) VALUES (1, -1, -1) USING OPERATION_ID 'o1';"
+        ),
+        Err("23514".to_string())
+    );
+    sql_insert(
+        &core,
+        &bob,
+        "INSERT INTO docs (id, a, b) VALUES (1, 2, -1) USING OPERATION_ID 'o2';",
+    )
+    .expect("bob ok");
 }
 
 // --- 単一行 INSERT --------------------------------------------------------
