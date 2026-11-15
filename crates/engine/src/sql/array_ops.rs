@@ -240,11 +240,64 @@ pub(crate) fn array_overlaps(a: &[Option<Key<'_>>], b: &[Option<Key<'_>>]) -> bo
 // ---------------------------------------------------------------- 束縛
 
 /// 要素型が比較器を持つか（numeric・json・ENUM は持たない）。
+#[deny(clippy::wildcard_enum_match_arm)]
 fn comparable_elem(elem: ArrayElemType) -> bool {
-    !matches!(
-        elem,
-        ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum
-    )
+    match elem {
+        ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum => false,
+        ArrayElemType::Text
+        | ArrayElemType::Bool
+        | ArrayElemType::Integer
+        | ArrayElemType::BigInt
+        | ArrayElemType::Real
+        | ArrayElemType::Double
+        | ArrayElemType::Date
+        | ArrayElemType::Timestamp
+        | ArrayElemType::Uuid
+        | ArrayElemType::Bytea
+        | ArrayElemType::Jsonb => true,
+    }
+}
+
+/// 要素型が浮動小数（`REAL`／`DOUBLE PRECISION`）か。小数形リテラルの比較特例の判定。
+/// ワイルドカード無しの網羅 match で、要素型の追加時に判断を強制する（Issue #3229）。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn is_float_elem(elem: ArrayElemType) -> bool {
+    match elem {
+        ArrayElemType::Real | ArrayElemType::Double => true,
+        ArrayElemType::Text
+        | ArrayElemType::Bool
+        | ArrayElemType::Integer
+        | ArrayElemType::BigInt
+        | ArrayElemType::Date
+        | ArrayElemType::Timestamp
+        | ArrayElemType::Uuid
+        | ArrayElemType::Numeric { .. }
+        | ArrayElemType::Bytea
+        | ArrayElemType::Json
+        | ArrayElemType::Jsonb
+        | ArrayElemType::Enum => false,
+    }
+}
+
+/// 要素型ごとに、量化比較で受理する左辺の CAST 種別の集合。数値は整数・浮動小数の要素どうし、
+/// 他は同じ型どうし。`Numeric`・`Json`・`Enum` は受理する種別なし。網羅 match（Issue #3229）。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn lhs_kinds_for(elem: ArrayElemType) -> &'static [CastKind] {
+    use CastKind as K;
+    match elem {
+        ArrayElemType::Integer
+        | ArrayElemType::BigInt
+        | ArrayElemType::Real
+        | ArrayElemType::Double => &[K::Int2, K::Int4, K::Int8, K::Float4, K::Float8],
+        ArrayElemType::Text => &[K::Text, K::Varchar, K::Bpchar],
+        ArrayElemType::Bool => &[K::Bool],
+        ArrayElemType::Date => &[K::Date],
+        ArrayElemType::Timestamp => &[K::Timestamp],
+        ArrayElemType::Uuid => &[K::Uuid],
+        ArrayElemType::Bytea => &[K::Bytea],
+        ArrayElemType::Jsonb => &[K::Jsonb],
+        ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Enum => &[],
+    }
 }
 
 /// 配列式のオペランドを束縛して要素型を得る。配列でない式・要素型を確定できない配列は拒否する。
@@ -399,24 +452,12 @@ pub(super) fn bind_array_containment(
 fn check_lhs_compatible(kind: CastKind, elem: ArrayElemType) -> Result<(), SqlSurfaceError> {
     use ArrayElemType as E;
     use CastKind as K;
-    let ok = match kind {
-        K::Int2 | K::Int4 | K::Int8 | K::Float4 | K::Float8 => {
-            matches!(elem, E::Integer | E::BigInt | E::Real | E::Double)
-        }
-        K::Text | K::Varchar | K::Bpchar => elem == E::Text,
-        K::Bool => elem == E::Bool,
-        K::Date => elem == E::Date,
-        K::Timestamp => elem == E::Timestamp,
-        K::Uuid => elem == E::Uuid,
-        K::Bytea => elem == E::Bytea,
-        K::Jsonb => elem == E::Jsonb,
-        K::Numeric => {
-            return Err(unsupported(
-                "ANY/ALL with a numeric operand is not supported yet",
-            ))
-        }
-        _ => false,
-    };
+    if kind == K::Numeric {
+        return Err(unsupported(
+            "ANY/ALL with a numeric operand is not supported yet",
+        ));
+    }
+    let ok = lhs_kinds_for(elem).contains(&kind);
     if ok {
         return Ok(());
     }
@@ -548,9 +589,7 @@ fn bind_quantified_lhs(
     // float8 へ寄せる）。f64 を経由しない numeric のまま比べる形は未対応（`0A000`）。
     // 整数形のリテラルは f64 で正確に表せる範囲（絶対値 2^53 以下）に限る。範囲外は丸めで別要素へ
     // 誤一致しうるため特例に入れず、従来経路（`0A000` 拒否）へ落とす。
-    if matches!(lhs, Expr::Number(n) if number_exact_in_f64(n))
-        && matches!(elem, Some(ArrayElemType::Real | ArrayElemType::Double))
-    {
+    if matches!(lhs, Expr::Number(n) if number_exact_in_f64(n)) && elem.is_some_and(is_float_elem) {
         let (bound, _) = bind_cast(lhs, &CastType::Float8, env, node_budget)?;
         return Ok((bound, CastKind::Float8));
     }
@@ -844,5 +883,40 @@ mod tests {
         assert_eq!(compare_arrays(&a, &b), Ordering::Equal);
         let c = ints(&[Some(5), Some(1), Some(7)]);
         assert_ne!(compare_arrays(&a, &c), Ordering::Equal);
+    }
+
+    /// Issue #3229: 要素型ごとの左辺受理表・比較器有無・浮動小数判定を固定する
+    /// （網羅 helper への置き換えで挙動が変わっていないことの回帰）。
+    #[test]
+    fn element_type_tables_are_pinned() {
+        use ArrayElemType as E;
+        use CastKind as K;
+        for elem in E::ALL_KINDS {
+            let kinds = lhs_kinds_for(elem);
+            let expected: &[CastKind] = match elem {
+                E::Integer | E::BigInt | E::Real | E::Double => {
+                    &[K::Int2, K::Int4, K::Int8, K::Float4, K::Float8]
+                }
+                E::Text => &[K::Text, K::Varchar, K::Bpchar],
+                E::Bool => &[K::Bool],
+                E::Date => &[K::Date],
+                E::Timestamp => &[K::Timestamp],
+                E::Uuid => &[K::Uuid],
+                E::Bytea => &[K::Bytea],
+                E::Jsonb => &[K::Jsonb],
+                E::Numeric { .. } | E::Json | E::Enum => &[],
+            };
+            assert_eq!(kinds, expected, "{elem:?}");
+            assert_eq!(
+                comparable_elem(elem),
+                !matches!(elem, E::Numeric { .. } | E::Json | E::Enum),
+                "{elem:?}"
+            );
+            assert_eq!(is_float_elem(elem), matches!(elem, E::Real | E::Double));
+        }
+        // 左辺 numeric は要素型によらず先行して 0A000。
+        assert!(check_lhs_compatible(K::Numeric, E::Integer).is_err());
+        assert!(check_lhs_compatible(K::Int4, E::Real).is_ok());
+        assert!(check_lhs_compatible(K::Text, E::Integer).is_err());
     }
 }
