@@ -188,20 +188,24 @@ impl EngineCore {
         skip: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+        // Execute と同じ順序（外側の束縛 → 全副文の RETURNING の事前束縛）で検査し、
+        // 参照されない副文の束縛エラーも Describe で報告する（Issue #3251）。
         if let DmMain::Read(read) = &stmt.main {
             let parsed = super::ParsedSql::Statement((**read).clone());
-            return self
+            let columns = self
                 .describe_parsed_in_session_impl(session, &parsed, skip, &[], limits)?
                 .ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
-                });
+                })?;
+            self.prebind_substatement_returning(session, stmt)?;
+            return Ok(columns);
         }
-        self.prebind_substatement_returning(session, stmt)?;
         let plan = self
             .plan_data_modifying_outer(session, stmt, limits)?
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
             })?;
+        self.prebind_substatement_returning(session, stmt)?;
         Ok(plan.columns().to_vec())
     }
 

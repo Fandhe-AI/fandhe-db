@@ -15615,7 +15615,13 @@ impl<'a> Parser<'a> {
                     "RETURNING does not support subqueries",
                 ));
             }
-            let colref = crate::sql::relation::ColumnRef::unqualified(name.clone());
+            // 非修飾で書かれた識別子だけがスコープ照合の対象。対象表で修飾された `(t.k)` は
+            // 式パーサーが非修飾へ正規化済みなので、対象表の修飾を戻して FROM／USING 側と衝突させない。
+            let colref = if unqualified.iter().any(|u| u == name) {
+                crate::sql::relation::ColumnRef::unqualified(name.clone())
+            } else {
+                crate::sql::relation::ColumnRef::qualified(target_exposed, name.clone())
+            };
             return Ok(match alias {
                 Some(a) => DmlFromReturningItem::AliasedColumn(colref, a),
                 None => DmlFromReturningItem::Column(colref),
