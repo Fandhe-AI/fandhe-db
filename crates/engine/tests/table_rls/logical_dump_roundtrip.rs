@@ -182,6 +182,8 @@ fn assert_full_round_trip(tag: &str, format: TableDataFormat) {
         "CREATE INDEX",
         "CREATE FUNCTION",
         "CREATE TRIGGER",
+        // Issue #3190: WHEN 条件が論理ダンプに出て、復元で再投入できる。
+        "WHEN (",
         "CREATE POLICY",
         "CREATE ROLE",
         "ROW LEVEL SECURITY",
