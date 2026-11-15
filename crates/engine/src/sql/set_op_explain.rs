@@ -15,7 +15,8 @@ use crate::sql::allowlist::{SetOperator, SetTree, ValidatedSetOperation};
 use crate::sql::explain_tree::{present, ExplainNode, ExplainTreeError};
 use crate::sql::set_op::{BoundSetLeaf, LeafShape};
 
-/// 集合演算の段の木を組み立てる。外側から全体 `limit`（あるときだけ）→ `set_operation` の入れ子 →
+/// 集合演算の段の木を組み立てる。外側から全体 `limit`（あるときだけ）→ 全体 `sort`（あるときだけ）→
+/// `set_operation` の入れ子 →
 /// 葉（`scan`、枝内 `limit`／`sort`／`aggregate` 付き）。`leaves` と `leaf_lines` の長さが木の葉の数と
 /// 違うときは fail-closed（[`ExplainTreeError::InvalidLine`]）。再帰の深さは構文段の上限
 /// （枝 16・括弧 4）で抑えられる。
@@ -31,6 +32,15 @@ pub(crate) fn explain_tree(
     let mut shapes = leaves.iter().map(|l| &l.shape);
     let mut ordinal = 0usize;
     let mut current = build(&validated.tree, &mut shapes, &mut lines, &mut ordinal)?;
+    // Issue #3267: 全体 `ORDER BY` は合成結果の外側・全体 `limit` の内側（実行順の逆）。キー名は出さない。
+    if !validated.order_by.is_empty() {
+        let mut node = ExplainNode::try_stage(
+            "sort".to_string(),
+            vec![format!("sort_keys: {}", validated.order_by.len())],
+        )?;
+        node.push_child(current)?;
+        current = node;
+    }
     if validated.limit.is_some() || validated.offset != 0 {
         let mut node = ExplainNode::try_stage(
             "limit".to_string(),

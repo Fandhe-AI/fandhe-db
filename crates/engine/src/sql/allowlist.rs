@@ -4383,8 +4383,8 @@ pub struct ValidatedSetOperation {
     pub(crate) offset: u32,
     /// 括弧なし末尾の `ORDER BY`（集合演算全体のソートキー。Issue #3266・SQL-29・SQL-56 ポインタ）。
     /// 空は `ORDER BY` なし。最後の枝の句ではなく集合全体に掛かる（枝内の句は
-    /// [`SetTree::LimitedBranch`] 等が持つ）。キーの解決（出力列名・序数 → 列位置）と、
-    /// ソート未実装の間の `0A000` の関門は `sql::set_op` が担う（実行は Issue #3267）。
+    /// [`SetTree::LimitedBranch`] 等が持つ）。キーの解決（出力列名・序数 → 列位置）・型と照合の
+    /// 検査・実行（ソート → `OFFSET` → `LIMIT`）は `sql::set_op` が担う（Issue #3267）。
     pub(crate) order_by: Vec<SetOrderKey>,
 }
 
@@ -19116,13 +19116,9 @@ fn check_buffered_body_shape_with(
             }
             Ok(())
         }
-        // Issue #3266: 集合全体の `ORDER BY` はソート実行（#3267）まで未実装。参照時の拒否より
-        // 手前の定義時に `0A000` にし、使えない本文の永続化を防ぐ（fail-closed）。
-        Statement::SetOperation(v) if !v.order_by.is_empty() => {
-            Err(SqlSurfaceError::feature_not_supported(
-                "ORDER BY over a set operation result is not supported yet",
-            ))
-        }
+        // Issue #3267: 集合全体の `ORDER BY` は本文でも `sql::set_op` が実行する（参照時の評価は
+        // 本文を `order_by` ごと保った文として既存の集合演算経路へ渡す）。キー型・照合の拒否も
+        // 参照時に同じ `0A000` になる。
         Statement::SetOperation(v) => check_body_set_tree(&v.tree, lookup, out),
         // Issue #1411: 本文の FROM が別の評価後射影形ビュー（または単純形ビュー経由で
         // そこへ到達するビュー）の連鎖。本文として許すのは列射影・`WHERE`（宣言的述語、
@@ -29364,10 +29360,12 @@ fn recursive_cte_statement(
                 "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT",
             ));
         }
-        // Issue #3266: 集合全体の `ORDER BY` はソート実行（#3267）まで未実装（fail-closed）。
+        // 再帰 CTE のアンカー項の集合全体 `ORDER BY` は、PostgreSQL では構文上受理されない位置
+        // （アンカーは `WITH RECURSIVE` の非再帰項で、全体の `ORDER BY` を持てない）。意図的な拒否
+        // で、設計記録は `docs/design/set-operations.md`（Issue #3267）。
         Statement::SetOperation(v) if !v.order_by.is_empty() => {
             return Err(SqlSurfaceError::feature_not_supported(
-                "ORDER BY over a set operation result is not supported yet",
+                "ORDER BY over a set operation result is not supported in the anchor term of WITH RECURSIVE",
             ));
         }
         Statement::Select(_)
