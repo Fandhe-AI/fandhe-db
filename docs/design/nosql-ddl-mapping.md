@@ -113,8 +113,10 @@ SQL と NoSQL の同一宣言が同一のカタログ表現になることは、
 ## CHECK 制約（Issue #1199・NOSQL-13・TABLE-16・SQL-23）
 
 `create_table.constraints[]` に `{"kind":"check","name":"<任意>","predicate":[...]}`
-を指定できる。`predicate` は `FILTER_ITEM_SCHEMA` の葉形（`column`／`op`／`value`）の
-配列で、要素同士は AND 結合。表制約 `[CONSTRAINT <name>] CHECK (<葉> AND ...)` の
+を指定できる。`predicate` は `filter` と同じ語彙の要素（葉・`or` 群・`not` 群。Issue #3246 で
+SQL 表層の CHECK 述語形へ拡張）の配列で、要素同士は AND 結合。形・RLS 述語名・件数／深さ／
+葉の総数／`in` 要素数の上限の検査は `http::query::filter` の形検査段を共有する（第 2 の
+形パーサを持たない）。表制約 `[CONSTRAINT <name>] CHECK (<述語> AND ...)` の
 トークン列へ写像し、SQL 表層と同じ `validate_create_table_tokens` → `run_ddl` へ
 合流する（第 2 の DDL 実行器・評価器・権限判定は作らない）。
 
@@ -124,6 +126,13 @@ SQL と NoSQL の同一宣言が同一のカタログ表現になることは、
 | `eq`／`lt`／`gt` | `=`／`<`／`>` |
 | `le`・`lte`／`ge`・`gte` | `<=`／`>=` |
 | `prefix`（文字列のみ） | `LIKE '<メタ文字エスケープ済み>%'`（update/delete の prefix と同じ `like_escape`） |
+| `ne` | `NOT ( <col> = <値> )`（SQL の `<>` と同じ脱糖形） |
+| `like`（文字列のみ） | `LIKE '<raw>'`（生のパターン） |
+| `in`（文字列・数値の配列） | `IN ( <値>, ... )`（`not` 群と組み合わせて `NOT IN`） |
+| `between`（要素 2 個） | `BETWEEN <値> AND <値>` |
+| `is_null`／`not_null` | `IS NULL`／`IS NOT NULL` |
+| `{"or":[...]}` 群 | `( <分岐> OR <分岐> ... )`（単一分岐は平坦化） |
+| `{"not":{...}}` 群 | `NOT ( <内側> )` |
 | 値: 文字列・数値 | `default_literal_tokens`（負数は `-` と数値に分かれ、engine が SQL 表層と同じ `42601` で拒否） |
 | 値: 真偽値（`eq` のみ） | `true`／`false` |
 
@@ -131,10 +140,15 @@ SQL と NoSQL の同一宣言が同一のカタログ表現になることは、
   列型との整合は engine の束縛が判定する（wire に型検査を持たない）。
 - 表制約としてのみ生成するため既定名は `<table>_check` 系（SQL の列制約形の
   `<table>_<col>_check` とは既定名だけが異なる。意図した差分）。
-- fail-closed の拒否（すべて `42601`）: check への `columns`／`references`、
+- fail-closed の拒否（`42601`）: check への `columns`／`references`、
   pk/unique/foreign_key への `predicate`、unique/foreign_key への `name`、`predicate` の欠落・空配列、
-  `in` と `or` グループ、語彙外の `op`、RLS 述語名の列、`prefix` と非文字列、
-  真偽値と `eq` 以外。葉が 256 件を超える場合は確保前に `54000`。
+  語彙外の `op`、RLS 述語名の列（`or`／`not` の内側を含む）、`prefix`／`like` と非文字列、
+  真偽値と `eq`／`ne` 以外、空の `in`、`between` の要素数違反、`is_null`／`not_null` への `value`、
+  `in`／`between` の真偽値・複合値の要素、`eq`／`ne` の複合値、形が不正な `or`／`not` 群。
+  葉の総数・`in` の要素数が 256 を超える場合とネスト深さ超過は確保前に `54000`。
+- 列型との整合は engine が判定し、SQL 表層と同じ `wire_code` になる（wire は先回り判定しない）:
+  TEXT 列の `between` と数値列への文字列要素の `in` は `22000`、vector 系列列の `is_null` は `42601`、
+  式を左辺にとる形は表現できない（NoSQL の `column` は列名のみ）。
 - `primary_key` の `name`（Issue #1437・NOSQL-13・TABLE-22）は
   `CONSTRAINT <ident> PRIMARY KEY (...)` へ写し、SQL 表層と同じカタログ表現にする。
   名前は `ident_token` と engine の制約名検証の二段で検証し、重複宣言（`42P16`）・
@@ -165,7 +179,9 @@ permission_denial_is_byte_identical_regardless_of_table_existence` で固定）�
   権限拒否・エラー分類・SQL/NoSQL パリティを固定（うち 7 件は
   Issue #1148 の参照アクション宣言・連鎖適用・宣言時検査・上限超過・
   テナント境界、7 件は Issue #1199 の CHECK 違反 `23514`・既定名・拒否・
-  件数上限・権限）。
+  件数上限・権限）。Issue #3246 で拡張述語形の三値論理・テナント越境（メッセージに他テナントの
+  値・名前を含まない）・RLS 述語名の入れ子拒否・engine 拒否の SQL パリティ・SQL の末尾 `;` 付き
+  INSERT との混在・権限を追加。
 - `crates/wire-server/src/http/query/ddl.rs`・`op.rs`・`schema.rs`・`gate.rs`・
   `http/session/{store,issue,middleware}.rs` の単体テスト。
 
@@ -173,7 +189,8 @@ permission_denial_is_byte_identical_regardless_of_table_existence` で固定）�
 
 - `ALTER COLUMN TYPE` 相当の op 語彙（`alter_table.drop_column` は Issue #1167 で
   SQL 表層と同じ入口へ結線済み）。
-- `alter_table` での CHECK 追加・削除、算術式を含む CHECK 述語、列制約形の
+- `alter_table` での CHECK 追加・削除（受け皿 Issue なし。要否は別途判断）、
+  算術式・関数呼び出しを含む CHECK 述語（filter 語彙に式の表現がない）、列制約形の
   既定名、pk/unique/fk の制約名指定の NoSQL 表現。
 - `create_view`／`drop_view` の NoSQL 対応。`create_index`／`drop_index` は op 形を
   [nosql-index-ddl-mapping.md](nosql-index-ddl-mapping.md) で確定し、Issue #2108 で結線済み。
