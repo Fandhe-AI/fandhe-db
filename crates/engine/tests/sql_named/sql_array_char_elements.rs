@@ -394,6 +394,15 @@ fn char_padding_is_bounded_before_allocation() {
     ] {
         assert_eq!(code(&core, sql), "54000", "{sql}");
     }
+    // NULL 要素は空白詰めされないため確保量に数えない。
+    ok(
+        &core,
+        "INSERT INTO big (id, a) VALUES (2, '{NULL,NULL}') USING OPERATION_ID 'd2'",
+    );
+    assert_eq!(
+        txt(&core, "SELECT '{NULL,NULL}'::char(10485760)[] LIMIT 1"),
+        "{NULL,NULL}"
+    );
 }
 
 #[test]
@@ -439,6 +448,11 @@ fn comparisons_ignore_char_padding_and_mix_with_text() {
         ("SELECT id FROM t WHERE v = tx LIMIT 10", 1),
         ("SELECT id FROM t WHERE 'ab' = ANY(v) LIMIT 10", 1),
         ("SELECT id FROM t WHERE v && ARRAY['cd'] LIMIT 10", 1),
+        // 型なしリテラル側が空白詰め済みでも等しい（Issue #3231）。
+        ("SELECT id FROM t WHERE c = '{\"a  \",b}' LIMIT 10", 1),
+        ("SELECT id FROM t WHERE '{\"a  \",b}' = c LIMIT 10", 1),
+        ("SELECT id FROM t WHERE c @> '{\"a  \"}' LIMIT 10", 1),
+        ("SELECT id FROM t WHERE c && '{\"b  \"}' LIMIT 10", 1),
     ] {
         assert_eq!(row_count(&core, "alice", sql), want, "{sql}");
     }

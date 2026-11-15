@@ -316,6 +316,18 @@ fn bind_array_operand(
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ArrayElemType), SqlSurfaceError> {
+    let (bound, orig) = bind_array_operand_orig(expr, env, node_budget)?;
+    let (bound, elem) = normalize_compare_operand(bound, orig);
+    Ok((bound, elem))
+}
+
+/// 要素型を正規化する前（`CHAR(n)`・`VARCHAR(n)` のまま）の配列オペランドの束縛。
+/// 型なしリテラルを反対側の元の要素型で解釈するために、正規化と分けて呼ぶ（Issue #3231）。
+fn bind_array_operand_orig(
+    expr: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ArrayElemType), SqlSurfaceError> {
     let (bound, ty) = bind_operand(expr, env, node_budget)?;
     if ty != ExprType::Array {
         return Err(operator_missing("array"));
@@ -334,10 +346,14 @@ fn bind_array_operand(
             "array predicates on numeric, json or enum elements are not supported yet",
         ));
     }
-    // `VARCHAR`／`CHAR(n)` 要素は TEXT と同じ比較系として扱う（Issue #3231。PostgreSQL と同じく
-    // `text[] = varchar[]` を受理する）。`CHAR(n)` は空白詰めで保存されるが比較では末尾の空白を
-    // 無視するため、被演算子を「要素ごとに末尾 U+0020 を除いた `text[]`」へ変換して束縛する
-    // （投影では包まず、空白詰めのまま返る）。
+    Ok((bound, elem))
+}
+
+/// `VARCHAR`／`CHAR(n)` 要素は TEXT と同じ比較系として扱う（Issue #3231。PostgreSQL と同じく
+/// `text[] = varchar[]` を受理する）。`CHAR(n)` は空白詰めで保存されるが比較では末尾の空白を
+/// 無視するため、被演算子を「要素ごとに末尾 U+0020 を除いた `text[]`」へ変換して束縛する
+/// （投影では包まず、空白詰めのまま返る）。型なしリテラル側にも同じ正規化を適用する。
+fn normalize_compare_operand(bound: BoundExpr, elem: ArrayElemType) -> (BoundExpr, ArrayElemType) {
     match elem {
         ArrayElemType::Bpchar(n) => {
             let trimmed = super::cast::cast_node(
@@ -347,10 +363,19 @@ fn bind_array_operand(
                 },
                 bound,
             );
-            Ok((trimmed, ArrayElemType::Text))
+            (trimmed, ArrayElemType::Text)
         }
-        ArrayElemType::Varchar(_) => Ok((bound, ArrayElemType::Text)),
-        _ => Ok((bound, elem)),
+        ArrayElemType::Varchar(_) => (bound, ArrayElemType::Text),
+        _ => (bound, elem),
+    }
+}
+
+/// `text[]` に解釈済みの型なしリテラルへ、反対側が `CHAR(n)[]` のときだけ要素ごとの末尾 U+0020 除去を
+/// 適用する（`CHAR(n)` 側は [`normalize_compare_operand`] で除去済み。両辺の比較を揃える）。
+fn rtrim_literal_like(bound: BoundExpr, orig: ArrayElemType) -> BoundExpr {
+    match orig {
+        ArrayElemType::Bpchar(_) => normalize_compare_operand(bound, orig).0,
+        _ => bound,
     }
 }
 
@@ -391,13 +416,19 @@ fn bind_array_pair(
             Ok((l, r, le))
         }
         (true, false) if is_untyped_literal(rhs) => {
-            let (l, le) = bind_array_operand(lhs, env, node_budget)?;
+            let (l, lo) = bind_array_operand_orig(lhs, env, node_budget)?;
+            let (l, le) = normalize_compare_operand(l, lo);
             let (r, _) = bind_cast(rhs, &literal_as(le)?, env, node_budget)?;
+            // `CHAR(n)` 側の末尾空白を無視する比較に合わせ、リテラル側も同じ rtrim を通す
+            // （`CHAR(n)` へは変換せず、PG と同じく切り詰め・空白詰めは行わない）。
+            let r = rtrim_literal_like(r, lo);
             Ok((l, r, le))
         }
         (false, true) if is_untyped_literal(lhs) => {
-            let (r, re) = bind_array_operand(rhs, env, node_budget)?;
+            let (r, ro) = bind_array_operand_orig(rhs, env, node_budget)?;
+            let (r, re) = normalize_compare_operand(r, ro);
             let (l, _) = bind_cast(lhs, &literal_as(re)?, env, node_budget)?;
+            let l = rtrim_literal_like(l, ro);
             Ok((l, r, re))
         }
         _ => Err(operator_missing(op_sql)),

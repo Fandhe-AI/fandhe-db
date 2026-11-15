@@ -1654,11 +1654,12 @@ fn convert_array_elements(
         // `VARCHAR(n)[]`／`CHAR(n)[]`（Issue #3231）。代入（INSERT・UPDATE 等）は要素ごとに
         // スカラー列と同じ規則（超過は `22001`・末尾空白のみの超過は切り詰め・`CHAR` は空白詰め）、
         // 明示 CAST は `n` 文字へ黙って切り詰め（`CHAR` は空白詰め）。`CHAR(n)` の空白詰めによる
-        // 巨大確保は、要素数 × n を確保前に配列ペイロード上限で検査して `54000` にする。
+        // 巨大確保は、非 NULL 要素数 × n を確保前に配列ペイロード上限で検査して `54000` にする。
         E::Varchar(Some(n)) | E::Bpchar(n) => {
             let pads = matches!(elem, E::Bpchar(_));
             if pads
-                && (raw_elements.len() as u64).saturating_mul(u64::from(n))
+                && (raw_elements.iter().filter(|e| e.is_some()).count() as u64)
+                    .saturating_mul(u64::from(n))
                     > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN)
             {
                 return Err(SqlSurfaceError::payload_too_large(

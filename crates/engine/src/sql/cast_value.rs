@@ -1310,7 +1310,12 @@ fn cast_array(
     // 超えるなら変換前に `54000` で拒否する（`CHAR(10485760)[]` 等による巨大確保の防止。
     // Issue #3231）。
     if let ArrayElemType::Bpchar(n) = to {
-        let total = (a.flat().len() as u64).saturating_mul(u64::from(n));
+        // NULL 要素は空白詰めされないため数えない（`ARRAY[...]` 経路と同じ契約）。
+        let non_null = array_to_values(a.flat())?
+            .iter()
+            .filter(|e| !matches!(e, ExprValue::Null))
+            .count();
+        let total = (non_null as u64).saturating_mul(u64::from(n));
         if total > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN) {
             return Err(SqlSurfaceError::payload_too_large(
                 "array of character(n) elements exceeds the maximum array payload length",
