@@ -100,7 +100,10 @@ fn wire_set_op_rejections_carry_sqlstate() {
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
 
     for (sql, code) in [
-        ("SELECT s FROM a EXCEPT ALL SELECT s FROM b;", "42601"),
+        (
+            "SELECT s FROM a EXCEPT ALL DISTINCT SELECT s FROM b;",
+            "42601",
+        ),
         (
             "SELECT s FROM a INTERSECT ALL DISTINCT SELECT s FROM b;",
             "42601",

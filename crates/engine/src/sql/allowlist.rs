@@ -4296,6 +4296,9 @@ pub(crate) enum SetOperator {
     /// min(左の出現数, 右の出現数) 件だけ残す。
     IntersectAll,
     Except,
+    /// 多重集合版の `EXCEPT ALL`（Issue #3269）。左の順序で、同じ行を
+    /// max(左の出現数 − 右の出現数, 0) 件だけ残す（先に現れた行から相殺する）。
+    ExceptAll,
 }
 
 /// 集合演算の構文木。葉は単一テーブルの広域取得（[`ValidatedScan`]）に限定する
@@ -24128,8 +24131,9 @@ fn parse_set_term(
     Ok(left)
 }
 
-/// `set_expr := set_term { (UNION [ALL | DISTINCT] | EXCEPT) set_term }`
-/// （`EXCEPT ALL`／`EXCEPT DISTINCT` は #3269 まで `42601`）（左結合）。
+/// `set_expr := set_term { (UNION [ALL | DISTINCT] | EXCEPT [ALL | DISTINCT]) set_term }`
+/// （左結合）。量指定語は 1 語だけ消費し、明示 `DISTINCT` は既定と同義（Issue #3269）。
+/// 量指定語の連続は次の `parse_set_term` が枝の開始を見つけられず `42601`。
 fn parse_set_expr(
     p: &mut Parser<'_>,
     lookup: &impl TableLookup,
@@ -24162,14 +24166,22 @@ fn parse_set_expr(
             };
         } else if p.peek_ident_matches("EXCEPT") {
             p.advance();
-            if p.peek_ident_matches("ALL") || p.peek_ident_matches("DISTINCT") {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXCEPT ALL/DISTINCT is not supported",
-                ));
-            }
+            let all = if p.peek_ident_matches("ALL") {
+                p.advance();
+                true
+            } else if p.peek_ident_matches("DISTINCT") {
+                p.advance();
+                false
+            } else {
+                false
+            };
             let right = parse_set_term(p, lookup, depth, branch_count)?;
             left = SetTree::Op {
-                op: SetOperator::Except,
+                op: if all {
+                    SetOperator::ExceptAll
+                } else {
+                    SetOperator::Except
+                },
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -41007,7 +41019,7 @@ mod tests {
 
     /// Issue #2047（SQL-75 (2) ポインタ）: 集合演算の `EXPLAIN` は `ExplainTarget::SetOperation`
     /// になる（先頭が括弧の形を含む）。集合演算子の無い `EXPLAIN (SELECT ...)` は従来どおり `42601`、
-    /// 未対応の枝形（`EXCEPT ALL`）は非 EXPLAIN と同じ拒否。
+    /// 未対応の枝形（`EXCEPT ALL DISTINCT`）は非 EXPLAIN と同じ拒否。
     #[test]
     fn explain_accepts_set_operation_shapes() {
         let lookup = catalog_with(&["a", "b"]);
@@ -41016,6 +41028,7 @@ mod tests {
             "EXPLAIN (SELECT id FROM a) UNION ALL SELECT id FROM b",
             "EXPLAIN SELECT id FROM a EXCEPT SELECT id FROM b LIMIT 3",
             "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
+            "EXPLAIN SELECT id FROM a EXCEPT ALL SELECT id FROM b",
         ] {
             match validate_sql(sql, &lookup) {
                 Ok(Statement::Explain(target @ ExplainTarget::SetOperation(_))) => {
@@ -41033,13 +41046,16 @@ mod tests {
         }
         let err = validate_sql("EXPLAIN (SELECT id FROM a)", &lookup).expect_err("no operator");
         assert_eq!(err.wire_code(), "42601");
-        let plain = validate_sql("SELECT id FROM a EXCEPT ALL SELECT id FROM b", &lookup)
-            .expect_err("plain EXCEPT ALL is rejected");
-        let explained = validate_sql(
-            "EXPLAIN SELECT id FROM a EXCEPT ALL SELECT id FROM b",
+        let plain = validate_sql(
+            "SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
             &lookup,
         )
-        .expect_err("EXPLAIN EXCEPT ALL is rejected");
+        .expect_err("plain EXCEPT ALL DISTINCT is rejected");
+        let explained = validate_sql(
+            "EXPLAIN SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
+            &lookup,
+        )
+        .expect_err("EXPLAIN EXCEPT ALL DISTINCT is rejected");
         assert_eq!(plain.wire_code(), explained.wire_code());
     }
 
@@ -41066,6 +41082,19 @@ mod tests {
             op_of("SELECT id FROM a UNION DISTINCT SELECT id FROM b"),
             SetOperator::Union
         );
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT ALL SELECT id FROM b"),
+            SetOperator::ExceptAll
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT DISTINCT SELECT id FROM b"),
+            SetOperator::Except
+        );
+        // INTERSECT は EXCEPT ALL より強く結合する（根が ExceptAll）。
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT ALL SELECT id FROM b INTERSECT SELECT id FROM c"),
+            SetOperator::ExceptAll
+        );
         // INTERSECT ALL は UNION より強く結合する。
         assert_eq!(
             op_of("SELECT id FROM a UNION SELECT id FROM b INTERSECT ALL SELECT id FROM c"),
@@ -41074,8 +41103,9 @@ mod tests {
         for sql in [
             "SELECT id FROM a INTERSECT ALL DISTINCT SELECT id FROM b",
             "SELECT id FROM a INTERSECT ALL ALL SELECT id FROM b",
-            "SELECT id FROM a EXCEPT ALL SELECT id FROM b",
-            "SELECT id FROM a EXCEPT DISTINCT SELECT id FROM b",
+            "SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
+            "SELECT id FROM a EXCEPT ALL ALL SELECT id FROM b",
+            "SELECT id FROM a EXCEPT DISTINCT ALL SELECT id FROM b",
         ] {
             let e = validate_sql(sql, &lookup).expect_err(sql);
             assert_eq!(e.wire_code(), "42601", "{sql}");
