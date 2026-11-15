@@ -103,6 +103,7 @@ pub(crate) fn binary_param_for_wire_type(t: crate::result_encoder::WireType) -> 
         | WireType::TextArray
         | WireType::BoolArray
         | WireType::Int2Array
+        | WireType::TimeArray
         | WireType::Int4Array
         | WireType::Int8Array
         | WireType::Float4Array

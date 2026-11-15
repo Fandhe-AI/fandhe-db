@@ -382,6 +382,10 @@ fn write_array(
             quoted(out, &engine::datetime::format_timestamp(*v));
             Ok(())
         })?,
+        ArrayValue::Time(items) => each!(out, items, |out, v| {
+            quoted(out, &engine::datetime::format_time(*v));
+            Ok(())
+        })?,
         ArrayValue::Uuid(items) => each!(out, items, |out, v| {
             quoted(out, &v.to_string());
             Ok(())
@@ -494,6 +498,7 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
                 engine::catalog::ArrayElemType::Double => "double precision[]",
                 engine::catalog::ArrayElemType::Date => "date[]",
                 engine::catalog::ArrayElemType::Timestamp => "timestamp[]",
+                engine::catalog::ArrayElemType::Time => "time[]",
                 engine::catalog::ArrayElemType::Uuid => "uuid[]",
                 engine::catalog::ArrayElemType::Numeric { .. } => "numeric[]",
                 engine::catalog::ArrayElemType::Bytea => "bytea[]",
@@ -1088,6 +1093,12 @@ mod tests {
                 "timestamp[]",
                 V::Timestamp(vec![Some(1_000_000)]),
                 r#"["1970-01-01 00:00:01"]"#,
+            ),
+            (
+                ArrayElemType::Time,
+                "time[]",
+                V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)]),
+                r#"["10:00:00",null,"24:00:00"]"#,
             ),
             (
                 ArrayElemType::Uuid,

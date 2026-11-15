@@ -144,6 +144,7 @@ pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
         ArrayElemType::Double => CastSrc::Float8,
         ArrayElemType::Date => CastSrc::Date,
         ArrayElemType::Timestamp => CastSrc::Timestamp,
+        ArrayElemType::Time => CastSrc::Time,
         ArrayElemType::Uuid => CastSrc::Uuid,
         ArrayElemType::Numeric { .. } => CastSrc::Numeric,
         ArrayElemType::Bytea => CastSrc::Bytea,
@@ -167,6 +168,7 @@ pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
         ArrayElemType::Double => CastDst::Float8,
         ArrayElemType::Date => CastDst::Date,
         ArrayElemType::Timestamp => CastDst::Timestamp,
+        ArrayElemType::Time => CastDst::Time,
         ArrayElemType::Uuid => CastDst::Uuid,
         ArrayElemType::Numeric { precision, scale } => CastDst::Numeric(Some((precision, scale))),
         ArrayElemType::Bytea => CastDst::Bytea,
@@ -1201,6 +1203,7 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Double(v) => map(v, |x| Ok(ExprValue::Scalar(*x))),
         ArrayValue::Date(v) => map(v, |d| Ok(ExprValue::Date(*d))),
         ArrayValue::Timestamp(v) => map(v, |t| Ok(ExprValue::Timestamp(*t))),
+        ArrayValue::Time(v) => map(v, |t| Ok(ExprValue::Time(*t))),
         ArrayValue::Uuid(v) => map(v, |u| Ok(ExprValue::Uuid(*u))),
         ArrayValue::Numeric(v) => map(v, |d| Ok(ExprValue::Numeric(*d))),
         ArrayValue::Bytea(v) => map(v, |b| Ok(ExprValue::Bytes(Cow::Owned(b.clone())))),
@@ -1269,6 +1272,12 @@ pub(crate) fn values_to_array(
         })?),
         ArrayElemType::Timestamp => ArrayValue::Timestamp(collect(values, |v| match v {
             ExprValue::Timestamp(t) => Ok(t),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Time => ArrayValue::Time(collect(values, |v| match v {
+            // 防御: 変換経路は範囲検査済みの値だけを渡すが、範囲外は格納せず拒否する（fail-closed）。
+            ExprValue::Time(t) if crate::datetime::validate_time_micros(t) => Ok(t),
+            ExprValue::Time(_) => Err(out_of_range("time out of range")),
             _ => Err(bad()),
         })?),
         ArrayElemType::Uuid => ArrayValue::Uuid(collect(values, |v| match v {

@@ -120,6 +120,7 @@ mod sql_smallint_widening;
 mod sql_sparsevec_column;
 mod sql_sparsevec_limits;
 mod sql_surface;
+mod sql_time_array;
 mod sql_time_column;
 mod sql_time_query;
 mod sql_timestamptz_column;

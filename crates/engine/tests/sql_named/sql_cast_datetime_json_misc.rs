@@ -1054,16 +1054,49 @@ fn smallint_array_cast_converts_values_and_checks_range() {
     );
 }
 
+/// `time[]` への CAST（Issue #3232）。値・結果の列型・型付き NULL・範囲外・書式不正・
+/// 規則表で `×` の整数配列（`42846`）。
+#[test]
+fn time_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-time");
+    let time_ty =
+        ColumnType::Array(ArrayType::new(ArrayElemType::Time, MAX_ARRAY_ELEMENTS).expect("ty"));
+    let (cell, meta) = first(&core, "CAST('{10:00,24:00:00}' AS time[])");
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::Time(vec![
+            Some(36_000_000_000),
+            Some(86_400_000_000)
+        ]))
+    );
+    assert_eq!(meta_type(&meta), Some(time_ty.clone()));
+    let (cell, meta) = first(&core, "CAST(NULL AS time[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(time_ty));
+    // 整数配列 -> time[] は規則表で `×`（42846）のまま。
+    assert_eq!(err_of(&core, "CAST(ai AS time[])").wire_code(), "42846");
+    // text 配列からは要素ごとの io 変換。
+    assert_eq!(
+        value(&core, "CAST(CAST('{01:02:03}' AS text[]) AS time[])"),
+        Cell::Array(ArrayValue::Time(vec![Some(3_723_000_000)]))
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{24:00:01}' AS time[])").wire_code(),
+        "22008"
+    );
+    assert_eq!(err_of(&core, "CAST('{x}' AS time[])").wire_code(), "22007");
+}
+
 #[test]
 fn arrays_without_a_representable_element_type_are_not_implemented() {
     let (core, _g) = setup("cast-array-unsupported");
-    for target in ["time[]", "timestamptz[]", "interval[]"] {
+    for target in ["timestamptz[]", "interval[]"] {
         // 文字列型・型付き NULL は常に 0A000。整数配列は要素の組（int4 -> 変換先の要素型）が
         // 規則表で `×` なら 42846 が先に出る（time／timestamptz／interval）。
         for operand in ["ai", "CAST('{1}' AS text)", "NULL"] {
             let e = err_of(&core, &format!("CAST({operand} AS {target})"));
             let elem_is_impossible =
-                operand == "ai" && ["time[]", "timestamptz[]", "interval[]"].contains(&target);
+                operand == "ai" && ["timestamptz[]", "interval[]"].contains(&target);
             let want = if elem_is_impossible { "42846" } else { "0A000" };
             assert_eq!(e.wire_code(), want, "{operand} -> {target}");
         }
