@@ -318,8 +318,11 @@ fn range_op(op: &str) -> Option<CompareOp> {
 /// `filter` 配列要素・`or` グループの中間形（形・語彙・RLS・上限は検査済みで、
 /// 列型に依存する値の解釈は `schema` が届くまで確定できないため未解決のまま
 /// 借用で保持する）。
+///
+/// `pub(super)` なのは `ddl.rs` の `create_table` CHECK 写像（Issue #3246）が形検査段
+/// （[`map_filter_items`]）を共有し、第 2 の形パーサを持たないため。
 #[derive(Debug)]
-enum FilterNode<'a> {
+pub(super) enum FilterNode<'a> {
     Leaf {
         column: &'a str,
         op: &'a str,
@@ -569,7 +572,7 @@ fn map_element<'a>(
 /// へ写像する。件数検査（[`declarative_filter::check_filter_count`]、`54000`）を
 /// `Vec` 確保・借用より**前**に行う（`.claude/rules/security.md`「不安全な設計｜
 /// 無制限リソース確保（DoS）」対応）。
-fn map_filter_items(items: &[JsonValue]) -> Result<Vec<FilterNode<'_>>, FilterError> {
+pub(super) fn map_filter_items(items: &[JsonValue]) -> Result<Vec<FilterNode<'_>>, FilterError> {
     declarative_filter::check_filter_count(items.len()).map_err(FilterError::Bind)?;
     let mut leaves = 0usize;
     let mut mapped = Vec::with_capacity(items.len());
