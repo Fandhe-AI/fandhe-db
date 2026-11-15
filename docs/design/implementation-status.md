@@ -2097,3 +2097,5 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 `storage::decode_row_dim_and_metadata_body_borrowed(buf, offset)` へ渡し、行ごとのヘッダ（tenant の UTF-8 検証）
 デコードを 1 回にした。検査の順序・fail-closed は不変。単体・結合テストを追加。同一ホスト A/B の実測は未検証。
 詳細は `docs/design/wide-retrieval-scan.md` の追記節。
+
+**Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。
