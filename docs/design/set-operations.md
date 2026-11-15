@@ -51,7 +51,7 @@ spec 上、集合演算（SQL-29 (c)）の前提タスク TASK-213 は `JOIN`・
 
 ```text
 top       := set_expr [ORDER BY <set_key> {, <set_key>}] [LIMIT <n>] [OFFSET <m>] [;]
-set_key   := (<出力列名> | <整数序数>) [ASC|DESC] [NULLS FIRST|LAST]   -- Issue #3266（構文・束縛のみ）
+set_key   := (<出力列名> | <整数序数>) [ASC|DESC] [NULLS FIRST|LAST]   -- Issue #3266（構文・束縛）・#3267（実行）
 set_expr  := set_term { (UNION [ALL | DISTINCT] | EXCEPT [ALL | DISTINCT]) set_term }  -- 左結合
 set_term  := primary { INTERSECT [ALL | DISTINCT] primary }                   -- 左結合・UNION/EXCEPT より高優先
 primary   := branch | '(' set_expr ')'                         -- 括弧の入れ子深さは 4 まで（実装既定値）
@@ -91,11 +91,20 @@ Issue #3266（SQL-29・SQL-56 のポインタ）で、括弧なし末尾の `ORD
 - 式キーは `0A000`（PG は結果列名しか許さない）。キー数の上限は広域取得と同じ 8（超過は `54000`）。
 - 判定順は、構文（`42601`）→ 全体 `LIMIT`／`OFFSET` の範囲（`22000`）→ 型整合（`42804`）→
   キーの解決 → 関門。
-- **ソート実行は Issue #3267 まで未実装**のため、解決に成功したキーも `check_set_order_by` の関門が
-  `0A000` で拒否する（未ソートの行を返さない）。関門は `prepare`／`describe_columns` にあり、
-  実行・Describe・`EXPLAIN`（`ANALYZE` 含む）・`DECLARE CURSOR` が共有する。ビュー・InlineOnly の
-  CTE 本文・再帰 CTE のアンカー項は定義時に `0A000`。#3267 はこの関門を解決済みキーの返却へ
-  置き換える。
+- Issue #3267 で実行を実装した。合成結果（重複除去・上限判定の後）を `sql::cell_sort::sort_rows`
+  （安定ソート。`sort_by` のみ）で並べ、その後に `OFFSET` → `LIMIT`／結果行数上限を適用する
+  （`FETCH FIRST n ROWS ONLY`・`OFFSET m ROWS` は正規化で `LIMIT`／`OFFSET` になる）。同値の行は
+  下記の順序規約（左の子が先・枝内は走査順）を保つ。ソート用の領域は確保前に文全体の累計バイト
+  予算へ計上し（`checked_*`）、超過は `54000`。
+- キー型と照合は `sql::set_op::plan_set_order_by` が行を読まずに検査し、`prepare`／
+  `describe_columns` が共有する（実行・Describe・`EXPLAIN`〔`ANALYZE` 含む〕・`DECLARE CURSOR` の
+  受理・拒否が一致する）。比較できない型（`TIMESTAMPTZ`・`TIME`・`INTERVAL`・`CHAR(n)`・`JSON`・
+  配列・`VECTOR` 等）と、非バイト列順（ICU）照合の列を持つ表がある文の `TEXT` キーは `0A000`
+  （バイト列順で黙って比べない fail-closed）。ビュー本文は参照時に同じ検査を通る。
+- `EXPLAIN` は全体 `sort` 段（`sort_keys` はキー数のみ）を、全体 `limit` 段と `set_operation` 段の
+  間に出す。
+- 式キーの `0A000` は PG と同じ（結果列名・序数しか許さない）意図的な拒否。再帰 CTE のアンカー項の
+  全体 `ORDER BY` は PG でも受理されない位置のため定義時に `0A000` のままとする（意図的な拒否）。
 - 次は従来どおり `42601`: 最後以外の枝の直後の `ORDER BY`、括弧内の入れ子の集合式の `ORDER BY`、
   `LIMIT` の後の `ORDER BY`、キー無し・末尾カンマ、修飾名、距離演算子キー。
 
@@ -112,10 +121,15 @@ Issue #3270（SQL-42 のポインタ）で、`FROM` あり枝の式項目（リ�
 （`SELECT 7 UNION SELECT y FROM b`）を `SetTree::ConstBranch` として受理する。定数枝は
 `sql::const_select` の束縛・実行をそのまま使い、表を読まないので RLS の対象行を持たない。
 定数枝の集計項目・`WHERE`／`HAVING`、括弧付きの `LIMIT`／`OFFSET` は `42601`、ルーチン呼び出し・
-スキーマ関数は束縛段が `0A000`。全枝が定数の集合演算（`SELECT 1 UNION SELECT 2`）と、式射影の枝・
-定数枝を含む集合演算の `EXPLAIN` は `0A000`（EXPLAIN は Issue #3271 で対応予定）。ビュー本文の
-定数枝・式枝は `42601`。型の決まらない `NULL`・文字列リテラルを他の枝の型へ解決する規則は
+スキーマ関数は束縛段が `0A000`。全枝が定数の集合演算（`SELECT 1 UNION SELECT 2`）とその
+`EXPLAIN` は `0A000`。ビュー本文の定数枝・式枝は `42601`。型の決まらない `NULL`・文字列リテラルを他の枝の型へ解決する規則は
 持たず、型が一致しなければ `42804`。
+
+Issue #3271 で、式射影の枝・定数枝を含む集合演算の結果（`INTERSECT`／`EXCEPT`・`ALL` を含む）と
+`EXPLAIN`（`ANALYZE`・`VERBOSE`・`FORMAT JSON` を含む）を対応済みにした。EXPLAIN は、式射影の枝を
+通常の `scan` 葉（単一表の `EXPLAIN` と同じく射影の中身は描画しない）、定数枝を葉 `result`
+（`source: constant`。`cte_explain` と共通の語彙）として描画する。`relation:` の序数は位置ベースで、
+定数枝も葉の位置を 1 つ消費する（`SELECT 7 UNION SELECT k FROM a` の `scan` は `relation: 2`）。
 
 全体に対する `LIMIT <n>` は任意（`1..=core::MAX_SEARCH_K`。範囲外は
 `22000`）。範囲検証は `sql::set_op::execute` が全枝の走査より前に行い、
@@ -185,14 +199,20 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 - `INTERSECT ALL`／`EXCEPT ALL` の右辺の出現数表も文全体の累計バイト予算に計上する（超過は `54000`）。
 - 全体の `LIMIT n` は、この順序の先頭から n 件。
 
-## スコープ外（Issue #929 の対象外事項）
+## スコープ外（Issue #929・#3270・#3271 の対象外事項）
 
-- `DISTINCT`・ベクトル順位付けを含む枝、集合演算の結果全体に対する `ORDER BY` のソート実行
-  （構文・束縛は Issue #3266 で対応済み、実行は Issue #3267。集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）
-- `COPY TO`・`EXPLAIN` での集合演算（`EXPLAIN` は Issue #2047、`DECLARE CURSOR` は Issue #3176 で対応済み。
-  cursor の詳細は [sql-cursor.md](sql-cursor.md)。
-  詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md)）、明示トランザクション
-  内での実行（いずれも既存の既定経路で `42601`／`0A000` に自然に落ちる）
+- `DISTINCT`・ベクトル順位付けを含む枝（集合演算の結果全体に対する `ORDER BY` は構文・束縛を
+  Issue #3266、実行を Issue #3267 で対応済み。集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）。
+  全体 `ORDER BY` の未対応は、比較できない型・ICU 照合のキー、`FETCH ... WITH TIES`（いずれも
+  `0A000`／`42601`。親 Issue #3265 の配下で追跡）
+- 式射影の枝・定数枝（Issue #3270・#3271 で結果と `EXPLAIN` を対応済み）の残る未対応（受け皿の Issue は未定）:
+  全枝が定数の集合演算とその `EXPLAIN`（`0A000`）、定数枝の集計・`WHERE`／`HAVING`・括弧付き定数枝の
+  `LIMIT`／`OFFSET`（`42601`）、型の決まらない `NULL`・文字列リテラルの型解決（`42703`／`42804`）、
+  ビュー本文の定数枝・式枝（`42601`）、枝内の窓関数・式 `ORDER BY` キー（`42601`）
+- `COPY TO`、明示トランザクション内での実行（既存の既定経路で `42601`／`0A000` に自然に落ちる）。
+  `EXPLAIN` は Issue #2047、`DECLARE CURSOR` は Issue #3176 で対応済み（cursor の詳細は
+  [sql-cursor.md](sql-cursor.md)、`EXPLAIN` は
+  [explain-search-engine-exposure.md](explain-search-engine-exposure.md)）
 - NoSQL（HTTP）表層での集合演算（spec 上も非対応）
 - サブクエリと CTE（#927・#928）、`JOIN` を含む複数テーブル計画基盤
   （#924〜#926）、RLS-10 の横断検証（#931）

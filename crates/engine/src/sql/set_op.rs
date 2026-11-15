@@ -29,11 +29,12 @@
 //! `eval_tree` が同時に保持し得ると、単一クエリの結果予算をはるかに超える
 //! 合計メモリを SQL 入力だけで確保できてしまう〔DoS〕ため）。
 //!
-//! 括弧なし末尾の `ORDER BY`（集合全体のソートキー。Issue #3266）は、本モジュールが出力列名・
-//! 序数を左端の枝の列へ解決する（[`resolve_order_keys`]）ところまでを担う。ソート実行は
-//! Issue #3267 の責務で、それまでは解決に成功したキーも [`check_set_order_by`] の関門が
-//! `0A000` で拒否する（未ソートの行を返さない fail-closed。実行・Describe・`EXPLAIN`・
-//! `DECLARE CURSOR` はいずれも [`prepare`]／[`describe_columns`] を通る）。
+//! 括弧なし末尾の `ORDER BY`（集合全体のソートキー。Issue #3266・#3267）は、本モジュールが出力列名・
+//! 序数を左端の枝の列へ解決し（[`resolve_order_keys`]）、キー型・照合を検査して比較計画にし
+//! （[`plan_set_order_by`]）、合成結果の確定後・`OFFSET`／`LIMIT` の直前に
+//! [`crate::sql::cell_sort::sort_rows`]（安定ソート）で並べ替える。比較できない型・非バイト列順の
+//! 照合は `0A000` で拒否する（未ソートの行や誤順の行を返さない fail-closed）。実行・Describe・
+//! `EXPLAIN`・`DECLARE CURSOR` はいずれも [`prepare`]／[`describe_columns`] を通る。
 //!
 //! スコープ外（Issue #929 の対象外事項。詳細は PR 本文参照）:
 //! - 明示トランザクション内での実行
@@ -46,7 +47,9 @@ use crate::sql::allowlist::{
     SetAggregateBranch, SetConstBranch, SetOperator, SetOrderKey, SetTree, SqlSurfaceError,
     ValidatedScan,
 };
+use crate::sql::cell_sort::{sort_rows, OrderClass, OrderKeyPlan};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::join::values::{cmp_class, CmpClass};
 use crate::sql::order_value::NullPlacement;
 use crate::sql::udf_call::UdfRegistry;
 
@@ -797,7 +800,7 @@ fn validate_tree_types(
                         has_offset: bound.offset != 0,
                         aggregate: None,
                     },
-                    scan: Some(bound),
+                    source: BoundSetLeafSource::Scan(Box::new(bound)),
                 });
             }
             Ok((columns, has_vector))
@@ -823,22 +826,31 @@ fn validate_tree_types(
                         has_offset: grouped.is_some_and(|g| g.offset != 0),
                         aggregate: Some(aggregate_shape(&bound)),
                     },
-                    scan: None,
+                    source: BoundSetLeafSource::Aggregate,
                 });
             }
             Ok((columns, has_vector))
         }
         SetTree::ConstBranch(branch) => {
-            // EXPLAIN（`leaves` を渡す経路）は構文段が定数枝を 0A000 にするため到達しない。
-            // 到達したら葉の対応が崩れるので fail-closed にする。
-            if leaves.is_some() {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "FROM-less branch reached the set operation EXPLAIN path".to_string(),
-                });
-            }
+            // 束縛を先に行い、束縛エラー（ルーチン呼び出しの 0A000 等）を実行・EXPLAIN で同じ順序・
+            // `wire_code` にする（Issue #3271）。
             let bound = crate::sql::const_select::bind(&branch.0, udfs)?;
             let columns = bound.columns();
             let has_vector = columns_have_vector(&columns);
+            if let Some(out) = leaves {
+                // 定数枝は表を読まない葉。表名は空・段なしの形で積む（EXPLAIN は葉 `result`）。
+                out.push(BoundSetLeaf {
+                    table: String::new(),
+                    shape: LeafShape {
+                        limited: false,
+                        sort_keys: 0,
+                        has_limit: false,
+                        has_offset: false,
+                        aggregate: None,
+                    },
+                    source: BoundSetLeafSource::Constant,
+                });
+            }
             Ok((columns, has_vector))
         }
         SetTree::Op { op, left, right } => {
@@ -858,10 +870,9 @@ fn validate_tree_types(
 }
 
 /// 解決済みの集合全体 `ORDER BY` キー（Issue #3266）。`index` は合成後の出力列の位置（0 始まり）。
-/// `nulls` は未指定を PG 既定（ASC は末尾・DESC は先頭）で確定した値。ソート実行（Issue #3267）が
-/// 受け取る形で、本 Issue では関門（[`check_set_order_by`]）の判定にだけ使う。
+/// `nulls` は未指定を PG 既定（ASC は末尾・DESC は先頭）で確定した値。[`plan_set_order_by`] が
+/// 比較クラスを付けて [`OrderKeyPlan`] にし、ソート実行（Issue #3267）が受け取る。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct ResolvedSetOrderKey {
     pub(crate) index: usize,
     pub(crate) descending: bool,
@@ -935,21 +946,81 @@ pub(crate) fn resolve_order_keys(
     Ok(resolved)
 }
 
-/// ソート未実装の間の関門（Issue #3266。実装は Issue #3267）。キーを解決（構文・束縛の誤りは
-/// 先に `42703`／`42702`／`42P10`）し、1 つ以上あれば `0A000` で拒否する。Execute・Describe・
-/// `EXPLAIN`・`DECLARE CURSOR` が同じ関数を通るため受理・拒否が一致する。#3267 はこの関門を
-/// 解決済みキーの返却へ置き換える。
-pub(crate) fn check_set_order_by(
+/// 集合全体 `ORDER BY` の実行計画を行を読まずに作る（Issue #3267・SQL-29 (c) ポインタ）。
+/// キーを解決（構文・束縛の誤りは先に `42703`／`42702`／`42P10`）したあと、キー列の型から比較
+/// クラスを決める。比較できない型（`TIMESTAMPTZ`・`CHAR(n)`・`JSON`・配列・`VECTOR` 等）と、
+/// 非バイト列順の照合を持つ列を含む表がある場合の `TEXT` キーは `0A000` で拒否する（照合を
+/// 運ばずにバイト列順で黙って比べる fail-open を作らない。`core.rs` の
+/// `check_buffered_view_collations` と同じ保守的な表単位の判定）。Execute（[`prepare`]）・
+/// Describe・`EXPLAIN`・`DECLARE CURSOR` が同じ関数を通るため受理・拒否と `wire_code` が一致する。
+/// 行を読まないので、可視行の有無によらず分類・文言は同一（テナント境界を緩めない）。
+/// キーが無ければ空の計画（ソートなし）。
+pub(crate) fn plan_set_order_by(
+    schemas: &HashMap<String, TableSchema>,
+    tree: &SetTree,
     columns: &[ColumnMeta],
     keys: &[SetOrderKey],
-) -> Result<(), SqlSurfaceError> {
+) -> Result<Vec<OrderKeyPlan>, SqlSurfaceError> {
     let resolved = resolve_order_keys(columns, keys)?;
-    if resolved.is_empty() {
-        Ok(())
-    } else {
-        Err(SqlSurfaceError::feature_not_supported(
-            "ORDER BY over a set operation result is not supported yet",
-        ))
+    let mut plans = Vec::with_capacity(resolved.len());
+    let mut has_text_key = false;
+    for key in &resolved {
+        let meta = columns
+            .get(key.index)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let class = match meta {
+            ColumnMeta::Id => cmp_class(None),
+            ColumnMeta::AliasedId { .. } => cmp_class(Some(&crate::sql::exec::ALIASED_ID_TYPE)),
+            ColumnMeta::Scalar { ty, .. } | ColumnMeta::Computed { ty: Some(ty), .. } => {
+                cmp_class(Some(ty))
+            }
+            ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => None,
+        }
+        .ok_or_else(|| {
+            SqlSurfaceError::feature_not_supported(
+                "ORDER BY over a set operation result is not supported for this column type",
+            )
+        })?;
+        has_text_key |= matches!(class, CmpClass::Text);
+        plans.push(OrderKeyPlan {
+            index: key.index,
+            class: OrderClass::Scalar(class),
+            descending: key.descending,
+            nulls: key.nulls,
+        });
+    }
+    if has_text_key {
+        let mut names = Vec::new();
+        collect_branch_tables(tree, &mut names);
+        let collated = names.iter().filter_map(|n| schemas.get(n)).any(|schema| {
+            schema
+                .columns
+                .iter()
+                .any(|c| c.collation.is_some_and(|coll| !coll.is_byte_order()))
+        });
+        if collated {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "this collation is not supported in this expression",
+            ));
+        }
+    }
+    Ok(plans)
+}
+
+/// ソート用の比較キー配列・添字列・スロット列を [`SetOpBudget`] へ計上する（確保前に判定する）。
+/// 計算は `checked_*` で行い、オーバーフローは予算超過と同じ `54000`。
+fn charge_sort_budget(
+    budget: &mut SetOpBudget,
+    rows: usize,
+    keys: usize,
+) -> Result<(), SqlSurfaceError> {
+    match crate::sql::cell_sort::sort_alloc_bytes(rows, keys) {
+        Some(total) => budget.charge(total),
+        None => Err(SqlSurfaceError::payload_too_large(
+            "set operation exceeds the shared result byte budget",
+        )),
     }
 }
 
@@ -969,7 +1040,7 @@ pub(crate) fn prepare(
     order_by: &[SetOrderKey],
     result_limits: &crate::result_limits::ResultLimits,
     leaves: Option<&mut Vec<BoundSetLeaf>>,
-) -> Result<(Option<usize>, usize), SqlSurfaceError> {
+) -> Result<(Option<usize>, usize, Vec<OrderKeyPlan>), SqlSurfaceError> {
     // PR #1105 レビュー指摘対応: 全体 `LIMIT` の範囲検証（`1..=設定値`）を全枝の走査・合成より
     // 前に行う（[`describe_columns`] と同じ検証を共有し、Execute／Describe の受理・拒否を一致させる）。
     let validated_limit = match limit {
@@ -983,9 +1054,9 @@ pub(crate) fn prepare(
     // PR #1105 レビュー指摘対応: 列数・列型整合（`DatatypeMismatch`・`42804`）を全枝の走査・合成より
     // 前に確定させる（[`validate_tree_types`] のドキュメンテーションコメント参照）。
     let (columns, _) = validate_tree_types(schemas, tree, udfs, leaves)?;
-    // Issue #3266: キーの解決（`42703`／`42702`／`42P10`）→ 未実装の関門（`0A000`）。
-    check_set_order_by(&columns, order_by)?;
-    Ok((validated_limit, validated_offset))
+    // Issue #3266・#3267: キーの解決（`42703`／`42702`／`42P10`）→ キー型・照合（`0A000`）。
+    let plans = plan_set_order_by(schemas, tree, &columns, order_by)?;
+    Ok((validated_limit, validated_offset, plans))
 }
 
 /// `EXPLAIN` が葉（枝）ごとに必要とする束縛結果（Issue #2047）。[`prepare`] が左から右の順に積み、
@@ -997,8 +1068,20 @@ pub(crate) struct BoundSetLeaf {
     pub(crate) table: String,
     /// 段の木に必要な枝の形（項目数・有無のみ。値は持たない）。
     pub(crate) shape: LeafShape,
-    /// スキャン枝の束縛結果（実行と同じ `bind_scan`）。集計枝は `None`。
-    pub(crate) scan: Option<crate::sql::parser::BoundScan>,
+    /// 葉の種別（「`None` なら集計」といった暗黙の契約を避け、種別を型で明示する）。
+    pub(crate) source: BoundSetLeafSource,
+}
+
+/// [`BoundSetLeaf`] の種別（Issue #3271）。`core.rs` が走査分類の行を作る分岐と、
+/// `sql::set_op_explain` が葉を描画する分岐の根拠になる。
+#[derive(Debug)]
+pub(crate) enum BoundSetLeafSource {
+    /// スキャン枝（式射影を含む。実行と同じ `bind_scan` の結果）。
+    Scan(Box<crate::sql::parser::BoundScan>),
+    /// 集計枝。
+    Aggregate,
+    /// `FROM` なしの定数枝（表を読まない。EXPLAIN は葉 `result`）。
+    Constant,
 }
 
 /// 枝の形（SQL-75 (5): 件数・有無のみで LIMIT／OFFSET の値は持たない）。
@@ -1307,7 +1390,7 @@ pub(crate) fn execute_with_budget_and_result_limits(
     group_limits: crate::group_by_limits::GroupByLimits,
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let (validated_limit, validated_offset) = prepare(
+    let (validated_limit, validated_offset, order_plan) = prepare(
         schemas,
         tree,
         udfs,
@@ -1327,6 +1410,13 @@ pub(crate) fn execute_with_budget_and_result_limits(
         group_limits,
         &mut budget,
     )?;
+    // Issue #3267: 全体 `ORDER BY` は合成結果が確定した後、`OFFSET`／`LIMIT` の直前に安定ソートする
+    // （同値の行は合成結果の順序規約を保つ）。ソート用の領域は確保前に文全体の予算へ計上する。
+    let mut outcome = outcome;
+    if !order_plan.is_empty() {
+        charge_sort_budget(&mut budget, outcome.rows.len(), order_plan.len())?;
+        outcome.rows = sort_rows(outcome.rows, &order_plan)?;
+    }
     // §2.4: 上限判定（`MAX_SET_OP_ROWS`）は全体 `LIMIT` による切り詰めより前に
     // 完結している（`eval_tree` が既に検証済み）。
     let rows = match validated_limit {
@@ -1393,8 +1483,9 @@ pub(crate) fn describe_columns(
         width,
         &mut next_leaf,
     )?;
-    // Issue #3266: Execute（[`prepare`]）と同じ関門を通し、Describe と Execute の受理・拒否を一致させる。
-    check_set_order_by(&columns, order_by)?;
+    // Issue #3266・#3267: Execute（[`prepare`]）と同じ計画関数を通し、Describe と Execute の
+    // 受理・拒否を一致させる（計画自体は使わない）。
+    plan_set_order_by(schemas, tree, &columns, order_by)?;
     Ok(columns)
 }
 
@@ -2238,14 +2329,90 @@ mod tests {
         );
     }
 
-    /// Issue #3266: 解決に成功したキーも、ソート実装（#3267）までは関門が `0A000` で拒否する。
+    /// Issue #3267: 解決済みキーは比較計画（位置・降順・NULL 位置）になり、キー無しは空の計画。
+    /// 解決の誤りは型検査より先に `42P10`。
     #[test]
-    fn check_set_order_by_gate_rejects_resolved_keys_with_0a000() {
-        let cols = vec![named("a")];
-        assert!(check_set_order_by(&cols, &[]).is_ok());
-        let err = check_set_order_by(&cols, &[ord_key(1, false)]).expect_err("gate");
-        assert_eq!(err.wire_code(), "0A000");
-        let err = check_set_order_by(&cols, &[ord_key(2, false)]).expect_err("resolve first");
+    fn plan_set_order_by_returns_resolved_key_plans() {
+        let schemas = HashMap::new();
+        let tree = text_branch("a");
+        let cols = vec![named("a"), named("b")];
+        assert!(plan_set_order_by(&schemas, &tree, &cols, &[])
+            .expect("no keys")
+            .is_empty());
+        let plans = plan_set_order_by(
+            &schemas,
+            &tree,
+            &cols,
+            &[ord_key(2, true), ord_key(1, false)],
+        )
+        .expect("plans");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].index, 1);
+        assert!(plans[0].descending);
+        assert_eq!(plans[0].nulls, NullPlacement::First);
+        assert_eq!(plans[1].index, 0);
+        assert_eq!(plans[1].nulls, NullPlacement::Last);
+        let err = plan_set_order_by(&schemas, &tree, &cols, &[ord_key(3, false)])
+            .expect_err("resolve first");
         assert_eq!(err.wire_code(), "42P10");
+    }
+
+    /// Issue #3267: 比較できない型（型を決められない式列・`VECTOR`）のキーは `0A000`。
+    #[test]
+    fn plan_set_order_by_rejects_unsortable_column_types() {
+        let schemas = HashMap::new();
+        let tree = text_branch("a");
+        for meta in [
+            ColumnMeta::Scalar {
+                name: "v".to_string(),
+                ty: ColumnType::Vector(2),
+            },
+            ColumnMeta::Computed {
+                name: "v".to_string(),
+                ty: None,
+            },
+        ] {
+            let err = plan_set_order_by(&schemas, &tree, &[meta], &[ord_key(1, false)])
+                .expect_err("unsortable");
+            assert_eq!(err.wire_code(), "0A000");
+        }
+    }
+
+    /// Issue #3267: 非バイト列順の照合列を持つ表がある文の `TEXT` キーは `0A000`
+    /// （照合を運ばずにバイト列順で比べない）。キーが `TEXT` でなければ影響しない。
+    #[test]
+    fn plan_set_order_by_rejects_text_key_with_non_byte_order_collation() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "a".to_string(),
+            TableSchema::new(
+                "a",
+                vec![ColumnDef::new("body", ColumnType::Text, false)
+                    .with_collation(crate::collation::Collation::UndIcu)],
+            ),
+        );
+        let tree = text_branch("a");
+        let err = plan_set_order_by(&schemas, &tree, &[named("body")], &[ord_key(1, false)])
+            .expect_err("collation");
+        assert_eq!(err.wire_code(), "0A000");
+        let int_col = ColumnMeta::Scalar {
+            name: "n".to_string(),
+            ty: ColumnType::Integer,
+        };
+        assert!(plan_set_order_by(&schemas, &tree, &[int_col], &[ord_key(1, false)]).is_ok());
+    }
+
+    /// Issue #3267: ソート領域の計上は文全体の予算を超えたら `54000`（確保前に判定）。
+    #[test]
+    fn sort_budget_is_charged_and_overflow_is_rejected() {
+        let mut budget = SetOpBudget::new(1 << 20);
+        charge_sort_budget(&mut budget, 10, 2).expect("small sort fits");
+        assert!(budget.used > 0);
+        let mut small = SetOpBudget::new(64);
+        let err = charge_sort_budget(&mut small, 1000, 1).expect_err("over budget");
+        assert_eq!(err.wire_code(), "54000");
+        let mut huge = SetOpBudget::new(usize::MAX);
+        let err = charge_sort_budget(&mut huge, usize::MAX, usize::MAX).expect_err("overflow");
+        assert_eq!(err.wire_code(), "54000");
     }
 }

@@ -3303,6 +3303,8 @@ fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
         BinOp::Sub => 2,
         BinOp::Mul => 3,
         BinOp::Div => 4,
+        // 追記のみのタグ。既存 1〜9 は不変（golden 互換。Issue #3273）。
+        BinOp::Rem => 10,
         BinOp::Gt => 5,
         BinOp::Lt => 6,
         BinOp::Ge => 7,
@@ -6241,15 +6243,34 @@ mod tests {
         );
     }
 
-    /// SQL-42・Issue #1521: 文字列リテラルの外の `%`／単独 `#` を含む DELETE は
+    /// SQL-42・Issue #3273: `%` の二項演算を含む DELETE は構文段を通ってハッシュ計算へ到達し、
+    /// `/` を含む同形の文とは別の operation_id になる（`Rem` はタグ 10）。
+    #[test]
+    fn percent_delete_is_accepted_and_hashed_apart_from_division() {
+        use crate::recovery::required_op_id::LedgerMode;
+        use crate::sql::allowlist::{validate_delete_statement, StructuralOnlyLookup};
+
+        let validate = |sql: &str| {
+            validate_delete_statement(
+                sql,
+                &StructuralOnlyLookup,
+                LedgerMode::CompareOnlyWithoutLedger,
+            )
+            .unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"))
+        };
+        let rem = validate("DELETE FROM t WHERE n % 2 = 0");
+        let div = validate("DELETE FROM t WHERE n / 2 = 0");
+        assert_ne!(rem, div);
+    }
+
+    /// SQL-42・Issue #1521: 文字列リテラルの外の単独 `#`・右辺の無い末尾 `%` を含む DELETE は
     /// 構文段で `42601` となり、ハッシュ計算（`for_*_where`）へ到達しない。
     #[test]
-    fn percent_and_hash_outside_literals_are_rejected_before_hashing() {
+    fn hash_and_dangling_percent_outside_literals_are_rejected_before_hashing() {
         use crate::recovery::required_op_id::LedgerMode;
         use crate::sql::allowlist::{validate_delete_statement, StructuralOnlyLookup};
 
         for sql in [
-            "DELETE FROM t WHERE n % 2 = 0",
             "DELETE FROM t WHERE n # 1 = 0",
             "DELETE FROM t WHERE id = 1 %",
         ] {
@@ -7628,6 +7649,7 @@ mod tests {
             BinOp::Sub,
             BinOp::Mul,
             BinOp::Div,
+            BinOp::Rem,
             BinOp::Gt,
             BinOp::Lt,
             BinOp::Ge,

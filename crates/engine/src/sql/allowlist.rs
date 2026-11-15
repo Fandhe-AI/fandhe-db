@@ -624,6 +624,7 @@ fn is_where_group_operator_token(token: &Token) -> bool {
             | Token::Punct('-')
             | Token::Punct('*')
             | Token::Punct('/')
+            | Token::Punct('%')
             | Token::RegexMatch
             | Token::RegexMatchCi
             | Token::RegexNotMatch
@@ -4384,8 +4385,8 @@ pub struct ValidatedSetOperation {
     pub(crate) offset: u32,
     /// 括弧なし末尾の `ORDER BY`（集合演算全体のソートキー。Issue #3266・SQL-29・SQL-56 ポインタ）。
     /// 空は `ORDER BY` なし。最後の枝の句ではなく集合全体に掛かる（枝内の句は
-    /// [`SetTree::LimitedBranch`] 等が持つ）。キーの解決（出力列名・序数 → 列位置）と、
-    /// ソート未実装の間の `0A000` の関門は `sql::set_op` が担う（実行は Issue #3267）。
+    /// [`SetTree::LimitedBranch`] 等が持つ）。キーの解決（出力列名・序数 → 列位置）・型と照合の
+    /// 検査・実行（ソート → `OFFSET` → `LIMIT`）は `sql::set_op` が担う（Issue #3267）。
     pub(crate) order_by: Vec<SetOrderKey>,
 }
 
@@ -7768,7 +7769,7 @@ impl<'a> Parser<'a> {
                     && !self.quoted_null.contains(&self.pos)
                     && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('[' | '(')));
                 let next_is_op = self.tokens.get(self.pos + 1).is_some_and(|t| {
-                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                    matches!(t, Token::Punct('+' | '-' | '*' | '/' | '%' | '['))
                         || matches!(t, Token::TypeCast)
                         || is_json_operator_token(t)
                         || matches!(t, Token::BitDistanceOp(_))
@@ -7793,8 +7794,10 @@ impl<'a> Parser<'a> {
                     if self.peek_ident_matches("COLLATE")
                         || self.peek_at_time_zone()
                         || self.peek().is_some_and(|t| {
-                            matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
-                                || is_json_operator_token(t)
+                            matches!(
+                                t,
+                                Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast
+                            ) || is_json_operator_token(t)
                                 || matches!(t, Token::BitDistanceOp(_))
                         })
                     {
@@ -8981,7 +8984,7 @@ impl<'a> Parser<'a> {
                     || self.is_value_function_keyword_at(self.pos)
                     || matches!(next, Some(Token::Punct('(')))
                     || next.is_some_and(|t| {
-                        matches!(t, Token::Punct('+' | '-' | '*' | '/' | '['))
+                        matches!(t, Token::Punct('+' | '-' | '*' | '/' | '%' | '['))
                             || matches!(t, Token::TypeCast)
                             || is_json_operator_token(t)
                     })
@@ -9050,8 +9053,10 @@ impl<'a> Parser<'a> {
                 if self.peek_ident_matches("COLLATE")
                     || self.peek_at_time_zone()
                     || self.peek().is_some_and(|t| {
-                        matches!(t, Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
-                            || is_json_operator_token(t)
+                        matches!(
+                            t,
+                            Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast
+                        ) || is_json_operator_token(t)
                     })
                 {
                     return self.parse_aggregate_expr_item(Some(head));
@@ -9086,7 +9091,7 @@ impl<'a> Parser<'a> {
             if self.allow_aggregate_expr_items
                 && matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::Punct('+' | '-' | '*' | '/'))
+                    Some(Token::Punct('+' | '-' | '*' | '/' | '%'))
                 )
             {
                 return self.parse_aggregate_expr_item(None);
@@ -11984,7 +11989,7 @@ impl<'a> Parser<'a> {
         self.parse_mul_rest(lhs, depth)
     }
 
-    /// 乗除算ループ（`* /`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
+    /// 乗除算・剰余ループ（`* / %`）。[`Self::parse_add_rest`] と同じ理由で左辺解析済みから継続できる。
     fn parse_mul_rest(&mut self, lhs: Expr, depth: usize) -> Result<Expr, SqlSurfaceError> {
         // 先頭の関数呼び出しを先に読み終えた投影項目から継続する場合も、後置 `COLLATE` を
         // 一次式の直後として受理する（`parse_primary_expr` 経由では適用済みで冪等）。
@@ -11995,6 +12000,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Token::Punct('*')) => BinOp::Mul,
                 Some(Token::Punct('/')) => BinOp::Div,
+                Some(Token::Punct('%')) => BinOp::Rem,
                 _ => break,
             };
             self.advance();
@@ -13755,7 +13761,7 @@ impl<'a> Parser<'a> {
         matches!(self.peek(), Some(Token::Ident(_) | Token::Number(_)))
             && matches!(
                 self.tokens.get(self.pos + 1),
-                Some(Token::Punct('+' | '-' | '*' | '/'))
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%'))
             )
     }
 
@@ -14274,7 +14280,7 @@ impl<'a> Parser<'a> {
             let lit = self.expect_literal()?;
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(lit);
@@ -14368,7 +14374,7 @@ impl<'a> Parser<'a> {
             let lit = self.expect_literal()?;
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(SetValue::Literal(lit));
@@ -19117,13 +19123,9 @@ fn check_buffered_body_shape_with(
             }
             Ok(())
         }
-        // Issue #3266: 集合全体の `ORDER BY` はソート実行（#3267）まで未実装。参照時の拒否より
-        // 手前の定義時に `0A000` にし、使えない本文の永続化を防ぐ（fail-closed）。
-        Statement::SetOperation(v) if !v.order_by.is_empty() => {
-            Err(SqlSurfaceError::feature_not_supported(
-                "ORDER BY over a set operation result is not supported yet",
-            ))
-        }
+        // Issue #3267: 集合全体の `ORDER BY` は本文でも `sql::set_op` が実行する（参照時の評価は
+        // 本文を `order_by` ごと保った文として既存の集合演算経路へ渡す）。キー型・照合の拒否も
+        // 参照時に同じ `0A000` になる。
         Statement::SetOperation(v) => check_body_set_tree(&v.tree, lookup, out),
         // Issue #1411: 本文の FROM が別の評価後射影形ビュー（または単純形ビュー経由で
         // そこへ到達するビュー）の連鎖。本文として許すのは列射影・`WHERE`（宣言的述語、
@@ -23906,21 +23908,15 @@ pub(crate) fn aggregate_has_unrendered_explain_shape(v: &ValidatedAggregate) -> 
         || super::subquery::aggregate_has_filter_subquery(v)
 }
 
-/// 枝の投影に式項目（`SelectItem::Expr`）を含むか（Issue #3270。別名付きの列参照も式項目として数える）。
-fn scan_has_expr_projection(scan: &ValidatedScan) -> bool {
-    matches!(&scan.projection, Projection::Items(items)
-        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })))
-}
-
 /// 集合演算木のいずれかの枝が [`scan_has_unrendered_explain_shape`]／
 /// [`aggregate_has_unrendered_explain_shape`] に当たるか。
 pub(crate) fn set_tree_has_unrendered_explain_shape(tree: &SetTree) -> bool {
     match tree {
-        // Issue #3270: 式射影の枝・定数枝の EXPLAIN は未対応（0A000。後続 Issue #3271）。
         SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => {
-            scan_has_unrendered_explain_shape(scan) || scan_has_expr_projection(scan)
+            scan_has_unrendered_explain_shape(scan)
         }
-        SetTree::ConstBranch(_) => true,
+        // Issue #3271: 定数枝は葉 `result`（`source: constant`）として描画できる。
+        SetTree::ConstBranch(_) => false,
         SetTree::AggregateBranch(agg) => aggregate_has_unrendered_explain_shape(&agg.0),
         SetTree::Op { left, right, .. } => {
             set_tree_has_unrendered_explain_shape(left)
@@ -29365,10 +29361,12 @@ fn recursive_cte_statement(
                 "with a SEARCH or CYCLE clause, the left side of the UNION must be a SELECT",
             ));
         }
-        // Issue #3266: 集合全体の `ORDER BY` はソート実行（#3267）まで未実装（fail-closed）。
+        // 再帰 CTE のアンカー項の集合全体 `ORDER BY` は、PostgreSQL では構文上受理されない位置
+        // （アンカーは `WITH RECURSIVE` の非再帰項で、全体の `ORDER BY` を持てない）。意図的な拒否
+        // で、設計記録は `docs/design/set-operations.md`（Issue #3267）。
         Statement::SetOperation(v) if !v.order_by.is_empty() => {
             return Err(SqlSurfaceError::feature_not_supported(
-                "ORDER BY over a set operation result is not supported yet",
+                "ORDER BY over a set operation result is not supported in the anchor term of WITH RECURSIVE",
             ));
         }
         Statement::Select(_)
@@ -29766,12 +29764,6 @@ fn validate_sql_tokens_impl(
                 if set_tree_has_value_subqueries(&validated.tree) {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for queries with value subqueries",
-                    ));
-                }
-                // Issue #3270: 式射影の枝・定数枝を含む集合演算の EXPLAIN は未対応（後続 Issue #3271）。
-                if set_tree_has_unrendered_explain_shape(&validated.tree) {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "EXPLAIN is not supported for set operations with expression or FROM-less branches",
                     ));
                 }
                 return Ok(Statement::Explain(ExplainTarget::SetOperation(validated)));
@@ -35324,19 +35316,29 @@ mod tests {
         }
     }
 
-    /// SQL-42・Issue #1521: lexer が `%`／単独 `#` を字句化しても、構文段は受理しない
-    /// （fail-closed）。変更前後で 42601 は同じ。
+    /// SQL-42・Issue #1521: 単独 `#`（ビット XOR）と、右辺の無い末尾 `%` は構文段が受理しない
+    /// （fail-closed）。`%` の二項演算は Issue #3273 で受理に変わった（別テストで固定）。
     #[test]
-    fn rejects_percent_and_hash_tokens_as_syntax_error() {
+    fn rejects_hash_token_and_dangling_percent_as_syntax_error() {
         for sql in [
-            "SELECT * FROM documents WHERE n % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
             "SELECT * FROM documents WHERE n # 1 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT n % 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
-            "SELECT * FROM documents ORDER BY n % 2 LIMIT 5",
             "SELECT * FROM documents WHERE lang = 'ja' %",
             "SELECT * FROM documents WHERE lang = 'ja' #",
         ] {
             assert_rejected_as_syntax_error(sql);
+        }
+    }
+
+    /// SQL-42・Issue #3273: `%` は WHERE・投影・ORDER BY で `BinOp::Rem` の二項式として受理する。
+    #[test]
+    fn accepts_percent_as_remainder_operator() {
+        for sql in [
+            "SELECT * FROM documents WHERE n % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT n % 2 FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            "SELECT * FROM documents WHERE (n) % 2 = 0 ORDER BY embedding <=> '[0.1]' LIMIT 5",
+        ] {
+            let lookup = catalog_with(&["documents"]);
+            validate_statement(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"));
         }
     }
 
@@ -43489,15 +43491,15 @@ mod tests {
     }
 
     #[test]
-    fn set_op_tree_with_expression_or_const_branch_is_unrendered_for_explain() {
-        let plain = set_op_of("SELECT n FROM t UNION SELECT n FROM u").expect("accepted");
-        assert!(!set_tree_has_unrendered_explain_shape(&plain.tree));
+    fn set_op_tree_with_expression_or_const_branch_is_rendered_for_explain() {
+        // Issue #3271: 式射影の枝・定数枝は EXPLAIN で描画できる（未描画形ではない）。
         for sql in [
+            "SELECT n FROM t UNION SELECT n FROM u",
             "SELECT n+1 FROM t UNION SELECT n FROM u",
             "SELECT 7 UNION SELECT n FROM u",
         ] {
             let v = set_op_of(sql).expect("accepted");
-            assert!(set_tree_has_unrendered_explain_shape(&v.tree), "{sql}");
+            assert!(!set_tree_has_unrendered_explain_shape(&v.tree), "{sql}");
         }
     }
 
@@ -43637,6 +43639,40 @@ mod tests {
         ));
     }
 
+    /// Issue #3273・SQL-42: `%` は `* /` と同じ優先度・左結合で、単項マイナスより低い。
+    #[test]
+    fn projection_remainder_precedence_and_associativity() {
+        assert_eq!(first_expr("n % 2"), bin(BinOp::Rem, ident("n"), num("2")));
+        assert_eq!(
+            first_expr("n+1%2"),
+            bin(BinOp::Add, ident("n"), bin(BinOp::Rem, num("1"), num("2")))
+        );
+        assert_eq!(
+            first_expr("n*2%3"),
+            bin(BinOp::Rem, bin(BinOp::Mul, ident("n"), num("2")), num("3"))
+        );
+        assert_eq!(
+            first_expr("7%3*2"),
+            bin(BinOp::Mul, bin(BinOp::Rem, num("7"), num("3")), num("2"))
+        );
+        assert_eq!(first_expr("-7%3"), bin(BinOp::Rem, num("-7"), num("3")));
+        assert_eq!(
+            first_expr("-n%3"),
+            bin(BinOp::Rem, bin(BinOp::Sub, num("0"), ident("n")), num("3"))
+        );
+        assert_eq!(
+            first_expr("abs(n)%2"),
+            bin(
+                BinOp::Rem,
+                Expr::Call {
+                    name: "abs".to_string(),
+                    args: vec![ident("n")]
+                },
+                num("2")
+            )
+        );
+    }
+
     #[test]
     fn projection_infix_keeps_existing_projections() {
         let stmt = scan_items("n, lang").expect("accepted");
@@ -43686,7 +43722,7 @@ mod tests {
 
     #[test]
     fn projection_infix_rejections() {
-        for list in ["n % 2", "'a' + n", "n +", "(n"] {
+        for list in ["n %", "% 2", "'a' + n", "n +", "(n"] {
             let r = scan_items(list);
             assert_eq!(r.expect_err(list).wire_code(), "42601", "{list}");
         }

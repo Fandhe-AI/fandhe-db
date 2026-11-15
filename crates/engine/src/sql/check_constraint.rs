@@ -507,6 +507,7 @@ fn binop_str(op: udf_call::BinOp) -> &'static str {
         BinOp::Sub => "-",
         BinOp::Mul => "*",
         BinOp::Div => "/",
+        BinOp::Rem => "%",
         BinOp::Gt => ">",
         BinOp::Lt => "<",
         BinOp::Ge => ">=",
