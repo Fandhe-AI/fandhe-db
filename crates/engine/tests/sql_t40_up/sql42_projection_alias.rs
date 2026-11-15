@@ -298,8 +298,7 @@ fn unsupported_forms_stay_fail_closed() {
         // 暗黙の別名は受理しない。
         "SELECT n m FROM t LIMIT 10",
         "SELECT n AS FROM t LIMIT 10",
-        // 集合演算の枝・ビュー本体。
-        "SELECT n AS x FROM t UNION SELECT n FROM t",
+        // ビュー本体。
         "CREATE VIEW v AS SELECT n AS x FROM t",
     ] {
         assert_eq!(code(&core, &ctx, sql), "42601", "{sql}");

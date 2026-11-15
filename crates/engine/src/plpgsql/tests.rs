@@ -1153,7 +1153,6 @@ fn column_only_positions_reject_variables_with_0a000() {
         "PERFORM DISTINCT v FROM t",
         "PERFORM sum(1) OVER (PARTITION BY v) FROM t",
         "PERFORM sum(1) OVER (ORDER BY v) FROM t",
-        "PERFORM q FROM t UNION SELECT v FROM u",
         "PERFORM count(DISTINCT v) FROM t",
     ] {
         assert_eq!(

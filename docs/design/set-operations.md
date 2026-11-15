@@ -56,6 +56,7 @@ set_term  := primary { INTERSECT [ALL | DISTINCT] primary }                   --
 primary   := branch | '(' set_expr ')'                         -- 括弧の入れ子深さは 4 まで（実装既定値）
 branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
            | <集計形の枝>                                        -- Issue #1191
+           | SELECT <式>[ AS <別名>] [, ...]                       -- Issue #3270（FROM なしの定数枝）
            | '(' <単一 SELECT> ORDER BY ... LIMIT n [OFFSET m] ')'  -- Issue #1191（括弧付きのみ）
 ```
 
@@ -84,8 +85,19 @@ Issue #1191 で次を受理する:
 
 - 枝内の `<=>`（ベクトル順位付け）・`USING PLAN`・`USING MODE`・`HINT ORDER`・
   `DISTINCT`、括弧なしの枝内 `ORDER BY`・`OFFSET`
-- 式項目（`Computed` 投影。宣言的 UDF・組み込み関数呼び出し）: 束縛時に型を
-  確定できないため fail-closed で拒否する
+- 枝内の窓関数・値の部分クエリ項目・距離列、式の中の集計呼び出し（`coalesce(sum(n), 0)` 等）、
+  枝内の式 `ORDER BY` キー
+
+Issue #3270（SQL-42 のポインタ）で、`FROM` あり枝の式項目（リテラル・算術・関数呼び出し・
+`列 AS 別名`）を受理した。通常の SELECT と同じ `bind_scan`（`bind_projection`）で束縛し、型の
+統一は下の既存規則に任せる（規則は新設しない）。あわせて `FROM` なしの定数枝
+（`SELECT 7 UNION SELECT y FROM b`）を `SetTree::ConstBranch` として受理する。定数枝は
+`sql::const_select` の束縛・実行をそのまま使い、表を読まないので RLS の対象行を持たない。
+定数枝の集計項目・`WHERE`／`HAVING`、括弧付きの `LIMIT`／`OFFSET` は `42601`、ルーチン呼び出し・
+スキーマ関数は束縛段が `0A000`。全枝が定数の集合演算（`SELECT 1 UNION SELECT 2`）と、式射影の枝・
+定数枝を含む集合演算の `EXPLAIN` は `0A000`（EXPLAIN は Issue #3271 で対応予定）。ビュー本文の
+定数枝・式枝は `42601`。型の決まらない `NULL`・文字列リテラルを他の枝の型へ解決する規則は
+持たず、型が一致しなければ `42804`。
 
 全体に対する `LIMIT <n>` は任意（`1..=core::MAX_SEARCH_K`。範囲外は
 `22000`）。範囲検証は `sql::set_op::execute` が全枝の走査より前に行い、
@@ -113,8 +125,9 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 （`ColumnMeta::Id` と `Id` は一致、`Scalar { ty }` は `ColumnType` の完全一致
 に加え、整数型〔`SMALLINT`／`INTEGER`／`BIGINT`〕どうしを互換とし結果列は広い方の型へ
 拡大する〔Issue #1560。名前は左端の枝〕）が一致しない場合は新設エラー分類 `SqlSurfaceError::DatatypeMismatch`
-（`ErrorClass::DatatypeMismatch`。`42804`）で拒否する。`Computed` 列は構文
-検証段で既に排除済みのため到達しない。結果列名・メタデータは常に左端の枝に
+（`ErrorClass::DatatypeMismatch`。`42804`）で拒否する。式射影・集計・定数枝が返す `Computed`
+列は、束縛時に確定した静的型を `Scalar` と同じ型として比較し、静的型を持たない列
+（`Computed { ty: None }`）は不一致（`42804`）とする。結果列名・メタデータは常に左端の枝に
 揃える。
 
 `VECTOR` 列を投影に含む枝は、重複除去を伴う演算（`UNION`／`INTERSECT`／`INTERSECT ALL`／
