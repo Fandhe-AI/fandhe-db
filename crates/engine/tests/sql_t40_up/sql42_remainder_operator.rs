@@ -263,3 +263,40 @@ fn tenant_boundary_holds() {
     assert_eq!(r.rows.len(), 3);
     assert!(ints(&r).iter().all(|v| v.abs() < 100));
 }
+
+/// f64 レーン（WHERE）で `b * b` が 2^53 を超える丸めた中間値を剰余へ流さない（22003 で拒否）。
+#[test]
+fn where_remainder_rejects_inexact_intermediate() {
+    let (core, ctx, _g) = setup();
+    assert_eq!(
+        code(&core, &ctx, "SELECT id FROM t WHERE (b * b) % 2 = 0"),
+        "22003"
+    );
+    // 2^53 未満の厳密な中間値は従来どおり評価する。
+    let r = run(&core, &ctx, "SELECT id FROM t WHERE (n * n) % 2 = 1");
+    assert_eq!(r.rows.len(), 3);
+}
+
+/// 型付き UDF の引数への `%` は、定義時・呼び出し時とも整数引数なら受理する。
+#[test]
+fn typed_udf_param_remainder_is_accepted() {
+    let (core, ctx, _g) = setup();
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    for sql in [
+        "CREATE FUNCTION odd(x integer) RETURNS integer AS x % 2",
+        "CREATE FUNCTION odd8(x bigint) RETURNS bigint AS x % 2",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut s, sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"));
+    }
+    for (sql, expected) in [("SELECT odd(7)", 1), ("SELECT odd8(8)", 0)] {
+        match core
+            .execute_sql_in_session(&ctx, &mut s, sql)
+            .unwrap_or_else(|e| panic!("{sql:?} should succeed: {e:?}"))
+        {
+            SqlOutcome::Query(r) => assert_eq!(ints(&r), vec![expected], "{sql}"),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+}

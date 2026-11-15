@@ -9523,8 +9523,14 @@ fn rem_integer_syntax(expr: &Expr, env: &BindEnv<'_>) -> bool {
     match expr {
         Expr::Number(raw) => classify_exact_int_literal(raw).is_some(),
         Expr::Ident(name) => {
-            if env.params.contains_key(name.to_ascii_lowercase().as_str()) {
-                return false;
+            // UDF 引数は宣言型（`param_decl`）が整数型のときだけ整数と証明する。型なし引数は
+            // 偽（fail-closed）。型付き引数は呼び出し時に宣言型へ代入変換済みで整数値になる。
+            let lower = name.to_ascii_lowercase();
+            if env.params.contains_key(lower.as_str()) {
+                return matches!(
+                    env.param_decl.get(lower.as_str()),
+                    Some(CastType::Int2 | CastType::Int4 | CastType::Int8)
+                );
             }
             match env
                 .schema
@@ -13259,6 +13265,14 @@ fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
         BinOp::Rem => {
             if b == 0.0 {
                 return Err(SqlSurfaceError::division_by_zero("%"));
+            }
+            // 中間値（`b * b` 等）が f64 で丸められた被演算子を誤った剰余にしないため、
+            // 2^53 以上の絶対値は厳密に表せるか分からないので fail-closed で拒否する。
+            const EXACT_LIMIT: f64 = 9_007_199_254_740_992.0;
+            if a.abs() >= EXACT_LIMIT || b.abs() >= EXACT_LIMIT {
+                return Err(SqlSurfaceError::numeric_out_of_range(
+                    "remainder operand exceeds the exactly representable integer range",
+                ));
             }
             let r = a % b;
             if r == 0.0 {
