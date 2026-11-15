@@ -429,7 +429,7 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
 - **段の重ね方（外側から。該当しない段は出さない）**: 全体 `limit`（`LIMIT`／`OFFSET` があるときだけ）→
   `set_operation`（入れ子は演算子の優先順位と括弧どおり。子は左、右の順）→ 葉。葉は、通常の枝が `scan`、
   括弧付きの枝が `limit` → `sort` → `scan`、集計の枝が `limit` → `sort` → `aggregate` → `scan`。
-- **語彙（JOIN と同じ閉じた集合・安定契約）**: `set_operation` の属性は `set_operator: union|union_all|intersect|except`。
+- **語彙（JOIN と同じ閉じた集合・安定契約）**: `set_operation` の属性は `set_operator: union|union_all|intersect|intersect_all|except`。
   `scan` は `relation: <n>`（葉の左からの 1 始まりの序数）に続けて `scalar_plan:`／`access_path:`
   （`scan_explain_lines` を共有。枝ごとに PK 点検索 → GIN → 全走査）。ほかは JOIN の段と同じ意味。
 - **集計の枝の走査分類**: 実行器は可視ビットマップのキャッシュ・arena・スカラー索引を渡さない（常に全走査）ため、

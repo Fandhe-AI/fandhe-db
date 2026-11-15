@@ -1,4 +1,4 @@
-//! 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`EXCEPT`）の束縛・実行本体
+//! 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`INTERSECT ALL`／`EXCEPT`）の束縛・実行本体
 //! （SQL-29 (c)・RLS-10 (b)・TASK-213）。
 //!
 //! 責務境界: `sql::allowlist::validate_sql_tokens` が構造検証した
@@ -44,6 +44,42 @@ use crate::sql::udf_call::UdfRegistry;
 /// （実装既定値。`core::MAX_SEARCH_K` と同値）。超過は `54000`。合成結果の行数
 /// 上限も同じ定数を共有する（重複除去後の行数は必ずこの値以下になる）。
 const MAX_SET_OP_ROWS: usize = 10_000;
+
+/// 多重集合演算用の行キー出現数表（Issue #3268）。`eval_tree` の `INTERSECT ALL`
+/// が使い、`EXCEPT ALL`（#3269）も `take_one` の否定で再利用できる形にしてある。
+/// 右辺の各行を文全体の [`SetOpBudget`] に計上してから確保する（再出現の行も
+/// 常に計上する。過大側に倒れるので fail-closed）。
+struct KeyCounts {
+    map: HashMap<Vec<u8>, usize>,
+}
+
+impl KeyCounts {
+    fn from_rows(rows: &[ResultRow], budget: &mut SetOpBudget) -> Result<Self, SqlSurfaceError> {
+        let mut map: HashMap<Vec<u8>, usize> = HashMap::new();
+        for row in rows {
+            crate::interrupt::check()?;
+            let len = row_key_len(row)?
+                .checked_add(std::mem::size_of::<usize>())
+                .ok_or_else(|| SqlSurfaceError::payload_too_large("set operation key too large"))?;
+            budget.charge(len)?;
+            let key = row_key(row)?;
+            let n = map.entry(key).or_insert(0);
+            *n = n.saturating_add(1);
+        }
+        Ok(Self { map })
+    }
+
+    /// 残数が 1 以上なら 1 減らして `true`。
+    fn take_one(&mut self, key: &[u8]) -> bool {
+        match self.map.get_mut(key) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 /// 集合演算文全体（全枝の走査・合成・行キー生成）で共有する累計バイト予算
 /// （PR #1105 レビュー指摘対応）。各枝を独立に
@@ -935,6 +971,27 @@ fn eval_tree(
                     }
                     rows
                 }
+                SetOperator::IntersectAll => {
+                    // Issue #3268: 多重集合の交差。右辺の出現数を数え、左辺の各行で
+                    // 残数があるときだけ 1 件消費して出力する（min(左, 右) 件）。
+                    let mut counts = KeyCounts::from_rows(&r.rows, budget)?;
+                    let mut rows = Vec::new();
+                    for row in l.rows.into_iter() {
+                        crate::interrupt::check()?;
+                        budget.charge(row_key_len(&row)?)?;
+                        let key = row_key(&row)?;
+                        if !counts.take_one(&key) {
+                            continue;
+                        }
+                        if rows.len() >= MAX_SET_OP_ROWS {
+                            return Err(SqlSurfaceError::payload_too_large(
+                                "set operation result exceeds the row limit",
+                            ));
+                        }
+                        rows.push(row);
+                    }
+                    rows
+                }
                 SetOperator::Intersect | SetOperator::Except => {
                     let mut right_keys: HashSet<Vec<u8>> = HashSet::new();
                     for row in &r.rows {
@@ -1410,6 +1467,59 @@ mod tests {
         assert_eq!(err.wire_code(), "54000");
     }
 
+    /// Issue #3268: `INTERSECT ALL` の右辺カウント表構築も共有予算の対象で、
+    /// 超過は `54000`、十分な上限なら多重度 min(左, 右) の件数で成功する。
+    #[test]
+    fn intersect_all_charges_budget_and_keeps_min_multiplicity() {
+        let path = unique_db_path("set-op-intersect-all-budget");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&text_schema("a")).expect("create a");
+        storage.create_table(&text_schema("b")).expect("create b");
+        let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let body = "x".repeat(4096);
+        insert_text_row(&storage, "a", &tenant_ctx, &body);
+        // 2 行目は id・operation_id を変えて同内容の重複行にする。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "a",
+            &tenant_ctx,
+            2,
+            Visibility::Public,
+            &[Value::Vector(vec![0.0, 0.0]), Value::Text(body.clone())],
+            &OperationId::parse("seed-a-2").expect("valid operation_id"),
+        )
+        .expect("insert second row");
+        insert_text_row(&storage, "b", &tenant_ctx, &body);
+
+        let tree = SetTree::Op {
+            op: SetOperator::IntersectAll,
+            left: Box::new(text_branch("a")),
+            right: Box::new(text_branch("b")),
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), text_schema("a"));
+        schemas.insert("b".to_string(), text_schema("b"));
+        let udfs = UdfRegistry::default();
+        let run = |cap: usize| {
+            execute_with_budget(
+                &read_txn,
+                &tenant_ctx,
+                &schemas,
+                &tree,
+                &udfs,
+                None,
+                cap,
+                crate::group_by_limits::GroupByLimits::default(),
+            )
+        };
+        let err = run(4096 * 3 + 1024).expect_err("row keys must be charged");
+        assert_eq!(err.wire_code(), "54000");
+        let ok = run(1024 * 1024).expect("generous cap succeeds");
+        assert_eq!(ok.rows.len(), 1);
+    }
+
     /// PR #1105 レビュー指摘の回帰: 全体 `LIMIT` の範囲外検証（`22000`）は全枝の
     /// 走査より前に行う。存在しないテーブルを枝に含めても（走査すれば `XX000`
     /// 相当の内部エラーになるはずの構成）、範囲外 `LIMIT` が先に `22000` で拒否
@@ -1689,6 +1799,7 @@ mod tests {
             SetOperator::Union,
             SetOperator::UnionAll,
             SetOperator::Intersect,
+            SetOperator::IntersectAll,
             SetOperator::Except,
         ];
         for state in ["empty", "null-only", "non-null"] {
@@ -1744,7 +1855,9 @@ mod tests {
                 let present = usize::from(state != "empty");
                 let expected = match op {
                     SetOperator::UnionAll => 2 * present,
-                    SetOperator::Union | SetOperator::Intersect => present,
+                    SetOperator::Union | SetOperator::Intersect | SetOperator::IntersectAll => {
+                        present
+                    }
                     SetOperator::Except => 0,
                 };
                 assert_eq!(result.rows.len(), expected, "{op:?} {state}");

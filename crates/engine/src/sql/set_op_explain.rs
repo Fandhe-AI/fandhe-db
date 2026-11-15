@@ -57,6 +57,7 @@ fn operator_token(op: SetOperator) -> &'static str {
         SetOperator::Union => "union",
         SetOperator::UnionAll => "union_all",
         SetOperator::Intersect => "intersect",
+        SetOperator::IntersectAll => "intersect_all",
         SetOperator::Except => "except",
     }
 }

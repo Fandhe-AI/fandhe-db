@@ -560,6 +560,11 @@ fn shapes() -> Vec<Shape> {
             check: Check::StatisticOnly,
         },
         Shape {
+            axis: "set_intersect_all",
+            sql: "SELECT lang FROM documents INTERSECT ALL SELECT lang FROM other_docs",
+            check: Check::StatisticOnly,
+        },
+        Shape {
             axis: "set_except",
             sql: "SELECT lang FROM documents EXCEPT SELECT lang FROM other_docs",
             check: Check::StatisticOnly,
@@ -755,6 +760,7 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
         "set_union",
         "set_union_all",
         "set_intersect",
+        "set_intersect_all",
         "set_except",
         "window_row_number",
         "window_count",
