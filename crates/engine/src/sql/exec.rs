@@ -7069,7 +7069,7 @@ pub(crate) fn execute_insert_returning_in(
     // 失敗しうる（commit 成功境界の違反）ため、この組み合わせは書き込み前に fail-closed で拒否する。
     let mut projector = crate::sql::returning::ReturningProjector::new(returning, schema);
     if projector.has_computed() && has_sequence {
-        return Err(SqlSurfaceError::unsupported(
+        return Err(SqlSurfaceError::feature_not_supported(
             "RETURNING expressions are not supported with sequence-assigned values yet",
         ));
     }
