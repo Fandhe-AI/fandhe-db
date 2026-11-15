@@ -2105,3 +2105,5 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 詳細は `docs/design/wide-retrieval-scan.md` の追記節。
 
 **Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。
+
+**Issue #3253（feat(engine): COPY (集計 SELECT) TO STDOUT を受理。SQL-34・WIRE-22 のポインタ）**: 依存・unsafe の変更なし。`ValidatedCopyTo.inner` を `CopyToSource`（`Scan`／`Aggregate`）へ変更（公開型の破壊的変更）。括弧形の内側が集計 SELECT のとき、通常の SELECT と同じ `run_validated_aggregate`（集計アームから切り出し）で実行し、結果列型（`0A000`）と結果件数（`54000`・無条件）を CopyOutResponse の前に検査する。権限ゲートは通常の SELECT と同じ列走査規則。順位付き・`USING PLAN`・JOIN・集合演算・WHERE 中のサブクエリは従来どおり `42601`。テスト: engine `table_rls/copy_to_aggregate.rs`、wire `wire_proto/wire_copy_to_aggregate.rs`。詳細は [wire-copy-protocol.md](wire-copy-protocol.md)。

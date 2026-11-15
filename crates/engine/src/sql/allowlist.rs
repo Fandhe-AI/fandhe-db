@@ -30439,10 +30439,35 @@ pub struct ValidatedCopyFrom {
     pub operation_id: Option<OperationId>,
 }
 
+/// `COPY ... TO STDOUT` の読み取り元（Issue #3253・SQL-34・WIRE-22 のポインタ）。
+/// 広域取得（[`ValidatedScan`]）か集計 SELECT（[`ValidatedAggregate`]）のいずれか。
+/// 実行側（`EngineCore::run_copy_to_scan`）がこの種別で通常の SELECT と同じ実行経路へ振り分ける。
+///
+/// **#3253 で追加した破壊的変更（BREAKING CHANGE）**: [`ValidatedCopyTo::inner`] の型を
+/// `Box<ValidatedScan>` からこの enum へ変えた。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CopyToSource {
+    /// 広域取得（SQL-15）。テーブル形は常にこちら。
+    Scan(Box<ValidatedScan>),
+    /// 集計 SELECT（`count(*)`・`GROUP BY`・`HAVING`・集計 `ORDER BY` 等）。括弧形のみ。
+    Aggregate(Box<ValidatedAggregate>),
+}
+
+impl CopyToSource {
+    /// 読み取り対象のテーブル名（権限ゲート・経路選択が使う）。
+    pub fn table_name(&self) -> &str {
+        match self {
+            Self::Scan(v) => v.table_name(),
+            Self::Aggregate(v) => v.table_name(),
+        }
+    }
+}
+
 /// 許可形状の構造判定を通過した `COPY (<SELECT>) TO STDOUT [[WITH]
 /// (FORMAT text|csv)]` 文（Issue #939・WIRE-17・TASK-220）。内側 `SELECT` は
-/// 広域取得（[`ValidatedScan`]。SQL-15・Issue #454）の形のみを受理し
-/// （順位付け `ORDER BY`／`USING PLAN`・集計は `42601`）、[`validate_sql_tokens`]
+/// 広域取得（[`ValidatedScan`]。SQL-15・Issue #454）または集計 SELECT
+/// （[`ValidatedAggregate`]。Issue #3253）の形のみを受理し
+/// （順位付け `ORDER BY`／`USING PLAN`・JOIN・集合演算・CTE は `42601`）、[`validate_sql_tokens`]
 /// と単一の実装を共有する（第 2 の SELECT パーサーを持たない）。
 ///
 /// テーブル形 `COPY <table> [(<col>, ...)] TO STDOUT`（Issue #1771・WIRE-22 (5)・SQL-34 の
@@ -30452,7 +30477,7 @@ pub struct ValidatedCopyFrom {
 /// 差し替え漏れは束縛段の `LIMIT` 範囲検査で拒否され、上限なし走査にはならない＝fail-closed）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedCopyTo {
-    pub inner: Box<ValidatedScan>,
+    pub inner: CopyToSource,
     pub format: CopyFormat,
     /// 解決済みの `WITH` オプション（Issue #1763。TO 側の出力経路が Issue #1765 で適用する）。
     pub options: copy_options::CopyOptions,
@@ -30877,20 +30902,21 @@ fn validate_copy_from_tokens(
 /// `COPY (<SELECT>) TO STDOUT [[WITH] (FORMAT text|csv)] [;]` を構造判定する
 /// （Issue #939・WIRE-17）。`rest` の先頭は必ず `(` であること（呼び出し元
 /// [`validate_copy_tokens`] が確認済み）。内側 `SELECT` は
-/// [`validate_sql_tokens`] が返す [`Statement::Scan`]（広域取得。SQL-15）のみを
-/// 受理する（第 2 の SELECT パーサーを持たない設計。`Select`（順位付き）・
-/// `Aggregate`・`Explain`・`SetSearchMode`・`CreateFunction` はいずれも
-/// `42601` へ落とす）。
+/// [`validate_sql_tokens`] が返す [`Statement::Scan`]（広域取得。SQL-15）と
+/// [`Statement::Aggregate`]（集計。Issue #3253）のみを受理する（第 2 の SELECT
+/// パーサーを持たない設計。`Select`（順位付き）・`Join`・`Explain`・
+/// `SetSearchMode`・`CreateFunction` 等はいずれも `42601` へ落とす）。
 fn validate_copy_to_tokens(
     rest: &[Token],
     lookup: &impl TableLookup,
 ) -> Result<CopyStatement, SqlSurfaceError> {
     let (inner, after) = split_parenthesized(rest)?;
-    let scan = match validate_sql_tokens(inner, lookup)? {
-        Statement::Scan(v) => v,
+    let source = match validate_sql_tokens(inner, lookup)? {
+        Statement::Scan(v) => CopyToSource::Scan(Box::new(v)),
+        Statement::Aggregate(v) => CopyToSource::Aggregate(Box::new(v)),
         _ => {
             return Err(SqlSurfaceError::unsupported(
-                "COPY (...) TO STDOUT only supports a non-ranked SELECT (no ORDER BY / USING PLAN / aggregate)",
+                "COPY (...) TO STDOUT only supports a single-table SELECT or aggregate (no USING PLAN / ranked ORDER BY / JOIN / set operation / CTE)",
             ))
         }
     };
@@ -30900,7 +30926,7 @@ fn validate_copy_to_tokens(
     let (format, options) = parse_copy_to_tail(&mut p)?;
 
     Ok(CopyStatement::To(ValidatedCopyTo {
-        inner: Box::new(scan),
+        inner: source,
         format,
         options,
         table_form: false,
@@ -31006,7 +31032,7 @@ fn validate_copy_table_to_tokens(
         with_ties: false,
     };
     Ok(CopyStatement::To(ValidatedCopyTo {
-        inner: Box::new(scan),
+        inner: CopyToSource::Scan(Box::new(scan)),
         format,
         options,
         table_form: true,

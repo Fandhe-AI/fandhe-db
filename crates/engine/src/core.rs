@@ -14014,6 +14014,80 @@ impl EngineCore {
         self.execute_read_statement_with_limits(ctx, session, stmt, read_txn, self.result_limits)
     }
 
+    /// 検証済み集計 SELECT（[`ValidatedAggregate`](crate::sql::allowlist::ValidatedAggregate)）の
+    /// 実行本体（サブクエリ解決 → 束縛 → 実行 → グループ数上限の再検査）。
+    /// [`Self::execute_read_statement_with_limits`] の `Statement::Aggregate` アームと
+    /// `COPY (<集計 SELECT>) TO STDOUT`（[`Self::run_copy_to_scan`]。Issue #3253・SQL-34・
+    /// WIRE-22 のポインタ）が共有し、後者が第 2 の集計実行器を持たず、通常の SELECT と
+    /// 同じ `PolicyContext`・同じ read source・同じ上限規則を通るようにする。
+    fn run_validated_aggregate<R: crate::storage::read_source::ReadSource>(
+        &self,
+        read_txn: &R,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        schema: &crate::catalog::TableSchema,
+        mut validated: crate::sql::allowlist::ValidatedAggregate,
+        limits: crate::result_limits::ResultLimits,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: 束縛
+        // （`bind_aggregate`）の前に WHERE 中のサブクエリ
+        // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
+        // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
+        // 解決する（`sql::subquery` モジュールドキュメント参照）。
+        let mut subquery_budget = self.nesting_limits.max_subquery_executions();
+        let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
+        // Issue #1842・SQL-61: 肯定形の相関 `EXISTS` を半結合・行ごとの再評価で実行する。
+        // 再評価・比較の予算は 1 文ごとに作り、入れ子を含む文全体で共有する。
+        let correlated = crate::sql::correlated_exists::CorrelatedCtx::enabled(
+            self.join_limits,
+            self.correlated_limits,
+        );
+        validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
+            validated.where_predicates,
+            &[schema],
+            read_txn,
+            ctx,
+            &self.storage,
+            session.udfs(),
+            self.group_by_limits,
+            self.nesting_limits,
+            limits,
+            &mut subquery_budget,
+            &mut subquery_in_value_budget,
+            &correlated,
+        )?;
+        // SQL-57・Issue #1806: 集計項目の `FILTER (WHERE ...)` 中の部分クエリも
+        // 同じ文脈・同じ予算で解決する。
+        crate::sql::subquery::resolve_aggregate_item_filters(
+            &mut validated.items,
+            validated
+                .group_by
+                .as_mut()
+                .map_or(&mut [][..], |g| g.having_aggregates.as_mut_slice()),
+            &[schema],
+            read_txn,
+            ctx,
+            &self.storage,
+            session.udfs(),
+            self.group_by_limits,
+            self.nesting_limits,
+            limits,
+            &mut subquery_budget,
+            &mut subquery_in_value_budget,
+        )?;
+        let bound = crate::sql::parser::bind_aggregate(&validated, schema, session.udfs())?
+            .with_result_cap(limits.max_result_rows());
+        let result = self.run_aggregate_plan(
+            read_txn,
+            ctx,
+            schema,
+            &bound,
+            crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
+        )?;
+        let result = Self::enforce_group_result_cap(&validated, result, &limits)?;
+        Ok(result)
+    }
+
     /// [`Self::execute_read_statement`] の本体。明示 `LIMIT` の範囲上限を引数で受ける
     /// （Issue #1555）。評価後射影形ビューの本文は外側の設定値と連動させず、
     /// 独立した既定値で実行するために分離している。
@@ -14110,65 +14184,10 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
-            crate::sql::allowlist::Statement::Aggregate(mut validated) => {
+            crate::sql::allowlist::Statement::Aggregate(validated) => {
                 let schema = table_schema_in(read_txn, &validated.table_name)?;
-                // Issue #927・SQL-29 (a)・RLS-10 (b)・TASK-213: 束縛
-                // （`bind_aggregate`）の前に WHERE 中のサブクエリ
-                // （`IN (SELECT ...)`／`EXISTS (SELECT ...)`）を、外側と同じ
-                // `PolicyContext`・同じ `read_txn`（同一スナップショット）で
-                // 解決する（`sql::subquery` モジュールドキュメント参照）。
-                let mut subquery_budget = self.nesting_limits.max_subquery_executions();
-                let mut subquery_in_value_budget = crate::sql::subquery::MAX_SUBQUERY_IN_VALUES;
-                // Issue #1842・SQL-61: 肯定形の相関 `EXISTS` を半結合・行ごとの再評価で実行する。
-                // 再評価・比較の予算は 1 文ごとに作り、入れ子を含む文全体で共有する。
-                let correlated = crate::sql::correlated_exists::CorrelatedCtx::enabled(
-                    self.join_limits,
-                    self.correlated_limits,
-                );
-                validated.where_predicates = crate::sql::subquery::resolve_where_predicates(
-                    validated.where_predicates,
-                    &[&schema],
-                    read_txn,
-                    ctx,
-                    &self.storage,
-                    session.udfs(),
-                    self.group_by_limits,
-                    self.nesting_limits,
-                    limits,
-                    &mut subquery_budget,
-                    &mut subquery_in_value_budget,
-                    &correlated,
-                )?;
-                // SQL-57・Issue #1806: 集計項目の `FILTER (WHERE ...)` 中の部分クエリも
-                // 同じ文脈・同じ予算で解決する。
-                crate::sql::subquery::resolve_aggregate_item_filters(
-                    &mut validated.items,
-                    validated
-                        .group_by
-                        .as_mut()
-                        .map_or(&mut [][..], |g| g.having_aggregates.as_mut_slice()),
-                    &[&schema],
-                    read_txn,
-                    ctx,
-                    &self.storage,
-                    session.udfs(),
-                    self.group_by_limits,
-                    self.nesting_limits,
-                    limits,
-                    &mut subquery_budget,
-                    &mut subquery_in_value_budget,
-                )?;
-                let bound =
-                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?
-                        .with_result_cap(limits.max_result_rows());
-                let result = self.run_aggregate_plan(
-                    read_txn,
-                    ctx,
-                    &schema,
-                    &bound,
-                    crate::sql::aggregate::MAX_AGGREGATE_RESULT_BYTES,
-                )?;
-                let result = Self::enforce_group_result_cap(&validated, result, &limits)?;
+                let result = self
+                    .run_validated_aggregate(read_txn, ctx, session, &schema, validated, limits)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
             crate::sql::allowlist::Statement::Scan(mut validated) => {
@@ -15309,6 +15328,33 @@ impl EngineCore {
         Ok(())
     }
 
+    /// 集計 SELECT 経由の COPY 結果列に HALFVEC／INT8VEC／SPARSEVEC が含まれる場合に
+    /// `0A000` で拒否する（Issue #3253。[`Self::reject_halfvec_copy_projection`] の結果列版。
+    /// 集計は `BoundScan` を持たないため、実行後の列メタから判定する。CopyOutResponse の前に確定する）。
+    fn reject_unsupported_copy_result_columns(
+        columns: &[crate::sql::exec::ColumnMeta],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        use crate::catalog::ColumnType;
+        use crate::sql::exec::ColumnMeta;
+        let hit = columns.iter().find_map(|c| {
+            let ty = match c {
+                ColumnMeta::Scalar { ty, .. } => Some(ty),
+                ColumnMeta::Computed { ty, .. } => ty.as_ref(),
+                _ => None,
+            };
+            match ty {
+                Some(ColumnType::HalfVec(_)) => Some("COPY does not support HALFVEC columns"),
+                Some(ColumnType::Int8Vec(_)) => Some("COPY does not support INT8VEC columns"),
+                Some(ColumnType::SparseVec(_)) => Some("COPY does not support SPARSEVEC columns"),
+                _ => None,
+            }
+        });
+        if let Some(message) = hit {
+            return Err(crate::sql::allowlist::SqlSurfaceError::feature_not_supported(message));
+        }
+        Ok(())
+    }
+
     /// `COPY ... TO STDOUT` の読み取り（束縛 → 走査）を担う単一の入口（Issue #1771・WIRE-22 (5)・
     /// SQL-34 のポインタ）。`begin_copy_validated`・`begin_copy_active`（明示 txn の dirty 分岐）・
     /// `core/temp_route.rs::begin_copy_temp` の 3 経路がここを通る（行数上限の判定を 1 か所に
@@ -15318,6 +15364,10 @@ impl EngineCore {
     /// - テーブル形: `LIMIT` を行数上限 + 1 に差し替えて取得し、上限を超えたら黙って切り詰めず
     ///   `54000` で拒否する（`CopyOutResponse` より前に確定するため行は 1 件も送られない）。
     ///   エラー文言は固定で、行の内容・テナント ID を含めない。
+    /// - 括弧形の集計 SELECT（Issue #3253）: 通常の SELECT と同じ
+    ///   [`Self::run_validated_aggregate`] で実行し（サブクエリ解決・RLS・グループ数上限を共有）、
+    ///   結果列の型（HALFVEC 系）と結果件数（`--max-result-rows`。明示 `LIMIT`・単一行集計を含め
+    ///   無条件）を検査してから返す。超過は部分出力せず `54000`。
     pub(super) fn run_copy_to_scan(
         &self,
         source: &impl crate::storage::read_source::ReadSource,
@@ -15326,10 +15376,36 @@ impl EngineCore {
         schema: &crate::catalog::TableSchema,
         v: &crate::sql::allowlist::ValidatedCopyTo,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
-        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::sql::allowlist::{CopyToSource, SqlSurfaceError};
+        let inner_scan = match &v.inner {
+            CopyToSource::Scan(scan) => scan,
+            CopyToSource::Aggregate(agg) => {
+                // 構文段はテーブル形の集計を作らない。到達したら fail-closed。
+                if v.is_table_form() {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "internal error".to_string(),
+                    });
+                }
+                let result = self.run_validated_aggregate(
+                    source,
+                    ctx,
+                    session,
+                    schema,
+                    (**agg).clone(),
+                    self.result_limits,
+                )?;
+                Self::reject_unsupported_copy_result_columns(&result.columns)?;
+                if result.rows.len() > self.result_limits.max_result_rows() {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "COPY result exceeds the row limit",
+                    ));
+                }
+                return Ok(result);
+            }
+        };
         if !v.is_table_form() {
             let bound = crate::sql::parser::bind_scan_with_dummy_flags(
-                &v.inner,
+                inner_scan,
                 schema,
                 session.udfs(),
                 &[],
@@ -15345,7 +15421,7 @@ impl EngineCore {
         // （ハード上限 - 1）は使わない（設定値ちょうどの行数を許容するため）。
         let cap = self.result_limits.max_result_rows();
         let fetch = cap.checked_add(1).ok_or_else(internal)?;
-        let mut scan = (*v.inner).clone();
+        let mut scan = (**inner_scan).clone();
         scan.limit = u32::try_from(cap).map_err(|_| internal())?;
         let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
             &scan,
