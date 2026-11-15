@@ -76,9 +76,15 @@
 //! 書き込み時の検査（違反は `23514`）は engine 側の単一の実装が担い、wire 側に
 //! 型検査・評価器を持たない。
 //!
-//! - `predicate` の葉は `CHECK_LEAF_SCHEMA` 形（`column`／`op`／`value`）で、
-//!   `op` は `eq`／`prefix`／`lt`／`le`(`lte`)／`gt`／`ge`(`gte`) のみ。`in`・`or`
-//!   グループは engine も CHECK 内で拒否するため wire で先に `42601` とする。
+//! - `predicate` の各要素は `filter` と同じ語彙（`eq`／`ne`／`prefix`／`like`／範囲 6
+//!   語彙／`in`／`between`／`is_null`／`not_null`・`{"or":[..]}`・`{"not":{..}}`。
+//!   Issue #3246）。形・RLS 述語名・件数／深さ／葉の総数／`in` 要素数の上限は
+//!   `http::query::filter` の形検査段を共有し（第 2 の形パーサを持たない）、
+//!   [`check_node_tokens`] が SQL の `IN`／`BETWEEN`／`IS [NOT] NULL`／`OR`／`NOT`
+//!   のトークン列へ写す（`ne` は `NOT ( col = v )`）。
+//! - 列型との整合・TEXT の BETWEEN（`22000`）・数値列への文字列要素の IN（`22000`）・
+//!   vector 系列の IS NULL（`42601`）等の判定は engine に一本化し、wire で先回りしない
+//!   （SQLSTATE パリティ）。
 //! - CREATE TABLE 時点ではスキーマが無いため、値トークンの種類は JSON 値の型で
 //!   決める（`prefix` は `LIKE '<escaped>%'`、真偽値は `eq` のみ）。
 //! - 表制約としてのみ生成するため既定名は `<table>_check` 系となる（SQL の列制約
@@ -136,11 +142,11 @@ use engine::sql::lexer::{tokenize, Keyword, Token};
 use crate::http::response as http_response;
 use crate::http::session::middleware::SessionPrincipal;
 
-use super::filter::{is_rls_predicate_column, like_escape};
+use super::filter::{is_rls_predicate_column, like_escape, map_filter_items, FilterNode};
 use super::ident::{self, InvalidIdentifier};
 use super::schema::{
-    SchemaError, Validated, CHECK_LEAF_SCHEMA, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA,
-    DDL_CONSTRAINT_SCHEMA, DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA,
+    SchemaError, Validated, DDL_ADD_COLUMN_SCHEMA, DDL_COLUMN_SCHEMA, DDL_CONSTRAINT_SCHEMA,
+    DDL_DROP_COLUMN_SCHEMA, DDL_REFERENCES_SCHEMA,
 };
 use engine::catalog::MAX_COLUMN_COUNT;
 
@@ -387,8 +393,9 @@ fn referential_action_tokens(raw: &str) -> Result<Vec<Token>, DdlError> {
 }
 
 /// CHECK 述語の比較演算子（`=`／`<`／`<=`／`>`／`>=`）の固定語彙写像。
-/// `prefix`・`in` は本関数の対象外（呼び出し元が分岐する）。語彙外は
-/// [`DdlError::InvalidRequest`]。JSON 文字列を `Token::Ident` へ流用しない。
+/// `ne`・`prefix`・`like`・`in`・`between`・`is_null`・`not_null` は本関数の対象外
+/// （[`check_node_tokens`] が分岐する）。語彙外は [`DdlError::InvalidRequest`]。
+/// JSON 文字列を `Token::Ident` へ流用しない。
 fn check_compare_op_token(op: &str) -> Result<Token, DdlError> {
     match op {
         "eq" => Ok(Token::Punct('=')),
@@ -400,45 +407,135 @@ fn check_compare_op_token(op: &str) -> Result<Token, DdlError> {
     }
 }
 
-/// CHECK 述語の葉 1 件（`{column, op, value}`）をトークン列へ写像する
-/// （[`build_check_tokens`] 専用。モジュール doc「CHECK」節参照）。
-fn check_leaf_tokens(item: &JsonValue) -> Result<Vec<Token>, DdlError> {
-    let v = CHECK_LEAF_SCHEMA.validate(item).map_err(DdlError::from)?;
-    let column = v.required_str("column").map_err(DdlError::from)?;
-    let op = v.required_str("op").map_err(DdlError::from)?;
-    let value = v.required_scalar("value").map_err(DdlError::from)?;
-    // `visible()` 等の RLS 述語名は CHECK の列にできない（多層防御。engine も拒否）。
-    if is_rls_predicate_column(column) {
-        return Err(DdlError::InvalidRequest);
-    }
-    let mut tokens = vec![ident_token(column)?];
-    if op == "prefix" {
-        let JsonValue::String(raw) = value else {
-            return Err(DdlError::InvalidRequest);
-        };
-        if raw.chars().any(|c| c.is_control()) {
-            return Err(DdlError::InvalidRequest);
-        }
-        tokens.push(Token::Ident("LIKE".to_string()));
-        tokens.push(Token::StringLiteral(format!("{}%", like_escape(raw))));
-        return Ok(tokens);
-    }
-    let op_token = check_compare_op_token(op)?;
+/// `IN` の要素・`BETWEEN` の境界に使えるスカラー（文字列・数値のみ）をトークン列へ
+/// 写像する。真偽値・配列・オブジェクトは [`DdlError::InvalidRequest`]。
+fn check_scalar_tokens(value: &JsonValue) -> Result<Vec<Token>, DdlError> {
     match value {
-        JsonValue::Bool(b) => {
-            // 真偽値は等価比較のみ（BoolEquality 形）。
-            if op != "eq" {
+        JsonValue::String(_) | JsonValue::Number(_) => default_literal_tokens(value),
+        _ => Err(DdlError::InvalidRequest),
+    }
+}
+
+/// 制御文字を含まない文字列だけを受け取る（`prefix`／`like` 用）。
+fn check_pattern_text(value: &JsonValue) -> Result<&str, DdlError> {
+    match value {
+        JsonValue::String(raw) if !raw.chars().any(|c| c.is_control()) => Ok(raw.as_str()),
+        _ => Err(DdlError::InvalidRequest),
+    }
+}
+
+/// 形検査済みの [`FilterNode`]（`filter.rs` の形検査段と共有。Issue #3246）を
+/// CHECK 述語のトークン列へ写像する（[`build_check_tokens`] 専用。モジュール doc
+/// 「CHECK」節参照）。wire は SQL の形を出すだけで、列型との整合・未対応形の判定は
+/// engine に一本化する（SQLSTATE パリティ）。演算子・キーワードは固定語彙の `match`
+/// だけで生成し、JSON の `op` 文字列をトークンへ流用しない。
+fn check_node_tokens(node: &FilterNode<'_>) -> Result<Vec<Token>, DdlError> {
+    match node {
+        FilterNode::Leaf { column, op, value } => {
+            // `visible()` 等の RLS 述語名は CHECK の列にできない（多層防御。
+            // 形検査段・engine も拒否）。
+            if is_rls_predicate_column(column) {
                 return Err(DdlError::InvalidRequest);
             }
-            tokens.push(op_token);
-            tokens.push(Token::Ident(if *b { "true" } else { "false" }.to_string()));
+            let column_token = ident_token(column)?;
+            let mut tokens = vec![column_token.clone()];
+            match *op {
+                "prefix" => {
+                    let raw = check_pattern_text(value)?;
+                    tokens.push(Token::Ident("LIKE".to_string()));
+                    tokens.push(Token::StringLiteral(format!("{}%", like_escape(raw))));
+                }
+                "like" => {
+                    let raw = check_pattern_text(value)?;
+                    tokens.push(Token::Ident("LIKE".to_string()));
+                    tokens.push(Token::StringLiteral(raw.to_string()));
+                }
+                "in" => {
+                    let JsonValue::Array(items) = value else {
+                        return Err(DdlError::InvalidRequest);
+                    };
+                    tokens.push(Token::Ident("IN".to_string()));
+                    tokens.push(Token::Punct('('));
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            tokens.push(Token::Punct(','));
+                        }
+                        tokens.extend(check_scalar_tokens(item)?);
+                    }
+                    tokens.push(Token::Punct(')'));
+                }
+                "between" => {
+                    let JsonValue::Array(items) = value else {
+                        return Err(DdlError::InvalidRequest);
+                    };
+                    let [lo, hi] = items.as_slice() else {
+                        return Err(DdlError::InvalidRequest);
+                    };
+                    tokens.push(Token::Ident("BETWEEN".to_string()));
+                    tokens.extend(check_scalar_tokens(lo)?);
+                    tokens.push(Token::Keyword(Keyword::And));
+                    tokens.extend(check_scalar_tokens(hi)?);
+                }
+                "is_null" => {
+                    tokens.push(Token::Ident("IS".to_string()));
+                    tokens.push(Token::Ident("NULL".to_string()));
+                }
+                "not_null" => {
+                    tokens.push(Token::Ident("IS".to_string()));
+                    tokens.push(Token::Ident("NOT".to_string()));
+                    tokens.push(Token::Ident("NULL".to_string()));
+                }
+                "ne" => {
+                    // SQL の `<>` と同じく否定へ脱糖した形で渡す（`<>` の多文字トークンを
+                    // wire で組み立てない）。
+                    let mut inner = vec![column_token, Token::Punct('=')];
+                    inner.extend(check_equality_value_tokens(value)?);
+                    return Ok(not_group(inner));
+                }
+                other => {
+                    let op_token = check_compare_op_token(other)?;
+                    if matches!(value, JsonValue::Bool(_)) && other != "eq" {
+                        // 真偽値は等価比較のみ（BoolEquality 形）。
+                        return Err(DdlError::InvalidRequest);
+                    }
+                    tokens.push(op_token);
+                    tokens.extend(check_equality_value_tokens(value)?);
+                }
+            }
+            Ok(tokens)
         }
-        other => {
-            tokens.push(op_token);
-            tokens.extend(default_literal_tokens(other)?);
+        FilterNode::Or(branches) => {
+            let mut tokens = vec![Token::Punct('(')];
+            for (i, branch) in branches.iter().enumerate() {
+                if i > 0 {
+                    tokens.push(Token::Ident("OR".to_string()));
+                }
+                tokens.extend(check_node_tokens(branch)?);
+            }
+            tokens.push(Token::Punct(')'));
+            Ok(tokens)
         }
+        FilterNode::Not(inner) => Ok(not_group(check_node_tokens(inner)?)),
     }
-    Ok(tokens)
+}
+
+/// 比較・等価の右辺リテラル（真偽値は固定語彙の識別子。配列・オブジェクトは
+/// CHECK に複合値の比較がないため [`DdlError::InvalidRequest`]）。
+fn check_equality_value_tokens(value: &JsonValue) -> Result<Vec<Token>, DdlError> {
+    match value {
+        JsonValue::Bool(b) => Ok(vec![Token::Ident(
+            if *b { "true" } else { "false" }.to_string(),
+        )]),
+        other => default_literal_tokens(other),
+    }
+}
+
+/// `NOT ( <inner> )` を組み立てる。
+fn not_group(inner: Vec<Token>) -> Vec<Token> {
+    let mut tokens = vec![Token::Ident("NOT".to_string()), Token::Punct('(')];
+    tokens.extend(inner);
+    tokens.push(Token::Punct(')'));
+    tokens
 }
 
 /// `kind == "check"` の制約をトークン列へ写像する（Issue #1199・NOSQL-13・
@@ -458,8 +555,10 @@ fn build_check_tokens(
     if predicate.is_empty() {
         return Err(DdlError::InvalidRequest);
     }
-    // 確保前に件数上限を検査する（DoS 対策。`54000`）。
-    engine::declarative_filter::check_filter_count(predicate.len()).map_err(DdlError::from)?;
+    // 形・語彙・RLS 述語名・件数／深さ／葉の総数／`in` 要素数の上限は、`filter` と
+    // 共有する形検査段が確保前に判定する（`42601`／`54000`。Issue #3246）。
+    let nodes =
+        map_filter_items(predicate).map_err(|e| DdlError::Engine(e.into_sql_surface_error()))?;
     let name = v.optional_str("name").map_err(DdlError::from)?;
 
     let mut tokens = Vec::new();
@@ -469,11 +568,11 @@ fn build_check_tokens(
     }
     tokens.push(Token::Ident("CHECK".to_string()));
     tokens.push(Token::Punct('('));
-    for (i, leaf) in predicate.iter().enumerate() {
+    for (i, node) in nodes.iter().enumerate() {
         if i > 0 {
             tokens.push(Token::Keyword(Keyword::And));
         }
-        tokens.extend(check_leaf_tokens(leaf)?);
+        tokens.extend(check_node_tokens(node)?);
     }
     tokens.push(Token::Punct(')'));
     Ok(tokens)
@@ -2009,7 +2108,6 @@ mod tests {
             r#"{"kind":"check"}"#,
             r#"{"kind":"check","predicate":[]}"#,
             r#"{"kind":"check","columns":["a"],"predicate":[{"column":"a","op":"gt","value":0}]}"#,
-            r#"{"kind":"check","predicate":[{"column":"a","op":"in","value":[1]}]}"#,
             r#"{"kind":"check","predicate":[{"column":"a","op":"neq","value":1}]}"#,
             r#"{"kind":"check","predicate":[{"column":"visible","op":"eq","value":true}]}"#,
             r#"{"kind":"check","predicate":[{"column":"a","op":"prefix","value":"\u0001"}]}"#,
@@ -2025,10 +2123,145 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    DdlError::InvalidRequest | DdlError::InvalidIdentifier | DdlError::Shape(_)
+                    DdlError::InvalidRequest
+                        | DdlError::InvalidIdentifier
+                        | DdlError::Shape(_)
+                        | DdlError::Engine(_)
                 ),
                 "case {c}: {err:?}"
             );
+        }
+    }
+
+    /// SQL 表層のテキストを tokenize して `ValidatedCreateTable` を得る（パリティ比較用）。
+    fn sql_check_validated(
+        columns: &str,
+        check: &str,
+    ) -> Result<engine::sql::allowlist::ValidatedCreateTable, SqlSurfaceError> {
+        let tokens = tokenize(&format!("CREATE TABLE t ({columns}, {check})")).expect("lex");
+        validate_create_table_tokens_with_implicit_id(&tokens)
+    }
+
+    fn nosql_check_validated(
+        columns: &str,
+        predicate_json: &str,
+    ) -> Result<engine::sql::allowlist::ValidatedCreateTable, SqlSurfaceError> {
+        let value = obj(&format!(
+            r#"{{"kind":"check","predicate":{predicate_json}}}"#
+        ));
+        let constraint = build_constraint_tokens(&value).expect("check must map");
+        let mut t = tokenize(&format!("CREATE TABLE t ({columns},")).expect("lex");
+        t.extend(constraint);
+        t.push(Token::Punct(')'));
+        validate_create_table_tokens_with_implicit_id(&t)
+    }
+
+    /// Issue #3246・NOSQL-13・TABLE-16: 拡張述語形が SQL 表層の同じ意味の CHECK と
+    /// 同一のカタログ表現になること。
+    #[test]
+    fn build_constraint_tokens_check_extended_forms_match_sql_surface() {
+        let cols = "n INTEGER, s TEXT";
+        let cases: [(&str, &str); 13] = [
+            (
+                r#"[{"column":"n","op":"in","value":[1,2]}]"#,
+                "CHECK (n IN (1, 2))",
+            ),
+            (
+                r#"[{"column":"s","op":"in","value":["a","b"]}]"#,
+                "CHECK (s IN ('a', 'b'))",
+            ),
+            (
+                r#"[{"not":{"column":"n","op":"in","value":[1,2]}}]"#,
+                "CHECK (NOT (n IN (1, 2)))",
+            ),
+            (
+                r#"[{"column":"n","op":"between","value":[1,3]}]"#,
+                "CHECK (n BETWEEN 1 AND 3)",
+            ),
+            (
+                r#"[{"not":{"column":"n","op":"between","value":[1,3]}}]"#,
+                "CHECK (NOT (n BETWEEN 1 AND 3))",
+            ),
+            (r#"[{"column":"n","op":"is_null"}]"#, "CHECK (n IS NULL)"),
+            (
+                r#"[{"column":"n","op":"not_null"}]"#,
+                "CHECK (n IS NOT NULL)",
+            ),
+            (
+                r#"[{"or":[{"column":"n","op":"gt","value":0},{"column":"s","op":"eq","value":"a"}]}]"#,
+                "CHECK ((n > 0 OR s = 'a'))",
+            ),
+            (
+                r#"[{"not":{"or":[{"column":"n","op":"eq","value":0},{"column":"s","op":"eq","value":"a"}]}}]"#,
+                "CHECK (NOT ((n = 0 OR s = 'a')))",
+            ),
+            (
+                r#"[{"column":"n","op":"ne","value":1}]"#,
+                "CHECK (NOT (n = 1))",
+            ),
+            (
+                r#"[{"column":"s","op":"like","value":"a_%"}]"#,
+                "CHECK (s LIKE 'a_%')",
+            ),
+            (
+                r#"[{"or":[{"column":"n","op":"gt","value":0}]}]"#,
+                "CHECK (n > 0)",
+            ),
+            (
+                r#"[{"column":"n","op":"gt","value":-1},{"column":"n","op":"not_null"}]"#,
+                "CHECK (n > -1 AND n IS NOT NULL)",
+            ),
+        ];
+        for (json, sql) in cases {
+            let nosql =
+                nosql_check_validated(cols, json).unwrap_or_else(|e| panic!("{json}: {e:?}"));
+            let expect = sql_check_validated(cols, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(nosql, expect, "case {json}");
+        }
+    }
+
+    /// `NOT IN` の SQL 表記と NoSQL の `not` + `in` が同じ表現になること。
+    #[test]
+    fn build_constraint_tokens_check_not_in_matches_sql_not_in() {
+        let cols = "n INTEGER, s TEXT";
+        let nosql =
+            nosql_check_validated(cols, r#"[{"not":{"column":"n","op":"in","value":[1,2]}}]"#)
+                .expect("nosql");
+        let sql = sql_check_validated(cols, "CHECK (n NOT IN (1, 2))").expect("sql");
+        assert_eq!(nosql, sql);
+    }
+
+    /// intentional: docs/design/nosql-ddl-mapping.md
+    /// 形の不正は `42601`、上限超過は `54000` で fail-closed になること。
+    #[test]
+    fn build_constraint_tokens_check_extended_shape_rejections_wire_codes() {
+        let too_many = vec!["1"; 257].join(",");
+        let cases: Vec<(String, &str)> = vec![
+            (r#"[{"column":"a","op":"in","value":[]}]"#.into(), "42601"),
+            (r#"[{"column":"a","op":"between","value":[1]}]"#.into(), "42601"),
+            (r#"[{"column":"a","op":"between","value":[1,2,3]}]"#.into(), "42601"),
+            (r#"[{"column":"a","op":"is_null","value":1}]"#.into(), "42601"),
+            (r#"[{"column":"a","op":"in","value":[true]}]"#.into(), "42601"),
+            (r#"[{"column":"a","op":"eq","value":[1]}]"#.into(), "42601"),
+            (r#"[{"or":[]}]"#.into(), "42601"),
+            (r#"[{"not":[1]}]"#.into(), "42601"),
+            (
+                r#"[{"or":[{"column":"a","op":"gt","value":0},{"column":"visible","op":"eq","value":true}]}]"#.into(),
+                "42601",
+            ),
+            (
+                r#"[{"not":{"column":"visible()","op":"is_null"}}]"#.into(),
+                "42601",
+            ),
+            (
+                format!(r#"[{{"column":"a","op":"in","value":[{too_many}]}}]"#),
+                "54000",
+            ),
+        ];
+        for (json, code) in cases {
+            let value = obj(&format!(r#"{{"kind":"check","predicate":{json}}}"#));
+            let err = build_constraint_tokens(&value).expect_err(&json);
+            assert_eq!(err.wire_code(), code, "case {json}");
         }
     }
 
