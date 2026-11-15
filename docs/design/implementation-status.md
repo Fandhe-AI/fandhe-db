@@ -2095,6 +2095,8 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #3217（perf(engine): 行ノルム² をスナップショット世代単位で常駐キャッシュ。SQL-33・CORE-3 のポインタ）**: 依存・unsafe・公開 API の変更なし。`SqlArenaSnapshot` に遅延初期化の行ノルム²（行数 × 4 バイト。`approx_heap_bytes` に算入）を持たせ、キャッシュヒットした `<=>` 全走査（WHERE なし・マスクなし・走査 arena がスナップショット自身）と hybrid の密側で C2 入力として渡す。それ以外の形は従来経路。固定した検査は `arena_cache.rs` の単体テストと `sql_named/sql_arena_cache.rs` の `resident_row_norms_*`（距離のビット一致・世代更新後の再計算・WHERE 縮約 arena・テナント分離・hybrid）。p50 低下の A/B は未検証。詳細は [hybrid-rrf-latency-breakdown.md](hybrid-rrf-latency-breakdown.md)。
 
+**Issue #3225（chore(bench): hybrid ベンチの条件を揃えて recall を並記。SEARCH-13 のポインタ）**: production コード・依存・unsafe・CI の変更なし。crossdb ハーネスに self と Redis で取得深さを揃えた `hybrid_rrf_depth50`／`hybrid_rrf_depth200` と、Redis の語の結合診断 `hybrid_text_conjunction` を追加し、`dense_gt_recall_at_10`・`overlap_at_10_vs_depth200`・`topic_hit_rate_at_10` を結果 JSON と stdout に並べる。既存の `hybrid_rrf`・`bulk_hybrid_k200` の条件は不変。純ロジックは `scripts/crossdb_bench/hybrid_depth.py`、検査は `scripts/tests/test_crossdb_hybrid_depth.py`。条件差の記録は `docs/design/crossdb-bench.md`。実機計測は未実施（未検証）。
+
 ## Issue #3223: scan の decode_row_header 二重デコードの解消
 
 `sql/scan.rs::with_visible_row` の `Fast`／`DimAndScalar` 段で、RLS 判定のヘッダデコードの offset を
