@@ -256,8 +256,14 @@ impl EngineCore {
             DmlStatement::Insert(v) => {
                 let lookup = super::InsertSchemaLookup::new(&self.storage);
                 if v.returning.is_some() {
-                    self.execute_insert_returning_form(target, ctx, v, &lookup)
-                        .map(|o| Some(o.result))
+                    self.execute_insert_returning_form(
+                        target,
+                        ctx,
+                        v,
+                        &lookup,
+                        &crate::sql::udf_call::UdfRegistry::default(),
+                    )
+                    .map(|o| Some(o.result))
                 } else {
                     self.execute_insert_form(target, ctx, v, &lookup)
                         .map(|_| None)
@@ -278,8 +284,13 @@ impl EngineCore {
             }
             DmlStatement::Delete(crate::sql::allowlist::DeleteStatement::SingleRow(v)) => {
                 if v.returning.is_some() {
-                    self.execute_delete_returning_form(target, ctx, v)
-                        .map(|o| Some(o.result))
+                    self.execute_delete_returning_form(
+                        target,
+                        ctx,
+                        v,
+                        &crate::sql::udf_call::UdfRegistry::default(),
+                    )
+                    .map(|o| Some(o.result))
                 } else {
                     self.execute_delete_form(target, ctx, v).map(|_| None)
                 }

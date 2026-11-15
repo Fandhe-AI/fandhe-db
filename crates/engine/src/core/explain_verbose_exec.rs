@@ -92,7 +92,11 @@ impl EngineCore {
                     ExplainDml::Update(v) => (v.table_name(), v.returning()),
                 };
                 let schema = self.load_table_schema_for_dml(table)?;
-                if let Some(projection) = crate::sql::parser::bind_returning(returning, &schema)? {
+                if let Some(projection) = crate::sql::parser::bind_returning_with_udfs(
+                    returning,
+                    &schema,
+                    session.udfs(),
+                )? {
                     let columns = crate::sql::returning::column_meta(&projection, &schema)?;
                     let names: Vec<&str> = columns
                         .iter()

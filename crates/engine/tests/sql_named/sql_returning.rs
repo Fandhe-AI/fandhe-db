@@ -1459,9 +1459,10 @@ fn returning_duplicate_aliases_yield_two_same_named_columns() {
     }
 }
 
-/// 暗黙の別名・未知の列・未定義関数（UDF 呼び出しを含む。受け皿 #3250）・サブクエリ・集計は
-/// 書き込み前に拒否し、台帳も消費しない。文言に旧来の誤解を招く表現（function-call）を含まない。
-// tracked: #3250
+/// 暗黙の別名・未知の列・未定義関数・サブクエリ・集計は書き込み前に拒否し、台帳も消費しない。
+/// 文言に旧来の誤解を招く表現（function-call）を含まない。`*, lang` の `0A000` は #3248 の
+/// 意図的な拒否（定義済み UDF の受理は #3250 の専用テストで検証する）。
+// intentional: docs/design/sql-returning.md
 #[test]
 fn returning_unsupported_items_are_rejected_before_writing() {
     let (core, path) = new_core_with_table();
@@ -1770,4 +1771,313 @@ fn returning_expressions_never_touch_other_tenant_rows() {
     );
     assert_eq!(out.result.rows.len(), 1);
     assert_eq!(out.result.rows[0].cells, vec![Cell::Text("Z".to_string())]);
+}
+// ---------------------------------------------------------------------
+// RETURNING での UDF 評価（Issue #3250・SQL-21 のポインタ）
+// ---------------------------------------------------------------------
+
+fn define(core: &EngineCore, ctx: &PolicyContext, session: &mut SessionState, sql: &str) {
+    run(core, ctx, session, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+/// 宣言的 UDF は RETURNING の全 DML 形で評価でき、列メタ・値が同じ式の SELECT と一致する
+/// （別名付き・UDF の入れ子・組み込み関数との混在を含む）。
+#[test]
+fn returning_declarative_udf_matches_select_for_every_dml() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+    );
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION twice(x) AS shout(shout(x))",
+    );
+    let exprs = "shout(lang) AS u, twice(body) AS t, length(shout(body)) + 1 AS n";
+
+    let ins = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.3,0.4]', 'ja', 'hello'), (2, '[0.5,0.6]', 'en', 'abc') \
+                 RETURNING {exprs} USING OPERATION_ID 'op-udf-ins'"
+            ),
+        )
+        .expect("insert returning udf"),
+    );
+    assert_eq!(ins.rows_affected, 2);
+    let select = match run(
+        &core,
+        &alice,
+        &mut session,
+        &format!("SELECT {exprs} FROM {TABLE} LIMIT 10"),
+    )
+    .expect("select udf")
+    {
+        SqlOutcome::Query(q) => q,
+        other => panic!("expected Query, got {other:?}"),
+    };
+    assert_eq!(ins.result.columns, select.columns);
+    let mut a: Vec<String> = ins
+        .result
+        .rows
+        .iter()
+        .map(|r| format!("{:?}", r.cells))
+        .collect();
+    let mut b: Vec<String> = select
+        .rows
+        .iter()
+        .map(|r| format!("{:?}", r.cells))
+        .collect();
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET lang = 'fr' WHERE id = 1 RETURNING shout(lang) AS u \
+                 USING OPERATION_ID 'op-udf-upd'"
+            ),
+        )
+        .expect("update returning udf"),
+    );
+    assert_eq!(upd.result.rows.len(), 1);
+    assert_eq!(upd.result.rows[0].cells, vec![Cell::Text("FR".to_string())]);
+
+    let upd = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "UPDATE {TABLE} SET body = 'zzz' WHERE lang = 'en' RETURNING twice(body) AS t \
+                 USING OPERATION_ID 'op-udf-updp'"
+            ),
+        )
+        .expect("predicate update returning udf"),
+    );
+    assert_eq!(
+        upd.result.rows[0].cells,
+        vec![Cell::Text("ZZZ".to_string())]
+    );
+
+    let del = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE id = 1 RETURNING shout(body) AS b \
+                 USING OPERATION_ID 'op-udf-del'"
+            ),
+        )
+        .expect("delete returning udf"),
+    );
+    assert_eq!(
+        del.result.rows[0].cells,
+        vec![Cell::Text("HELLO".to_string())]
+    );
+
+    let del = expect_returning(
+        run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "DELETE FROM {TABLE} WHERE lang = 'en' RETURNING shout(lang) AS l \
+                 USING OPERATION_ID 'op-udf-delp'"
+            ),
+        )
+        .expect("predicate delete returning udf"),
+    );
+    assert_eq!(del.result.rows[0].cells, vec![Cell::Text("EN".to_string())]);
+}
+
+/// 評価時エラー（0 除算）は commit 前に abort し、行も台帳も残さない。
+#[test]
+fn returning_udf_eval_error_aborts_without_consuming_ledger() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION inv(x) AS 1 / x",
+    );
+    let sql = |ret: &str| {
+        format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hello') RETURNING {ret} USING OPERATION_ID 'op-udf-err'"
+        )
+    };
+    let err = run(&core, &alice, &mut session, &sql("inv(length(body) - 5)"))
+        .expect_err("division by zero");
+    assert_eq!(err.wire_code(), "22012", "{err}");
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+    expect_returning(
+        run(&core, &alice, &mut session, &sql("inv(length(body))"))
+            .expect("ledger must be unconsumed"),
+    );
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+}
+
+/// `LANGUAGE sql|plpgsql` 関数（書き込みを試みうる UDF）は RETURNING から呼べず、書き込み前に
+/// `0A000` で拒否する。対象表・ルーチンが書く表・台帳のいずれも残さない。
+// intentional: docs/design/sql-returning.md
+#[test]
+fn returning_routine_call_is_rejected_before_any_write() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE TABLE audit (embedding VECTOR(2) NOT NULL, lang TEXT NOT NULL, body TEXT NOT NULL)",
+    );
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION w(x text) RETURNS text LANGUAGE sql AS \
+         $$ INSERT INTO audit (embedding, lang, body) VALUES ('[0.1,0.2]', 'x', 'y'); SELECT x $$",
+    );
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION pw(x text) RETURNS text LANGUAGE plpgsql IMMUTABLE AS \
+         $$ BEGIN RETURN x; END $$",
+    );
+    for f in ["w(lang)", "pw(lang)"] {
+        let err = run(
+            &core,
+            &alice,
+            &mut session,
+            &format!(
+                "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                 (1, '[0.1,0.2]', 'ja', 'hello') RETURNING {f} USING OPERATION_ID 'op-udf-rt'"
+            ),
+        )
+        .expect_err(f);
+        assert_eq!(err.wire_code(), "0A000", "{f}: {err}");
+        assert_eq!(count_star(&core, &alice, TABLE), 0, "{f}");
+        assert_eq!(count_star(&core, &alice, "audit"), 0, "{f}");
+    }
+    // 台帳が未消費なので、同じ operation_id で RETURNING なしの INSERT が通る。
+    run(
+        &core,
+        &alice,
+        &mut session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hello') USING OPERATION_ID 'op-udf-rt'"
+        ),
+    )
+    .expect("ledger must be unconsumed");
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+    // UPDATE・DELETE でも同じく書き込み前に拒否する。
+    for sql in [
+        format!(
+            "UPDATE {TABLE} SET lang = 'fr' WHERE id = 1 RETURNING w(lang) \
+             USING OPERATION_ID 'op-udf-ru'"
+        ),
+        format!(
+            "DELETE FROM {TABLE} WHERE id = 1 RETURNING w(lang) USING OPERATION_ID 'op-udf-rd'"
+        ),
+    ] {
+        let err = run(&core, &alice, &mut session, &sql).expect_err(&sql);
+        assert_eq!(err.wire_code(), "0A000", "{sql}: {err}");
+    }
+    assert_eq!(count_star(&core, &alice, TABLE), 1);
+    assert_eq!(count_star(&core, &alice, "audit"), 0);
+}
+
+/// 他セッションが定義した UDF は解決できず `42883`。エラー文言に関数本体を含めない。
+#[test]
+fn returning_udf_is_not_visible_across_sessions() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let bob = ctx_for("bob", true);
+    let mut bob_session = SessionState::default();
+    bob_session.allow_ddl();
+    let mut alice_session = SessionState::default();
+    define(
+        &core,
+        &bob,
+        &mut bob_session,
+        "CREATE FUNCTION secretf(x) AS upper(x)",
+    );
+    let err = run(
+        &core,
+        &alice,
+        &mut alice_session,
+        &format!(
+            "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+             (1, '[0.1,0.2]', 'ja', 'hello') RETURNING secretf(lang) USING OPERATION_ID 'op-udf-x'"
+        ),
+    )
+    .expect_err("other session's udf");
+    assert_eq!(err.wire_code(), "42883", "{err}");
+    assert!(!err.to_string().contains("upper"), "{err}");
+    assert_eq!(count_star(&core, &alice, TABLE), 0);
+}
+
+/// 明示 Tx 内の UDF 付き RETURNING は ROLLBACK で行が残らず、COMMIT で残る。
+#[test]
+fn returning_udf_in_explicit_transaction() {
+    let (core, path) = new_core_with_table();
+    let _guard = CleanupGuard(path);
+    let alice = ctx_for("alice", true);
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    define(
+        &core,
+        &alice,
+        &mut session,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+    );
+    for (end, expected, op) in [("ROLLBACK", 0, "op-udf-tx1"), ("COMMIT", 1, "op-udf-tx2")] {
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let out = expect_returning(
+            core.execute_sql_in_txn(
+                &alice,
+                &mut session,
+                &mut txn,
+                &format!(
+                    "INSERT INTO {TABLE} (id, embedding, lang, body) VALUES \
+                     (1, '[0.1,0.2]', 'ja', 'hello') RETURNING shout(lang) AS u \
+                     USING OPERATION_ID '{op}'"
+                ),
+            )
+            .expect("insert in tx"),
+        );
+        assert_eq!(out.result.rows[0].cells, vec![Cell::Text("JA".to_string())]);
+        core.execute_sql_in_txn(&alice, &mut session, &mut txn, end)
+            .expect("end tx");
+        assert_eq!(count_star(&core, &alice, TABLE), expected, "{end}");
+    }
 }
