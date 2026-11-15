@@ -10270,12 +10270,16 @@ impl<'a> Parser<'a> {
             return false;
         };
         let mut depth: u32 = 0;
+        // 配列コンストラクタ `ARRAY[1, 2]` 内のカンマを行値の区切りと誤認しないよう角括弧の深さも追跡する
+        let mut bracket_depth: u32 = 0;
         let mut has_top_level_comma = false;
         for idx in self.pos..close {
             match self.tokens.get(idx) {
                 Some(Token::Punct('(')) => depth = depth.saturating_add(1),
                 Some(Token::Punct(')')) => depth = depth.saturating_sub(1),
-                Some(Token::Punct(',')) if depth == 1 => {
+                Some(Token::Punct('[')) => bracket_depth = bracket_depth.saturating_add(1),
+                Some(Token::Punct(']')) => bracket_depth = bracket_depth.saturating_sub(1),
+                Some(Token::Punct(',')) if depth == 1 && bracket_depth == 0 => {
                     has_top_level_comma = true;
                     break;
                 }
@@ -34149,6 +34153,26 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    /// Issue #3255: 配列コンストラクタ内のカンマ（`ARRAY[1, 2]`）は行値の区切りではない
+    /// （括弧で囲んだ配列比較が `42601` へ後退しないこと）。
+    #[test]
+    fn row_value_detection_ignores_commas_inside_array_brackets() {
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for sql in [
+            "(ARRAY[1, 2]) = ARRAY[1, 2]",
+            "(ARRAY[1, 2]) = (ARRAY[1, 2])",
+        ] {
+            let preds =
+                where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+            assert!(
+                !preds
+                    .iter()
+                    .any(|p| matches!(p, WherePredicate::RowCompare { .. })),
+                "{sql}: {preds:?}"
+            );
+        }
     }
 
     /// Issue #3255: 行値比較の fail-closed な拒否（成分数不一致・未対応形は `42601`／`0A000`、

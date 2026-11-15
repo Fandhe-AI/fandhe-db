@@ -474,7 +474,8 @@ pub(crate) fn normalize_session_local_predicates(predicates: &mut [WherePredicat
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {}
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => {}
         }
     }
 }
@@ -716,7 +717,8 @@ fn reject_vector_family_null_tests(
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {}
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => {}
         }
     }
     Ok(())
@@ -901,7 +903,8 @@ fn referenced_column_names(
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {}
+            | WherePredicate::CorrelatedExists(_)
+            | WherePredicate::RowCompare { .. } => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();
