@@ -214,7 +214,7 @@ fn check_set_target(name: &str, schema: &TableSchema) -> Result<usize, SqlSurfac
 /// SET 右辺の式に現れる非修飾の列名をスコープ全体で照合する。対象表と FROM 側の両方に該当すれば
 /// `42702`、FROM 側だけなら `0A000`（FROM 表の列を使う式は #1755 以降）。どの表にも無い名前は
 /// 既存の式束縛（対象表のスキーマ）が未知列として扱う。
-fn check_set_expr_scope(
+pub(crate) fn check_set_expr_scope(
     scope: &BindingScope<'_>,
     unqualified: &[String],
 ) -> Result<(), SqlSurfaceError> {
@@ -245,6 +245,22 @@ pub fn bind_update_from(
     stmt: &ValidatedUpdateFrom,
     target_schema: &TableSchema,
     from_schemas: &[&TableSchema],
+) -> Result<BoundUpdateFrom, SqlSurfaceError> {
+    bind_update_from_with_udfs(
+        stmt,
+        target_schema,
+        from_schemas,
+        &crate::sql::udf_call::UdfRegistry::default(),
+    )
+}
+
+/// [`bind_update_from`] のセッション UDF レジストリ付き版（Issue #3251）。`RETURNING` の式内の UDF を
+/// 解決する。レジストリを渡さない公開版は空レジストリ（UDF は `42883`＝fail-closed）。
+pub(crate) fn bind_update_from_with_udfs(
+    stmt: &ValidatedUpdateFrom,
+    target_schema: &TableSchema,
+    from_schemas: &[&TableSchema],
+    udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundUpdateFrom, SqlSurfaceError> {
     let scope = build_scope(&stmt.target, target_schema, &stmt.from, from_schemas)?;
     let where_columns = resolve_where_columns(&scope, stmt.where_clause.as_deref())?;
@@ -291,7 +307,7 @@ pub fn bind_update_from(
     let returning = stmt
         .returning
         .as_ref()
-        .map(|r| bind_from_returning(r, &scope))
+        .map(|r| bind_from_returning(r, &scope, udfs))
         .transpose()?;
 
     Ok(BoundUpdateFrom {
@@ -314,12 +330,27 @@ pub fn bind_delete_using(
     target_schema: &TableSchema,
     using_schemas: &[&TableSchema],
 ) -> Result<BoundDeleteUsing, SqlSurfaceError> {
+    bind_delete_using_with_udfs(
+        stmt,
+        target_schema,
+        using_schemas,
+        &crate::sql::udf_call::UdfRegistry::default(),
+    )
+}
+
+/// [`bind_delete_using`] のセッション UDF レジストリ付き版（Issue #3251）。
+pub(crate) fn bind_delete_using_with_udfs(
+    stmt: &ValidatedDeleteUsing,
+    target_schema: &TableSchema,
+    using_schemas: &[&TableSchema],
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundDeleteUsing, SqlSurfaceError> {
     let scope = build_scope(&stmt.target, target_schema, &stmt.using, using_schemas)?;
     let where_columns = resolve_where_columns(&scope, stmt.where_clause.as_deref())?;
     let returning = stmt
         .returning
         .as_ref()
-        .map(|r| bind_from_returning(r, &scope))
+        .map(|r| bind_from_returning(r, &scope, udfs))
         .transpose()?;
     Ok(BoundDeleteUsing {
         relations: std::iter::once(stmt.target.clone())

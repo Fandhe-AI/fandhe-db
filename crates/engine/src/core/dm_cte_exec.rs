@@ -139,8 +139,12 @@ impl EngineCore {
                 detail: "this collation is not supported in this expression".to_string(),
             });
         }
-        let projection = crate::sql::parser::bind_returning(body.returning(), &schema)?
-            .ok_or_else(crate::sql::cte::data_modifying_cte_unsupported)?;
+        let projection = crate::sql::parser::bind_returning_with_udfs(
+            body.returning(),
+            &schema,
+            session.udfs(),
+        )?
+        .ok_or_else(crate::sql::cte::data_modifying_cte_unsupported)?;
         let columns: Vec<ColumnMeta> = crate::sql::returning::column_meta(&projection, &schema)?;
         crate::sql::view_buffered::plan_outer_parts(
             &columns,
@@ -152,6 +156,29 @@ impl EngineCore {
         .map(Some)
     }
 
+    /// 全副文（外側から参照されない副文を含む）の `RETURNING` を、セッションの UDF レジストリで
+    /// 書き込み前に束縛して結果を捨てる（Issue #3251）。未登録関数 `42883`・未知列 `42703`・型エラー・
+    /// `LANGUAGE sql|plpgsql` 関数の `0A000` を、先行副文の書き込みと台帳照合より前に確定させる。
+    /// Describe と Execute が共有し、両者のエラーを一致させる。
+    fn prebind_substatement_returning(
+        &self,
+        session: &SessionState,
+        stmt: &ValidatedDataModifyingCte,
+    ) -> Result<(), SqlSurfaceError> {
+        for body in &stmt.dm_ctes {
+            if body.returning().is_none() {
+                continue;
+            }
+            let schema = self.load_table_schema_for_dml(&body.target_table)?;
+            crate::sql::parser::bind_returning_with_udfs(
+                body.returning(),
+                &schema,
+                session.udfs(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// 拡張クエリの Describe 腕から呼ぶ。書き込みは一切実行せず、主クエリの結果列メタを返す。
     /// 副文を読む形は外側処理後の列メタ、実表等を読む形は読み取り文の列メタ（Execute と同じ入口）。
     pub(super) fn describe_data_modifying_cte(
@@ -161,19 +188,24 @@ impl EngineCore {
         skip: &crate::sql::parser::LiteralSkip,
         limits: &crate::result_limits::ResultLimits,
     ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
+        // Execute と同じ順序（外側の束縛 → 全副文の RETURNING の事前束縛）で検査し、
+        // 参照されない副文の束縛エラーも Describe で報告する（Issue #3251）。
         if let DmMain::Read(read) = &stmt.main {
             let parsed = super::ParsedSql::Statement((**read).clone());
-            return self
+            let columns = self
                 .describe_parsed_in_session_impl(session, &parsed, skip, &[], limits)?
                 .ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
-                });
+                })?;
+            self.prebind_substatement_returning(session, stmt)?;
+            return Ok(columns);
         }
         let plan = self
             .plan_data_modifying_outer(session, stmt, limits)?
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "internal error".to_string(),
             })?;
+        self.prebind_substatement_returning(session, stmt)?;
         Ok(plan.columns().to_vec())
     }
 
@@ -256,14 +288,8 @@ impl EngineCore {
             DmlStatement::Insert(v) => {
                 let lookup = super::InsertSchemaLookup::new(&self.storage);
                 if v.returning.is_some() {
-                    self.execute_insert_returning_form(
-                        target,
-                        ctx,
-                        v,
-                        &lookup,
-                        &crate::sql::udf_call::UdfRegistry::default(),
-                    )
-                    .map(|o| Some(o.result))
+                    self.execute_insert_returning_form(target, ctx, v, &lookup, session.udfs())
+                        .map(|o| Some(o.result))
                 } else {
                     self.execute_insert_form(target, ctx, v, &lookup)
                         .map(|_| None)
@@ -281,8 +307,9 @@ impl EngineCore {
                         session,
                         form,
                         pre_update,
-                        // CTE 本体は外側プランの束縛を通らない場合があるため、UDF は評価せず空レジストリで 42883 に倒す（fail-closed）。
-                        &crate::sql::udf_call::UdfRegistry::default(),
+                        // セッションの UDF レジストリで解決する。書き込み前の事前束縛（`prebind_substatement_returning`）が
+                        // 全副文の解決エラーを確定済み（Issue #3251）。
+                        session.udfs(),
                     )
                     .map(|o| Some(o.result))
                 } else {
@@ -292,13 +319,8 @@ impl EngineCore {
             }
             DmlStatement::Delete(crate::sql::allowlist::DeleteStatement::SingleRow(v)) => {
                 if v.returning.is_some() {
-                    self.execute_delete_returning_form(
-                        target,
-                        ctx,
-                        v,
-                        &crate::sql::udf_call::UdfRegistry::default(),
-                    )
-                    .map(|o| Some(o.result))
+                    self.execute_delete_returning_form(target, ctx, v, session.udfs())
+                        .map(|o| Some(o.result))
                 } else {
                     self.execute_delete_form(target, ctx, v).map(|_| None)
                 }
@@ -311,8 +333,7 @@ impl EngineCore {
                         session,
                         v,
                         pre_delete,
-                        // 同上（参照されない CTE 本体で UDF が評価され書き込みが残るのを防ぐ）。
-                        &crate::sql::udf_call::UdfRegistry::default(),
+                        session.udfs(),
                     )
                     .map(|o| Some(o.result))
                 } else {
@@ -336,6 +357,8 @@ impl EngineCore {
         let limits = self.result_limits;
         // 外側の束縛エラー（未知列・曖昧な列・`LIMIT` 範囲・照合）は何かを書く前に確定させる。
         self.plan_data_modifying_outer(session, stmt, &limits)?;
+        // 参照されない副文を含む全副文の `RETURNING` を書き込み・台帳照合より前に束縛する（Issue #3251）。
+        self.prebind_substatement_returning(session, stmt)?;
         // 順序を保証できない形（参照アクションを持つ表に対する複数副文）は書き込み前に拒否する。
         self.reject_unordered_referential_actions(write_txn, stmt)?;
 

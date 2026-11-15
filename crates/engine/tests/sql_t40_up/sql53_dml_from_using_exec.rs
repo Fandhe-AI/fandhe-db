@@ -255,7 +255,9 @@ fn names(r: &engine::sql::exec::ReturningOutcome) -> Vec<String> {
         .iter()
         .map(|c| match c {
             ColumnMeta::Id => "id".to_string(),
-            ColumnMeta::Scalar { name, .. } => name.clone(),
+            ColumnMeta::Scalar { name, .. }
+            | ColumnMeta::Computed { name, .. }
+            | ColumnMeta::AliasedId { name } => name.clone(),
             other => panic!("unexpected column {other:?}"),
         })
         .collect()
@@ -444,8 +446,8 @@ fn returning_with_operation_id_commits_ledger_and_rejects_resend() {
     assert_eq!(after, xs(&core, &alice));
 }
 
-/// 未対応の形は fail-closed（副作用ゼロ）: 別名・関数呼び出し・項目なし・曖昧な列・句順の誤り。
-// tracked: #3251（FROM／USING の別名・式）
+/// 未対応の形は fail-closed（副作用ゼロ）: FROM 側の列を含む式・項目なし・曖昧な列・句順の誤り。
+// tracked: #3296（FROM／USING 側の列を式の中で参照する RETURNING）
 #[test]
 fn unsupported_returning_forms_fail_closed_without_side_effects() {
     let (core, _g) = new_core("sql53-ret-reject");
@@ -454,11 +456,29 @@ fn unsupported_returning_forms_fail_closed_without_side_effects() {
     let before = xs(&core, &alice);
     for (sql, code) in [
         (
-            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING t.x AS y",
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING lower(s.k)",
+            "0A000",
+        ),
+        (
+            "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.v + 1",
+            "0A000",
+        ),
+        // 非修飾の `v` は FROM 側だけの列（式の中での参照は未対応）。
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING v + 1",
+            "0A000",
+        ),
+        // 式の非修飾名が両表に該当すれば曖昧。
+        (
+            "DELETE FROM t USING s WHERE t.k = s.k RETURNING upper(k)",
+            "42702",
+        ),
+        (
+            "DELETE FROM t USING s WHERE t.k = s.k RETURNING t.*  AS q",
             "42601",
         ),
         (
-            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING lower(s.k)",
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING (SELECT 1)",
             "42601",
         ),
         ("DELETE FROM t USING s WHERE t.k = s.k RETURNING", "42601"),
@@ -481,4 +501,89 @@ fn unsupported_returning_forms_fail_closed_without_side_effects() {
         assert_eq!(err.wire_code(), code, "{sql}");
     }
     assert_eq!(before, xs(&core, &alice));
+}
+
+/// 別名つきの列参照（任意の relation の列・疑似列 `id`）と対象表の式・組み込み関数を受理する（Issue #3251）。
+/// 対象表の値は UPDATE が更新後、DELETE が削除前。出力名は別名・既定名で、`;` 付きの単独送信でも同じ。
+#[test]
+fn update_from_and_delete_using_returning_accept_aliases_and_target_expressions() {
+    let alice = ctx("alice");
+    for sql in [
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k \
+         RETURNING t.id AS rid, s.v AS w, upper(t.k) AS u, t.x + 1 AS y, lower(t.k)",
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k \
+         RETURNING t.id AS rid, s.v AS w, upper(t.k) AS u, t.x + 1 AS y, lower(t.k);",
+    ] {
+        let (core, _g) = new_core("sql53-ret-expr-upd");
+        seed(&core, &alice);
+        let r = returning(&core, &alice, sql).expect(sql);
+        assert_eq!(r.rows_affected, 2, "{sql}");
+        assert_eq!(names(&r), vec!["rid", "w", "u", "y", "lower"], "{sql}");
+        let rows: Vec<_> = r.result.rows.iter().map(|r| r.cells.clone()).collect();
+        let text = |s: &str| engine::sql::exec::Cell::Text(s.into());
+        assert_eq!(
+            rows,
+            vec![
+                vec![id_cell(1), int(100), text("A"), int(101), text("a")],
+                vec![id_cell(2), int(200), text("B"), int(201), text("b")],
+            ],
+            "{sql}"
+        );
+    }
+    let (core, _g) = new_core("sql53-ret-expr-del");
+    seed(&core, &alice);
+    let r = returning(
+        &core,
+        &alice,
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.v AS w, t.x * 2 AS dbl;",
+    )
+    .expect("delete");
+    assert_eq!(names(&r), vec!["w", "dbl"]);
+    let rows: Vec<_> = r.result.rows.iter().map(|r| r.cells.clone()).collect();
+    assert_eq!(rows, vec![vec![int(100), int(20)], vec![int(200), int(40)]]);
+}
+
+/// 評価時エラー（ゼロ除算）は書き込みを残さず元の SQLSTATE（`22012`）で失敗する（Issue #3251）。
+#[test]
+fn returning_expression_runtime_error_leaves_no_side_effects() {
+    let alice = ctx("alice");
+    let (core, _g) = new_core("sql53-ret-expr-err");
+    seed(&core, &alice);
+    let before = xs(&core, &alice);
+    let err = run(
+        &core,
+        &alice,
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.x / 0",
+    )
+    .expect_err("division by zero");
+    assert_eq!(err.wire_code(), "22012");
+    assert_eq!(before, xs(&core, &alice));
+}
+
+/// 他テナントの Private 行は式つき `RETURNING` にも影響行数にも現れない（RLS-10。Issue #3251）。
+#[test]
+fn returning_expressions_do_not_expose_other_tenant_rows() {
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let (core, _g) = new_core("sql53-ret-expr-rls");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO t (id, embedding, k, x) VALUES (1, '[0.1,0.2]', 'a', 10)",
+    )
+    .expect("alice t");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO s (id, embedding, k, v) VALUES (1, '[0.1,0.2]', 'a', 100)",
+    )
+    .expect("alice s");
+    let r = returning(
+        &core,
+        &bob,
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING upper(t.k) AS u, s.v AS w",
+    )
+    .expect("bob");
+    assert_eq!(r.rows_affected, 0);
+    assert!(r.result.rows.is_empty());
 }

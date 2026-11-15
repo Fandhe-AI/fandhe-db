@@ -622,6 +622,22 @@ fn self_join_returning_exposes_only_own_rows() {
     assert!(rows_t(&core, &bob).contains("90"));
 }
 
+/// 括弧付きの対象表修飾列 `(t.k)`（別名付きを含む）は、FROM 側にも `k` があっても対象表へ解決される
+/// （修飾を失って全スコープで再束縛され `42702` になってはならない）。
+#[test]
+fn parenthesized_target_qualified_returning_column_resolves_to_target() {
+    let alice = ctx("alice");
+    let (core, _g) = new_core("sql53-acc-paren-ret");
+    insert(&core, &alice, "t", 1, "a", 10);
+    for sql in [
+        "UPDATE t SET x = d2.x FROM t AS d2 WHERE t.k = d2.k RETURNING (t.k)",
+        "UPDATE t SET x = d2.x FROM t AS d2 WHERE t.k = d2.k RETURNING (t.k) AS kk",
+    ] {
+        let out = run(&core, &alice, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(out.contains('a'), "{sql}: {out}");
+    }
+}
+
 // ---- 7. 末尾 `;` ----
 
 /// psql 形の末尾 `;` 付き単独送信は、`;` なしと同じタグ・同じ副作用になる。
