@@ -446,7 +446,8 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     assert_eq!(times(&core, "SELECT id, v FROM t LIMIT 5").len(), 2);
 }
 
-/// `TIME(p)`・`TIME WITH TIME ZONE`・`TIMETZ`・`time[]` は構文段で `0A000`。
+/// `TIME(p)`・`TIME WITH TIME ZONE`・`TIMETZ`（それぞれの配列を含む）は構文段で `0A000`。
+/// `TIME[]` 系は Issue #3232 で専用の要素型として受理する（拒否固定から反転）。
 #[test]
 fn unsupported_time_type_spellings_are_rejected_with_feature_not_supported() {
     let (_p, _g, core) = open("tm-spellings");
@@ -455,10 +456,17 @@ fn unsupported_time_type_spellings_are_rejected_with_feature_not_supported() {
         "CREATE TABLE a (v TIME WITH TIME ZONE)",
         "CREATE TABLE a (v time with time zone)",
         "CREATE TABLE a (v TIMETZ)",
-        "CREATE TABLE a (v TIME[])",
-        "CREATE TABLE a (v TIME[3])",
+        "CREATE TABLE a (v TIME(3)[])",
+        "CREATE TABLE a (v TIMETZ[])",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
+    }
+    for sql in [
+        "CREATE TABLE ta (v TIME[])",
+        "CREATE TABLE tb (v TIME[3])",
+        "CREATE TABLE tc (v TIME WITHOUT TIME ZONE[])",
+    ] {
+        ok(&core, sql);
     }
     ok(&core, "CREATE TABLE b (v TIME)");
     for sql in [

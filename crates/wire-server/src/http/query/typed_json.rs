@@ -238,7 +238,7 @@ fn push_array_element(out: &mut String, text: &str, quote: bool) {
 }
 
 /// `ARRAY` 列（`TEXT`／`BOOLEAN`／`SMALLINT`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
-/// `DATE`／`TIMESTAMP`／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
+/// `DATE`／`TIMESTAMP`／`TIME`／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
 /// 向け配列直列化。要素種別を
 /// `array_ty.elem()` に応じて検証したうえで `{...}` テキストを組み立てる。
 /// 要素数が [`ArrayType::max_len`] を超える場合はテキストを組み立てる**前**に
@@ -281,7 +281,10 @@ pub fn array_literal_text(
                 JsonValue::Number(n),
             ) => push_array_element(&mut out, &number_literal_text(n), false),
             (
-                ArrayElemType::Date | ArrayElemType::Timestamp | ArrayElemType::Uuid,
+                ArrayElemType::Date
+                | ArrayElemType::Timestamp
+                | ArrayElemType::Time
+                | ArrayElemType::Uuid,
                 JsonValue::String(s),
             ) => push_array_element(&mut out, s, true),
             (ArrayElemType::Numeric { .. }, JsonValue::Number(n)) => {
@@ -345,7 +348,13 @@ pub fn array_literal_text(
                     "ARRAY column element must be a JSON number",
                 ))
             }
-            (ArrayElemType::Date | ArrayElemType::Timestamp | ArrayElemType::Uuid, _) => {
+            (
+                ArrayElemType::Date
+                | ArrayElemType::Timestamp
+                | ArrayElemType::Time
+                | ArrayElemType::Uuid,
+                _,
+            ) => {
                 return Err(TypedJsonError::TypeMismatch(
                     "ARRAY column element must be a JSON string",
                 ))
@@ -877,6 +886,10 @@ mod tests {
             parse(ArrayElemType::Timestamp, r#"["1970-01-01 00:00:01"]"#),
             V::Timestamp(vec![Some(1_000_000)])
         );
+        assert_eq!(
+            parse(ArrayElemType::Time, r#"["10:00:00",null,"24:00:00"]"#),
+            V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)])
+        );
         assert!(matches!(
             parse(
                 ArrayElemType::Uuid,
@@ -896,6 +909,7 @@ mod tests {
             (ArrayElemType::Date, num("1")),
             (ArrayElemType::Uuid, JsonValue::Bool(false)),
             (ArrayElemType::Timestamp, num("[]")),
+            (ArrayElemType::Time, num("1")),
         ] {
             let err = array_literal_text(&[item], &ty(elem)).expect_err("reject");
             assert!(matches!(err, TypedJsonError::TypeMismatch(_)));

@@ -638,12 +638,29 @@ fn smallint_column_yields_a_smallint_array() {
     );
 }
 
+/// `time` 列は `time[]`（専用の要素型）を返す（Issue #3232。以前は `0A000`）。
+#[test]
+fn time_column_yields_a_time_array() {
+    let (core, path) = build_core("sql57-arr-time");
+    let _g = CleanupGuard(path);
+    let r = run(&core, "SELECT array_agg(tm ORDER BY id DESC) FROM t");
+    assert!(matches!(
+        r.columns.first(),
+        Some(engine::sql::exec::ColumnMeta::Computed { ty: Some(ColumnType::Array(a)), .. })
+            if a.elem() == engine::catalog::ArrayElemType::Time
+    ));
+    assert_eq!(
+        arr(&core, "SELECT array_agg(tm ORDER BY id DESC) FROM t"),
+        Some(ArrayValue::Time((1..=8).rev().map(Some).collect()))
+    );
+}
+
 /// 未対応の要素型は `0A000`（fail-closed）。
 #[test]
 fn unsupported_element_types_are_rejected() {
     let (core, path) = build_core("sql57-arr-unsupported");
     let _g = CleanupGuard(path);
-    for col in ["ch", "tm", "embedding", "arr"] {
+    for col in ["ch", "embedding", "arr"] {
         assert_eq!(
             code_of(&core, &format!("SELECT array_agg({col}) FROM t")),
             "0A000",

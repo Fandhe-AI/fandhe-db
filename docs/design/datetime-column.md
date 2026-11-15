@@ -168,9 +168,9 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **丸め**: 端数は 7 桁目で丸め（0.5 は 0 から遠い側）、8 桁目以降は数字確認のみで捨てる。丸めた後に範囲を判定する（`23:59:59.9999995` は `24:00:00` として受理）。PostgreSQL は浮動小数の丸めを使うため、0.5 ちょうどの境界は乖離しうる。
 - **PostgreSQL との乖離**: 秒 60 を繰り上げず `22008` で拒否する（TIMESTAMP の D-5 と同じ）。TZ 接尾辞・AM/PM・1 桁の時は受理しない。
 - **整形**: `HH:MM:SS[.ffffff]`（端数 0 なら省略、末尾の 0 は削る）。端数の整形は `format_timestamp` と共通ヘルパーを共有する。
-- **型名**: `TIME`・`TIME WITHOUT TIME ZONE` は受理。`TIME(p)`・`TIME WITH TIME ZONE`・`TIMETZ`・`time[]` は構文段で `0A000`。`TIME` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する。`time`・`timetz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した（`RESERVED_TYPE_NAMES` へは足さない）。
+- **型名**: `TIME`・`TIME WITHOUT TIME ZONE` は受理。`TIME(p)`・`TIME WITH TIME ZONE`・`TIMETZ` は構文段で `0A000`（`time[]` は Issue #3232 で受理済み。[array-column-type.md](array-column-type.md) 参照）。`TIME` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する。`time`・`timetz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した（`RESERVED_TYPE_NAMES` へは足さない）。
 - **暫定挙動**: JOIN キー・PK／UNIQUE／FK・`ALTER COLUMN TYPE`（TIME との相互変換）は既存の拒否コードで fail-closed（述語・集計・並べ替え・索引・集合演算・SET 式・EXTRACT は Issue #1570 で解禁。下記）。wire の OID 1083・バイナリ入出力と NoSQL の insert／update／DDL の型束縛は #1571 で対応済み。NoSQL の filter は本 Issue の述語解禁後の別対応。
-- **対象外**: NoSQL filter、`TIME(p)` の保存精度（兄弟 Issue に担当なし。要確認）、`time[]`（OID 1183）。
+- **対象外**: NoSQL filter、`TIME(p)` の保存精度（兄弟 Issue に担当なし。要確認）。`time[]`（OID 1183）は Issue #3232 で受理済み。
 
 ## Issue #1570 追記: TIME の述語・集計・索引・EXTRACT
 

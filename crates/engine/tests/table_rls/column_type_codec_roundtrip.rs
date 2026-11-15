@@ -100,6 +100,7 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::Jsonb => "jsonb",
         ArrayElemType::Enum => "enum",
         ArrayElemType::SmallInt => "smallint",
+        ArrayElemType::Time => "time",
     }
 }
 
@@ -316,6 +317,7 @@ fn all_column_type_variants_are_covered_by_case_table() {
         ArrayElemType::Jsonb,
         ArrayElemType::Enum,
         ArrayElemType::SmallInt,
+        ArrayElemType::Time,
     ]
     .iter()
     .map(array_elem_label)
@@ -337,7 +339,8 @@ fn all_column_type_variants_are_covered_by_case_table() {
             "json",
             "jsonb",
             "enum",
-            "smallint"
+            "smallint",
+            "time"
         ])
     );
 }
@@ -1539,6 +1542,15 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::SmallInt(vec![Some(i16::MIN), None, Some(0), Some(i16::MAX)]),
         ),
         (
+            ArrayElemType::Time,
+            ArrayValue::Time(vec![
+                Some(0),
+                None,
+                Some(43_200_000_000),
+                Some(86_400_000_000),
+            ]),
+        ),
+        (
             ArrayElemType::BigInt,
             ArrayValue::BigInt(vec![None, Some(i64::MIN), Some(i64::MAX)]),
         ),
@@ -1588,6 +1600,7 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::Bool(_) => ArrayValue::Bool(vec![]),
             ArrayValue::Integer(_) => ArrayValue::Integer(vec![]),
             ArrayValue::SmallInt(_) => ArrayValue::SmallInt(vec![]),
+            ArrayValue::Time(_) => ArrayValue::Time(vec![]),
             ArrayValue::BigInt(_) => ArrayValue::BigInt(vec![]),
             ArrayValue::Real(_) => ArrayValue::Real(vec![]),
             ArrayValue::Double(_) => ArrayValue::Double(vec![]),

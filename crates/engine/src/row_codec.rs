@@ -245,6 +245,9 @@ pub enum ArrayValue {
     Integer(Vec<Option<i32>>),
     /// `SMALLINT[]`（Issue #3230）。`Integer` と別 variant にして型の区別（OID 1005）を保つ。
     SmallInt(Vec<Option<i16>>),
+    /// `TIME[]`（Issue #3232）。0 時起点のマイクロ秒。`Timestamp` と別 variant にして型の区別
+    /// （OID 1183）を保つ。
+    Time(Vec<Option<i64>>),
     BigInt(Vec<Option<i64>>),
     Real(Vec<Option<f32>>),
     Double(Vec<Option<f64>>),
@@ -445,6 +448,9 @@ impl ArrayValue {
             ArrayValue::Timestamp(items) => bounded(items, dims, max_len, |v| {
                 quote_pg_array_text_elem(&crate::datetime::format_timestamp(*v))
             }),
+            ArrayValue::Time(items) => bounded(items, dims, max_len, |v| {
+                quote_pg_array_text_elem(&crate::datetime::format_time(*v))
+            }),
             ArrayValue::Uuid(items) => bounded(items, dims, max_len, |v| v.to_string()),
             // NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を含むため常に引用・
             // エスケープされ PostgreSQL と同形の `"\\x0102"` になる）、JSON／JSONB／ENUM は
@@ -482,6 +488,7 @@ impl ArrayValue {
             (ArrayValue::Bool(a), ArrayValue::Bool(b)) => ArrayValue::Bool(join(a, b)),
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => ArrayValue::Integer(join(a, b)),
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => ArrayValue::SmallInt(join(a, b)),
+            (ArrayValue::Time(a), ArrayValue::Time(b)) => ArrayValue::Time(join(a, b)),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => ArrayValue::BigInt(join(a, b)),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => ArrayValue::Real(join(a, b)),
             (ArrayValue::Double(a), ArrayValue::Double(b)) => ArrayValue::Double(join(a, b)),
@@ -545,6 +552,7 @@ impl ArrayValue {
             (ArrayValue::Bool(a), ArrayValue::Bool(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Time(a), ArrayValue::Time(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => {
                 eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
@@ -608,6 +616,7 @@ impl ArrayValue {
             ArrayValue::Bool(v) => ArrayValue::Bool(pick(v, keep)),
             ArrayValue::Integer(v) => ArrayValue::Integer(pick(v, keep)),
             ArrayValue::SmallInt(v) => ArrayValue::SmallInt(pick(v, keep)),
+            ArrayValue::Time(v) => ArrayValue::Time(pick(v, keep)),
             ArrayValue::BigInt(v) => ArrayValue::BigInt(pick(v, keep)),
             ArrayValue::Real(v) => ArrayValue::Real(pick(v, keep)),
             ArrayValue::Double(v) => ArrayValue::Double(pick(v, keep)),
@@ -638,6 +647,7 @@ impl ArrayValue {
             ArrayValue::Bool(v) => map(v, |b| if *b { "t" } else { "f" }.to_string()),
             ArrayValue::Integer(v) => map(v, |x| x.to_string()),
             ArrayValue::SmallInt(v) => map(v, |x| x.to_string()),
+            ArrayValue::Time(v) => map(v, |x| crate::datetime::format_time(*x)),
             ArrayValue::BigInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Real(v) => map(v, |x| crate::scalar_float::format_real(*x)),
             ArrayValue::Double(v) => map(v, |x| crate::scalar_float::format_double(*x)),
@@ -684,6 +694,7 @@ macro_rules! array_dispatch {
             ArrayValue::Bool($items) => $body,
             ArrayValue::Integer($items) => $body,
             ArrayValue::SmallInt($items) => $body,
+            ArrayValue::Time($items) => $body,
             ArrayValue::BigInt($items) => $body,
             ArrayValue::Real($items) => $body,
             ArrayValue::Double($items) => $body,
@@ -716,6 +727,7 @@ impl ArrayValue {
             ArrayValue::Bool(_) => ArrayElemType::Bool,
             ArrayValue::Integer(_) => ArrayElemType::Integer,
             ArrayValue::SmallInt(_) => ArrayElemType::SmallInt,
+            ArrayValue::Time(_) => ArrayElemType::Time,
             ArrayValue::BigInt(_) => ArrayElemType::BigInt,
             ArrayValue::Real(_) => ArrayElemType::Real,
             ArrayValue::Double(_) => ArrayElemType::Double,
@@ -768,6 +780,7 @@ impl ArrayValue {
             ArrayValue::Bool(v) => cut!(Bool, v),
             ArrayValue::Integer(v) => cut!(Integer, v),
             ArrayValue::SmallInt(v) => cut!(SmallInt, v),
+            ArrayValue::Time(v) => cut!(Time, v),
             ArrayValue::BigInt(v) => cut!(BigInt, v),
             ArrayValue::Real(v) => cut!(Real, v),
             ArrayValue::Double(v) => cut!(Double, v),
@@ -837,6 +850,7 @@ impl ArrayValue {
             ArrayValue::Bool(v) => v.len().saturating_mul(std::mem::size_of::<Option<bool>>()),
             ArrayValue::Integer(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
             ArrayValue::SmallInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i16>>()),
+            ArrayValue::Time(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::Real(v) => v.len().saturating_mul(std::mem::size_of::<Option<f32>>()),
             ArrayValue::Double(v) => v.len().saturating_mul(std::mem::size_of::<Option<f64>>()),
@@ -870,6 +884,8 @@ impl ArrayValue {
             ArrayValue::Enum(_) => 13,
             // Issue #3230 の新規採番。
             ArrayValue::SmallInt(_) => 14,
+            // Issue #3232 の新規採番。
+            ArrayValue::Time(_) => 15,
             // `flat()` は `Multi` を返さない。
             ArrayValue::Multi(_) => {
                 return Err(RowCodecError::Invalid(
@@ -1369,6 +1385,7 @@ impl<'a> ArrayRef<'a> {
             | ArrayElemType::Timestamp
             | ArrayElemType::Uuid
             | ArrayElemType::SmallInt
+            | ArrayElemType::Time
             | ArrayElemType::Bytea
             | ArrayElemType::Enum => Ok(std::borrow::Cow::Borrowed(self.bytes)),
         }
@@ -1997,7 +2014,10 @@ fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
         ArrayElemType::Bool => Some(1),
         ArrayElemType::SmallInt => Some(2),
         ArrayElemType::Integer | ArrayElemType::Real | ArrayElemType::Date => Some(4),
-        ArrayElemType::BigInt | ArrayElemType::Double | ArrayElemType::Timestamp => Some(8),
+        ArrayElemType::BigInt
+        | ArrayElemType::Double
+        | ArrayElemType::Timestamp
+        | ArrayElemType::Time => Some(8),
         ArrayElemType::Uuid => Some(16),
     }
 }
@@ -2201,6 +2221,7 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
+            | ArrayElemType::Time
             | ArrayElemType::Enum,
             _,
         ) => {}
@@ -2351,6 +2372,16 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
                 if !crate::datetime::validate_timestamp_micros(*v) {
                     return Err(RowCodecError::Invalid(
                         "array TIMESTAMP element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::Time(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_time_micros(*v) {
+                    return Err(RowCodecError::Invalid(
+                        "array TIME element out of range".to_string(),
                     ));
                 }
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -2642,6 +2673,16 @@ fn decode_array_elements(
             Ok(v)
         })
         .map(ArrayValue::Timestamp),
+        ArrayElemType::Time => decode_fixed_array_elements(rest, &nulls, 8, |c| {
+            let v = i64::from_le_bytes(array_le_bytes::<8>(c)?);
+            if !crate::datetime::validate_time_micros(v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array TIME element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::Time),
         ArrayElemType::Uuid => decode_fixed_array_elements(rest, &nulls, 16, |c| {
             Ok(Uuid::from_bytes(array_le_bytes::<16>(c)?))
         })
@@ -7847,6 +7888,82 @@ mod tests {
         // 幅 2 の列として壊れた長さ（奇数バイト）は復号で Invalid になる。
         assert!(matches!(
             decode_array_elements(ArrayElemType::SmallInt, &[0u8, 1, 2], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    /// Issue #3232: `TIME[]` は固定幅 8 バイトで往復する（NULL 要素・空配列・境界値・2 次元）。
+    /// 範囲外・型違い・壊れたフレームは encode／decode とも Invalid で fail-closed。
+    #[test]
+    fn time_array_roundtrips_with_fixed_eight_byte_width() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "a",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Time, 8).expect("array ty")),
+                    true,
+                ),
+                ColumnDef::new(
+                    "b",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Time, 8)
+                            .and_then(|a| a.with_ndims(2))
+                            .expect("array ty"),
+                    ),
+                    true,
+                ),
+            ],
+        );
+        let flat = ArrayValue::Time(vec![Some(0), None, Some(86_400_000_000), Some(1)]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::Time(vec![Some(1), Some(2), Some(3), Some(4)]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::Time(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        // 要素幅 8 バイトの本文: NULL ビットマップ 1 バイト + 非 NULL 3 要素 x 8 バイト。
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 15);
+        assert_eq!(payload.len(), 1 + 3 * 8);
+        // 型違い（Timestamp の値を TIME[] 列へ）は拒否する。
+        let bad = vec![
+            Value::Array(ArrayValue::Timestamp(vec![Some(1)])),
+            Value::Null,
+        ];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 範囲外のマイクロ秒は encode で Invalid。
+        for micros in [-1_i64, 86_400_000_001] {
+            let out_of_range = vec![
+                Value::Array(ArrayValue::Time(vec![Some(micros)])),
+                Value::Null,
+            ];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &out_of_range),
+                Err(RowCodecError::Invalid(_))
+            ));
+            // 範囲外の永続バイト列は decode でも Invalid（破損データを黙って受理しない）。
+            let mut body = vec![0u8];
+            body.extend_from_slice(&micros.to_le_bytes());
+            assert!(matches!(
+                decode_array_elements(ArrayElemType::Time, &body, 1, 0),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+        // 幅 8 の列として壊れた長さ（7 バイト）は復号で Invalid になる。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Time, &[0u8, 1, 2, 3, 4, 5, 6, 7], 1, 0),
             Err(RowCodecError::Invalid(_))
         ));
     }

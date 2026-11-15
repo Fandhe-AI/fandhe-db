@@ -1712,6 +1712,16 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Timestamp),
+        // time は列束縛と同じ検査（範囲外 22008・書式不正 22007）を経てから格納する（Issue #3232）。
+        E::Time => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::Time, raw)? {
+                Value::Time(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "time array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Time),
         E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
             Value::Uuid(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
@@ -9112,8 +9122,8 @@ fn bind_array_agg_value(
             ColumnType::Json => ArrayElemType::Json,
             ColumnType::Jsonb => ArrayElemType::Jsonb,
             ColumnType::SmallInt => ArrayElemType::SmallInt,
+            ColumnType::Time => ArrayElemType::Time,
             ColumnType::Bpchar(_)
-            | ColumnType::Time
             | ColumnType::TimestampTz
             | ColumnType::Interval
             | ColumnType::Bit(_)
@@ -9201,6 +9211,7 @@ fn resolve_array_agg_input(
             | ArrayElemType::Double
             | ArrayElemType::Date
             | ArrayElemType::Timestamp
+            | ArrayElemType::Time
             | ArrayElemType::Uuid
             | ArrayElemType::Numeric { .. }
             | ArrayElemType::Jsonb
