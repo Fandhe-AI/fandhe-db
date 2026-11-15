@@ -63,6 +63,7 @@ mod wire_sequence_ddl;
 mod wire_sequence_nextval;
 mod wire_sequence_setval;
 mod wire_session_timezone;
+mod wire_set_op_except_all;
 mod wire_set_op_intersect_all;
 mod wire_sql25_distinct;
 mod wire_sql26_explain_expression_order_having;

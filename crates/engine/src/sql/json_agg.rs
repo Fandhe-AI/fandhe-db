@@ -142,10 +142,6 @@ pub(crate) fn render(
         ArrayValue::Uuid(v) => {
             render_items(v, sep, &mut out, |u, o| push_quoted(o, &u.to_string()))?
         }
-        // ビット列は PostgreSQL の to_json と同じく 0/1 の文字列として引用する。
-        ArrayValue::Bit(v) => {
-            render_items(v, sep, &mut out, |b, o| push_quoted(o, &b.format_text()))?
-        }
         ArrayValue::Bytea(v) => render_items(v, sep, &mut out, |b, o| {
             // 16 進表記は入力の 2 倍。確保の前に長さを見る。
             if b.len().saturating_mul(2) > MAX_JSON_FIELD_LEN {
@@ -173,7 +169,7 @@ pub(crate) fn render(
         })?,
         ArrayValue::Jsonb(v) => render_items(v, sep, &mut out, |s, o| push_checked(o, s))?,
         // 束縛段が拒否する要素型。到達したら束縛層の実装バグ（fail-closed）。
-        ArrayValue::Enum(_) | ArrayValue::Multi(_) => {
+        ArrayValue::Enum(_) | ArrayValue::Multi(_) | ArrayValue::Bit(_) => {
             return Err(accumulator_bug(
                 "json aggregate element type reached finish",
             ))

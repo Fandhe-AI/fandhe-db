@@ -52,7 +52,7 @@ spec 上、集合演算（SQL-29 (c)）の前提タスク TASK-213 は `JOIN`・
 ```text
 top       := set_expr [ORDER BY <set_key> {, <set_key>}] [LIMIT <n>] [OFFSET <m>] [;]
 set_key   := (<出力列名> | <整数序数>) [ASC|DESC] [NULLS FIRST|LAST]   -- Issue #3266（構文・束縛のみ）
-set_expr  := set_term { (UNION [ALL | DISTINCT] | EXCEPT) set_term }      -- 左結合
+set_expr  := set_term { (UNION [ALL | DISTINCT] | EXCEPT [ALL | DISTINCT]) set_term }  -- 左結合
 set_term  := primary { INTERSECT [ALL | DISTINCT] primary }                   -- 左結合・UNION/EXCEPT より高優先
 primary   := branch | '(' set_expr ')'                         -- 括弧の入れ子深さは 4 まで（実装既定値）
 branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
@@ -62,10 +62,11 @@ branch    := SELECT <select_list> FROM <table_or_view> [WHERE <既存述語>]
 
 優先順位は PostgreSQL と同じ: `INTERSECT` は `UNION`／`EXCEPT` より強く結合
 し、同じ優先度の演算子は左結合。`UNION`・`UNION ALL`・`INTERSECT`・
-`INTERSECT ALL`・`EXCEPT` を受理する。明示の `UNION DISTINCT`／`INTERSECT DISTINCT` は
-既定の `UNION`／`INTERSECT` と同じ意味（Issue #3268）。`INTERSECT ALL` は多重集合の交差で、
-同じ行を min(左の出現数, 右の出現数) 件残す。`EXCEPT ALL`／`EXCEPT DISTINCT` と量指定語の
-連続（`ALL DISTINCT` 等）は `42601`（`EXCEPT ALL`／`DISTINCT` は #3269）。
+`INTERSECT ALL`・`EXCEPT`・`EXCEPT ALL` を受理する。明示の `UNION DISTINCT`／`INTERSECT DISTINCT`／
+`EXCEPT DISTINCT` は既定の `UNION`／`INTERSECT`／`EXCEPT` と同じ意味（Issue #3268・#3269）。
+`INTERSECT ALL` は多重集合の交差で、同じ行を min(左の出現数, 右の出現数) 件残す。`EXCEPT ALL` は
+多重集合の差で、同じ行を max(左の出現数 − 右の出現数, 0) 件残す。量指定語の連続
+（`ALL DISTINCT` 等）は `42601`。
 
 Issue #1191 で次を受理する:
 
@@ -135,7 +136,7 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 揃える。
 
 `VECTOR` 列を投影に含む枝は、重複除去を伴う演算（`UNION`／`INTERSECT`／`INTERSECT ALL`／
-`EXCEPT`）の対象なら `22000`（`UNION ALL` のみなら許可）。判定は演算子木を
+`EXCEPT`／`EXCEPT ALL`）の対象なら `22000`（`UNION ALL` のみなら許可）。判定は演算子木を
 辿り、重複除去を伴うノードの配下に `VECTOR` 列があるかで行う。
 
 ## 実行・上限（受入基準 2・4）
@@ -167,15 +168,14 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 - 演算子木の左の子の結果を先に、右の子の結果を後に並べる。
 - 各枝の中は SQL-15 の走査順（`(tenant_id, id)` 昇順の物理走査順）に従う。
 - 重複除去では最初に出現した行だけを残す。
-- `INTERSECT`／`INTERSECT ALL`／`EXCEPT` は左の子の順序を保つ。`INTERSECT ALL` は同じ行を左で先に現れたものから min 件残す。
-- `INTERSECT ALL` の右辺の出現数表も文全体の累計バイト予算に計上する（超過は `54000`）。
+- `INTERSECT`／`INTERSECT ALL`／`EXCEPT`／`EXCEPT ALL` は左の子の順序を保つ。`INTERSECT ALL` は同じ行を左で先に現れたものから min 件残す。`EXCEPT ALL` は同じ行の左で先に現れた min(左, 右) 件を相殺し、後ろの行を左の順序のまま残す。
+- `INTERSECT ALL`／`EXCEPT ALL` の右辺の出現数表も文全体の累計バイト予算に計上する（超過は `54000`）。
 - 全体の `LIMIT n` は、この順序の先頭から n 件。
 
 ## スコープ外（Issue #929 の対象外事項）
 
 - `DISTINCT`・ベクトル順位付けを含む枝、集合演算の結果全体に対する `ORDER BY` のソート実行
   （構文・束縛は Issue #3266 で対応済み、実行は Issue #3267。集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）
-- `EXCEPT ALL`／`EXCEPT DISTINCT`（#3269）
 - `COPY TO`・`EXPLAIN` での集合演算（`EXPLAIN` は Issue #2047、`DECLARE CURSOR` は Issue #3176 で対応済み。
   cursor の詳細は [sql-cursor.md](sql-cursor.md)。
   詳細は [explain-search-engine-exposure.md](explain-search-engine-exposure.md)）、明示トランザクション

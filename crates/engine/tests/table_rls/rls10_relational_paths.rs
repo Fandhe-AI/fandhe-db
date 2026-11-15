@@ -570,6 +570,11 @@ fn shapes() -> Vec<Shape> {
             check: Check::StatisticOnly,
         },
         Shape {
+            axis: "set_except_all",
+            sql: "SELECT lang FROM documents EXCEPT ALL SELECT lang FROM other_docs",
+            check: Check::StatisticOnly,
+        },
+        Shape {
             axis: "window_row_number",
             sql: "SELECT id, title, ROW_NUMBER() OVER (PARTITION BY lang ORDER BY score DESC) FROM documents LIMIT 50",
             check: Check::DocumentsId,
@@ -762,6 +767,7 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
         "set_intersect",
         "set_intersect_all",
         "set_except",
+        "set_except_all",
         "window_row_number",
         "window_count",
         "view",

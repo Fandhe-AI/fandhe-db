@@ -1,4 +1,4 @@
-//! 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`INTERSECT ALL`／`EXCEPT`）の束縛・実行本体
+//! 集合演算（`UNION`／`UNION ALL`／`INTERSECT`／`INTERSECT ALL`／`EXCEPT`／`EXCEPT ALL`）の束縛・実行本体
 //! （SQL-29 (c)・RLS-10 (b)・TASK-213）。
 //!
 //! 責務境界: `sql::allowlist::validate_sql_tokens` が構造検証した
@@ -53,7 +53,7 @@ use crate::sql::udf_call::UdfRegistry;
 const MAX_SET_OP_ROWS: usize = 10_000;
 
 /// 多重集合演算用の行キー出現数表（Issue #3268）。`eval_tree` の `INTERSECT ALL`
-/// が使い、`EXCEPT ALL`（#3269）も `take_one` の否定で再利用できる形にしてある。
+/// と `EXCEPT ALL`（#3269）が使う（`take_one` が `true` の行を、前者は残し後者は相殺する）。
 /// 右辺の各行を文全体の [`SetOpBudget`] に計上してから確保する（再出現の行も
 /// 常に計上する。過大側に倒れるので fail-closed）。
 struct KeyCounts {
@@ -1100,6 +1100,27 @@ fn eval_tree(
                     }
                     rows
                 }
+                SetOperator::ExceptAll => {
+                    // Issue #3269: 多重集合の差。右辺の出現数を数え、左辺の各行で
+                    // 残数があれば 1 件相殺して捨て、無ければ出力する（max(左 − 右, 0) 件）。
+                    let mut counts = KeyCounts::from_rows(&r.rows, budget)?;
+                    let mut rows = Vec::new();
+                    for row in l.rows.into_iter() {
+                        crate::interrupt::check()?;
+                        budget.charge(row_key_len(&row)?)?;
+                        let key = row_key(&row)?;
+                        if counts.take_one(&key) {
+                            continue;
+                        }
+                        if rows.len() >= MAX_SET_OP_ROWS {
+                            return Err(SqlSurfaceError::payload_too_large(
+                                "set operation result exceeds the row limit",
+                            ));
+                        }
+                        rows.push(row);
+                    }
+                    rows
+                }
                 SetOperator::Intersect | SetOperator::Except => {
                     let mut right_keys: HashSet<Vec<u8>> = HashSet::new();
                     for row in &r.rows {
@@ -1645,6 +1666,58 @@ mod tests {
         assert_eq!(ok.rows.len(), 1);
     }
 
+    /// Issue #3269: `EXCEPT ALL` も右辺の行キーを予算へ計上し、左 2 件・右 1 件で 1 件残す。
+    #[test]
+    fn except_all_charges_budget_and_keeps_difference_multiplicity() {
+        let path = unique_db_path("set-op-except-all-budget");
+        let storage = Storage::open(&path).expect("open storage");
+        let _guard = CleanupGuard(path);
+        storage.create_table(&text_schema("a")).expect("create a");
+        storage.create_table(&text_schema("b")).expect("create b");
+        let tenant_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let body = "x".repeat(4096);
+        insert_text_row(&storage, "a", &tenant_ctx, &body);
+        // 2 行目は id・operation_id を変えて同内容の重複行にする。
+        crate::tenant::insert_typed_row(
+            &storage,
+            "a",
+            &tenant_ctx,
+            2,
+            Visibility::Public,
+            &[Value::Vector(vec![0.0, 0.0]), Value::Text(body.clone())],
+            &OperationId::parse("seed-a-2").expect("valid operation_id"),
+        )
+        .expect("insert second row");
+        insert_text_row(&storage, "b", &tenant_ctx, &body);
+
+        let tree = SetTree::Op {
+            op: SetOperator::ExceptAll,
+            left: Box::new(text_branch("a")),
+            right: Box::new(text_branch("b")),
+        };
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let mut schemas = HashMap::new();
+        schemas.insert("a".to_string(), text_schema("a"));
+        schemas.insert("b".to_string(), text_schema("b"));
+        let udfs = UdfRegistry::default();
+        let run = |cap: usize| {
+            execute_with_budget(
+                &read_txn,
+                &tenant_ctx,
+                &schemas,
+                &tree,
+                &udfs,
+                None,
+                cap,
+                crate::group_by_limits::GroupByLimits::default(),
+            )
+        };
+        let err = run(4096 * 3 + 1024).expect_err("row keys must be charged");
+        assert_eq!(err.wire_code(), "54000");
+        let ok = run(1024 * 1024).expect("generous cap succeeds");
+        assert_eq!(ok.rows.len(), 1);
+    }
+
     /// PR #1105 レビュー指摘の回帰: 全体 `LIMIT` の範囲外検証（`22000`）は全枝の
     /// 走査より前に行う。存在しないテーブルを枝に含めても（走査すれば `XX000`
     /// 相当の内部エラーになるはずの構成）、範囲外 `LIMIT` が先に `22000` で拒否
@@ -1938,6 +2011,7 @@ mod tests {
             SetOperator::Intersect,
             SetOperator::IntersectAll,
             SetOperator::Except,
+            SetOperator::ExceptAll,
         ];
         for state in ["empty", "null-only", "non-null"] {
             let path = unique_db_path(&format!("set-op-tstz-{state}"));
@@ -1995,7 +2069,7 @@ mod tests {
                     SetOperator::Union | SetOperator::Intersect | SetOperator::IntersectAll => {
                         present
                     }
-                    SetOperator::Except => 0,
+                    SetOperator::Except | SetOperator::ExceptAll => 0,
                 };
                 assert_eq!(result.rows.len(), expected, "{op:?} {state}");
                 describe_columns(

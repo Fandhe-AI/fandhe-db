@@ -190,6 +190,10 @@ const MAX_INSERT_ROWS_PER_STATEMENT: usize = 1_000;
 /// 定数。Issue #945）と二重定義しないよう、同じ値をそちらから参照する。
 pub(crate) const MAX_IN_LIST_ITEMS: usize = crate::declarative_filter::MAX_IN_LIST_ITEMS;
 
+/// 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)` の 1 辺の成分数の上限（SQL-9・Issue #3255）。
+/// 成分を `Vec` へ push する**前**に判定し、超過は `54000`（無制限確保の防止）。
+pub(crate) const MAX_ROW_COMPARE_COMPONENTS: usize = 64;
+
 /// `ALTER TABLE` 1 文が持てるアクション数の上限（Issue #1633）。`MAX_COLUMN_COUNT` と同値で、
 /// 超過は確保前に `54000` で拒否する（無制限リソース確保の防止）。
 pub const MAX_ALTER_TABLE_ACTIONS: usize = MAX_COLUMN_COUNT;
@@ -3070,6 +3074,19 @@ pub enum WherePredicate {
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
+    /// 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)`（SQL-9・Issue #3255。親 #3254）。構文段だけが
+    /// 生成する。不変条件は `lhs.len() == rhs.len()` かつ 2 以上 [`MAX_ROW_COMPARE_COMPONENTS`] 以下
+    /// （成分 1 個の括弧は従来どおり式として扱い本 variant にしない）。評価（辞書式・三値論理）は
+    /// #3256 の担当で、それまでは束縛段（`sql::parser::bind_where_predicates_recursive`）の暫定
+    /// ゲートが `0A000` で止める（fail-closed）。否定は `where_negation` が演算子反転で押し下げる。
+    ///
+    /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
+    /// （既存の破壊的変更運用を踏襲）。
+    RowCompare {
+        lhs: Vec<Expr>,
+        op: ArrayCmpOp,
+        rhs: Vec<Expr>,
+    },
 }
 
 /// [`WherePredicate::ScalarSubqueryCompare`] の比較演算子（Issue #1191）。
@@ -4296,6 +4313,9 @@ pub(crate) enum SetOperator {
     /// min(左の出現数, 右の出現数) 件だけ残す。
     IntersectAll,
     Except,
+    /// 多重集合版の `EXCEPT ALL`（Issue #3269）。左の順序で、同じ行を
+    /// max(左の出現数 − 右の出現数, 0) 件だけ残す（先に現れた行から相殺する）。
+    ExceptAll,
 }
 
 /// 集合演算の構文木。葉は単一テーブルの広域取得（[`ValidatedScan`]）に限定する
@@ -10214,6 +10234,11 @@ impl<'a> Parser<'a> {
     /// 否定押し下げ（`where_negation`）が `Expression(_)` を `42601` で拒否する（fail-closed。
     /// 三値論理で fail-open にしない）。
     fn parse_expression_predicate(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
+        // 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)`（SQL-9・Issue #3255）。WHERE の式述語の葉
+        // だけで判定し、`parse_primary_expr` は変えない（SELECT 項目・関数引数等では従来どおり `42601`）。
+        if self.row_compare_ahead() {
+            return self.parse_row_compare();
+        }
         // 左辺が引用なしの裸の `NULL` で直後が `IS [NOT] DISTINCT FROM` なら `NULL` リテラル
         // （SQL-54・Issue #1783。それ以外の位置の `NULL` は従来どおり列参照として読む）。
         let null_lhs = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NULL"))
@@ -10313,6 +10338,122 @@ impl<'a> Parser<'a> {
             ArrayCmpOp::Gt => ExprLeaf::Plain(binary(BinOp::Gt, lhs, rhs)),
             ArrayCmpOp::Ge => ExprLeaf::Plain(binary(BinOp::Ge, lhs, rhs)),
         })
+    }
+
+    /// 現在位置が行値比較の左辺 `( e1 , e2 ... ) <比較演算子>` か（消費しない。Issue #3255）。
+    /// 対応する `)` を 1 回だけ線形に探し、その内側に括弧深さ 1 の `,` があり、直後が比較演算子
+    /// （`= < > <= >=`・`<>`）のときだけ真。成分 1 個の括弧（`(a) < 3`）は偽で、従来の式経路へ流す。
+    /// CHECK 本体では行値を認識しない（従来どおり `42601`）。先読みは `get()` のみで後戻りしない。
+    fn row_compare_ahead(&self) -> bool {
+        if self.in_check_body || !matches!(self.peek(), Some(Token::Punct('('))) {
+            return false;
+        }
+        let Some(close) = self.find_matching_close_paren(self.pos) else {
+            return false;
+        };
+        let mut depth: u32 = 0;
+        // 配列コンストラクタ `ARRAY[1, 2]` 内のカンマを行値の区切りと誤認しないよう角括弧の深さも追跡する
+        let mut bracket_depth: u32 = 0;
+        let mut has_top_level_comma = false;
+        for idx in self.pos..close {
+            match self.tokens.get(idx) {
+                Some(Token::Punct('(')) => depth = depth.saturating_add(1),
+                Some(Token::Punct(')')) => depth = depth.saturating_sub(1),
+                Some(Token::Punct('[')) => bracket_depth = bracket_depth.saturating_add(1),
+                Some(Token::Punct(']')) => bracket_depth = bracket_depth.saturating_sub(1),
+                Some(Token::Punct(',')) if depth == 1 && bracket_depth == 0 => {
+                    has_top_level_comma = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        has_top_level_comma
+            && matches!(
+                close.checked_add(1).and_then(|i| self.tokens.get(i)),
+                Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
+            )
+    }
+
+    /// 行の 1 辺 `( e1 , e2 , ... )` を読む。成分数は `limit` 以下に抑え、`push` の**前**に検査する
+    /// （左辺は [`MAX_ROW_COMPARE_COMPONENTS`] 超で `54000`。右辺は左辺の個数を超えた時点で `42601`
+    /// として打ち切り、`parse_update_row_assignment` と同じく無制限に読み進めない）。
+    fn parse_row_side(&mut self, limit: Option<usize>) -> Result<Vec<Expr>, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut items: Vec<Expr> = Vec::new();
+        loop {
+            match limit {
+                Some(n) if items.len() >= n => {
+                    return Err(SqlSurfaceError::unsupported(
+                        "unequal number of entries in row expressions",
+                    ));
+                }
+                None if items.len() >= MAX_ROW_COMPARE_COMPONENTS => {
+                    return Err(SqlSurfaceError::payload_too_large(format!(
+                        "row value component count exceeds limit {MAX_ROW_COMPARE_COMPONENTS}"
+                    )));
+                }
+                _ => {}
+            }
+            items.push(self.parse_value_expr(1)?);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+        Ok(items)
+    }
+
+    /// 行値比較の本体（[`Self::row_compare_ahead`] が真のとき呼ばれる。Issue #3255）。
+    /// 右辺が行でない・サブクエリ・成分数不一致は fail-closed（`42601`／`0A000`）。評価は #3256。
+    fn parse_row_compare(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
+        let lhs = self.parse_row_side(None)?;
+        let not_equal = matches!(self.peek(), Some(Token::Punct('<')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Punct('>'))
+            );
+        let op = if not_equal {
+            self.advance();
+            self.advance();
+            ArrayCmpOp::Ne
+        } else {
+            match self.expect_cmp_op()? {
+                BinOp::Gt => ArrayCmpOp::Gt,
+                BinOp::Lt => ArrayCmpOp::Lt,
+                BinOp::Ge => ArrayCmpOp::Ge,
+                BinOp::Le => ArrayCmpOp::Le,
+                _ => ArrayCmpOp::Eq,
+            }
+        };
+        if !matches!(self.peek(), Some(Token::Punct('('))) {
+            return Err(SqlSurfaceError::unsupported(
+                "row value comparison requires a row expression on both sides",
+            ));
+        }
+        // 行とサブクエリの比較は PostgreSQL では受理されるが当面は未対応（tracked: #3254 の対象外）。
+        if matches!(
+            self.tokens.get(self.pos.saturating_add(1)),
+            Some(Token::Keyword(Keyword::Select))
+        ) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "row value comparison with a subquery is not supported",
+            ));
+        }
+        let rhs = self.parse_row_side(Some(lhs.len()))?;
+        if rhs.len() != lhs.len() {
+            return Err(SqlSurfaceError::unsupported(
+                "unequal number of entries in row expressions",
+            ));
+        }
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Preds(vec![WherePredicate::RowCompare {
+            lhs,
+            op,
+            rhs,
+        }]))
     }
 
     /// `tokens[idx]` が式左辺の後置語（`IS [NOT] NULL`・`[NOT] BETWEEN`・`[NOT] IN (`）なら種別を返す
@@ -18491,7 +18632,9 @@ fn check_view_body_pred_leaf(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
-        | WherePredicate::CorrelatedExists(_) => Err(rejected()),
+        | WherePredicate::CorrelatedExists(_)
+        // 行値比較は評価が #3256 まで未対応のため VIEW 本文では拒否する（tracked: #3256）。
+        | WherePredicate::RowCompare { .. } => Err(rejected()),
     }
 }
 
@@ -18519,7 +18662,9 @@ fn check_cte_body_predicates(where_predicates: &[WherePredicate]) -> Result<(), 
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {
+            | WherePredicate::CorrelatedExists(_)
+            // 行値比較は CTE／派生表本文では未対応（tracked: #3256）。
+            | WherePredicate::RowCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
                 ));
@@ -18669,6 +18814,8 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_)
+        // 行値比較は評価後射影形ビューの外側 WHERE では未対応（tracked: #3256）。
+        | WherePredicate::RowCompare { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::ScalarSubqueryCompare { .. } => Err(SqlSurfaceError::unsupported(
@@ -19150,6 +19297,8 @@ fn check_body_pred(
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
         | WherePredicate::IsNull { .. } => Ok(()),
+        // 行値比較は本文の列走査が成分を辿れないため fail-closed に拒否する（tracked: #3256）。
+        WherePredicate::RowCompare { .. } => Err(body_form_unsupported()),
     }
 }
 
@@ -19282,7 +19431,9 @@ pub(crate) fn rename_column_in_view_body(
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(
+            | WherePredicate::CorrelatedExists(_)
+            // 行値比較は VIEW 本文では未対応（tracked: #3256）。
+            | WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::unsupported(
                 "view body WHERE predicate form is not supported",
             )),
         }
@@ -19474,7 +19625,9 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
-        | WherePredicate::CorrelatedExists(_) => String::new(),
+        | WherePredicate::CorrelatedExists(_)
+        // VIEW 本文の検査が行値比較を拒否するため到達しない（tracked: #3256）。
+        | WherePredicate::RowCompare { .. } => String::new(),
     }
 }
 
@@ -24159,8 +24312,9 @@ fn parse_set_term(
     Ok(left)
 }
 
-/// `set_expr := set_term { (UNION [ALL | DISTINCT] | EXCEPT) set_term }`
-/// （`EXCEPT ALL`／`EXCEPT DISTINCT` は #3269 まで `42601`）（左結合）。
+/// `set_expr := set_term { (UNION [ALL | DISTINCT] | EXCEPT [ALL | DISTINCT]) set_term }`
+/// （左結合）。量指定語は 1 語だけ消費し、明示 `DISTINCT` は既定と同義（Issue #3269）。
+/// 量指定語の連続は次の `parse_set_term` が枝の開始を見つけられず `42601`。
 fn parse_set_expr(
     p: &mut Parser<'_>,
     lookup: &impl TableLookup,
@@ -24193,14 +24347,22 @@ fn parse_set_expr(
             };
         } else if p.peek_ident_matches("EXCEPT") {
             p.advance();
-            if p.peek_ident_matches("ALL") || p.peek_ident_matches("DISTINCT") {
-                return Err(SqlSurfaceError::unsupported(
-                    "EXCEPT ALL/DISTINCT is not supported",
-                ));
-            }
+            let all = if p.peek_ident_matches("ALL") {
+                p.advance();
+                true
+            } else if p.peek_ident_matches("DISTINCT") {
+                p.advance();
+                false
+            } else {
+                false
+            };
             let right = parse_set_term(p, lookup, depth, branch_count)?;
             left = SetTree::Op {
-                op: SetOperator::Except,
+                op: if all {
+                    SetOperator::ExceptAll
+                } else {
+                    SetOperator::Except
+                },
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -34316,6 +34478,125 @@ mod tests {
         }
     }
 
+    /// Issue #3255（SQL-9。親 #3254）: WHERE の行値比較 `(e1, e2, ...) <op> (f1, f2, ...)` の構文と AST。
+    /// 評価は #3256。成分 1 個の括弧は従来どおり式。
+    #[test]
+    fn row_value_comparison_parses_to_row_compare() {
+        use crate::sql::udf_call::ArrayCmpOp;
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for (sql, want_op) in [
+            ("(a, b) = (1, 2)", ArrayCmpOp::Eq),
+            ("(a, b) <> (1, 2)", ArrayCmpOp::Ne),
+            ("(a, b) != (1, 2)", ArrayCmpOp::Ne),
+            ("(a, b) < (1, 2)", ArrayCmpOp::Lt),
+            ("(a, b) <= (1, 2)", ArrayCmpOp::Le),
+            ("(a, b) > (1, 2)", ArrayCmpOp::Gt),
+            ("(a, b) >= (1, 2)", ArrayCmpOp::Ge),
+            ("((a, b) < (1, 2))", ArrayCmpOp::Lt),
+            // 前置 NOT は演算子反転で押し下げる（`<` → `>=`）。
+            ("NOT (a, b) < (1, 2)", ArrayCmpOp::Ge),
+            ("NOT ((a, b) = (1, 2))", ArrayCmpOp::Ne),
+            ("NOT (a, b) <> (1, 2)", ArrayCmpOp::Eq),
+        ] {
+            let preds =
+                where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+            let [WherePredicate::RowCompare { lhs, op, rhs }] = preds.as_slice() else {
+                panic!("expected a row comparison for {sql}, got {preds:?}");
+            };
+            assert_eq!((lhs.len(), rhs.len(), *op), (2, 2, want_op), "{sql}");
+        }
+        // 成分は式でもよい。AND との組み合わせでは 1 葉として並ぶ。
+        let preds = where_predicates_for(&format!(
+            "SELECT * FROM documents WHERE a = 1 AND (a + 1, lower(b), c) < (2, 'x', 3) {tail}"
+        ));
+        assert!(matches!(
+            preds.as_slice(),
+            [
+                WherePredicate::Expression(_),
+                WherePredicate::RowCompare { lhs, .. }
+            ] if lhs.len() == 3
+        ));
+        // 成分 1 個の括弧は従来どおりの式（行値にならない）。
+        let preds = where_predicates_for(&format!("SELECT * FROM documents WHERE (a) < 3 {tail}"));
+        assert!(matches!(
+            preds.as_slice(),
+            [WherePredicate::Expression(Expr::Binary {
+                op: BinOp::Lt,
+                ..
+            })]
+        ));
+    }
+
+    /// Issue #3255: 配列コンストラクタ内のカンマ（`ARRAY[1, 2]`）は行値の区切りではない
+    /// （括弧で囲んだ配列比較が `42601` へ後退しないこと）。
+    #[test]
+    fn row_value_detection_ignores_commas_inside_array_brackets() {
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        for sql in [
+            "(ARRAY[1, 2]) = ARRAY[1, 2]",
+            "(ARRAY[1, 2]) = (ARRAY[1, 2])",
+        ] {
+            let preds =
+                where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+            assert!(
+                !preds
+                    .iter()
+                    .any(|p| matches!(p, WherePredicate::RowCompare { .. })),
+                "{sql}: {preds:?}"
+            );
+        }
+    }
+
+    /// Issue #3255: 行値比較の fail-closed な拒否（成分数不一致・未対応形は `42601`／`0A000`、
+    /// 上限超過は `54000`、CHECK 本体では認識しない）。
+    #[test]
+    fn row_value_comparison_rejects_unsupported_forms() {
+        let lookup = catalog_with(&["documents"]);
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let code = |sql: &str| {
+            validate_statement(sql, &lookup)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} must fail"))
+                .wire_code()
+        };
+        for pred in [
+            "(a, b) < (1, 2, 3)",
+            "(a, b, c) < (1, 2)",
+            "(a, b) < 3",
+            "a < (1, 2)",
+            "(a, b) < ROW(1, 2)",
+            "ROW(a, b) < (1, 2)",
+            "((a, b), c) < ((1, 2), 3)",
+            "(a, b) IN ((1, 2))",
+            "(a, b) IS NULL",
+            "(a, b) = ANY (b)",
+        ] {
+            assert_eq!(
+                code(&format!("SELECT * FROM documents WHERE {pred} {tail}")),
+                "42601",
+                "{pred}"
+            );
+        }
+        assert_eq!(
+            code(&format!(
+                "SELECT * FROM documents WHERE (a, b) = (SELECT 1, 2) {tail}"
+            )),
+            "0A000"
+        );
+        let row = |n: usize| vec!["a"; n].join(", ");
+        let at = MAX_ROW_COMPARE_COMPONENTS;
+        let ok_sql = format!(
+            "SELECT * FROM documents WHERE ({0}) = ({0}) {tail}",
+            row(at)
+        );
+        assert!(validate_statement(&ok_sql, &lookup).is_ok());
+        let over = format!(
+            "SELECT * FROM documents WHERE ({0}) = ({0}) {tail}",
+            row(at + 1)
+        );
+        assert_eq!(code(&over), "54000");
+    }
+
     /// Issue #1603（TABLE-35）: 量化比較 `ANY`／`SOME`／`ALL` と `&&` の構文。`SOME` は `ANY` に正規化し、
     /// `<>`／`!=` は `NOT =` と同じ `Or([<],[>])` へ脱糖し、サブクエリ形は `0A000`。
     #[test]
@@ -41080,7 +41361,7 @@ mod tests {
 
     /// Issue #2047（SQL-75 (2) ポインタ）: 集合演算の `EXPLAIN` は `ExplainTarget::SetOperation`
     /// になる（先頭が括弧の形を含む）。集合演算子の無い `EXPLAIN (SELECT ...)` は従来どおり `42601`、
-    /// 未対応の枝形（`EXCEPT ALL`）は非 EXPLAIN と同じ拒否。
+    /// 未対応の枝形（`EXCEPT ALL DISTINCT`）は非 EXPLAIN と同じ拒否。
     #[test]
     fn explain_accepts_set_operation_shapes() {
         let lookup = catalog_with(&["a", "b"]);
@@ -41089,6 +41370,7 @@ mod tests {
             "EXPLAIN (SELECT id FROM a) UNION ALL SELECT id FROM b",
             "EXPLAIN SELECT id FROM a EXCEPT SELECT id FROM b LIMIT 3",
             "EXPLAIN SELECT id FROM a INTERSECT ALL SELECT id FROM b",
+            "EXPLAIN SELECT id FROM a EXCEPT ALL SELECT id FROM b",
         ] {
             match validate_sql(sql, &lookup) {
                 Ok(Statement::Explain(target @ ExplainTarget::SetOperation(_))) => {
@@ -41106,13 +41388,16 @@ mod tests {
         }
         let err = validate_sql("EXPLAIN (SELECT id FROM a)", &lookup).expect_err("no operator");
         assert_eq!(err.wire_code(), "42601");
-        let plain = validate_sql("SELECT id FROM a EXCEPT ALL SELECT id FROM b", &lookup)
-            .expect_err("plain EXCEPT ALL is rejected");
-        let explained = validate_sql(
-            "EXPLAIN SELECT id FROM a EXCEPT ALL SELECT id FROM b",
+        let plain = validate_sql(
+            "SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
             &lookup,
         )
-        .expect_err("EXPLAIN EXCEPT ALL is rejected");
+        .expect_err("plain EXCEPT ALL DISTINCT is rejected");
+        let explained = validate_sql(
+            "EXPLAIN SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
+            &lookup,
+        )
+        .expect_err("EXPLAIN EXCEPT ALL DISTINCT is rejected");
         assert_eq!(plain.wire_code(), explained.wire_code());
     }
 
@@ -41139,6 +41424,19 @@ mod tests {
             op_of("SELECT id FROM a UNION DISTINCT SELECT id FROM b"),
             SetOperator::Union
         );
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT ALL SELECT id FROM b"),
+            SetOperator::ExceptAll
+        );
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT DISTINCT SELECT id FROM b"),
+            SetOperator::Except
+        );
+        // INTERSECT は EXCEPT ALL より強く結合する（根が ExceptAll）。
+        assert_eq!(
+            op_of("SELECT id FROM a EXCEPT ALL SELECT id FROM b INTERSECT SELECT id FROM c"),
+            SetOperator::ExceptAll
+        );
         // INTERSECT ALL は UNION より強く結合する。
         assert_eq!(
             op_of("SELECT id FROM a UNION SELECT id FROM b INTERSECT ALL SELECT id FROM c"),
@@ -41147,8 +41445,9 @@ mod tests {
         for sql in [
             "SELECT id FROM a INTERSECT ALL DISTINCT SELECT id FROM b",
             "SELECT id FROM a INTERSECT ALL ALL SELECT id FROM b",
-            "SELECT id FROM a EXCEPT ALL SELECT id FROM b",
-            "SELECT id FROM a EXCEPT DISTINCT SELECT id FROM b",
+            "SELECT id FROM a EXCEPT ALL DISTINCT SELECT id FROM b",
+            "SELECT id FROM a EXCEPT ALL ALL SELECT id FROM b",
+            "SELECT id FROM a EXCEPT DISTINCT ALL SELECT id FROM b",
         ] {
             let e = validate_sql(sql, &lookup).expect_err(sql);
             assert_eq!(e.wire_code(), "42601", "{sql}");

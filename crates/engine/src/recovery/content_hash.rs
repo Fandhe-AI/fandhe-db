@@ -2596,6 +2596,22 @@ fn push_dml_where_predicate(
             });
             push_dml_subquery_tokens(b, inner_tokens)?;
         }
+        // 行値比較（SQL-9・Issue #3255）。述語形 DML は束縛ゲート（#3256 まで `0A000`）より先に
+        // content hash が計算されうるため、Internal にせず新タグ 19（変更禁止）で直列化する。
+        // 直列化順は「演算子の判別子（`ArrayCmpOp::hash_tag`）→ 左辺成分数（u32 LE）→ 左辺の各成分式
+        // → 右辺成分数（u32 LE）→ 右辺の各成分式」。演算子・成分順・成分数の違いは別ハッシュになる。
+        WherePredicate::RowCompare { lhs, op, rhs } => {
+            b.push_u8(19);
+            b.push_u8(op.hash_tag());
+            for side in [lhs, rhs] {
+                let count = u32::try_from(side.len()).map_err(|_| dml_hash_field_too_large())?;
+                b.push_raw(&count.to_le_bytes());
+                for expr in side {
+                    push_dml_expr(b, expr, None)?;
+                    collect_referenced_udfs(expr, udf_registry, referenced)?;
+                }
+            }
+        }
         // `IdCompare` は `sql::subquery` が解決段で生成する内部専用の葉で、構文解析
         // からは作られない（述語形 DML の content hash 対象へ到達しない防御的経路）。
         WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => {
@@ -8102,6 +8118,56 @@ mod tests {
                 b.push_u8(4);
             })
         );
+    }
+
+    /// Issue #3255（SQL-9）: 行値比較の述語形 DML の content hash。演算子・成分順・成分数・
+    /// 左右の入れ替えが別ハッシュで、同一の述語は同一ハッシュ（Internal にしない）。
+    #[test]
+    fn row_compare_where_hash_distinguishes_shape() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::{ArrayCmpOp, Expr};
+        let id = |n: &str| Expr::Ident(n.to_string());
+        let rc = |lhs: Vec<Expr>, op: ArrayCmpOp, rhs: Vec<Expr>| {
+            del_hash(&[WherePredicate::RowCompare { lhs, op, rhs }])
+        };
+        let base = rc(
+            vec![id("a"), id("b")],
+            ArrayCmpOp::Lt,
+            vec![id("c"), id("d")],
+        );
+        assert_eq!(
+            base,
+            rc(
+                vec![id("a"), id("b")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d")]
+            )
+        );
+        let variants = [
+            rc(
+                vec![id("a"), id("b")],
+                ArrayCmpOp::Le,
+                vec![id("c"), id("d")],
+            ),
+            rc(
+                vec![id("b"), id("a")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d")],
+            ),
+            rc(
+                vec![id("c"), id("d")],
+                ArrayCmpOp::Lt,
+                vec![id("a"), id("b")],
+            ),
+            rc(
+                vec![id("a"), id("b"), id("e")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d"), id("f")],
+            ),
+        ];
+        for v in &variants {
+            assert_ne!(&base, v);
+        }
     }
 
     /// 未束縛 `$n` と解決済みの内部の葉（`IdCompare`）は fail-closed。
