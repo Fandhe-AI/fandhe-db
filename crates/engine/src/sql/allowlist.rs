@@ -4922,10 +4922,10 @@ pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
         .ok()
 }
 
-/// `RETURNING` 句の項目として受理できる形か（Issue #3248・SQL-21 のポインタ）。
-/// 裸の列参照、または `AS <別名>` 付きの列参照だけを受理し、式・関数呼び出しは拒否する。
-/// 構文段（`Parser::parse_returning_clause`）と束縛段（`sql::parser::bind_returning`）が
-/// 同じ判定を共有する単一情報源。別名は出力列名を替えるだけで、値・型・読む列は別名なしと同じ。
+/// `RETURNING` 句の項目が「別名付き（または裸の）列参照」か（Issue #3248・SQL-21 のポインタ）。
+/// 値・型・読む列は別名なしと同じで、出力列名だけが変わる。式項目の受理可否は
+/// [`returning_item_rejection`] が決める（束縛段が列参照を式評価器へ通さない分岐と、
+/// データ変更 CTE・ビュー経由の書き込みの文言出し分けに使う）。
 pub(crate) fn is_returning_column_item(item: &SelectItem) -> bool {
     match item {
         SelectItem::Column(_) => true,
@@ -4935,6 +4935,87 @@ pub(crate) fn is_returning_column_item(item: &SelectItem) -> bool {
         } => !is_scalar_subquery_placeholder_name(name),
         SelectItem::Expr { .. } => false,
     }
+}
+
+/// 式 `expr` の直下の子式を `out` へ積む（[`returning_item_rejection`] の明示スタック走査用。
+/// `sql::parser::collect_expr_idents` と同じ変種の網羅）。
+fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Number(_)
+        | Expr::String(_)
+        | Expr::Ident(_)
+        | Expr::Null
+        | Expr::ValueFunction { .. }
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. } => {}
+        Expr::Call { args, .. } | Expr::Coalesce(args) => out.extend(args.iter()),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        } => {
+            out.push(lhs);
+            out.push(rhs);
+        }
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => out.push(expr),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => {
+            out.extend(expr.array_expr_children().into_iter().flatten());
+        }
+        Expr::SqlJsonQuery(q) => out.extend(q.children()),
+        Expr::Case { whens, else_result } => {
+            for (cond, result) in whens {
+                out.push(cond);
+                out.push(result);
+            }
+            if let Some(e) = else_result {
+                out.push(e);
+            }
+        }
+    }
+}
+
+/// `RETURNING` 句の 1 項目を受理できない形なら、その拒否エラーを返す（Issue #3249・SQL-21 の
+/// ポインタ）。構文段（`Parser::parse_returning_clause`）と束縛段（`sql::parser::bind_returning`）が
+/// 同じ判定を共有する単一情報源。スカラー式・組み込み関数・別名付き式は受理し、次を拒否する。
+/// - 式木のどこかにあるスカラーサブクエリ: `42601`（他表を読む経路を作らない）。
+/// - 式木のどこかにある集計関数呼び出し: `42803`（PostgreSQL と同じ）。
+///
+/// 暗黙の別名（`<式> <別名>`）は構文解析が拒否済みでここへ届かない。走査は明示スタックで行い、
+/// 再帰の深さを入力に依存させない。
+pub(crate) fn returning_item_rejection(item: &SelectItem) -> Option<SqlSurfaceError> {
+    let root = match item {
+        SelectItem::Column(_) => return None,
+        SelectItem::Expr { expr, .. } => expr,
+    };
+    let mut stack: Vec<&Expr> = vec![root];
+    while let Some(expr) = stack.pop() {
+        match expr {
+            Expr::Ident(name) if is_scalar_subquery_placeholder_name(name) => {
+                return Some(SqlSurfaceError::unsupported(
+                    "subqueries are not supported in RETURNING",
+                ));
+            }
+            Expr::Ident(name) if aggregate_placeholder_index(name).is_some() => {
+                return Some(SqlSurfaceError::GroupingError {
+                    detail: "aggregate functions are not allowed in RETURNING",
+                });
+            }
+            Expr::Call { name, .. } if is_aggregate_function_name(name) => {
+                return Some(SqlSurfaceError::GroupingError {
+                    detail: "aggregate functions are not allowed in RETURNING",
+                });
+            }
+            _ => {}
+        }
+        push_expr_children(expr, &mut stack);
+    }
+    None
 }
 
 /// 名前が埋め込みスカラーサブクエリの内部名の接頭辞を持つか（添字が不正でも真。漏えい防止の判定用）。
@@ -15274,9 +15355,9 @@ impl<'a> Parser<'a> {
     /// `RETURNING` は `expect_end_of_statement` が余剰トークンとして `42601` へ
     /// 落とす）。省略時は `Ok(None)`。投影は `SELECT` と同じ許可形状
     /// （[`Self::parse_select_list`]）を再利用するが、[`Projection::Items`] は
-    /// 別名付き列参照（Issue #3248。[`is_returning_column_item`]）だけを受理し、式項目は
-    /// `42601` で拒否する（`RETURNING` が返す行は書き込み結果そのものであり、式評価のための
-    /// セッション UDF レジストリを持たないこのパーサー段では意味を持たないため。受け皿 #3249）。
+    /// 式項目（Issue #3249）まで受理する。ただしスカラーサブクエリ（`42601`）と集計関数
+    /// （選択リスト構文解析が `42601`。多層防御の `42803`）は拒否する。UDF 呼び出しは束縛段が空の
+    /// UDF レジストリで解決して未定義関数として拒否する（受け皿 #3250）。
     /// `*` と他項目の併用は `0A000`（未対応）。
     fn parse_returning_clause(&mut self) -> Result<Option<Projection>, SqlSurfaceError> {
         if !self.peek_contextual_keyword("RETURNING") {
@@ -15290,12 +15371,10 @@ impl<'a> Parser<'a> {
                 "RETURNING * combined with other items is not supported yet",
             ));
         }
-        if matches!(&projection, Projection::Items(items) if !items.iter().all(is_returning_column_item))
-        {
-            return Err(SqlSurfaceError::unsupported(
-                "RETURNING supports only column references with optional AS aliases; \
-                 expressions are not supported yet",
-            ));
+        if let Projection::Items(items) = &projection {
+            if let Some(err) = items.iter().find_map(returning_item_rejection) {
+                return Err(err);
+            }
         }
         Ok(Some(projection))
     }
@@ -34765,21 +34844,25 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    /// Issue #3249: 組み込み関数・スカラー式の RETURNING 項目は構文段で受理する（`Items`）。
     #[test]
-    fn rejects_insert_with_function_call_returning_item() {
+    fn accepts_insert_with_function_call_and_scalar_expression_returning_items() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert(
-            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
-             RETURNING vec_norm(embedding) USING OPERATION_ID 'op-0001'",
-            &lookup,
-            LedgerMode::Ledgered,
-        )
-        .expect_err("function-call RETURNING items must be rejected");
-        assert_eq!(err.wire_code(), "42601");
-        assert!(
-            !err.to_string().contains("function-call"),
-            "message must not mislead: {err}"
-        );
+        for items in ["vec_norm(embedding)", "id + 1", "id + 1 AS m, upper(lang)"] {
+            let stmt = validate_insert(
+                &format!(
+                    "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') \
+                     RETURNING {items} USING OPERATION_ID 'op-0001'"
+                ),
+                &lookup,
+                LedgerMode::Ledgered,
+            )
+            .expect(items);
+            assert!(
+                matches!(stmt.returning, Some(Projection::Items(_))),
+                "{items}"
+            );
+        }
     }
 
     /// Issue #3248: `AS` 別名付きの列参照は受理し、別名なしの裸の列だけなら `Columns` のまま。
@@ -34812,10 +34895,14 @@ mod tests {
     fn rejects_returning_expressions_implicit_alias_and_star_combination() {
         let lookup = catalog_with(&["documents"]);
         for (items, code) in [
-            ("id + 1", "42601"),
             ("id rid", "42601"),
             ("id AS", "42601"),
             ("*, id AS rid", "0A000"),
+            // サブクエリ（トップレベル・入れ子）・集計関数は SELECT リストの構文解析が 42601 で拒否する（Issue #3249）。
+            ("(SELECT id FROM notes LIMIT 1)", "42601"),
+            ("1 + (SELECT id FROM notes LIMIT 1) AS x", "42601"),
+            ("count(*)", "42601"),
+            ("1 + sum(id)", "42601"),
         ] {
             let err = validate_insert(
                 &format!(

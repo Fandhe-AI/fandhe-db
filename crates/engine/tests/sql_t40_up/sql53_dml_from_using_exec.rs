@@ -445,7 +445,7 @@ fn returning_with_operation_id_commits_ledger_and_rejects_resend() {
 }
 
 /// 未対応の形は fail-closed（副作用ゼロ）: 別名・関数呼び出し・項目なし・曖昧な列・句順の誤り。
-// tracked: #3251（FROM／USING の別名）・#3249（式）
+// tracked: #3251（FROM／USING の別名・式）
 #[test]
 fn unsupported_returning_forms_fail_closed_without_side_effects() {
     let (core, _g) = new_core("sql53-ret-reject");

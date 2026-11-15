@@ -39,11 +39,10 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 扱う。分類が `RETURNING` の有無で変わると内容照合ハッシュが変わり再送判定が
 崩れるため。`peek_single_row_delete_id` と同じ判定）。
 
-`<投影>` は `*` または裸の列名リスト（疑似列 `id` を含む。`SELECT` の
-`Projection::Columns`／`Projection::All` を再利用）。関数呼び出し項目
-（`Projection::Items`）は構文段・束縛段の両方で多層防御として `42601`
-拒否する（`RETURNING` が返す行は書き込み結果そのものであり、式評価用の
-セッション UDF レジストリを経由する必要がないため）。
+`<投影>` は `*`・列名リスト（疑似列 `id` を含む）・`AS` 別名付き項目・スカラー式／組み込み関数
+（`SELECT` の `Projection::Columns`／`Projection::All`／`Projection::Items` を再利用。Issue #3249 で
+式・組み込み関数まで受理）。スカラーサブクエリ・集計関数は構文段・束縛段の両方で拒否する。
+UDF の呼び出しは、束縛段が空の UDF レジストリで解決して未定義関数として拒否する（受け皿 #3250）。
 
 ## 受理・拒否表
 
@@ -55,7 +54,12 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 | `... RETURNING USING OPERATION_ID '...'`（投影なし） | `42601` |
 | `... RETURNING id RETURNING body USING OPERATION_ID '...'`（重複） | `42601` |
 | `... RETURNING id AS rid, lang AS l USING OPERATION_ID '...'`（`AS` 別名付きの列参照。Issue #3248） | 受理（列名だけが別名になり、値・型は別名なしと同じ。別名の重複も受理） |
-| `... RETURNING vec_norm(embedding) USING OPERATION_ID '...'`（式・関数呼び出し項目） | `42601`（文言は「列参照と `AS` 別名のみ・式は未対応」。式の受け皿は #3249） |
+| `... RETURNING vec_norm(embedding), id + 1 AS m USING OPERATION_ID '...'`（組み込み関数・スカラー式。Issue #3249） | 受理（結果の型・値・列名は同じ式の `SELECT` と一致する） |
+| `... RETURNING my_udf(lang) ...`（UDF 呼び出し） | `42883`（受け皿 #3250） |
+| `... RETURNING (SELECT ...) ...`・式の内側のサブクエリ・集計関数 | `42601`（他表を読む経路を作らない） |
+| `... RETURNING lang + 1 ...`（式の型エラー） | 書き込み前に `42883` 等（台帳は消費しない） |
+| 式の評価時エラー（`1 / 0` 等） | `22012` 等（commit 前に書き込みを中止。行・台帳は残らない。`TenantWriteError::ReturningExpressionFailed`） |
+| 採番列・`id` 省略の INSERT ＋ 式項目の `RETURNING` | `0A000`（書き込み前。仮値での評価と commit 後の失敗を避けるため fail-closed。列参照・別名だけの `RETURNING` は従来どおり受理） |
 | `... RETURNING lang l ...`（`AS` を省いた別名） | `42601` |
 | `... RETURNING *, lang AS l ...`（`*` と他の項目の併用） | `0A000`（Issue #3248 の対象外。`*` の展開と個別項目の併用は出力列の重複・順序の扱いを別途決める必要があり、現行は fail-closed で拒否したまま据え置く（対応しない。需要が出た時点でユーザー承認のうえ起票する）） |
 | `TRUNCATE TABLE <table> ... RETURNING *` | `42601`（`TRUNCATE` は対象外） |
@@ -63,7 +67,7 @@ INSERT INTO <table> (...) VALUES (...)[, ...] ON CONFLICT (...) DO NOTHING | DO 
 | 述語つき `DELETE ... WHERE <非 id 述語> RETURNING ...` | 受理（Issue #1182。削除前の値を返す） |
 | 単一行・述語形いずれの `UPDATE ... RETURNING ...`（セッション経路） | 受理（Issue #1182。更新後の値を返す） |
 | `INSERT ... ON CONFLICT ... RETURNING ...` | 受理（Issue #1182。挿入行・`DO UPDATE` 行のみ返し、`DO NOTHING` で衝突した行は返さない。所有だが不可視な衝突先は `DO NOTHING` ではスキップ、`DO UPDATE` では `42501`。下記「UPSERT の衝突先が不可視の場合」節） |
-| 未知列・式項目の `RETURNING`（全 DML） | 書き込み前に `42703`／`42601`（台帳は消費しない） |
+| 未知列・未定義関数の `RETURNING`（全 DML） | 書き込み前に `42703`／`42883`（台帳は消費しない） |
 | `EngineCore::execute_insert_sql`／`execute_insert_sql_batch`／`execute_delete_sql`／`execute_update_sql`（非セッション入口）＋ `RETURNING` | `42601`（検証直後・書き込み前。台帳は消費しない。`RETURNING` を黙って落とす fail-open を避ける） |
 | 明示トランザクション内（`BEGIN ... COMMIT`）の単一行・述語形 `UPDATE ... RETURNING`、述語形 `DELETE ... RETURNING`、UPSERT の `RETURNING` | 受理（Issue #1272・#1273。autocommit と同じ契約。詳細は `explicit-transaction.md`） |
 
@@ -367,7 +371,24 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
   （第 2 の投影実装を作らない）、`id AS rid` は `ProjectedColumn::AliasedId`、実列は別名を列名にした
   `Column` へ解決する。別名は出力列名を替えるだけで、読む列・行・RLS の再判定・列権限は別名なしと同じ。
 - 構文段（`Parser::parse_returning_clause`）と束縛段（`bind_returning`）は判定関数
-  `is_returning_column_item` を共有する。式は `42601`（受け皿 #3249）。
+  `returning_item_rejection` を共有する（Issue #3249 で式を受理。サブクエリ・集計だけを拒否）。
 - 旧文言「function-call items」は誤解を招くため廃止し、原因別の文言へ分けた。
 - 未対応のまま残る面（受け皿 #3251）: データ変更 CTE（`0A000`）・ビューへの書き込み（`42601`）・
   `UPDATE ... FROM`／`DELETE ... USING`（`42601`）・NoSQL への展開。
+
+## 式・組み込み関数の評価（Issue #3249・SQL-21 のポインタ）
+
+- 束縛は `bind_returning` が SELECT と同じ `bind_projection_with_literals`（空の UDF レジストリ・
+  ハイブリッド詳細不可）へ委譲する。結果の型（`result_ty`）・既定の列名は SELECT と同じ規則になる。
+- 評価は `sql::returning::ReturningProjector` が行う。式は文ごとに 1 回だけコンパイルし
+  （`ExprProgram`）、行ごとには評価スタックを使い回す。セルへの写像とバイト予算は
+  `sql::scan::computed_value_to_cell`（上限は `MAX_RETURNING_RESULT_BYTES`）を SELECT と共有する。
+- UPDATE・DELETE・UPSERT・トリガ経路では、投影は write トランザクション内・commit 前に行う
+  （`returning_collector`）。評価時エラーは `SqlSurfaceError` のまま `ReturningExpressionFailed` で
+  透過し、書き込みを abort する（`Internal` は従来どおり `XX000`）。RLS の再判定は式の評価より前に行う。
+- トリガの無い INSERT は書き込み前の事前投影で式を評価し、その行をそのまま返す（commit 後に式を
+  評価しない）。採番列・`id` 省略の INSERT は払い出し値が commit 後にしか確定しないため、式項目と
+  の組み合わせは書き込み前に `0A000` で拒否する（払い出し値を使った in-txn 投影への拡張は未対応）。
+- 列権限は、RETURNING が読む列（式の中の列識別子を含む）を SELECT 権限で判定する。
+- 未対応のまま残る面: UDF 呼び出し（#3250）、データ変更 CTE・ビューへの書き込み・
+  `UPDATE ... FROM`／`DELETE ... USING`・NoSQL への展開（#3251）、`RETURNING` 内の `$n`（位置判定で拒否）。

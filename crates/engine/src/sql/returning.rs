@@ -6,7 +6,9 @@
 //! `*_returning` 実行入口）が既に確定させた
 //! `(id, values)` を、`SELECT` の投影束縛（`sql::parser::bind_projection`）と
 //! 同じ列解決規則（実カラム優先・疑似列 `id`）で `sql::exec::QueryResult` へ
-//! 写像するだけの薄い層とする（第 2 の投影実装を作らない）。
+//! 写像する薄い層とする（第 2 の投影実装を作らない）。スカラー式・組み込み関数の項目
+//! （Issue #3249）は [`ReturningProjector`] が `sql::expr_program` で評価し、セル写像は
+//! `sql::scan::computed_value_to_cell` を共有する。
 
 use crate::catalog::TableSchema;
 use crate::row_codec::Value;
@@ -144,9 +146,9 @@ fn try_alloc_bytes_for_budget(
 }
 
 /// 型不整合・実装バグの検出用（untrusted 入力起因ではないため `wire_code` は
-/// `XX000`。`sql::scan::scan_bug` と同方針）。`RETURNING` の投影は
-/// `sql::parser::bind_returning` が `Computed`（式項目）を構造的に排除した
-/// うえで返すため、通常はここへ到達しない契約だが、多層防御として
+/// `XX000`。`sql::scan::scan_bug` と同方針）。式項目（`Computed`）は
+/// [`ReturningProjector`] だけが評価でき、評価器を持たない [`project_row`] 経由で
+/// 到達した場合（`dml_from_returning` 等、式を受理しない面）は多層防御として
 /// fail-closed に扱う。
 fn returning_bug(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::Internal {
@@ -182,9 +184,10 @@ pub(crate) fn column_meta(
                     ty,
                 })
             }
-            ProjectedColumn::Computed { .. } => {
-                Err(returning_bug("computed projection items are not supported"))
-            }
+            // 式項目（Issue #3249）は SELECT・Describe と同じ列メタ写像を共有する。
+            ProjectedColumn::Computed {
+                name, result_ty, ..
+            } => Ok(crate::sql::exec::computed_column_meta(name, result_ty)),
         })
         .collect()
 }
@@ -205,8 +208,24 @@ pub(crate) fn project_row(
     projection: &[ProjectedColumn],
     budget: &mut usize,
 ) -> Result<ResultRow, SqlSurfaceError> {
+    project_row_with(id, values, projection, budget, None)
+}
+
+/// [`project_row`] の本体。`eval` が `Some` のときだけ式項目（`Computed`）を評価する。
+fn project_row_with(
+    id: u64,
+    values: &[Value],
+    projection: &[ProjectedColumn],
+    budget: &mut usize,
+    mut eval: Option<&mut ReturningProjector<'_>>,
+) -> Result<ResultRow, SqlSurfaceError> {
+    // 式項目があるときだけ行ビューを組み立てる（式なしの文は従来と同一コスト）。
+    let payloads = match eval.as_deref() {
+        Some(p) if p.has_computed => Some(crate::sql::exec::array_payload_scratch(values)?),
+        _ => None,
+    };
     let mut cells = Vec::with_capacity(projection.len());
-    for col in projection {
+    for (col_idx, col) in projection.iter().enumerate() {
         let cell = match col {
             ProjectedColumn::Id => Cell::Integer(id),
             ProjectedColumn::AliasedId { .. } => Cell::Integer(id),
@@ -289,8 +308,11 @@ pub(crate) fn project_row(
                 Some(Value::Uuid(u)) => Cell::Uuid(*u),
                 None => return Err(returning_bug("value index out of range")),
             },
-            ProjectedColumn::Computed { .. } => {
-                return Err(returning_bug("computed projection items are not supported"));
+            ProjectedColumn::Computed { result_ty, .. } => {
+                let (Some(p), Some(scratch)) = (eval.as_deref_mut(), payloads.as_deref()) else {
+                    return Err(returning_bug("computed projection evaluator is missing"));
+                };
+                p.eval_cell(id, values, scratch, col_idx, result_ty.as_ref(), budget)?
             }
         };
         cells.push(cell);
@@ -300,6 +322,96 @@ pub(crate) fn project_row(
         score: 0.0,
         cells,
     })
+}
+
+/// 式項目を含みうる `RETURNING` 投影の評価器（Issue #3249）。文ごとに 1 回だけ式をコンパイルし、
+/// 行ごとの評価では評価スタックを使い回す。`sql::exec::returning_collector`（`tenant` の書き込み
+/// トランザクション内・commit 前に行ごと呼ばれる）と INSERT の書き込み前投影が使う。行ビュー・
+/// 結果セルの写像・バイト予算は SELECT 投影（`sql::exec`・`sql::scan::computed_value_to_cell`）と
+/// 同じ部品を共有し、第 2 の式評価実装を作らない。
+pub(crate) struct ReturningProjector<'a> {
+    projection: &'a [ProjectedColumn],
+    /// `projection` と添字が 1 対 1 対応する（`Computed` 以外は `None`）。
+    programs: Vec<Option<crate::sql::expr_program::ExprProgram>>,
+    scratch: Vec<crate::sql::expr_program::StackValue>,
+    /// スキーマ上の VECTOR 列の位置（無ければ `None`）。
+    vector_index: Option<usize>,
+    column_count: usize,
+    has_computed: bool,
+}
+
+impl<'a> ReturningProjector<'a> {
+    /// `projection` の式項目をコンパイルして評価器を作る。
+    pub(crate) fn new(projection: &'a [ProjectedColumn], schema: &TableSchema) -> Self {
+        let programs: Vec<_> = projection
+            .iter()
+            .map(|col| match col {
+                ProjectedColumn::Computed { expr, .. } => {
+                    Some(crate::sql::expr_program::ExprProgram::compile(expr))
+                }
+                _ => None,
+            })
+            .collect();
+        let has_computed = programs.iter().any(Option::is_some);
+        Self {
+            projection,
+            programs,
+            scratch: Vec::new(),
+            vector_index: schema
+                .columns
+                .iter()
+                .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_))),
+            column_count: schema.columns.len(),
+            has_computed,
+        }
+    }
+
+    /// 投影が式項目を含むか。
+    pub(crate) fn has_computed(&self) -> bool {
+        self.has_computed
+    }
+
+    /// 1 行分を投影する（`values` の契約は [`project_row`] と同じ）。
+    pub(crate) fn project_row(
+        &mut self,
+        id: u64,
+        values: &[Value],
+        budget: &mut usize,
+    ) -> Result<ResultRow, SqlSurfaceError> {
+        let projection = self.projection;
+        project_row_with(id, values, projection, budget, Some(self))
+    }
+
+    /// 式項目 1 つを評価してセルへ写す。評価エラーは SELECT と同じ `SqlSurfaceError` のまま返す。
+    fn eval_cell(
+        &mut self,
+        id: u64,
+        values: &[Value],
+        payloads: &[Option<Vec<u8>>],
+        col_idx: usize,
+        result_ty: Option<&crate::catalog::ColumnType>,
+        budget: &mut usize,
+    ) -> Result<Cell, SqlSurfaceError> {
+        let program = self
+            .programs
+            .get(col_idx)
+            .and_then(|p| p.as_ref())
+            .ok_or_else(|| returning_bug("computed program missing at evaluation time"))?;
+        let mut view = crate::sql::exec::candidate_scalar_view(values, payloads);
+        view.resize(self.column_count, None);
+        let embedding: &[f32] = match self.vector_index.and_then(|i| values.get(i)) {
+            Some(Value::Vector(v)) => v.as_slice(),
+            _ => &[],
+        };
+        let value = program.eval(id, embedding, &view, &mut self.scratch)?;
+        let cell = crate::sql::scan::computed_value_to_cell(
+            value,
+            result_ty,
+            budget,
+            MAX_RETURNING_RESULT_BYTES,
+        )?;
+        Ok(cell)
+    }
 }
 
 #[cfg(test)]
