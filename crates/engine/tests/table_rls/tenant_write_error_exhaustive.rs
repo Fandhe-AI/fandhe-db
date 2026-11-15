@@ -56,6 +56,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::IndexExpressionEvaluationFailed(inner) => inner.error_class(),
         // Issue #1544: SET 右辺式の評価エラーも内側の分類へ委譲する。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner.error_class(),
+        // Issue #3249: RETURNING 式項目の評価エラーも内側の分類へ委譲する。
+        TenantWriteError::ReturningExpressionFailed(inner) => inner.error_class(),
         // Issue #1690: nextval／currval の採番・解決の失敗も内側の分類へ委譲する。
         TenantWriteError::SequenceEvaluationFailed(inner) => inner.error_class(),
         // Issue #1723: BEFORE ROW INSERT トリガの発火失敗も内側の分類へ委譲する。

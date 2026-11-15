@@ -337,17 +337,9 @@ const COLUMN_ONLY: &[&str] = &[
     "SELECT a FROM t WHERE n > 1 UNION ALL SELECT a FROM u WHERE n < 5 @11 SelectItemBare",
     "SELECT a FROM t INTERSECT SELECT a FROM u @1 SelectItemBare",
     "SELECT a FROM t INTERSECT SELECT a FROM u @6 SelectItemBare",
-    "UPDATE t SET n = n + 1 WHERE n BETWEEN 1 AND 5 RETURNING a, n @15 SelectItemBare",
-    "UPDATE t SET n = n + 1 WHERE n BETWEEN 1 AND 5 RETURNING a, n @17 SelectItemBare",
     "DELETE FROM t WHERE a IN (SELECT a FROM u) @4 WhereHead",
     "DELETE FROM t WHERE n > (SELECT max(n) FROM u) @4 WhereHead",
-    "DELETE FROM t WHERE a = 'x' AND n BETWEEN 1 AND 5 RETURNING a, n @14 SelectItemBare",
-    "DELETE FROM t WHERE a = 'x' AND n BETWEEN 1 AND 5 RETURNING a, n @16 SelectItemBare",
     "DELETE FROM t WHERE n = (SELECT max(n) FROM u) RETURNING n @4 WhereHead",
-    "DELETE FROM t WHERE n = (SELECT max(n) FROM u) RETURNING n @16 SelectItemBare",
-    "INSERT INTO t (a) VALUES ('x') RETURNING a @11 SelectItemBare",
-    "UPDATE t SET n = 5 WHERE a = 'x' RETURNING n @11 SelectItemBare",
-    "DELETE FROM t WHERE a = 'x' RETURNING a @8 SelectItemBare",
 ];
 
 #[test]

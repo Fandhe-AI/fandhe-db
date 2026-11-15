@@ -17,10 +17,10 @@ use crate::sql::parser::{BoundAggregate, BoundScan, ProjectedColumn};
 
 /// `SELECT`・広域取得（scan）が共有する `ProjectedColumn` 列から `ColumnMeta` を
 /// 導出する。`sql::exec::execute_statement_with_cache`・`sql::scan::execute_scan`
-/// の投影列メタデータ組み立てと同一の写像（`Computed` 項目を拒否しない点で
-/// `sql::returning::column_meta` とは異なる——`RETURNING` は `Computed` 項目を
-/// 構造検証段で排除済みだが、通常の `SELECT` は宣言的 UDF・組み込み関数呼び出し
-/// （TASK-79・SQL-9）による `Computed` 項目を持ちうる）。
+/// の投影列メタデータ組み立てと同一の写像（`Computed` 項目は
+/// `sql::exec::computed_column_meta` を共有する。`sql::returning::column_meta`
+/// も Issue #3249 から同じ写像を使う。ただし `RETURNING` はハイブリッド詳細項目を
+/// 持てず、通常の `SELECT` だけが持ちうる）。
 ///
 /// `index` が `schema.columns` の範囲外になることは、`schema` が束縛時と同一の
 /// スナップショットから取得されている限り起こらない（`bind_projection` が
