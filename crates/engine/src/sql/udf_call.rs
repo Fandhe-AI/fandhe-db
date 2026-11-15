@@ -408,7 +408,7 @@ pub enum Expr {
     /// 構文段（`allowlist::Parser::parse_expression_predicate`）が WHERE の式述語の頂点としてだけ生成し、
     /// `SOME` は `ANY` に正規化する。束縛・評価は `sql::array_ops`。サブクエリ形は構文段が `0A000` で拒否する。
     Quantified {
-        op: ArrayCmpOp,
+        op: QuantifiedOp,
         quantifier: Quantifier,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
@@ -463,6 +463,89 @@ impl ArrayCmpOp {
             ArrayCmpOp::Le => "<=",
             ArrayCmpOp::Gt => ">",
             ArrayCmpOp::Ge => ">=",
+        }
+    }
+}
+
+/// 量化比較 `<lhs> <op> ANY|SOME|ALL (<array>)` の演算子（[`Expr::Quantified`]・
+/// [`BoundExpr::ArrayQuantified`]）。比較演算子 [`ArrayCmpOp`] に加え、`LIKE`／`ILIKE`／
+/// `NOT LIKE`／`NOT ILIKE`（`~~` 系の演算子名を含む）を持つ。`ArrayCmpOp` は配列どうしの比較とも
+/// 共有するため LIKE は足さず、量化専用の本列挙に分ける（SQL-9・Issue #3258）。
+///
+/// 破壊的変更（Issue #3258）: `Expr::Quantified.op`・`BoundExpr::ArrayQuantified.op` の型を
+/// `ArrayCmpOp` から本列挙へ変更した。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifiedOp {
+    /// 比較演算子（`=` `<>` `<` `<=` `>` `>=`）。
+    Cmp(ArrayCmpOp),
+    /// `[NOT] LIKE|ILIKE`。`negated` は `x NOT LIKE ANY (a)`（一致しない要素が 1 つでもある）の
+    /// 後置 NOT で、量化子の反転（外側の前置 NOT）とは別物。
+    Like {
+        negated: bool,
+        case_insensitive: bool,
+    },
+}
+
+impl QuantifiedOp {
+    /// 演算子の否定。量化子の反転と組で `where_negation` が使う（`NOT (x LIKE ANY a)` =
+    /// `x NOT LIKE ALL a`。三値論理でも成り立つ）。
+    pub fn negated(self) -> Self {
+        match self {
+            QuantifiedOp::Cmp(c) => QuantifiedOp::Cmp(c.negated()),
+            QuantifiedOp::Like {
+                negated,
+                case_insensitive,
+            } => QuantifiedOp::Like {
+                negated: !negated,
+                case_insensitive,
+            },
+        }
+    }
+
+    /// `content_hash` 用の安定した 1 バイト識別子（変更禁止）。比較演算子は
+    /// [`ArrayCmpOp::hash_tag`]（1〜6）をそのまま使い、既存の内容ハッシュを変えない。
+    pub(crate) fn hash_tag(self) -> u8 {
+        match self {
+            QuantifiedOp::Cmp(c) => c.hash_tag(),
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: false,
+            } => 7,
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: true,
+            } => 8,
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: false,
+            } => 9,
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: true,
+            } => 10,
+        }
+    }
+
+    /// SQL 表記（CHECK／ポリシー式の再解析可能な描画用）。
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            QuantifiedOp::Cmp(c) => c.as_sql(),
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: false,
+            } => "LIKE",
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: true,
+            } => "ILIKE",
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: false,
+            } => "NOT LIKE",
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: true,
+            } => "NOT ILIKE",
         }
     }
 }
@@ -1172,7 +1255,7 @@ pub enum BoundExpr {
     /// 量化比較 `lhs op ANY|ALL (array)`（TABLE-35・Issue #1603）。`lhs` は要素型 `elem` と
     /// 比較できる型へ束縛済み。`all` が真なら ALL、偽なら ANY。
     ArrayQuantified {
-        op: ArrayCmpOp,
+        op: QuantifiedOp,
         all: bool,
         elem: crate::catalog::ArrayElemType,
         lhs: Box<BoundExpr>,

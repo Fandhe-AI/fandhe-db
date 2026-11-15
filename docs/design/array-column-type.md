@@ -573,3 +573,9 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
   KEY／FK は変更なし。
 - **対象外**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14。対応しない）。VARCHAR・INTERVAL・BIT の各要素型は #3231・
   #3234・#3235。
+
+## Issue #3258 追記（LIKE の量化形）
+
+`<式> [NOT] LIKE|ILIKE ANY|SOME|ALL (<配列式>)` と `~~` 系演算子（TABLE-35・SQL-9 のポインタ）は
+`Expr::Quantified` の演算子型を `QuantifiedOp` へ広げて受理する。設計は
+[like-wildcard-patterns.md](like-wildcard-patterns.md) の「実装メモ（Issue #3258）」を参照。

@@ -25,7 +25,7 @@ use crate::sql::cast::{
 };
 use crate::sql::udf_call::{
     is_array_expr, ArrayCmpOp, ArrayContainOp, BinOp, BindEnv, BoundExpr, Expr, ExprType,
-    ExprValue, JsonAccessOp, Quantifier,
+    ExprValue, JsonAccessOp, QuantifiedOp, Quantifier,
 };
 
 /// 要素 1 個の比較用ビュー。整数系（integer・bigint・date・timestamp）は `Int`、浮動小数
@@ -569,7 +569,7 @@ fn lhs_elem_cast_type(kind: CastKind) -> Result<CastType, SqlSurfaceError> {
 /// 呼び出し側が構築ノード自身を課金済み）。右辺は配列式または型なしリテラル（左辺の型の配列として
 /// 解釈）に限り、配列でない右辺は PG と同じく `42809` 相当ではなく型不一致 `42804` とする。
 pub(super) fn bind_quantified(
-    op: ArrayCmpOp,
+    op: QuantifiedOp,
     quantifier: Quantifier,
     lhs: &Expr,
     rhs: &Expr,
@@ -581,6 +581,12 @@ pub(super) fn bind_quantified(
             "ANY/ALL is not supported in a CHECK constraint",
         ));
     }
+    let op = match op {
+        QuantifiedOp::Cmp(c) => c,
+        like @ QuantifiedOp::Like { .. } => {
+            return bind_quantified_like(like, quantifier, lhs, rhs, env, node_budget)
+        }
+    };
     let r_arr = is_array_expr(rhs, env);
     if !r_arr && !is_untyped_literal(rhs) {
         return Err(SqlSurfaceError::datatype_mismatch(
@@ -610,11 +616,95 @@ pub(super) fn bind_quantified(
     reject_json_ordering(op, elem)?;
     Ok((
         BoundExpr::ArrayQuantified {
-            op,
+            op: QuantifiedOp::Cmp(op),
             all: quantifier == Quantifier::All,
             elem,
             lhs: Box::new(l_bound),
             array: Box::new(r_bound),
+        },
+        ExprType::Bool,
+    ))
+}
+
+/// `lhs [NOT] LIKE|ILIKE ANY|ALL (rhs)` の束縛（[`bind_quantified`] から呼ばれる。SQL-9・Issue #3258）。
+///
+/// 左辺は TEXT（型なしリテラルは text として解釈）、右辺は `text[]`／`varchar(n)[]` の配列式か
+/// 型なしリテラル（`text[]` として解釈）に限る。要素型は許可する腕だけを列挙し、既定は拒否
+/// （新しい要素型が黙って通らないようにする）。`CHAR(n)[]` は text への暗黙変換で末尾空白が落ち
+/// うる意味論差があるため `0A000`。ICU 照合などの列は式の束縛が `0A000` で拒否する。
+/// パターンは配列の要素（実行時の値）なので束縛時にはコンパイルしない。
+fn bind_quantified_like(
+    op: QuantifiedOp,
+    quantifier: Quantifier,
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
+    let r_arr = is_array_expr(rhs, env);
+    if !r_arr && !is_untyped_literal(rhs) {
+        return Err(SqlSurfaceError::datatype_mismatch(
+            "op ANY/ALL (array) requires array on right side",
+        ));
+    }
+    let array = if r_arr {
+        let (array, elem) = bind_array_operand_orig(rhs, env, node_budget)?;
+        match elem {
+            ArrayElemType::Text | ArrayElemType::Varchar(_) => {}
+            ArrayElemType::Bpchar(_) => {
+                return Err(unsupported(
+                    "LIKE ANY/ALL on a CHAR(n) array is not supported yet",
+                ))
+            }
+            ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::SmallInt
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Enum => {
+                return Err(SqlSurfaceError::undefined_function(
+                    "operator does not exist: LIKE/ILIKE on a non-text array element",
+                ))
+            }
+        }
+        array
+    } else {
+        bind_cast(
+            rhs,
+            &CastType::Array(Box::new(CastType::Text)),
+            env,
+            node_budget,
+        )?
+        .0
+    };
+    let l = if is_untyped_literal(lhs) {
+        bind_cast(lhs, &CastType::Text, env, node_budget)?.0
+    } else {
+        let (bound, ty) = bind_operand(lhs, env, node_budget)?;
+        if ty != ExprType::Text {
+            return Err(SqlSurfaceError::undefined_function(
+                "operator does not exist: LIKE/ILIKE on a non-text operand",
+            ));
+        }
+        bound
+    };
+    Ok((
+        BoundExpr::ArrayQuantified {
+            op,
+            all: quantifier == Quantifier::All,
+            elem: ArrayElemType::Text,
+            lhs: Box::new(l),
+            array: Box::new(array),
         },
         ExprType::Bool,
     ))
@@ -781,9 +871,58 @@ pub(crate) fn quantify(
     }
 }
 
+/// `LIKE`／`ILIKE` 量化の純粋な三値論理（SQL-9・Issue #3258。PG の ScalarArrayOpExpr と同じ意味論）。
+///
+/// - 空の配列は左辺が NULL でも ANY が偽・ALL が真（パターンを 1 つも評価しない）。
+/// - 空でない配列で左辺が NULL なら NULL（パターンはコンパイルしない＝エラーにもならない）。
+/// - 要素を配列の順に評価し、NULL 要素は不明。非 NULL 要素はその場でコンパイルして
+///   `matches != negated` を得る（ANY は最初の真・ALL は最初の偽で打ち切るため、打ち切り後の
+///   無効パターンはエラーにならない）。
+/// - パターン長超過は `54000`・末尾の孤立エスケープは `22025`（既存の単独 LIKE と同じ
+///   コンパイル時点の判定）。第 2 の照合実装は作らず `declarative_filter::LikePattern` を使う。
+pub(crate) fn quantify_like(
+    negated: bool,
+    case_insensitive: bool,
+    all: bool,
+    lhs: Option<&Key<'_>>,
+    items: &[Option<Key<'_>>],
+) -> Result<Option<bool>, SqlSurfaceError> {
+    if items.is_empty() {
+        return Ok(Some(all));
+    }
+    let Some(lhs) = lhs else {
+        return Ok(None);
+    };
+    let Key::Text(subject) = lhs else {
+        return Err(internal("LIKE ANY/ALL left operand is not text"));
+    };
+    let mut saw_unknown = false;
+    for item in items {
+        let outcome = match item {
+            None => None,
+            Some(Key::Text(pattern)) => {
+                let compiled = if case_insensitive {
+                    crate::declarative_filter::compile_ilike_pattern(pattern)?
+                } else {
+                    crate::declarative_filter::compile_like_pattern(pattern)?
+                };
+                Some(compiled.matches(subject) != negated)
+            }
+            Some(_) => return Err(internal("LIKE ANY/ALL array element is not text")),
+        };
+        match outcome {
+            Some(true) if !all => return Ok(Some(true)),
+            Some(false) if all => return Ok(Some(false)),
+            Some(_) => {}
+            None => saw_unknown = true,
+        }
+    }
+    Ok(if saw_unknown { None } else { Some(all) })
+}
+
 /// 量化比較の評価。配列が NULL なら NULL（空かどうかの判定より先）。
 pub(crate) fn eval_array_quantified<'a>(
-    op: ArrayCmpOp,
+    op: QuantifiedOp,
     all: bool,
     lhs: &BoundExpr,
     array: &BoundExpr,
@@ -798,7 +937,14 @@ pub(crate) fn eval_array_quantified<'a>(
     let items = array_keys(&a)?;
     let l = crate::sql::udf_call::eval_with_scalars(lhs, id, embedding, row_scalars)?;
     let lkey = value_key(&l)?;
-    Ok(match quantify(op, all, lkey.as_ref(), &items) {
+    let result = match op {
+        QuantifiedOp::Cmp(c) => quantify(c, all, lkey.as_ref(), &items),
+        QuantifiedOp::Like {
+            negated,
+            case_insensitive,
+        } => quantify_like(negated, case_insensitive, all, lkey.as_ref(), &items)?,
+    };
+    Ok(match result {
         Some(b) => ExprValue::Bool(b),
         None => ExprValue::Null,
     })
@@ -991,5 +1137,70 @@ mod tests {
         assert!(check_lhs_compatible(K::Numeric, E::Integer).is_err());
         assert!(check_lhs_compatible(K::Int4, E::Real).is_ok());
         assert!(check_lhs_compatible(K::Text, E::Integer).is_err());
+    }
+
+    fn texts(v: &[Option<&'static str>]) -> Vec<Option<Key<'static>>> {
+        v.iter().map(|x| x.map(Key::Text)).collect()
+    }
+
+    /// SQL-9・Issue #3258: LIKE 量化の三値論理（空配列・NULL 左辺・NULL 要素・negated・打ち切り）。
+    #[test]
+    fn quantify_like_three_valued_logic() {
+        let s = Key::Text("apple");
+        let ql_res = |neg, ci, all, l: Option<&Key<'_>>, items: &[Option<&'static str>]| {
+            quantify_like(neg, ci, all, l, &texts(items))
+        };
+        let ql = |neg, ci, all, l: Option<&Key<'_>>, items: &[Option<&'static str>]| {
+            ql_res(neg, ci, all, l, items).expect("no error")
+        };
+        // 空配列は左辺 NULL でも ANY が偽・ALL が真。
+        assert_eq!(ql(false, false, false, None, &[]), Some(false));
+        assert_eq!(ql(false, false, true, None, &[]), Some(true));
+        assert_eq!(ql(false, false, false, Some(&s), &[]), Some(false));
+        // 空でない配列で左辺 NULL は NULL（無効パターンでもエラーにならない）。
+        assert_eq!(ql(false, false, false, None, &[Some("a\\")]), None);
+        // 一致 + NULL 要素: ANY は真、ALL は NULL。
+        assert_eq!(
+            ql(false, false, false, Some(&s), &[None, Some("a%")]),
+            Some(true)
+        );
+        assert_eq!(ql(false, false, true, Some(&s), &[None, Some("a%")]), None);
+        // 不一致 + NULL 要素: ANY は NULL、ALL は偽。
+        assert_eq!(ql(false, false, false, Some(&s), &[None, Some("b%")]), None);
+        assert_eq!(
+            ql(false, false, true, Some(&s), &[None, Some("b%")]),
+            Some(false)
+        );
+        // negated（後置 NOT）。`'apple' NOT LIKE ANY ('a%','b%')` は真。
+        assert_eq!(
+            ql(true, false, false, Some(&s), &[Some("a%"), Some("b%")]),
+            Some(true)
+        );
+        assert_eq!(
+            ql(true, false, true, Some(&s), &[Some("a%"), Some("b%")]),
+            Some(false)
+        );
+        // ILIKE は ASCII を畳み込む。
+        assert_eq!(
+            ql(false, false, false, Some(&s), &[Some("A%")]),
+            Some(false)
+        );
+        assert_eq!(ql(false, true, false, Some(&s), &[Some("A%")]), Some(true));
+        // 打ち切り後の無効パターンはエラーにならない。打ち切る前ならエラー。
+        assert_eq!(
+            ql(false, false, false, Some(&s), &[Some("a%"), Some("x\\")]),
+            Some(true)
+        );
+        assert_eq!(
+            ql(false, false, true, Some(&s), &[Some("b%"), Some("x\\")]),
+            Some(false)
+        );
+        let err =
+            ql_res(false, false, false, Some(&s), &[Some("x\\"), Some("a%")]).expect_err("22025");
+        assert_eq!(err.wire_code(), "22025");
+        let long = "a".repeat(crate::declarative_filter::MAX_LIKE_PATTERN_LEN + 1);
+        let err = quantify_like(false, false, false, Some(&s), &[Some(Key::Text(&long))])
+            .expect_err("54000");
+        assert_eq!(err.wire_code(), "54000");
     }
 }
