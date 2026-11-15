@@ -632,6 +632,21 @@ fn limit_inside_branch_is_rejected() {
     assert_eq!(err.wire_code(), "42601");
 }
 
+/// Issue #3270 レビュー対応: 括弧付き枝の select list の値サブクエリは束縛せず `42601`。
+#[test]
+fn scalar_subquery_in_limited_branch_is_rejected() {
+    let (storage, path) = seeded_two_tables();
+    let _guard = CleanupGuard(path);
+    let core = new_core(storage);
+    let err = run_err(
+        &core,
+        "tenant-a",
+        "(SELECT (SELECT lang FROM other_docs LIMIT 1) FROM docs LIMIT 1) \
+         UNION ALL (SELECT lang FROM other_docs LIMIT 1)",
+    );
+    assert_eq!(err.wire_code(), "42601");
+}
+
 #[test]
 fn bare_parenthesized_select_without_operator_is_rejected() {
     let (storage, path) = seeded_two_tables();

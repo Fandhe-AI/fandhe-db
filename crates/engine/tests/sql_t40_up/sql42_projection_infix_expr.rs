@@ -179,7 +179,6 @@ fn unsupported_forms_stay_rejected() {
         "SELECT n + FROM t LIMIT 10",
         "SELECT * FROM t WHERE n = -n LIMIT 10",
         "CREATE VIEW v AS SELECT n+1 FROM t",
-        "SELECT n+1 FROM t UNION SELECT n FROM t",
         "SELECT n+1 FROM t GROUP BY n",
         "SELECT n + sum(n) FROM t",
     ] {

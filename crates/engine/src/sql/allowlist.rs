@@ -4318,9 +4318,9 @@ pub(crate) enum SetOperator {
     ExceptAll,
 }
 
-/// 集合演算の構文木。葉は単一テーブルの広域取得（[`ValidatedScan`]）に限定する
-/// （TASK-213 の設計判断: `JOIN` 基盤〔TASK-212〕を前提にしない。`sql::set_op`
-/// モジュールドキュメント参照）。
+/// 集合演算の構文木。葉は単一テーブルの広域取得（[`ValidatedScan`]）・集計形の枝・
+/// `FROM` なしの定数枝（Issue #3270）のいずれか（TASK-213 の設計判断: `JOIN` 基盤〔TASK-212〕を
+/// 前提にしない。`sql::set_op` モジュールドキュメント参照）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SetTree {
     /// 既定の枝（`ORDER BY`／`LIMIT`／`OFFSET` を持たない単一テーブル広域取得）。
@@ -4336,6 +4336,10 @@ pub(crate) enum SetTree {
     /// 場合に限り枝内 `ORDER BY`／`LIMIT` を持てる（`ValidatedAggregate::group_by`
     /// の既存フィールドで表す）。
     AggregateBranch(Box<SetAggregateBranch>),
+    /// `FROM` なしの定数枝（`SELECT 7 UNION SELECT y FROM b`。Issue #3270・SQL-42 のポインタ）。
+    /// 表を読まないため RLS の対象になる行がなく、`sql::const_select` の束縛・実行をそのまま使う。
+    /// `WHERE`／`HAVING`／`LIMIT`／`OFFSET`／トップレベルの集計項目は構文段が `42601` にする。
+    ConstBranch(Box<SetConstBranch>),
     Op {
         op: SetOperator,
         left: Box<SetTree>,
@@ -4352,6 +4356,15 @@ pub(crate) enum SetTree {
 pub(crate) struct SetAggregateBranch(pub(crate) ValidatedAggregate);
 
 impl Eq for SetAggregateBranch {}
+
+/// 集合演算の定数枝（[`SetTree::ConstBranch`]）を保持する薄いラッパー。
+/// [`ValidatedConstSelect`] は `PartialEq` のみを導出するため、[`SetAggregateBranch`] と同じく
+/// `Eq` を手動で付与する（構文段が生成する式リテラルは有限値のみで NaN を作らないため
+/// 反射律は成立する）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SetConstBranch(pub(crate) ValidatedConstSelect);
+
+impl Eq for SetConstBranch {}
 
 /// 許可形状の構造判定を通過した集合演算文（SQL-29 (c)・RLS-10 (b)・TASK-213）。
 /// 束縛（枝ごとの `bind_scan`）・実行（合成・重複除去・RLS 独立適用）は
@@ -14008,14 +14021,12 @@ impl<'a> Parser<'a> {
         Ok(Some(order))
     }
 
-    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...] [WHERE <条件>] [HAVING <条件>] [LIMIT <n>] [OFFSET <m>][;]`
-    /// （`FROM` なし。SQL-43・Issue #1531・#2329・#2331）を解析する。句の順序は固定で、
-    /// `SELECT *`・`AND`／`OR` 等を含む条件・`OFFSET` を `LIMIT` より前に置く形・
-    /// `GROUP BY`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
-    /// （fail-closed）。トップレベルの集計項目（Issue #2330）だけを受理し、
-    /// 集計を含む式・入れ子集計は `42601`。列参照の拒否は束縛段の責務（構文木だけでは
-    /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
-    fn parse_const_select(&mut self) -> Result<ValidatedConstSelect, SqlSurfaceError> {
+    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...]` の項目リストだけを読む（`FROM` なしの
+    /// 定数式 SELECT。Issue #3270 で [`Self::parse_const_select`] から切り出した）。後続の句
+    /// （`WHERE`／`LIMIT` 等）は読まず、呼び出し元に任せる。集合演算の定数枝
+    /// （`parse_set_branch`）も共有の [`Parser`] 上でこれだけを呼び、全体の `LIMIT`／`OFFSET`／
+    /// 末尾 `ORDER BY` を枝の句として誤って消費しない。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
+    fn parse_const_select_items(&mut self) -> Result<Vec<ConstSelectItem>, SqlSurfaceError> {
         self.expect_keyword(Keyword::Select)?;
         if matches!(self.peek(), Some(Token::Punct('*'))) {
             return Err(SqlSurfaceError::unsupported(
@@ -14064,6 +14075,18 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        Ok(items)
+    }
+
+    /// `SELECT <式>|<集計呼び出し>[ AS <別名>][, ...] [WHERE <条件>] [HAVING <条件>] [LIMIT <n>] [OFFSET <m>][;]`
+    /// （`FROM` なし。SQL-43・Issue #1531・#2329・#2331）を解析する。句の順序は固定で、
+    /// `SELECT *`・`AND`／`OR` 等を含む条件・`OFFSET` を `LIMIT` より前に置く形・
+    /// `GROUP BY`／`ORDER BY`・空リスト・末尾カンマはすべて `42601`
+    /// （fail-closed）。トップレベルの集計項目（Issue #2330）だけを受理し、
+    /// 集計を含む式・入れ子集計は `42601`。列参照の拒否は束縛段の責務（構文木だけでは
+    /// 関数名の意味が確定しないため）。項目数は `MAX_CONST_SELECT_ITEMS` で有界化する。
+    fn parse_const_select(&mut self) -> Result<ValidatedConstSelect, SqlSurfaceError> {
+        let items = self.parse_const_select_items()?;
         let where_clause = if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance();
             Some(self.parse_const_select_condition(false)?)
@@ -19341,6 +19364,8 @@ fn check_body_set_tree(
         SetTree::AggregateBranch(agg) => {
             check_body_aggregate(&agg.0, lookup, BodyExprPolicy::Reject, out)
         }
+        // Issue #3270: ビュー本文には定数枝を書けない（fail-closed）。
+        SetTree::ConstBranch(_) => Err(body_form_unsupported()),
         SetTree::Op { left, right, .. } => {
             check_body_set_tree(left, lookup, out)?;
             check_body_set_tree(right, lookup, out)
@@ -23880,13 +23905,21 @@ pub(crate) fn aggregate_has_unrendered_explain_shape(v: &ValidatedAggregate) -> 
         || super::subquery::aggregate_has_filter_subquery(v)
 }
 
+/// 枝の投影に式項目（`SelectItem::Expr`）を含むか（Issue #3270。別名付きの列参照も式項目として数える）。
+fn scan_has_expr_projection(scan: &ValidatedScan) -> bool {
+    matches!(&scan.projection, Projection::Items(items)
+        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })))
+}
+
 /// 集合演算木のいずれかの枝が [`scan_has_unrendered_explain_shape`]／
 /// [`aggregate_has_unrendered_explain_shape`] に当たるか。
 pub(crate) fn set_tree_has_unrendered_explain_shape(tree: &SetTree) -> bool {
     match tree {
+        // Issue #3270: 式射影の枝・定数枝の EXPLAIN は未対応（0A000。後続 Issue #3271）。
         SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => {
-            scan_has_unrendered_explain_shape(scan)
+            scan_has_unrendered_explain_shape(scan) || scan_has_expr_projection(scan)
         }
+        SetTree::ConstBranch(_) => true,
         SetTree::AggregateBranch(agg) => aggregate_has_unrendered_explain_shape(&agg.0),
         SetTree::Op { left, right, .. } => {
             set_tree_has_unrendered_explain_shape(left)
@@ -23900,9 +23933,115 @@ pub(crate) fn set_tree_has_unrendered_explain_shape(tree: &SetTree) -> bool {
 fn set_tree_has_value_subqueries(tree: &SetTree) -> bool {
     match tree {
         SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => scan.has_value_subqueries(),
-        SetTree::AggregateBranch(_) => false,
+        SetTree::AggregateBranch(_) | SetTree::ConstBranch(_) => false,
         SetTree::Op { left, right, .. } => {
             set_tree_has_value_subqueries(left) || set_tree_has_value_subqueries(right)
+        }
+    }
+}
+
+/// 式木が集計関数の呼び出しを含むか（Issue #3270）。集合演算の枝は、トップレベルの集計項目を
+/// 集計形の枝へ振り分ける（`looks_like_aggregate_select`）が、式の中に埋もれた集計
+/// （`coalesce(sum(n), 0)`）は振り分けられない。束縛段へ渡すと意図しない別のエラーや誤解釈に
+/// なり得るため、構文段で `42601` にする。`Expr` の全 variant を網羅する（variant 追加時に
+/// コンパイルエラーで検査漏れに気づく。fail-closed）。
+fn expr_contains_aggregate_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_)
+        | Expr::Ident(_)
+        | Expr::String(_)
+        | Expr::Null
+        | Expr::DateLiteral(_)
+        | Expr::TimestampLiteral(_)
+        | Expr::IntervalLiteral(_)
+        | Expr::TimeLiteral(_)
+        | Expr::TimestampTzLiteral { .. }
+        | Expr::ValueFunction { .. } => false,
+        Expr::Call { name, args } => {
+            is_aggregate_function_name(name) || args.iter().any(expr_contains_aggregate_call)
+        }
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::NullIf(lhs, rhs)
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::RegexMatch {
+            lhs, pattern: rhs, ..
+        }
+        | Expr::JsonAccess { lhs, rhs, .. }
+        | Expr::VectorDistance { lhs, rhs, .. } => {
+            expr_contains_aggregate_call(lhs) || expr_contains_aggregate_call(rhs)
+        }
+        Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => expr_contains_aggregate_call(expr),
+        Expr::ArrayConstructor(_) | Expr::Subscript { .. } | Expr::Quantified { .. } => expr
+            .array_expr_children()
+            .into_iter()
+            .flatten()
+            .any(expr_contains_aggregate_call),
+        Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_aggregate_call),
+        Expr::Case { whens, else_result } => {
+            whens
+                .iter()
+                .any(|(c, r)| expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r))
+                || else_result
+                    .as_deref()
+                    .is_some_and(expr_contains_aggregate_call)
+        }
+        Expr::Coalesce(args) => args.iter().any(expr_contains_aggregate_call),
+    }
+}
+
+/// 集合演算の `FROM` あり枝の式項目に集計呼び出しが含まれていれば `42601`（Issue #3270）。
+fn reject_aggregate_in_branch_items(projection: &Projection) -> Result<(), SqlSurfaceError> {
+    if let Projection::Items(items) = projection {
+        let has_aggregate = items.iter().any(|it| match it {
+            SelectItem::Expr { expr, .. } => expr_contains_aggregate_call(expr),
+            SelectItem::Column(_) => false,
+        });
+        if has_aggregate {
+            return Err(SqlSurfaceError::unsupported(
+                "aggregate calls inside an expression are not allowed in a set operation branch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 集合演算の定数枝（`FROM` なしの `SELECT <項目>`。Issue #3270・SQL-42 のポインタ）を、共有の
+/// [`Parser`] 上で項目リストだけ読んで解析する。後続の全体 `LIMIT`／`OFFSET`／末尾 `ORDER BY`
+/// は呼び出し元（`parse_set_operation`）の担当で、ここでは消費しない（`parse_const_select` を
+/// 枝スライスへ使うと全体 `OFFSET` を枝の句として取り込み、結果が黙って変わるため使わない）。
+/// トップレベルの集計項目・`WHERE`／`HAVING` は枝が持てない句として `42601`（fail-closed）。
+fn parse_set_const_branch(p: &mut Parser<'_>) -> Result<SetTree, SqlSurfaceError> {
+    let items = p.parse_const_select_items()?;
+    if items.iter().any(|it| it.aggregate().is_some()) {
+        return Err(SqlSurfaceError::unsupported(
+            "aggregate items are not allowed in a FROM-less set operation branch",
+        ));
+    }
+    if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) || p.peek_ident_matches("HAVING") {
+        return Err(SqlSurfaceError::unsupported(
+            "WHERE/HAVING are not allowed in a FROM-less set operation branch",
+        ));
+    }
+    Ok(SetTree::ConstBranch(Box::new(SetConstBranch(
+        ValidatedConstSelect {
+            items,
+            where_clause: None,
+            having: None,
+            limit: None,
+            offset: None,
+        },
+    ))))
+}
+
+/// 集合演算木が表を読む葉を 1 つ以上持つか（Issue #3270）。全枝が定数の木は、表の葉を前提とする
+/// 下流（読み取り権限・一時表の経路・カーソル・`EXPLAIN` の対象表名）が成り立たないため、
+/// `parse_set_operation` が `0A000` で拒否する。
+fn set_tree_has_table_leaf(tree: &SetTree) -> bool {
+    match tree {
+        SetTree::ConstBranch(_) => false,
+        SetTree::Branch(_) | SetTree::LimitedBranch(_) | SetTree::AggregateBranch(_) => true,
+        SetTree::Op { left, right, .. } => {
+            set_tree_has_table_leaf(left) || set_tree_has_table_leaf(right)
         }
     }
 }
@@ -23926,8 +24065,8 @@ fn looks_like_set_operation(tokens: &[Token]) -> bool {
 /// 追加した集計形の枝）を解析する。検索 SELECT・広域取得が持つランキング段・
 /// `LIMIT`・`OFFSET`・`DISTINCT` はいずれも括弧なしの枝では受理しない（fail-closed。
 /// 括弧なしの末尾 `ORDER BY`／`LIMIT` は集合演算全体に掛かるため。括弧付きの単一
-/// `SELECT` 枝は [`parse_set_limited_branch`]）。`Computed` 投影項目（宣言的 UDF・
-/// 組み込み関数呼び出し）も、束縛時に型を確定できないため受理しない。
+/// `SELECT` 枝は [`parse_set_limited_branch`]）。式項目（Issue #3270）は受理するが、式の中の
+/// 集計呼び出しは `42601`。`FROM` なしの枝は定数枝（[`parse_set_const_branch`]）へ振り分ける。
 fn parse_set_branch(
     p: &mut Parser<'_>,
     lookup: &impl TableLookup,
@@ -23939,6 +24078,13 @@ fn parse_set_branch(
     let branch_start = p.pos;
     let branch_end = set_branch_end(&p.tokens, branch_start);
     if let Some(slice) = p.tokens.get(branch_start..branch_end) {
+        // Issue #3270（SQL-42 ポインタ）: 深さ 0 に `FROM` が無い枝は定数枝。トップレベルの
+        // `validate_select_statement` と同じく、集計形の判定より前に振り分ける。
+        if matches!(slice.first(), Some(Token::Keyword(Keyword::Select)))
+            && is_from_less_select(slice)
+        {
+            return parse_set_const_branch(p);
+        }
         if looks_like_aggregate_select(slice) {
             let shape = parse_aggregate_shape(
                 slice,
@@ -23954,13 +24100,7 @@ fn parse_set_branch(
     p.expect_keyword(Keyword::Select)?;
 
     let projection = p.parse_select_list()?;
-    if let Projection::Items(items) = &projection {
-        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })) {
-            return Err(SqlSurfaceError::unsupported(
-                "computed projection items are not allowed inside a set operation branch",
-            ));
-        }
-    }
+    reject_aggregate_in_branch_items(&projection)?;
 
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
@@ -24244,12 +24384,13 @@ fn parse_set_limited_branch(
             "window functions are not allowed inside a set operation branch",
         ));
     }
-    if let Projection::Items(items) = &shape.projection {
-        if items.iter().any(|it| matches!(it, SelectItem::Expr { .. })) {
-            return Err(SqlSurfaceError::unsupported(
-                "computed projection items are not allowed inside a set operation branch",
-            ));
-        }
+    reject_aggregate_in_branch_items(&shape.projection)?;
+    // select list の値サブクエリは枝では束縛しない（fail-closed。Issue #3270。式項目の
+    // 受理解禁で、従来の一括拒否が担っていた経路が素通りしないようにする）。
+    if !shape.scalar_subquery_items.is_empty() {
+        return Err(SqlSurfaceError::unsupported(
+            "scalar subqueries in the select list are not allowed inside a set operation branch",
+        ));
     }
     // Issue #1188: 式キーの `ORDER BY` は集合演算の枝では非対応（式キーを含む文は
     // `order_by` が空になるため、黙って渡すと並べ替えなしで LIMIT が適用される）。
@@ -24508,6 +24649,11 @@ fn parse_set_operation(
     let limit = p.parse_optional_limit()?;
     let offset = p.parse_optional_offset()?.unwrap_or(0);
     p.expect_end_of_statement()?;
+    if !set_tree_has_table_leaf(&tree) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "a set operation whose branches are all FROM-less is not supported",
+        ));
+    }
     // 構文の誤り（`42601`）を先に確定させてから、式キーを `0A000` にする
     // （PG の「集合演算の ORDER BY は結果列名だけ」に対応する分類）。
     let mut order_by = Vec::with_capacity(scan_keys.len());
@@ -29619,6 +29765,12 @@ fn validate_sql_tokens_impl(
                 if set_tree_has_value_subqueries(&validated.tree) {
                     return Err(SqlSurfaceError::unsupported(
                         "EXPLAIN is not supported for queries with value subqueries",
+                    ));
+                }
+                // Issue #3270: 式射影の枝・定数枝を含む集合演算の EXPLAIN は未対応（後続 Issue #3271）。
+                if set_tree_has_unrendered_explain_shape(&validated.tree) {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "EXPLAIN is not supported for set operations with expression or FROM-less branches",
                     ));
                 }
                 return Ok(Statement::Explain(ExplainTarget::SetOperation(validated)));
@@ -43281,6 +43433,71 @@ mod tests {
         let v = parse_create_table_ok(&sql);
         assert_eq!(v.columns.len(), MAX_COLUMN_COUNT);
         assert_eq!(v.checks.len(), 2);
+    }
+
+    // ---------- 集合演算の枝の式射影・定数枝の構文段の振り分け（Issue #3270） ----------
+
+    fn set_op_of(sql: &str) -> Result<ValidatedSetOperation, SqlSurfaceError> {
+        let tokens = lexer::tokenize(sql).expect("valid tokens");
+        parse_set_operation(&tokens, &StructuralOnlyLookup)
+    }
+
+    #[test]
+    fn set_op_const_branch_is_parsed_as_const_leaf() {
+        let v = set_op_of("SELECT 7 UNION SELECT y FROM b").expect("accepted");
+        match &v.tree {
+            SetTree::Op { left, right, .. } => {
+                assert!(matches!(**left, SetTree::ConstBranch(_)));
+                assert!(matches!(**right, SetTree::Branch(_)));
+            }
+            other => panic!("unexpected tree {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_op_trailing_offset_is_not_swallowed_by_a_const_branch() {
+        let v = set_op_of("SELECT y FROM b UNION SELECT 7 OFFSET 1").expect("accepted");
+        assert_eq!(v.offset, 1);
+        let v = set_op_of("SELECT y FROM b UNION SELECT 7 LIMIT 2").expect("accepted");
+        assert_eq!(v.limit, Some(2));
+    }
+
+    #[test]
+    fn set_op_expression_items_are_accepted_but_embedded_aggregates_are_not() {
+        assert!(set_op_of("SELECT n+1 AS m FROM t UNION SELECT n FROM u").is_ok());
+        for sql in [
+            "SELECT coalesce(sum(n), 0) FROM t UNION SELECT n FROM u",
+            "SELECT 1 + max(n) FROM t UNION SELECT n FROM u",
+        ] {
+            let err = set_op_of(sql).expect_err("embedded aggregate must be rejected");
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_op_const_branch_rejects_aggregates_and_where_and_all_const_trees() {
+        for (sql, code) in [
+            ("SELECT count(*) UNION SELECT y FROM b", "42601"),
+            ("SELECT 7 WHERE true UNION SELECT y FROM b", "42601"),
+            ("SELECT 1 UNION SELECT 2", "0A000"),
+            ("SELECT 1 UNION ALL SELECT 2 UNION SELECT 3", "0A000"),
+        ] {
+            let err = set_op_of(sql).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_op_tree_with_expression_or_const_branch_is_unrendered_for_explain() {
+        let plain = set_op_of("SELECT n FROM t UNION SELECT n FROM u").expect("accepted");
+        assert!(!set_tree_has_unrendered_explain_shape(&plain.tree));
+        for sql in [
+            "SELECT n+1 FROM t UNION SELECT n FROM u",
+            "SELECT 7 UNION SELECT n FROM u",
+        ] {
+            let v = set_op_of(sql).expect("accepted");
+            assert!(set_tree_has_unrendered_explain_shape(&v.tree), "{sql}");
+        }
     }
 
     // ---------- 集合演算検出の誤検出防止（Issue #929 最終レビュー指摘の回帰） ----------

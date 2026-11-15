@@ -79,6 +79,9 @@ fn build<'a>(
             node.push_child(build(right, shapes, lines, ordinal)?)?;
             Ok(node)
         }
+        // Issue #3270: 定数枝・式射影の枝の EXPLAIN は構文段が 0A000 にする（後続 Issue #3271）。
+        // 到達した場合は葉の対応が取れないため fail-closed にする。
+        SetTree::ConstBranch(_) => Err(ExplainTreeError::InvalidLine),
         SetTree::Branch(_) | SetTree::LimitedBranch(_) | SetTree::AggregateBranch(_) => {
             let shape = shapes.next().ok_or(ExplainTreeError::InvalidLine)?;
             let scan_lines = lines.next().ok_or(ExplainTreeError::InvalidLine)?;
