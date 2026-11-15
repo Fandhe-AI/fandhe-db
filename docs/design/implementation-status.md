@@ -2093,4 +2093,11 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #3217（perf(engine): 行ノルム² をスナップショット世代単位で常駐キャッシュ。SQL-33・CORE-3 のポインタ）**: 依存・unsafe・公開 API の変更なし。`SqlArenaSnapshot` に遅延初期化の行ノルム²（行数 × 4 バイト。`approx_heap_bytes` に算入）を持たせ、キャッシュヒットした `<=>` 全走査（WHERE なし・マスクなし・走査 arena がスナップショット自身）と hybrid の密側で C2 入力として渡す。それ以外の形は従来経路。固定した検査は `arena_cache.rs` の単体テストと `sql_named/sql_arena_cache.rs` の `resident_row_norms_*`（距離のビット一致・世代更新後の再計算・WHERE 縮約 arena・テナント分離・hybrid）。p50 低下の A/B は未検証。詳細は [hybrid-rrf-latency-breakdown.md](hybrid-rrf-latency-breakdown.md)。
 
+## Issue #3223: scan の decode_row_header 二重デコードの解消
+
+`sql/scan.rs::with_visible_row` の `Fast`／`DimAndScalar` 段で、RLS 判定のヘッダデコードの offset を
+`storage::decode_row_dim_and_metadata_body_borrowed(buf, offset)` へ渡し、行ごとのヘッダ（tenant の UTF-8 検証）
+デコードを 1 回にした。検査の順序・fail-closed は不変。単体・結合テストを追加。同一ホスト A/B の実測は未検証。
+詳細は `docs/design/wide-retrieval-scan.md` の追記節。
+
 **Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。
