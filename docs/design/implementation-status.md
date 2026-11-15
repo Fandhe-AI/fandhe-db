@@ -2105,3 +2105,5 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 詳細は `docs/design/wide-retrieval-scan.md` の追記節。
 
 **Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。
+
+**Issue #3242（refactor(engine): CHECK の評価を三値論理に置き換える。TABLE-16・SQL-24 のポインタ）**: 依存・unsafe・公開 API の変更なし。`CompiledChecks` を述語木（`BoundConjunction`）の Kleene 三値評価へ置き換え、葉の評価器は WHERE と共有する。違反は FALSE のときだけ（`23514`）、UNKNOWN は合格。非 NULL で UNKNOWN の葉と範囲外の列は `XX000` で拒否し、`OR` 群は保持して列マスクへ反映する。受理する形（`reject_forbidden_elements`）は変えず、解禁は #3243・#3244。置換前後の一致は差分テストで固定した。詳細は [sql-check-constraint.md](sql-check-constraint.md) の D1。
