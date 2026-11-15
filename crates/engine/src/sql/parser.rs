@@ -9992,7 +9992,12 @@ pub(crate) fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -
             lhs: Box::new(f(lhs)),
             rhs: Box::new(f(rhs)),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|o| Box::new(f(o))),
             whens: whens.iter().map(|(c, r)| (f(c), f(r))).collect(),
             else_result: else_result.as_ref().map(|e| Box::new(f(e))),
         },
@@ -12389,7 +12394,14 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(c, out);
             }
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_idents(operand, out);
+            }
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
                 collect_expr_idents(result, out);
@@ -13424,7 +13436,15 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: match operand {
+                Some(o) => Some(Box::new(rec(o)?)),
+                None => None,
+            },
             whens: whens
                 .iter()
                 .map(|(c, r)| Ok((rec(c)?, rec(r)?)))

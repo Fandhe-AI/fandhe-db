@@ -378,18 +378,68 @@ fn invisible_row_with_division_by_zero_in_case_does_not_error() {
 
 // --- 拒否経路（wire_code の決定性） --------------------------------------------
 
+/// 単純 CASE（Issue #3279。以前は `42601` で拒否していた）は受理され、同値の検索形と
+/// 同じ結果になる。結果値は Rust 側の独立オラクル（`id == 2` の行だけ 20、他は ELSE の 0）で固定する。
 #[test]
-fn simple_case_form_is_rejected_with_42601() {
+fn simple_case_form_is_accepted_and_matches_searched_form() {
     let (core, _guard) = new_core_with_docs();
     let mut session = SessionState::default();
-    let err = core
-        .execute_sql_in_session(
+    let simple = expect_query(
+        core.execute_sql_in_session(
             &ctx(),
             &mut session,
-            "SELECT CASE id WHEN 1 THEN 2 END FROM docs LIMIT 1",
+            "SELECT id, CASE id WHEN 2 THEN 20 ELSE 0 END AS c FROM docs \
+             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
         )
-        .unwrap_err();
-    assert_eq!(err.wire_code(), "42601");
+        .expect("simple CASE should be accepted"),
+    );
+    let searched = expect_query(
+        core.execute_sql_in_session(
+            &ctx(),
+            &mut session,
+            "SELECT id, CASE WHEN id = 2 THEN 20 ELSE 0 END AS c FROM docs \
+             ORDER BY embedding <=> '[3.0,4.0,0.0]' LIMIT 3",
+        )
+        .expect("searched CASE should be accepted"),
+    );
+    assert_eq!(simple.columns, searched.columns);
+    assert_eq!(simple.rows.len(), 3);
+    for row in &simple.rows {
+        let expected = if row.id == 2 { 20 } else { 0 };
+        assert_eq!(
+            cell(row, 1),
+            &Cell::SignedInteger(expected),
+            "row {}",
+            row.id
+        );
+    }
+    let simple_cells: Vec<_> = simple
+        .rows
+        .iter()
+        .map(|r| (r.id, cell(r, 1).clone()))
+        .collect();
+    let searched_cells: Vec<_> = searched
+        .rows
+        .iter()
+        .map(|r| (r.id, cell(r, 1).clone()))
+        .collect();
+    assert_eq!(simple_cells, searched_cells);
+}
+
+/// 単純 CASE の不正な形（WHEN 無し・END 無し）は従来どおり `42601`。
+#[test]
+fn malformed_simple_case_form_is_rejected_with_42601() {
+    let (core, _guard) = new_core_with_docs();
+    let mut session = SessionState::default();
+    for sql in [
+        "SELECT CASE id END FROM docs LIMIT 1",
+        "SELECT CASE id WHEN 1 THEN 2 FROM docs LIMIT 1",
+    ] {
+        let err = core
+            .execute_sql_in_session(&ctx(), &mut session, sql)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601", "{sql}");
+    }
 }
 
 #[test]

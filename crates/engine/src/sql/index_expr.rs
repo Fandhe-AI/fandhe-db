@@ -385,7 +385,14 @@ fn check_expr_with(
             check_expr_with(lhs, site, udf)?;
             check_expr_with(rhs, site, udf)
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                check_expr_with(o, site, udf)?;
+            }
             for (cond, result) in whens {
                 check_expr_with(cond, site, udf)?;
                 check_expr_with(result, site, udf)?;
@@ -529,10 +536,15 @@ pub(crate) fn expr_contains_collate(expr: &Expr) -> bool {
         | Expr::Quantified { lhs, rhs, .. } => {
             expr_contains_collate(lhs) || expr_contains_collate(rhs)
         }
-        Expr::Case { whens, else_result } => {
-            whens
-                .iter()
-                .any(|(c, r)| expr_contains_collate(c) || expr_contains_collate(r))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_collate)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_contains_collate(c) || expr_contains_collate(r))
                 || else_result.as_deref().is_some_and(expr_contains_collate)
         }
         Expr::Coalesce(items) | Expr::ArrayConstructor(items) => {
@@ -639,7 +651,15 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: match operand.as_deref() {
+                Some(o) => Some(Box::new(rec(o)?)),
+                None => None,
+            },
             whens: whens
                 .iter()
                 .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
@@ -828,7 +848,14 @@ pub(crate) fn check_bound_index_expression_determinism(
         Expr::VectorDistance { .. } => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "distance expressions are not supported in an index expression".to_string(),
         }),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                rec(o)?;
+            }
             for (cond, result) in whens {
                 rec(cond)?;
                 rec(result)?;

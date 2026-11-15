@@ -3701,6 +3701,10 @@ impl ValidatedMaterializedViewRead {
     }
 }
 
+/// [`Parser::case_expr_starts_at`] の前方走査の上限トークン数（Issue #3279）。`case` を
+/// 列名として多数並べた入力でも、各位置の走査が定数で打ち切られ全体が 2 乗時間にならない。
+const CASE_START_SCAN_LIMIT: usize = 1024;
+
 /// `FROM` なし定数式 SELECT の項目数上限（SQL-43）。1 文あたりの束縛・評価コストを
 /// 有界にするための DoS 対策で、`MAX_EXPR_NODES` と同程度の桁に揃えた。アロケーション
 /// より前に検査する。
@@ -5016,7 +5020,7 @@ pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
 
 /// 式 `expr` の直下の子式を `out` へ積む（[`returning_item_rejection`] の明示スタック走査用。
 /// `sql::parser::collect_expr_idents` と同じ変種の網羅）。
-fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+pub(crate) fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     match expr {
         Expr::Number(_)
         | Expr::String(_)
@@ -5045,7 +5049,14 @@ fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             out.extend(expr.array_expr_children().into_iter().flatten());
         }
         Expr::SqlJsonQuery(q) => out.extend(q.children()),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                out.push(op);
+            }
             for (cond, result) in whens {
                 out.push(cond);
                 out.push(result);
@@ -7528,6 +7539,80 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// `pos` の識別子が `CASE` 式（検索形・単純形）の開始かを、消費せずに判定する
+    /// （対象ビヘイビア: SQL-26。Issue #3279）。投影・集計項目・一次式・ORDER BY キーの
+    /// 4 箇所が共有する単一情報源。
+    ///
+    /// - 引用なしの `CASE` の直後が `WHEN` なら検索形（従来と同じ）。
+    /// - そうでなければ前方へ走査し、括弧・入れ子の `CASE ... END` の外（深さ 0）で `WHEN` に
+    ///   当たれば単純形（`CASE x WHEN v ...`）。深さ 0 で `,` `)` `]` `;`・キーワード・
+    ///   `THEN`/`ELSE`/`END`/`AS`/`AND`/`OR` に当たれば列名 `case` の参照（後方互換）。
+    ///
+    /// 走査長は [`CASE_START_SCAN_LIMIT`] で打ち切る（超えたら偽。後続の構文解析で `42601`
+    /// に落ちる fail-closed）。`case + case + ...` のような入力で 2 乗時間にならないための上限。
+    fn case_expr_starts_at(&self, pos: usize) -> bool {
+        let Some(Token::Ident(name)) = self.tokens.get(pos) else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("CASE") {
+            return false;
+        }
+        let word_at = |i: usize, w: &str| {
+            matches!(self.tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w)
+                && !self.quoted_null.contains(&i))
+        };
+        let first = pos.saturating_add(1);
+        if matches!(self.tokens.get(first), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("WHEN"))
+        {
+            return true;
+        }
+        if self.quoted_null.contains(&pos) {
+            return false;
+        }
+        let mut depth: usize = 0;
+        let mut i = first;
+        let end = first.saturating_add(CASE_START_SCAN_LIMIT);
+        while i < end {
+            let Some(tok) = self.tokens.get(i) else {
+                return false;
+            };
+            match tok {
+                Token::Punct('(' | '[') => depth = depth.saturating_add(1),
+                Token::Punct(')' | ']') => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                Token::Punct(',' | ';') if depth == 0 => return false,
+                Token::Keyword(_) if depth == 0 => return false,
+                Token::Ident(_) => {
+                    if word_at(i, "CASE") {
+                        depth = depth.saturating_add(1);
+                    } else if word_at(i, "END") {
+                        if depth == 0 {
+                            return false;
+                        }
+                        depth -= 1;
+                    } else if depth == 0 {
+                        if word_at(i, "WHEN") {
+                            return true;
+                        }
+                        if ["THEN", "ELSE", "AS", "AND", "OR"]
+                            .iter()
+                            .any(|w| word_at(i, w))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i = i.saturating_add(1);
+        }
+        false
+    }
+
     /// `offset` 個先のトークンが区切り文字 `c` かを消費せずに判定する
     /// （`JOIN ... USING (` の 2 トークン組の判定。Issue #1826）。
     fn peek_punct_at(&self, offset: usize, c: char) -> bool {
@@ -7758,9 +7843,11 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(name)) => {
                 // `WHEN` を伴わない `CASE` は既存の列名 `case` でありうるため 1 トークン
                 // 先読みする。`NULL` は列名との曖昧性を解消できないので式トリガーにしない。
-                let starts_case =
-                    name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
-                let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+                let starts_case = self.case_expr_starts_at(self.pos);
+                // `CASE (x) WHEN ...`（単純形）は `starts_case` が先に真になるため呼び出しと
+                // 取り違えない。後ろに `WHEN` が無い `case(x)` は従来どおり関数呼び出し。
+                let starts_call = !starts_case
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
                 // TABLE-35・Issue #1602: 識別子の直後の `[`（添字・スライス）と、引用なしの
                 // `ARRAY[...]`／`ARRAY(...)`（配列コンストラクタ）も式項目の開始。
@@ -8976,7 +9063,7 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Ident(name)) => {
                 let next = self.tokens.get(self.pos + 1);
-                (name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN"))
+                self.case_expr_starts_at(self.pos)
                     || (name.eq_ignore_ascii_case("ARRAY")
                         && !self.quoted_null.contains(&self.pos)
                         && matches!(next, Some(Token::Punct('[' | '('))))
@@ -12267,9 +12354,7 @@ impl<'a> Parser<'a> {
             // と同じ方針で、次のトークンが `WHEN` のときのみ `CASE` 式として扱う。
             // 先読み無しで無条件に消費すると既存の VECTOR 列名 `case` の参照
             // （例: `vec_norm(case)`）が構文エラー化する破壊的変更になる。
-            Some(Token::Ident(name))
-                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") =>
-            {
+            Some(Token::Ident(_)) if self.case_expr_starts_at(self.pos) => {
                 self.advance();
                 self.parse_case_expr(depth)
             }
@@ -12807,10 +12892,12 @@ impl<'a> Parser<'a> {
     }
 
     /// 検索形 `CASE WHEN <lhs> <cmp> <rhs> THEN <value_expr> {WHEN ...}
-    /// [ELSE <value_expr>] END` を解析する（対象ビヘイビア: SQL-26）。呼び出し元は
-    /// `CASE` トークンを消費済み。単純 CASE（`CASE x WHEN v ...`）・WHEN 条件中の
-    /// `AND`/`OR`/`IS NULL` 等の論理演算は本 Issue の対象外として `42601` で拒否
-    /// する（`cond` は常に `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
+    /// [ELSE <value_expr>] END` と単純形 `CASE <value_expr> WHEN <value_expr> THEN
+    /// <value_expr> {WHEN ...} [ELSE <value_expr>] END`（Issue #3279）を解析する
+    /// （対象ビヘイビア: SQL-26）。呼び出し元は `CASE` トークンを消費済み。検索形の WHEN
+    /// 条件中の `AND`/`OR`/`IS NULL` 等の論理演算・単純形の `WHEN 1, 2` 列挙・被演算子の
+    /// 比較式は `42601` で拒否する（検索形の `cond` は常に
+    /// `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
     fn parse_case_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
         self.enter_case_nesting()?;
@@ -12820,11 +12907,36 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_case_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
-        // 直後が `WHEN` でなければ単純 CASE 形（`CASE x WHEN v ...`）であり、
-        // 本 Issue の対象外として拒否する（`42601`）。
+        // 直後が `WHEN` でなければ単純形（`CASE x WHEN v ...`）。被演算子は AST に
+        // 1 回だけ保持する（複製しない。`Expr::Case` の doc 参照）。単純形はこれまで全体が
+        // `42601` だったため、`NULL` をリテラルとして解析しても互換性は壊れない。
+        let operand = if self.peek_ident_matches("WHEN") {
+            None
+        } else {
+            Some(Box::new(
+                self.parse_value_expr_with_null_context(depth + 1, true)?,
+            ))
+        };
         self.expect_ident_matching("WHEN")?;
         let mut whens = Vec::new();
         loop {
+            if operand.is_some() {
+                // 単純形の WHEN 値（比較値）。NULL は「決して一致しない」比較値として受理する。
+                let value = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                self.expect_ident_matching("THEN")?;
+                let result = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                whens.push((value, result));
+                if whens.len() > MAX_CASE_BRANCHES {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "CASE has too many WHEN branches",
+                    ));
+                }
+                if self.peek_ident_matches("WHEN") {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             // WHEN 条件式（`<value_expr> <cmp_op> <value_expr>`）は
             // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL` は
             // ここでは常に列参照として解析する（`allow_null_literal` を強制的に
@@ -12868,7 +12980,11 @@ impl<'a> Parser<'a> {
         };
         self.expect_ident_matching("END")?;
         self.consume_expr_node()?;
-        Ok(Expr::Case { whens, else_result })
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_result,
+        })
     }
 
     /// `COALESCE '(' <value_expr> {',' <value_expr>} ')'`（対象ビヘイビア:
@@ -13785,7 +13901,7 @@ impl<'a> Parser<'a> {
                 true
             }
             Some(Token::Ident(name)) => {
-                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
+                if self.case_expr_starts_at(self.pos) {
                     return true;
                 }
                 // bit 列の距離式（TABLE-48・Issue #2970）: `ORDER BY v <~> '1010'`。
@@ -23973,10 +24089,15 @@ fn expr_contains_aggregate_call(expr: &Expr) -> bool {
             .flatten()
             .any(expr_contains_aggregate_call),
         Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_aggregate_call),
-        Expr::Case { whens, else_result } => {
-            whens
-                .iter()
-                .any(|(c, r)| expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_aggregate_call)
+                || whens.iter().any(|(c, r)| {
+                    expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r)
+                })
                 || else_result
                     .as_deref()
                     .is_some_and(expr_contains_aggregate_call)
@@ -44033,7 +44154,9 @@ mod tests {
         assert_eq!(items.len(), 3);
         match &items[0] {
             SelectItem::Expr {
-                expr: Expr::Case { whens, else_result },
+                expr: Expr::Case {
+                    whens, else_result, ..
+                },
                 ..
             } => {
                 assert_eq!(whens[0].1, Expr::Null);
@@ -44441,16 +44564,136 @@ mod tests {
         }
     }
 
+    /// 単純 CASE（Issue #3279）は被演算子を AST に 1 回だけ保持して受理する（以前は `42601`）。
     #[test]
-    fn rejects_simple_case_form() {
+    fn accepts_simple_case_form_with_single_operand() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_statement(
-            "SELECT CASE id WHEN 1 THEN 2 END FROM documents \
+        let stmt = validate_statement(
+            "SELECT CASE id WHEN 1 THEN 2 WHEN 3 THEN 4 ELSE 5 END FROM documents \
              ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
             &lookup,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("simple CASE should be accepted");
+        let items = select_expr_items(&stmt);
+        match &items[0] {
+            SelectItem::Expr {
+                expr:
+                    Expr::Case {
+                        operand,
+                        whens,
+                        else_result,
+                    },
+                ..
+            } => {
+                assert_eq!(operand.as_deref(), Some(&Expr::Ident("id".to_string())));
+                assert_eq!(
+                    whens,
+                    &vec![
+                        (Expr::Number("1".to_string()), Expr::Number("2".to_string())),
+                        (Expr::Number("3".to_string()), Expr::Number("4".to_string())),
+                    ]
+                );
+                assert_eq!(else_result.as_deref(), Some(&Expr::Number("5".to_string())));
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+    }
+
+    /// 単純 CASE の被演算子・比較値は `NULL` リテラルとして解析する（Issue #3279）。
+    #[test]
+    fn simple_case_accepts_null_operand_and_null_when_value() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE NULL WHEN NULL THEN 1 ELSE 2 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("simple CASE with NULL should be accepted");
+        match &select_expr_items(&stmt)[0] {
+            SelectItem::Expr {
+                expr: Expr::Case { operand, whens, .. },
+                ..
+            } => {
+                assert_eq!(operand.as_deref(), Some(&Expr::Null));
+                assert_eq!(whens[0].0, Expr::Null);
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+    }
+
+    /// 括弧付き被演算子（`CASE (id) WHEN ...`）は関数呼び出しと取り違えない。後ろに `WHEN` の無い
+    /// `case(x)` は従来どおり関数呼び出し（列名 `case` の互換）。
+    #[test]
+    fn simple_case_with_parenthesized_operand_is_not_a_call() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE (id + 1) WHEN 2 THEN 1 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("parenthesized operand should parse as a simple CASE");
+        assert!(matches!(
+            &select_expr_items(&stmt)[0],
+            SelectItem::Expr {
+                expr: Expr::Case {
+                    operand: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    /// 構文の不正な単純形は `42601`（fail-closed）。
+    #[test]
+    fn rejects_malformed_simple_case_forms() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            // WHEN の無い形・END の無い形・WHEN 値のカンマ列挙・THEN の無い形。
+            "SELECT CASE id END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1 THEN 2 FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1, 2 THEN 3 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            // 被演算子に比較式は書けない。
+            "SELECT CASE id > 1 WHEN 1 THEN 2 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+        ] {
+            let err = validate_statement(sql, &lookup).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 列名 `case`（`WHEN` を伴わない `CASE`）は従来どおり列参照として読む（後方互換）。
+    #[test]
+    fn column_named_case_is_still_a_column_reference() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT case, case + 1 FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("column named case should remain accepted");
+        let items = select_expr_items(&stmt);
+        assert!(
+            matches!(
+                &items[0],
+                SelectItem::Column(name) if name == "case"
+            ) || matches!(
+                &items[0],
+                SelectItem::Expr { expr: Expr::Ident(name), .. } if name == "case"
+            )
+        );
+    }
+
+    /// 単純 CASE の分岐数の上限は検索形と同じ（`54000`）。
+    #[test]
+    fn simple_case_branch_count_is_bounded() {
+        let lookup = catalog_with(&["documents"]);
+        let mut sql = String::from("SELECT CASE id");
+        for i in 0..=MAX_CASE_BRANCHES {
+            sql.push_str(&format!(" WHEN {i} THEN {i}"));
+        }
+        sql.push_str(" END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10");
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

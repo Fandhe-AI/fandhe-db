@@ -85,9 +85,45 @@
   周囲を括弧で囲まず `render_condition` でレンダリングする——`parse_case_expr`
   の `cond` 文法が括弧で囲まれた比較全体を受理しないため）。
 
+## 単純 CASE（Issue #3279。SQL-26・SQL-42 のポインタ）
+
+`CASE x WHEN v THEN … [ELSE …] END` を、CASE が書けるすべての文脈（投影・WHERE・ORDER BY・
+集計・GROUP BY・CHECK・ビュー本文・INSERT VALUES の定数式・FROM の無い SELECT・UPDATE SET）で
+受理する。意味は各分岐 `x = v_i`（NULL は一致しない）で、被演算子は 1 回だけ評価する。
+
+- **AST**: `Expr::Case` に `operand: Option<Box<Expr>>` を足した。`None` が従来の検索形で、`Some(x)` では
+  `whens[i].0` を条件ではなく比較値として読む。構文段で `WHEN x = v` へ脱糖して `x` を複製する案は採らない。
+  `routine_fold`（`LANGUAGE sql|plpgsql` 関数の呼び出しを束縛前に畳み込む）は 2 番目以降の WHEN 条件を
+  条件付き位置として副作用のある呼び出しを `0A000` にするため、複製すると被演算子の副作用が 1 回にならない。
+  構造的な走査（列参照収集・列名書き換え・UDF 参照収集・ノード数・正規化・privilege 等）は `operand` も辿り、
+  条件を解釈する箇所（束縛・定数畳み込み・パラメータ型推論）は `udf_call::simple_case_conditions`／
+  `case_condition_exprs` で検索形の条件列へ下げてから既存の処理に流す。
+- **開始判定**: `Parser::case_expr_starts_at` に一本化した（投影・集計項目・一次式・ORDER BY キーが共有）。
+  引用なしの `CASE` の直後が `WHEN` なら検索形、そうでなければ括弧・入れ子の `CASE … END` の外で `WHEN` に
+  当たれば単純形、`,` `)` `]` `;`・キーワード・`THEN`/`ELSE`/`END`/`AS`/`AND`/`OR` に当たれば列名 `case`
+  （後方互換）。走査は `CASE_START_SCAN_LIMIT` トークンで打ち切り、超えたら偽（後続で `42601`）。
+  互換性の注意: `CASE WHEN … THEN case + 1 WHEN …` のように引用なしの列 `case` に演算子が続きその後に
+  別の `WHEN` が来る形だけは単純 CASE として読まれる（PostgreSQL では `CASE` は予約語でこの形は書けない）。
+- **束縛**: `bind_case` が各分岐を `Binary Eq` へ下げて既存の比較と同じ型規則・unknown リテラル強制で束縛する。
+  被演算子か比較値が裸の `NULL` の分岐は一致しない条件（`BoundExpr::Null`）にし、もう一方の辺は通常どおり
+  束縛して列の存在・型を検査する（存在オラクルにしない）。被演算子の複製は束縛の `node_budget`（`54000`）が
+  有界にする。`clock_timestamp()` を被演算子に含む WHEN 2 個以上の形は分岐ごとに壁時計を読み直して
+  「1 回評価」と食い違うため `0A000` で拒否する（`now()` 等の取引固定の時刻は受理）。
+- **`routine_fold`**: 被演算子を最初に 1 回だけ畳み込む（呼び出しは 1 回だけ起動して値に置き換わる）。
+  第 1 分岐の比較値以外・すべての結果・ELSE は従来どおり条件付き位置。
+- **描画・ハッシュ**: CHECK・ビュー本文の描画は `(CASE <operand> WHEN <v> THEN <r> … END)` で、
+  `parse(render(x)) == x` を単体テストで固定した。内容照合ハッシュは検索形（タグ 6）のバイト列を変えず、
+  単純形を新タグ 23（被演算子・分岐数・各 (値, 結果)・ELSE 有無）にした
+  （`multi-row-dml-operation-id.md` §4.4）。同値の検索形とは別内容として扱う。
+- **パラメータ**: 拡張クエリの `$n` を単純 CASE の被演算子・比較値に置く形は、パラメータ位置の許可リスト
+  （`sql::params`）の外のため Parse で `42601`（fail-closed）。型推論（`param_infer`）は下げた条件を辿る。
+
 ## 対象外（out-of-scope-tracking）
 
-- 単純 CASE（`CASE x WHEN v …`）: `42601` を維持。
+- 単純 CASE の被演算子に比較・論理式を書く形（`CASE a > 1 WHEN true …`）: 値式の文法外で `42601`。
+- 単純 CASE の WHEN 値の `IN` 列挙（`WHEN 1, 2`）: PostgreSQL の SQL 式でも書けないため対応しない。
+- 単純 CASE の被演算子・比較値への `$n`（拡張クエリ）: パラメータ位置の許可リストの拡張が必要で、
+  検索形の式内 `$n` と同じ別課題。
 - `WHEN` 条件内の `AND`/`OR`/`NOT`/`IS NULL`/`<>`/`IN`/`BETWEEN`: `BoundExpr`
   に論理演算ノードが無く、別 Issue（#913 等）に依存する。
 - スカラー列（INTEGER/REAL/NUMERIC/TEXT 等）の式参照（レーン A）: 現状

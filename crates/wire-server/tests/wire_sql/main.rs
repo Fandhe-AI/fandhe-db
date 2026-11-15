@@ -69,6 +69,7 @@ mod wire_set_op_intersect_all;
 mod wire_sql25_distinct;
 mod wire_sql26_explain_expression_order_having;
 mod wire_sql26_extract_order_having;
+mod wire_sql26_simple_case;
 mod wire_sql29_scalar_subquery;
 mod wire_sql29_set_operation_order_by;
 mod wire_sql33_cosine_order;

@@ -280,11 +280,18 @@ pub enum Expr {
     /// それ以外の位置（`id + NULL` 等）は型を決められない形として
     /// `FeatureNotSupported`（`0A000`）で拒否する。
     Null,
-    /// 検索形 `CASE WHEN <cond> THEN <result> {WHEN ...} [ELSE <result>] END`
-    /// （対象ビヘイビア: SQL-26）。単純 CASE（`CASE x WHEN v ...`）・`cond` 中の
-    /// 論理演算（`AND`/`OR`/`IS NULL` 等）は許可リスト（`sql::allowlist::Parser`）が
-    /// 構文段で拒否するため、`cond` は常に比較の [`Expr::Binary`] になる。
+    /// `CASE` 式（対象ビヘイビア: SQL-26。単純形は Issue #3279）。
+    ///
+    /// - `operand == None`（検索形 `CASE WHEN <cond> THEN <result> ... [ELSE <result>] END`）:
+    ///   `whens[i].0` は条件で、`cond` 中の論理演算（`AND`/`OR`/`IS NULL` 等）は許可リスト
+    ///   （`sql::allowlist::Parser`）が構文段で拒否するため、常に比較の [`Expr::Binary`] になる。
+    /// - `operand == Some(x)`（単純形 `CASE x WHEN v THEN <result> ... END`）: `whens[i].0` は
+    ///   条件ではなく比較値 `v_i` で、意味は各分岐 `x = v_i`（NULL は一致しない）。被演算子 `x` は
+    ///   構文段で複製せず AST に 1 回だけ保持する（`routine_fold` が副作用を持つ呼び出しを
+    ///   1 回だけ起動できるようにするため）。条件を解釈する箇所は
+    ///   [`simple_case_conditions`] で検索形の条件列へ下げてから処理する。
     Case {
+        operand: Option<Box<Expr>>,
         whens: Vec<(Expr, Expr)>,
         else_result: Option<Box<Expr>>,
     },
@@ -2202,10 +2209,15 @@ pub(crate) fn contains_typed_numeric(expr: &Expr) -> bool {
         | Expr::VectorDistance { lhs, rhs, .. } => {
             contains_typed_numeric(lhs) || contains_typed_numeric(rhs)
         }
-        Expr::Case { whens, else_result } => {
-            whens
-                .iter()
-                .any(|(c, r)| contains_typed_numeric(c) || contains_typed_numeric(r))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(contains_typed_numeric)
+                || whens
+                    .iter()
+                    .any(|(c, r)| contains_typed_numeric(c) || contains_typed_numeric(r))
                 || else_result.as_deref().is_some_and(contains_typed_numeric)
         }
         Expr::Coalesce(args) => args.iter().any(contains_typed_numeric),
@@ -2357,11 +2369,19 @@ pub(crate) fn first_non_builtin_call_with(
                 .into_iter()
                 .find_map(|c| first_non_builtin_call_with(c, allow_current_time, allow_json_fns))
         }
-        Expr::Case { whens, else_result } => whens
-            .iter()
-            .find_map(|(c, r)| {
-                first_non_builtin_call_with(c, allow_current_time, allow_json_fns)
-                    .or_else(|| first_non_builtin_call_with(r, allow_current_time, allow_json_fns))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => operand
+            .as_deref()
+            .and_then(|o| first_non_builtin_call_with(o, allow_current_time, allow_json_fns))
+            .or_else(|| {
+                whens.iter().find_map(|(c, r)| {
+                    first_non_builtin_call_with(c, allow_current_time, allow_json_fns).or_else(
+                        || first_non_builtin_call_with(r, allow_current_time, allow_json_fns),
+                    )
+                })
             })
             .or_else(|| {
                 else_result.as_deref().and_then(|e| {
@@ -3418,13 +3438,21 @@ fn expr_reaches_function(
             .children()
             .into_iter()
             .any(|c| expr_reaches_function(c, target, registry, visited)),
-        Expr::Case { whens, else_result } => {
-            whens.iter().any(|(c, r)| {
-                expr_reaches_function(c, target, registry, visited)
-                    || expr_reaches_function(r, target, registry, visited)
-            }) || else_result
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand
                 .as_deref()
-                .is_some_and(|e| expr_reaches_function(e, target, registry, visited))
+                .is_some_and(|o| expr_reaches_function(o, target, registry, visited))
+                || whens.iter().any(|(c, r)| {
+                    expr_reaches_function(c, target, registry, visited)
+                        || expr_reaches_function(r, target, registry, visited)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(|e| expr_reaches_function(e, target, registry, visited))
         }
         Expr::Coalesce(args) => args
             .iter()
@@ -3502,7 +3530,14 @@ fn collect_call_names(expr: &Expr, out: &mut Vec<String>) {
                 collect_call_names(c, out);
             }
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_call_names(o, out);
+            }
             for (c, r) in whens {
                 collect_call_names(c, out);
                 collect_call_names(r, out);
@@ -4250,7 +4285,14 @@ fn validate_closed_expr(
             validate_closed_expr(rhs, params, registry, node_budget)
         }
         Expr::Null => Ok(()),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                validate_closed_expr(operand, params, registry, node_budget)?;
+            }
             for (cond, result) in whens {
                 validate_closed_expr(cond, params, registry, node_budget)?;
                 validate_closed_expr(result, params, registry, node_budget)?;
@@ -6331,10 +6373,67 @@ fn unify_branch_type(
     Ok(())
 }
 
-/// 検索形 `CASE` を束縛する（対象ビヘイビア: SQL-26。`sql::allowlist::Parser`
-/// が構文段で単純 CASE・WHEN 内の論理演算を拒否済みのため、`cond` は常に
-/// 比較の [`Expr::Binary`] である）。
+/// 単純 CASE（`CASE x WHEN v_i ...`。Issue #3279）の各分岐を検索形の条件 `x = v_i` へ下げる
+/// （対象ビヘイビア: SQL-26）。被演算子の構文木は分岐ごとに複製されるため、呼び出し側は
+/// 複製前に [`expr_node_count`](crate::sql::where_negation::expr_node_count) を自分のノード予算から
+/// 差し引くこと（束縛段 [`bind_case`] は束縛自体の `node_budget` 課金で有界にする）。
+/// 被演算子か比較値が裸の `NULL` の分岐は PostgreSQL の `x = NULL`（常に不明）と同じく一致しない
+/// ため、条件を `None`（決して真にならない）として返す。
+pub(crate) fn simple_case_conditions(operand: &Expr, whens: &[(Expr, Expr)]) -> Vec<Option<Expr>> {
+    whens
+        .iter()
+        .map(|(v, _)| {
+            if matches!(operand, Expr::Null) || matches!(v, Expr::Null) {
+                None
+            } else {
+                Some(Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(operand.clone()),
+                    rhs: Box::new(v.clone()),
+                })
+            }
+        })
+        .collect()
+}
+
+/// `CASE` の各分岐の条件を検索形の式として取り出す（検索形はそのまま借用し、単純形は
+/// [`simple_case_conditions`] で `operand = v_i`（NULL を含む分岐は常に不明な `NULL`）へ下げる。
+/// Issue #3279）。定数畳み込み・型推論など、条件の意味を解釈する箇所が共有する。
+pub(crate) fn case_condition_exprs<'a>(
+    operand: Option<&Expr>,
+    whens: &'a [(Expr, Expr)],
+) -> Vec<std::borrow::Cow<'a, Expr>> {
+    match operand {
+        None => whens.iter().map(|(c, _)| Cow::Borrowed(c)).collect(),
+        Some(op) => simple_case_conditions(op, whens)
+            .into_iter()
+            .map(|c| Cow::Owned(c.unwrap_or(Expr::Null)))
+            .collect(),
+    }
+}
+
+/// 式木に `clock_timestamp()` 呼び出しが含まれるか（単純 CASE の被演算子の 1 回評価の保証に
+/// 使う。Issue #3279）。分岐ごとに被演算子を束縛し直すため、呼び出しごとに壁時計を読む関数が
+/// 含まれると PostgreSQL の「1 回だけ評価」と食い違う。
+fn contains_clock_timestamp_call(expr: &Expr) -> bool {
+    let mut stack: Vec<&Expr> = vec![expr];
+    while let Some(e) = stack.pop() {
+        if let Expr::Call { name, .. } = e {
+            if name.eq_ignore_ascii_case("clock_timestamp") {
+                return true;
+            }
+        }
+        crate::sql::allowlist::push_expr_children(e, &mut stack);
+    }
+    false
+}
+
+/// 束縛段で `CASE` を束縛する（対象ビヘイビア: SQL-26）。`sql::allowlist::Parser` が構文段で
+/// WHEN 内の論理演算を拒否済みのため、検索形の `cond` は常に比較の [`Expr::Binary`] である。
+/// 単純形（`operand` が `Some`。Issue #3279）は各分岐を [`simple_case_conditions`] の規則で
+/// `operand = v_i` として束縛する（NULL を含む分岐は一致しない条件 [`BoundExpr::Null`]）。
 fn bind_case(
+    operand: Option<&Expr>,
     whens: &[(Expr, Expr)],
     else_result: &Option<Box<Expr>>,
     env: &mut BindEnv<'_>,
@@ -6345,12 +6444,37 @@ fn bind_case(
             "CASE has too many WHEN branches",
         ));
     }
+    if let Some(op) = operand {
+        if whens.len() > 1 && contains_clock_timestamp_call(op) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "clock_timestamp() as a simple CASE operand with multiple WHEN branches is not supported".to_string(),
+            });
+        }
+    }
     bind_with_case_nesting(env, |env| {
         let mut bound_whens = Vec::with_capacity(whens.len());
         let mut unified: Option<ExprType> = None;
         let mut branch_tys: Vec<Option<ExprType>> = Vec::new();
-        for (cond, result) in whens {
-            let (cond_bound, cond_ty) = bind_expr_in(cond, env, node_budget)?;
+        let simple_conds = operand.map(|op| simple_case_conditions(op, whens));
+        for (idx, (cond, result)) in whens.iter().enumerate() {
+            let (cond_bound, cond_ty) = match (&simple_conds, operand) {
+                (Some(conds), Some(op)) => match conds.get(idx).and_then(Option::as_ref) {
+                    Some(lowered) => bind_expr_in(lowered, env, node_budget)?,
+                    None => {
+                        // 一致しない分岐でも、NULL でない側は通常どおり束縛して列の存在・型・
+                        // 権限を検査する（存在オラクルにせず、検索形と同じ拒否を保つ）。
+                        let other = if matches!(op, Expr::Null) { cond } else { op };
+                        if !matches!(other, Expr::Null) {
+                            bind_expr_in(other, env, node_budget)?;
+                        }
+                        *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                            SqlSurfaceError::payload_too_large("expression is too large")
+                        })?;
+                        (BoundExpr::Null, ExprType::Bool)
+                    }
+                },
+                _ => bind_expr_in(cond, env, node_budget)?,
+            };
             if cond_ty != ExprType::Bool {
                 return Err(SqlSurfaceError::DatatypeMismatch {
                     detail: "CASE WHEN condition must be a boolean comparison".to_string(),
@@ -7415,7 +7539,11 @@ pub(super) fn bind_expr_any(
         Expr::Null => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "NULL is only allowed as a CASE/COALESCE/NULLIF operand".to_string(),
         }),
-        Expr::Case { whens, else_result } => bind_case(whens, else_result, env, node_budget),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => bind_case(operand.as_deref(), whens, else_result, env, node_budget),
         Expr::Coalesce(args) => bind_coalesce(args, env, node_budget),
         Expr::NullIf(lhs, rhs) => bind_nullif(lhs, rhs, env, node_budget),
         Expr::IsDistinctFrom { negated, lhs, rhs } => {
@@ -8398,7 +8526,9 @@ fn exact_mode_kind(expr: &Expr, bound: &BoundExpr, schema: Option<&TableSchema>)
             None => ProjKind::Other,
         },
         (
-            Expr::Case { whens, else_result },
+            Expr::Case {
+                whens, else_result, ..
+            },
             BoundExpr::Case {
                 whens: bound_whens,
                 else_result: bound_else,
@@ -8466,7 +8596,9 @@ pub(crate) fn projection_kind(
     match (expr, bound) {
         (Expr::Null, _) => return ProjKind::Null,
         (
-            Expr::Case { whens, else_result },
+            Expr::Case {
+                whens, else_result, ..
+            },
             BoundExpr::Case {
                 whens: bound_whens,
                 else_result: bound_else,
@@ -9573,6 +9705,7 @@ fn rem_harden_operand(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> B
                 Some(Expr::Case {
                     whens: ws,
                     else_result: els,
+                    ..
                 }) if ws.len() == whens.len() => (Some(ws), els.as_deref()),
                 _ => (None, None),
             };
@@ -15099,6 +15232,7 @@ mod tests {
 
     fn case_expr(whens: Vec<(Expr, Expr)>, else_result: Option<Expr>) -> Expr {
         Expr::Case {
+            operand: None,
             whens,
             else_result: else_result.map(Box::new),
         }
@@ -15535,6 +15669,7 @@ mod tests {
         };
         assert_eq!(first_non_builtin_call(&arith), None);
         let case = Expr::Case {
+            operand: None,
             whens: vec![(
                 ident("a"),
                 call("round", vec![ident("x"), Expr::Number("2".into())]),
@@ -15558,11 +15693,13 @@ mod tests {
         let nested = call("lower", vec![call("myfn", vec![ident("x")])]);
         assert_eq!(first_non_builtin_call(&nested), Some("myfn"));
         let case = Expr::Case {
+            operand: None,
             whens: vec![(call("f", vec![ident("x")]), Expr::Null)],
             else_result: None,
         };
         assert_eq!(first_non_builtin_call(&case), Some("f"));
         let else_case = Expr::Case {
+            operand: None,
             whens: vec![],
             else_result: Some(Box::new(call("g", vec![]))),
         };
@@ -15679,6 +15816,7 @@ mod tests {
         let ni = Expr::NullIf(Box::new(f8()), Box::new(num("0")));
         assert_eq!(rem(ni, num("2")).unwrap_err().wire_code(), "42883");
         let case = Expr::Case {
+            operand: None,
             whens: vec![(bin(BinOp::Eq, num("1"), num("1")), f8())],
             else_result: Some(Box::new(f8())),
         };

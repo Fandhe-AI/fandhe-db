@@ -2736,7 +2736,14 @@ fn collect_referenced_udfs(
             }
             Ok(())
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_referenced_udfs(operand, udf_registry, out)?;
+            }
             for (cond, result) in whens {
                 collect_referenced_udfs(cond, udf_registry, out)?;
                 collect_referenced_udfs(result, udf_registry, out)?;
@@ -2894,7 +2901,14 @@ fn push_set_expr(
                     }
                 }
             }
-            Expr::Case { whens, else_result } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    walk(b, o);
+                }
                 for (c, r) in whens {
                     walk(b, c);
                     walk(b, r);
@@ -3017,8 +3031,20 @@ fn push_dml_expr(
         Expr::Null => {
             b.push_u8(5);
         }
-        Expr::Case { whens, else_result } => {
-            b.push_u8(6);
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            // 検索形はタグ 6 のまま（既存の golden・台帳と互換）。単純形（Issue #3279）は別タグ 23 で
+            // 被演算子を先頭に直列化し、同値の検索形とは別内容として扱う。
+            match operand {
+                None => b.push_u8(6),
+                Some(operand) => {
+                    b.push_u8(23);
+                    push_dml_expr(b, operand, params)?;
+                }
+            }
             let count = u32::try_from(whens.len()).map_err(|_| dml_hash_field_too_large())?;
             b.push_raw(&count.to_le_bytes());
             for (cond, result) in whens {
@@ -5484,18 +5510,22 @@ mod tests {
             rhs: Box::new(Expr::Number("1".to_string())),
         };
         let with_else = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_gt.clone(), Expr::Number("1".to_string()))],
             else_result: Some(Box::new(Expr::Number("0".to_string()))),
         });
         let without_else = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_gt.clone(), Expr::Number("1".to_string()))],
             else_result: None,
         });
         let different_branch_order = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_lt, Expr::Number("1".to_string()))],
             else_result: Some(Box::new(Expr::Number("0".to_string()))),
         });
         let same_as_with_else = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_gt, Expr::Number("1".to_string()))],
             else_result: Some(Box::new(Expr::Number("0".to_string()))),
         });
@@ -5509,6 +5539,44 @@ mod tests {
         assert_ne!(h_with_else, h_without_else);
         assert_ne!(h_with_else, h_different_order);
         assert_eq!(h_with_else, h_same);
+    }
+
+    /// 単純 CASE（Issue #3279）は同値の検索形とは別のハッシュになり（別内容として扱う）、
+    /// 被演算子・比較値の違いも反映される。検索形（`operand: None`）のバイト列は不変。
+    #[test]
+    fn simple_case_hash_differs_from_equivalent_searched_case() {
+        use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
+
+        let registry = UdfRegistry::default();
+        let simple = |operand: &str, v: &str| {
+            where_predicate_id_gt_zero(Expr::Case {
+                operand: Some(Box::new(Expr::Ident(operand.to_string()))),
+                whens: vec![(Expr::Number(v.to_string()), Expr::Number("1".to_string()))],
+                else_result: None,
+            })
+        };
+        let searched = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
+            whens: vec![(
+                Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Ident("id".to_string())),
+                    rhs: Box::new(Expr::Number("1".to_string())),
+                },
+                Expr::Number("1".to_string()),
+            )],
+            else_result: None,
+        });
+        let h_simple = for_delete_where("t", &[simple("id", "1")], &registry).unwrap();
+        let h_simple_again = for_delete_where("t", &[simple("id", "1")], &registry).unwrap();
+        let h_other_operand = for_delete_where("t", &[simple("n", "1")], &registry).unwrap();
+        let h_other_value = for_delete_where("t", &[simple("id", "2")], &registry).unwrap();
+        let h_searched = for_delete_where("t", &[searched], &registry).unwrap();
+
+        assert_eq!(h_simple, h_simple_again);
+        assert_ne!(h_simple, h_searched);
+        assert_ne!(h_simple, h_other_operand);
+        assert_ne!(h_simple, h_other_value);
     }
 
     /// `Expr::Null`／`Expr::Coalesce`／`Expr::NullIf` がそれぞれ他タグ・互いに
@@ -7134,10 +7202,12 @@ mod tests {
             (
                 "case when order",
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1"), when_gt("2", "2")],
                     else_result: None,
                 },
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("2", "2"), when_gt("1", "1")],
                     else_result: None,
                 },
@@ -7145,10 +7215,12 @@ mod tests {
             (
                 "case else presence",
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1")],
                     else_result: None,
                 },
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1")],
                     else_result: Some(Box::new(num("0"))),
                 },
@@ -7156,10 +7228,12 @@ mod tests {
             (
                 "case then value",
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1")],
                     else_result: Some(Box::new(num("0"))),
                 },
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "2")],
                     else_result: Some(Box::new(num("0"))),
                 },
