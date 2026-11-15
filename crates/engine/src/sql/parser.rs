@@ -10233,6 +10233,11 @@ pub struct BoundScan {
     /// SQL テキスト経由の [`bind_scan`] と [`Self::new`] は常に `None`（既存経路は不変）。
     /// [`Self::with_after`] だけが設定する。
     pub(crate) keyset: Option<crate::sql::keyset::BoundKeyset>,
+    /// `SELECT DISTINCT ON`（Issue #3261）のグループ前置長。`Some(k)` のとき [`Self::order_by`] の
+    /// 先頭 `k` キー（= ON キー）が等しい行を 1 グループとして、ソート順で最初の行だけを返す
+    /// （`sql::scan` の経路 (B) が重複排除を `OFFSET`／`LIMIT` より前に行う）。SQL テキスト経由の
+    /// [`bind_scan`] が `ValidatedScan` から引き継ぐ。[`Self::new`]（NoSQL 表層）は常に `None`。
+    pub(crate) distinct_on: Option<usize>,
 }
 
 /// 広域取得の式キーの `(束縛済み式, コンパイル済みプログラム)` 列（[`BoundScan::order_exprs`]）。
@@ -11004,6 +11009,7 @@ impl BoundScan {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
             // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
             // NoSQL `sort`（NOSQL-15・Issue #946）を付与する場合は呼び出し元が
             // 続けて `with_order_by` を呼ぶ（builder 形。シグネチャは変えない）。
@@ -12607,6 +12613,31 @@ pub(crate) fn bind_scan_with_dummy_flags(
         ));
     }
 
+    // Issue #3261: `SELECT DISTINCT ON` のグループ前置長の整合を束縛段でも確認する（多層防御。
+    // 構文段が組み立てた実効 ORDER BY の先頭 `k` キーが ON キー）。実行器へ意味を運べない併用
+    // （ウィンドウ・`WITH TIES`）と、グループ同一性の規則が未確定の INTERVAL キーは拒否する。
+    if let Some(k) = stmt.distinct_on {
+        if k == 0 || order_by.len() < k {
+            return Err(SqlSurfaceError::Internal {
+                detail: "DISTINCT ON prefix exceeds the ORDER BY keys".to_string(),
+            });
+        }
+        if !stmt.window_items.is_empty() || stmt.with_ties {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "SELECT DISTINCT ON cannot be combined with window functions or WITH TIES",
+            ));
+        }
+        if order_by
+            .iter()
+            .take(k)
+            .any(|key| key.kind == OrderKind::Interval)
+        {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "SELECT DISTINCT ON over an INTERVAL key is not supported",
+            ));
+        }
+    }
+
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
@@ -12635,6 +12666,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
             None
         },
         keyset: None,
+        distinct_on: stmt.distinct_on,
     })
 }
 
