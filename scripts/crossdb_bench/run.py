@@ -27,7 +27,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import load_jsonl, write_result  # noqa: E402
 from hybrid_depth import DEPTH_ARMS, overlap_at_k, summary_line, topic_hit_rate  # noqa: E402
-from recall import build_ground_truth, recall_at_k, recall_at_k_tie_tolerant  # noqa: E402
+from recall import (  # noqa: E402
+    build_ground_truth,
+    fixture_norm_stats,
+    recall_at_k,
+    recall_at_k_tie_tolerant,
+)  # noqa: E402
 
 DB_MODULES = [
     "self",
@@ -302,6 +307,12 @@ def main() -> int:
 
     # --- recall_at_10: vector_knn フェーズが ids_per_query を返していれば ground truth と照合 ---
     docs_file = resolve_docs_file(args)
+    # 自作 DB の `<=>`（コサイン）と内積正解の順位一致の前提（単位ノルム）を記録する（Issue #3224）。
+    if os.path.exists(docs_file):
+        norm = fixture_norm_stats(docs_file, queries)
+        meta["fixture_norm"] = norm
+        if norm["max_abs_norm_deviation"] > 1e-3 or norm["zero_norm_docs"] or norm["zero_norm_queries"]:
+            print(f"warning: fixture is not unit-norm: {norm}", file=sys.stderr)
     knn_phase = phases.get("vector_knn", {})
     ids_per_query = knn_phase.get("ids_per_query") if isinstance(knn_phase, dict) else None
     # dense 正解集合は docs_file・queries・k が共通なので 1 度だけ構築して全 arm で再利用する

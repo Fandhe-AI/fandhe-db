@@ -2,8 +2,8 @@
 `CROSSDB_PG_PORT` で上書き可。`containers.sh` と同じ変数を読む）の機能別
 ベンチマーク実装。
 
-自作 DB 側も `<#>`（負の内積の昇順。SQL-33）で、pgvector の `<#>`（負の内積。
-ORDER BY 昇順で内積の大きい順になる）と同じ演算子・同じ意味で比較する。RLS 相当は、自作 DB の現行契約（実機確認:
+pgvector は recall 正解と同じ内積の `<#>`（負の内積。ORDER BY 昇順で内積の大きい順）を使う。
+自作 DB 側は `<=>`（コサイン）だが、フィクスチャは L2 正規化済みで順位が一致する（SQL-33・Issue #3224）。RLS 相当は、自作 DB の現行契約（実機確認:
 どのテナントの wire セッションからも `visibility = 'public'` の行のみが
 可視。private 行は所有テナント自身からも不可視）に合わせ、`visibility` 列を
 追加したうえで `WHERE visibility = 'public'`（tenant 列では絞り込まない）を

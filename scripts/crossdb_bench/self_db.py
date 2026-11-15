@@ -4,9 +4,11 @@
 プロトコルのみ・`autocommit=True`・パラメータなし `execute(sql)`）で接続する。
 クエリ形は `crates/engine/examples/feature_bench.rs` に合わせてある（比較可能性
 のため独自方言を作らない）。
-距離演算子は他 DB・recall 正解（内積）に合わせ `<#>`（負の内積の昇順。Issue #2952・
-SQL-33）。`feature_bench.rs` とは演算子だけ違う。`mode_precision` のみ `<#>` 併用が
-engine で `0A000` となるため `<=>` のまま（self 専用フェーズ）。
+距離演算子は全 kNN 形で `<=>`（コサイン距離の昇順。SQL-33）。`feature_bench.rs` と
+同じ。Issue #2952 で一時 `<#>`（負の内積）へ切り替えたが、`<#>`（Ip）は HNSW の対応
+metric 外で `--config hnsw` が厳密全走査に倒れ、`USING MODE 'precision'` とも併用できない
+ため Issue #3224 で `<=>` に戻した。他 DB・recall 正解は内積のままだが、フィクスチャは
+L2 正規化済みでコサインと内積の順位は一致する（`recall.py` の正規化検査で確認）。
 
 RLS 相当のテナント境界は wire 接続ユーザーのテナントで自動適用される
 （`bench` = tenant-a、`bench_b` = tenant-b の 2 ユーザーを users.txt に登録する）。
@@ -487,14 +489,14 @@ def _run_phases(
                 explain_rows = [r[0] for r in cur.fetchall()]
             verified = self_hnsw.verify_explain_rows(explain_rows, expect_hnsw=is_hnsw)
             phases["ann_probe"] = verified
-            # 実際の kNN 形（`<#>`）が HNSW に到達するかを記録する（assert しない）。
-            # `<#>`（Ip）は現行 HNSW の対応 metric 外で厳密全走査に倒れるが、上の
-            # `USING PLAN('probe')` はコサイン既定のため engine: hnsw を返す。
-            # ここで観測しないと ANN 計測値が偽陽性になる（Issue #2952）。
+            # 実際の kNN 形（`<=>`）が HNSW に到達するかを記録する（assert しない）。
+            # kNN の演算子が HNSW の対応 metric 外になると厳密全走査に倒れるが、上の
+            # `USING PLAN('probe')` は engine: hnsw を返す。ここで観測しないと
+            # ANN 計測値が偽陽性になる（Issue #2952・#3224）。
             if query_vecs:
                 with conn_a.cursor() as cur:
                     cur.execute(
-                        f"EXPLAIN SELECT id FROM docs ORDER BY embedding <#> '{query_vecs[0]}' LIMIT 10"
+                        f"EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '{query_vecs[0]}' LIMIT 10"
                     )
                     knn_plan = self_hnsw.parse_explain_rows([r[0] for r in cur.fetchall()])
                 phases["ann_probe"] = {**verified, "knn_operator_plan": knn_plan}
@@ -505,20 +507,20 @@ def _run_phases(
         # クエリの所要時間が構築コストの実行証跡になる（informational。exact
         # 構成にはこのフェーズを持たせない）。
         if is_hnsw and query_vecs and not knn_reaches_hnsw:
-            # kNN 本体（`<#>`）が厳密全走査になる構成では索引構築を伴わないため、
+            # kNN 本体が厳密全走査になる構成では索引構築を伴わないため、
             # 初回クエリ時間を ANN 構築コストとして記録しない（偽の計測を残さない）。
             phases["hnsw_index_warm"] = unsupported(
-                "<#> は現行 HNSW の対応 metric 外で厳密全走査になるため索引構築を伴わない"
+                "kNN 演算子が HNSW の対応 metric 外で厳密全走査になるため索引構築を伴わない"
             )
         elif is_hnsw and query_vecs:
             t0 = time.perf_counter()
-            _exec_ids(conn_a, f"SELECT id FROM docs ORDER BY embedding <#> '{query_vecs[0]}' LIMIT 10")
+            _exec_ids(conn_a, f"SELECT id FROM docs ORDER BY embedding <=> '{query_vecs[0]}' LIMIT 10")
             t1 = time.perf_counter()
             phases["hnsw_index_warm"] = {"first_query_us": (t1 - t0) * 1_000_000.0}
 
         # --- vector_knn ---
         def knn(qv):
-            sql = f"SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10"
+            sql = f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10"
             return _exec_ids(conn_a, sql)
 
         stats, _ = measure(knn, query_vecs)
@@ -530,7 +532,7 @@ def _run_phases(
         def knn_where(qv):
             sql = (
                 f"SELECT id FROM docs WHERE lang = 'ja' "
-                f"ORDER BY embedding <#> '{qv}' LIMIT 10"
+                f"ORDER BY embedding <=> '{qv}' LIMIT 10"
             )
             return _exec_ids(conn_a, sql)
 
@@ -620,13 +622,11 @@ def _run_phases(
 
         # --- mode_recall / mode_precision ---
         def mode_recall_query(qv):
-            sql = f"SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10 USING MODE 'recall'"
+            sql = f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10 USING MODE 'recall'"
             return _exec_ids(conn_a, sql)
 
-        # `<#>` と `USING MODE 'precision'` の併用は engine が `0A000` で拒否する
-        # （確信度を cosine 類似度で判定する設計）ため、このフェーズだけ `<=>`
-        # （コサイン距離）のまま残す。他 DB はすべて precision を unsupported とする
-        # self 専用フェーズで、DB 間比較・recall 評価の対象外。
+        # 他 DB はすべて precision を unsupported とする self 専用フェーズで、
+        # DB 間比較・recall 評価の対象外（演算子は他の kNN 形と同じ `<=>`）。
         def mode_precision_query(qv):
             sql = f"SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10 USING MODE 'precision'"
             return _exec_ids(conn_a, sql)
@@ -661,7 +661,7 @@ def _run_phases(
         def bulk_knn(k: int):
             def _run(qv):
                 return _exec_rows(
-                    f"SELECT id, body FROM docs ORDER BY embedding <#> '{qv}' LIMIT {k}"
+                    f"SELECT id, body FROM docs ORDER BY embedding <=> '{qv}' LIMIT {k}"
                 )
 
             return _run
@@ -678,7 +678,7 @@ def _run_phases(
         def bulk_knn_where(qv):
             return _exec_rows(
                 f"SELECT id, body FROM docs WHERE lang = 'ja' "
-                f"ORDER BY embedding <#> '{qv}' LIMIT 200"
+                f"ORDER BY embedding <=> '{qv}' LIMIT 200"
             )
 
         stats, last = measure(bulk_knn_where, query_vecs)
@@ -778,7 +778,7 @@ def _run_phases(
             qv0 = query_vecs[0]
             udf_sql = (
                 f"SELECT id, norm_scale(embedding, 2.0) AS score FROM docs "
-                f"ORDER BY embedding <#> '{qv0}' LIMIT 10"
+                f"ORDER BY embedding <=> '{qv0}' LIMIT 10"
             )
 
             def udf_call(_):
@@ -799,14 +799,14 @@ def _run_phases(
             )
 
         # --- explain ---
-        # 素の `ORDER BY embedding <#> '...'` に対する `EXPLAIN`（USING PLAN を伴わない
+        # 素の `ORDER BY embedding <=> '...'` に対する `EXPLAIN`（USING PLAN を伴わない
         # 検索 SELECT）は engine の `sql::explain` で受理される。pgvector と同じく
         # 計測し、出力の先頭行を記録する。許可リストで拒否される版（`42601`）のみ
         # unsupported とし、接続断・タイムアウト等の実行障害は再送出して計測全体を
         # 失敗させる（unsupported へ丸めると仕様変更に気づけない。codex-review P1）。
         def explain(qv):
             with conn_a.cursor() as cur:
-                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <#> '{qv}' LIMIT 10")
+                cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '{qv}' LIMIT 10")
                 return [r[0] for r in cur.fetchall()]
 
         try:
