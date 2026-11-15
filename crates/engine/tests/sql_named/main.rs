@@ -98,6 +98,7 @@ mod sql_interval_column;
 mod sql_interval_part_trunc;
 mod sql_interval_query;
 mod sql_json_query_functions;
+mod sql_like_quantified;
 mod sql_multidim_array;
 mod sql_not_null_default;
 mod sql_operation_id;

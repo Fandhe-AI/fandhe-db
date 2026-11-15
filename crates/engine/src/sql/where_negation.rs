@@ -385,10 +385,11 @@ mod tests {
     /// TABLE-35・Issue #1603: 量化比較の否定は量化子の反転と演算子の否定（二重否定で元に戻る）。
     #[test]
     fn quantified_negation_flips_quantifier_and_operator() {
+        use crate::sql::udf_call::QuantifiedOp;
         use crate::sql::udf_call::{ArrayCmpOp, Quantifier};
         let q = |op, quantifier| {
             WherePredicate::Expression(Expr::Quantified {
-                op,
+                op: QuantifiedOp::Cmp(op),
                 quantifier,
                 lhs: Box::new(Expr::Number("1".into())),
                 rhs: Box::new(Expr::Ident("a".into())),
@@ -405,6 +406,32 @@ mod tests {
             assert_eq!(once, vec![q(neg, Quantifier::All)]);
             let twice = negate_conjunction(once, &mut b).expect("negate twice");
             assert_eq!(twice, vec![q(op, Quantifier::Any)]);
+        }
+    }
+
+    /// SQL-9・Issue #3258: LIKE 系の量化形の否定も量化子の反転と演算子（`negated`）の反転で、
+    /// 二重否定で元に戻る（`NOT (x LIKE ANY a)` = `x NOT LIKE ALL a`）。
+    #[test]
+    fn like_quantified_negation_flips_quantifier_and_negated() {
+        use crate::sql::udf_call::{QuantifiedOp, Quantifier};
+        let q = |negated, case_insensitive, quantifier| {
+            WherePredicate::Expression(Expr::Quantified {
+                op: QuantifiedOp::Like {
+                    negated,
+                    case_insensitive,
+                },
+                quantifier,
+                lhs: Box::new(Expr::Ident("s".into())),
+                rhs: Box::new(Expr::Ident("a".into())),
+            })
+        };
+        let mut b = 100;
+        for ci in [false, true] {
+            let once = negate_conjunction(vec![q(false, ci, Quantifier::Any)], &mut b)
+                .expect("negate once");
+            assert_eq!(once, vec![q(true, ci, Quantifier::All)]);
+            let twice = negate_conjunction(once, &mut b).expect("negate twice");
+            assert_eq!(twice, vec![q(false, ci, Quantifier::Any)]);
         }
     }
 
