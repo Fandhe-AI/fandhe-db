@@ -5000,21 +5000,6 @@ pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
         .ok()
 }
 
-/// `RETURNING` 句の項目が「別名付き（または裸の）列参照」か（Issue #3248・SQL-21 のポインタ）。
-/// 値・型・読む列は別名なしと同じで、出力列名だけが変わる。式項目の受理可否は
-/// [`returning_item_rejection`] が決める（束縛段が列参照を式評価器へ通さない分岐と、
-/// データ変更 CTE・ビュー経由の書き込みの文言出し分けに使う）。
-pub(crate) fn is_returning_column_item(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::Column(_) => true,
-        SelectItem::Expr {
-            expr: Expr::Ident(name),
-            alias: Some(_),
-        } => !is_scalar_subquery_placeholder_name(name),
-        SelectItem::Expr { .. } => false,
-    }
-}
-
 /// 式 `expr` の直下の子式を `out` へ積む（[`returning_item_rejection`] の明示スタック走査用。
 /// `sql::parser::collect_expr_idents` と同じ変種の網羅）。
 fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
@@ -15678,12 +15663,18 @@ impl<'a> Parser<'a> {
     }
 
     /// FROM／USING つき UPDATE／DELETE 専用の `RETURNING` 句（Issue #1756・SQL-53 のポインタ）。
-    /// `*`・`<公開名>.*`・列参照（修飾あり・なし）の並びだけを受理し、式・関数呼び出し・
-    /// `AS` 別名は従来の `RETURNING` と同じく `42601`（受理範囲を従来より広げない）。
-    /// 呼び出し元は `parse_update_from`／`parse_delete_using`（Issue #3204 で結線）で、
-    /// 項目の束縛は `sql::dml_from_returning` が行う。
+    /// 受理する項目は次のとおり（Issue #3251 で別名・式を追加）。
+    /// - `*`・`<公開名>.*`（直後の `AS` は `42601`）。
+    /// - 列参照（修飾あり・なし）と、その `AS <別名>`（任意の relation の列・疑似列 `id`）。
+    /// - 対象表の列だけを参照する式・関数呼び出し（任意で `AS <別名>`）。対象表（`target_exposed`）で
+    ///   修飾した参照は非修飾へ正規化し、FROM／USING 側の修飾参照は `0A000`（fail-closed。
+    ///   SET の式と同じ境界）。サブクエリは `42601`・集計は `42803`（基表の `RETURNING` と同じ）。
+    ///
+    /// 呼び出し元は `parse_update_from`／`parse_delete_using`（Issue #3204 で結線）で、項目の束縛は
+    /// `sql::dml_from_returning` が行う。
     pub(crate) fn parse_dml_from_returning_clause(
         &mut self,
+        target_exposed: &str,
     ) -> Result<Option<crate::sql::dml_from_returning::DmlFromReturning>, SqlSurfaceError> {
         use crate::sql::dml_from_returning::{
             DmlFromReturning, DmlFromReturningItem, MAX_DML_FROM_RETURNING_ITEMS,
@@ -15699,6 +15690,10 @@ impl<'a> Parser<'a> {
                     "too many RETURNING items",
                 ));
             }
+            let star = matches!(
+                self.peek(),
+                Some(Token::Punct('*') | Token::QualifiedStar { .. })
+            );
             let item = match self.peek() {
                 Some(Token::Punct('*')) => {
                     self.advance();
@@ -15709,14 +15704,33 @@ impl<'a> Parser<'a> {
                     self.advance();
                     DmlFromReturningItem::QualifiedAll(qualifier)
                 }
-                _ => DmlFromReturningItem::Column(
-                    self.parse_join_colref_as(super::colref_sink::Role::SelectItemBare)?,
-                ),
+                _ if self.peek_dml_returning_single_column()
+                    || self.peek_dml_returning_paren_qualified_column() =>
+                {
+                    // 括弧付きの修飾列 `(s.v)` は括弧を剥がして括弧なしと同じ列束縛経路へ通す。
+                    let parenthesized = matches!(self.peek(), Some(Token::Punct('(')));
+                    if parenthesized {
+                        self.advance();
+                    }
+                    let colref =
+                        self.parse_join_colref_as(super::colref_sink::Role::SelectItemBare)?;
+                    if parenthesized {
+                        self.advance(); // `)`（先読みで存在確認済み）
+                    }
+                    if self.peek_ident_matches("AS") {
+                        self.advance();
+                        DmlFromReturningItem::AliasedColumn(colref, self.expect_ident()?)
+                    } else {
+                        DmlFromReturningItem::Column(colref)
+                    }
+                }
+                _ => self.parse_dml_from_returning_expr_item(target_exposed)?,
             };
-            if self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))) {
+            if star
+                && (self.peek_ident_matches("AS") || matches!(self.peek(), Some(Token::Punct('('))))
+            {
                 return Err(SqlSurfaceError::unsupported(
-                    "RETURNING aliases and expressions are not supported with UPDATE ... FROM \
-                     or DELETE ... USING yet",
+                    "RETURNING aliases are not supported on star items",
                 ));
             }
             items.push(item);
@@ -15727,6 +15741,97 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(Some(DmlFromReturning { items }))
+    }
+
+    /// FROM／USING つき DML の `RETURNING` 項目が列参照 1 個（直後が `,`・`AS`・句境界）かを先読みだけで
+    /// 判定する。関数呼び出し・演算子つきの式は含めない（式項目の経路で読む。Issue #3251）。
+    fn peek_dml_returning_single_column(&self) -> bool {
+        if !matches!(
+            self.peek(),
+            Some(Token::QualifiedIdent { .. } | Token::Ident(_))
+        ) {
+            return false;
+        }
+        // 引用なしの括弧なし SQL 値関数（`CURRENT_DATE` 等）は列参照ではなく式として読む。
+        // 引用付きの同名識別子は列参照のまま。
+        if self.is_value_function_keyword_at(self.pos) {
+            return false;
+        }
+        Self::returning_item_boundary(self.tokens.get(self.pos.saturating_add(1)))
+    }
+
+    /// 項目の直後のトークンが `RETURNING` 項目の境界（`,`・`;`・`AS`・句境界・終端）か。
+    fn returning_item_boundary(next: Option<&Token>) -> bool {
+        match next {
+            None => true,
+            Some(Token::Punct(',' | ';')) => true,
+            Some(Token::Ident(w)) => ["AS", "USING", "PARTITIONED"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k)),
+            _ => false,
+        }
+    }
+
+    /// `RETURNING` 項目が括弧付きの修飾列参照 `(q.col)` 1 個（直後が境界）かを先読みで判定する。
+    /// 括弧なしの `q.col` と同じ列束縛経路へ通すための判定（Issue #3251）。
+    fn peek_dml_returning_paren_qualified_column(&self) -> bool {
+        matches!(self.peek(), Some(Token::Punct('(')))
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::QualifiedIdent { .. })
+            )
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(2)),
+                Some(Token::Punct(')'))
+            )
+            && Self::returning_item_boundary(self.tokens.get(self.pos.saturating_add(3)))
+    }
+
+    /// FROM／USING つき DML の `RETURNING` の式項目 1 つ（Issue #3251）。`dml_from_target` を対象表の
+    /// 公開名に設定して式を読む間、対象表で修飾した列は非修飾へ正規化され、FROM／USING 側の修飾列は
+    /// `0A000`、実際に非修飾で書かれた識別子は `dml_from_unqualified` に集まる（束縛段が FROM／USING 側
+    /// との衝突を検査する）。状態はエラー時も元へ戻す。
+    fn parse_dml_from_returning_expr_item(
+        &mut self,
+        target_exposed: &str,
+    ) -> Result<crate::sql::dml_from_returning::DmlFromReturningItem, SqlSurfaceError> {
+        use crate::sql::dml_from_returning::DmlFromReturningItem;
+        let prev = self.dml_from_target.replace(target_exposed.to_string());
+        self.dml_from_unqualified.clear();
+        let parsed = self.parse_projection_infix(0);
+        self.dml_from_target = prev;
+        let unqualified = std::mem::take(&mut self.dml_from_unqualified);
+        let expr = parsed?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        // 括弧付きの裸識別子 `(n)` は列参照として扱う（別名なしは `Column`、別名付きは `AliasedColumn`）。
+        if let Expr::Ident(name) = &expr {
+            if is_scalar_subquery_placeholder_name(name) {
+                return Err(SqlSurfaceError::unsupported(
+                    "RETURNING does not support subqueries",
+                ));
+            }
+            // 非修飾で書かれた識別子だけがスコープ照合の対象。対象表で修飾された `(t.k)` は
+            // 式パーサーが非修飾へ正規化済みなので、対象表の修飾を戻して FROM／USING 側と衝突させない。
+            let colref = if unqualified.iter().any(|u| u == name) {
+                crate::sql::relation::ColumnRef::unqualified(name.clone())
+            } else {
+                crate::sql::relation::ColumnRef::qualified(target_exposed, name.clone())
+            };
+            return Ok(match alias {
+                Some(a) => DmlFromReturningItem::AliasedColumn(colref, a),
+                None => DmlFromReturningItem::Column(colref),
+            });
+        }
+        let item = SelectItem::Expr { expr, alias };
+        if let Some(err) = returning_item_rejection(&item) {
+            return Err(err);
+        }
+        Ok(DmlFromReturningItem::Expr { item, unqualified })
     }
 
     /// 文末専用句 `PARTITIONED [CHUNK <n>]`（Issue #1129・SQL-19）の構造パース。
@@ -22801,7 +22906,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let from = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
-        let returning = self.parse_dml_from_returning_clause()?;
+        let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
         // 文ハッシュは検証入口が元のトークン列から算出して差し替える（QuotedNull 正規化前の列を使うため）。
         let statement_hash = placeholder_statement_hash()?;
@@ -22827,7 +22932,7 @@ impl<'a> Parser<'a> {
         self.expect_contextual_keyword("USING")?;
         let using = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
-        let returning = self.parse_dml_from_returning_clause()?;
+        let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
         let statement_hash = placeholder_statement_hash()?;
         Ok(ParsedDeleteUsing {
@@ -32260,14 +32365,17 @@ mod tests {
         }
     }
 
-    /// SQL-53・Issue #1756: FROM／USING つき DML の RETURNING は `*`・`t.*`・列参照だけを受理する。
+    /// SQL-53・Issue #1756・#3251: FROM／USING つき DML の RETURNING は `*`・`t.*`・列参照・別名・
+    /// 対象表の式を受理し、FROM／USING 側の修飾列を含む式・サブクエリ・集計は拒否する。
     #[test]
-    fn dml_from_returning_clause_accepts_star_and_column_refs_only() {
+    fn dml_from_returning_clause_accepts_aliases_and_target_expressions() {
         use super::*;
         use crate::sql::dml_from_returning::DmlFromReturningItem;
         let parse = |sql: &str| {
             let toks = crate::sql::lexer::tokenize(sql).expect("lex");
-            Parser::new(&toks).parse_dml_from_returning_clause()
+            let mut p = Parser::new(&toks);
+            p.parse_dml_from_returning_clause("t")
+                .and_then(|r| p.expect_end_of_statement().map(|_| r))
         };
         let ok = parse("RETURNING *, t.*, a, s.b")
             .expect("accepted")
@@ -32279,18 +32387,53 @@ mod tests {
             DmlFromReturningItem::QualifiedAll("t".to_string())
         );
         assert!(parse("").expect("empty").is_none());
-        for bad in [
-            "RETURNING a AS x",
-            "RETURNING lower(a)",
-            "RETURNING a + 1",
-            "RETURNING",
+        let aliased = parse("RETURNING a AS x, s.b AS y, id AS i")
+            .expect("alias")
+            .expect("present");
+        assert!(aliased
+            .items
+            .iter()
+            .all(|i| matches!(i, DmlFromReturningItem::AliasedColumn(..))));
+        let expr = parse("RETURNING lower(t.a), a + 1 AS n, (b), -a")
+            .expect("expr")
+            .expect("present");
+        assert!(matches!(expr.items[0], DmlFromReturningItem::Expr { .. }));
+        match &expr.items[1] {
+            DmlFromReturningItem::Expr { unqualified, .. } => {
+                assert_eq!(unqualified, &vec!["a".to_string()]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(expr.items[2], DmlFromReturningItem::Column(_)));
+        // 括弧なし SQL 値関数は式、引用付き同名は列参照（P1 回帰）。
+        let vf = parse("RETURNING CURRENT_DATE AS d, \"current_date\" AS c")
+            .expect("value function")
+            .expect("present");
+        assert!(matches!(vf.items[0], DmlFromReturningItem::Expr { .. }));
+        assert!(matches!(
+            vf.items[1],
+            DmlFromReturningItem::AliasedColumn(..)
+        ));
+        // 括弧付き FROM／USING 修飾列は括弧なしと同じ列束縛（Medium 回帰）。
+        let paren = parse("RETURNING (s.v), (s.v) AS w")
+            .expect("paren qualified")
+            .expect("present");
+        assert!(matches!(paren.items[0], DmlFromReturningItem::Column(_)));
+        assert!(matches!(
+            paren.items[1],
+            DmlFromReturningItem::AliasedColumn(..)
+        ));
+        for (bad, code) in [
+            ("RETURNING lower(s.a)", "0A000"),
+            ("RETURNING s.a + 1", "0A000"),
+            ("RETURNING *  AS x", "42601"),
+            ("RETURNING a x", "42601"),
+            ("RETURNING count(a)", "42601"),
+            ("RETURNING", "42601"),
         ] {
-            let tokens = crate::sql::lexer::tokenize(bad).expect("lex");
-            let mut p = Parser::new(&tokens);
-            let res = p
-                .parse_dml_from_returning_clause()
-                .and_then(|r| p.expect_end_of_statement().map(|_| r));
-            assert!(res.is_err(), "must reject: {bad}");
+            let res = parse(bad);
+            let err = res.expect_err(bad);
+            assert_eq!(err.wire_code(), code, "{bad}");
         }
     }
 

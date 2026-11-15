@@ -9677,6 +9677,7 @@ impl EngineCore {
                 self.execute_view_insert(
                     || crate::tenant::WriteTarget::Autocommit(&self.storage),
                     ctx,
+                    session,
                     stmt,
                     Some(crate::sql::view_write_scope::InsteadOfGuard::new(
                         ctx.tenant_id(),
@@ -11041,6 +11042,7 @@ impl EngineCore {
                 let (outcome, base_table) = self.execute_view_insert(
                     || crate::tenant::WriteTarget::InTxn(write_txn),
                     ctx,
+                    session,
                     stmt,
                     None,
                 )?;
@@ -12695,9 +12697,10 @@ impl EngineCore {
                         Ok::<_, crate::sql::allowlist::SqlSurfaceError>((rewritten, schema))
                     })
                     .map_err(crate::catalog::table_lookup_error)??;
-                match crate::sql::parser::bind_returning(
+                match crate::sql::parser::bind_returning_with_udfs(
                     rewritten.insert.returning.as_ref(),
                     &schema,
+                    session.udfs(),
                 )? {
                     Some(projection) => {
                         let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
@@ -12740,7 +12743,11 @@ impl EngineCore {
                     DeleteStatement::SingleRow(v) => v.returning.as_ref(),
                     DeleteStatement::Predicate(v) => v.returning(),
                 };
-                match crate::sql::parser::bind_returning(returning, &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    returning,
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => {
                         let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
                         crate::sql::view_insert::apply_public_names(
@@ -12780,7 +12787,11 @@ impl EngineCore {
                     ValidatedUpdateForm::Single(v) => v.returning.as_ref(),
                     ValidatedUpdateForm::Predicate(v) => v.returning(),
                 };
-                match crate::sql::parser::bind_returning(returning, &schema)? {
+                match crate::sql::parser::bind_returning_with_udfs(
+                    returning,
+                    &schema,
+                    session.udfs(),
+                )? {
                     Some(projection) => {
                         let mut columns = crate::sql::returning::column_meta(&projection, &schema)?;
                         crate::sql::view_insert::apply_public_names(
@@ -20430,6 +20441,7 @@ impl EngineCore {
         &self,
         make_target: impl Fn() -> crate::tenant::WriteTarget<'t>,
         ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedViewInsert,
         instead_of_guard: Option<crate::sql::view_write_scope::InsteadOfGuard>,
     ) -> Result<(crate::sql::SqlOutcome, String), crate::sql::allowlist::SqlSurfaceError> {
@@ -20472,8 +20484,8 @@ impl EngineCore {
                         ctx,
                         &rewritten.insert,
                         &lookup,
-                        // ビュー書き込みは UDF を解決しない（#3251。空 = 未登録扱い 42883 で fail-closed）。
-                        &crate::sql::udf_call::UdfRegistry::default(),
+                        // セッションの UDF レジストリで解決する（基表 DML と同じ。Issue #3251）。
+                        session.udfs(),
                     )
                     .map(|mut outcome| {
                         crate::sql::view_insert::apply_public_names(
@@ -20523,12 +20535,7 @@ impl EngineCore {
                 };
                 match &rewritten.delete {
                     DeleteStatement::SingleRow(v) if v.returning.is_some() => self
-                        .execute_delete_returning_form(
-                            make_target(),
-                            ctx,
-                            v,
-                            &crate::sql::udf_call::UdfRegistry::default(),
-                        )
+                        .execute_delete_returning_form(make_target(), ctx, v, session.udfs())
                         .map(returning),
                     DeleteStatement::SingleRow(v) => self
                         .execute_delete_form(make_target(), ctx, v)
@@ -21591,8 +21598,7 @@ impl EngineCore {
     }
 
     /// [`Self::execute_predicate_delete_returning_form`] のビュー経由版。`RETURNING` の束縛に
-    /// 空レジストリを渡し UDF を解決しない（#3251。未登録扱い 42883 で fail-closed。ビュー INSERT・
-    /// 単一行 DELETE と同じ契約）。
+    /// セッションの UDF レジストリを渡す（基表 DML と同じ。Issue #3251）。
     fn execute_view_predicate_delete_returning_form(
         &self,
         target: crate::tenant::WriteTarget<'_>,
@@ -21606,7 +21612,7 @@ impl EngineCore {
             session,
             stmt,
             None,
-            &crate::sql::udf_call::UdfRegistry::default(),
+            session.udfs(),
         )
     }
 
@@ -21964,8 +21970,8 @@ impl EngineCore {
         self.execute_update_returning_form_pre(target, ctx, session, stmt, None, session.udfs())
     }
 
-    /// [`Self::execute_update_returning_form`] のビュー経由版。`RETURNING` の束縛に空レジストリを
-    /// 渡し UDF を解決しない（#3251。未登録扱い 42883 で fail-closed）。
+    /// [`Self::execute_update_returning_form`] のビュー経由版。`RETURNING` の束縛にセッションの
+    /// UDF レジストリを渡す（基表 DML と同じ。Issue #3251）。
     fn execute_view_update_returning_form(
         &self,
         target: crate::tenant::WriteTarget<'_>,
@@ -21973,14 +21979,7 @@ impl EngineCore {
         session: &crate::sql::mode::SessionState,
         stmt: &crate::sql::allowlist::ValidatedUpdateForm,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        self.execute_update_returning_form_pre(
-            target,
-            ctx,
-            session,
-            stmt,
-            None,
-            &crate::sql::udf_call::UdfRegistry::default(),
-        )
+        self.execute_update_returning_form_pre(target, ctx, session, stmt, None, session.udfs())
     }
 
     /// 内側の実装。`pre` が `Some` のとき、`WHERE` のサブクエリは呼び出し元（データ変更 CTE の

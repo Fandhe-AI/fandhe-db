@@ -456,3 +456,23 @@ fn copy_from_commit_recheck_uses_the_same_column_list_as_begin() {
     f.admin_run("REVOKE INSERT (c) ON ca2 FROM alice");
     f.core.commit_copy_in(&ctx(), batch).expect("commit");
 }
+
+/// データ変更 CTE の副文・`UPDATE ... FROM` の `RETURNING` の式は、列単位の付与だけでは通らず（判別できない形は
+/// 全列を要求する fail-closed）、表単位の権限があれば通る（Issue #3251・SQL-40）。
+#[test]
+fn returning_expressions_on_cte_and_from_forms_demand_table_level_privileges() {
+    let f = fx("colpriv-returning-surfaces");
+    let cte = "WITH u AS (UPDATE ca2 SET b = 1 WHERE a = 1 RETURNING a + c AS x) SELECT x FROM u";
+    let from =
+        "UPDATE ca2 SET b = 1 FROM ct WHERE ca2.a = ct.n RETURNING ca2.a + ca2.c AS x, ct.m AS y";
+    f.admin_run("GRANT UPDATE (b) ON ca2 TO alice");
+    f.admin_run("GRANT SELECT (a) ON ca2 TO alice");
+    f.admin_run("GRANT SELECT (n) ON ct TO alice");
+    f.admin_run("GRANT SELECT (m) ON ct TO alice");
+    assert_eq!(f.alice(cte), "42501");
+    assert_eq!(f.alice(from), "42501");
+    f.admin_run("GRANT SELECT, UPDATE ON ca2 TO alice");
+    f.admin_run("GRANT SELECT ON ct TO alice");
+    assert_eq!(f.alice(cte), "ok");
+    assert_eq!(f.alice(from), "ok");
+}

@@ -174,6 +174,7 @@ impl EngineCore {
             joined_returning_collector(
                 ctx,
                 bound,
+                schema,
                 // 採番方式の表は行 id を返さない（単一表の `RETURNING` と同じ規則）。
                 schema.is_allocated(),
                 &lookup,
