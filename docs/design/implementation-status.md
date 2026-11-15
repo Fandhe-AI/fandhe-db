@@ -2101,3 +2101,5 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 詳細は `docs/design/wide-retrieval-scan.md` の追記節。
 
 **Issue #3237（docs(design): VIEW 本文 WHERE の受理方針を決める。TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ）**: コード変更なし。LIMIT なし本文は単純形を拡張して保持し（Buffered へは回さない）、組み込み関数だけの式述語・`OR`・`IS NULL` 等を受理、UDF は定義時（`42601`）と参照時（固定文言 `XX000`）の両方で拒否する方針を [create-view.md](create-view.md) の「Issue #3237 追記」に記録した。実装は #3238〜#3240。
+
+**Issue #3248（feat(engine): RETURNING の AS 別名を受理し、誤解を招く文言を直す。親 #3247・SQL-21・SQL-42 のポインタ）**: 基表への INSERT・UPDATE・DELETE・UPSERT の `RETURNING` で、`AS` 別名付きの列参照を受理した（`sql::allowlist::is_returning_column_item` を構文段・束縛段が共有し、束縛は SELECT と同じ `resolve_projected_column`。`sql::returning` は `AliasedId` を列メタ・`Cell::Integer` へ写す）。式・`AS` 省略は `42601` のまま文言を原因別に改め、「function-call items」の文言を廃止した（ビュー書き込み・データ変更 CTE・FROM／USING の文言も原因別。拒否は #3251 が受け皿）。`*` と他項目の併用は `0A000`（未起票）。詳細は [sql-returning.md](sql-returning.md) の追記節。依存の追加なし。
