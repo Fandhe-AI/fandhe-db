@@ -23742,7 +23742,6 @@ mod tests {
         assert!(storage.get_table_schema("orphan").is_err());
     }
 
-    /// 単純形ビューの保存本文が AST 経由で書き換わり、reopen 後も保持される。改名元を
     /// 式述語つきの単純形ビュー本文（`OR`・`IN`・`BETWEEN`・`IS NULL`・式・関数）も列改名に追随し、
     /// 関数名・リテラルは書き換わらず、再オープン後も本文が参照できる（TABLE-38 のポインタ、
     /// Issue #3239）。
@@ -23786,6 +23785,7 @@ mod tests {
         assert!(!body.contains("lower(kind)"), "{body}");
     }
 
+    /// 単純形ビューの保存本文が AST 経由で書き換わり、reopen 後も保持される。改名元を
     /// 公開しないビュー・無関係な表のビューは本文がバイト単位で不変（TABLE-38 のポインタ、
     /// Issue #1621）。
     #[test]
