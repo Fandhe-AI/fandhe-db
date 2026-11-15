@@ -36,6 +36,11 @@ use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::{expr_node_count, negate_conjunction};
 
 mod grouped_window;
+// 要素つき `CREATE SCHEMA` の要素分割・構文検証（TABLE-27・Issue #3286）。
+mod schema_elements;
+pub(crate) use schema_elements::{
+    create_name_index as schema_element_create_name_index, SchemaElement, SchemaElementKind,
+};
 // `DO` ブロックの構文検証（SQL-68・Issue #2228）。
 mod do_block;
 pub use do_block::ValidatedDo;
@@ -1195,6 +1200,10 @@ pub enum SqlSurfaceError {
     NoSchemaSelected,
     /// 予約名（`pg_` 接頭辞）の SCHEMA 名の指定（TABLE-27・ERR-6、Issue #1713）。`42939`。
     ReservedName { name: String },
+    /// 要素つき `CREATE SCHEMA`（`CREATE SCHEMA s CREATE TABLE x.t ...`）の要素が、作成中の SCHEMA とは別の
+    /// SCHEMA で修飾された名前を作ろうとした（TABLE-27・Issue #3286）。`42P15`。`schema` は利用者が書いた
+    /// 修飾名、`created` は作成中の SCHEMA 名（どちらも利用者自身が書いた識別子のみ）。
+    InvalidSchemaDefinition { schema: String, created: String },
     /// `CREATE ROLE`／`CREATE USER` の名前が同一テナント内の既存ロールと衝突した（SQL-39・ERR-6、
     /// Issue #1962）。`42710`。名前は利用者自身が書いた識別子だけで、内部 ID・他テナントの情報を含めない。
     DuplicateRole { name: String },
@@ -1524,6 +1533,10 @@ impl SqlSurfaceError {
             Self::DuplicateTable { name } => Self::DuplicateTable { name: f(&name) },
             Self::DuplicateSchema { name } => Self::DuplicateSchema { name: f(&name) },
             Self::InvalidSchemaName { name } => Self::InvalidSchemaName { name: f(&name) },
+            Self::InvalidSchemaDefinition { schema, created } => Self::InvalidSchemaDefinition {
+                schema: f(&schema),
+                created: f(&created),
+            },
             Self::DuplicateObject { name } => Self::DuplicateObject { name: f(&name) },
             Self::DuplicateRole { name } => Self::DuplicateRole { name: f(&name) },
             Self::UndefinedRole { name } => Self::UndefinedRole { name: f(&name) },
@@ -2114,6 +2127,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::ReservedName { .. } | SqlSurfaceError::ReservedRoleName { .. } => {
                 ErrorClass::ReservedName
             }
+            SqlSurfaceError::InvalidSchemaDefinition { .. } => ErrorClass::InvalidSchemaDefinition,
             SqlSurfaceError::DuplicateRole { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::UndefinedRole { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::RoleHasDependents { .. } => ErrorClass::DependentObjectsStillExist,
@@ -2373,6 +2387,13 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::NoSchemaSelected => {
                 f.write_str("no schema has been selected to create in")
+            }
+            // 名前は利用者自身が書いた識別子のみ（内部 ID・他テナントの情報は含めない。Issue #3286）。
+            SqlSurfaceError::InvalidSchemaDefinition { schema, created } => {
+                write!(
+                    f,
+                    "CREATE specifies a schema ({schema}) different from the one being created ({created})"
+                )
             }
             SqlSurfaceError::ReservedName { name } => {
                 write!(f, "unacceptable schema name: {name}")
@@ -21255,6 +21276,9 @@ pub struct ValidatedCreateSchema {
     pub(crate) if_not_exists: bool,
     /// `AUTHORIZATION <ロール>` の所有者指定（Issue #2236。省略時は作成者＝現在ロール）。
     pub(crate) authorization: Option<RoleSpec>,
+    /// 見出しの後ろに続くスキーマ要素（`CREATE TABLE`／`VIEW`／`SEQUENCE`。Issue #3286）。記述順で保持し、
+    /// 空なら従来どおりの `CREATE SCHEMA`。実行は `core::schema_elements` が 1 つの write txn で行う。
+    pub(crate) elements: Vec<SchemaElement>,
 }
 
 impl ValidatedCreateSchema {
@@ -21357,8 +21381,10 @@ pub(crate) fn is_drop_schema_statement(tokens: &[Token]) -> bool {
 
 /// [`ValidatedCreateSchema`] の構造検証本体（TABLE-27、Issue #1713）。`AUTHORIZATION <ロール>`
 /// （`CREATE SCHEMA [IF NOT EXISTS] <名> AUTHORIZATION <ロール>` と名前省略形
-/// `CREATE SCHEMA AUTHORIZATION <ロール名>`。Issue #2236）は所有者の指定として受理し、schema_element
-/// （`CREATE SCHEMA s CREATE TABLE ...`）と、`CURRENT_USER` 等で名前を省略する形は黙って無視せず
+/// `CREATE SCHEMA AUTHORIZATION <ロール名>`。Issue #2236）は所有者の指定として受理する。
+/// 見出しの後ろのスキーマ要素（`CREATE SCHEMA s CREATE TABLE ...`。Issue #3286）は
+/// `schema_elements` が分割・構造検証する。受理しない種別・形と `IF NOT EXISTS` との併用は固定文言の
+/// `0A000`（PostgreSQL 17 と同じ。設計記録 D3）。`CURRENT_USER` 等で名前を省略する形も黙って無視せず
 /// `0A000` で拒否する（fail-closed。設計記録 D10）。修飾名・不正な識別子・余分なトークンは `42601`。
 pub(crate) fn validate_create_schema_tokens(
     tokens: &[Token],
@@ -21367,10 +21393,30 @@ pub(crate) fn validate_create_schema_tokens(
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("SCHEMA")?;
     let if_not_exists = p.parse_optional_if_not_exists();
-    let elements = || {
-        SqlSurfaceError::feature_not_supported(
-            "CREATE SCHEMA with schema elements is not supported",
-        )
+    // 見出しの後ろに要素が続く形（`CREATE`／`GRANT`）の検証と格納。`IF NOT EXISTS` との併用は拒否する。
+    let finish = |p: &mut Parser<'_>,
+                  name: String,
+                  authorization: Option<RoleSpec>|
+     -> Result<ValidatedCreateSchema, SqlSurfaceError> {
+        let mut elements = Vec::new();
+        if schema_elements::starts_element(p) {
+            if if_not_exists {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "CREATE SCHEMA IF NOT EXISTS cannot include schema elements",
+                ));
+            }
+            let start = tokens.len().saturating_sub(p.remaining().len());
+            let rest = tokens.get(start..).unwrap_or(&[]);
+            elements = schema_elements::parse_elements(&name, rest)?;
+        } else {
+            p.expect_end_of_statement()?;
+        }
+        Ok(ValidatedCreateSchema {
+            name,
+            if_not_exists,
+            authorization,
+            elements,
+        })
     };
     // 名前省略形: `CREATE SCHEMA [IF NOT EXISTS] AUTHORIZATION <ロール名>`（SCHEMA 名はロール名）。
     if p.peek_ident_matches("AUTHORIZATION") {
@@ -21381,15 +21427,7 @@ pub(crate) fn validate_create_schema_tokens(
                 "CREATE SCHEMA AUTHORIZATION without a schema name requires a role name",
             ));
         };
-        if p.peek_ident_matches("CREATE") {
-            return Err(elements());
-        }
-        p.expect_end_of_statement()?;
-        return Ok(ValidatedCreateSchema {
-            name,
-            if_not_exists,
-            authorization: Some(spec),
-        });
+        return finish(&mut p, name, Some(spec));
     }
     if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
         return Err(SqlSurfaceError::unsupported(
@@ -21405,15 +21443,7 @@ pub(crate) fn validate_create_schema_tokens(
     } else {
         None
     };
-    if p.peek_ident_matches("CREATE") {
-        return Err(elements());
-    }
-    p.expect_end_of_statement()?;
-    Ok(ValidatedCreateSchema {
-        name,
-        if_not_exists,
-        authorization,
-    })
+    finish(&mut p, name, authorization)
 }
 
 /// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713・#1717）。

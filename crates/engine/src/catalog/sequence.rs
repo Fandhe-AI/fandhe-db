@@ -1179,6 +1179,26 @@ pub(crate) fn create_sequence_in_txn(
     Ok(id)
 }
 
+/// [`create_sequence_in_txn`] に、作成者（所有者の予約。キーは SEQUENCE のキー）の `SEQUENCES` の既定権限の
+/// 初期 ACL 適用（Issue #2237）を足した write txn 内本体（begin・commit を含まない）。予約が無い（未束縛の
+/// 作成）なら ACL は適用しない。[`Storage::create_sequence`] と、要素つき `CREATE SCHEMA` の SEQUENCE 要素
+/// （`sql::ddl`。Issue #3286）が共有する。
+pub(crate) fn create_sequence_with_default_acl_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    params: &SequenceParams,
+) -> Result<u64> {
+    validate_relation_key(name)?;
+    params.validate()?;
+    let id = create_sequence_in_txn(write_txn, name, params)?;
+    if let Some((tenant, role)) = super::privilege::owner::pending_creator_for_key(name) {
+        super::privilege::default_acl::apply_default_acl_to_sequence_in_txn(
+            write_txn, &tenant, role, name, id,
+        )?;
+    }
+    Ok(id)
+}
+
 /// 暗黙 SEQUENCE を持つ列 1 件の宣言（SERIAL 系・IDENTITY 列。TABLE-24・Issue #1694／#1695）。
 /// `CREATE TABLE` の列宣言順に並べて渡し、`<table>_<col>_seq` の衝突番号（`seq1`…）が列順に
 /// 決まるようにする。`sql::ddl::execute_create_table` が組み立てる。
@@ -1585,14 +1605,7 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let id = create_sequence_in_txn(&write_txn, name, params)?;
-        // 作成者（所有者の予約。キーは SEQUENCE のキー）の `SEQUENCES` の既定権限を同じ txn で初期 ACL へ適用する
-        // （Issue #2237）。予約が無い（未束縛の作成）なら何も適用しない。
-        if let Some((tenant, role)) = super::privilege::owner::pending_creator_for_key(name) {
-            super::privilege::default_acl::apply_default_acl_to_sequence_in_txn(
-                &write_txn, &tenant, role, name, id,
-            )?;
-        }
+        create_sequence_with_default_acl_in_txn(&write_txn, name, params)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
 

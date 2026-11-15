@@ -495,6 +495,60 @@ pub(crate) fn schema_relation_keys_in_txn<R: ReadSource>(
     Ok(out)
 }
 
+/// 組み込み SCHEMA 名、または `tenant_id` に同名の SCHEMA が既にあるか（write txn 内の 1 回の get）。
+fn schema_name_taken_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+) -> Result<bool> {
+    Ok(is_builtin_schema_name(name) || schema_id_in_txn(write_txn, tenant_id, name)?.is_some())
+}
+
+/// SCHEMA を作る write txn 内本体（識別子・予約名の再検証 → 組み込み名・同名の既存 `SchemaAlreadyExists` →
+/// 件数上限 `ViewLimitExceeded` → ID 払い出しと保存 → 所有者・既定 ACL の記録。begin・commit を含まない）。
+/// 払い出した内部 ID を返す。`Err` の場合は呼び出し側が txn を破棄する。`Storage::create_schema_with_limit`
+/// と、SCHEMA と全要素を 1 回の commit で作る要素つき `CREATE SCHEMA`（`core::schema_elements`。Issue #3286）が
+/// 共有する。照会は `(tenant_id, name)` だけで、他テナントの SCHEMA は見えない。
+pub(crate) fn create_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+    max_schemas: usize,
+    owner: Option<u64>,
+) -> Result<u64> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_reserved_schema_name(name) {
+        return Err(CatalogError::ReservedSchemaName(name.to_string()));
+    }
+    if schema_name_taken_in_txn(write_txn, tenant_id, name)? {
+        return Err(CatalogError::SchemaAlreadyExists(name.to_string()));
+    }
+    if count_schemas_capped(write_txn, tenant_id, max_schemas)? >= max_schemas {
+        return Err(CatalogError::ViewLimitExceeded(
+            "too many schemas".to_string(),
+        ));
+    }
+    let id = allocate_schema_id_in_txn(write_txn)?;
+    {
+        let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
+        table.insert((tenant_id, name), encode_schema_def(id).as_slice())?;
+    }
+    if let Some(owner) = owner {
+        super::privilege::owner::set_owner_in_txn(
+            write_txn,
+            tenant_id,
+            &super::privilege::PrivilegeObject::Schema(id),
+            owner,
+        )?;
+        // 所有者（作成者）の `SCHEMAS` の既定権限を同じ txn で初期 ACL へ適用する（Issue #2237）。
+        super::privilege::default_acl::apply_default_acl_to_schema_in_txn(
+            write_txn, tenant_id, owner, id,
+        )?;
+    }
+    Ok(id)
+}
+
 impl Storage {
     /// `tenant_id` に SCHEMA `name` を作る。判定順は識別子 → 予約名（`IF NOT EXISTS` より先。
     /// `42939`）→ 組み込み名・同名の既存（`IF NOT EXISTS` なら成功の no-op、無ければ
@@ -544,37 +598,12 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let exists = is_builtin_schema_name(name)
-            || schema_id_in_txn(&*write_txn, tenant_id, name)?.is_some();
-        if exists {
-            return if if_not_exists {
-                Ok(CreateSchemaResult::AlreadyExists)
-            } else {
-                Err(CatalogError::SchemaAlreadyExists(name.to_string()))
-            };
+        // `IF NOT EXISTS` の no-op は commit せず返す（txn は破棄される）。それ以外の既存は下の本体が
+        // `SchemaAlreadyExists` にする。
+        if if_not_exists && schema_name_taken_in_txn(&write_txn, tenant_id, name)? {
+            return Ok(CreateSchemaResult::AlreadyExists);
         }
-        if count_schemas_capped(&*write_txn, tenant_id, max_schemas)? >= max_schemas {
-            return Err(CatalogError::ViewLimitExceeded(
-                "too many schemas".to_string(),
-            ));
-        }
-        let id = allocate_schema_id_in_txn(&write_txn)?;
-        {
-            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
-            table.insert((tenant_id, name), encode_schema_def(id).as_slice())?;
-        }
-        if let Some(owner) = owner {
-            super::privilege::owner::set_owner_in_txn(
-                &write_txn,
-                tenant_id,
-                &super::privilege::PrivilegeObject::Schema(id),
-                owner,
-            )?;
-            // 所有者（作成者）の `SCHEMAS` の既定権限を同じ txn で初期 ACL へ適用する（Issue #2237）。
-            super::privilege::default_acl::apply_default_acl_to_schema_in_txn(
-                &write_txn, tenant_id, owner, id,
-            )?;
-        }
+        create_schema_in_txn(&write_txn, tenant_id, name, max_schemas, owner)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(CreateSchemaResult::Created)
