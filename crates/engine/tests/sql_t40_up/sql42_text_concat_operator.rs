@@ -238,6 +238,25 @@ fn jsonb_concat_is_unchanged() {
     );
 }
 
+/// 左結合の jsonb `||` を多段に連ねても束縛時間が段数に対して線形に収まる
+/// （オペランドを二重に束縛すると 2^段数になり、この試験は終わらない。PR #3453 指摘）。
+#[test]
+fn deep_jsonb_concat_chain_binds_in_linear_time() {
+    let (core, ctx, _g) = setup();
+    let mut sql = String::from("SELECT docb");
+    for _ in 0..40 {
+        sql.push_str(" || '{}'");
+    }
+    sql.push_str(" FROM t WHERE id = 1");
+    let started = std::time::Instant::now();
+    let r = run(&core, &ctx, &sql);
+    assert_eq!(cells0(&r), vec![Cell::Json("{\"a\":1}".to_string())]);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "jsonb || chain took too long"
+    );
+}
+
 #[test]
 fn tenant_boundary_holds() {
     let (core, ctx, _g) = setup();
