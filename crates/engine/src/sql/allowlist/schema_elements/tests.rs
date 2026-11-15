@@ -127,6 +127,9 @@ fn creating_in_another_schema_is_42p15_and_same_schema_is_accepted() {
         "CREATE SCHEMA s CREATE TABLE other.t (a INT)",
         "CREATE SCHEMA s CREATE SEQUENCE other.q",
         "CREATE SCHEMA s CREATE TABLE t (a INT) CREATE VIEW other.v AS SELECT a FROM t",
+        // 大文字小文字だけが異なる修飾名も別スキーマ扱い（実行段の名前解決と同じ完全一致）。
+        "CREATE SCHEMA \"S\" CREATE TABLE s.t (a INT)",
+        "CREATE SCHEMA Public CREATE TABLE public.t (a INT)",
     ] {
         assert_eq!(code(sql), "42P15", "{sql}");
     }

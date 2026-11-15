@@ -264,10 +264,10 @@ fn validate_element(schema_name: &str, tokens: &[Token]) -> Result<SchemaElement
             validate_create_sequence_tokens(&probe)?;
         }
     }
-    // 作成名が作成中の SCHEMA 以外で修飾されていれば `42P15`（PostgreSQL 17 と同じ。同名の修飾は受理する）。
+    // 作成名が作成中の SCHEMA 以外で修飾されていれば `42P15`。比較は実行段の名前解決と同じく大文字小文字を区別する完全一致。
     if let Some(idx) = create_name_index(tokens) {
         if let Some(Token::QualifiedIdent { qualifier, .. }) = tokens.get(idx) {
-            if !qualifier.eq_ignore_ascii_case(schema_name) {
+            if qualifier != schema_name {
                 return Err(SqlSurfaceError::InvalidSchemaDefinition {
                     schema: truncate_for_error(qualifier),
                     created: truncate_for_error(schema_name),
