@@ -69,6 +69,10 @@ impl From<SchemaError> for ReturningRequestError {
 ///
 /// 文字列形は `"*"` 専用（列名 1 つの文字列形は拒否）。配列形は非空で、各要素が
 /// [`check_identifier`] を通る文字列であること（`"*"` を含む配列は識別子ではないため拒否）。
+///
+/// SQL 表層の `RETURNING` が受理する式・`AS` 別名・関数呼び出し（Issue #3248〜#3251）はここでは
+/// 受理しない（識別子検査で `42601`。NoSQL 表層は式の言語を持たない。対応しない。ポインタ:
+/// `docs/spec/04-behavior/nosql-surface.md` NOSQL-22・`docs/design/sql-returning.md`）。
 pub fn parse_returning(
     validated: &Validated<'_>,
 ) -> Result<Option<Projection>, ReturningRequestError> {

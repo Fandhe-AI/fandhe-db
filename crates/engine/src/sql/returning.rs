@@ -202,6 +202,7 @@ pub(crate) fn column_meta(
 /// 本モジュールの通常の書き込み経路では使われない〕の `DecodedRow::values` は
 /// この契約を満たさないため使わない）。`score` は検索結果ではないため常に
 /// `0.0`（`sql::scan::execute_scan` と同じ「順序を持たない結果セット」の扱い）。
+#[cfg(test)]
 pub(crate) fn project_row(
     id: u64,
     values: &[Value],
