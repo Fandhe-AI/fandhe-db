@@ -153,14 +153,19 @@ fn resolve_alias(name: &str, projection: &Projection) -> Result<Expr, SqlSurface
     };
     let mut found: Option<&Expr> = None;
     for item in items {
-        let SelectItem::Expr {
-            expr,
-            alias: Some(alias),
-        } = item
-        else {
-            continue;
+        // 明示別名がなければ PostgreSQL と同じく暗黙の出力名（関数呼び出しは関数名）を使う。
+        let (expr, matches) = match item {
+            SelectItem::Expr {
+                expr,
+                alias: Some(alias),
+            } => (expr, alias == name),
+            SelectItem::Expr { expr, alias: None } => match expr {
+                Expr::Call { name: f, .. } => (expr, f.eq_ignore_ascii_case(name)),
+                _ => continue,
+            },
+            _ => continue,
         };
-        if alias != name {
+        if !matches {
             continue;
         }
         match found {
@@ -240,6 +245,14 @@ pub(crate) fn check_distinct_on_order_prefix(
             });
         }
     }
+    // 重複キーは PostgreSQL と同様に除く（既出キーを不一致判定へ再投入しない）。
+    let mut unique_keys: Vec<Expr> = Vec::new();
+    for k in sort_keys {
+        if !unique_keys.contains(&k) {
+            unique_keys.push(k);
+        }
+    }
+    let sort_keys = unique_keys;
     let mismatch = SqlSurfaceError::DistinctOnOrderByMismatch;
     let mut covered: Vec<&Expr> = Vec::new();
     let mut skipped = false;
@@ -358,6 +371,35 @@ mod tests {
         let err = check_distinct_on_order_prefix(&on, &proj, &[sk("lang")], &[])
             .expect_err("out of range ordinal is not guessed");
         assert_eq!(err.wire_code(), "0A000");
+    }
+
+    #[test]
+    fn distinct_on_prefix_ignores_duplicate_order_keys() {
+        // ORDER BY lang, id, lang は重複キーを除くと lang, id で先頭一致（PostgreSQL 準拠）。
+        assert!(check(&["lang"], &["lang", "id", "lang"]).is_ok());
+    }
+
+    #[test]
+    fn distinct_on_prefix_resolves_implicit_output_name() {
+        let call = Expr::Call {
+            name: "lower".to_string(),
+            args: vec![id("lang")],
+        };
+        let proj = Projection::Items(vec![SelectItem::Expr {
+            expr: call.clone(),
+            alias: None,
+        }]);
+        // DISTINCT ON (lower) ... ORDER BY lower(lang)
+        let on = [id("lower")];
+        let order = [ScanOrderKey::Expr {
+            expr: call.clone(),
+            descending: false,
+            nulls: None,
+        }];
+        assert!(check_distinct_on_order_prefix(&on, &proj, &[], &order).is_ok());
+        // DISTINCT ON (lower(lang)) ... ORDER BY lower
+        let on = [call];
+        assert!(check_distinct_on_order_prefix(&on, &proj, &[sk("lower")], &[]).is_ok());
     }
 
     #[test]
