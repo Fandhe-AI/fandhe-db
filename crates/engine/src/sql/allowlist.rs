@@ -27,9 +27,10 @@ use crate::sql::order_value::NullPlacement;
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::relation::{ColumnRef, TableRef};
 use crate::sql::udf_call::{
-    ArrayCmpOp, ArraySubscript, BinOp, Expr, JsonAccessOp, Quantifier, SqlJsonBehavior,
-    SqlJsonQueryExpr, SqlJsonQueryKind, ValueFunctionKind, MAX_CALL_ARGS, MAX_CASE_BRANCHES,
-    MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_FUNCTION_CALL_ARGS, MAX_UDF_PARAMS,
+    ArrayCmpOp, ArraySubscript, BinOp, Expr, JsonAccessOp, QuantifiedOp, Quantifier,
+    SqlJsonBehavior, SqlJsonQueryExpr, SqlJsonQueryKind, ValueFunctionKind, MAX_CALL_ARGS,
+    MAX_CASE_BRANCHES, MAX_CASE_NESTING, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_FUNCTION_CALL_ARGS,
+    MAX_UDF_PARAMS,
 };
 use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::{expr_node_count, negate_conjunction};
@@ -10156,6 +10157,9 @@ impl<'a> Parser<'a> {
         if let Some((negated, case_insensitive, len)) = self.like_at(self.pos) {
             return self.parse_like_rest(negated, case_insensitive, len, lhs);
         }
+        if let Some((op, quantifier, kw_len)) = self.like_quantified_at(self.pos) {
+            return self.parse_quantified_like_rest(op, quantifier, kw_len, lhs);
+        }
         if let Some((negated, case_insensitive)) = self.regex_op_at(self.pos) {
             return self.parse_regex_rest(negated, case_insensitive, lhs);
         }
@@ -10767,6 +10771,85 @@ impl<'a> Parser<'a> {
                 detail: "ANY/ALL is not supported in a CHECK constraint".to_string(),
             });
         }
+        self.advance();
+        self.advance();
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Select))) {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ANY/ALL with a subquery is not supported".to_string(),
+            });
+        }
+        let rhs = self.parse_value_expr(1)?;
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(ExprLeaf::Plain(Expr::Quantified {
+            op: QuantifiedOp::Cmp(op),
+            quantifier,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        }))
+    }
+
+    /// `tokens[idx]` から `[NOT] LIKE|ILIKE ANY|SOME|ALL (` が並んでいれば
+    /// `(op, 量化子, キーワード部〔量化子の直前まで〕のトークン数)` を返す（消費しない。SQL-9・
+    /// Issue #3258）。量化子は [`Self::peek_quantifier`] と同じ文脈照合（`(` が続くときだけ）で、
+    /// `any` という名前の列を壊さない。後置 `NOT` は演算子側の `negated`（量化子は反転しない）。
+    fn like_quantified_at(&self, idx: usize) -> Option<(QuantifiedOp, Quantifier, usize)> {
+        let word = |i: usize, k: &str| matches!(self.tokens.get(i), Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+        let (negated, kw) = if word(idx, "NOT") {
+            (true, idx.checked_add(1)?)
+        } else {
+            (false, idx)
+        };
+        let case_insensitive = if word(kw, "ILIKE") {
+            true
+        } else if word(kw, "LIKE") {
+            false
+        } else {
+            return None;
+        };
+        let q = kw.checked_add(1)?;
+        let quantifier = match self.tokens.get(q) {
+            Some(Token::Ident(w))
+                if w.eq_ignore_ascii_case("ANY") || w.eq_ignore_ascii_case("SOME") =>
+            {
+                Quantifier::Any
+            }
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("ALL") => Quantifier::All,
+            _ => return None,
+        };
+        if !matches!(self.tokens.get(q.checked_add(1)?), Some(Token::Punct('('))) {
+            return None;
+        }
+        Some((
+            QuantifiedOp::Like {
+                negated,
+                case_insensitive,
+            },
+            quantifier,
+            q.checked_sub(idx)?,
+        ))
+    }
+
+    /// `lhs [NOT] LIKE|ILIKE ANY|SOME|ALL ( <配列式> )` の続きを読み、[`Expr::Quantified`] を作る
+    /// （SQL-9・Issue #3258）。方針は [`Self::parse_quantified_rest`] と同じ（CHECK 本体・サブクエリ形は
+    /// `0A000`、ノード予算を課金）。量化形の後ろの `ESCAPE` は PG の文法にも無く、消費せず呼び出し元の
+    /// 終端検査が `42601` で拒否する。
+    fn parse_quantified_like_rest(
+        &mut self,
+        op: QuantifiedOp,
+        quantifier: Quantifier,
+        kw_len: usize,
+        lhs: Expr,
+    ) -> Result<ExprLeaf, SqlSurfaceError> {
+        if self.in_check_body {
+            return Err(SqlSurfaceError::FeatureNotSupported {
+                detail: "ANY/ALL is not supported in a CHECK constraint".to_string(),
+            });
+        }
+        for _ in 0..kw_len {
+            self.advance();
+        }
+        // 量化子と `(`
         self.advance();
         self.advance();
         if matches!(self.peek(), Some(Token::Keyword(Keyword::Select))) {
@@ -18479,6 +18562,16 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
             case_insensitive: true,
             ..
         } => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "ILIKE is not supported on a view with an aggregate/LIMIT body".to_string(),
+        }),
+        // Issue #3258: `ILIKE ANY|ALL` も単独の `ILIKE` と同じ理由（合成スキーマが照合を持たない）で拒否する。
+        WherePredicate::Expression(Expr::Quantified {
+            op: QuantifiedOp::Like {
+                case_insensitive: true,
+                ..
+            },
+            ..
+        }) => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "ILIKE is not supported on a view with an aggregate/LIMIT body".to_string(),
         }),
         WherePredicate::Equality { .. }
@@ -34006,7 +34099,11 @@ mod tests {
             else {
                 panic!("expected a quantified predicate for {sql}, got {preds:?}");
             };
-            assert_eq!((*op, *quantifier), (want_op, want_q), "{sql}");
+            assert_eq!(
+                (*op, *quantifier),
+                (QuantifiedOp::Cmp(want_op), want_q),
+                "{sql}"
+            );
         }
         // `a && b` は jsonb 演算子と同じ段の裸の述語。
         let preds = where_predicates_for(&format!("SELECT * FROM documents WHERE a && b {tail}"));
@@ -34037,6 +34134,53 @@ mod tests {
             ("a = ANY(SELECT x FROM documents)", "0A000"),
             ("a & b", "42601"),
             ("ANY(a) = 1", "42601"),
+        ] {
+            let full = format!("SELECT * FROM documents WHERE {sql} {tail}");
+            let err = validate_statement(&full, &lookup).expect_err(sql);
+            assert_eq!(err.wire_code(), code, "{sql}");
+        }
+    }
+
+    /// SQL-9・Issue #3258: `[NOT] LIKE|ILIKE ANY|SOME|ALL`（`~~` 系の演算子名を含む）の構文。
+    /// 後置 `NOT` は演算子の `negated`（量化子は反転しない）。拒否の形は固定のコードで返す。
+    #[test]
+    fn like_quantified_parses_and_rejects() {
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let like = |negated, case_insensitive| QuantifiedOp::Like {
+            negated,
+            case_insensitive,
+        };
+        for (sql, want_op, want_q) in [
+            ("a LIKE ANY(b)", like(false, false), Quantifier::Any),
+            ("a ILIKE SOME(b)", like(false, true), Quantifier::Any),
+            ("a LIKE ALL(b)", like(false, false), Quantifier::All),
+            ("a NOT LIKE ALL(b)", like(true, false), Quantifier::All),
+            ("a NOT ILIKE ANY(b)", like(true, true), Quantifier::Any),
+            ("a ~~ ANY(b)", like(false, false), Quantifier::Any),
+            ("a ~~* ANY(b)", like(false, true), Quantifier::Any),
+            ("a !~~ ANY(b)", like(true, false), Quantifier::Any),
+            ("a !~~* ALL(b)", like(true, true), Quantifier::All),
+            ("lower(a) like any (b)", like(false, false), Quantifier::Any),
+            (
+                "(lower(a)) LIKE ANY(b)",
+                like(false, false),
+                Quantifier::Any,
+            ),
+        ] {
+            let preds =
+                where_predicates_for(&format!("SELECT * FROM documents WHERE {sql} {tail}"));
+            let [WherePredicate::Expression(Expr::Quantified { op, quantifier, .. })] =
+                preds.as_slice()
+            else {
+                panic!("expected a quantified predicate for {sql}, got {preds:?}");
+            };
+            assert_eq!((*op, *quantifier), (want_op, want_q), "{sql}");
+        }
+        let lookup = catalog_with(&["documents"]);
+        for (sql, code) in [
+            ("a LIKE ANY(SELECT x FROM documents)", "0A000"),
+            ("a LIKE ANY(b) ESCAPE '!'", "42601"),
+            ("a LIKE ANY b", "42601"),
         ] {
             let full = format!("SELECT * FROM documents WHERE {sql} {tail}");
             let err = validate_statement(&full, &lookup).expect_err(sql);
