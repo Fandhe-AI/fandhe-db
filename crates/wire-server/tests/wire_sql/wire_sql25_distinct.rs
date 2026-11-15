@@ -440,3 +440,68 @@ fn distinct_on_is_classified_over_simple_and_extended_and_connection_survives() 
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
+
+/// Issue #3262: ORDER BY なしの `SELECT DISTINCT ON` は、簡易クエリ（psql 風の末尾 `;` 単独送信・
+/// 末尾 `;` なし）・拡張クエリのいずれでも、lang 昇順・各 lang の最小 id を代表とする固定の行を返す
+/// （契約は `docs/design/select-distinct-on.md` §6）。alice（tenant-a）の可視行は id=1 ja・id=2 en・
+/// id=3 ja・id=11 xx で、tenant-b の private 行（id=12）は現れない。
+#[test]
+fn distinct_on_without_order_by_is_deterministic_over_simple_and_extended() {
+    let (core, _guard) = new_core_aggregate_docs();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    for sql in [
+        "SELECT DISTINCT ON (lang) lang, id FROM docs;",
+        "SELECT DISTINCT ON (lang) lang, id FROM docs",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_row_description(&mut stream), vec!["lang", "id"]);
+        for (lang, id) in [("en", "2"), ("ja", "1"), ("xx", "11")] {
+            let row = read_data_row(&mut stream);
+            assert_eq!(row[0].as_deref(), Some(lang), "{sql}");
+            assert_eq!(row[1].as_deref(), Some(id), "{sql}");
+        }
+        assert_eq!(read_command_complete(&mut stream), "SELECT 3");
+        assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
+    }
+
+    let sql = "SELECT DISTINCT ON (lang) lang, id FROM docs";
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("", sql, 0));
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("", ""));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+    let mut kinds = Vec::new();
+    let mut rows: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let (kind, body) = read_message(&mut stream);
+        kinds.push(kind);
+        if kind == b'D' {
+            rows.push(body.clone());
+        }
+        if kind == b'C' {
+            assert_eq!(body, b"SELECT 3\0");
+        }
+        if kind == b'Z' {
+            assert_eq!(body, b"I");
+            break;
+        }
+    }
+    assert_eq!(kinds, vec![b'1', b'2', b'D', b'D', b'D', b'C', b'Z']);
+    // DataRow: 列数(2) + [長さ(4) + 値]*2。lang 昇順・ja の代表は最小 id の 1。
+    let expect: [(&str, &str); 3] = [("en", "2"), ("ja", "1"), ("xx", "11")];
+    for (body, (lang, id)) in rows.iter().zip(expect) {
+        let mut want = vec![0u8, 2];
+        for v in [lang, id] {
+            want.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            want.extend_from_slice(v.as_bytes());
+        }
+        assert_eq!(body, &want);
+    }
+
+    send_simple_query(&mut stream, "SELECT COUNT(DISTINCT lang) AS n FROM docs");
+    let _columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row[0].as_deref(), Some("3"));
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
