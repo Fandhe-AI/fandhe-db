@@ -50,6 +50,7 @@ import psycopg
 import self_copy
 import self_durability
 import self_hnsw
+from hybrid_depth import DEPTH_ARMS, self_window_clause
 from common import (
     DIM,
     TENANT_OTHER,
@@ -593,6 +594,29 @@ def _run_phases(
         idxs = list(range(len(query_vecs)))
         stats, _ = measure(hybrid, idxs)
         phases["hybrid_rrf"] = stats
+
+        # --- hybrid_rrf_depth{50,200}（Issue #3225）: Redis と取得深さを揃えた arm ---
+        # `window` 引数（SEARCH-13）で pool_depth を明示する。拒否（22000/0A000 等）は
+        # 握りつぶさず例外のまま計測全体を失敗させる（fail-closed）。
+        for arm, pool in DEPTH_ARMS.items():
+
+            def hybrid_depth(i, _arm=arm):
+                qv, qt = query_vecs[i], query_texts[i]
+                sql = (
+                    f"SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '{qv}', "
+                    f"body, '{qt}'{self_window_clause(_arm)}) LIMIT 10"
+                )
+                return _exec_ids(conn_a, sql)
+
+            stats, _ = measure(hybrid_depth, idxs)
+            # 品質指標用に全クエリ分を計測外で 1 回ずつ実行して id を集める。
+            phases[arm] = {
+                **stats,
+                "pool_depth": pool,
+                "window": pool,
+                "dense_fetch_k_initial": 2 * pool,
+                "ids_per_query": [hybrid_depth(i) for i in idxs],
+            }
 
         # --- mode_recall / mode_precision ---
         def mode_recall_query(qv):

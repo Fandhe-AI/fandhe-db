@@ -2095,6 +2095,8 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 **Issue #3229（feat(engine): 配列要素型追加の土台。親 #3228・TABLE-14・TABLE-35 のポインタ）**: 依存・unsafe・公開 API の挙動変更なし（`ArrayElemType::ALL_KINDS`・`kind_ordinal` を追加）。`ArrayElemType` を扱う `_ =>`／`matches!` を網羅 match に置換し、要素型の追加漏れをコンパイルエラーで検出できるようにした。全要素型の往復・凍結・OID 対応テストと、既存 13 種の wire 回帰テスト（末尾 `;` 付き・別テナントで 0 行）を追加。受理する型・SQLSTATE・OID・永続化表現は不変。箇所の一覧とチェックリストは `docs/design/array-column-type.md` の Issue #3229 追記。
 
+**Issue #3225（chore(bench): hybrid ベンチの条件を揃えて recall を並記。SEARCH-13 のポインタ）**: production コード・依存・unsafe・CI の変更なし。crossdb ハーネスに self と Redis で取得深さを揃えた `hybrid_rrf_depth50`／`hybrid_rrf_depth200` と、Redis の語の結合診断 `hybrid_text_conjunction` を追加し、`dense_gt_recall_at_10`・`overlap_at_10_vs_depth200`・`topic_hit_rate_at_10` を結果 JSON と stdout に並べる。既存の `hybrid_rrf`・`bulk_hybrid_k200` の条件は不変。純ロジックは `scripts/crossdb_bench/hybrid_depth.py`、検査は `scripts/tests/test_crossdb_hybrid_depth.py`。条件差の記録は `docs/design/crossdb-bench.md`。実機計測は未実施（未検証）。
+
 ## Issue #3223: scan の decode_row_header 二重デコードの解消
 
 `sql/scan.rs::with_visible_row` の `Fast`／`DimAndScalar` 段で、RLS 判定のヘッダデコードの offset を
