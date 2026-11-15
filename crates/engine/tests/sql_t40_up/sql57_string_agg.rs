@@ -463,7 +463,7 @@ fn argument_shape_and_type_errors_are_rejected_fail_closed() {
     for sql in [
         "SELECT sum(k, 1) FROM t",
         "SELECT count(s ORDER BY s) FROM t",
-        "SELECT sum(DISTINCT k) FROM t",
+        "SELECT variance(DISTINCT k) FROM t",
         "SELECT string_agg(max(s), ',') FROM t",
     ] {
         assert_eq!(code_of(&core, sql), "42601", "{sql}");
