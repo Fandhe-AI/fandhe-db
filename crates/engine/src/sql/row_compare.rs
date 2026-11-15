@@ -180,10 +180,12 @@ pub(crate) fn lower_row_compare(
     let mut remaining = *budget;
     match op {
         ArrayCmpOp::Eq => eq_conjunction(&pairs, &mut remaining),
-        ArrayCmpOp::Ne => crate::sql::where_negation::negate_conjunction(
-            eq_conjunction(&pairs, &mut remaining)?,
-            budget,
-        ),
+        ArrayCmpOp::Ne => {
+            let eqs = eq_conjunction(&pairs, &mut remaining)?;
+            // 否定の課金も写しで試算する（生きた予算へ課金すると束縛段の走査と二重課金になる）。
+            let mut negation_budget = *budget;
+            crate::sql::where_negation::negate_conjunction(eqs, &mut negation_budget)
+        }
         ArrayCmpOp::Lt => lex(&pairs, BinOp::Lt, BinOp::Lt, &mut remaining),
         ArrayCmpOp::Le => lex(&pairs, BinOp::Lt, BinOp::Le, &mut remaining),
         ArrayCmpOp::Gt => lex(&pairs, BinOp::Gt, BinOp::Gt, &mut remaining),
@@ -235,5 +237,22 @@ mod tests {
         let mut budget = usize::MAX;
         assert!(lower_row_compare(&exprs(1), ArrayCmpOp::Eq, &exprs(1), &mut budget).is_err());
         assert!(lower_row_compare(&exprs(2), ArrayCmpOp::Eq, &exprs(3), &mut budget).is_err());
+    }
+
+    #[test]
+    fn expansion_does_not_consume_live_budget() {
+        // 展開は予算の写しで試算するのみで、生きた予算は束縛段の課金のために手付かずで残す。
+        for op in [
+            ArrayCmpOp::Eq,
+            ArrayCmpOp::Ne,
+            ArrayCmpOp::Lt,
+            ArrayCmpOp::Le,
+            ArrayCmpOp::Gt,
+            ArrayCmpOp::Ge,
+        ] {
+            let mut budget = 1000usize;
+            lower_row_compare(&exprs(3), op, &exprs(3), &mut budget).unwrap();
+            assert_eq!(budget, 1000, "live budget consumed for {op:?}");
+        }
     }
 }
