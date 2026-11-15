@@ -19160,62 +19160,89 @@ pub(crate) fn render_stored_simple_view_body(
 }
 
 /// 単純形ビュー本文 AST の列参照 `old` を `new` へ付け替える（TABLE-38 のポインタ、
-/// Issue #1621）。文字列置換でなく AST を書き換え、保存時は
+/// Issue #1621・#3239）。文字列置換でなく AST を書き換え、保存時は
 /// [`render_stored_simple_view_body`] で再描画する（リテラルのエスケープ・列名の
-/// 引用は既存レンダラーに任せる）。投影の列リストと `WHERE` 述語の列を対象とし、
-/// 変更があれば `true`。`parse_view_body` が受理しない述語形は到達しないが、
-/// 将来 variant が増えても追随漏れを起こさないよう `Err`（fail-closed）にする。
+/// 引用は既存レンダラーに任せ、往復ガードが意味の化けを拒否する）。投影の列リストと
+/// `WHERE` 述語の列を対象とし、変更があれば `true`。
+///
+/// `WHERE` は CHECK 制約の列改名・ビュー列別名と共有の走査器
+/// [`crate::sql::check_constraint::map_predicate_columns`] で書き換える（第 2 の走査器を
+/// 作らない）。式述語（`Expression`・`IN`・`BETWEEN`・`IS NULL`・`NOT`・`OR`）も 1 回の走査で
+/// 全列を一括写像するため連鎖置換は起きず、関数名は写像されない。`parse_view_body` が
+/// 受理しない述語形・`Projection::Items` は到達しないが、将来 variant が増えても追随漏れを
+/// 起こさないよう網羅的な `match` で `Err`（fail-closed）にする。
 pub(crate) fn rename_column_in_view_body(
     body: &mut ParsedViewBody,
     old: &str,
     new: &str,
 ) -> Result<bool, SqlSurfaceError> {
-    fn swap(column: &mut String, old: &str, new: &str) -> bool {
-        if column == old {
-            *column = new.to_string();
-            true
-        } else {
-            false
-        }
-    }
-    let mut changed = false;
-    if let Projection::Columns(cols) = &mut body.projection {
-        for c in cols.iter_mut() {
-            changed |= swap(c, old, new);
-        }
-    }
-    for pred in &mut body.where_predicates {
+    fn ensure_renamable(pred: &WherePredicate) -> Result<(), SqlSurfaceError> {
         match pred {
-            WherePredicate::Equality { column, .. }
-            | WherePredicate::Prefix {
-                lhs: Expr::Ident(column),
-                ..
-            }
-            | WherePredicate::BoolEquality { column, .. }
-            | WherePredicate::BoolColumn { column }
-            | WherePredicate::Compare { column, .. } => {
-                changed |= swap(column, old, new);
-            }
-            WherePredicate::Or(branches) if branches.is_empty() => {}
-            WherePredicate::Or(_)
-            | WherePredicate::PredicateCall { .. }
-            | WherePredicate::Prefix { .. }
-            | WherePredicate::Expression(_)
+            WherePredicate::Equality { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. }
             | WherePredicate::InList { .. }
             | WherePredicate::Between { .. }
             | WherePredicate::IsNull { .. }
-            | WherePredicate::Not(_)
+            | WherePredicate::Expression(_) => Ok(()),
+            WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_some() => Ok(()),
+            WherePredicate::Not(inner) => ensure_renamable(inner),
+            WherePredicate::Or(branches) => {
+                branches.iter().flatten().try_for_each(ensure_renamable)
+            }
+            WherePredicate::Prefix { .. }
+            | WherePredicate::PredicateCall { .. }
             | WherePredicate::InSubquery { .. }
             | WherePredicate::Exists { .. }
             | WherePredicate::ScalarSubqueryCompare { .. }
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
-            | WherePredicate::CorrelatedExists(_) => {
-                return Err(SqlSurfaceError::unsupported(
-                    "view body WHERE predicate form is not supported",
-                ));
+            | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(
+                "view body WHERE predicate form is not supported",
+            )),
+        }
+    }
+    let mut changed = false;
+    match &mut body.projection {
+        Projection::All => {}
+        Projection::Columns(cols) => {
+            for c in cols.iter_mut() {
+                if c == old {
+                    *c = new.to_string();
+                    changed = true;
+                }
             }
         }
+        Projection::Items(_) => {
+            return Err(SqlSurfaceError::unsupported(
+                "view body projection form is not supported",
+            ));
+        }
+    }
+    for pred in &body.where_predicates {
+        ensure_renamable(pred)?;
+    }
+    let map = |c: &str| {
+        if c == old {
+            new.to_string()
+        } else {
+            c.to_string()
+        }
+    };
+    let unsupported =
+        || SqlSurfaceError::unsupported("view body WHERE predicate form is not supported");
+    let mut renamed = Vec::with_capacity(body.where_predicates.len());
+    for pred in &body.where_predicates {
+        renamed.push(crate::sql::check_constraint::map_predicate_columns(
+            pred,
+            &map,
+            &unsupported,
+        )?);
+    }
+    if renamed != body.where_predicates {
+        changed = true;
+        body.where_predicates = renamed;
     }
     Ok(changed)
 }
@@ -44611,6 +44638,81 @@ mod body_expr_policy_tests {
         assert!(stored.starts_with(crate::sql::lexer::STORED_BODY_BOOL_LITERAL_MARKER));
         let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retokenize");
         assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+    }
+
+    /// 式述語つき本文（Issue #3238 の受理形）の列改名（Issue #3239）: 全形で書き換え、
+    /// 描画 → 再パースの往復が書き換えた AST と一致する。関数名は写像されない。
+    #[test]
+    fn rename_column_in_view_body_follows_expression_predicates() {
+        for pred in [
+            "n > 3",
+            "n + 1 > 3",
+            "lower(n) = 'c'",
+            "COALESCE(n, 0) > 1",
+            "n IN (1, 2)",
+            "n BETWEEN 1 AND 5",
+            "n IS NULL",
+            "n IS NOT NULL",
+            "NOT (s = 'a' OR n > 3)",
+            "s = 'a' OR n > 3",
+            "n = 1 OR TRUE",
+        ] {
+            let sql = format!("SELECT s FROM t WHERE {pred}");
+            let tokens = crate::sql::lexer::tokenize(&sql).expect(pred);
+            let mut body = parse_view_body(&tokens).expect(pred);
+            let before = body.clone();
+            assert!(
+                !rename_column_in_view_body(&mut body.clone(), "absent", "zzz").expect(pred),
+                "{pred}"
+            );
+            assert!(
+                rename_column_in_view_body(&mut body, "n", "m").expect(pred),
+                "{pred}"
+            );
+            assert_ne!(body, before, "{pred}");
+            let stored = render_stored_simple_view_body(&body).expect(pred);
+            assert!(!stored.contains(" n "), "{pred}: {stored}");
+            let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect(pred);
+            assert_eq!(parse_view_body(&retokens).expect(pred), body, "{pred}");
+        }
+    }
+
+    /// 改名元を参照しない式述語は変更なし。関数名と同名の列を改名しても関数名は書き換わらず、
+    /// 2 列の入れ替えで連鎖置換が起きない。
+    #[test]
+    fn rename_column_in_view_body_expression_keeps_function_names_and_swaps() {
+        let parse = |sql: &str| {
+            let tokens = crate::sql::lexer::tokenize(sql).expect(sql);
+            parse_view_body(&tokens).expect(sql)
+        };
+        let mut body = parse("SELECT s FROM t WHERE lower(s) = 'c'");
+        assert!(!rename_column_in_view_body(&mut body, "n", "m").expect("noop"));
+        // 関数名 `lower` と同名の列 `lower` を改名しても呼び出し名は不変。
+        let mut body = parse("SELECT s FROM t WHERE lower(s) = 'c' OR lower > 1");
+        let before = body.clone();
+        assert!(rename_column_in_view_body(&mut body, "lower", "low").expect("rename"));
+        let stored = render_stored_simple_view_body(&body).expect("render");
+        assert!(stored.contains("lower("), "{stored}");
+        assert_ne!(body, before);
+        // 入れ替え: a→b の後に b→a を続けても、一括写像ではなく 1 回ずつなので別列へ化けない。
+        let mut body = parse("SELECT s FROM t WHERE a + b > 1");
+        assert!(rename_column_in_view_body(&mut body, "a", "b").expect("a->b"));
+        let stored = render_stored_simple_view_body(&body).expect("render");
+        let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retok");
+        assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+    }
+
+    /// 予約名（`true`）への改名で式述語の意味が化けた本文は保存されない（往復ガードで `Err`、
+    /// または引用で正しく往復する）。
+    #[test]
+    fn rename_column_in_view_body_expression_reserved_name_never_changes_meaning() {
+        let tokens = crate::sql::lexer::tokenize("SELECT s FROM t WHERE n + 1 > 3").expect("tok");
+        let mut body = parse_view_body(&tokens).expect("parse");
+        assert!(rename_column_in_view_body(&mut body, "n", "true").expect("rename"));
+        if let Ok(stored) = render_stored_simple_view_body(&body) {
+            let retokens = crate::sql::lexer::tokenize_stored_view_body(&stored).expect("retok");
+            assert_eq!(parse_view_body(&retokens).expect("reparse"), body);
+        }
     }
 
     /// `SELECT *` と述語なしの本文は改名元を参照しないため変更なし（`false`）。
