@@ -728,6 +728,8 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
             | "MAX"
             | "STRING_AGG"
             | "ARRAY_AGG"
+            | "JSON_AGG"
+            | "JSONB_AGG"
             | "VARIANCE"
             | "VAR_POP"
             | "VAR_SAMP"
@@ -4463,6 +4465,12 @@ pub enum AggregateFunc {
     /// 1 次元配列（NULL 入力は NULL 要素・入力なしは NULL）。内側の `ORDER BY`・`DISTINCT` を
     /// 受理する（SQL 表層のみ。`string_agg` と同じ仕組みを共有する）。
     ArrayAgg,
+    /// `json_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #3264）。結果は `json` の配列
+    /// （`array_agg` と同じ状態・束縛を共有し、確定時に JSON テキストへ書く。入力なしは NULL）。
+    JsonAgg,
+    /// `jsonb_agg([DISTINCT] <式> [ORDER BY ...])`（SQL-57・Issue #3264）。[`Self::JsonAgg`] の
+    /// `jsonb` 版で、結果は正規形（空白なし）の `jsonb` 配列。
+    JsonbAgg,
     /// `variance(<数値>)`（SQL-57・Issue #1803）。`var_samp` と同義（標本分散）。入力が整数系・
     /// numeric なら numeric、浮動小数・数値式なら double を返す。行数 0 は NULL、1 も NULL。
     Variance,
@@ -4501,6 +4509,15 @@ impl AggregateFunc {
         matches!(self, AggregateFunc::Grouping)
     }
 
+    /// `array_agg` の状態（[`crate::sql::array_agg::ArrayAggState`]）で評価する関数か
+    /// （`array_agg`・`json_agg`・`jsonb_agg`。Issue #3264）。束縛・DISTINCT・ORDER BY・資源上限が共通。
+    pub(crate) fn uses_array_agg_state(self) -> bool {
+        matches!(
+            self,
+            AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg
+        )
+    }
+
     /// 分散系の集計関数か（`variance`／`var_pop`／`var_samp` と `stddev`／`stddev_pop`／
     /// `stddev_samp`。Issue #1803・#1804）。引数の型検査・結果型・累積器の選択がこの 6 関数で
     /// 共通になる。
@@ -4535,6 +4552,8 @@ impl AggregateFunc {
             "MAX" => Some(AggregateFunc::Max),
             "STRING_AGG" => Some(AggregateFunc::StringAgg),
             "ARRAY_AGG" => Some(AggregateFunc::ArrayAgg),
+            "JSON_AGG" => Some(AggregateFunc::JsonAgg),
+            "JSONB_AGG" => Some(AggregateFunc::JsonbAgg),
             "VARIANCE" => Some(AggregateFunc::Variance),
             "VAR_POP" => Some(AggregateFunc::VarPop),
             "VAR_SAMP" => Some(AggregateFunc::VarSamp),
@@ -4559,6 +4578,8 @@ impl AggregateFunc {
             AggregateFunc::Max => "max",
             AggregateFunc::StringAgg => "string_agg",
             AggregateFunc::ArrayAgg => "array_agg",
+            AggregateFunc::JsonAgg => "json_agg",
+            AggregateFunc::JsonbAgg => "jsonb_agg",
             AggregateFunc::Variance => "variance",
             AggregateFunc::VarPop => "var_pop",
             AggregateFunc::VarSamp => "var_samp",
@@ -8459,12 +8480,14 @@ impl<'a> Parser<'a> {
                     after_distinct,
                     Some(Token::StringLiteral(_)) | Some(Token::Punct('(' | '-' | '+'))
                 ),
-                AggregateFunc::ArrayAgg => matches!(
-                    after_distinct,
-                    Some(Token::StringLiteral(_))
-                        | Some(Token::Number(_))
-                        | Some(Token::Punct('(' | '-' | '+'))
-                ),
+                AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg => {
+                    matches!(
+                        after_distinct,
+                        Some(Token::StringLiteral(_))
+                            | Some(Token::Number(_))
+                            | Some(Token::Punct('(' | '-' | '+'))
+                    )
+                }
                 // SQL-57・Issue #1809: `COUNT(DISTINCT (a + b))`・`COUNT(DISTINCT -n)` も修飾子と読む
                 // （数値・文字列リテラルは従来どおり対象外。`COUNT(distinct)` の列名互換を保つ）。
                 // Issue #3263: `SUM`／`AVG`／`MIN`／`MAX` の `DISTINCT` も同じ読み。
@@ -8492,11 +8515,11 @@ impl<'a> Parser<'a> {
                     | AggregateFunc::Min
                     | AggregateFunc::Max
                     | AggregateFunc::StringAgg
-                    | AggregateFunc::ArrayAgg
             )
+            && !func.uses_array_agg_state()
         {
             return Err(SqlSurfaceError::unsupported(
-                "DISTINCT is only allowed inside COUNT, SUM, AVG, MIN, MAX, string_agg and array_agg",
+                "DISTINCT is only allowed inside COUNT, SUM, AVG, MIN, MAX, string_agg, array_agg, json_agg and jsonb_agg",
             ));
         }
         // Issue #3263: `MIN`／`MAX(DISTINCT x)` は重複除去が結果に影響しないため、解析直後に
@@ -8529,7 +8552,7 @@ impl<'a> Parser<'a> {
             // `string_agg` の引数位置は text と確定するため、裸の `NULL` をリテラルとして解析する。
             let saved_null = self.allow_null_literal;
             self.allow_null_literal =
-                matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg);
+                func == AggregateFunc::StringAgg || func.uses_array_agg_state();
             let mut parsed = self.parse_value_expr(0);
             // `bool_and` 系に限り引数に比較式（`<値式> <比較演算子> <値式>`）を受理する
             // （SQL-57・Issue #1805）。ほかの集計関数の引数文法は変えない。
@@ -8577,13 +8600,15 @@ impl<'a> Parser<'a> {
                 func.default_alias()
             )));
         }
-        if func == AggregateFunc::ArrayAgg {
-            // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801）。引数が 2 つ以上の形は
+        if func.uses_array_agg_state() {
+            // `array_agg(<式> [ORDER BY ...])`（SQL-57・Issue #1801。`json_agg`・`jsonb_agg` は
+            // Issue #3264 で同じ文法）。引数が 2 つ以上の形は
             // 該当シグネチャの関数が無い扱い（`42883`。`string_agg` と同じ）。
             if matches!(self.peek(), Some(Token::Punct(','))) {
-                return Err(SqlSurfaceError::undefined_function(
-                    "function array_agg requires exactly one argument",
-                ));
+                return Err(SqlSurfaceError::undefined_function(format!(
+                    "function {} requires exactly one argument",
+                    func.default_alias()
+                )));
             }
             if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
                 order_by = self.parse_in_aggregate_order_by()?;
@@ -18988,7 +19013,8 @@ fn check_body_aggregate(
         match item {
             AggregateSelectItem::Aggregate(agg) => {
                 // `string_agg`・`array_agg`（SQL-57）はビュー本体には含めさせない（fail-closed）。
-                if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                if agg.func == AggregateFunc::StringAgg
+                    || agg.func.uses_array_agg_state()
                     || agg.func.is_variance_family()
                     || agg.func.is_bool_agg()
                     || agg.func.is_grouping()
@@ -22847,9 +22873,9 @@ fn parse_join_aggregate_item(p: &mut Parser<'_>) -> Result<JoinSelectItem, SqlSu
         });
     }
     // `array_agg` も同じ理由で JOIN は対象外（SQL-57・Issue #1801）。
-    if func == AggregateFunc::ArrayAgg {
+    if func.uses_array_agg_state() {
         return Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "array_agg is not supported in JOIN".to_string(),
+            detail: format!("{} is not supported in JOIN", func.default_alias()),
         });
     }
     // 分散系（SQL-57・Issue #1803）も JOIN は対象外（明示拒否で fail-closed に保つ）。
@@ -26787,7 +26813,8 @@ fn buffered_aggregate_outer(
             match item {
                 AggregateSelectItem::Aggregate(agg) => {
                     // `string_agg`（SQL-57）は評価後射影形ビューの外側では評価しない（fail-closed）。
-                    if matches!(agg.func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg)
+                    if agg.func == AggregateFunc::StringAgg
+                        || agg.func.uses_array_agg_state()
                         || agg.func.is_variance_family()
                         || agg.func.is_bool_agg()
                         || agg.func.is_grouping()
@@ -38760,6 +38787,27 @@ mod tests {
         );
         assert!(is_aggregate_function_name("String_Agg"));
     }
+    /// SQL-57・Issue #3264: `json_agg`・`jsonb_agg` は `array_agg` と同じ文法で解析され、
+    /// 関数名・既定列名・`DISTINCT`・内側 `ORDER BY` が AST に載る。
+    #[test]
+    fn json_agg_parses_like_array_agg() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT json_agg(DISTINCT a ORDER BY a DESC), JSONB_AGG(b) AS xs FROM documents",
+            &lookup,
+        );
+        let first = expect_agg_item(&agg.items()[0]);
+        assert_eq!(first.func, AggregateFunc::JsonAgg);
+        assert!(first.distinct);
+        assert_eq!(first.order_by.len(), 1);
+        assert_eq!(first.func.default_alias(), "json_agg");
+        let second = expect_agg_item(&agg.items()[1]);
+        assert_eq!(second.func, AggregateFunc::JsonbAgg);
+        assert_eq!(second.func.default_alias(), "jsonb_agg");
+        assert!(is_aggregate_function_name("Json_Agg"));
+        assert!(is_aggregate_function_name("JSONB_AGG"));
+    }
+
     /// SQL-57・Issue #1801: `array_agg` の構文。1 引数・`DISTINCT`・内側 `ORDER BY`（複数キー・
     /// 方向・NULL 位置）が AST に載り、数値リテラル・括弧式の前の `DISTINCT` も修飾子と読まれる。
     #[test]

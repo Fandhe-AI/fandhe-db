@@ -359,11 +359,12 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 | JSON スカラー関数（実装済み） | #1599 |
 | JSON 集合返却関数（SRF 基盤待ち） | #2220 |
 | jsonpath（字句・構文解析器は #2183、評価器は #2184、`jsonb_path_*` 関数は #2185、`@?`／`@@` は #2186、`JSON_EXISTS`・`JSON_VALUE`・`JSON_QUERY` は #2187 で実装済み） | #2183〜#2187 |
+| JSON 集計関数（`json_agg`・`jsonb_agg`。実装済み） | #3264 |
 | 索引 | #2204 |
 
 ## 対象外・申し送り
 
 - コード実装はすべて上記の担当 Issue が行う。
-- 集計関数（`jsonb_agg` 系）の担当 Issue は未割当。
+- `json_object_agg`・`jsonb_object_agg` の担当 Issue は未割当（`json_agg`・`jsonb_agg` は #3264 で実装済み）。
 - SRF 基盤（#2220 系）。
 - spec 側の課題があれば spec リポ側で扱う。

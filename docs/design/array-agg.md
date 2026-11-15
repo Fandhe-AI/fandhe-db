@@ -111,3 +111,24 @@
 - 配列を入力にした多次元の結果、ENUM・smallint・char(n)・time・timestamptz・interval の要素
 - `array_agg(...)[i]` などの式・HAVING・文レベル ORDER BY で配列結果を使う形
 - 要素数の上限の起動時設定（SQL-46 の範囲。#1606 の申し送りと同じ）
+
+## JSON_AGG・JSONB_AGG（Issue #3264）
+
+`json_agg([DISTINCT] <式> [ORDER BY ...]) [FILTER (WHERE ...)]` と `jsonb_agg(...)` は `array_agg` と
+同じ状態（`sql::array_agg::ArrayAggState`）・束縛（`resolve_array_agg_input`）を共有する別名の集計で、
+確定時だけ `sql::json_agg` が JSON テキストへ書く（`ArrayAggInput.output` が出力形）。GROUP BY のあり・なし、
+末尾 `;` 付きの単独送信、extended query で動く。
+
+- 結果型は `json`（OID 114）／`jsonb`（OID 3802）。入力なしは NULL、NULL 入力は `null` 要素
+- `json_agg` の要素間は カンマと半角スペース（PostgreSQL 17 と同じ）。要素の表記は `json_build_object`・`to_json` と同じ
+  （bigint は厳密・numeric は位取り保持・real/double の非有限値は文字列・bytea は `\x` 付き 16 進の文字列）
+- `jsonb_agg` は空白なしの正規形。json 要素は重複キーを後勝ちで畳む。PostgreSQL の jsonb 出力との
+  要素間の空白差は既存の jsonb 出力と同じ既知差分
+- 資源上限: 要素数は JSON 列の上限（65,536）、出力全体の長さは JSON 列の上限、入れ子の深さは格納時と同じ検証。
+  超過は確保前に `54000`。他テナントの行は判定に寄与しない
+- 受理する要素型は `array_agg` と同じ。`DISTINCT`／引数一致の `ORDER BY` は json 要素が `42883`、bytea が `0A000`
+- 契約変更: `json_agg`・`jsonb_agg` が集計関数名として予約される（同名の `CREATE FUNCTION` は拒否）。
+  `AggregateFunc` に `JsonAgg`・`JsonbAgg` を追加（公開 enum）
+- 対象外: `json_object_agg`・`jsonb_object_agg`、行全体参照 `json_agg(t)`、FROM なし・JOIN・ビュー本体・
+  ウィンドウ・NoSQL 表層、結果を `ORDER BY`／`HAVING`／式の被演算子に使う形（`0A000`）、timestamptz・interval・
+  bit・vector 系・配列・ENUM の要素、`k + 1` のような静的に型を決められない式（`array_agg` と同じ `0A000`）
