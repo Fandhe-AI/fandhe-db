@@ -7350,7 +7350,10 @@ pub(super) fn bind_expr_any(
             // `%` の被演算子の中間演算（`+ - * / %`）は f64 の丸めを剰余へ持ち込まないため、
             // 各演算を整数の checked 演算（|v| <= 2^53 を超えれば 22003）へ置き換える。
             let (l, r) = if *op == BinOp::Rem && lt == ExprType::Scalar && rt == ExprType::Scalar {
-                (rem_harden_operand(l), rem_harden_operand(r))
+                (
+                    rem_harden_operand(Some(lhs), l, env),
+                    rem_harden_operand(Some(rhs), r, env),
+                )
             } else {
                 (l, r)
             };
@@ -9529,16 +9532,39 @@ fn rem_integer_operand(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> boo
 /// （[`BuiltinFn::TypedArith`] の `Int8`。各演算の結果が 2^53 を超えれば `22003`）へ再帰的に
 /// 置き換える（Issue #3273）。f64 レーンでは `((b*b+1)-(b*b)) % 2` のように、最終値だけを見ても
 /// 中間の丸めを検出できないため、各中間演算で精度を保証する。葉（列・リテラル・CAST 等）は不変。
-fn rem_harden_operand(e: BoundExpr) -> BoundExpr {
+fn rem_harden_operand(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> BoundExpr {
     match e {
         BoundExpr::Binary {
             op: op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem),
             lhs,
             rhs,
-        } => BoundExpr::Builtin {
-            f: BuiltinFn::TypedArith(op, NumericKind::Int8),
-            args: vec![rem_harden_operand(*lhs), rem_harden_operand(*rhs)],
-        },
+        } => {
+            let (le, re) = match expr {
+                Some(Expr::Binary { lhs: a, rhs: b, .. }) => (Some(&**a), Some(&**b)),
+                _ => (None, None),
+            };
+            BoundExpr::Builtin {
+                f: BuiltinFn::TypedArith(op, NumericKind::Int8),
+                args: vec![
+                    rem_harden_operand(le, *lhs, env),
+                    rem_harden_operand(re, *rhs, env),
+                ],
+            }
+        }
+        // 整数型への CAST の内部の整数算術も f64 の丸めを持ち込むため再帰的に硬化する。
+        // 内側が整数と証明できない CAST（float8 から整数への丸め等）は CAST 自身の意味論に任せる。
+        BoundExpr::Builtin {
+            f: f @ BuiltinFn::Cast(_),
+            mut args,
+        } => {
+            if let (Some(Expr::Cast { expr: inner, .. }), 1) = (expr, args.len()) {
+                if rem_integer_syntax(inner, env) {
+                    let a = args.remove(0);
+                    args.push(rem_harden_operand(Some(inner), a, env));
+                }
+            }
+            BoundExpr::Builtin { f, args }
+        }
         other => other,
     }
 }
@@ -12844,6 +12870,10 @@ fn numeric_arith_eval(
 fn exact_int(v: f64) -> Result<i64, SqlSurfaceError> {
     if v.is_finite() && v.fract() == 0.0 && v.abs() <= TYPED_INT_EXACT_MAX as f64 {
         Ok(v as i64)
+    } else if v.is_finite() && v.fract() == 0.0 {
+        // 整数値だが f64 で厳密に運べない大きさ（|v| > 2^53）は、不変条件違反ではなく
+        // 値域外として 22003 にする（`%` の被演算子が大きな BIGINT／id を含む場合。Issue #3273）。
+        Err(SqlSurfaceError::numeric_out_of_range("bigint out of range"))
     } else {
         Err(SqlSurfaceError::Internal {
             detail: "typed integer arithmetic received a non-integer operand".to_string(),

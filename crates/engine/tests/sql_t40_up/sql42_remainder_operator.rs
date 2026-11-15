@@ -286,6 +286,33 @@ fn where_remainder_rejects_inexact_intermediate() {
     assert_eq!(r.rows.len(), 3);
 }
 
+/// 整数 CAST の内部の f64 算術も精度検査（22003）の対象にし、丸めによる誤一致を許さない。
+#[test]
+fn where_remainder_hardens_integer_cast_interior() {
+    let (core, ctx, _g) = setup();
+    assert_eq!(
+        code(&core, &ctx, "SELECT CAST(b * b AS bigint) % 2 FROM t"),
+        "22003"
+    );
+}
+
+/// |v| > 2^53 の BIGINT 値を含む被演算子は、不変条件違反（XX000）でなく 22003 にする。
+#[test]
+fn where_remainder_large_bigint_operand_is_22003() {
+    let (core, ctx, _g) = setup();
+    run_opt(
+        &core,
+        &ctx,
+        "INSERT INTO t (id, embedding, n, b, w, r, d, s) VALUES \
+         (4, '[0.4,0.1]', 1, 1152921504606846976, 1, 1.5, 2.5, 'x') USING OPERATION_ID 'seed-big'",
+    )
+    .unwrap_or_else(|e| panic!("insert should succeed: {e:?}"));
+    assert_eq!(
+        code(&core, &ctx, "SELECT id FROM t WHERE (b + 1) % 2 = 0"),
+        "22003"
+    );
+}
+
 /// 型付き UDF の引数への `%` は、定義時・呼び出し時とも整数引数なら受理する。
 #[test]
 fn typed_udf_param_remainder_is_accepted() {
