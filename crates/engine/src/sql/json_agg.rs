@@ -15,7 +15,7 @@
 //!
 //! 資源上限（超過は `54000`。確保の前に判定し、部分的な結果は返さない）: 出力全体の長さは
 //! [`MAX_JSON_FIELD_LEN`]、入れ子の深さ・要素数は格納時と同じ検証（`validate_json_column_text`・
-//! `canonicalize_jsonb_text`）に通す。エスケープによる膨張（最大 6 倍）は 1 片ごとの長さ判定で止める。
+//! `canonicalize_jsonb_text`）に通す。エスケープによる膨張（最大 6 倍）は、展開後の長さを先に数えて確保の前に止める。
 
 use crate::json::{self, DuplicateKeys, MAX_JSON_FIELD_LEN};
 use crate::row_codec::ArrayValue;
@@ -30,18 +30,37 @@ fn too_large() -> SqlSurfaceError {
     SqlSurfaceError::payload_too_large(TOO_LARGE_DETAIL)
 }
 
-/// 引用符付きの JSON 文字列を `out` へ追記する（エスケープ後の長さは入力の高々 6 倍のため、
-/// 入力長を確保の前に見る）。
+/// 引用符付きの JSON 文字列のエスケープ後の長さ（バイト数）を、文字列を作らずに数える。
+/// `json::write_canonical_string` の展開規則（`\"`・`\\`・`\b` 等は 2 バイト、他の制御文字は
+/// `\u00xx` の 6 バイト）と一致させる。
+fn quoted_len(s: &str) -> usize {
+    let mut n: usize = 2;
+    for c in s.chars() {
+        let add = match c {
+            '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+        n = n.saturating_add(add);
+    }
+    n
+}
+
+/// 引用符付きの JSON 文字列を `out` へ追記する。エスケープ後の長さを先に数え、既存の `out` の
+/// 長さと合わせて出力上限を確保の前に判定する（制御文字の多い入力が 6 倍に膨らんでから拒否する
+/// ことを避ける）。確保は必要量だけを `try_reserve` で行い、超過・確保失敗は `54000`。
 fn push_quoted(out: &mut String, s: &str) -> Result<(), SqlSurfaceError> {
     if s.len() > MAX_JSON_FIELD_LEN {
         return Err(too_large());
     }
-    let mut quoted = String::new();
-    quoted
-        .try_reserve(s.len().saturating_add(2))
-        .map_err(|_| too_large())?;
-    json::write_canonical_string(s, &mut quoted);
-    push_checked(out, &quoted)
+    let need = quoted_len(s);
+    let new_len = out.len().checked_add(need).ok_or_else(too_large)?;
+    if new_len > MAX_JSON_FIELD_LEN {
+        return Err(too_large());
+    }
+    out.try_reserve(need).map_err(|_| too_large())?;
+    json::write_canonical_string(s, out);
+    Ok(())
 }
 
 /// 非有限の浮動小数は PostgreSQL に合わせて JSON 文字列にする。
@@ -170,6 +189,32 @@ mod tests {
 
     fn json_of(a: ArrayValue) -> String {
         render(&a, ArrayAggOutput::Json).unwrap()
+    }
+
+    #[test]
+    fn quoted_len_matches_the_escaped_output() {
+        for src in ["abc", "a\"b\\c\n\t\u{1}", "日本語\u{1f}", ""] {
+            let mut q = String::new();
+            json::write_canonical_string(src, &mut q);
+            assert_eq!(quoted_len(src), q.len(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn control_heavy_text_is_rejected_by_expanded_size() {
+        // 入力長は上限内だが、U+0001 が 6 倍に展開されると上限を超える。
+        let src = "\u{1}".repeat(MAX_JSON_FIELD_LEN / 2);
+        let mut out = String::new();
+        assert!(push_quoted(&mut out, &src).is_err());
+        assert!(out.is_empty());
+        assert!(out.capacity() < MAX_JSON_FIELD_LEN);
+    }
+
+    #[test]
+    fn existing_output_length_counts_toward_the_limit() {
+        let mut out = "x".repeat(MAX_JSON_FIELD_LEN - 3);
+        assert!(push_quoted(&mut out, "ab").is_err());
+        assert_eq!(out.len(), MAX_JSON_FIELD_LEN - 3);
     }
 
     #[test]

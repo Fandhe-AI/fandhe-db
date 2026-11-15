@@ -120,7 +120,7 @@
 末尾 `;` 付きの単独送信、extended query で動く。
 
 - 結果型は `json`（OID 114）／`jsonb`（OID 3802）。入力なしは NULL、NULL 入力は `null` 要素
-- `json_agg` の要素間は `, `（PostgreSQL 17 と同じ）。要素の表記は `json_build_object`・`to_json` と同じ
+- `json_agg` の要素間は カンマと半角スペース（PostgreSQL 17 と同じ）。要素の表記は `json_build_object`・`to_json` と同じ
   （bigint は厳密・numeric は位取り保持・real/double の非有限値は文字列・bytea は `\x` 付き 16 進の文字列）
 - `jsonb_agg` は空白なしの正規形。json 要素は重複キーを後勝ちで畳む。PostgreSQL の jsonb 出力との
   要素間の空白差は既存の jsonb 出力と同じ既知差分
