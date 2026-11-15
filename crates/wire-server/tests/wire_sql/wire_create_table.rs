@@ -383,3 +383,42 @@ fn wire_insert_into_child_of_allocated_parent_id_checks_parent_existence() {
     assert_eq!(read_command_complete(&mut stream), "SELECT 1");
     read_ready_for_query(&mut stream);
 }
+/// CHECK 付きの表は、NULL を含む比較（UNKNOWN）の行を受理し、FALSE の行だけを `23514` で拒否する
+/// （TABLE-16・SQL-26、Issue #3242）。psql が送る末尾 `;` 付きの単独文でも同じで、違反後も接続は
+/// 継続して使える。
+#[test]
+fn wire_check_constraint_accepts_null_comparison_and_rejects_false_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE ranges (lo INTEGER, hi INTEGER, CHECK (lo < hi));",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO ranges (lo, hi) VALUES (NULL, 5);",
+            "INSERT 0 1",
+        ),
+        (
+            "INSERT INTO ranges (lo, hi) VALUES (5, NULL);",
+            "INSERT 0 1",
+        ),
+        ("INSERT INTO ranges (lo, hi) VALUES (1, 2);", "INSERT 0 1"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(&mut stream, "INSERT INTO ranges (lo, hi) VALUES (9, 1);");
+    expect_error_response_with_sqlstate(&mut stream, "23514");
+    read_ready_for_query(&mut stream);
+
+    // 接続は継続して使える。
+    send_simple_query(&mut stream, "INSERT INTO ranges (lo, hi) VALUES (2, 3);");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
