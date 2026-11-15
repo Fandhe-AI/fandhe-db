@@ -11669,6 +11669,7 @@ impl EngineCore {
                 session.udfs(),
                 validated.limit,
                 validated.offset,
+                &validated.order_by,
                 max_result_bytes.min(crate::arena::MAX_ARENA_TOTAL_BYTES),
                 self.group_by_limits,
                 &self.result_limits,
@@ -13050,6 +13051,7 @@ impl EngineCore {
                     dummy_equality_flags,
                     validated.limit,
                     validated.offset,
+                    &validated.order_by,
                     limits,
                 )?;
                 Ok(Some(columns))
@@ -14354,6 +14356,7 @@ impl EngineCore {
                     session.udfs(),
                     validated.limit,
                     validated.offset,
+                    &validated.order_by,
                     self.group_by_limits,
                     limits,
                 )?;
@@ -17168,6 +17171,7 @@ impl EngineCore {
             session.udfs(),
             validated.limit,
             validated.offset,
+            &validated.order_by,
             &self.explain_limits(),
             Some(&mut leaves),
         )?;

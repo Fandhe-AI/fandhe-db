@@ -764,6 +764,7 @@ fn bind_scan_plan(
         physical_order_keys: Vec::new(),
         embedded_scalar_subqueries: Vec::new(),
         with_ties: false,
+        distinct_on: None,
     };
     let bound = super::parser::bind_scan(&scan, &schema, udfs)?;
     Ok(ScanPlan {

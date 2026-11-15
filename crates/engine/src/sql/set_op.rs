@@ -27,6 +27,12 @@
 //! `eval_tree` が同時に保持し得ると、単一クエリの結果予算をはるかに超える
 //! 合計メモリを SQL 入力だけで確保できてしまう〔DoS〕ため）。
 //!
+//! 括弧なし末尾の `ORDER BY`（集合全体のソートキー。Issue #3266）は、本モジュールが出力列名・
+//! 序数を左端の枝の列へ解決する（[`resolve_order_keys`]）ところまでを担う。ソート実行は
+//! Issue #3267 の責務で、それまでは解決に成功したキーも [`check_set_order_by`] の関門が
+//! `0A000` で拒否する（未ソートの行を返さない fail-closed。実行・Describe・`EXPLAIN`・
+//! `DECLARE CURSOR` はいずれも [`prepare`]／[`describe_columns`] を通る）。
+//!
 //! スコープ外（Issue #929 の対象外事項。詳細は PR 本文参照）:
 //! - 明示トランザクション内での実行
 
@@ -35,9 +41,10 @@ use std::collections::{HashMap, HashSet};
 use crate::catalog::{ColumnType, TableSchema};
 use crate::policy::PolicyContext;
 use crate::sql::allowlist::{
-    SetAggregateBranch, SetOperator, SetTree, SqlSurfaceError, ValidatedScan,
+    SetAggregateBranch, SetOperator, SetOrderKey, SetTree, SqlSurfaceError, ValidatedScan,
 };
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::order_value::NullPlacement;
 use crate::sql::udf_call::UdfRegistry;
 
 /// 重複除去を伴う演算（`UNION`／`INTERSECT`／`EXCEPT`）の行キー集合の基数上限
@@ -794,17 +801,116 @@ fn validate_tree_types(
     }
 }
 
+/// 解決済みの集合全体 `ORDER BY` キー（Issue #3266）。`index` は合成後の出力列の位置（0 始まり）。
+/// `nulls` は未指定を PG 既定（ASC は末尾・DESC は先頭）で確定した値。ソート実行（Issue #3267）が
+/// 受け取る形で、本 Issue では関門（[`check_set_order_by`]）の判定にだけ使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ResolvedSetOrderKey {
+    pub(crate) index: usize,
+    pub(crate) descending: bool,
+    pub(crate) nulls: NullPlacement,
+}
+
+/// 出力列メタデータの列名（疑似列 `id` は `id`）。
+fn output_column_name(meta: &ColumnMeta) -> &str {
+    match meta {
+        ColumnMeta::Id => "id",
+        ColumnMeta::AliasedId { name }
+        | ColumnMeta::Scalar { name, .. }
+        | ColumnMeta::Computed { name, .. }
+        | ColumnMeta::Record { name, .. } => name,
+    }
+}
+
+/// 集合全体 `ORDER BY` のキーを合成後の出力列（左端の枝の列名）へ解決する（Issue #3266）。
+/// 序数は `1..=列数`（範囲外は `42P10`）、列名は出力列名と一致するもの（無ければ `42703`、
+/// 2 列以上と一致なら `42702`）。枝のテーブルにあっても出力に無い列は `42703`（PG と同じ）。
+/// 行を読まないため、可視行の有無によらず分類・文言は同一（テナント境界を緩めない）。
+pub(crate) fn resolve_order_keys(
+    columns: &[ColumnMeta],
+    keys: &[SetOrderKey],
+) -> Result<Vec<ResolvedSetOrderKey>, SqlSurfaceError> {
+    let mut resolved = Vec::with_capacity(keys.len());
+    for key in keys {
+        match key {
+            SetOrderKey::Ordinal {
+                position,
+                descending,
+                nulls,
+            } => {
+                let index = usize::try_from(*position)
+                    .ok()
+                    .and_then(|p| p.checked_sub(1))
+                    .filter(|i| *i < columns.len())
+                    .ok_or(SqlSurfaceError::OrderByPositionNotInSelectList {
+                        position: *position,
+                    })?;
+                resolved.push(ResolvedSetOrderKey {
+                    index,
+                    descending: *descending,
+                    nulls: nulls.unwrap_or(NullPlacement::pg_default(*descending)),
+                });
+            }
+            SetOrderKey::Column {
+                name,
+                descending,
+                nulls,
+            } => {
+                let mut matches = columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| output_column_name(c) == name.as_str())
+                    .map(|(i, _)| i);
+                let index = matches
+                    .next()
+                    .ok_or_else(|| SqlSurfaceError::undefined_column(name.clone()))?;
+                if matches.next().is_some() {
+                    return Err(SqlSurfaceError::ambiguous_column(name.clone()));
+                }
+                resolved.push(ResolvedSetOrderKey {
+                    index,
+                    descending: *descending,
+                    nulls: nulls.unwrap_or(NullPlacement::pg_default(*descending)),
+                });
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// ソート未実装の間の関門（Issue #3266。実装は Issue #3267）。キーを解決（構文・束縛の誤りは
+/// 先に `42703`／`42702`／`42P10`）し、1 つ以上あれば `0A000` で拒否する。Execute・Describe・
+/// `EXPLAIN`・`DECLARE CURSOR` が同じ関数を通るため受理・拒否が一致する。#3267 はこの関門を
+/// 解決済みキーの返却へ置き換える。
+pub(crate) fn check_set_order_by(
+    columns: &[ColumnMeta],
+    keys: &[SetOrderKey],
+) -> Result<(), SqlSurfaceError> {
+    let resolved = resolve_order_keys(columns, keys)?;
+    if resolved.is_empty() {
+        Ok(())
+    } else {
+        Err(SqlSurfaceError::feature_not_supported(
+            "ORDER BY over a set operation result is not supported yet",
+        ))
+    }
+}
+
 /// 行を読まない準備段（Issue #2047・SQL-75 (2)(6) ポインタ）。全体 `LIMIT`／`OFFSET` の範囲検証
 /// → 全枝の束縛と列型整合の検証、の順で行う。実行（[`execute_with_budget_and_result_limits`]）と
 /// `EXPLAIN`（`core.rs` の `run_set_operation_explain`）の双方がこの 1 関数を通るため、判定順と
 /// `wire_code` が構造的に一致する。`leaves` を渡すと束縛した葉を左から右の順に積む（`EXPLAIN` 用。
 /// 実行側は `None`）。戻り値は検証済みの全体 `LIMIT`（`Some` なら範囲内）と `OFFSET`。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare(
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
     udfs: &UdfRegistry,
     limit: Option<u32>,
     offset: u32,
+    // Issue #3266: 括弧なし末尾 `ORDER BY` のキー（空は無し）。
+    order_by: &[SetOrderKey],
     result_limits: &crate::result_limits::ResultLimits,
     leaves: Option<&mut Vec<BoundSetLeaf>>,
 ) -> Result<(Option<usize>, usize), SqlSurfaceError> {
@@ -820,7 +926,9 @@ pub(crate) fn prepare(
     let validated_offset = crate::sql::parser::validate_search_offset(offset)?;
     // PR #1105 レビュー指摘対応: 列数・列型整合（`DatatypeMismatch`・`42804`）を全枝の走査・合成より
     // 前に確定させる（[`validate_tree_types`] のドキュメンテーションコメント参照）。
-    validate_tree_types(schemas, tree, udfs, leaves)?;
+    let (columns, _) = validate_tree_types(schemas, tree, udfs, leaves)?;
+    // Issue #3266: キーの解決（`42703`／`42702`／`42P10`）→ 未実装の関門（`0A000`）。
+    check_set_order_by(&columns, order_by)?;
     Ok((validated_limit, validated_offset))
 }
 
@@ -1072,6 +1180,8 @@ pub(crate) fn execute(
     limit: Option<u32>,
     // Issue #1796: 全体 `OFFSET`（省略時 0）。評価後の行から先に読み飛ばす。
     offset: u32,
+    // Issue #3266: 括弧なし末尾 `ORDER BY` のキー。
+    order_by: &[SetOrderKey],
     // Issue #1550: 集計形の枝へ渡す `GROUP BY` の列数・グループ数上限（`EngineCore` 保持）。
     group_limits: crate::group_by_limits::GroupByLimits,
     // Issue #1555: 全体 `LIMIT` の範囲上限（`EngineCore` 保持。枝行数上限
@@ -1086,6 +1196,7 @@ pub(crate) fn execute(
         udfs,
         limit,
         offset,
+        order_by,
         crate::arena::MAX_ARENA_TOTAL_BYTES,
         group_limits,
         &result_limits,
@@ -1117,6 +1228,7 @@ pub(crate) fn execute_with_budget(
         udfs,
         limit,
         0,
+        &[],
         budget_cap,
         group_limits,
         &crate::result_limits::ResultLimits::default(),
@@ -1133,12 +1245,21 @@ pub(crate) fn execute_with_budget_and_result_limits(
     udfs: &UdfRegistry,
     limit: Option<u32>,
     offset: u32,
+    order_by: &[SetOrderKey],
     budget_cap: usize,
     group_limits: crate::group_by_limits::GroupByLimits,
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    let (validated_limit, validated_offset) =
-        prepare(schemas, tree, udfs, limit, offset, result_limits, None)?;
+    let (validated_limit, validated_offset) = prepare(
+        schemas,
+        tree,
+        udfs,
+        limit,
+        offset,
+        order_by,
+        result_limits,
+        None,
+    )?;
     let mut budget = SetOpBudget::new(budget_cap);
     let outcome = eval_tree(
         read_txn,
@@ -1182,6 +1303,7 @@ pub(crate) fn execute_with_budget_and_result_limits(
 /// `LIMIT`（任意）で、[`execute`] と同じ範囲検証（`1..=MAX_SEARCH_K`）を行う
 /// （PR #1105 レビュー指摘対応: 従来は Describe が全体 `LIMIT` を一切検証せず、
 /// Execute では拒否される範囲外の値が Describe だけ受理されてしまっていた）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn describe_columns(
     schemas: &HashMap<String, TableSchema>,
     tree: &SetTree,
@@ -1189,6 +1311,7 @@ pub(crate) fn describe_columns(
     dummy_equality_flags: &[bool],
     limit: Option<u32>,
     offset: u32,
+    order_by: &[SetOrderKey],
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<Vec<ColumnMeta>, SqlSurfaceError> {
     if let Some(n) = limit {
@@ -1205,15 +1328,17 @@ pub(crate) fn describe_columns(
         dummy_equality_flags.len() / leaves
     };
     let mut next_leaf = 0usize;
-    Ok(describe_tree(
+    let (columns, _) = describe_tree(
         schemas,
         tree,
         udfs,
         dummy_equality_flags,
         width,
         &mut next_leaf,
-    )?
-    .0)
+    )?;
+    // Issue #3266: Execute（[`prepare`]）と同じ関門を通し、Describe と Execute の受理・拒否を一致させる。
+    check_set_order_by(&columns, order_by)?;
+    Ok(columns)
 }
 
 /// 集合演算木の枝（葉）数。
@@ -1351,6 +1476,7 @@ mod tests {
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }))
     }
 
@@ -1618,6 +1744,7 @@ mod tests {
             &udfs,
             Some(0),
             0,
+            &[],
             crate::group_by_limits::GroupByLimits::default(),
             crate::result_limits::ResultLimits::default(),
         )
@@ -1632,6 +1759,7 @@ mod tests {
             &udfs,
             Some(crate::core::MAX_SEARCH_K as u32 + 1),
             0,
+            &[],
             crate::group_by_limits::GroupByLimits::default(),
             crate::result_limits::ResultLimits::default(),
         )
@@ -1647,8 +1775,17 @@ mod tests {
         let schemas: HashMap<String, TableSchema> = HashMap::new();
         let udfs = UdfRegistry::default();
 
-        let err = describe_columns(&schemas, &tree, &udfs, &[], Some(0), 0, &Default::default())
-            .expect_err("LIMIT 0 must be rejected by describe_columns");
+        let err = describe_columns(
+            &schemas,
+            &tree,
+            &udfs,
+            &[],
+            Some(0),
+            0,
+            &[],
+            &Default::default(),
+        )
+        .expect_err("LIMIT 0 must be rejected by describe_columns");
         assert_eq!(err.wire_code(), "22000");
 
         let err = describe_columns(
@@ -1658,6 +1795,7 @@ mod tests {
             &[],
             Some(crate::core::MAX_SEARCH_K as u32 + 1),
             0,
+            &[],
             &Default::default(),
         )
         .expect_err("LIMIT over MAX_SEARCH_K must be rejected by describe_columns");
@@ -1689,6 +1827,7 @@ mod tests {
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }))
     }
 
@@ -1861,6 +2000,7 @@ mod tests {
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         }))
     }
 
@@ -1935,9 +2075,91 @@ mod tests {
                     SetOperator::Except | SetOperator::ExceptAll => 0,
                 };
                 assert_eq!(result.rows.len(), expected, "{op:?} {state}");
-                describe_columns(&schemas, &tree, &udfs, &[], None, 0, &Default::default())
-                    .unwrap_or_else(|e| panic!("describe {op:?} {state}: {e:?}"));
+                describe_columns(
+                    &schemas,
+                    &tree,
+                    &udfs,
+                    &[],
+                    None,
+                    0,
+                    &[],
+                    &Default::default(),
+                )
+                .unwrap_or_else(|e| panic!("describe {op:?} {state}: {e:?}"));
             }
         }
+    }
+
+    fn named(name: &str) -> ColumnMeta {
+        ColumnMeta::Scalar {
+            name: name.to_string(),
+            ty: ColumnType::Text,
+        }
+    }
+
+    fn ord_key(position: i64, descending: bool) -> SetOrderKey {
+        SetOrderKey::Ordinal {
+            position,
+            descending,
+            nulls: None,
+        }
+    }
+
+    /// Issue #3266: 序数は `1..=列数` だけを受理し、境界の外は `42P10`。
+    #[test]
+    fn resolve_order_keys_checks_ordinal_bounds() {
+        let cols = vec![named("a"), named("b")];
+        for bad in [0, 3, -1] {
+            let err = resolve_order_keys(&cols, &[ord_key(bad, false)]).expect_err("out of range");
+            assert_eq!(err.wire_code(), "42P10", "{bad}");
+        }
+        let ok = resolve_order_keys(&cols, &[ord_key(1, false), ord_key(2, true)]).unwrap();
+        assert_eq!((ok[0].index, ok[1].index), (0, 1));
+    }
+
+    /// Issue #3266: 列名の一致・不一致（`42703`）・重複（`42702`）と `NULLS` 既定値の確定。
+    #[test]
+    fn resolve_order_keys_resolves_names_and_defaults_nulls() {
+        let cols = vec![named("a"), named("b"), named("a")];
+        let col = |n: &str, d: bool| SetOrderKey::Column {
+            name: n.to_string(),
+            descending: d,
+            nulls: None,
+        };
+        assert_eq!(
+            resolve_order_keys(&cols, &[col("zz", false)])
+                .expect_err("unknown")
+                .wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            resolve_order_keys(&cols, &[col("a", false)])
+                .expect_err("duplicate")
+                .wire_code(),
+            "42702"
+        );
+        let ok = resolve_order_keys(&cols, &[col("b", false), col("b", true)]).unwrap();
+        assert_eq!(ok[0].nulls, NullPlacement::Last);
+        assert_eq!(ok[1].nulls, NullPlacement::First);
+        let explicit = SetOrderKey::Column {
+            name: "b".to_string(),
+            descending: false,
+            nulls: Some(NullPlacement::First),
+        };
+        assert_eq!(
+            resolve_order_keys(&cols, &[explicit]).unwrap()[0].nulls,
+            NullPlacement::First
+        );
+    }
+
+    /// Issue #3266: 解決に成功したキーも、ソート実装（#3267）までは関門が `0A000` で拒否する。
+    #[test]
+    fn check_set_order_by_gate_rejects_resolved_keys_with_0a000() {
+        let cols = vec![named("a")];
+        assert!(check_set_order_by(&cols, &[]).is_ok());
+        let err = check_set_order_by(&cols, &[ord_key(1, false)]).expect_err("gate");
+        assert_eq!(err.wire_code(), "0A000");
+        let err = check_set_order_by(&cols, &[ord_key(2, false)]).expect_err("resolve first");
+        assert_eq!(err.wire_code(), "42P10");
     }
 }

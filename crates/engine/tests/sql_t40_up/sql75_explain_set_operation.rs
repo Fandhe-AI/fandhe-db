@@ -366,3 +366,22 @@ fn works_inside_explicit_transaction() {
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "COMMIT")
         .expect("commit");
 }
+
+/// 括弧なし末尾 `ORDER BY`（集合全体のキー。Issue #3266）は `EXPLAIN`・`EXPLAIN ANALYZE` でも
+/// 実行と同じ分類になる（ソート実行は #3267 まで `0A000`。解決できないキーは `42703`／`42P10`）。
+// tracked: #3267
+#[test]
+fn trailing_order_by_is_classified_like_execution() {
+    let (core, _g) = seeded("x75s-order-by");
+    for prefix in ["EXPLAIN", "EXPLAIN ANALYZE"] {
+        for (tail, want) in [
+            ("ORDER BY k", "0A000"),
+            ("ORDER BY 1 DESC NULLS FIRST LIMIT 1", "0A000"),
+            ("ORDER BY nope", "42703"),
+            ("ORDER BY 2", "42P10"),
+        ] {
+            let sql = format!("{prefix} SELECT k FROM a UNION SELECT k FROM b {tail}");
+            assert_eq!(code(&core, &sql), want, "{sql}");
+        }
+    }
+}
