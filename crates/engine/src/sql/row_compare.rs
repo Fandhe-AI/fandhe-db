@@ -33,18 +33,22 @@ pub(crate) fn contains_row_compare(preds: &[WherePredicate]) -> bool {
     })
 }
 
-/// トップレベルの連言に含まれる行値比較を展開した連言を返す（行値比較以外は複製）。
+/// トップレベルの連言に含まれる行値比較を展開し、`(行値比較以外の述語の複製, 展開で生成した述語)` を返す。
+/// 生成した述語は元のテキスト上に等価述語の字句として現れず、Describe 用ダミーフラグ
+/// （`sql::params::where_equality_literal_is_param`）の序数に数えられていないため、束縛段は
+/// 生成分を別カウンタ・空フラグ（常に実リテラル扱い）で束縛して、兄弟の `$n` の序数をずらさない。
 /// `Or` 分岐の中の行値比較は、分岐ごとの再帰束縛でこの関数が再び適用される。
 /// `Not(RowCompare)` は構文段が演算子反転へ押し下げるため届かない想定で、届いたら `Internal`。
 pub(crate) fn lower_top_level(
     preds: &[WherePredicate],
     budget: &mut usize,
-) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+) -> Result<(Vec<WherePredicate>, Vec<WherePredicate>), SqlSurfaceError> {
     let mut out = Vec::with_capacity(preds.len());
+    let mut generated = Vec::new();
     for p in preds {
         match p {
             WherePredicate::RowCompare { lhs, op, rhs } => {
-                out.extend(lower_row_compare(lhs, *op, rhs, budget)?);
+                generated.extend(lower_row_compare(lhs, *op, rhs, budget)?);
             }
             WherePredicate::Not(inner)
                 if matches!(inner.as_ref(), WherePredicate::RowCompare { .. }) =>
@@ -54,7 +58,7 @@ pub(crate) fn lower_top_level(
             other => out.push(other.clone()),
         }
     }
-    Ok(out)
+    Ok((out, generated))
 }
 
 fn internal(detail: &str) -> SqlSurfaceError {

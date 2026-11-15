@@ -3311,14 +3311,20 @@ fn bind_where_predicates_recursive(
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
     // 行値比較（SQL-9・Issue #3256）: 束縛の前に既存の述語（比較葉・`Or`・連言）へ展開し、以降は
     // 通常の比較と同じ書き換え・束縛を通す（`sql::row_compare`）。`Or` 分岐は再帰でここへ戻る。
+    // 展開で生成した述語は元テキストの等価述語として数えられていない（`sql::params` のダミーフラグは
+    // 元トークン列の走査）ため、`equality_ordinal` を消費させず末尾で別カウンタ・空フラグで束縛する。
     let lowered;
+    let mut generated: Vec<WherePredicate> = Vec::new();
     let where_predicates: &[WherePredicate] = if where_predicates.iter().any(|p| {
         matches!(
             p,
             WherePredicate::RowCompare { .. } | WherePredicate::Not(_)
         )
     }) {
-        lowered = crate::sql::row_compare::lower_top_level(where_predicates, node_budget)?;
+        let (kept, produced) =
+            crate::sql::row_compare::lower_top_level(where_predicates, node_budget)?;
+        lowered = kept;
+        generated = produced;
         &lowered
     } else {
         where_predicates
@@ -3597,11 +3603,27 @@ fn bind_where_predicates_recursive(
             }
         }
     }
-    let metadata_filters = declarative_filter::bind_all_for_describe(
+    let mut metadata_filters = declarative_filter::bind_all_for_describe(
         &declarative_filters,
         schema,
         &filter_skip_enum_validation,
     )?;
+    if !generated.is_empty() {
+        let mut gen_ordinal = 0usize;
+        let (gen_meta, gen_expr, _gen_rls, gen_or) = bind_where_predicates_recursive(
+            &generated,
+            schema,
+            udfs,
+            node_budget,
+            &[],
+            &mut gen_ordinal,
+            rewrite_total,
+            allow_text_range_rewrite,
+        )?;
+        metadata_filters.extend(gen_meta);
+        expr_filters.extend(gen_expr);
+        or_filters.extend(gen_or);
+    }
     Ok((
         metadata_filters,
         expr_filters,

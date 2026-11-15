@@ -980,6 +980,35 @@ fn describe_prepared_rejects_real_invalid_enum_label_alongside_unrelated_dollar_
     assert_eq!(err.wire_code(), "22P02");
 }
 
+// Issue #3256・PR #3447 指摘の回帰: 行値比較の展開で生成した葉はダミーフラグの序数を消費しない。
+// 行値比較と `$n` の等価述語が同居しても `$n` のダミー値だけが検証を省略され、
+// 行値内の実リテラルの検証は維持される。
+#[test]
+fn describe_prepared_row_compare_does_not_shift_dummy_flag_ordinals() {
+    let path = unique_db_path("prepared-describe-row-compare-ordinal");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_enum_documents_table(&path);
+    let session = SessionState::default();
+
+    let ok = core
+        .parse_sql_prepared(
+            "SELECT id FROM documents WHERE (lang, mood) = ('en', 'happy') AND mood = $1 LIMIT 5",
+        )
+        .expect("parse_sql_prepared should succeed");
+    core.describe_prepared_in_session(&session, &ok)
+        .expect("row compare must not consume the ordinal of the sibling $n equality");
+
+    let bad = core
+        .parse_sql_prepared(
+            "SELECT id FROM documents WHERE (lang, mood) = ('en', 'not-a-real-mood') AND mood = $1 LIMIT 5",
+        )
+        .expect("parse_sql_prepared should succeed");
+    let err = core
+        .describe_prepared_in_session(&session, &bad)
+        .expect_err("the real literal inside the row value must still be validated");
+    assert_eq!(err.wire_code(), "22P02");
+}
+
 // PR #1012 レビュー指摘対応: 同じ根本原因（`bind_where_predicates` の値検証を
 // Prepared Describe が無条件にスキップし得る）は集計 SELECT・広域取得
 // （scan）経由の Describe でも同様に起こり得るため、`bind_aggregate`・
