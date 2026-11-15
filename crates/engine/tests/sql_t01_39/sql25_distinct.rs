@@ -868,6 +868,32 @@ fn distinct_on_returns_first_row_per_group_across_tenants() {
     }
 }
 
+/// 関数の暗黙の出力名（`lower`）を ON／ORDER BY キーに書いても、物理列 `lower` ではなく
+/// 投影式 `lower(lang)` へ束縛される（Issue #3261 のレビュー指摘。物理列が無くても 42703 にならない）。
+#[test]
+fn distinct_on_implicit_function_output_name_binds_to_expression() {
+    let path = unique_db_path("sql25-distinct-on-implicit-name");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let _truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let ctx = ctx_for("tenant-a", true);
+    for sql in [
+        "SELECT DISTINCT ON (lower) lower(lang) FROM docs",
+        "SELECT DISTINCT ON (lower) lower(lang) FROM docs ORDER BY lower",
+    ] {
+        let result = core.execute_sql(&ctx, sql).expect(sql);
+        let got: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| as_text(&r.cells[0]).expect("lower"))
+            .collect();
+        let uniq: BTreeSet<&String> = got.iter().collect();
+        assert_eq!(got.len(), uniq.len(), "one row per key: {sql}");
+        assert!(!got.is_empty(), "{sql}");
+    }
+}
+
 /// 重複排除は OFFSET／LIMIT より前（OFFSET はグループ単位で効く）。式・別名・序数キーも受理する。
 #[test]
 fn distinct_on_dedups_before_offset_and_accepts_alias_ordinal_expression_keys() {

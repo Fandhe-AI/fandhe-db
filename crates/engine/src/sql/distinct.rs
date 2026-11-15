@@ -248,6 +248,26 @@ fn canonical_sort_keys(
     Ok(unique_keys)
 }
 
+fn canon_of_on(e: &Expr, projection: &Projection) -> Result<Expr, SqlSurfaceError> {
+    canonical_key(e, projection)
+}
+
+/// 裸名の `ORDER BY` キーが暗黙の出力名（関数名）経由で式へ解決された場合、同じ式の式キーへ
+/// 置き換える（束縛段の別名解決は明示別名しか扱わず、裸名のままだと物理列として引かれて
+/// 検証した式と別の対象を並べ替え・グループ化してしまうため。Issue #3261）。
+fn materialize_implicit_alias(key: ScanOrderKey, canon: &Expr) -> ScanOrderKey {
+    match key {
+        ScanOrderKey::Column { key, nulls } if !matches!(canon, Expr::Ident(_)) => {
+            ScanOrderKey::Expr {
+                expr: canon.clone(),
+                descending: key.descending,
+                nulls,
+            }
+        }
+        other => other,
+    }
+}
+
 /// `DISTINCT ON` の実効ソートキー列とグループ前置長を組み立てる（Issue #3261。SQL-25 のポインタ）。
 ///
 /// PostgreSQL と同じく、`ORDER BY` に現れない ON キーは既定順（`ASC`・NULLS 未指定）で末尾へ暗黙に足す。
@@ -288,8 +308,8 @@ pub(crate) fn distinct_on_effective_order(
             ScanOrderKey::Ordinal { position, .. } => resolve_ordinal(*position, projection)?,
         };
         if !seen.contains(&canon) {
+            effective.push(materialize_implicit_alias(key, &canon));
             seen.push(canon);
-            effective.push(key);
         }
     }
     // ON キー（異なり）のうち ORDER BY に無いものを末尾へ ASC で足す。
@@ -305,6 +325,14 @@ pub(crate) fn distinct_on_effective_order(
         }
         seen.push(canon);
         let key = match e {
+            // 暗黙の出力名（関数名）が式へ解決された場合は、束縛段が物理列として引かないよう式キーにする。
+            Expr::Ident(_) if !matches!(canon_of_on(e, projection), Ok(Expr::Ident(_))) => {
+                ScanOrderKey::Expr {
+                    expr: canon_of_on(e, projection)?,
+                    descending: false,
+                    nulls: None,
+                }
+            }
             Expr::Ident(name) => ScanOrderKey::Column {
                 key: ScalarOrderKey {
                     column: name.clone(),
@@ -595,6 +623,28 @@ mod tests {
         // DISTINCT ON (lower(lang)) ... ORDER BY lower
         let on = [call];
         assert!(check_distinct_on_order_prefix(&on, &proj, &[sk("lower")], &[]).is_ok());
+    }
+
+    #[test]
+    fn effective_order_materializes_implicit_output_name_as_expr_key() {
+        let call = Expr::Call {
+            name: "lower".to_string(),
+            args: vec![id("lang")],
+        };
+        let proj = Projection::Items(vec![SelectItem::Expr {
+            expr: call.clone(),
+            alias: None,
+        }]);
+        // ON キー・ORDER BY キーの双方が物理列 `lower` ではなく `lower(lang)` の式キーになる。
+        let (keys, n) =
+            distinct_on_effective_order(&[id("lower")], &proj, &[], &[]).expect("effective");
+        assert_eq!(n, 1);
+        assert!(matches!(&keys[0], ScanOrderKey::Expr { expr, .. } if *expr == call));
+        let (keys, n) = distinct_on_effective_order(&[id("lower")], &proj, &[sk("lower")], &[])
+            .expect("effective");
+        assert_eq!(n, 1);
+        assert_eq!(keys.len(), 1);
+        assert!(matches!(&keys[0], ScanOrderKey::Expr { expr, .. } if *expr == call));
     }
 
     fn effective(
