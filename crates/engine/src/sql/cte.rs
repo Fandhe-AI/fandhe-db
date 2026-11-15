@@ -538,10 +538,17 @@ pub(crate) fn validate_data_modifying_cte(
             }
             cols.clone()
         }
-        // 別名付き列参照（Issue #3248 で構文段が受理）は CTE 展開が未対応（#3251）。式は構文段で拒否済み。
-        Projection::Items(_) => {
+        // 別名付き列参照（Issue #3248）・式（Issue #3249）は構文段が受理するが、CTE 展開は未対応（#3251）。
+        Projection::Items(items) => {
             return Err(SqlSurfaceError::feature_not_supported(
-                "RETURNING column aliases in a data-modifying CTE are not supported yet",
+                if items
+                    .iter()
+                    .all(crate::sql::allowlist::is_returning_column_item)
+                {
+                    "RETURNING column aliases in a data-modifying CTE are not supported yet"
+                } else {
+                    "RETURNING expressions in a data-modifying CTE are not supported yet"
+                },
             ));
         }
     };

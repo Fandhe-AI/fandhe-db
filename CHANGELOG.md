@@ -9,6 +9,8 @@
 
 ### Changed
 
+- `RETURNING` がスカラー式と組み込み関数を評価するようにした（Issue #3249・SQL-21 ポインタ。基表への INSERT・UPDATE・DELETE・UPSERT。判断は [sql-returning.md](docs/design/sql-returning.md) の「式・組み込み関数の評価」節）。結果の型・値・列名は同じ式の `SELECT` と一致する。UDF 呼び出し・サブクエリ・集計は従来どおり拒否し、採番列・`id` 省略の INSERT との組み合わせは `0A000` で拒否する。依存の追加はない。
+  BREAKING CHANGE: 公開 enum `tenant::TenantWriteError`（`#[non_exhaustive]` ではない）に variant `ReturningExpressionFailed` を追加した（網羅 `match` の下流はコンパイルできなくなる。移行は腕の追加。内側の `SqlSurfaceError` をそのまま透過する）。
 - `RETURNING` が `AS` 別名付きの列参照を受理するようにした（Issue #3248・SQL-21 ポインタ。基表への INSERT・UPDATE・DELETE・UPSERT。判断は [sql-returning.md](docs/design/sql-returning.md) の追記節）。式と `AS` なしの暗黙の別名は従来どおり `42601`。**挙動の変更**: 拒否の文言を原因別に改め、「function-call items」を廃止した。公開 API の変更はない。依存の追加はない。
 - NoSQL（HTTP）表層の書き込み入口（`insert`・単一行／述語形の `update`・`delete`）でトリガを発火させるようにした（Issue #3282・TABLE-45 ポインタ）。engine の `EngineCore::execute_bound_update_in_session` に SET 列名の引数 `set_columns: &[&str]` を追加した（`VectorCore` ではなく `EngineCore` 固有メソッドのため API スナップショットの対象外。移行は SET する列名の列を渡す）。`RETURNING` 付き・UPSERT・分割実行・生の行 API は従来どおり `0A000`。
 - FK の参照アクション（CASCADE・SET NULL・SET DEFAULT）が書き換える子表の ROW トリガを、子行ごとに発火させる（Issue #3284・TABLE-45）。従来は子表に該当イベントのトリガがあると親の UPDATE／DELETE を `0A000` で拒否していた。**挙動の変更**: 結線済みの経路（SQL の UPDATE／DELETE）では BEFORE の書き換え・`NULL` 返却（子行が残れば `23503`）と AFTER が発火し、子の AFTER は親の AFTER より先に発火する。子表の FOR EACH STATEMENT トリガと、結線の無い経路（RETURNING 付き・分割実行・UPSERT の `DO UPDATE`・NoSQL の `RETURNING`／分割実行／UPSERT・生の行 API）は従来どおり `0A000`。NoSQL（HTTP）表層の単一行／述語形の `update`・`delete`（#3282 で結線済み）は SQL と同じ経路を共有するため、子表の ROW トリガも発火する。公開 API の変更はない。

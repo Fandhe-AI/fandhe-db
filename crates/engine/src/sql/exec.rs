@@ -5522,10 +5522,13 @@ fn mask_returning_row_id(schema: &crate::catalog::TableSchema, mut row: ResultRo
 fn returning_collector<'a>(
     ctx: &'a PolicyContext,
     returning: &'a [crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
     mask_row_id: bool,
     budget: &'a mut usize,
     rows: &'a mut Vec<ResultRow>,
 ) -> impl FnMut(&crate::tenant::CapturedRow) -> Result<(), crate::tenant::TenantWriteError> + 'a {
+    // 式項目は文ごとに 1 回だけコンパイルし、行ごとには評価スタックを使い回す（Issue #3249）。
+    let mut projector = crate::sql::returning::ReturningProjector::new(returning, schema);
     move |row: &crate::tenant::CapturedRow| {
         if !ctx.is_visible(&row.tenant_id, row.visibility) {
             // 新規挿入行は不可視なら `XX000` で書き込みを中止する（fail-closed。
@@ -5538,7 +5541,7 @@ fn returning_collector<'a>(
             }
             return Ok(());
         }
-        match crate::sql::returning::project_row(row.id, &row.values, returning, budget) {
+        match projector.project_row(row.id, &row.values, budget) {
             Ok(mut result_row) => {
                 // 採番方式の表は内部 rowid を応答へ出さない（TABLE-23・Issue #2199）。
                 if mask_row_id {
@@ -5555,8 +5558,13 @@ fn returning_collector<'a>(
             Err(SqlSurfaceError::PayloadTooLarge { detail }) => {
                 Err(crate::tenant::TenantWriteError::ReturningProjectionTooLarge(detail))
             }
-            Err(other) => Err(crate::tenant::TenantWriteError::ReturningProjectionFailed(
-                other.to_string(),
+            // 内部不整合は従来どおり `XX000`。式の評価エラー（`22012` 等）は元の SQLSTATE のまま
+            // 透過する（Issue #3249。同じ式の SELECT と同じ `wire_code`）。
+            Err(other @ SqlSurfaceError::Internal { .. }) => Err(
+                crate::tenant::TenantWriteError::ReturningProjectionFailed(other.to_string()),
+            ),
+            Err(other) => Err(crate::tenant::TenantWriteError::ReturningExpressionFailed(
+                other,
             )),
         }
     }
@@ -5639,6 +5647,7 @@ pub(crate) fn execute_delete_returning_in(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -5809,6 +5818,7 @@ pub(crate) fn execute_update_returning_in(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -5910,6 +5920,8 @@ pub(crate) fn map_write_error(
         // SET 右辺式の評価エラー（Issue #1544・SQL-45 のポインタ）も内側の
         // `SqlSurfaceError` を透過する（通常の式評価と同じ `wire_code`）。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner,
+        // RETURNING 式項目の評価エラー（Issue #3249）も内側の `SqlSurfaceError` を透過する。
+        TenantWriteError::ReturningExpressionFailed(inner) => inner,
         // `nextval`／`currval` の採番・解決の失敗（`2200H`・`55000`・`22003`・`0A000` 等。
         // TABLE-24・Issue #1690）も内側の `SqlSurfaceError` を透過する。
         TenantWriteError::SequenceEvaluationFailed(inner) => inner,
@@ -6121,6 +6133,7 @@ pub(crate) fn execute_predicate_delete_returning(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -6390,6 +6403,7 @@ pub(crate) fn execute_predicate_update_returning(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -7050,6 +7064,15 @@ pub(crate) fn execute_insert_returning_in(
     let has_sequence = bounds
         .iter()
         .any(|b| b.id_omitted || b.volatile_default_columns.iter().any(is_sequence_mark));
+    // 式項目（Issue #3249）は文ごとに 1 回だけコンパイルする。採番・`id` 省略の仮値では式を正しく
+    // 評価できず（`10 / seq_col` が仮値 0 で誤って拒否される）、払い出し後の再投影は commit 後に
+    // 失敗しうる（commit 成功境界の違反）ため、この組み合わせは書き込み前に fail-closed で拒否する。
+    let mut projector = crate::sql::returning::ReturningProjector::new(returning, schema);
+    if projector.has_computed() && has_sequence {
+        return Err(SqlSurfaceError::unsupported(
+            "RETURNING expressions are not supported with sequence-assigned values yet",
+        ));
+    }
     let mut rows = Vec::new();
     let mut budget = 0usize;
     // INSERT トリガがある表では、BEFORE が値を短縮したり行をスキップしたりして最終行が入力値より小さく
@@ -7079,17 +7102,12 @@ pub(crate) fn execute_insert_returning_in(
             let probe = sequence_patched_values(bound, schema, |_| Some(0))?;
             rows.push(mask_returning_row_id(
                 schema,
-                crate::sql::returning::project_row(bound.id, &probe, returning, &mut budget)?,
+                projector.project_row(bound.id, &probe, &mut budget)?,
             ));
         } else {
             rows.push(mask_returning_row_id(
                 schema,
-                crate::sql::returning::project_row(
-                    bound.id,
-                    &bound.values,
-                    returning,
-                    &mut budget,
-                )?,
+                projector.project_row(bound.id, &bound.values, &mut budget)?,
             ));
         }
     }
@@ -7121,6 +7139,7 @@ pub(crate) fn execute_insert_returning_in(
     let mut trigger_project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut trigger_budget,
         &mut trigger_rows,
@@ -7193,7 +7212,7 @@ pub(crate) fn execute_insert_returning_in(
             };
             rows.push(mask_returning_row_id(
                 schema,
-                crate::sql::returning::project_row(row_id, &values, returning, &mut budget)?,
+                projector.project_row(row_id, &values, &mut budget)?,
             ));
         }
     }
@@ -7325,6 +7344,7 @@ pub(crate) fn execute_upsert_returning_in(
     let mut project = returning_collector(
         ctx,
         returning,
+        bound_schema,
         bound_schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -8491,8 +8511,11 @@ mod tests {
             let projection = [ProjectedColumn::Id];
             let mut budget = 0usize;
             let mut rows = Vec::new();
+            let schema = crate::catalog::TableSchema::new("docs", Vec::new());
             let result =
-                returning_collector(ctx, &projection, false, &mut budget, &mut rows)(&row(origin));
+                returning_collector(ctx, &projection, &schema, false, &mut budget, &mut rows)(
+                    &row(origin),
+                );
             (result, rows)
         }
 

@@ -1950,12 +1950,17 @@ pub fn bind_column_projection(
 
 /// `RETURNING` 句（Issue #873・#1182・SQL-21）の投影束縛。`INSERT`（UPSERT を含む）・
 /// `DELETE`（単一行・述語形）・`UPDATE`（単一行・述語形）の全形が実行結線済みのため、
-/// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を
-/// [`bind_column_projection`] と同じ [`bind_projection`] へ委譲する（第 2 の
-/// 投影実装を作らない）。`Projection::Items` は別名付き列参照（Issue #3248）だけを
-/// 受理し、式項目は多層防御として `42601` で拒否する——`sql::allowlist::
-/// Parser::parse_returning_clause` が構造検証段で既に同じ判定
-/// （`is_returning_column_item`）を行っており、通常は式はここへ到達しない契約。
+/// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を SELECT と同じ
+/// [`bind_projection_with_literals`] へ委譲する（第 2 の投影実装を作らない。Issue #3249 で
+/// スカラー式・組み込み関数まで受理）。式の型・列名・NULL 規則は SELECT と一致する。
+///
+/// - UDF 呼び出しは空の UDF レジストリで解決するため未定義関数として拒否する（受け皿 #3250）。
+/// - ハイブリッド検索の詳細関数（`hybrid_*()`）・スカラーサブクエリ・集計関数は拒否する。
+///   構文段（`Parser::parse_returning_clause`）が同じ判定（[`crate::sql::allowlist::
+///   returning_item_rejection`]）を行っており、`Validated*` を経ない呼び出し元が迂回できない
+///   よう多層防御として再適用する。
+/// - 束縛エラー（`42883`・`42804`・`42703` 等）はすべて書き込みより前に返るため、行も台帳も
+///   消費しない（呼び出し順は束縛 → 権限 → 台帳 → 書き込み）。
 pub fn bind_returning(
     returning: Option<&Projection>,
     schema: &TableSchema,
@@ -1964,38 +1969,32 @@ pub fn bind_returning(
         return Ok(None);
     };
     if let Projection::Items(items) = projection {
-        // 別名付きの列参照だけを `resolve_projected_column` で直接束縛する（Issue #3248）。
-        // `bind_projection` へ Items を渡すと式・ハイブリッド詳細が出うるため経由しない。
-        let mut cols = Vec::with_capacity(items.len());
-        for item in items {
-            match item {
-                crate::sql::allowlist::SelectItem::Column(name) => {
-                    cols.push(resolve_projected_column(name, name, schema)?);
-                }
-                crate::sql::allowlist::SelectItem::Expr {
-                    expr: Expr::Ident(name),
-                    alias: Some(alias),
-                } if !crate::sql::allowlist::is_scalar_subquery_placeholder_name(name) => {
-                    cols.push(resolve_projected_column(name, alias, schema)?);
-                }
-                crate::sql::allowlist::SelectItem::Expr { .. } => {
-                    return Err(SqlSurfaceError::unsupported(
-                        "RETURNING supports only column references with optional AS aliases; \
-                         expressions are not supported yet",
-                    ));
-                }
-            }
+        if let Some(err) = items
+            .iter()
+            .find_map(crate::sql::allowlist::returning_item_rejection)
+        {
+            return Err(err);
         }
-        return Ok(Some(cols));
     }
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    bind_projection(
+    let cols = bind_projection_with_literals(
         projection,
         schema,
         &crate::sql::udf_call::UdfRegistry::default(),
         &mut node_budget,
-    )
-    .map(Some)
+        &LiteralSkip::NONE,
+        false,
+    )?;
+    // `allow_hybrid_detail = false` のため通常は出ない（不変条件の確認。fail-closed）。
+    if cols
+        .iter()
+        .any(|c| matches!(c, ProjectedColumn::HybridDetail { .. }))
+    {
+        return Err(SqlSurfaceError::Internal {
+            detail: "hybrid detail is not supported in RETURNING".to_string(),
+        });
+    }
+    Ok(Some(cols))
 }
 
 /// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）向けのベクトル値束縛ヘルパー。
