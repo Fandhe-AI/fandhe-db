@@ -99,6 +99,8 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::Json => "json",
         ArrayElemType::Jsonb => "jsonb",
         ArrayElemType::Enum => "enum",
+        ArrayElemType::Varchar(_) => "varchar",
+        ArrayElemType::Bpchar(_) => "bpchar",
         ArrayElemType::SmallInt => "smallint",
         ArrayElemType::Time => "time",
     }

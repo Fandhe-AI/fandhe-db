@@ -1090,13 +1090,7 @@ fn time_array_cast_converts_values_and_checks_range() {
 #[test]
 fn arrays_without_a_representable_element_type_are_not_implemented() {
     let (core, _g) = setup("cast-array-unsupported");
-    for target in [
-        "timestamptz[]",
-        "interval[]",
-        "character varying(3)[]",
-        "character(3)[]",
-        "character varying[]",
-    ] {
+    for target in ["timestamptz[]", "interval[]"] {
         // 文字列型・型付き NULL は常に 0A000。整数配列は要素の組（int4 -> 変換先の要素型）が
         // 規則表で `×` なら 42846 が先に出る（time／timestamptz／interval）。
         for operand in ["ai", "CAST('{1}' AS text)", "NULL"] {
@@ -1111,6 +1105,57 @@ fn arrays_without_a_representable_element_type_are_not_implemented() {
     assert_eq!(err_of(&core, "CAST(ai AS uuid[])").wire_code(), "42846");
     assert_eq!(err_of(&core, "CAST(i4 AS integer[])").wire_code(), "42846");
     assert_eq!(err_of(&core, "CAST(ai AS integer)").wire_code(), "42846");
+}
+
+/// `varchar[]`・`varchar(n)[]`・`char(n)[]` への変換は専用の配列要素型として受理する（Issue #3231）。
+/// 値は `text[]` への変換と同じ規則（型付き NULL・NULL 要素・整数配列の I/O 変換）で、`(n)` は
+/// 要素を黙って切り詰め、`char(n)` は空白詰めする。結果列の型は配列型のままである。
+#[test]
+fn varchar_and_char_arrays_are_cast_targets() {
+    let (core, _g) = setup("cast-array-char");
+    for target in [
+        "character varying(3)[]",
+        "character varying[]",
+        "varchar(3)[]",
+    ] {
+        assert_eq!(
+            value(&core, &format!("CAST(ai AS {target})")),
+            Cell::Array(ArrayValue::Text(vec![
+                Some("1".into()),
+                None,
+                Some("3".into())
+            ])),
+            "ai -> {target}"
+        );
+        assert_eq!(
+            value(&core, &format!("CAST(CAST('{{1}}' AS text) AS {target})")),
+            Cell::Array(ArrayValue::Text(vec![Some("1".into())])),
+            "text -> {target}"
+        );
+        assert_eq!(
+            value(&core, &format!("CAST(NULL AS {target})")),
+            Cell::Null,
+            "NULL -> {target}"
+        );
+    }
+    assert_eq!(
+        value(&core, "CAST(ai AS character(3)[])"),
+        Cell::Array(ArrayValue::Text(vec![
+            Some("1  ".into()),
+            None,
+            Some("3  ".into())
+        ]))
+    );
+    assert_eq!(
+        value(&core, "CAST(CAST('{abcd}' AS text) AS character(2)[])"),
+        Cell::Array(ArrayValue::Text(vec![Some("ab".into())]))
+    );
+    assert_eq!(
+        value(&core, "CAST(CAST('{abcd}' AS text) AS varchar(2)[])"),
+        Cell::Array(ArrayValue::Text(vec![Some("ab".into())]))
+    );
+    // 長さなしの `char[]` は要素型として受理しない。
+    assert_eq!(err_of(&core, "CAST(ai AS char[])").wire_code(), "0A000");
 }
 
 // --- 消費位置・テナント境界 ---

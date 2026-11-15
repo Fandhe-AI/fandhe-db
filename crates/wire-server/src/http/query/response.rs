@@ -505,6 +505,8 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
                 engine::catalog::ArrayElemType::Json => "json[]",
                 engine::catalog::ArrayElemType::Jsonb => "jsonb[]",
                 engine::catalog::ArrayElemType::Enum => "enum[]",
+                engine::catalog::ArrayElemType::Varchar(_) => "varchar[]",
+                engine::catalog::ArrayElemType::Bpchar(_) => "bpchar[]",
             },
         },
     }

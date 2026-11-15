@@ -88,8 +88,9 @@ pub enum CastDst {
     Jsonb,
     Uuid,
     Bytea,
-    /// 配列（要素型は [`CastSrc::Array`] と同じ運び方。`varchar(n)[]` 等の対応要素型の無い
-    /// 変換先は束縛段が `0A000` にするため、ここへは来ない）。
+    /// 配列（要素型は [`CastSrc::Array`] と同じ運び方。`smallint[]` 等の対応要素型の無い
+    /// 変換先は束縛段が `0A000` にするため、ここへは来ない。`varchar(n)[]`・`char(n)[]` は
+    /// Issue #3231 で対応済み）。
     Array(ArrayElemType),
 }
 
@@ -132,7 +133,9 @@ impl CastDst {
 /// 配列の要素型から、要素の変換元の記述子を導く（`enum` 要素は対象外で `None`）。
 pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
     Some(match e {
-        ArrayElemType::Text => CastSrc::Text,
+        // `VARCHAR`／`CHAR(n)` 要素も文字列として扱う。`CHAR(n)` の末尾空白除去は
+        // [`cast_array`] が変換先に応じて行う（Issue #3231）。
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => CastSrc::Text,
         ArrayElemType::Bool => CastSrc::Bool,
         ArrayElemType::SmallInt => CastSrc::Int2,
         ArrayElemType::Integer => CastSrc::Int4,
@@ -155,6 +158,8 @@ pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
 pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
     Some(match e {
         ArrayElemType::Text => CastDst::Text,
+        ArrayElemType::Varchar(len) => CastDst::Varchar(len),
+        ArrayElemType::Bpchar(n) => CastDst::Bpchar(n),
         ArrayElemType::Bool => CastDst::Bool,
         ArrayElemType::SmallInt => CastDst::Int2,
         ArrayElemType::Integer => CastDst::Int4,
@@ -574,7 +579,10 @@ fn decimal_to_float(d: &Decimal, single: bool) -> Result<f64, SqlSurfaceError> {
 
 /// 型修飾子の適用結果の文字列（切り詰め・空白埋め）。`varchar(n)`／`char(n)` への明示的な変換は
 /// 文字数 `n` で黙って切り詰める（代入と違い `22001` にならない）。
-fn apply_char_typmod(s: Cow<'_, str>, to: CastDst) -> Result<Cow<'_, str>, SqlSurfaceError> {
+pub(crate) fn apply_char_typmod(
+    s: Cow<'_, str>,
+    to: CastDst,
+) -> Result<Cow<'_, str>, SqlSurfaceError> {
     let (n, pad) = match to {
         CastDst::Varchar(Some(n)) => (n, false),
         CastDst::Bpchar(n) => (n, true),
@@ -1233,10 +1241,12 @@ pub(crate) fn values_to_array(
         )),
     };
     Ok(match to {
-        ArrayElemType::Text => ArrayValue::Text(collect(values, |v| match v {
-            ExprValue::Text(s) => Ok(s.into_owned()),
-            _ => Err(bad()),
-        })?),
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => {
+            ArrayValue::Text(collect(values, |v| match v {
+                ExprValue::Text(s) => Ok(s.into_owned()),
+                _ => Err(bad()),
+            })?)
+        }
         ArrayElemType::Bool => ArrayValue::Bool(collect(values, |v| match v {
             ExprValue::Bool(b) => Ok(b),
             _ => Err(bad()),
@@ -1305,10 +1315,38 @@ fn cast_array(
         return Err(internal("array element type is not supported for casts"));
     };
     let element = CastFn { from: src, to: dst };
+    // `CHAR(n)` への変換は、要素ごとに n 文字へ空白詰めされる。要素数 × n が配列ペイロード上限を
+    // 超えるなら変換前に `54000` で拒否する（`CHAR(10485760)[]` 等による巨大確保の防止。
+    // Issue #3231）。
+    if let ArrayElemType::Bpchar(n) = to {
+        // NULL 要素は空白詰めされないため数えない（`ARRAY[...]` 経路と同じ契約）。
+        let non_null = array_to_values(a.flat())?
+            .iter()
+            .filter(|e| !matches!(e, ExprValue::Null))
+            .count();
+        let total = (non_null as u64).saturating_mul(u64::from(n));
+        if total > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN) {
+            return Err(SqlSurfaceError::payload_too_large(
+                "array of character(n) elements exceeds the maximum array payload length",
+            ));
+        }
+    }
+    // `CHAR(n)` 要素は空白詰めで保存されるため、`CHAR(n)` 以外へ変換するときは各要素の末尾の
+    // U+0020 を除く（スカラーの `bpchar` → `text` と同じ。Issue #3231）。
+    let rtrim_source =
+        matches!(from, ArrayElemType::Bpchar(_)) && !matches!(to, ArrayElemType::Bpchar(_));
     // 多次元は平坦な要素列を変換してから次元を与え直す（次元を保つ。Issue #1605）。
     let converted = array_to_values(a.flat())?
         .into_iter()
-        .map(|v| apply_cast(element, v))
+        .map(|v| {
+            let v = match v {
+                ExprValue::Text(t) if rtrim_source => {
+                    ExprValue::Text(Cow::Owned(t.trim_end_matches(' ').to_string()))
+                }
+                other => other,
+            };
+            apply_cast(element, v)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let flat = values_to_array(converted, to)?;
     ArrayValue::with_dims(flat, a.dims())

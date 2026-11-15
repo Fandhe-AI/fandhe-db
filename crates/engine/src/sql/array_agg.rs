@@ -353,10 +353,12 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
         Ok(out)
     }
     Ok(match ty {
-        ArrayElemType::Text => ArrayValue::Text(collect(elems, |e| match e {
-            Elem::Text(s) => Some(s),
-            _ => None,
-        })?),
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => {
+            ArrayValue::Text(collect(elems, |e| match e {
+                Elem::Text(s) => Some(s),
+                _ => None,
+            })?)
+        }
         ArrayElemType::Bool => ArrayValue::Bool(collect(elems, |e| match e {
             Elem::Bool(b) => Some(b),
             _ => None,
@@ -476,7 +478,10 @@ fn elem_from_scalar(
     use row_codec::ScalarRef as S;
     let mismatch = || accumulator_bug("array_agg column value does not match its element type");
     Ok(match (ty, v) {
-        (ArrayElemType::Text, S::Text(s)) => Elem::Text(try_clone_str(s)?),
+        (
+            ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_),
+            S::Text(s),
+        ) => Elem::Text(try_clone_str(s)?),
         (ArrayElemType::Bool, S::Bool(b)) => Elem::Bool(*b),
         (ArrayElemType::Integer, S::Integer(x)) => Elem::Integer(*x),
         // smallint 列は `ScalarRef::Integer`（i32）で読まれる。範囲外は格納値の破損として扱う。
@@ -500,6 +505,8 @@ fn elem_from_scalar(
         // 要素型の追加時にコンパイルエラーで対応判断を強制する（Issue #3229）。
         (
             ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
             | ArrayElemType::Bool
             | ArrayElemType::Integer
             | ArrayElemType::BigInt
@@ -534,7 +541,10 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
         return Ok(None);
     }
     Ok(Some(match (ty, v) {
-        (ArrayElemType::Text, ExprValue::Text(s)) => Elem::Text(try_clone_str(&s)?),
+        (
+            ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_),
+            ExprValue::Text(s),
+        ) => Elem::Text(try_clone_str(&s)?),
         (ArrayElemType::Bool, ExprValue::Bool(b)) => Elem::Bool(b),
         (ArrayElemType::Integer, ExprValue::Scalar(x)) => {
             let n = i32::try_from(int_of(x)?)
@@ -560,6 +570,8 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
         // 全要素型を列挙する理由は `elem_from_scalar` と同じ（Issue #3229）。
         (
             ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
             | ArrayElemType::Bool
             | ArrayElemType::Integer
             | ArrayElemType::BigInt
