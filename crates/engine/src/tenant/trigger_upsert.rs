@@ -534,7 +534,7 @@ pub(super) fn upsert_rows_with_triggers(
                     } else {
                         assignments.iter().map(|(idx, _)| *idx).collect()
                     };
-                    crate::constraint::enforce_referencing_rows_in_txn(
+                    crate::constraint::enforce_referencing_rows_with_triggers_in_txn(
                         write_txn,
                         table,
                         schema,
@@ -545,6 +545,14 @@ pub(super) fn upsert_rows_with_triggers(
                         },
                         Some(&pre_images),
                         write_target.fk_check_mode(),
+                        // 参照アクションが書き換える子表の ROW トリガも子行ごとに発火する（実行モデルの D8。
+                        // 計画段が子表トリガを許可した経路のため、通過証を持つ UPDATE 計画から渡す）。
+                        update_plan
+                            .map(|plan| crate::constraint::ChildTriggers {
+                                runtime: plan.runtime,
+                                writes,
+                            })
+                            .as_ref(),
                     )?;
                 }
             }

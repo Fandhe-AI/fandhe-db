@@ -371,6 +371,90 @@ fn upsert_fires_insert_and_update_triggers_with_and_without_semicolon() {
     );
 }
 
+// DO UPDATE が親キーを書き換えると、参照アクション（ON UPDATE CASCADE）で書き換わる子表の行トリガも
+// 子行ごとに発火する（実行モデルの D8: 黙って飛ばさない）。子表だけにトリガがある場合と、親側にも
+// UPDATE トリガがある場合の両方。
+fn upsert_child_tables(core: &EngineCore, tenant: &str) {
+    ok(core, tenant, "CREATE SCHEMA s");
+    ok(
+        core,
+        tenant,
+        "CREATE TABLE s.par (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    ok(
+        core,
+        tenant,
+        "CREATE TABLE s.kid (pid INTEGER REFERENCES s.par (id) ON UPDATE CASCADE)",
+    );
+    ok(
+        core,
+        tenant,
+        "CREATE TABLE audit (n INTEGER, lv TEXT, op TEXT)",
+    );
+    ok(core, tenant, "INSERT INTO s.par (id, n) VALUES (1, 0)");
+    ok(core, tenant, "INSERT INTO s.kid (pid) VALUES (1)");
+    func(
+        core,
+        tenant,
+        "log_kid",
+        "BEGIN INSERT INTO audit (n, op) VALUES (NEW.pid, 'kid'); RETURN NULL; END",
+    );
+    func(
+        core,
+        tenant,
+        "log_par",
+        "BEGIN INSERT INTO audit (n, op) VALUES (NEW.id, 'par'); RETURN NULL; END",
+    );
+}
+
+#[test]
+fn upsert_do_update_fires_child_table_row_trigger_on_cascade() {
+    let (_g, core) = open("t45fire-upsert-child");
+    upsert_child_tables(&core, "t1");
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER ku AFTER UPDATE ON s.kid FOR EACH ROW EXECUTE FUNCTION log_kid()",
+    );
+    ok(
+        &core,
+        "t1",
+        "INSERT INTO s.par (id, n) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = 11",
+    );
+    assert_eq!(ints(&core, "t1", "SELECT pid FROM s.kid"), vec![11]);
+    assert_eq!(
+        texts(&core, "t1", "SELECT op FROM audit"),
+        vec!["kid"],
+        "child AFTER UPDATE trigger must fire once"
+    );
+    assert_eq!(ints(&core, "t1", "SELECT n FROM audit"), vec![11]);
+}
+
+#[test]
+fn upsert_do_update_fires_both_parent_and_child_triggers() {
+    let (_g, core) = open("t45fire-upsert-both");
+    upsert_child_tables(&core, "t1");
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER pu AFTER UPDATE ON s.par FOR EACH ROW EXECUTE FUNCTION log_par()",
+    );
+    ok(
+        &core,
+        "t1",
+        "CREATE TRIGGER ku AFTER UPDATE ON s.kid FOR EACH ROW EXECUTE FUNCTION log_kid()",
+    );
+    ok(
+        &core,
+        "t1",
+        "INSERT INTO s.par (id, n) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET id = 11",
+    );
+    assert_eq!(ints(&core, "t1", "SELECT pid FROM s.kid"), vec![11]);
+    let mut ops = texts(&core, "t1", "SELECT op FROM audit");
+    ops.sort();
+    assert_eq!(ops, vec!["kid", "par"]);
+}
+
 // 文トリガ: UPSERT は DO UPDATE のとき UPDATE 文トリガも発火する。再送（operation_id）は二重発火しない。
 #[test]
 fn upsert_statement_triggers_and_replay() {
