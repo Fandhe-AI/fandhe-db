@@ -86,6 +86,22 @@ def classify_explain(text: str) -> str:
     return "unknown"
 
 
+def pick_diagnostic_index(term_strings: list[str]) -> int:
+    """語結合の診断に使うクエリの添字を返す。有効語が 2 個以上ある最初のもの（無ければ 0）。
+
+    1 語だけだと結合子が計画に現れず、INTERSECT／UNION の判定が成立しないため。
+    """
+    for i, t in enumerate(term_strings):
+        if len(t.split()) >= 2:
+            return i
+    return 0
+
+
+def body_only_expr(terms: str) -> str:
+    """FT.EXPLAIN 用の本文条件だけの式。可視性フィルタを含めない（外側 INTERSECT の混入を避ける）。"""
+    return f"@body:({terms})"
+
+
 def summary_line(phase: str, data: dict) -> str:
     """arm 1 つ分の p50 と品質指標を stdout 1 行へ整形する。unsupported はその旨を出す。"""
     if data.get("unsupported"):

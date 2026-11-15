@@ -95,6 +95,17 @@ class StaticConditionTest(unittest.TestCase):
         self.assertIn("self_window_clause", read("self_db.py"))
         self.assertIn("redis_params", read("redis_db.py"))
 
+    def test_diagnostic_picks_multi_term_query(self):
+        self.assertEqual(hd.pick_diagnostic_index(["a", "b c", "d e"]), 1)
+        self.assertEqual(hd.pick_diagnostic_index(["a", "b"]), 0)
+        self.assertEqual(hd.pick_diagnostic_index([]), 0)
+
+    def test_explain_expr_excludes_visibility_filter(self):
+        self.assertEqual(hd.body_only_expr("x y"), "@body:(x y)")
+        self.assertNotIn("visibility", hd.body_only_expr("x y"))
+        src = read("redis_db.py")
+        self.assertIn('"FT.EXPLAIN", INDEX, body_only_expr(', src)
+
 
 if __name__ == "__main__":
     unittest.main()

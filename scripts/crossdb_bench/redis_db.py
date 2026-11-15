@@ -44,7 +44,7 @@ from redis.commands.search.query import Query
 import redis.commands.search.reducers as reducers
 
 from common import build_meta, doc_visibility, env_port, measure, unsupported
-from hybrid_depth import DEPTH_ARMS, classify_explain, redis_params
+from hybrid_depth import DEPTH_ARMS, body_only_expr, classify_explain, pick_diagnostic_index, redis_params
 
 HOST = "127.0.0.1"
 # 既定値 36379 は containers.sh の `${CROSSDB_REDIS_PORT:-36379}` と一致させること。
@@ -389,7 +389,11 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         q = Query(expr).paging(0, 0).dialect(2)
         return int(r.ft(INDEX).search(q).total)
 
-    explain_raw = r.execute_command("FT.EXPLAIN", INDEX, _conj_expr(query_texts[0], " "), "DIALECT", "2")
+    # 診断は本文条件の部分木だけを FT.EXPLAIN にかける（可視性フィルタとの積の外側 INTERSECT を
+    # 語結合と誤認しない）。有効語が複数ある query を選ぶ。件数取得側は可視性フィルタを維持する
+    _term_strs = [" ".join(_hybrid_terms(qt).split()) for qt in query_texts]
+    _diag_terms = _term_strs[pick_diagnostic_index(_term_strs)]
+    explain_raw = r.execute_command("FT.EXPLAIN", INDEX, body_only_expr(_diag_terms), "DIALECT", "2")
     explain_text = explain_raw.decode(errors="replace") if isinstance(explain_raw, bytes) else str(explain_raw)
     and_counts = sorted(_total(_conj_expr(qt, " ")) for qt in query_texts)
     or_counts = sorted(_total(_conj_expr(qt, "|")) for qt in query_texts)
