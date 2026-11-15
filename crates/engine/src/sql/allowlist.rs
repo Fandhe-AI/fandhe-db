@@ -19173,9 +19173,9 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         WherePredicate::Not(inner) => format!("NOT {}", render_where_predicate(inner)),
         // 分岐 0 個の恒偽は `FALSE` で描画する（`()` は再解析できない。Issue #1526）。
         WherePredicate::Or(branches) if branches.is_empty() => "FALSE".to_string(),
-        // 非空の `Or` は `parse_view_body` が拒否するため現時点では到達しない。将来の
-        // ビュー本体 OR 解禁（別 Issue）に備え、往復可能な形で網羅描画だけ
-        // 先に用意しておく（TASK-208・Issue #912）。
+        // 非空の `Or` はビュー本文の判定表（`View`）が受理するため到達する。保存時の
+        // 描画→再解析の往復ガードが、この描画結果と元 AST の一致を検証する
+        // （TASK-208・Issue #912・Issue #3238）。
         WherePredicate::Or(branches) => {
             let rendered_branches: Vec<String> = branches
                 .iter()
