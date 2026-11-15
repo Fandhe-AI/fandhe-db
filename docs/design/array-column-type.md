@@ -562,7 +562,7 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
   OID 1560）・スライス（`bit(n)[]`）を受理する。値の等価（`=`・`<>`・UNIQUE・集合演算）は長さを含む正準
   ペイロードで判定するため受理する。同じ宣言の `BIT(n)[]` 列どうしの代入（`UPDATE SET v = w`・`INSERT ... SELECT`）は
   恒等として受理し、宣言が違う列・他の型の配列からの代入は `0A000`。
-- **fail-closed の面**: スカラー BIT と同じく未解禁の機能は拒否する。包含・重なり・量化比較（`@>`・`&&`・`ANY`）・
+- **fail-closed の面**: 等価比較（`=`・`<>`）は上記のとおり対応済み。それ以外の未対応の機能は拒否する。包含・重なり・量化比較（`@>`・`&&`・`ANY`）・
   順序比較・ORDER BY・DISTINCT・GROUP BY・`array_agg`・`ARRAY[...]` 構築子・配列関数・CAST（`::text`・
   `::bit(n)[]` 等）・索引・ALTER COLUMN TYPE。`CastType` に BIT が無いため、`elem_cast_type(Bit)` は `None` を返し、
   そのままでは ENUM 配列（`SourceKind::Array(None)`）と取り違えて通してしまう。`cast::array_source_kind` が bit 配列を
@@ -572,3 +572,9 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
   要素は `"1010"` の JSON 文字列（入力も JSON 文字列のみ。文字種・長さは engine が検査）。
 - **据え置いた面（対象外）**: `VARBIT[]`・`BIT VARYING[]`、`bit[]` の比較・包含・並べ替え・集計・CAST（スカラー BIT の
   解禁に合わせて別 Issue）、配列のバイナリ形式（TABLE-35 (4)・WIRE-14）、NoSQL DDL の `element_type: "bit"`。
+
+## Issue #3258 追記（LIKE の量化形）
+
+`<式> [NOT] LIKE|ILIKE ANY|SOME|ALL (<配列式>)` と `~~` 系演算子（TABLE-35・SQL-9 のポインタ）は
+`Expr::Quantified` の演算子型を `QuantifiedOp` へ広げて受理する。設計は
+[like-wildcard-patterns.md](like-wildcard-patterns.md) の「実装メモ（Issue #3258）」を参照。

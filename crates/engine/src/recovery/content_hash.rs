@@ -6876,9 +6876,17 @@ mod tests {
             rhs: Box::new(r),
         }
     }
-    use crate::sql::udf_call::{ArrayCmpOp, Quantifier};
+    use crate::sql::udf_call::{ArrayCmpOp, QuantifiedOp, Quantifier};
     fn quantified(
         op: ArrayCmpOp,
+        quantifier: Quantifier,
+        l: crate::sql::udf_call::Expr,
+        r: crate::sql::udf_call::Expr,
+    ) -> crate::sql::udf_call::Expr {
+        quantified_op(QuantifiedOp::Cmp(op), quantifier, l, r)
+    }
+    fn quantified_op(
+        op: QuantifiedOp,
         quantifier: Quantifier,
         l: crate::sql::udf_call::Expr,
         r: crate::sql::udf_call::Expr,
@@ -7248,6 +7256,63 @@ mod tests {
                 "quantified lt vs ge",
                 quantified(ArrayCmpOp::Lt, Quantifier::All, n(), text("{1}")),
                 quantified(ArrayCmpOp::Ge, Quantifier::All, n(), text("{1}")),
+            ),
+            // SQL-9・Issue #3258: LIKE 系の量化形は互いに・比較演算子の量化形とも区別される
+            // （タグ 19 の演算子バイト 7〜10。既存の 1〜6 は不変）。
+            (
+                "quantified like vs ilike",
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: true,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+            ),
+            (
+                "quantified like vs not like",
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: true,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+            ),
+            (
+                "quantified like vs eq",
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
             ),
             (
                 "quantified operand swap",
