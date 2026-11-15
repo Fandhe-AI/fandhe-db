@@ -456,7 +456,23 @@ pub(crate) fn normalize_session_local_predicates(predicates: &mut [WherePredicat
                     normalize_session_local_predicates(branch);
                 }
             }
-            _ => {}
+            // 他の形の値は `String` リテラル等で session-local な TIMESTAMPTZ を持たない。
+            // 追随漏れを検出するため列挙する（Issue #3245）。
+            WherePredicate::Equality { .. }
+            | WherePredicate::IsNull { .. }
+            | WherePredicate::Prefix { .. }
+            | WherePredicate::PredicateCall { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. }
+            | WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. }
+            | WherePredicate::CorrelatedExists(_) => {}
         }
     }
 }
@@ -676,7 +692,24 @@ fn reject_vector_family_null_tests(
                     reject_vector_family_null_tests(schema, branch)?;
                 }
             }
-            _ => {}
+            // 列型ガードの対象は `IS [NOT] NULL` だけ。他の形は束縛段と
+            // `reject_forbidden_elements` が担う。variant 追加時の追随漏れを
+            // コンパイルエラーにするためワイルドカードを使わず列挙する（Issue #3245）。
+            WherePredicate::Equality { .. }
+            | WherePredicate::Prefix { .. }
+            | WherePredicate::PredicateCall { .. }
+            | WherePredicate::Expression(_)
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. }
+            | WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. }
+            | WherePredicate::CorrelatedExists(_) => {}
         }
     }
     Ok(())
@@ -843,7 +876,25 @@ fn referenced_column_names(
                 }
             }
             WherePredicate::Not(inner) => collect_predicate_idents(inner, acc),
-            _ => {}
+            // 宣言的な葉は束縛済みフィルタ（情報源 1）と OR 群（`visit_column_indices`）が
+            // 依存列を収集するため、ここで重ねて push しない（記録列の網羅検査と順序を
+            // 変えないため）。`PredicateCall`・サブクエリ系は `reject_forbidden_elements`
+            // が拒否済みでここへは到達しない。ワイルドカードを避け追随漏れを検出する（Issue #3245）。
+            WherePredicate::Equality { .. }
+            | WherePredicate::IsNull { .. }
+            | WherePredicate::Prefix { .. }
+            | WherePredicate::PredicateCall { .. }
+            | WherePredicate::BoolEquality { .. }
+            | WherePredicate::BoolColumn { .. }
+            | WherePredicate::Compare { .. }
+            | WherePredicate::InList { .. }
+            | WherePredicate::Between { .. }
+            | WherePredicate::InSubquery { .. }
+            | WherePredicate::Exists { .. }
+            | WherePredicate::ScalarSubqueryCompare { .. }
+            | WherePredicate::QuantifiedSubqueryCompare { .. }
+            | WherePredicate::IdCompare { .. }
+            | WherePredicate::CorrelatedExists(_) => {}
         }
     }
     let mut idents: Vec<&str> = Vec::new();

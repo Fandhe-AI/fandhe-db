@@ -517,3 +517,84 @@ fn wire_check_constraint_accepts_or_and_not_with_trailing_semicolon() {
     assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
     read_ready_for_query(&mut stream);
 }
+
+/// 新しい述語形の CHECK に対する `ADD CONSTRAINT` の既存行再検証・`RENAME COLUMN`・`ALTER COLUMN
+/// TYPE` の追随（TABLE-16・SQL-24、Issue #3245）。psql が送る末尾 `;` 付きの単独文で、違反・束縛
+/// 不能は `XX000` 以外の SQLSTATE で拒否され、拒否の後も接続は継続して使える。
+#[test]
+fn wire_check_new_forms_follow_add_constraint_rename_and_alter_type_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE items (kind TEXT, n INTEGER, note TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO items (kind, n, note) VALUES ('a', 20, NULL);",
+            "INSERT 0 1",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    // 既存行が違反する ADD CONSTRAINT は 23514（BETWEEN は 20 が範囲外、IS NOT NULL は NULL が違反）。
+    for sql in [
+        "ALTER TABLE items ADD CONSTRAINT c_btw CHECK (n BETWEEN 1 AND 10);",
+        "ALTER TABLE items ADD CONSTRAINT c_nn CHECK (note IS NOT NULL);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "23514");
+        read_ready_for_query(&mut stream);
+    }
+    // 適合する形（NULL は UNKNOWN で合格）は受理される。
+    for sql in [
+        "ALTER TABLE items ADD CONSTRAINT c_kind CHECK (kind IN ('a', 'b'));",
+        "ALTER TABLE items ADD CONSTRAINT c_n CHECK (n NOT IN (7, 8));",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), "ALTER TABLE", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    // RENAME COLUMN の後も新しい列名で CHECK が強制される。
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE items RENAME COLUMN kind TO kind2;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind2, n, note) VALUES ('c', 1, 'x');",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "23514");
+    read_ready_for_query(&mut stream);
+
+    // ALTER COLUMN TYPE の後も NOT IN が強制される。TEXT へは束縛できず XX000 以外で拒否される。
+    send_simple_query(&mut stream, "ALTER TABLE items ALTER COLUMN n TYPE BIGINT;");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind2, n, note) VALUES ('a', 7, 'x');",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "23514");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ALTER TABLE items ALTER COLUMN n TYPE TEXT;");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
+    read_ready_for_query(&mut stream);
+
+    // 接続は継続して使える。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind2, n, note) VALUES ('b', 1, 'y');",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
