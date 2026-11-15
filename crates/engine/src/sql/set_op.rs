@@ -6,7 +6,9 @@
 //! [`crate::sql::allowlist::SetTree`]。葉は単一テーブルの広域取得
 //! [`crate::sql::allowlist::ValidatedScan`]（Issue #1191 で、括弧付き枝の枝内
 //! `ORDER BY`／`LIMIT`／`OFFSET` と、集計形の枝
-//! [`crate::sql::allowlist::ValidatedAggregate`] を追加）に限定する——TASK-212（`JOIN`・複数
+//! [`crate::sql::allowlist::ValidatedAggregate`] を追加。Issue #3270 で式射影の項目と、
+//! `FROM` なしの定数枝 [`crate::sql::allowlist::SetConstBranch`]〔`sql::const_select` の束縛・実行を
+//! 再利用。表を読まない〕を追加）に限定する——TASK-212（`JOIN`・複数
 //! テーブル実行計画基盤）を前提にしない設計判断。TASK-213 は TASK-212 に後続
 //! するが、本実装は各枝を独立した単一テーブル走査として扱うことで基盤の完成を
 //! 待たずに導入する）を受け取り、`core.rs::EngineCore` の SQL 実行経路
@@ -41,7 +43,8 @@ use std::collections::{HashMap, HashSet};
 use crate::catalog::{ColumnType, TableSchema};
 use crate::policy::PolicyContext;
 use crate::sql::allowlist::{
-    SetAggregateBranch, SetOperator, SetOrderKey, SetTree, SqlSurfaceError, ValidatedScan,
+    SetAggregateBranch, SetConstBranch, SetOperator, SetOrderKey, SetTree, SqlSurfaceError,
+    ValidatedScan,
 };
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::order_value::NullPlacement;
@@ -192,6 +195,8 @@ pub(crate) fn collect_branch_tables(tree: &SetTree, out: &mut Vec<String>) {
                 out.push(agg.0.table_name.clone());
             }
         }
+        // Issue #3270: 定数枝は表を読まない。
+        SetTree::ConstBranch(_) => {}
         SetTree::Op { left, right, .. } => {
             collect_branch_tables(left, out);
             collect_branch_tables(right, out);
@@ -199,12 +204,22 @@ pub(crate) fn collect_branch_tables(tree: &SetTree, out: &mut Vec<String>) {
     }
 }
 
-/// 集合演算木の左端の枝の表名（`ExplainTarget::table_name` 用。Issue #2047）。
+/// 集合演算木の左から最初の表の葉の表名（`ExplainTarget::table_name` 用。Issue #2047）。定数枝
+/// （Issue #3270）は表を持たないので飛ばし、表の葉が無ければ空文字（構文段が全枝定数の木を
+/// 拒否するため実際には到達しない。`ExplainTarget::Join` の先例に倣う）。
 pub(crate) fn leftmost_table(tree: &SetTree) -> &str {
     match tree {
         SetTree::Branch(scan) | SetTree::LimitedBranch(scan) => &scan.table_name,
         SetTree::AggregateBranch(agg) => &agg.0.table_name,
-        SetTree::Op { left, .. } => leftmost_table(left),
+        SetTree::ConstBranch(_) => "",
+        SetTree::Op { left, right, .. } => {
+            let l = leftmost_table(left);
+            if l.is_empty() {
+                leftmost_table(right)
+            } else {
+                l
+            }
+        }
     }
 }
 
@@ -217,7 +232,8 @@ struct EvalOutcome {
 }
 
 /// [`ColumnMeta`] 同士の型整合判定（SQL-29 (c) §2.2）。広域取得の枝は `Id`／`Scalar`
-/// のみ。集計形の枝（Issue #1191）は `Computed` を返し、束縛時に確定した静的型
+/// のほか、式射影の項目・定数枝（Issue #3270）は `Computed` を返す。集計形の枝（Issue #1191）も
+/// `Computed` を返し、束縛時に確定した静的型
 /// （`Some(ty)`。Issue #1173）を `Scalar` と同じ型として比較する。静的型を持たない
 /// `Computed { ty: None }` は不一致として扱う（fail-closed。`42804`）。
 fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
@@ -225,14 +241,21 @@ fn columns_compatible(a: &ColumnMeta, b: &ColumnMeta) -> bool {
         match m {
             ColumnMeta::Scalar { ty, .. } => Some(ty),
             ColumnMeta::Computed { ty: Some(ty), .. } => Some(ty),
-            ColumnMeta::AliasedId { .. } => Some(&crate::sql::exec::ALIASED_ID_TYPE),
-            ColumnMeta::Id | ColumnMeta::Computed { ty: None, .. } | ColumnMeta::Record { .. } => {
-                None
-            }
+            ColumnMeta::Id
+            | ColumnMeta::AliasedId { .. }
+            | ColumnMeta::Computed { ty: None, .. }
+            | ColumnMeta::Record { .. } => None,
         }
     }
     match (a, b) {
-        (ColumnMeta::Id, ColumnMeta::Id) => true,
+        // 疑似列 `id`（`Cell::Integer`）は通常の NUMERIC 列（`Cell::Numeric`）と行キーのタグが
+        // 異なり、同値でも重複除去・交差・差が誤るため、`id` 同士以外とは互換にしない
+        // （fail-closed。`42804`。`Id` が従来そうである扱いへ `AliasedId` も揃える）。
+        // 疑似列 `id` は別名の有無（`Id`／`AliasedId`）にかかわらず同じ値域として互換にする。
+        (
+            ColumnMeta::Id | ColumnMeta::AliasedId { .. },
+            ColumnMeta::Id | ColumnMeta::AliasedId { .. },
+        ) => true,
         _ => match (static_type(a), static_type(b)) {
             // 整数型（SMALLINT／INTEGER／BIGINT）は PostgreSQL 同様に相互に互換とし、結果列は
             // 広い方へ拡大する（[`merge_columns`]。Issue #1560）。
@@ -718,6 +741,26 @@ fn eval_aggregate_branch(
     })
 }
 
+/// 定数枝（[`SetTree::ConstBranch`]。Issue #3270）を束縛・実行する。`sql::const_select` の
+/// `bind` → `execute` をそのまま使い（第 2 の評価器を作らない）、結果バイトを文全体で共有する
+/// `budget` へ計上する。表・ストレージに触れないため RLS の対象行は無く、他テナントの情報にも
+/// 依存しない。ルーチン呼び出し・スキーマ関数は `bind` が `0A000` にする（fail-closed）。
+fn eval_const_branch(
+    branch: &SetConstBranch,
+    udfs: &UdfRegistry,
+    budget: &mut SetOpBudget,
+) -> Result<EvalOutcome, SqlSurfaceError> {
+    let bound = crate::sql::const_select::bind(&branch.0, udfs)?;
+    let result = crate::sql::const_select::execute(&bound)?;
+    budget.charge(result_bytes(&result.columns, &result.rows))?;
+    let has_vector = columns_have_vector(&result.columns);
+    Ok(EvalOutcome {
+        columns: result.columns,
+        rows: result.rows,
+        has_vector,
+    })
+}
+
 /// 集合演算木全体の列数・列型整合を、行走査（[`eval_tree`]・
 /// [`crate::sql::scan::execute_scan_with_budget`]）より前に確定させる
 /// （PR #1105 レビュー指摘対応: 従来は `eval_tree` が左右の枝を実際に走査して
@@ -783,6 +826,19 @@ fn validate_tree_types(
                     scan: None,
                 });
             }
+            Ok((columns, has_vector))
+        }
+        SetTree::ConstBranch(branch) => {
+            // EXPLAIN（`leaves` を渡す経路）は構文段が定数枝を 0A000 にするため到達しない。
+            // 到達したら葉の対応が崩れるので fail-closed にする。
+            if leaves.is_some() {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "FROM-less branch reached the set operation EXPLAIN path".to_string(),
+                });
+            }
+            let bound = crate::sql::const_select::bind(&branch.0, udfs)?;
+            let columns = bound.columns();
+            let has_vector = columns_have_vector(&columns);
             Ok((columns, has_vector))
         }
         SetTree::Op { op, left, right } => {
@@ -1037,6 +1093,7 @@ fn eval_tree(
                     })?;
             eval_aggregate_branch(read_txn, ctx, schema, branch, udfs, group_limits, budget)
         }
+        SetTree::ConstBranch(branch) => eval_const_branch(branch, udfs, budget),
         SetTree::Op { op, left, right } => {
             let l = eval_tree(read_txn, ctx, schemas, left, udfs, group_limits, budget)?;
             let r = eval_tree(read_txn, ctx, schemas, right, udfs, group_limits, budget)?;
@@ -1408,6 +1465,17 @@ fn describe_tree(
             let has_vector = columns_have_vector(&columns);
             Ok((columns, has_vector))
         }
+        SetTree::ConstBranch(branch) => {
+            // 定数枝もダミーフラグの区画を 1 枝分進める（`count_leaves` が葉として数えるため。
+            // 進めないと後続の枝のフラグの対応がずれる）。
+            let _ = branch_flags(dummy_equality_flags, width, next_leaf);
+            // Execute（`eval_const_branch`／`validate_tree_types`）と同じ通常の `bind` を使い、
+            // ルーチン呼び出しの 0A000 拒否を Describe と Execute で一致させる。
+            let bound = crate::sql::const_select::bind(&branch.0, udfs)?;
+            let columns = bound.columns();
+            let has_vector = columns_have_vector(&columns);
+            Ok((columns, has_vector))
+        }
         SetTree::Op { op, left, right } => {
             let (l_columns, l_has_vector) =
                 describe_tree(schemas, left, udfs, dummy_equality_flags, width, next_leaf)?;
@@ -1436,6 +1504,24 @@ mod tests {
     use crate::storage::{Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
     use redb::ReadableDatabase;
+
+    /// Issue #3270 レビュー対応: 別名付き `id`（`Cell::Integer`）と NUMERIC 列（`Cell::Numeric`）は
+    /// 行キーのタグが異なるため互換にしない。`id` 同士は別名の有無にかかわらず互換。
+    #[test]
+    fn aliased_id_is_incompatible_with_numeric_but_compatible_with_id() {
+        let aliased = ColumnMeta::AliasedId { name: "x".into() };
+        let numeric = ColumnMeta::Scalar {
+            name: "amount".into(),
+            ty: ColumnType::Numeric {
+                precision: 20,
+                scale: 0,
+            },
+        };
+        assert!(!columns_compatible(&aliased, &numeric));
+        assert!(!columns_compatible(&numeric, &aliased));
+        assert!(columns_compatible(&aliased, &ColumnMeta::Id));
+        assert!(columns_compatible(&aliased, &aliased));
+    }
 
     fn text_schema(name: &str) -> TableSchema {
         TableSchema::new(
