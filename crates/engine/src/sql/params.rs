@@ -366,9 +366,25 @@ pub(crate) fn joined_where_conjunct_flags(
         region = rest;
     }
     let mut flags = Vec::new();
+    push_conjunct_flags(region, kinds, &mut flags);
+    flags
+}
+
+/// [`joined_where_conjunct_flags`] の本体。深さ 0 の `AND` で分割し、全体が 1 組の括弧で包まれた
+/// 連言分は `sql::join::plan::flatten_conjuncts` と同じく括弧内を再帰的に平坦化する（個数を AST と揃える）。
+/// 括弧内に深さ 0 の `OR` がある連言分は AST でも 1 葉なので偽フラグ 1 個とする。
+fn push_conjunct_flags(region: &[Token], kinds: &[ParamLiteralKind], flags: &mut Vec<bool>) {
     let mut depth: usize = 0;
     let mut seg_start = 0usize;
     let finish = |seg: &[Token], flags: &mut Vec<bool>| {
+        if let Some(inner) = strip_outer_parens(seg) {
+            if has_top_level_or(inner) {
+                flags.push(false);
+            } else {
+                push_conjunct_flags(inner, kinds, flags);
+            }
+            return;
+        }
         flags.push(matches!(
             seg,
             [
@@ -383,14 +399,46 @@ pub(crate) fn joined_where_conjunct_flags(
             Token::Punct('(') => depth = depth.saturating_add(1),
             Token::Punct(')') => depth = depth.saturating_sub(1),
             Token::Keyword(lexer::Keyword::And) if depth == 0 => {
-                finish(region.get(seg_start..i).unwrap_or(&[]), &mut flags);
+                finish(region.get(seg_start..i).unwrap_or(&[]), flags);
                 seg_start = i.saturating_add(1);
             }
             _ => {}
         }
     }
-    finish(region.get(seg_start..).unwrap_or(&[]), &mut flags);
-    flags
+    finish(region.get(seg_start..).unwrap_or(&[]), flags);
+}
+
+/// 先頭の `(` と末尾の `)` が互いに対応する（全体を 1 組の括弧が包む）とき、その内側を返す。
+fn strip_outer_parens(seg: &[Token]) -> Option<&[Token]> {
+    let inner = seg
+        .strip_prefix(&[Token::Punct('(')])?
+        .strip_suffix(&[Token::Punct(')')])?;
+    let mut depth: usize = 0;
+    for t in inner {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(inner)
+}
+
+/// 括弧の外側（深さ 0）に `OR` 語があるか。
+fn has_top_level_or(seg: &[Token]) -> bool {
+    let mut depth: usize = 0;
+    seg.iter().any(|t| match t {
+        Token::Punct('(') => {
+            depth = depth.saturating_add(1);
+            false
+        }
+        Token::Punct(')') => {
+            depth = depth.saturating_sub(1);
+            false
+        }
+        Token::Ident(s) => depth == 0 && s.eq_ignore_ascii_case("or"),
+        _ => false,
+    })
 }
 
 /// 結合 DML の関係一覧 `(公開名, 表名)`（先頭が書き込み先、続いて FROM／USING の表。Issue #3297）。
@@ -5092,6 +5140,23 @@ mod typed_value_tests {
         assert_eq!(
             joined_where_conjunct_flags(&tk, &[]),
             vec![false, true, false]
+        );
+        // 括弧内の連言も AST と同じ単位（葉ごと）で数える。`OR` を含む括弧は 1 葉。
+        let tk = tokenize_with_params(
+            "DELETE FROM a USING b WHERE a.id = b.id AND (b.l = 'J' AND b.f = true) AND b.d = $1",
+        )
+        .expect("tokenize");
+        assert_eq!(
+            joined_where_conjunct_flags(&tk, &[ParamLiteralKind::String]),
+            vec![false, false, false, true]
+        );
+        let tk = tokenize_with_params(
+            "DELETE FROM a USING b WHERE (b.l = 'J' OR b.f = 'x') AND b.d = $1",
+        )
+        .expect("tokenize");
+        assert_eq!(
+            joined_where_conjunct_flags(&tk, &[ParamLiteralKind::String]),
+            vec![false, true]
         );
     }
 }
