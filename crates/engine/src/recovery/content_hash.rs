@@ -6263,6 +6263,81 @@ mod tests {
         assert_ne!(rem, div);
     }
 
+    /// SQL-42・Issue #3274: `dml_binop_tag` の全 variant のタグ値を exact に固定する。
+    /// 既存テストは「互いに異なる」ことしか保証しないため、既存の 1〜9 が付け替えられて
+    /// いないこと（追記のみ。`Rem` は 10）をここで直接固定する。値が変わった場合は永続化済みの
+    /// 台帳との互換を壊したことを意味するため、期待値を更新しない。
+    #[test]
+    fn dml_binop_tag_table_is_golden() {
+        use crate::sql::udf_call::BinOp;
+        for (op, tag) in [
+            (BinOp::Add, 1u8),
+            (BinOp::Sub, 2),
+            (BinOp::Mul, 3),
+            (BinOp::Div, 4),
+            (BinOp::Gt, 5),
+            (BinOp::Lt, 6),
+            (BinOp::Ge, 7),
+            (BinOp::Le, 8),
+            (BinOp::Eq, 9),
+            (BinOp::Rem, 10),
+        ] {
+            assert_eq!(dml_binop_tag(op), tag, "{op:?}");
+        }
+    }
+
+    /// SQL-42・Issue #3274: `%` を含む文の `content_hash` をバイト単位で固定する（DELETE 述語形・
+    /// UPDATE SET 式の単一行形／述語形／分割実行形）。値が変わった場合は永続化済みの台帳との
+    /// 互換を壊したことを意味するため、期待値を更新しない。
+    #[test]
+    fn rem_hash_layouts_are_golden() {
+        use crate::recovery::required_op_id::LedgerMode;
+        use crate::sql::allowlist::{
+            validate_delete_statement, DeleteStatement, StructuralOnlyLookup,
+        };
+        use crate::sql::udf_call::{BinOp, UdfRegistry};
+
+        let delete = validate_delete_statement(
+            "DELETE FROM t WHERE n % 2 = 0",
+            &StructuralOnlyLookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("accepted");
+        let DeleteStatement::Predicate(p) = delete else {
+            panic!("predicate form expected");
+        };
+        let del =
+            for_delete_where("t", &p.where_predicates, &UdfRegistry::default()).expect("hash");
+        assert_eq!(
+            to_hex_1545(del.as_bytes()),
+            "4cda55d9b3324024442e810652dd35067886b6f67a9a855582973912631324b3",
+            "DELETE ... WHERE n % 2 layout changed"
+        );
+
+        let [single, atomic, part] = set_expr_hashes(&bin(BinOp::Rem, ident("n"), num("3")));
+        assert_eq!(
+            to_hex_1545(single.as_bytes()),
+            "GOLDEN_SINGLE",
+            "single-row SET n % 3 layout changed"
+        );
+        assert_eq!(
+            to_hex_1545(atomic.as_bytes()),
+            "GOLDEN_ATOMIC",
+            "predicate-form SET n % 3 layout changed"
+        );
+        assert_eq!(
+            to_hex_1545(part.as_bytes()),
+            "GOLDEN_PART",
+            "partitioned SET n % 3 layout changed"
+        );
+
+        // `%` と `/` が同形の文は 3 経路すべてで別ハッシュ（再送の取り違えを 22023 で検出できる）。
+        let div = set_expr_hashes(&bin(BinOp::Div, ident("n"), num("3")));
+        for (a, b) in [single, atomic, part].iter().zip(div.iter()) {
+            assert_ne!(a, b);
+        }
+    }
+
     /// SQL-42・Issue #1521: 文字列リテラルの外の単独 `#`・右辺の無い末尾 `%` を含む DELETE は
     /// 構文段で `42601` となり、ハッシュ計算（`for_*_where`）へ到達しない。
     #[test]
