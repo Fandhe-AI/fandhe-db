@@ -162,6 +162,13 @@ impl EngineCore {
         has_operation_id: bool,
         udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
+        // FROM／USING の JOIN 連鎖・多表（Issue #3294）の計画木は未対応。単一表 source 前提の木を
+        // 誤って返さないよう fail-closed で拒否する（実行側は受理済み）。
+        if plan.source.fold.is_some() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "EXPLAIN of multi-relation FROM/USING is not supported yet",
+            ));
+        }
         let limits = self.joined_dml_limits();
         plan.validate(&limits)?;
         plan.key_classes()?;

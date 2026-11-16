@@ -958,7 +958,7 @@ pub enum CopyColumnKind {
 
 /// COPY のレコード単位の束縛状態。`CopyInSession` が所有し、text/csv の分割器が確定した
 /// レコードと binary 形式で wire-server が変換済みのレコードを、同一の経路
-/// （フィールド数照合 → ① → ④ → [`bind_copy_record`] → ②）で取り込む。
+/// （フィールド数照合 → `--max-insert-rows` → ④ → [`bind_copy_record`] → ②）で取り込む。
 #[derive(Debug)]
 struct RecordSink {
     table: String,
@@ -967,6 +967,9 @@ struct RecordSink {
     // `Box`: `TableSchema` へ墓標スロット（TABLE-19・TASK-203・Issue #901）が加わりサイズが増えたため。
     schema: Box<TableSchema>,
     limits: BatchLimits,
+    /// `--max-insert-rows`（`DmlLimits::max_insert_rows_per_statement`）。指定時だけ COPY の行数上限になる
+    /// （INDEX-4 ① は COPY の行数に掛けない。Issue #3309）。未指定なら実効上限は ④ になる。
+    max_rows: Option<std::num::NonZeroUsize>,
     /// `HEADER` 指定（Issue #1764）。`False` 以外のとき最初の 1 レコードをヘッダ行として扱う。
     header: CopyHeader,
     /// 最初のレコード（ヘッダ行）をまだ処理していないか。
@@ -992,7 +995,8 @@ struct RecordSink {
 
 impl RecordSink {
     /// 1 レコード分のフィールドを取り込む。判定順序は ヘッダ処理 → フィールド数照合 →
-    /// ①（行数）→ ④（チャンク数）→ 列型照合・束縛 → ②（行あたりのバイト量）。
+    /// `--max-insert-rows`（指定時のみ）→ ④（チャンク数）→ 列型照合・束縛 → ②（行あたりのバイト量）。
+    /// ①（`max_files_per_batch`）は COPY の行数に掛けない（Issue #3309）。
     fn push_record(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
         // 協調キャンセルポイント（Issue #1953）。時計の読み出しは 1024 行に 1 回に間引く
         // （`bounds` が空の最初の行では必ず評価する）。
@@ -1004,7 +1008,7 @@ impl RecordSink {
             self.deadline.check()?;
         }
         // 最初に確定したレコードはヘッダ行。破棄（または照合）するだけで、
-        // 行数①・チャンク数④・束縛の対象に含めない。
+        // 行数・チャンク数④・束縛の対象に含めない。
         if std::mem::take(&mut self.header_pending) {
             return check_header_record(self.header, &self.columns, &fields);
         }
@@ -1016,7 +1020,15 @@ impl RecordSink {
             )));
         }
         let next_count = self.bounds.len().saturating_add(1);
-        batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
+        // 運用者が `--max-insert-rows` を明示したときだけ行数の上限にする（束縛より前に件数だけで判定）。
+        // メッセージには件数の上限値だけを入れる（本文・他テナント情報は入れない）。
+        if let Some(max) = self.max_rows {
+            if next_count > max.get() {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "COPY exceeds the allowed row count ({max})"
+                )));
+            }
+        }
         batch_limits::validate_chunk_total(next_count, &self.limits).map_err(map_batch_err)?;
         let bound = bind_copy_record(
             &self.table,
@@ -1132,6 +1144,7 @@ impl CopyInSession {
         clock: crate::sql::time_fn::StatementClock,
         time_zone: crate::datetime::SessionTimeZone,
         defer_not_null: bool,
+        max_rows: Option<std::num::NonZeroUsize>,
     ) -> Result<Self, SqlSurfaceError> {
         // csv で QUOTE／ESCAPE が改行系だとレコード終端と曖昧になるため、未対応として
         // CopyInResponse 前に拒否する（PostgreSQL は検査しないが拒否側に倒す既知の相違）。
@@ -1160,6 +1173,7 @@ impl CopyInSession {
                 operation_id,
                 schema: Box::new(schema),
                 limits,
+                max_rows,
                 header: options.header(),
                 header_pending: options.header() != CopyHeader::False,
                 bounds: Vec::new(),
@@ -1177,6 +1191,17 @@ impl CopyInSession {
             row_security: crate::sql::policy_applicability::current_row_security(),
             privilege_recheck: None,
         })
+    }
+
+    /// 1 回の COPY が受理できる行数の実効上限（`--max-insert-rows` と ④ の小さい方。1 以上）。
+    /// `dump_restore` が COPY を分割する幅に使う（INDEX-4 ① は掛からない。Issue #3309）。
+    #[must_use]
+    pub fn max_rows_per_batch(&self) -> usize {
+        let chunks = self.sink.limits.max_batch_chunks;
+        self.sink
+            .max_rows
+            .map_or(chunks, |m| chunks.min(m.get()))
+            .max(1)
     }
 
     /// commit 時の権限再判定値を持たせる（`begin_copy_validated` の `FROM` 腕が呼ぶ。Issue #1969）。
@@ -1263,7 +1288,7 @@ impl CopyInSession {
     /// 1 個の CopyData メッセージ本文を取り込む（text/csv 形式）。判定順序:
     /// 1. ③（生 CopyData バイト量の累計）を `pending` へ追加する前に判定
     ///    （`54000`。超過時点で拒否し、それ以降のバイトは一切保持しない）。
-    /// 2. 完了したレコードごとに、①（行数）→④（生成チャンク数。1 行=1
+    /// 2. 完了したレコードごとに、`--max-insert-rows`（指定時のみ）→④（生成チャンク数。1 行=1
     ///    チャンクと読み替える。既存の単文 INSERT 経路と同じ読み替え規則）→
     ///    フィールド分割・エスケープ解決・列型照合（`22000`）→②（当該行の
     ///    デコード後バイト量）の順に判定する。
@@ -1277,7 +1302,7 @@ impl CopyInSession {
     }
 
     /// binary 形式で型変換済みの 1 レコード分のフィールド（正規テキスト。`None` = NULL）を取り込む。
-    /// text/csv の [`Self::feed`] と同じ束縛経路（①→④→束縛→②）を共有する（第 2 の書き込み経路を
+    /// text/csv の [`Self::feed`] と同じ束縛経路（`--max-insert-rows`→④→束縛→②）を共有する（第 2 の書き込み経路を
     /// 作らない。WIRE-23・Issue #1769）。呼び出しは `wire-server::copy::run_copy_from` から。
     pub fn feed_fields(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
         self.sink.deadline.check()?;

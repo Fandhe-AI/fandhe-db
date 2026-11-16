@@ -17,21 +17,25 @@ spec 本文は転記せず、ID のポインタのみを記す。
 ## 構文
 
 ```text
-UPDATE <表> [[AS] <別名>] SET <列> = <右辺>[, ...] FROM <rel>[, <rel>]* [WHERE <join_where>]
+UPDATE <表> [[AS] <別名>] SET <列> = <右辺>[, ...] FROM <from_list> [WHERE <join_where>]
        [USING OPERATION_ID '<id>' | NULL]
-DELETE FROM <表> [[AS] <別名>] USING <rel>[, <rel>]* [WHERE <join_where>]
+DELETE FROM <表> [[AS] <別名>] USING <from_list> [WHERE <join_where>]
        [USING OPERATION_ID '<id>' | NULL]
+<from_list> := <rel> { , <rel> | CROSS JOIN <rel> | [INNER | LEFT | RIGHT | FULL [OUTER]] JOIN <rel> ON <cond> }*
 <rel> := <表> [[AS] <別名>]
 ```
 
+`<from_list>` の JOIN 連鎖は Issue #3294 で受理した（下記「多方向結合」節）。
+
 - `WHERE` は JOIN の `WHERE` 文法（`JoinWhereExpr`）を再利用する。列同士の比較・`AND`／`OR`・括弧を受理し、数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`
   になる。#1750 のサブクエリ形と FROM 形は当面同時に使えない
-- SET 左辺は非修飾の列名だけ（`SET t.a = ...` は `42601`）。行値の代入 `(a, b) = (...)` は `0A000`
+- SET 左辺は非修飾の列名だけ（`SET t.a = ...` は `42601`）。行値の代入 `(a, b) = (...)`／`= ROW(...)` は Issue #3296 で受理（下記「SET の行値代入と FROM 側の式」節）
 - SET 右辺は 2 系統に分ける
   - 列参照 1 個（`DmlFromSetValue::Column`）: 修飾あり・なしとも FROM 側の列を指せる。直後が句境界（`,`・`FROM`・`WHERE`・`USING`・`RETURNING`・文末）のときだけ
-  - それ以外（`DmlFromSetValue::Value`）: 既存の `SetValue`。式中の修飾列参照は、対象表の公開名で修飾されたものだけを非修飾へ正規化し、FROM 側を指す修飾は `0A000`
+  - 列参照を含む式（`DmlFromSetValue::Expr`。Issue #3296）: 式中の列参照は修飾の有無によらずプレースホルダへ置き換えて参照ごとに運び、FROM 側の列も参照できる
+  - それ以外（`DmlFromSetValue::Value`）: リテラル・`DEFAULT`・列参照を含まない式（既存の `SetValue`）
 - 参照数（対象表を含む）は `MAX_TABLE_REFS` で積む前に検査する（超過は `54000`）。公開名の重複は `42601`（`BindingScope::new` と同じ契約）。別名で公開名を分ければ自己結合は受理する
-- `FROM` 内の `JOIN ... ON`・派生表・関数呼び出しは `42601`
+- 派生表・関数呼び出しは `42601`。`JOIN ... USING (...)`・`NATURAL JOIN`・カンマの後の `CROSS JOIN` 以外の明示 JOIN は `0A000`（意図的な拒否。下記「多方向結合」節）
 - `PARTITIONED` 併用は `42601`、`RETURNING` は `*`・`<公開名>.*`・列参照を受理する（#3204。式・関数・`AS` 別名は `42601`。束縛・実行は [sql-returning.md](sql-returning.md) の「結線」節）、`$n` は拡張クエリの Parse 段で `42601`
 - `--require-where-for-dml` は FROM／USING 形でも `WHERE` 省略を `42601` で拒否する（opt-in のときだけ）
 
@@ -58,7 +62,7 @@ FROM を黙って無視する（単一表として処理する）fail-open 経�
 1. スコープ構築（参照数 `54000`・公開名の重複 `42601`）
 2. `WHERE` の全列参照を解決（修飾子の不一致 `42P01`・非修飾で複数表に該当 `42702`・未知列 `42703`）
 3. SET 左辺の検査（重複・疑似列・未知列・`GENERATED ALWAYS`）
-4. SET 右辺: 列参照は解決と代入可否の判定（不一致は `42804`）、式は非修飾の列名をスコープ全体で照合（対象表と FROM 側の両方に該当で `42702`、FROM 側だけなら `0A000`）
+4. SET 右辺: 列参照は解決と代入可否の判定（不一致は `42804`）、式は全参照をスコープで解決する（Issue #3296。`42P01`・`42702`・`42703`）。対象表の列だけの式は従来の式束縛、FROM 側を含む式は変換器が束縛する
 
 結合条件の抽出・プッシュダウン・実行計画は #1755 の担当。
 
@@ -72,12 +76,37 @@ WHERE は最上位の `AND` で conjunct に平坦化し、解決済みの relat
 | -------- | ------ |
 | 別 relation の列同士の等値 | 結合キー（対象側・source 側へ向きを正規化。複合キー可） |
 | 対象側だけを参照（`OR` 可） | 対象側フィルタ（既存の述語形 DML と同じ束縛器） |
-| source 側だけを参照（`OR` 可） | source の走査へ押し下げる述語 |
+| source 側だけを参照（`OR` 可） | 単一表 source は走査へ押し下げる述語。畳み込み source（Issue #3294）は合成 JOIN 文の `WHERE` |
 | 上記以外 | `0A000` |
 
-`0A000` で拒否する形（第 1 弾の設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: WHERE 省略・等値結合キー無し、relation をまたぐ非等値・`OR`、同じ relation 内の列比較、FROM／USING が 2 表以上、キー化できない型（REAL／DOUBLE／NUMERIC 等）の結合キー、非バイト列順の照合つきキー列、embedding を参照する対象側述語、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列。キー列の型クラスが比較できない組は `42804`。
+`0A000` で拒否する形（設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: relation をまたぐ非等値・`OR`、対象側の列比較（単一表 source では source 側の列比較も）、キー化できない型（REAL／DOUBLE／NUMERIC 等）の結合キー、非バイト列順の照合つきキー列、embedding を参照する対象側述語、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列。キー列の型クラスが比較できない組は `42804`。等値結合キーが無い形（WHERE 省略・source だけの述語）と FROM／USING が 2 表以上の形は Issue #3294 で受理した（`MULTI_FROM`・`NO_EQUI_KEY` の拒否は廃止）。
 
-SET は、リテラルと対象表の列だけを使う式をそのまま運び、列参照（source 列を含む）を「対象列 ++ source の取り出し列」の合成スキーマ上の式として束縛する（合成名は利用者の識別子と衝突しない綴り）。Describe 経路で変換エラーを返すかどうかは #3202 の方針の範囲。
+SET は、リテラルと対象表の列だけを使う式をそのまま運び、列参照（source 列を含む）と source 列を含む式（Issue #3296）を「対象列 ++ source の取り出し列」の合成スキーマ上の式として束縛する（合成名は利用者の識別子と衝突しない綴り）。Describe 経路で変換エラーを返すかどうかは #3202 の方針の範囲。
+
+## 多方向結合（Issue #3294。親 #3290）
+
+ポインタ: SQL-53 (b)(3)(4)(5)・RLS-10・RECOVER-10/11・SQL-28。FROM／USING 内の `JOIN ... ON` と 3 表以上の結合を実行する。
+
+- **畳み込み**: source が 2 表以上、または JOIN の段を持つとき、source 側のリレーション列と結合段（カンマは `Cross` 段）から合成 JOIN 文（`FoldedSource`）を作り、既存の結合実行器（`sql::join::execute_with_limits`）で評価した出力 1 つを source 行源として扱う。対象表はその行源と結合キーで突き合わせる。第 2 の結合実行器は作らず、各リレーションは書き込むセッションの `PolicyContext` で独立に走査する（RLS-10 (b)）。走査は共有 write txn 上で行い、文の開始時点のスナップショットになる
+- **畳み込みスキーマ**: SET・結合キー・`RETURNING` が読む source 列だけを疑似列 `id` なしの採番方式スキーマとして並べる（疑似列 `id` は整数クラスの `BIGINT` 列）。`JoinedDmlSource` の添字系列（`columns`・`EquiKey::source_column`・セル位置）はその添字を指す。probe は単一表 source と共通
+- **単一表 source（JOIN の段なし）**: 従来の単一表走査のまま。結合キーが 0 本でもよい
+- **WHERE の振り分け**: 畳み込み source で source だけを参照する述語は、修飾した論理木のまま合成 JOIN 文の `WHERE` へ渡す（外部結合の意味論は結合計画器の pushdown・残余が守る）。複数の source にまたがる述語・列比較も可。対象表と source をまたぐ述語は列同士の等値だけを結合キーにし、それ以外は `0A000`（tracked: #3295）
+- **結合キーが 0 本**: 全 source 行を空キーの 1 バケットに入れ、対象行 1 件ごとに一致ペアへ source の行数を加算する。累計が出力行数上限を超えたら `54000`
+- **ON の束縛**: `ON` は FROM 側の表だけのスコープで解決する（段 k が参照できるのは先頭から k + 1 番目まで）。対象表への参照は PG と同じく拒否（修飾参照は `42P01`、対象表にしか無い非修飾列は `42703`）。判定順は「スコープ構築 → ON → WHERE → SET → RETURNING」。ON の型検証・結合キー／残余の分類は結合実行器が担い、変換の段階で合成 JOIN 文を束縛して Describe と Execute のコードをそろえる
+- **上限**（超過はすべて `54000`・副作用ゼロ）: リレーション数（対象表 + source の数）、各リレーションの入力行数、結合段の出力、NLJ の比較回数、畳み込み出力の行数（単一表 source と同じ可視行数上限）、累計バイト予算（結合実行器の上限を共有予算の残りに絞り、返った行を共有予算へ計上）、一致ペア
+- **RETURNING**: 畳み込み行 1 本を各 source relation 分の行参照として渡す（`from_rows[relation - 1]`）。外部結合の NULL 補完側は NULL
+- **スキーマ変化**: 実行時に畳み込みの全実表のスキーマを束縛時と照合する（不一致は従来どおり）
+- **台帳**: 文ハッシュはトークン列だけが材料で結合結果を含まない。事前照合は source の走査より前に行う
+
+意図的な拒否（`0A000` の固定文言。DML の束縛スコープに統合列の解決が無く、結合器の統合列と PG の優先順位の差を持ち込まないための安全弁。受け皿の Issue は無い）:
+
+| 形 | 理由 |
+| -- | ---- |
+| `JOIN ... USING (...)` | 統合列（`USING` の共通列）の解決を DML の束縛スコープが持たない |
+| `NATURAL JOIN` | 共通列の導出と統合列の解決を DML の束縛スコープが持たない |
+| カンマの後の `CROSS JOIN` 以外の明示 JOIN | PG ではカンマより JOIN が強く結合するため束縛がずれる（SELECT の JOIN と同じ安全弁） |
+
+派生表・関数呼び出しの FROM／USING は構文段の `42601` のまま。
 
 ## セキュリティ
 
@@ -125,6 +154,7 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - Issue #3292 の追加テスト: `sql53_dml_from_using_view.rs`（sql_t40_up）・`table44_temp_table_dml_from.rs`（table_rls）
 - `crates/engine/tests/sql_t40_up/sql53_dml_from_using_bind.rs`: 構文・束縛・変換器の拒否表・台帳の基本
 - `crates/engine/tests/sql_t40_up/sql53_dml_from_using_exec.rs`: dispatch の最小固定と RETURNING
+- `crates/engine/tests/sql_t40_up/sql53_dml_from_using_multi_join.rs`（Issue #3294）: JOIN ON・多方向結合・LEFT の NULL 補完・交差結合・多重一致・上限・RLS（3 表の越境）・RETURNING・再送冪等・fail-closed の拒否・Describe の一致・`search_path` ゲート
 - `crates/engine/tests/sql_t40_up/sql53_dml_from_using_acceptance.rs`（Issue #3205）: SQL 経由の受け入れ。多重一致・RLS（他テナントの件数が漏れない）・上限（`54000`・副作用ゼロ）・再送冪等・明示 Tx（COMMIT／ROLLBACK・read-your-writes・Failed）・自己結合・末尾 `;`・未対応形の fail-closed
 - `crates/engine/src/core/dml_join_exec_tests.rs`: 実行器の単体テスト（走査位置 `matches` の固定を含む）
 - `crates/wire-server/tests/wire_sql/wire_sql53_dml_from_using.rs`: 末尾 `;` 付き単独送信・タグ・op id
@@ -142,3 +172,16 @@ SQL-53 (b)・SQL-75・SQL-76 のポインタ。`EXPLAIN [ANALYZE|VERBOSE|(オプ
 - **VERBOSE**: `RETURNING` の列を `output:` に出す（Describe と同じ列）。`FORMAT JSON` は既存の包みで通り、`ANALYZE` との併用は `0A000`
 - **権限**: 非 EXPLAIN と同じビット（対象表 `UPDATE|SELECT`／`DELETE|SELECT`、FROM／USING 側の SELECT）。EXPLAIN は抜け道にならない
 - **まだ拒否する形**: target がビューの形・一時表が関与する形（FROM／USING 側の単純形ビューは #3292 で受理済みで、EXPLAIN も同じ計画を返す）、FROM 内の JOIN ON・多方向結合（#3294。木の組み立ては source 1 個前提で、#3294 が計画を拡張するときに追随させる）、分割実行（`PARTITIONED`）、セッション無しの入口
+
+## SET の行値代入と FROM 側の式（Issue #3296）
+
+SQL-53 (b)・RLS-10・RECOVER-10・RECOVER-11・SQL-28 のポインタ。依存・unsafe の変更なし。
+
+- **構文段**: SET 右辺の式を解析する間だけ `Parser::dml_from_set_refs` を有効にし、式中の列参照を出現順に `ColumnRef`（修飾の有無とも保持）へ積んで、式には NUL 始まりのプレースホルダ識別子（`dml_from::SET_REF_PREFIX` + 通し番号）を置く。名前ベースの書き換えをしないため、対象表修飾の参照と FROM 側の同名列を取り違えない。`RETURNING` の式項目は従来経路のまま（FROM 側の修飾は `0A000`）
+- **行値代入**: `parse_update_row_assignment`（Issue #1747）の本体を、右辺要素の解析器を引数に取る `parse_row_assignment_with` へ抽出し、単一表 UPDATE と FROM 形が同じ規則（`ROW`・1 列は `ROW` 必須で `42601`・個数不一致 `42601`・部分クエリ源 `0A000`・代入数の累計上限）を共有する。要素ごとの列参照 1 個は従来の `Column`、式は `Expr`、`DEFAULT` は `Value`
+- **束縛**: 参照を同じスコープで解決する。対象表の列だけの式はプレースホルダを列名へ戻して従来の式束縛へ、FROM 側を含む式は `BoundUpdateFrom::set_joined_exprs` へ載せる
+- **変換**: `plan_set` が参照ごとに合成スキーマ上の名前へ写して `bind_set_expr` で束縛する（型の照合・暗黙キャスト・式非対応の代入先型の `0A000`・範囲外 `22003` は単一表 SET と同じ）。source 列の登録は `register_source_column` に集約した。source の疑似列 `id` と写像できない型は `0A000`。実行器は変更しない
+- **SQLSTATE**: 列数の不一致・1 列の括弧形 `42601`、型の不整合 `42804`、部分クエリ源 `0A000`、未知の修飾子 `42P01`、曖昧な非修飾名 `42702`、未知列 `42703`
+- **権限・RLS**: 変更なし。FROM 側の SELECT 権限はトークン走査の読み取りゲート、source の走査は書き込むセッションの `PolicyContext`
+- **判定順**: 式の型検査は変換器が行うため、`RETURNING` の束縛エラーが式の `42804` より先に返ることがある（どちらも書き込み前の拒否）
+- **まだ拒否する形**: `RETURNING` の式の中で FROM／USING 側の列を参照する形（`0A000` のまま。受け皿の整理は別途）

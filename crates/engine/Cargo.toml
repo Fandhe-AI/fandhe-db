@@ -566,3 +566,13 @@ test = false
 name = "hnsw_search_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #3310（ポインタ: WIRE-17・INDEX-4）の手動計測入口。行の形から ①（件数上限）を外した後、
+# 大量 COPY FROM で ③（既定 64 MiB）と ④（既定 4096）のどちらが先に効くか・③ 直下の所要時間・
+# ピークメモリを測る情報提供専用ベンチ（既定値は変えない）。時間依存のため CI・make ci には含めない。
+# harness = false / test = false は他ベンチと同一方針。`make bench-copy-volume`（Makefile）から実行する。
+# 依存・feature は変更しない。
+name = "copy_volume_bench"
+harness = false
+test = false
