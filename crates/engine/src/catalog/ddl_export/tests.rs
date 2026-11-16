@@ -287,7 +287,8 @@ fn inject(storage: &Storage, table: &str, key: &str, value: &[u8]) {
     w.commit().expect("commit");
 }
 
-// tracked: #3287
+/// SCHEMA 配下の matview（Issue #3287）・ENUM は持ち主のスコープにだけ現れ、他テナントの
+/// ダンプには影響しない。持ち主のダンプは、読めない定義を黙って落とさず失敗する。
 #[test]
 fn matviews_and_enums_are_scoped_by_owner_and_never_leak_across_tenants() {
     let path = unique_db_path("ddl-export-scoped-kinds");
@@ -318,17 +319,12 @@ fn matviews_and_enums_are_scoped_by_owner_and_never_leak_across_tenants() {
     for (s, b) in scopes.iter().zip(&before) {
         assert_eq!(&dump_sql(&storage, s).expect("unchanged by tenant-b"), b);
     }
-    // 持ち主の B のダンプは、黙って落とさず失敗する（matview の検査が ENUM より先に走る）。
-    assert_eq!(
-        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-b"))),
-        "materialized view"
-    );
+    // 持ち主の B のダンプは、読めない定義を黙って落とさず失敗する（SCHEMA 配下の matview は
+    // 定義を decode して書き出す対象のため、壊れた blob は破損として全体失敗になる）。
+    assert!(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-b")).is_err());
     // A 自身の SCHEMA 配下の matview も黙って落とさない。
     inject(&storage, "materialized_views", &format!("#{id_a}.mv"), b"x");
-    assert_eq!(
-        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a"))),
-        "materialized view"
-    );
+    assert!(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a")).is_err());
     // 共有分だけの書き出しは、テナント固有の行に影響されない。
     dump_sql(&storage, &SchemaDdlScope::shared_only()).expect("shared only");
 }

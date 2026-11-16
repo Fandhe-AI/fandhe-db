@@ -42229,6 +42229,29 @@ mod tests {
         }
     }
 
+    /// SQL-42・Issue #3274: 素の走査の `ORDER BY` が算術で始まるキーを拒否する既存制限は
+    /// `%` にも `+ - * /` と同じコードで適用する（`%` だけ受理範囲を広げない）。一方、
+    /// 式キーとして始まる形（関数・CASE の内側の `%`）は受理する。
+    /// intentional: docs/design/implementation-status.md（Issue #3274 の記録）
+    #[test]
+    fn scan_order_by_arithmetic_leading_key_rejects_rem_like_other_operators() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            "SELECT * FROM documents ORDER BY n % 2 LIMIT 5",
+            "SELECT * FROM documents ORDER BY n * 2 LIMIT 5",
+            "SELECT * FROM documents ORDER BY n / 2 LIMIT 5",
+        ] {
+            let err = validate_sql(sql, &lookup).expect_err("must be rejected");
+            assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
+        }
+        for sql in [
+            "SELECT id FROM documents ORDER BY abs(n) % 2 LIMIT 5",
+            "SELECT id FROM documents ORDER BY CASE WHEN n % 2 = 0 THEN 0 ELSE 1 END LIMIT 5",
+        ] {
+            validate_sql(sql, &lookup).unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"));
+        }
+    }
+
     /// SQL-56 (2)・Issue #1792: 整数リテラルだけのキーは序数として受理し、`ASC`/`DESC` や
     /// 他のキーとも併用できる。範囲の検査は束縛段（ここでは位置のまま運ぶ）。
     #[test]
