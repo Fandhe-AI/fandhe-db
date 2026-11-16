@@ -1087,6 +1087,57 @@ fn time_array_cast_converts_values_and_checks_range() {
     assert_eq!(err_of(&core, "CAST('{x}' AS time[])").wire_code(), "22007");
 }
 
+/// `interval[]` への変換は専用の配列要素型として受理する（Issue #3234）。値は要素ごとの入力関数
+/// （書式不正 `22007`・無限大 `0A000`）で、整数配列からは規則表の `×`（`42846`）。
+#[test]
+fn interval_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-interval");
+    let iv_ty =
+        ColumnType::Array(ArrayType::new(ArrayElemType::Interval, MAX_ARRAY_ELEMENTS).expect("ty"));
+    let (cell, meta) = first(&core, "CAST('{\"1 day\",NULL,\"2 hours\"}' AS interval[])");
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::Interval(vec![
+            Some(engine::datetime::Interval {
+                months: 0,
+                days: 1,
+                micros: 0
+            }),
+            None,
+            Some(engine::datetime::Interval {
+                months: 0,
+                days: 0,
+                micros: 7_200_000_000
+            }),
+        ]))
+    );
+    assert_eq!(meta_type(&meta), Some(iv_ty.clone()));
+    let (cell, meta) = first(&core, "CAST(NULL AS interval[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(iv_ty));
+    // 整数配列 -> interval[] は規則表で `×`（42846）のまま。
+    assert_eq!(err_of(&core, "CAST(ai AS interval[])").wire_code(), "42846");
+    // text 配列からは要素ごとの io 変換。
+    assert_eq!(
+        value(&core, "CAST(CAST('{1 mon}' AS text[]) AS interval[])"),
+        Cell::Array(ArrayValue::Interval(vec![Some(
+            engine::datetime::Interval {
+                months: 1,
+                days: 0,
+                micros: 0
+            }
+        )]))
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{x}' AS interval[])").wire_code(),
+        "22007"
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{infinity}' AS interval[])").wire_code(),
+        "0A000"
+    );
+}
+
 /// `timestamptz[]` への CAST（Issue #3233）。値・結果の列型・型付き NULL・範囲外・書式不正・
 /// 規則表で `×` の整数配列（`42846`）・timestamp 配列からのセッション TZ 変換。
 #[test]
@@ -1135,18 +1186,8 @@ fn timestamptz_array_cast_converts_values_and_checks_range() {
 }
 
 #[test]
-fn arrays_without_a_representable_element_type_are_not_implemented() {
-    let (core, _g) = setup("cast-array-unsupported");
-    for target in ["interval[]"] {
-        // 文字列型・型付き NULL は常に 0A000。整数配列は要素の組（int4 -> 変換先の要素型）が
-        // 規則表で `×` なら 42846 が先に出る（time／timestamptz／interval）。
-        for operand in ["ai", "CAST('{1}' AS text)", "NULL"] {
-            let e = err_of(&core, &format!("CAST({operand} AS {target})"));
-            let elem_is_impossible = operand == "ai" && ["interval[]"].contains(&target);
-            let want = if elem_is_impossible { "42846" } else { "0A000" };
-            assert_eq!(e.wire_code(), want, "{operand} -> {target}");
-        }
-    }
+fn impossible_array_element_pairs_are_rejected_by_the_rule_table() {
+    let (core, _g) = setup("cast-array-impossible");
     // 規則表の `×` は要素型が未実装でも 42846 が先
     assert_eq!(err_of(&core, "CAST(ai AS uuid[])").wire_code(), "42846");
     assert_eq!(err_of(&core, "CAST(i4 AS integer[])").wire_code(), "42846");

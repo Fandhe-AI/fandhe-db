@@ -526,6 +526,22 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                         }
                     }
                 }
+                // Issue #3234 の新規採番（既存タグのバイト列は不変）。生の三要素を固定順に積む
+                // （`1 mon` と `30 days` は等価でもバイト列が異なる。interval.rs の契約どおり）。
+                crate::row_codec::ArrayValue::Interval(items) => {
+                    b.push_u8(17 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(i64::from(item.months) as u64);
+                            b.push_u64(i64::from(item.days) as u64);
+                            b.push_u64(item.micros as u64);
+                        }
+                    }
+                }
                 // Issue #3235 の新規採番（既存タグのバイト列は不変）。ビット長を要素ごとに積み、
                 // `bit(4)` の `1000` と `bit(8)` の `10000000`（同じバイト列）を別ハッシュにする。
                 crate::row_codec::ArrayValue::Bit(items) => {

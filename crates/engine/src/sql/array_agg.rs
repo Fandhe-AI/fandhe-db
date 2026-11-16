@@ -94,6 +94,8 @@ enum Elem {
     Timestamp(i64),
     /// `TIME`（Issue #3232）。0 時起点のマイクロ秒。
     Time(i64),
+    /// `INTERVAL`（Issue #3234）。生の三要素を保ち、`DISTINCT` の鍵だけ正規化キーにする。
+    Interval(crate::datetime::Interval),
     /// `TIMESTAMPTZ`（Issue #3233）。UTC 起点のマイクロ秒。
     TimestampTz(i64),
     Uuid(Uuid),
@@ -136,6 +138,10 @@ impl Elem {
             Elem::SmallInt(v) => out.extend_from_slice(&v.to_be_bytes()),
             Elem::BigInt(v) | Elem::Timestamp(v) | Elem::Time(v) | Elem::TimestampTz(v) => {
                 out.extend_from_slice(&v.to_be_bytes())
+            }
+            // スカラー INTERVAL と同じ正規化キー（`1 mon` と `30 days` は同じ鍵）。
+            Elem::Interval(v) => {
+                out.extend_from_slice(&crate::datetime::interval_cmp_key(v).to_be_bytes())
             }
             Elem::Real(v) => out.extend_from_slice(&canon_f64(f64::from(*v))),
             Elem::Double(v) => out.extend_from_slice(&canon_f64(*v)),
@@ -423,6 +429,10 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
             Elem::Time(v) => Some(v),
             _ => None,
         })?),
+        ArrayElemType::Interval => ArrayValue::Interval(collect(elems, |e| match e {
+            Elem::Interval(v) => Some(v),
+            _ => None,
+        })?),
         ArrayElemType::TimestampTz => ArrayValue::TimestampTz(collect(elems, |e| match e {
             Elem::TimestampTz(v) => Some(v),
             _ => None,
@@ -538,6 +548,7 @@ fn elem_from_scalar(
         (ArrayElemType::Date, S::Date(x)) => Elem::Date(*x),
         (ArrayElemType::Timestamp, S::Timestamp(x)) => Elem::Timestamp(*x),
         (ArrayElemType::Time, S::Time(x)) => Elem::Time(*x),
+        (ArrayElemType::Interval, S::Interval(x)) => Elem::Interval(*x),
         (ArrayElemType::TimestampTz, S::TimestampTz(x)) => Elem::TimestampTz(*x),
         (ArrayElemType::Uuid, S::Uuid(u)) => Elem::Uuid(*u),
         (ArrayElemType::Numeric { .. }, S::Numeric(d)) => Elem::Numeric(*d),
@@ -564,6 +575,7 @@ fn elem_from_scalar(
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Interval
             | ArrayElemType::Bit(_)
             | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
@@ -607,6 +619,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
         (ArrayElemType::Date, ExprValue::Date(d)) => Elem::Date(d),
         (ArrayElemType::Timestamp, ExprValue::Timestamp(t)) => Elem::Timestamp(t),
         (ArrayElemType::Time, ExprValue::Time(t)) => Elem::Time(t),
+        (ArrayElemType::Interval, ExprValue::Interval(v)) => Elem::Interval(v),
         (ArrayElemType::TimestampTz, ExprValue::TimestampTz(t)) => Elem::TimestampTz(t),
         (ArrayElemType::Uuid, ExprValue::Uuid(u)) => Elem::Uuid(u),
         (ArrayElemType::Numeric { .. }, ExprValue::Numeric(d)) => Elem::Numeric(d),
@@ -632,6 +645,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Interval
             | ArrayElemType::Bit(_)
             | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,

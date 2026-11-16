@@ -76,6 +76,7 @@ pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdl
                 (ArrayElemType::Bpchar(n), _) => format!("CHAR({n})"),
                 (ArrayElemType::SmallInt, _) => "SMALLINT".to_string(),
                 (ArrayElemType::Time, _) => "TIME".to_string(),
+                (ArrayElemType::Interval, _) => "INTERVAL".to_string(),
                 (ArrayElemType::Bit(n), _) => format!("BIT({n})"),
                 (ArrayElemType::TimestampTz, _) => "TIMESTAMPTZ".to_string(),
             };

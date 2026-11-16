@@ -196,14 +196,6 @@ fn unsupported_declarations_stay_fail_closed() {
         ),
         "22023"
     );
-    // 未対応の隣接要素型は従来どおり拒否する。
-    assert_eq!(
-        code(
-            &core,
-            "CREATE TABLE u (id BIGINT PRIMARY KEY, a INTERVAL[])"
-        ),
-        "0A000"
-    );
 }
 
 #[test]

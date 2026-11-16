@@ -880,6 +880,37 @@ fn create_table_time_column_binds_and_accepts_array_element() {
     );
 }
 
+/// Issue #3234（TABLE-14・TABLE-34・NOSQL-13）: 配列の要素型 `"interval"` が受理され、JSON 文字列の
+/// 要素が束縛でき、書式不正は 22007、JSON 数値は 42601 で拒否される。
+#[test]
+fn create_table_interval_array_column_binds() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let arr = query(
+        &session,
+        br#"{"op":"create_table","table":"iv2","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"interval","max_len":4}
+    ]}"#,
+    );
+    assert_eq!(arr.status, 200, "got: {arr:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"iv2","rows":[{"id":1,"embedding":[0.1,0.2],"a":["1 day",null,"2 hours"]}],"operation_id":"iv2-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let bad = query(
+        &session,
+        br#"{"op":"insert","table":"iv2","rows":[{"id":2,"embedding":[0.1,0.2],"a":["x"]}],"operation_id":"iv2-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&bad), "22007", "got: {bad:?}");
+    let num = query(
+        &session,
+        br#"{"op":"insert","table":"iv2","rows":[{"id":3,"embedding":[0.1,0.2],"a":[1]}],"operation_id":"iv2-3"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&num), "42601", "got: {num:?}");
+}
+
 /// Issue #1577（TABLE-33・NOSQL-13）: `create_table`／`add_column` の型名 `"timestamptz"` が
 /// 受理され、ISO 8601 の文字列が束縛でき、書式不正は 22007 で拒否される。
 #[test]

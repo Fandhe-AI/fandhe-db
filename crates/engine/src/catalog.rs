@@ -7231,6 +7231,11 @@ pub enum ArrayElemType {
     /// `BitString` のバイト列と同じ）。OID は別（`_bit` = 1561）なので Text へは丸めない。
     /// 長さなしの `BIT[]` は `BIT(1)[]`（スカラーと同じ）。`VARBIT[]`（OID 1563）は未対応。
     Bit(u32),
+    /// `INTERVAL`（Issue #3234・TABLE-14・TABLE-34・TABLE-35）。行内表現は要素ごとに固定幅
+    /// 16 バイト（`months: i32 LE`・`days: i32 LE`・`micros: i64 LE`。[`crate::datetime::Interval`]
+    /// のフィールド順）。OID は別（`_interval` = 1187）なので他型へは丸めない。等価・比較は
+    /// スカラー INTERVAL と同じ正規化キー（1 か月 = 30 日）で行うが、行バイトは生の三要素を保つ。
+    Interval,
     /// `TIMESTAMPTZ`（Issue #3233）。行内表現は UTC 起点のマイクロ秒 8 バイト LE（`Timestamp`・
     /// `Time` と同形）。OID は別（`_timestamptz` = 1185）なので他の要素型へは丸めない。
     TimestampTz,
@@ -7241,7 +7246,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 20] = [
+    pub const ALL_KINDS: [ArrayElemType; 21] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7264,6 +7269,7 @@ impl ArrayElemType {
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
         ArrayElemType::Bit(4),
+        ArrayElemType::Interval,
         ArrayElemType::TimestampTz,
     ];
 
@@ -7292,7 +7298,8 @@ impl ArrayElemType {
             ArrayElemType::SmallInt => 16,
             ArrayElemType::Time => 17,
             ArrayElemType::Bit(_) => 18,
-            ArrayElemType::TimestampTz => 19,
+            ArrayElemType::Interval => 19,
+            ArrayElemType::TimestampTz => 20,
         }
     }
 
@@ -7322,6 +7329,7 @@ impl ArrayElemType {
             ArrayElemType::Bit(_) => "bit",
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
+            ArrayElemType::Interval => "interval",
             ArrayElemType::TimestampTz => "timestamptz",
         }
     }
@@ -7337,6 +7345,7 @@ impl ArrayElemType {
             "bigint" => Ok(ArrayElemType::BigInt),
             "smallint" => Ok(ArrayElemType::SmallInt),
             "time" => Ok(ArrayElemType::Time),
+            "interval" => Ok(ArrayElemType::Interval),
             "timestamptz" => Ok(ArrayElemType::TimestampTz),
             "real" => Ok(ArrayElemType::Real),
             "double" => Ok(ArrayElemType::Double),
@@ -7420,6 +7429,7 @@ impl ArrayType {
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Interval
             | ArrayElemType::TimestampTz => {}
         }
         Ok(Self {
@@ -7526,6 +7536,7 @@ impl ArrayType {
                 | ArrayElemType::Varchar(None)
                 | ArrayElemType::SmallInt
                 | ArrayElemType::Time
+                | ArrayElemType::Interval
                 | ArrayElemType::TimestampTz,
                 _,
             ) => format!("{},{}", self.elem.catalog_tag(), self.max_len),
@@ -8243,6 +8254,7 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bpchar(_)
         | ArrayElemType::SmallInt
         | ArrayElemType::Time
+        | ArrayElemType::Interval
         | ArrayElemType::TimestampTz
         | ArrayElemType::Bit(_) => false,
     }
@@ -21012,6 +21024,7 @@ mod tests {
             (ArrayElemType::BigInt, "bigint"),
             (ArrayElemType::SmallInt, "smallint"),
             (ArrayElemType::Time, "time"),
+            (ArrayElemType::Interval, "interval"),
             (ArrayElemType::TimestampTz, "timestamptz"),
             (ArrayElemType::Real, "real"),
             (ArrayElemType::Double, "double"),

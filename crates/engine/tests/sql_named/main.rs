@@ -95,6 +95,7 @@ mod sql_insert_session_dispatch;
 mod sql_int8vec_column;
 mod sql_int8vec_distance;
 mod sql_interval_arith;
+mod sql_interval_array;
 mod sql_interval_column;
 mod sql_interval_part_trunc;
 mod sql_interval_query;

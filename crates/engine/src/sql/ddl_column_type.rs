@@ -153,16 +153,13 @@ pub(crate) fn to_static_column_type_with_array_default(
                 // `timestamptz[]` も別 OID（1185）を持つ専用の要素型へ写す（Issue #3233。Issue #1574
                 // で拒否していた形を受理へ反転した。`TIMESTAMPTZ(p)[]` はスカラー側が未対応で 0A000）。
                 ColumnType::TimestampTz => ArrayElemType::TimestampTz,
-                // `interval[]` も別 OID（1187）のため拒否する（Issue #1579）。
+                // `interval[]` は別 OID（1187）を持つ専用の要素型へ写す（Issue #3234。Text 等へ丸めると
+                // 型の区別が失われる。Issue #1579 で拒否していた形を受理へ反転した）。
+                ColumnType::Interval => ArrayElemType::Interval,
                 // `bit[]`・`bit(n)[]` は別 OID（1561）を持つ専用の要素型へ写す（Issue #3235。Text へ
                 // 丸めると型の区別が失われる。長さなしの `BIT[]` は `BIT(1)[]`。`VARBIT[]`・
                 // `BIT VARYING[]` はスカラーの VARBIT が構文段で `0A000` のため未対応のまま）。
                 ColumnType::Bit(n) => ArrayElemType::Bit(n),
-                ColumnType::Interval => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "this array element type is not supported yet".to_string(),
-                    })
-                }
                 ColumnType::Uuid => ArrayElemType::Uuid,
                 ColumnType::Numeric { precision, scale } => {
                     ArrayElemType::Numeric { precision, scale }
@@ -310,7 +307,8 @@ pub enum SqlColumnTypeName {
     /// `TIMESTAMP(p) WITH TIME ZONE`・配列は構文段で `0A000` のため精度付きには到達しない。
     TimestampTz,
     /// `INTERVAL`（TABLE-34・Issue #1579）。`INTERVAL(p)`・フィールド制限付き
-    /// （`INTERVAL YEAR TO MONTH` 等）・配列は構文段で `0A000` のため修飾付きには到達しない。
+    /// （`INTERVAL YEAR TO MONTH` 等）は構文段で `0A000` のため修飾付きには到達しない。配列
+    /// （`INTERVAL[]`）は Issue #3234 で受理（要素型の段で `ArrayElemType::Interval` へ写す）。
     Interval,
     /// `BIT(n)`（TABLE-48・Issue #2021）。長さ省略の `BIT` は `BIT(1)`（構文段で確定）。
     /// `BIT VARYING`・`VARBIT` は構文段で `0A000`、配列は要素型の段で `0A000`。
