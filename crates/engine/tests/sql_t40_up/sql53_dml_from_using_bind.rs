@@ -108,11 +108,19 @@ const EXECUTABLE: &[(&str, u64)] = &[
     ("DELETE FROM docs USING langs WHERE docs.lang = langs.lang", 1),
     ("DELETE FROM docs d USING langs AS l WHERE d.lang = l.lang", 1),
     ("DELETE FROM docs USING docs AS d2 WHERE docs.id = d2.id", 2),
+    // 非等値・OR をまたぐ述語・DML 専用の葉（Issue #3295。seed: docs = ja/en・n は NULL、langs = ja）
+    ("DELETE FROM docs USING langs WHERE docs.lang < langs.lang", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang >= langs.lang", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang OR docs.n = 1", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang AND langs.label IS NOT NULL", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang AND docs.n IS NULL", 1),
+    ("DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n IN (1, 2)", 0),
+    ("DELETE FROM docs USING langs WHERE docs.lang < langs.lang OR langs.label IS NULL;", 1),
 ];
 
 /// 束縛は通るが、変換器が `0A000` で拒否する形（第 1 弾の対象外。設計記録の変換器節）。
 const CONVERTER_REJECTED: &[&str] = &[
-    // relation をまたぐ OR
+    // 残余（Issue #3295）が FROM 側の疑似列 id を参照する形（固定文言の 0A000）
     "UPDATE docs SET lang = 'x', n = 1 FROM langs WHERE docs.lang = langs.lang OR (docs.id = langs.id)",
     // FROM／USING が 2 表以上
     "UPDATE docs SET lang = 'x' FROM langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
@@ -121,6 +129,9 @@ const CONVERTER_REJECTED: &[&str] = &[
     "UPDATE docs SET lang = 'x' FROM langs USING OPERATION_ID NULL",
     "DELETE FROM docs USING langs USING OPERATION_ID 'op-d2'",
     "DELETE FROM docs USING langs",
+    // 等値キーも残余も無い片側だけの述語（DML 専用の葉 `IS NULL`・数値リテラルは構文段では受理する）
+    "UPDATE docs SET lang = 'x' FROM langs WHERE langs.label IS NULL",
+    "DELETE FROM docs USING langs WHERE docs.n = 1",
     // 裸の bool 列 WHERE の後ろに DML の後続句が続く形（同上）
     "UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag USING OPERATION_ID 'op-u3'",
     "UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag;",
@@ -515,17 +526,13 @@ fn rejected_forms_fail_closed_with_expected_codes() {
              USING OPERATION_ID 'p2' PARTITIONED",
             "42601",
         ),
-        // WHERE の対象外構文（サブクエリ・IS NULL・数値リテラル・NOT）
+        // WHERE の対象外構文（サブクエリ・NOT・IS TRUE）
         (
             "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang IN (SELECT lang FROM langs LIMIT 1)",
             "42601",
         ),
         (
-            "UPDATE docs SET lang = 'x' FROM langs WHERE langs.label IS NULL",
-            "42601",
-        ),
-        (
-            "DELETE FROM docs USING langs WHERE docs.n = 1",
+            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND langs.flag IS TRUE",
             "42601",
         ),
         (

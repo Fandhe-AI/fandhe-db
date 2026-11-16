@@ -24,7 +24,7 @@ DELETE FROM <表> [[AS] <別名>] USING <rel>[, <rel>]* [WHERE <join_where>]
 <rel> := <表> [[AS] <別名>]
 ```
 
-- `WHERE` は JOIN の `WHERE` 文法（`JoinWhereExpr`）を再利用する。列同士の比較・`AND`／`OR`・括弧を受理し、数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`
+- `WHERE` は JOIN の `WHERE` 文法（`JoinWhereExpr`）を再利用する。列同士の比較・`AND`／`OR`・括弧を受理する。DML の WHERE だけが、数値リテラルとの比較（`= < <= > >=`）・数値 `IN`・`IS [NOT] NULL` の葉を加えて受理する（Issue #3295。SELECT の JOIN の WHERE／ON は同じ入力で `42601` のまま）。`NOT`・サブクエリ・`<>`・`IS TRUE` は構造的に `42601`
   になる。#1750 のサブクエリ形と FROM 形は当面同時に使えない
 - SET 左辺は非修飾の列名だけ（`SET t.a = ...` は `42601`）。行値の代入 `(a, b) = (...)` は `0A000`
 - SET 右辺は 2 系統に分ける
@@ -73,9 +73,10 @@ WHERE は最上位の `AND` で conjunct に平坦化し、解決済みの relat
 | 別 relation の列同士の等値 | 結合キー（対象側・source 側へ向きを正規化。複合キー可） |
 | 対象側だけを参照（`OR` 可） | 対象側フィルタ（既存の述語形 DML と同じ束縛器） |
 | source 側だけを参照（`OR` 可） | source の走査へ押し下げる述語 |
-| 上記以外 | `0A000` |
+| 対象と source をまたぐ上記以外（非等値・`OR`・キー化できない型の等値） | 残余述語（Issue #3295。下記「非等値・OR をまたぐ述語」節） |
+| 上記以外（参照列が無い等） | `0A000` |
 
-`0A000` で拒否する形（第 1 弾の設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: WHERE 省略・等値結合キー無し、relation をまたぐ非等値・`OR`、同じ relation 内の列比較、FROM／USING が 2 表以上、キー化できない型（REAL／DOUBLE／NUMERIC 等）の結合キー、非バイト列順の照合つきキー列、embedding を参照する対象側述語、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列。キー列の型クラスが比較できない組は `42804`。
+`0A000` で拒否する形（設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: WHERE 省略・等値結合キーも残余も無い形、FROM／USING が 2 表以上、embedding を参照する対象側述語・残余、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列、残余での source 疑似列 `id`・VECTOR／配列列の参照。同じ relation 内の列比較は Issue #3295 で対象側／source 側へ押し下げて受理する。キー列の型クラスが比較できない組は `42804`。
 
 SET は、リテラルと対象表の列だけを使う式をそのまま運び、列参照（source 列を含む）を「対象列 ++ source の取り出し列」の合成スキーマ上の式として束縛する（合成名は利用者の識別子と衝突しない綴り）。Describe 経路で変換エラーを返すかどうかは #3202 の方針の範囲。
 
@@ -119,6 +120,19 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - **自己結合**: ビューの基底表が target と同じ表でもよい（source の走査は書き込みより前に完了する既存の規約）
 - **権限**: `classify_write` は従来どおり target のビットだけを課し、source のビュー名はトークン走査の読み取りゲートで判定される。準備済み文の陳腐化はトークン列に現れる名前の同一性検査が覆う
 - **一時表だけの形**: `is_routable` が `UpdateFrom`／`DeleteUsing` を受理し、`temp_dispatch` が一時コアの `execute_update_from_on`／`execute_delete_using_on` を呼ぶ。総バイト数の上限（`54000`）・明示 Tx・Describe は既存の一時表経路に乗る
+
+## 非等値・OR をまたぐ述語（Issue #3295）
+
+SQL-53 (b)・RLS-10・RECOVER-10/11・SQL-28 のポインタ。等値キーが取れない部分を、対象行 × source 行のネストループで評価する残余述語として受理する。
+
+- **振り分け**: 最上位の `AND` の conjunct のうち、キー化できる列等値だけが結合キー。対象と source をまたぐそれ以外（非等値・`OR`・`AND`／`OR` 混在・REAL／DOUBLE／NUMERIC 等の等値・非バイト列順の照合の等値）は残余。型クラスが比較できない等値は従来どおり `42804`。キーが 0 本でも残余があれば受理する（キーも残余も無い形は従来どおり `0A000`）
+- **束縛・評価**: 残余は「対象表のスキーマ ++ 残余が参照する source 列（合成名）」の合成スキーマ上の `WherePredicate` へ変換し、通常の単一表 WHERE と同じ `bind_where_predicates` で束縛する（`sql::join::dml_residual`）。実行は `where_tree::BoundConjunction::matches` で、ビューは「対象行の走査結果 ++ source 行のスカラー」。第 2 の評価器を作らないため、NULL の三値論理・型強制・照合・数値リテラル・`IS NULL` の真理値が通常の WHERE と一致する。source 列は照合を引き継ぐ。SELECT JOIN の `residual::eval_all` は使わない（NULL 補完行を偽にする前提が `IS NULL` と相性が悪い）
+- **実行**: 候補は等値キーのバケット（キー 0 本なら source の全行）。バケットを評価する前に `charge_comparisons` で比較回数を文全体の上限へ計上する（超過は `54000`）。走査位置の昇順に評価し、残余が真になった組だけを一致ペアに数える（`max_output_rows`。一意化の前の累計）。採る source 行は真になった中の最初（決定的）。DELETE も短絡せず全候補を評価し、UPDATE と `54000` の判定を同じにする。内側ループで協調的中断（`57014`）に応じる。残余が無い形は従来経路のまま
+- **列配置**: 残余が参照する source 列は走査投影の末尾（SET・キー・`RETURNING` の列の後ろ）へ追記し、SET ビューと `RETURNING` のセル位置を動かさない
+- **DML 専用の葉**: `JoinWherePredicate::NumericCompare`・`IsNull`。`IN (数値, ...)` は構文段で数値比較の `OR` へ脱糖する。葉数・`IN` の要素数は積む前に検査する（`54000`）。`IsNull` は非 strict（`is_null_rejecting` は偽）で、SELECT の JOIN の文法は生成しない。多重防御として SELECT の計画器（`build_plan`）は新 variant を含む木を `0A000` で拒否する
+- **fail-closed**: 残余での source 疑似列 `id`（u64 を式評価ビューへ載せない）・VECTOR／配列列の参照は固定文言の `0A000`。サブクエリ・`NOT`・`<>`・`IS TRUE` は従来どおり `42601`。RLS は変えない（対象側は所有∧可視の候補、source 側は `ctx` 走査結果だけが入力で、他テナントの Private 行はどちらにも現れない）。エラー文言は固定文言と入力された名前だけ
+- **対象外**: WHERE 省略・片側だけの述語による交差結合と 3 表以上（#3294）、SET 右辺の FROM 側修飾式・行値代入（#3296）、`EXPLAIN` への残余の表示（対応しない。`EXPLAIN` が壊れないことだけを結合テストで確認）、SELECT の JOIN の WHERE／ON への数値リテラル・`IS NULL`（対応しない。外部結合の strict 簡約の見直しが要る別の判断）
+- **テスト**: `sql53_dml_from_using_residual.rs`（sql_t40_up。非等値・キー＋残余・OR・三値論理・数値リテラル・決定性・自己結合・RLS・明示 Tx・台帳・上限・fail-closed・EXPLAIN）・`dml_join_exec_tests.rs`（バケット内の偽の行の飛ばし・比較回数／ペア数上限）・`dml_plan_tests.rs`・`allowlist.rs` の単体テスト・`wire_sql53_dml_from_using.rs`（末尾 `;` のタグ）
 
 ## テスト
 

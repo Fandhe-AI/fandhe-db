@@ -131,6 +131,38 @@ fn explicit_transaction_commits_and_rolls_back() {
     assert_eq!(count(&mut stream, UPDATED), 2);
 }
 
+/// 非等値・`OR` をまたぐ述語・`IS NOT NULL`・数値リテラル（Issue #3295）も、末尾 `;` 付きの単独送信で
+/// 正確なタグを返す。以前は `0A000` で拒否していた形。docs = ja/en/fr、langs = ja/en。
+#[test]
+fn residual_predicates_report_exact_tags_with_trailing_semicolon() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    // en < ja・fr < ja の 2 行（ja はどの langs.lang よりも小さくない）。
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = 9 FROM langs WHERE docs.lang < langs.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, UPDATED), 2);
+    // OR をまたぐ述語（等値 OR 数値リテラル）。ja・en の 2 行。
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = 1 FROM langs WHERE docs.lang = langs.lang OR docs.n > 100;",
+        "UPDATE 2",
+        b'I',
+    );
+    expect_tag(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.lang < langs.lang AND langs.lang IS NOT NULL;",
+        "DELETE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, ALL), 1);
+}
+
 /// 末尾 `;` 付き単独送信（psql 形）の `USING OPERATION_ID`（Issue #3203・RECOVER-10/11）: 初回は正確なタグ、
 /// 再送は `23505`、別文への再利用は `22023` で、エラー後も接続は ReadyForQuery（`I`）へ戻り使い続けられる。
 #[test]

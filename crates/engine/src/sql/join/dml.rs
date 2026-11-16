@@ -43,9 +43,11 @@ use crate::row_codec::{ScalarRef, Value};
 use crate::sql::allowlist::{Projection, SqlSurfaceError, ValidatedScan, WherePredicate};
 use crate::sql::dml_from_returning::BoundFromReturning;
 use crate::sql::exec::{Cell, ResultRow};
+use crate::sql::expr_program::StackValue;
 use crate::sql::relation::ColumnSlot;
 use crate::sql::set_expr::BoundSetExpr;
 use crate::sql::udf_call::{BoundExpr, UdfRegistry};
+use crate::sql::where_tree::BoundConjunction;
 use crate::tenant::DmlCandidate;
 
 use super::values::{
@@ -84,6 +86,21 @@ pub(crate) struct JoinedDmlSource {
     /// `RETURNING` が source の疑似列 `id` を参照するため、結合キーが使わなくても走査で `id` を
     /// 取り出すか（Issue #3204）。
     pub(crate) include_pseudo_id: bool,
+}
+
+/// 対象と source をまたぐ残余述語（Issue #3295。非等値・`OR`・キー化できない型の等値・
+/// 数値リテラル・`IS [NOT] NULL` を含む部分木）。「対象表のスキーマ ++ [`Self::source_columns`]
+/// （合成名の列）」の合成スキーマ上で、通常の WHERE と同じ束縛器により束縛済み
+/// （[`super::dml_residual::plan_residual`]）。評価は対象行 × source 行の組ごとに
+/// [`JoinedProbe`] が行い、結合ビューは「対象行の走査結果 ++ 残余が参照する source 列」。
+#[derive(Debug, Clone)]
+pub(crate) struct JoinedResidual {
+    /// 残余が参照する source の列（`source.schema.columns` の添字。初出順・重複なし）。
+    /// ビュー上の位置は対象列数 + 並び位置。
+    pub(crate) source_columns: Vec<usize>,
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
+    pub(crate) expr_filters: Vec<BoundExpr>,
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
 }
 
 /// 等値結合キー 1 本。`None` は疑似列 `id`（`has_pseudo_id` の表のみ）。
@@ -134,8 +151,11 @@ pub(crate) struct JoinedUpdateSet {
 pub(crate) struct JoinedDmlPlan {
     pub(crate) target: JoinedDmlTarget,
     pub(crate) source: JoinedDmlSource,
-    /// 等値結合キー（1 本以上。複数なら複合キー）。
+    /// 等値結合キー（複数なら複合キー）。0 本のときは [`Self::residual`] が必須（キー無しの
+    /// ネストループ。Issue #3295）。
     pub(crate) keys: Vec<EquiKey>,
+    /// 対象と source をまたぐ残余述語（Issue #3295）。`None` なら従来の等値結合だけ。
+    pub(crate) residual: Option<JoinedResidual>,
     /// `Some` なら `UPDATE`、`None` なら `DELETE`。
     pub(crate) update: Option<JoinedUpdateSet>,
     /// 束縛済みの `RETURNING`（Issue #3204）。source 側の列は計画段で
@@ -174,6 +194,14 @@ impl JoinedDmlPlan {
                 cols.push(c);
             }
         }
+        // 残余が参照する列は最後尾へ追記する（SET ビュー・`RETURNING` の添字を動かさない）。
+        if let Some(r) = &self.residual {
+            for &c in &r.source_columns {
+                if !cols.contains(&c) {
+                    cols.push(c);
+                }
+            }
+        }
         cols
     }
 
@@ -208,8 +236,8 @@ impl JoinedDmlPlan {
                 limits.max_relations
             )));
         }
-        if self.keys.is_empty() {
-            return Err(internal("joined DML without a join key"));
+        if self.keys.is_empty() && self.residual.is_none() {
+            return Err(internal("joined DML without a join key or a residual"));
         }
         let (t_len, s_len) = (
             self.target.schema.columns.len(),
@@ -236,6 +264,7 @@ impl JoinedDmlPlan {
             .columns
             .iter()
             .chain(&self.source.returning_columns)
+            .chain(self.residual.iter().flat_map(|r| r.source_columns.iter()))
             .any(|&c| c >= s_len)
         {
             return Err(internal("source column out of range"));
@@ -440,12 +469,24 @@ pub(crate) struct JoinedProbe<'a> {
     cell_offset: usize,
     budget: JoinBudget,
     max_output_rows: usize,
+    /// 残余の比較回数上限（[`JoinLimits::max_comparisons`]。文全体で共有）。
+    max_comparisons: usize,
+    /// 残余述語の評価器（Issue #3295）。`None` なら従来の等値結合だけ。
+    residual: Option<ResidualEval>,
     /// 一意化の前の一致ペアの累計（`max_output_rows` の判定対象）。
     pairs: usize,
     /// 一致した対象行 id と採った source の走査位置（`RETURNING` の収集側と共有する。Issue #3204）。
     /// 述語クロージャ（書き込み）と収集クロージャ（読み取り）が同じ文内で別々に借用するため
     /// `RefCell` に置く。借用の重なりは起きない設計だが、起きても panic せず `XX000` にする。
     matches: Rc<RefCell<HashMap<u64, u32>>>,
+}
+
+/// 残余述語の実行時の評価器。
+struct ResidualEval {
+    conj: BoundConjunction,
+    /// 残余が参照する source 列の（走査結果のセル位置, 列型）。ビューへの追記順。
+    cells: Vec<(usize, ColumnType)>,
+    scratch: Vec<StackValue>,
 }
 
 impl<'a> JoinedProbe<'a> {
@@ -464,6 +505,33 @@ impl<'a> JoinedProbe<'a> {
         let index = build_source_index(read_txn, ctx, plan, &classes, udfs, limits, &mut budget)?;
         let source_columns = plan.source_columns();
         let cell_offset = usize::from(plan.source_id_in_cells());
+        let residual = match &plan.residual {
+            None => None,
+            Some(r) => {
+                let mut cells = Vec::with_capacity(r.source_columns.len());
+                for &c in &r.source_columns {
+                    let pos = plan.source_cell_position(ColumnSlot::Column(c))?;
+                    let ty = plan
+                        .source
+                        .schema
+                        .columns
+                        .get(c)
+                        .ok_or_else(|| internal("source column out of range"))?
+                        .ty
+                        .clone();
+                    cells.push((pos, ty));
+                }
+                Some(ResidualEval {
+                    conj: BoundConjunction::new(
+                        r.metadata_filters.clone(),
+                        r.expr_filters.clone(),
+                        r.or_filters.clone(),
+                    ),
+                    cells,
+                    scratch: Vec::new(),
+                })
+            }
+        };
         Ok(Self {
             plan,
             classes,
@@ -472,6 +540,8 @@ impl<'a> JoinedProbe<'a> {
             cell_offset,
             budget,
             max_output_rows: limits.max_output_rows,
+            max_comparisons: limits.max_comparisons,
+            residual,
             pairs: 0,
             matches: Rc::new(RefCell::new(HashMap::new())),
         })
@@ -528,17 +598,66 @@ impl<'a> JoinedProbe<'a> {
             };
             encode_key_component(&cell, class, &mut key)?;
         }
-        let Some(matched) = self.index.table.get(&key) else {
+        // 走査結果を所有する `Rc` を手元へ複製し、`self` の他フィールドの可変借用と衝突させない。
+        let index = Rc::clone(&self.index);
+        let Some(matched) = index.table.get(&key) else {
             return Ok(None);
         };
-        // 一意化の前に一致ペアを数え、上限超過は何も確保せずに拒否する。
-        self.pairs = self.pairs.saturating_add(matched.len());
-        if self.pairs > self.max_output_rows {
-            return Err(SqlSurfaceError::payload_too_large(
-                "JOIN result exceeds the row limit",
-            ));
-        }
-        let first = matched.first().copied();
+        let first = match self.residual.as_mut() {
+            None => {
+                // 一意化の前に一致ペアを数え、上限超過は何も確保せずに拒否する。
+                self.pairs = self.pairs.saturating_add(matched.len());
+                if self.pairs > self.max_output_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "JOIN result exceeds the row limit",
+                    ));
+                }
+                matched.first().copied()
+            }
+            Some(res) => {
+                // 残余の評価は候補（等値キーの一致バケット。キー無しなら source の全行）ごとの
+                // ネストループ。比較回数を評価の前に文全体の上限へ計上する（超過は `54000`）。
+                // DELETE も短絡せず全候補を評価する（UPDATE と `54000` の判定を同じにするため。
+                // コストは比較回数上限で抑える）。
+                self.budget
+                    .charge_comparisons(matched.len(), self.max_comparisons)?;
+                let base = scanned.len();
+                let mut view: Vec<Option<ScalarRef<'_>>> =
+                    Vec::with_capacity(base.saturating_add(res.cells.len()));
+                view.extend(scanned.iter().copied());
+                let mut first: Option<u32> = None;
+                for (n, &pos) in matched.iter().enumerate() {
+                    if n % 1024 == 0 {
+                        crate::interrupt::check()?;
+                    }
+                    let row = index
+                        .rows
+                        .get(pos as usize)
+                        .ok_or_else(|| internal("matched source row out of range"))?;
+                    view.truncate(base);
+                    for (cell_pos, ty) in &res.cells {
+                        let cell = row
+                            .cells
+                            .get(*cell_pos)
+                            .ok_or_else(|| internal("source cell out of range"))?;
+                        view.push(source_scalar(cell, ty, None)?);
+                    }
+                    if res.conj.matches(&view, c.id, &[], 0, &mut res.scratch)? {
+                        // 一致ペアは残余が真になった組だけを数える（一意化の前の累計）。
+                        self.pairs = self.pairs.saturating_add(1);
+                        if self.pairs > self.max_output_rows {
+                            return Err(SqlSurfaceError::payload_too_large(
+                                "JOIN result exceeds the row limit",
+                            ));
+                        }
+                        if first.is_none() {
+                            first = Some(pos);
+                        }
+                    }
+                }
+                first
+            }
+        };
         if let Some(pos) = first {
             self.budget.charge(std::mem::size_of::<(u64, u32)>())?;
             let mut log = self

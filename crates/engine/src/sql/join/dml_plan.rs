@@ -27,10 +27,11 @@ use crate::sql::relation::{ColumnRef, ColumnSlot, ResolvedColumn, TableRef};
 use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
 
 use super::dml::{
-    EquiKey, JoinedCopyItem, JoinedDmlPlan, JoinedDmlSource, JoinedDmlTarget, JoinedSetItem,
-    JoinedUpdateSet,
+    EquiKey, JoinedCopyItem, JoinedDmlPlan, JoinedDmlSource, JoinedDmlTarget, JoinedResidual,
+    JoinedSetItem, JoinedUpdateSet,
 };
-use super::plan::{collect_leaf_colrefs, flatten_conjuncts, slot_name, to_where_predicates};
+use super::dml_residual::{convert, plan_residual};
+use super::plan::{collect_leaf_colrefs, flatten_conjuncts, slot_name};
 use super::using::JoinScope;
 use super::values::{cell_scalar_supports, cmp_class, key_class};
 use super::JoinLimits;
@@ -56,14 +57,8 @@ struct Split {
     target: Vec<WherePredicate>,
     source: Vec<WherePredicate>,
     keys: Vec<EquiKey>,
-}
-
-/// 部分木に列同士の比較が含まれるか。
-fn contains_column_compare(expr: &JoinWhereExpr) -> bool {
-    match expr {
-        JoinWhereExpr::Leaf(p) => matches!(p, JoinWherePredicate::ColumnCompare { .. }),
-        JoinWhereExpr::And(ch) | JoinWhereExpr::Or(ch) => ch.iter().any(contains_column_compare),
-    }
+    /// 対象と source をまたぐ残余（Issue #3295）。
+    residual: Option<JoinedResidual>,
 }
 
 /// 部分木が参照する relation（対象側・source 側）。relation 添字が 2 以上なら `Internal`。
@@ -102,13 +97,14 @@ fn check_key_side(
 }
 
 /// 別 relation の列同士の等値を [`EquiKey`] にする（向きは対象側 `target_column`・source 側
-/// `source_column` に正規化）。型クラスが比較できなければ `42804`、キー化できなければ `0A000`。
+/// `source_column` に正規化）。型クラスが比較できなければ `42804`。キー化できない型・非バイト列順の
+/// 照合は `None`（残余として通常の WHERE と同じ評価へ回す。Issue #3295）。
 fn equi_key(
     lhs: &ResolvedColumn,
     rhs: &ResolvedColumn,
     target_schema: &TableSchema,
     source_schema: &TableSchema,
-) -> Result<EquiKey, SqlSurfaceError> {
+) -> Result<Option<EquiKey>, SqlSurfaceError> {
     let (t, s) = match (lhs.relation(), rhs.relation()) {
         (0, 1) => (lhs, rhs),
         (1, 0) => (rhs, lhs),
@@ -121,25 +117,24 @@ fn equi_key(
                 "JOIN key columns have incompatible types",
             ))
         }
-        _ => {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "this column type cannot be used as a JOIN key",
-            ))
-        }
+        _ => return Ok(None),
     }
-    let unkeyable =
-        |_| SqlSurfaceError::feature_not_supported("this column type cannot be used as a JOIN key");
-    let tc = key_class(t.column_type()).map_err(unkeyable)?;
-    let sc = key_class(s.column_type()).map_err(unkeyable)?;
+    let (Ok(tc), Ok(sc)) = (key_class(t.column_type()), key_class(s.column_type())) else {
+        return Ok(None);
+    };
     if tc != sc {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "this column type cannot be used as a JOIN key",
-        ));
+        return Ok(None);
     }
-    Ok(EquiKey {
-        target_column: check_key_side(target_schema, t.slot())?,
-        source_column: check_key_side(source_schema, s.slot())?,
-    })
+    let (Ok(target_column), Ok(source_column)) = (
+        check_key_side(target_schema, t.slot()),
+        check_key_side(source_schema, s.slot()),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(EquiKey {
+        target_column,
+        source_column,
+    }))
 }
 
 /// WHERE を結合キー・対象側述語・source 側述語へ振り分ける（判定順は文書冒頭のとおり決定的）。
@@ -149,6 +144,7 @@ fn split_where(
     target_schema: &TableSchema,
     other_schemas: &[&TableSchema],
     other_visible: &[Option<Vec<String>>],
+    udfs: &UdfRegistry,
 ) -> Result<Split, SqlSurfaceError> {
     let (Some(target_ref), [source_ref]) = (relations.first(), relations.get(1..).unwrap_or(&[]))
     else {
@@ -174,34 +170,50 @@ fn split_where(
         target: Vec::new(),
         source: Vec::new(),
         keys: Vec::new(),
+        residual: None,
     };
+    let mut residual: Vec<&JoinWhereExpr> = Vec::new();
     let schemas = [target_schema, *source_schema];
+    // 単一 relation で完結する部分木の列名解決（解決済みの relation 添字で行う）。
+    let mut name_of = |r: &ColumnRef| -> Result<String, SqlSurfaceError> {
+        let resolved = scope.resolve(r)?;
+        let schema = schemas
+            .get(resolved.relation())
+            .ok_or_else(|| internal("relation index out of range in DML join WHERE"))?;
+        slot_name(resolved.slot(), schema)
+    };
     for c in conjuncts {
         if let JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare { lhs, op, rhs }) = c {
             let (l, r) = (scope.resolve(lhs)?, scope.resolve(rhs)?);
             if l.relation() != r.relation() && *op == BinOp::Eq {
-                split
-                    .keys
-                    .push(equi_key(&l, &r, target_schema, source_schema)?);
+                match equi_key(&l, &r, target_schema, source_schema)? {
+                    Some(k) => split.keys.push(k),
+                    None => residual.push(c),
+                }
                 continue;
             }
-            return Err(SqlSurfaceError::feature_not_supported(UNSUPPORTED_WHERE));
         }
-        if contains_column_compare(c) {
-            return Err(SqlSurfaceError::feature_not_supported(UNSUPPORTED_WHERE));
-        }
+        // 判定は解決済みの relation 添字だけで行い、全域にする（取りこぼしは書き込み範囲を広げる）。
         match relation_set(c, &scope)? {
-            (true, false) => split
-                .target
-                .extend(to_where_predicates(c, &scope, &schemas)?),
-            (false, true) => split
-                .source
-                .extend(to_where_predicates(c, &scope, &schemas)?),
-            _ => return Err(SqlSurfaceError::feature_not_supported(UNSUPPORTED_WHERE)),
+            (true, false) => split.target.extend(convert(c, &mut name_of)?),
+            (false, true) => split.source.extend(convert(c, &mut name_of)?),
+            (true, true) => residual.push(c),
+            (false, false) => {
+                return Err(SqlSurfaceError::feature_not_supported(UNSUPPORTED_WHERE))
+            }
         }
     }
-    if split.keys.is_empty() {
+    if split.keys.is_empty() && residual.is_empty() {
         return Err(SqlSurfaceError::feature_not_supported(NO_EQUI_KEY));
+    }
+    if !residual.is_empty() {
+        split.residual = Some(plan_residual(
+            &residual,
+            &scope,
+            target_schema,
+            source_schema,
+            udfs,
+        )?);
     }
     Ok(split)
 }
@@ -464,6 +476,7 @@ pub(crate) fn plan_update_from(
         target_schema,
         from_schemas,
         bound.source_visible(),
+        udfs,
     )?;
     let ([target_ref, source_ref], [source_schema]) = (bound.relations(), from_schemas) else {
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
@@ -485,6 +498,7 @@ pub(crate) fn plan_update_from(
         target,
         source,
         keys: split.keys,
+        residual: split.residual,
         update: Some(update),
         returning: None,
     };
@@ -505,6 +519,7 @@ pub(crate) fn plan_delete_using(
         target_schema,
         using_schemas,
         bound.source_visible(),
+        udfs,
     )?;
     let ([target_ref, source_ref], [source_schema]) = (bound.relations(), using_schemas) else {
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
@@ -526,6 +541,7 @@ pub(crate) fn plan_delete_using(
         target,
         source,
         keys: split.keys,
+        residual: split.residual,
         update: None,
         returning: None,
     };

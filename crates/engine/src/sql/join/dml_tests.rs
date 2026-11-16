@@ -34,6 +34,7 @@ fn plan(keys: Vec<EquiKey>) -> JoinedDmlPlan {
             include_pseudo_id: false,
         },
         keys,
+        residual: None,
         update: None,
         returning: None,
     }

@@ -473,7 +473,9 @@ pub(super) fn leaf_colrefs(pred: &JoinWherePredicate) -> Vec<&ColumnRef> {
         | JoinWherePredicate::Compare { column, .. }
         | JoinWherePredicate::BoolEquality { column, .. }
         | JoinWherePredicate::BoolColumn { column }
-        | JoinWherePredicate::InList { column, .. } => vec![column],
+        | JoinWherePredicate::InList { column, .. }
+        | JoinWherePredicate::NumericCompare { column, .. }
+        | JoinWherePredicate::IsNull { column, .. } => vec![column],
         JoinWherePredicate::ColumnCompare { lhs, rhs, .. } => vec![lhs, rhs],
     }
 }
@@ -491,7 +493,11 @@ pub(super) fn is_null_rejecting(pred: &JoinWherePredicate) -> bool {
         | JoinWherePredicate::BoolEquality { .. }
         | JoinWherePredicate::BoolColumn { .. }
         | JoinWherePredicate::InList { .. }
-        | JoinWherePredicate::ColumnCompare { .. } => true,
+        | JoinWherePredicate::ColumnCompare { .. }
+        // 数値リテラルとの比較も strict（DML 専用の葉。SELECT 計画器は入口で拒否する）。
+        | JoinWherePredicate::NumericCompare { .. } => true,
+        // `IS [NOT] NULL` は NULL（外部結合の補完行）に対して真になりうる。
+        JoinWherePredicate::IsNull { .. } => false,
     }
 }
 
@@ -564,6 +570,18 @@ fn has_compare(expr: &JoinWhereExpr) -> bool {
     }
 }
 
+/// 部分木に DML 専用の葉（[`JoinWherePredicate::NumericCompare`]・[`JoinWherePredicate::IsNull`]）が
+/// 含まれるか。
+pub(super) fn contains_dml_only_leaf(expr: &JoinWhereExpr) -> bool {
+    match expr {
+        JoinWhereExpr::Leaf(p) => matches!(
+            p,
+            JoinWherePredicate::NumericCompare { .. } | JoinWherePredicate::IsNull { .. }
+        ),
+        JoinWhereExpr::And(ch) | JoinWhereExpr::Or(ch) => ch.iter().any(contains_dml_only_leaf),
+    }
+}
+
 /// 最上位の `AND` を平坦化して conjunct を集める。
 pub(super) fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e JoinWhereExpr>) {
     match expr {
@@ -576,7 +594,7 @@ pub(super) fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e J
     }
 }
 
-fn leaf_to_where(
+pub(super) fn leaf_to_where(
     pred: &JoinWherePredicate,
     name: String,
 ) -> Result<WherePredicate, SqlSurfaceError> {
@@ -604,6 +622,18 @@ fn leaf_to_where(
         JoinWherePredicate::InList { values, .. } => WherePredicate::InList {
             column: name,
             values: values.clone(),
+        },
+        JoinWherePredicate::NumericCompare { op, value, .. } => {
+            // 通常の WHERE の数値比較（`numeric_comparison`）と同じ式形にする。
+            WherePredicate::Expression(crate::sql::udf_call::Expr::Binary {
+                op: *op,
+                lhs: Box::new(crate::sql::udf_call::Expr::Ident(name)),
+                rhs: Box::new(crate::sql::udf_call::Expr::Number(value.clone())),
+            })
+        }
+        JoinWherePredicate::IsNull { negated, .. } => WherePredicate::IsNull {
+            column: name,
+            negated: *negated,
         },
         JoinWherePredicate::ColumnCompare { .. } => {
             return Err(SqlSurfaceError::Internal {
@@ -844,6 +874,19 @@ pub(super) fn build_plan<'a>(
         return Err(SqlSurfaceError::Internal {
             detail: "JOIN relation/step count is inconsistent".to_string(),
         });
+    }
+    // 多重防御: DML 専用の葉（数値リテラル比較・`IS [NOT] NULL`。Issue #3295）は SELECT の JOIN
+    // の文法が生成しないが、非 strict な葉が外部結合の簡約規則へ入らないよう入口で拒否する。
+    let dml_only = |e: &JoinWhereExpr| contains_dml_only_leaf(e);
+    if validated.where_clause.as_deref().is_some_and(dml_only)
+        || validated.steps.iter().any(|st| match &st.condition {
+            crate::sql::allowlist::JoinCondition::On(e) => dml_only(e),
+            _ => false,
+        })
+    {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "numeric literal comparison and IS NULL are not supported in JOIN conditions",
+        ));
     }
     let mut rel_schemas: Vec<&'a TableSchema> = Vec::with_capacity(relations.len());
     for r in relations {
