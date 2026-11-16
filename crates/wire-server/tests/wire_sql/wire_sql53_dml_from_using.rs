@@ -35,6 +35,12 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             vec![ColumnDef::new("lang", ColumnType::Text, false)],
         ))
         .expect("create langs");
+    storage
+        .create_table(&TableSchema::new(
+            "tags",
+            vec![ColumnDef::new("lang", ColumnType::Text, false)],
+        ))
+        .expect("create tags");
     (
         Arc::new(EngineCore::from_storage(
             storage,
@@ -165,4 +171,42 @@ fn operation_id_forms_report_tags_resend_and_reuse_errors() {
     expect_error_response_with_sqlstate(&mut stream, "23505");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
     assert_eq!(count(&mut stream, ALL), 1);
+}
+
+/// FROM／USING 内の `JOIN ... ON` と 3 表の形（Issue #3294）も、末尾 `;` 付き単独送信（psql 形）で正確な
+/// タグを返し、明示トランザクションの ROLLBACK で巻き戻る。未対応の結合形（`JOIN ... USING`）は
+/// `0A000` で拒否され、接続は ReadyForQuery（`I`）へ戻って使い続けられる。
+#[test]
+fn join_on_and_three_table_forms_report_exact_tags() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+    expect_tag(
+        &mut stream,
+        "INSERT INTO tags (id, lang) VALUES (1, 'ja') USING OPERATION_ID 'tag-1';",
+        "INSERT 0 1",
+        b'I',
+    );
+
+    let upd_join = "UPDATE docs SET n = 9 FROM langs JOIN tags ON langs.lang = tags.lang \
+                    WHERE docs.lang = langs.lang;";
+    expect_tag(&mut stream, upd_join, "UPDATE 1", b'I');
+    assert_eq!(count(&mut stream, UPDATED), 1);
+
+    let del_three =
+        "DELETE FROM docs USING langs, tags WHERE docs.lang = langs.lang AND langs.lang = tags.lang;";
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, del_three, "DELETE 1", b'T');
+    expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
+    assert_eq!(count(&mut stream, ALL), 3);
+    expect_tag(&mut stream, del_three, "DELETE 1", b'I');
+    assert_eq!(count(&mut stream, ALL), 2);
+
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs JOIN tags USING (lang);",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count(&mut stream, ALL), 2);
 }

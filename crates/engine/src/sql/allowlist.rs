@@ -4261,8 +4261,11 @@ pub enum DmlFromSetValue {
 pub struct ValidatedUpdateFrom {
     /// 更新対象の表参照（別名を含む）。
     pub(crate) target: TableRef,
-    /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個）。
+    /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個。JOIN で加わる表を含む平坦な並び）。
     pub(crate) from: Vec<TableRef>,
+    /// FROM 句の結合段（Issue #3294。長さは `from.len() - 1`。k 番目の段が `from[k + 1]` を加える。
+    /// カンマ区切りは [`JoinCondition::Cross`]、`ON` つきは [`JoinCondition::On`]）。
+    pub(crate) from_steps: Vec<JoinStep>,
     /// SET 句の (列名, 右辺)。宣言順を保持する。
     pub(crate) assignments: Vec<(String, DmlFromSetValue)>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
@@ -4300,8 +4303,10 @@ impl ValidatedUpdateFrom {
 pub struct ValidatedDeleteUsing {
     /// 削除対象の表参照（別名を含む）。
     pub(crate) target: TableRef,
-    /// USING 句の表参照（宣言順）。
+    /// USING 句の表参照（宣言順。JOIN で加わる表を含む平坦な並び）。
     pub(crate) using: Vec<TableRef>,
+    /// USING 句の結合段（Issue #3294。[`ValidatedUpdateFrom::from_steps`] と同じ契約）。
+    pub(crate) using_steps: Vec<JoinStep>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
     /// `RETURNING` 句（Issue #3204）。省略は `None`。
@@ -22992,42 +22997,103 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// FROM／USING 側の表の並び `<rel>[, <rel>]*`。対象表を含む参照数を [`crate::sql::relation::MAX_TABLE_REFS`]
-    /// で積む前に検査し（超過は `54000`）、公開名の重複は `42601`（`BindingScope::new` と同じ契約）。
+    /// FROM／USING 側の表の並び（Issue #3294）。文法は
+    /// `<rel> { , <rel> | CROSS JOIN <rel> | [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <rel> ON <cond> }*`。
+    /// 戻り値は平坦な表参照の並びと結合段（長さは表数 - 1。カンマは `Cross` 段）。
+    /// 対象表を含む参照数を [`crate::sql::relation::MAX_TABLE_REFS`] で積む前に検査し（超過は `54000`）、
+    /// 公開名の重複は `42601`（`BindingScope::new` と同じ契約）。`JOIN ... USING (...)`・`NATURAL JOIN`・
+    /// カンマの後の `CROSS JOIN` 以外の明示 JOIN は束縛の意味論が結合器の統合列に依存するため
+    /// 固定文言の `0A000` で拒否する（fail-closed。`docs/design/update-from-delete-using.md`）。
+    /// 派生表・関数呼び出しは識別子の検証（`42601`）で従来どおり拒否される。
     fn parse_dml_relation_list(
         &mut self,
         target: &TableRef,
-    ) -> Result<Vec<TableRef>, SqlSurfaceError> {
+    ) -> Result<(Vec<TableRef>, Vec<JoinStep>), SqlSurfaceError> {
         let mut rels: Vec<TableRef> = Vec::new();
+        let mut steps: Vec<JoinStep> = Vec::new();
+        let first = self.parse_dml_from_relation(target, &rels)?;
+        rels.push(first);
+        // PG ではカンマより JOIN が強く結合するため、カンマの後の CROSS 以外の明示 JOIN は
+        // 束縛の意味論がずれる。SELECT の JOIN（Issue #1833）と同じ安全弁で `0A000` にする。
+        let mut after_comma = false;
         loop {
-            if rels.len().saturating_add(1) >= crate::sql::relation::MAX_TABLE_REFS {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "too many table references in UPDATE/DELETE",
-                ));
-            }
-            let table = self.expect_ident()?;
-            crate::catalog::validate_relation_key(&table)
-                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
-            let alias = self.parse_relation_alias(is_dml_target_reserved_word, "FROM")?;
-            let rel = match alias {
-                Some(a) => TableRef::with_alias(table, a),
-                None => TableRef::new(table),
-            };
-            if rel.exposed_name() == target.exposed_name()
-                || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
-            {
-                return Err(SqlSurfaceError::unsupported(
-                    "duplicate table reference name in UPDATE/DELETE",
-                ));
-            }
-            rels.push(rel);
-            if matches!(self.peek(), Some(Token::Punct(','))) {
+            let (kind, form) = if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
-                continue;
-            }
-            break;
+                after_comma = true;
+                (JoinKind::Inner, JoinForm::Cross)
+            } else {
+                match parse_join_kind(self)? {
+                    Some((kind, form)) => {
+                        if after_comma && form != JoinForm::Cross {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "explicit JOIN after a comma-separated FROM / USING item is not supported",
+                            ));
+                        }
+                        (kind, form)
+                    }
+                    None => break,
+                }
+            };
+            let rel = self.parse_dml_from_relation(target, &rels)?;
+            rels.push(rel);
+            let has_using_list = self.peek_ident_matches("USING") && self.peek_punct_at(1, '(');
+            let condition = match form {
+                JoinForm::Cross => {
+                    if self.peek_ident_matches("ON") || has_using_list {
+                        return Err(SqlSurfaceError::unsupported(
+                            "CROSS JOIN or comma-separated FROM item cannot have an ON or USING clause",
+                        ));
+                    }
+                    JoinCondition::Cross
+                }
+                JoinForm::Natural => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "NATURAL JOIN is not supported in UPDATE ... FROM / DELETE ... USING",
+                    ));
+                }
+                JoinForm::Plain => {
+                    if has_using_list {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "JOIN ... USING (...) is not supported in UPDATE ... FROM / DELETE ... USING",
+                        ));
+                    }
+                    self.expect_ident_matching("ON")?;
+                    JoinCondition::On(parse_join_on_conditions(self)?)
+                }
+            };
+            steps.push(JoinStep { kind, condition });
         }
-        Ok(rels)
+        Ok((rels, steps))
+    }
+
+    /// FROM／USING 側の表参照 1 つ（`<表> [[AS] <別名>]`）。参照数の上限検査（`54000`）と公開名の
+    /// 重複検査（`42601`）を、`rels` へ積む前に行う。
+    fn parse_dml_from_relation(
+        &mut self,
+        target: &TableRef,
+        rels: &[TableRef],
+    ) -> Result<TableRef, SqlSurfaceError> {
+        if rels.len().saturating_add(1) >= crate::sql::relation::MAX_TABLE_REFS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many table references in UPDATE/DELETE",
+            ));
+        }
+        let table = self.expect_ident()?;
+        crate::catalog::validate_relation_key(&table)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        let alias = self.parse_relation_alias(is_dml_target_reserved_word, "FROM")?;
+        let rel = match alias {
+            Some(a) => TableRef::with_alias(table, a),
+            None => TableRef::new(table),
+        };
+        if rel.exposed_name() == target.exposed_name()
+            || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "duplicate table reference name in UPDATE/DELETE",
+            ));
+        }
+        Ok(rel)
     }
 
     /// `[WHERE <join_where>]`（JOIN と同じ文法。数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`）。
@@ -23119,7 +23185,7 @@ impl<'a> Parser<'a> {
         self.dml_from_target = prev;
         items?;
         self.expect_keyword(Keyword::From)?;
-        let from = self.parse_dml_relation_list(&target)?;
+        let (from, from_steps) = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
@@ -23129,6 +23195,7 @@ impl<'a> Parser<'a> {
             stmt: ValidatedUpdateFrom {
                 target,
                 from,
+                from_steps,
                 assignments,
                 where_clause,
                 returning,
@@ -23145,7 +23212,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let target = self.parse_dml_target_relation()?;
         self.expect_contextual_keyword("USING")?;
-        let using = self.parse_dml_relation_list(&target)?;
+        let (using, using_steps) = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
@@ -23154,6 +23221,7 @@ impl<'a> Parser<'a> {
             stmt: ValidatedDeleteUsing {
                 target,
                 using,
+                using_steps,
                 where_clause,
                 returning,
                 operation_id,
@@ -32782,9 +32850,41 @@ mod tests {
         ok("UPDATE a SET x = b.y FROM b WHERE a.id = b.id").expect("column rhs");
         ok("UPDATE a z SET x = 'k', y = DEFAULT FROM b q, c WHERE z.id = q.id").expect("alias");
         ok("DELETE FROM a z USING b q WHERE z.id = q.id USING OPERATION_ID 'o'").expect("delete");
+        // FROM／USING 内の JOIN ... ON と多方向結合（Issue #3294）
+        ok("UPDATE a SET x = c.y FROM b JOIN c ON b.id = c.id WHERE a.id = b.id").expect("join");
+        ok("UPDATE a SET x = 1 FROM b LEFT JOIN c ON b.id = c.id AND c.k = 'x' RETURNING a.id")
+            .expect("left join returning");
+        ok("UPDATE a SET x = 1 FROM b CROSS JOIN c, d WHERE a.id = b.id").expect("cross and comma");
+        ok(
+            "DELETE FROM a USING b INNER JOIN c ON b.id = c.id FULL OUTER JOIN d ON c.id = d.id \
+            WHERE a.id = b.id USING OPERATION_ID 'o'",
+        )
+        .expect("delete multi join");
+        ok("DELETE FROM a USING b JOIN c ON b.id = c.id OR b.k = c.k;").expect("or on");
+        ok("DELETE FROM a USING b JOIN c ON b.id = c.id RETURNING a.id").expect("returning");
         for (sql, code) in [
             ("UPDATE a SET a.x = 1 FROM b", "42601"),
-            ("UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id", "42601"),
+            // JOIN の形: USING・NATURAL・カンマの後の明示 JOIN は意図的な拒否（Issue #3294）
+            ("UPDATE a SET x = 1 FROM b JOIN c USING (id)", "0A000"),
+            ("UPDATE a SET x = 1 FROM b NATURAL JOIN c", "0A000"),
+            (
+                "UPDATE a SET x = 1 FROM b, c JOIN d ON c.id = d.id",
+                "0A000",
+            ),
+            (
+                "UPDATE a SET x = 1 FROM b CROSS JOIN c ON b.id = c.id",
+                "42601",
+            ),
+            ("UPDATE a SET x = 1 FROM b JOIN c", "42601"),
+            (
+                "UPDATE a SET x = 1 FROM b JOIN (SELECT 1) c ON b.id = c.id",
+                "42601",
+            ),
+            (
+                "UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id JOIN b ON c.id = b.id",
+                "42601",
+            ),
+            ("DELETE FROM a USING b JOIN c USING (id)", "0A000"),
             ("UPDATE a SET x = 1 FROM a", "42601"),
             ("UPDATE a SET x = c.y + 1 FROM b", "0A000"),
             ("UPDATE a SET (x, y) = (1, 2) FROM b", "0A000"),

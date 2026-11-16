@@ -32,6 +32,7 @@ fn plan(keys: Vec<EquiKey>) -> JoinedDmlPlan {
             columns: vec![2],
             returning_columns: Vec::new(),
             include_pseudo_id: false,
+            fold: None,
         },
         keys,
         update: None,
@@ -54,10 +55,10 @@ fn validate_accepts_a_well_formed_plan() {
 }
 
 #[test]
-fn validate_rejects_missing_or_out_of_range_keys_fail_closed() {
+fn validate_accepts_a_plan_without_keys_and_rejects_out_of_range_keys_fail_closed() {
     let limits = JoinLimits::default();
-    let err = plan(Vec::new()).validate(&limits).expect_err("no keys");
-    assert_eq!(err.wire_code(), "XX000");
+    // 結合キーが無い形（純粋な交差結合。Issue #3294）は受理し、上限は実行時の一致ペア数が担う。
+    plan(Vec::new()).validate(&limits).expect("cross join");
     let err = plan(vec![key(9, 1)]).validate(&limits).expect_err("range");
     assert_eq!(err.wire_code(), "XX000");
     let err = plan(vec![key(1, 9)]).validate(&limits).expect_err("range");
