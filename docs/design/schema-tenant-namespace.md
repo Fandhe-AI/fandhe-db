@@ -632,7 +632,7 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 - **本文の参照先（D7）**: 既存の `view_body_relations` による検査をそのまま使う。SCHEMA 配下の matview は SCHEMA 配下の relation だけを読め、public の relation を読む形（と public の matview が SCHEMA 配下を読む形）は `42501`。matview から matview への連鎖は同じ SCHEMA 内で受理する
 - **物理名**: 定義表のキー・実体メタ・行表（`matview_rows/{内部キー}`）は `user_rows/{内部キー}` と同じ流儀で内部キーをそのまま使う。`#`・`.` は識別子に現れないため public の同名と衝突しない。格納形式の版は上げない（内部キーを持つ DB を旧バイナリで開くと復号で `CorruptSchema`。fail-closed）。基表名の復号上限は、内部キーを収める専用の定数（`#` + `u64` の 10 進最大 20 桁 + `.` + 識別子上限）に変えた
 - **実体化の文脈（テナント境界）**: 内部キーの matview は、実体化の対象文脈を作成・更新者と同じテナントの文脈（可視性の違いは残す）に絞る。他テナントの文脈は名前解決でこの matview に到達できないため、その文脈で本文を評価して他テナントの文脈キーの実体を書く理由が無い。public の matview は従来どおり。作成の第 1 段で SCHEMA の存在を同じ txn 内で再確認する（解析と書き込みの間の `DROP SCHEMA` で孤児を作らない）
-- **`DROP SCHEMA`**: RESTRICT は matview があれば `2BP01`（従来どおり）。CASCADE は配下の matview を、実体・索引宣言・ACL・所有者・世代まで同じ txn・1 回の commit で消す。別 SCHEMA の matview が消える SCHEMA の表を読む外部依存も、根集合に matview を加えた依存列挙で先に消える。所有者ゲートの「配下に共有カタログの relation がある」判定に matview を含める。`unsupported_kinds` は ENUM 型だけになった
+- **`DROP SCHEMA`**: RESTRICT は matview があれば `2BP01`（従来どおり）。CASCADE は配下の matview を、実体・索引宣言・ACL・所有者・世代まで同じ txn・1 回の commit で消す。別 SCHEMA の matview が消える SCHEMA の表を読む外部依存も、根集合に matview を加えた依存列挙で先に消える。所有者ゲートの「配下に共有カタログの relation がある」判定に matview を含める。ENUM 型は `enum_types` に列挙され、`unsupported_kinds` を設定する種別は現在ない
 - **論理ダンプ**: SCHEMA 配下の matview を含むダンプを固定文言で全体失敗させていた 2 か所の拒否を外した。拒否の根拠（SQL で作り直せない）が消えたため。`CREATE MATERIALIZED VIEW s.mv` の描画と本文の内部キーの逆変換は表・ビューと同じ経路
 - **意図的な拒否（`intentional`）**: `ALTER MATERIALIZED VIEW ... SET SCHEMA`（修飾・未修飾とも。fail-closed の拒否のまま。専用の Issue が必要）のみ引き続き対象外
 - **PostgreSQL との差**: 本追記で新たに生じた差は無い（D7 による SCHEMA をまたぐ本文参照の `42501` は既存の意図的な差）
