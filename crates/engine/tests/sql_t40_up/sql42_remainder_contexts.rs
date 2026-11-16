@@ -401,8 +401,8 @@ fn update_set_zero_divisor_is_not_an_existence_oracle() {
         "t2",
         "DELETE FROM t WHERE id = 9 USING OPERATION_ID 'del-other'",
     );
-    // t1 の可視行は n > 0 のみが対象で 0 を含まない。t2 の n = 0 の行の有無に関わらず成功する。
-    let sql = "UPDATE t SET n = 1 % n WHERE n > 0 USING OPERATION_ID 'o1'";
+    // t1 の可視行に n = 0 は無い。述語 n >= 0 は他テナントの n = 0 の行も満たすため、可視性検査だけがそれを除外する（分離が欠ければ 22012 になる）。
+    let sql = "UPDATE t SET n = 1 % n WHERE n >= 0 USING OPERATION_ID 'o1'";
     assert_eq!(outcome_code(&with_other, "t1", sql), "ok");
     assert_eq!(outcome_code(&without_other, "t1", sql), "ok");
     assert_eq!(
