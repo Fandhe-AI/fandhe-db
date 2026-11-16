@@ -319,9 +319,6 @@ fn rejections_match_the_non_explain_statement() {
         "UPDATE a SET v = 'z' FROM pt WHERE a.v = pt.k",
         // あいまいな列参照。
         "UPDATE a SET v = 'z' FROM pt WHERE k = pt.k",
-        // 等値キーも残余も無い片側だけの述語（変換器の対象外。非等値の列比較は Issue #3295 で受理）。
-        "UPDATE a SET v = 'z' FROM pt WHERE a.k > 1",
-        "DELETE FROM a USING pt WHERE pt.k IS NULL",
     ] {
         let plain = code(&core, sql);
         assert_eq!(

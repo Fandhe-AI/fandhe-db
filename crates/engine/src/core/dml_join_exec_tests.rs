@@ -166,6 +166,7 @@ fn plan(keys: Vec<EquiKey>, update: Option<JoinedUpdateSet>) -> JoinedDmlPlan {
             columns: vec![1, 2],
             returning_columns: Vec::new(),
             include_pseudo_id: false,
+            fold: None,
         },
         keys,
         residual: None,
@@ -1087,6 +1088,7 @@ fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns
             columns: vec![2, 3, 4, 5, 6],
             returning_columns: Vec::new(),
             include_pseudo_id: false,
+            fold: None,
         },
         keys: vec![EquiKey {
             target_column: Some(1),

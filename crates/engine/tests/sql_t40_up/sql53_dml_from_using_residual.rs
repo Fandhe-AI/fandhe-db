@@ -441,8 +441,6 @@ fn unsupported_residual_forms_fail_closed() {
             "DELETE FROM t USING s WHERE t.x < s.v AND t.x IS TRUE",
             "42601",
         ),
-        // 等値キーも残余も無い片側だけの述語は従来どおり。
-        ("DELETE FROM t USING s WHERE t.x IS NULL", "0A000"),
     ] {
         assert_eq!(code(run(&core, &alice, sql)), want, "{sql}");
         let parsed = core.parse_sql(sql);

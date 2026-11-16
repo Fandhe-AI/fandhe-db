@@ -197,15 +197,14 @@ fn assert_rejected(sql: &str, code: &str) {
 }
 
 // intentional: docs/design/update-from-delete-using.md
+// tracked: #3295
 #[test]
 fn unsupported_shapes_are_rejected_with_feature_not_supported() {
     for sql in [
-        // WHERE 省略・等値キーも残余も無い
-        "DELETE FROM docs USING langs",
-        "DELETE FROM docs USING langs WHERE langs.flag",
-        "DELETE FROM docs USING langs WHERE docs.n = '1' AND langs.cnt = '2'",
-        // FROM／USING が 2 表以上
-        "DELETE FROM docs USING langs, langs AS l2 WHERE docs.lang = langs.lang",
+        // 畳み込み source（FROM／USING が 2 表以上・JOIN 段あり）では、対象とまたぐ非等値は拒否のまま
+        "DELETE FROM docs USING langs, langs AS l2 WHERE docs.lang = langs.lang AND docs.n < l2.cnt",
+        "DELETE FROM docs USING langs JOIN langs AS l2 ON langs.lang = l2.lang \
+         WHERE docs.lang = l2.lang AND docs.n < l2.cnt",
         // source の疑似列 id・写像できない型を SET の右辺に使う
         "UPDATE docs SET n = langs.id FROM langs WHERE docs.lang = langs.lang",
         "UPDATE docs SET embedding = langs.v FROM langs WHERE docs.lang = langs.lang",
@@ -275,6 +274,76 @@ fn residual_columns_follow_set_columns() {
     assert_eq!(p.source_columns(), vec![5]);
     assert_eq!(p.scan_columns(), vec![5, 3]);
     assert!(p.keys.is_empty());
+}
+
+/// 結合キーが無い形（WHERE 省略・source だけの述語）は純粋な交差結合として変換できる（Issue #3294）。
+/// 一致ペア数の上限は実行時に効く。
+#[test]
+fn keyless_forms_are_planned_as_cross_joins() {
+    for sql in [
+        "DELETE FROM docs USING langs",
+        "DELETE FROM docs USING langs WHERE langs.flag",
+        "DELETE FROM docs USING langs WHERE docs.n = '1' AND langs.cnt = '2'",
+    ] {
+        let p = del(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(p.keys.is_empty(), "{sql}");
+        assert!(p.source.fold.is_none(), "{sql}");
+    }
+    let p = upd("UPDATE docs SET n = langs.cnt FROM langs").unwrap();
+    assert!(p.keys.is_empty());
+    assert_eq!(p.source.columns, vec![5]);
+}
+
+/// FROM／USING が 2 表以上、または `JOIN ... ON` の形は source 側が畳み込まれ、畳み込みスキーマの添字で
+/// 結合キー・SET・`RETURNING` が組まれる（Issue #3294）。
+#[test]
+fn multi_source_forms_are_folded_into_one_source() {
+    let p = upd(
+        "UPDATE docs SET n = b.cnt FROM langs a JOIN langs b ON a.lang = b.lang \
+         WHERE docs.lang = a.lang RETURNING a.label, b.id",
+    )
+    .unwrap();
+    let fold = p.source.fold.as_ref().expect("folded");
+    assert_eq!(p.source_relation_count(), 2);
+    // 初出順: キー a.lang → 畳み込み列 0。SET は b.cnt → 畳み込み列 1。`RETURNING` は a.label・b.id。
+    assert_eq!(p.keys, vec![key(Some(1), Some(0))]);
+    assert_eq!(p.source.columns, vec![1]);
+    assert_eq!(fold.cols[0], (0, ColumnSlot::Column(0)));
+    assert_eq!(fold.cols[1], (1, ColumnSlot::Column(5)));
+    assert!(!p.source.schema.has_pseudo_id());
+    assert_eq!(p.source.returning_columns.len(), 2);
+    assert!(p.source.table.is_empty());
+
+    // カンマ区切りの 3 表（WHERE の source だけの述語は合成 JOIN 文へ渡る）。
+    let p = del("DELETE FROM docs USING langs a, langs b, langs c \
+         WHERE docs.lang = a.lang AND a.lang = b.lang AND b.lang = c.lang AND c.label = 'x'")
+    .unwrap();
+    let fold = p.source.fold.as_ref().expect("folded");
+    assert_eq!(fold.join.relations.len(), 3);
+    assert!(fold.join.where_clause.is_some());
+    assert!(p.source.where_predicates.is_empty());
+}
+
+/// 畳み込み source でも、何も取り出さない形（キーも `RETURNING` も無い `DELETE`）は走査投影が空にならない。
+#[test]
+fn folded_source_without_any_column_gets_a_dummy_projection() {
+    let p = del("DELETE FROM docs USING langs a, langs b").unwrap();
+    assert!(p.keys.is_empty());
+    assert_eq!(p.scan_columns().len(), 1);
+}
+
+/// ON が対象表を参照する形は PG と同じく拒否される（修飾参照は `42P01`、対象表にしか無い列は `42703`）。
+#[test]
+fn join_on_cannot_reference_the_target() {
+    assert_rejected(
+        "DELETE FROM docs USING langs a JOIN langs b ON docs.lang = b.lang WHERE docs.lang = a.lang",
+        "42P01",
+    );
+    assert_rejected(
+        "DELETE FROM docs USING langs a JOIN langs b ON a.lang = b.lang AND n = '1' \
+         WHERE docs.lang = a.lang",
+        "42703",
+    );
 }
 
 #[test]

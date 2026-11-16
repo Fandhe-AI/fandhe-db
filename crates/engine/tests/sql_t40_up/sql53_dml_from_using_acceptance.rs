@@ -665,6 +665,7 @@ fn trailing_semicolon_behaves_like_the_bare_statement() {
 
 /// 未対応の形は `0A000`／`42601`／束縛系で拒否され、行も台帳も不変。拒否のあとも同じ op id が使え、
 /// 他テナントの行へ影響しない（RLS を緩める経路にならない）。
+// tracked: #3295
 #[test]
 fn unsupported_forms_fail_closed_without_side_effects() {
     let alice = ctx("alice");
@@ -675,8 +676,6 @@ fn unsupported_forms_fail_closed_without_side_effects() {
     let before_a = rows_t(&core, &alice);
     let before_b = rows_t(&core, &bob);
     for (sql, want) in [
-        ("DELETE FROM t USING s", "0A000"),
-        ("UPDATE t SET x = 1 FROM s", "0A000"),
         // 非等値・OR をまたぐ述語は Issue #3295 で受理する（`sql53_dml_from_using_residual.rs`）。
         // 残余が VECTOR 列を参照する形は引き続き fail-closed。
         (
@@ -688,7 +687,7 @@ fn unsupported_forms_fail_closed_without_side_effects() {
             "0A000",
         ),
         (
-            "DELETE FROM t USING s, s AS s2 WHERE t.k = s.k AND s.k = s2.k",
+            "DELETE FROM t USING s, s AS s2 WHERE t.k = s.k AND t.x < s2.v",
             "0A000",
         ),
         ("DELETE FROM t USING nope WHERE t.k = nope.k", "42P01"),
