@@ -233,7 +233,6 @@ pub(crate) fn create_name_index(tokens: &[Token]) -> Option<usize> {
         .iter()
         .find(|p| {
             p.create_name
-                && !p.matview
                 && !(is_word(tokens, p.index, "IF")
                     && is_word(tokens, p.index.saturating_add(1), "NOT"))
         })

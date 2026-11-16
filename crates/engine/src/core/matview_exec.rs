@@ -53,9 +53,15 @@ impl EngineCore {
     /// 実体化の対象文脈を解決する（`CREATE`〔本 Issue〕と後続の `REFRESH`〔#1665〕が共有する）。
     /// 注入済みの集合があればそれを、無ければ作成/更新したセッションの文脈だけを返す。
     /// 文脈数が [`MAX_MATVIEW_CONTEXTS`] を超えたら `54000`（確保・評価の前に検査する）。
+    ///
+    /// `matview_name` が SCHEMA 配下の内部キー（`#<id>.<name>`。Issue #3287）のときは、テナントの
+    /// SCHEMA は自テナントの名前解決でしか到達できないため、作成・更新者と同じ `tenant_id` の文脈だけに
+    /// 絞る（可視性の違う文脈は残す）。他テナントの文脈で本文を評価して他テナントの ContextKey の実体を
+    /// 書く不要な経路を作らない（テナント境界の多層防御）。`public` の matview は従来どおり。
     pub(super) fn materialization_contexts_for(
         &self,
         creator: &PolicyContext,
+        matview_name: &str,
     ) -> Result<Vec<PolicyContext>, SqlSurfaceError> {
         let contexts: Vec<PolicyContext> = match &self.materialization_contexts {
             Some(list) => {
@@ -68,6 +74,12 @@ impl EngineCore {
             }
             None => vec![creator.clone()],
         };
+        if matview_name.starts_with('#') {
+            return Ok(contexts
+                .into_iter()
+                .filter(|c| c.tenant_id() == creator.tenant_id())
+                .collect());
+        }
         Ok(contexts)
     }
 
@@ -183,7 +195,7 @@ impl EngineCore {
             Err(e) => return Err(map_create_matview_error(e)),
         }
         if stmt.with_data() {
-            let contexts = self.materialization_contexts_for(creator)?;
+            let contexts = self.materialization_contexts_for(creator, stmt.name())?;
             let creator_key = ContextKey::from_context(creator);
             let mut seen: Vec<ContextKey> = Vec::new();
             for ctx in contexts {
@@ -321,7 +333,7 @@ impl EngineCore {
         let cap = plan.cap;
         self.check_matview_body_collations(&*write_txn, &plan.stmt)?;
 
-        let contexts = self.materialization_contexts_for(refresher)?;
+        let contexts = self.materialization_contexts_for(refresher, &def.name)?;
         let refresher_key = ContextKey::from_context(refresher);
         let mut seen: Vec<ContextKey> = Vec::new();
         for ctx in contexts {

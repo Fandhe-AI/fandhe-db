@@ -6389,7 +6389,7 @@ impl EngineCore {
         }
         // 作成先の判定では、path 上の USAGE の無い SCHEMA を飛ばさず `42501` にする（受入基準。K4）。
         // ここへ裸の名前のまま届いて作成先が自テナントの SCHEMA になるのは、解析時の書き換えを通らない経路
-        // （構文語と衝突する名前・`CREATE MATERIALIZED VIEW`・解析と実行の間の SCHEMA 作成の
+        // （構文語と衝突する名前・解析と実行の間の SCHEMA 作成の
         // 競合）。`public` へ黙って作らないよう、固定文言の `0A000` にする（fail-closed）。
         let probe = |schema: &str| self.schema_id_requiring_usage(ctx, session, schema);
         match crate::sql::search_path::creation_target(session, &probe)? {

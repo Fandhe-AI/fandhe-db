@@ -110,6 +110,7 @@ mod table24_sequence_nextval;
 mod table27_alter_schema;
 mod table27_current_schema;
 mod table27_enum_schema;
+mod table27_matview_schema;
 mod table27_qualified_names;
 mod table27_schema_ddl;
 mod table27_schema_elements;
