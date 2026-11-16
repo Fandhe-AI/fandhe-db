@@ -71,8 +71,10 @@ mod temp_route;
 pub use temp_route::{PreparedRelationIdentity, SessionRoutedSql};
 
 mod ctas_exec;
+// 要素つき `CREATE SCHEMA` の実行本体（TABLE-27・Issue #3286）。
 mod matview_exec;
 mod row_lock_exec;
+mod schema_elements;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
@@ -10407,20 +10409,25 @@ impl EngineCore {
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateSchema,
                 )?;
-                // 所有者（`AUTHORIZATION` の指定、省略時は作成者＝束縛中の現在ロール）を同じ write txn で
-                // 記録する（Issue #2236。未束縛で指定も無ければ記録せず、運用者権限でしか扱えない）。
-                let owner = crate::sql::owner_ddl::resolve_schema_owner(
-                    &self.storage,
-                    ctx.tenant_id(),
-                    session,
-                    stmt.authorization.as_ref(),
-                )?;
-                let outcome = crate::sql::ddl::execute_create_schema(
-                    &self.storage,
-                    ctx.tenant_id(),
-                    stmt,
-                    owner,
-                )?;
+                // スキーマ要素つき（Issue #3286）は SCHEMA と全要素を 1 つの write txn で作る専用の実行器へ。
+                let outcome = if !stmt.elements.is_empty() {
+                    self.execute_create_schema_with_elements(ctx, session, stmt)?
+                } else {
+                    // 所有者（`AUTHORIZATION` の指定、省略時は作成者＝束縛中の現在ロール）を同じ write txn で
+                    // 記録する（Issue #2236。未束縛で指定も無ければ記録せず、運用者権限でしか扱えない）。
+                    let owner = crate::sql::owner_ddl::resolve_schema_owner(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        stmt.authorization.as_ref(),
+                    )?;
+                    crate::sql::ddl::execute_create_schema(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        stmt,
+                        owner,
+                    )?
+                };
                 Ok(crate::sql::SqlOutcome::CreateSchema(outcome))
             }
             // Issue #2236: 運用者権限、またはテナント内の所有者（書き込み txn 内で検査）。

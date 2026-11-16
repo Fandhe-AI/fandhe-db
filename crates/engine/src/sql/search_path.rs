@@ -317,6 +317,10 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
 /// 列名・別名・構文語・表関数名・CTE 名は含めない。`SKIP LOCKED` の空結果前の RLS 判定
 /// （`core::row_lock_exec`・RLS-13）が、実参照表だけへ `policies_apply` を掛けるために使う。
 pub(crate) fn resolved_relation_names(tokens: &[Token]) -> Vec<String> {
+    // 要素つき `CREATE SCHEMA` は文全体を 1 つの `CREATE TABLE` として走査しない（Issue #3286）。
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Vec::new();
+    }
     let walk = crate::sql::relation_name::relation_positions(tokens);
     let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
     let mut out: Vec<String> = Vec::new();
@@ -376,6 +380,12 @@ pub(crate) fn resolved_relation_ref_names(tokens: &[Token]) -> Vec<String> {
 /// [`unqualified_relation_refs`] と [`resolved_relation_ref_names`] の共通本体。`keep_internal_keys` が
 /// 真なら名前解決済みの内部キーを除外しない。
 fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> Vec<GateRef> {
+    // 要素つき `CREATE SCHEMA` の要素は `core::schema_elements` が要素ごとに名前を解決する。文全体を 1 つの
+    // `CREATE TABLE` として走査すると要素の参照・作成名を誤った位置で数えるため、ここでは何も返さない
+    // （Issue #3286。設計記録 D8）。
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Vec::new();
+    }
     let walk = crate::sql::relation_name::relation_positions(tokens);
     let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
     // `DROP`／`ALTER`／`REFRESH` のオブジェクト名は `object_ddl_names` が（索引かどうかの区別つきで）
@@ -441,6 +451,18 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
             .map(|(_, r)| r),
     );
     out
+}
+
+/// 要素つき `CREATE SCHEMA` の要素 1 件（`CREATE TABLE`／`VIEW`／`SEQUENCE`）に現れる、未修飾の関係参照
+/// （トークン添字と名前。作成名・構文語・CTE 名・解決済みの内部キーを除く）。`core::schema_elements` が、
+/// 同じ文で先に作られる名前を新しい SCHEMA へ解決するために使う（位置判定は `search_path` の参照ゲートと共有。
+/// 第 2 の走査器は作らない。Issue #3286）。`skip` は既に解決済みの位置。
+pub(crate) fn element_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<(usize, String)> {
+    relation_refs(tokens, skip, false)
+        .into_iter()
+        .filter(|r| !r.is_index)
+        .map(|r| (r.index, r.name))
+        .collect()
 }
 
 /// `DROP`／`ALTER`／`REFRESH` の `[MATERIALIZED] VIEW`・`SEQUENCE`・`INDEX`・`TYPE` の対象名。
@@ -706,6 +728,8 @@ fn resolve_path_refs_inner(
     let hides_public = session.search_path_hides_public();
     if !(session.search_path_may_hold_tenant_schema() || hides_public)
         || gate_exempt(session, tokens)
+        // 要素つき `CREATE SCHEMA`（Issue #3286。設計記録 D8）: 要素の解決は実行腕だけが行う。
+        || crate::sql::allowlist::is_create_schema_statement(tokens)
     {
         return Ok(out);
     }

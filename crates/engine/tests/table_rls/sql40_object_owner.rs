@@ -273,6 +273,45 @@ fn create_schema_authorization_sets_the_owner() {
     f.ok("t1", &mut bound(ALICE, false), "DROP SCHEMA alice");
 }
 
+/// 要素つき `CREATE SCHEMA`（Issue #3286）: 要素は現在ロール（作成者）の所有で作られ、現在ロール以外を所有者に
+/// 指定した形は昇格経路になり得るため、何も作らず `0A000` で拒否する（設計記録 D2）。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn create_schema_with_elements_requires_the_owner_to_be_the_current_role() {
+    let f = fx("sql40_owner_schema_elements");
+    let mut alice = bound(ALICE, true);
+    f.ok(
+        "t1",
+        &mut alice,
+        "CREATE SCHEMA s CREATE TABLE t (id BIGINT PRIMARY KEY) CREATE VIEW v AS SELECT id FROM t",
+    );
+    // 要素の作成者（alice）が所有者で、運用者権限なしでも付与・取り消しできる。
+    let mut alice_plain = bound(ALICE, false);
+    f.ok("t1", &mut alice_plain, "GRANT SELECT ON s.t TO bob");
+    f.ok("t1", &mut alice_plain, "REVOKE SELECT ON s.t FROM bob");
+    // 現在ロール以外を所有者に指定した形は、束縛ロール・未束縛の運用者のどちらでも `0A000`（何も作らない）。
+    let mut op = operator();
+    for sess in [&mut alice, &mut op] {
+        assert_eq!(
+            f.code(
+                "t1",
+                sess,
+                "CREATE SCHEMA s2 AUTHORIZATION bob CREATE TABLE t (id BIGINT)"
+            ),
+            "0A000"
+        );
+    }
+    assert_eq!(f.code("t1", &mut op, "DROP SCHEMA s2"), "3F000");
+    // 現在ロール自身の指定は受理される。
+    f.ok(
+        "t1",
+        &mut alice,
+        "CREATE SCHEMA s2 AUTHORIZATION alice CREATE TABLE t (id BIGINT)",
+    );
+    // 配下に relation のある CASCADE は運用者権限が要る（共有カタログの削除。Issue #2236）。
+    f.ok("t1", &mut operator(), "DROP SCHEMA s2 CASCADE");
+}
+
 /// `GRANT ... TO PUBLIC` は同じテナントのロール全体にだけ作用し、他テナントのロールには及ばない。
 /// SCHEMA の USAGE（修飾名の解決で検査される）で観測する。
 #[test]
