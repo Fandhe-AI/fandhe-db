@@ -559,6 +559,9 @@ const RECALL_DIM: u32 = 16;
 const RECALL_ROWS: usize = 1_200;
 const RECALL_K: usize = 10;
 const RECALL_QUERIES: usize = 20;
+/// クエリ抽出の間隔。コーパスは `i % 12` でクラスタ割当のため、12 と互いに素な値にして 12 クラスタすべてを網羅する
+/// （`RECALL_QUERIES * RECALL_QUERY_STRIDE <= RECALL_ROWS` を満たす）。
+const RECALL_QUERY_STRIDE: usize = 61;
 
 /// 長さを正規化しない決定的なクラスタ付きコーパス。正規化済みだと内積とコサインの順位が一致し、
 /// `<#>` 固有の検証にならないため、行ごとに長さを [0.25, 4] で変える。
@@ -651,7 +654,7 @@ fn recall_core(
     (core, guard)
 }
 
-/// コサインと同じ手順（宣言なしの厳密側を対照にした Recall@10 の平均。クエリはコーパスから等間隔に 20 点）で、
+/// コサインと同じ手順（宣言なしの厳密側を対照にした Recall@10 の平均。クエリはコーパスから 12 と互いに素な間隔 61 で 20 点。全クラスタを対象にする）で、
 /// `<#>` の HNSW の Recall が常駐精度別の下限（F32／F16 は 0.9、I8 は 0.8）以上であることを固定する。
 /// 返る行の距離値は厳密側の同 id とビット一致する（一致契約）。
 #[test]
@@ -662,7 +665,7 @@ fn ip_recall_at_10_meets_cosine_regression_floor_per_precision() {
         let (core, _g1) = recall_core("sql33-ip-recall-hnsw", &corpus, precision, true);
         let mut sum = 0.0f64;
         for qi in 0..RECALL_QUERIES {
-            let q = &corpus[qi * (RECALL_ROWS / RECALL_QUERIES)];
+            let q = &corpus[qi * RECALL_QUERY_STRIDE];
             let sql = format!(
                 "SELECT id FROM docs ORDER BY embedding <#> '{}' LIMIT {RECALL_K}",
                 vec_literal(q)
