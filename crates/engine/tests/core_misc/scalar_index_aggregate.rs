@@ -1112,7 +1112,6 @@ fn aggregate_cast_item_as_operator_operand_stays_syntax_error() {
         ("->> 'k'", "42883"),
         ("-> 'k'", "42883"),
         ("#> '{k}'", "42883"),
-        ("|| 'x'", "0A000"),
         ("+ 1", "42883"),
         ("* 2", "42883"),
     ] {
@@ -1122,6 +1121,12 @@ fn aggregate_cast_item_as_operator_operand_stays_syntax_error() {
             .expect_err("a CAST operand in an aggregate list stays unsupported");
         assert_eq!(err.wire_code(), expected, "{sql}");
     }
+    // Issue #3276: text 同士の `||` は連結として成功する（PostgreSQL と同じ。従来は 0A000）。
+    core.execute_sql(
+        &ctx("tenant-a"),
+        "SELECT MAX(lang), CAST(MAX(lang) AS text) || 'x' FROM docs",
+    )
+    .expect("text concatenation of a CAST item succeeds");
 }
 
 /// Issue #1592: 集計後の投影が生成した TEXT（`CAST(.. AS char(n))` の空白埋め）も、型ごとの例外なく
