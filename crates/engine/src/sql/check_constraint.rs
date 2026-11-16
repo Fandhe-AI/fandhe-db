@@ -176,7 +176,10 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
         // `Expr::ValueFunction` に化けないよう二重引用符付きで出す（SQL-37・Issue #1586）。
         // 予約語以外は従来どおり引用なし（既存の保存形式との互換維持）。
         Expr::Ident(name) => {
-            if ValueFunctionKind::from_keyword(name).is_some() {
+            // 列名 `null` も裸で出すと再解析で `Expr::Null` に化ける（単純 CASE の被演算子・
+            // 比較値は NULL リテラルを許す文脈。Issue #3279）ため引用して出す。
+            if ValueFunctionKind::from_keyword(name).is_some() || name.eq_ignore_ascii_case("null")
+            {
                 format!("\"{name}\"")
             } else {
                 name.clone()
@@ -320,8 +323,9 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
             let mut s = String::from("(CASE");
             // 単純形（Issue #3279）は被演算子を 1 回だけ描画し、WHEN には比較値を描画する。
             if let Some(operand) = operand {
-                s.push(' ');
-                s.push_str(&render_expr(operand));
+                // 括弧付きで出す: 符号付き数値（`-1`）は単純 CASE の被演算子の開始判定
+                // （構文段の先読み）を通らないため、往復を保つ（括弧は AST に残らない）。
+                s.push_str(&format!(" ({})", render_expr(operand)));
             }
             for (cond, result) in whens {
                 let rendered = if operand.is_some() {
@@ -2438,6 +2442,22 @@ mod tests {
                 operand: Some(Box::new(Expr::Null)),
                 whens: vec![(Expr::Null, Expr::Number("1".to_string()))],
                 else_result: Some(Box::new(Expr::Number("2".to_string()))),
+            },
+            Expr::Case {
+                operand: Some(Box::new(Expr::Number("-1".to_string()))),
+                whens: vec![(
+                    Expr::Number("-1".to_string()),
+                    Expr::Number("1".to_string()),
+                )],
+                else_result: Some(Box::new(Expr::Number("0".to_string()))),
+            },
+            Expr::Case {
+                operand: Some(Box::new(Expr::Ident("null".to_string()))),
+                whens: vec![(
+                    Expr::Ident("NULL".to_string()),
+                    Expr::Number("1".to_string()),
+                )],
+                else_result: Some(Box::new(Expr::Number("0".to_string()))),
             },
         ];
         for expr in cases {

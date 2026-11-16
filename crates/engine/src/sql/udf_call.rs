@@ -14981,6 +14981,33 @@ mod tests {
         }
     }
 
+    /// 単純 CASE の被演算子が副作用関数（`nextval`・`setval`）を含む場合、被演算子は分岐ごとに
+    /// 再評価されるため、式位置の拒否（`0A000`）で fail-closed になる（Issue #3279 のレビュー指摘）。
+    #[test]
+    fn simple_case_operand_with_side_effect_function_is_rejected() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        for name in ["nextval", "setval"] {
+            let case = Expr::Case {
+                operand: Some(Box::new(call(name, vec![Expr::String("s".to_string())]))),
+                whens: vec![
+                    (
+                        Expr::Number("1".to_string()),
+                        Expr::Number("10".to_string()),
+                    ),
+                    (
+                        Expr::Number("2".to_string()),
+                        Expr::Number("20".to_string()),
+                    ),
+                ],
+                else_result: None,
+            };
+            let mut budget = MAX_EXPR_NODES;
+            let err = bind_expr(&case, &schema, &registry, &mut budget).unwrap_err();
+            assert_eq!(err.wire_code(), "0A000", "function {name}");
+        }
+    }
+
     #[test]
     fn calling_an_unknown_non_deterministic_function_is_rejected_with_42883() {
         let schema = schema_with_vector();

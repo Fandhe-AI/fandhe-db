@@ -31248,7 +31248,9 @@ pub(crate) fn validate_create_temp_table_tokens(
 pub(crate) fn parse_check_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let mut tokens = lexer::tokenize(sql)?;
+    // 引用付き `"null"` の列参照を保存本文から復元できるよう、引用付き NULL を区別する字句解析を使う
+    // （単純 CASE の被演算子・比較値は NULL リテラルを許すため。Issue #3279）。
+    let mut tokens = lexer::tokenize_marked(sql)?;
     // 旧版は時刻キーワード名の列参照を引用なしで保存した。CHECK は値関数を禁止しているため、
     // 保存本文中の未引用の予約語は旧形式の列参照として復元する（書き込み不能化を防ぐ）。
     lexer::requote_legacy_value_function_columns(&mut tokens);
