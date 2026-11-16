@@ -105,8 +105,10 @@ pub(crate) use materialized::read_materialized_view_in;
 const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog");
 
 /// ENUM 型定義（TABLE-14・TASK-198、Issue #890）を格納するテーブル。キーは
-/// 型名（`validate_identifier` で検証済み）、値は [`encode_enum_type_def`] で
-/// エンコードした語彙 blob。`CATALOG_TABLE`（列定義）とは独立したライフサイクルを
+/// 型名（裸の識別子＝public、または解決器が作る内部キー `#<schema_id>.<name>`＝テナントの SCHEMA 配下。
+/// [`validate_enum_type_name`] で検証済み。Issue #3288）、値は [`encode_enum_type_def`] で
+/// エンコードした語彙 blob。利用者向けの一覧 API・DDL 書き出しは内部キーをそのまま返さない
+/// （書き出しは `ddl_export` の所属判定で自テナントの SCHEMA 分だけ公開名へ戻す）。`CATALOG_TABLE`（列定義）とは独立したライフサイクルを
 /// 持つ名前空間で、列は型名の参照（[`ColumnType::Enum`]）のみを保持する。
 const ENUM_TYPES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("enum_types");
 
@@ -2068,10 +2070,11 @@ pub(crate) enum HnswGate {
     MetricMismatch { index_metric: VectorOpClass },
 }
 
-/// 物理 HNSW グラフが対応する距離種別か。現状のグラフはコサインだけ。
-/// opclass 別カーネル（Issue #1996・#1999）が入った時点でここを広げる。
+/// 物理 HNSW グラフが対応する距離種別か。物理グラフは内積で構築され、コサインは内積候補を
+/// 厳密コサインで再採点し、内積（Issue #3303）は再採点なしでそのまま答えにする。
+/// L2・L1 は未対応（厳密全走査）。`sql::hnsw_cache::hnsw_graph_metric_for` と `is_some()` が一致する。
 pub(crate) fn hnsw_supported_metric(metric: VectorOpClass) -> bool {
-    matches!(metric, VectorOpClass::Cosine)
+    matches!(metric, VectorOpClass::Cosine | VectorOpClass::Ip)
 }
 
 /// 宣言された opclass 集合から表示用の索引 metric を決める（Issue #1978 の決定規則）。
@@ -3893,6 +3896,38 @@ fn validate_catalog_param(param: &str) -> Result<()> {
     Ok(())
 }
 
+/// 型タグ別の `param` 文字集合検証（Issue #3289）。ENUM 型名の欄（`enum` タグの `param`、`array` タグの
+/// `enum,<名>,<max_len>[,d<N>]` の第 2 欄）に限り、裸の識別子に加えて解決器が作る内部キー
+/// `#<schema_id>.<name>`（SCHEMA 配下の型。[`namespace::RelationKey`]）を受理する。区切り文字（`:`・`,`・
+/// 改行）は内部キーの文法（正準 10 進・`.`・識別子）に含まれないため、注入経路は増えない。それ以外の
+/// タグ・欄は [`validate_catalog_param`] と同一（public の型の列は従来どおり裸の名前のままで、
+/// バイト列は不変）。
+fn validate_catalog_param_for_tag(tag: &str, param: &str) -> Result<()> {
+    match tag {
+        "enum" if param.starts_with('#') => validate_enum_type_ref(param),
+        "array" if param.starts_with("enum,#") => {
+            let mut fields = param.split(',');
+            let _tag = fields.next();
+            let Some(name) = fields.next() else {
+                return validate_catalog_param(param);
+            };
+            validate_enum_type_ref(name)?;
+            // 型名欄を無害な識別子へ置き換え、残りの欄を従来の文字集合で検証する。
+            let rest: Vec<&str> = fields.collect();
+            let masked = format!("enum,x,{}", rest.join(","));
+            validate_catalog_param(&masked)
+        }
+        _ => validate_catalog_param(param),
+    }
+}
+
+/// 列の ENUM 型参照（裸の名前または内部キー `#<schema_id>.<name>`）の検証（Issue #3289）。カタログに
+/// 保存された列定義の `param` と、解決器が書き換えた型名だけがこの形を取る（利用者の生入力は字句解析器が
+/// `#` を作らないため到達しない）。
+pub(crate) fn validate_enum_type_ref(name: &str) -> Result<()> {
+    namespace::RelationKey::parse(name).map(|_| ())
+}
+
 /// 列行 `param` 内の照合要素の接頭辞（TABLE-28・Issue #1609）。
 const COLLATION_PARAM_PREFIX: &str = "collate_";
 
@@ -5276,7 +5311,7 @@ impl ColumnType {
                 Ok(ColumnType::Jsonb)
             }
             "enum" => {
-                validate_identifier(param)?;
+                validate_enum_type_ref(param)?;
                 let def = resolve_enum(param)?;
                 Ok(ColumnType::Enum(def))
             }
@@ -5477,15 +5512,23 @@ fn validate_enum_labels(labels: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// ENUM 型名の検証。識別子形式（[`validate_identifier`]）に加え、組み込み型名
-/// （[`RESERVED_TYPE_NAMES`]。大文字小文字を区別しない）との衝突を拒否する
-/// （Issue #890 D1。将来 SQL-23 の `CREATE TABLE` 型名解決での曖昧さを防ぐ）。
+/// ENUM 型名の検証。識別子形式に加え、組み込み型名（[`RESERVED_TYPE_NAMES`]。大文字小文字を
+/// 区別しない）との衝突を拒否する（Issue #890 D1。将来 SQL-23 の `CREATE TABLE` 型名解決での
+/// 曖昧さを防ぐ）。
+///
+/// Issue #3288: 型名は裸の名前（public）または解決器が作る内部キー `#<schema_id>.<name>`
+/// （[`namespace::RelationKey`]。SCHEMA 配下）を受理する。予約名の判定は名前部だけで行うため、
+/// SCHEMA 配下でも `s.int4` のような組み込み型名との衝突は同じく拒否される。
 fn validate_enum_type_name(name: &str) -> Result<()> {
-    validate_identifier(name)?;
-    let lower = name.to_ascii_lowercase();
+    let key = namespace::RelationKey::parse(name)?;
+    let bare = match &key {
+        namespace::RelationKey::Public(n) => n.as_str(),
+        namespace::RelationKey::InSchema { name, .. } => name.as_str(),
+    };
+    let lower = bare.to_ascii_lowercase();
     if RESERVED_TYPE_NAMES.contains(&lower.as_str()) {
         return Err(CatalogError::Invalid(format!(
-            "enum type name collides with a built-in type name: {name:?}"
+            "enum type name collides with a built-in type name: {bare:?}"
         )));
     }
     Ok(())
@@ -5862,7 +5905,7 @@ fn validate_view_body_matches_base_relation(
 /// `relations` は本文が読む relation 名（先頭が `base_relation`。JOIN は両辺）、
 /// `buffered` は評価後射影形（集計・`LIMIT`・`ORDER BY`・JOIN を含む本文）か、
 /// `join` は JOIN 本文か。
-struct ViewBodyShape {
+pub(crate) struct ViewBodyShape {
     relations: Vec<String>,
     buffered: bool,
     join: bool,
@@ -7231,6 +7274,14 @@ pub enum ArrayElemType {
     /// `BitString` のバイト列と同じ）。OID は別（`_bit` = 1561）なので Text へは丸めない。
     /// 長さなしの `BIT[]` は `BIT(1)[]`（スカラーと同じ）。`VARBIT[]`（OID 1563）は未対応。
     Bit(u32),
+    /// `INTERVAL`（Issue #3234・TABLE-14・TABLE-34・TABLE-35）。行内表現は要素ごとに固定幅
+    /// 16 バイト（`months: i32 LE`・`days: i32 LE`・`micros: i64 LE`。[`crate::datetime::Interval`]
+    /// のフィールド順）。OID は別（`_interval` = 1187）なので他型へは丸めない。等価・比較は
+    /// スカラー INTERVAL と同じ正規化キー（1 か月 = 30 日）で行うが、行バイトは生の三要素を保つ。
+    Interval,
+    /// `TIMESTAMPTZ`（Issue #3233）。行内表現は UTC 起点のマイクロ秒 8 バイト LE（`Timestamp`・
+    /// `Time` と同形）。OID は別（`_timestamptz` = 1185）なので他の要素型へは丸めない。
+    TimestampTz,
 }
 
 impl ArrayElemType {
@@ -7238,7 +7289,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 19] = [
+    pub const ALL_KINDS: [ArrayElemType; 21] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7261,6 +7312,8 @@ impl ArrayElemType {
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
         ArrayElemType::Bit(4),
+        ArrayElemType::Interval,
+        ArrayElemType::TimestampTz,
     ];
 
     /// 種別の序数（[`ArrayElemType::ALL_KINDS`] の添字）。ワイルドカード無しの網羅 match の
@@ -7288,6 +7341,8 @@ impl ArrayElemType {
             ArrayElemType::SmallInt => 16,
             ArrayElemType::Time => 17,
             ArrayElemType::Bit(_) => 18,
+            ArrayElemType::Interval => 19,
+            ArrayElemType::TimestampTz => 20,
         }
     }
 
@@ -7317,6 +7372,8 @@ impl ArrayElemType {
             ArrayElemType::Bit(_) => "bit",
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
+            ArrayElemType::Interval => "interval",
+            ArrayElemType::TimestampTz => "timestamptz",
         }
     }
 
@@ -7331,6 +7388,8 @@ impl ArrayElemType {
             "bigint" => Ok(ArrayElemType::BigInt),
             "smallint" => Ok(ArrayElemType::SmallInt),
             "time" => Ok(ArrayElemType::Time),
+            "interval" => Ok(ArrayElemType::Interval),
+            "timestamptz" => Ok(ArrayElemType::TimestampTz),
             "real" => Ok(ArrayElemType::Real),
             "double" => Ok(ArrayElemType::Double),
             "date" => Ok(ArrayElemType::Date),
@@ -7412,7 +7471,9 @@ impl ArrayType {
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
-            | ArrayElemType::Time => {}
+            | ArrayElemType::Time
+            | ArrayElemType::Interval
+            | ArrayElemType::TimestampTz => {}
         }
         Ok(Self {
             elem,
@@ -7517,7 +7578,9 @@ impl ArrayType {
                 | ArrayElemType::Jsonb
                 | ArrayElemType::Varchar(None)
                 | ArrayElemType::SmallInt
-                | ArrayElemType::Time,
+                | ArrayElemType::Time
+                | ArrayElemType::Interval
+                | ArrayElemType::TimestampTz,
                 _,
             ) => format!("{},{}", self.elem.catalog_tag(), self.max_len),
         };
@@ -7573,7 +7636,7 @@ fn parse_array_param(
             ArrayType::new(ArrayElemType::Numeric { precision, scale }, max_len)
         }
         ("enum", [_, name, _]) => {
-            validate_identifier(name)?;
+            validate_enum_type_ref(name)?;
             let def = resolve_enum(name)?;
             ArrayType::new_enum(def, max_len)
         }
@@ -7623,7 +7686,7 @@ fn array_param_enum_name(param: &str) -> Result<Option<&str>> {
     }
     match fields.as_slice() {
         [_, name, max_len] => {
-            validate_identifier(name).map_err(|_| corrupt())?;
+            validate_enum_type_ref(name).map_err(|_| corrupt())?;
             let canonical = max_len
                 .parse::<u32>()
                 .map(|n| n.to_string() == *max_len && (1..=MAX_ARRAY_ELEMENTS).contains(&n))
@@ -8234,6 +8297,8 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bpchar(_)
         | ArrayElemType::SmallInt
         | ArrayElemType::Time
+        | ArrayElemType::Interval
+        | ArrayElemType::TimestampTz
         | ArrayElemType::Bit(_) => false,
     }
 }
@@ -10844,7 +10909,7 @@ fn encode_column_line(
     param_field: &str,
     nullable: bool,
 ) -> Result<String> {
-    validate_catalog_param(param_field)?;
+    validate_catalog_param_for_tag(type_name, param_field)?;
     let nullable_field = nullable_field_for(type_name, nullable);
     Ok(format!(
         "{name}:{type_name}:{param_field}:{nullable_field}\n"
@@ -10860,7 +10925,7 @@ fn encode_column_line_v3(
     nullable: bool,
     state: char,
 ) -> Result<String> {
-    validate_catalog_param(param_field)?;
+    validate_catalog_param_for_tag(type_name, param_field)?;
     let nullable_field = nullable_field_for(type_name, nullable);
     Ok(format!(
         "{name}:{type_name}:{param_field}:{nullable_field}:{state}\n"
@@ -10878,7 +10943,7 @@ fn encode_column_line_v5(
     state: char,
     default: Option<&ColumnDefault>,
 ) -> Result<String> {
-    validate_catalog_param(param_field)?;
+    validate_catalog_param_for_tag(type_name, param_field)?;
     let nullable_field = nullable_field_for(type_name, nullable);
     let default_field = match default {
         None => "-".to_string(),
@@ -12343,7 +12408,7 @@ fn decode_schema_body(
         }
 
         validate_identifier(name)?;
-        validate_catalog_param(param_field)?;
+        validate_catalog_param_for_tag(type_name, param_field)?;
         // 未知の型タグ・型別の `param` 文法違反は、ここで `ColumnDef`（`name` の
         // 所有 `String` を確保する）を構築する前に拒否する（アロケーション前拒否。
         // Issue #880 D7）。
@@ -16170,9 +16235,11 @@ impl Storage {
     /// 呼ばれる。同名の型が既に存在する場合は上書きせず
     /// `Err(CatalogError::TypeAlreadyExists)`。
     pub fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<Arc<EnumTypeDef>> {
-        if CREATE_ONLY_RESERVED_TYPE_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        // 予約名の判定は名前部だけで行う（SCHEMA 配下の内部キーでも組み込み型の別名と衝突させない）。
+        let bare_name = namespace::relation_name_part(name);
+        if CREATE_ONLY_RESERVED_TYPE_NAMES.contains(&bare_name.to_ascii_lowercase().as_str()) {
             return Err(CatalogError::Invalid(format!(
-                "enum type name collides with a built-in type alias: {name:?}"
+                "enum type name collides with a built-in type alias: {bare_name:?}"
             )));
         }
         let encoded = encode_enum_type_def(name, &labels)?;
@@ -16200,7 +16267,7 @@ impl Storage {
 
     /// 定義済みの ENUM 型をスナップショット読み取りで取得する。
     pub fn get_enum_type(&self, name: &str) -> Result<Arc<EnumTypeDef>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(ENUM_TYPES_TABLE) {
             Ok(t) => t,
@@ -16225,7 +16292,7 @@ impl Storage {
     /// 世代を進行させる（多層防御。同一クエリ内でスキーマが再取得されない
     /// キャッシュ経路が新ラベルを見落とす可能性を保守的に潰す）。
     pub fn alter_enum_type_add_value(&self, name: &str, label: String) -> Result<Arc<EnumTypeDef>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         validate_enum_label(&label)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let updated = {
@@ -16262,7 +16329,7 @@ impl Storage {
     /// `Err(CatalogError::DependentObjectsStillExist)` で拒否する（SQL-23 結線時は
     /// `2BP01` へ写像する。Issue #890 D5・Issue #1194）。
     pub fn drop_enum_type(&self, name: &str) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let dependents = dependent_tables_in_txn(&write_txn, name)?;
@@ -16345,6 +16412,23 @@ impl Storage {
         column_aliases: &[String],
         check_option: ViewCheckOption,
     ) -> Result<()> {
+        let (encoded, shape) =
+            Self::prepare_create_view(name, base_relation, body_sql, column_aliases, check_option)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::create_view_in_txn(&write_txn, name, base_relation, body_sql, &encoded, &shape)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// [`Self::create_view_with_check_option`] の txn 前処理（識別子・本文サイズ・別名の形状検証と定義のエンコード。
+    /// write txn を開く前に fail-closed に拒否できる判定だけ）。要素つき `CREATE SCHEMA` の実行器
+    /// （`core::schema_elements`）も同じ処理を通す（第 2 の検証経路を作らない。Issue #3286）。
+    pub(crate) fn prepare_create_view(
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        column_aliases: &[String],
+        check_option: ViewCheckOption,
+    ) -> Result<(Vec<u8>, ViewBodyShape)> {
         validate_relation_key(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
@@ -16372,8 +16456,22 @@ impl Storage {
             column_aliases: column_aliases.to_vec(),
             check_option,
         })?;
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
+        Ok((encoded, shape))
+    }
+
+    /// [`Self::create_view_with_check_option`] の write txn 内本体（begin・commit を含まない）。`encoded`・`shape`
+    /// は [`Self::prepare_create_view`] の結果。名前空間の衝突・参照先の存在と深さ・件数上限・保存・commit 記録・
+    /// 所有者の適用を行う。`Err` の場合は呼び出し側が txn を破棄する。単独の `CREATE VIEW` と、要素つき
+    /// `CREATE SCHEMA` が SCHEMA・表と同じ txn にビューを載せる経路が共有する（Issue #3286）。
+    pub(crate) fn create_view_in_txn(
+        write_txn: &redb::WriteTransaction,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        encoded: &[u8],
+        shape: &ViewBodyShape,
+    ) -> Result<()> {
+        namespace::ensure_key_schema_alive_in_txn(write_txn, name)?;
         {
             let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -16384,19 +16482,19 @@ impl Storage {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
-            if index_name_exists_in_txn(&write_txn, name)?
-                || materialized_view_exists_in_txn(&write_txn, name)?
-                || sequence::sequence_exists_in_txn(&write_txn, name)?
+            if index_name_exists_in_txn(write_txn, name)?
+                || materialized_view_exists_in_txn(write_txn, name)?
+                || sequence::sequence_exists_in_txn(write_txn, name)?
             {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             validate_new_view_body_in_txn(
-                &write_txn,
+                write_txn,
                 &catalog_table,
                 &views_table,
                 body_sql,
                 base_relation,
-                &shape,
+                shape,
             )?;
             let count = views_table.len()?;
             if count >= MAX_VIEWS as u64 {
@@ -16404,13 +16502,13 @@ impl Storage {
                     "too many views".to_string(),
                 ));
             }
-            views_table.insert(name, encoded.as_slice())?;
+            views_table.insert(name, encoded)?;
             // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
-            crate::storage::commit_log::note_ddl(&write_txn, name);
+            crate::storage::commit_log::note_ddl(write_txn, name);
             // 予約された作成者を所有者として同じ txn に書く（Issue #2236）。
-            privilege::owner::apply_pending_relation_owner_in_txn(&write_txn, name)?;
+            privilege::owner::apply_pending_relation_owner_in_txn(write_txn, name)?;
         }
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        Ok(())
     }
 
     /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）。他のビューが
@@ -18188,6 +18286,18 @@ fn catalog_value_references_enum_type_in_table(
     type_name: &str,
     table_name: Option<&str>,
 ) -> Result<bool> {
+    catalog_value_references_any_enum_type(bytes, &|name| name == type_name, table_name)
+}
+
+/// [`catalog_value_references_enum_type_in_table`] の述語版（Issue #3288）。`is_target` が真を返す
+/// ENUM 型（列型・配列要素型）を 1 つでも参照すれば真。`DROP SCHEMA ... CASCADE` が配下の型の
+/// 集合を 1 回の走査で照合するために使う（型ごとに全表を再解析する「型数 × 表数」を避ける）。
+/// 破損時の fail-closed（`CorruptSchema`）は単一型版と同一。
+fn catalog_value_references_any_enum_type(
+    bytes: &[u8],
+    is_target: &dyn Fn(&str) -> bool,
+    table_name: Option<&str>,
+) -> Result<bool> {
     if bytes.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::CorruptSchema(format!(
             "catalog value too large: {} bytes",
@@ -18492,12 +18602,12 @@ fn catalog_value_references_enum_type_in_table(
                 "duplicate column name: {name:?}"
             )));
         }
-        if tag == "enum" && param == type_name {
+        if tag == "enum" && is_target(param) {
             found = true;
         }
         // 配列の要素型としての参照（Issue #1357）。見落とすと `DROP TYPE` が
         // `enum[]` 列の残るテーブルを素通しし fail-open になる。
-        if tag == "array" && array_param_enum_name(param)? == Some(type_name) {
+        if tag == "array" && array_param_enum_name(param)?.is_some_and(is_target) {
             found = true;
         }
     }
@@ -18804,6 +18914,56 @@ fn dependent_tables_in_txn(
         }
     }
     Ok(dependents)
+}
+
+/// `DROP SCHEMA ... CASCADE`（Issue #3288）が配下の ENUM 型 `types`（内部キー）を消す。
+/// [`CATALOG_TABLE`] を 1 回だけ走査して（各値の解析は 1 回。型数 × 表数にしない）、`types` のどれかを
+/// 参照する列が残っていれば `DependentObjectsStillExist`（`2BP01`）で何も消さずに返す。呼び出し元は
+/// 同じ write txn を commit せず破棄するため、不可逆な削除は起きない。破損した値は `CorruptSchema`。
+pub(super) fn drop_schema_enum_types_in_txn(
+    write_txn: &redb::WriteTransaction,
+    types: &[String],
+) -> Result<()> {
+    let set: std::collections::HashSet<&str> = types.iter().map(String::as_str).collect();
+    // 読み取り専用オープン（欠落時に空のカタログ表を作らない）。
+    match crate::storage::read_source::ReadSource::open_table(write_txn, CATALOG_TABLE) {
+        Ok(table) => {
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                if catalog_value_references_any_enum_type(
+                    value.value(),
+                    &|param| set.contains(param),
+                    Some(key.value()),
+                )? {
+                    return Err(CatalogError::DependentObjectsStillExist(
+                        "enum type".to_string(),
+                    ));
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
+    for ty in types {
+        table.remove(ty.as_str())?;
+    }
+    Ok(())
+}
+
+/// ENUM 型 `key`（裸の名前または内部キー）が定義済みか（Issue #3288。search_path の未修飾 `DROP TYPE`
+/// の参照ゲートが、SCHEMA 配下に同名の型があるかを引く）。読み取り専用で開き、表が無ければ偽。
+pub(crate) fn enum_type_exists_in<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    key: &str,
+) -> Result<bool> {
+    let table = match src.open_table(ENUM_TYPES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let found = table.get(key)?.is_some();
+    Ok(found)
 }
 
 /// `create_table` の write txn 内で、`schema` の各 `FOREIGN KEY` 宣言の参照先を
@@ -21002,6 +21162,8 @@ mod tests {
             (ArrayElemType::BigInt, "bigint"),
             (ArrayElemType::SmallInt, "smallint"),
             (ArrayElemType::Time, "time"),
+            (ArrayElemType::Interval, "interval"),
+            (ArrayElemType::TimestampTz, "timestamptz"),
             (ArrayElemType::Real, "real"),
             (ArrayElemType::Double, "double"),
             (ArrayElemType::Date, "date"),
@@ -21280,6 +21442,36 @@ mod tests {
         assert_eq!(array_param_enum_name("bit,4,8").ok(), Some(None));
         assert!(ArrayType::new(ArrayElemType::Bit(0), 8).is_err());
         assert!(ArrayType::new(ArrayElemType::Bit(beyond), 8).is_err());
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` の param は `timestamptz,<max_len>`（2 次元は末尾 `d2`）で
+    /// 往復し、既存の `timestamp` の param を変えない。
+    #[test]
+    fn timestamptz_array_param_roundtrips_and_leaves_timestamp_param_unchanged() {
+        let one =
+            ColumnType::Array(ArrayType::new(ArrayElemType::TimestampTz, 4).expect("array ty"));
+        assert_eq!(one.catalog_fields(), ("array", "timestamptz,4".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4", &mut array_resolver)
+                .expect("decode"),
+            one
+        );
+        let two = ColumnType::Array(
+            ArrayType::new(ArrayElemType::TimestampTz, 4)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(
+            two.catalog_fields(),
+            ("array", "timestamptz,4,d2".to_string())
+        );
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4,d2", &mut array_resolver)
+                .expect("decode 2d"),
+            two
+        );
+        let ts = ColumnType::Array(ArrayType::new(ArrayElemType::Timestamp, 4).expect("array ty"));
+        assert_eq!(ts.catalog_fields(), ("array", "timestamp,4".to_string()));
     }
 
     /// Issue #1605: 2 次元以上の宣言は param 末尾の `d<N>` で往復し、1 次元の param は従来の
@@ -21718,6 +21910,86 @@ mod tests {
                     Err(CatalogError::Invalid(_))
                 ),
                 "must reject: {invalid_param:?}"
+            );
+        }
+    }
+
+    /// Issue #3289: ENUM 型名の欄（`enum` の `param`・`array` の `enum,<名>,<max_len>[,d<N>]` の第 2 欄）に
+    /// 限り、SCHEMA 配下の型の内部キー `#<id>.<name>` を受理する。非正準・区切り文字の混入・他のタグへの
+    /// 持ち込みは拒否し、public の型の行（裸の名前）はバイト列が変わらない。
+    #[test]
+    fn enum_param_accepts_internal_keys_only_in_enum_fields() {
+        // public の型の列は従来どおりのバイト列。
+        assert_eq!(
+            encode_column_line("m", "enum", "mood", true).expect("public"),
+            "m:enum:mood:1\n"
+        );
+        // 内部キーは enum 列・enum 配列の型名欄で受理され、往復する。
+        assert_eq!(
+            encode_column_line("m", "enum", "#12.mood", true).expect("key"),
+            "m:enum:#12.mood:1\n"
+        );
+        assert!(encode_column_line("m", "array", "enum,#12.mood,4", false).is_ok());
+        assert!(encode_column_line("m", "array", "enum,#12.mood,4,d2", false).is_ok());
+        let mut resolve =
+            |name: &str| -> Result<Arc<EnumTypeDef>> { Ok(EnumTypeDef::for_test(name, &["a"])) };
+        let decoded =
+            ColumnType::from_catalog_fields("enum", "#12.mood", &mut resolve).expect("decode key");
+        assert_eq!(decoded.catalog_fields(), ("enum", "#12.mood".to_string()));
+        let decoded = ColumnType::from_catalog_fields("array", "enum,#12.mood,4", &mut resolve)
+            .expect("decode array key");
+        assert_eq!(
+            decoded.catalog_fields(),
+            ("array", "enum,#12.mood,4".to_string())
+        );
+        assert_eq!(
+            array_param_enum_name("enum,#12.mood,4,d2").expect("ok"),
+            Some("#12.mood")
+        );
+        // 非正準・不正な形は encode・decode の両側で拒否する。
+        for bad in [
+            "#012.x",
+            "#0.x",
+            "#1.",
+            "#a.x",
+            "#1.1x",
+            "#1.x.y",
+            "#",
+            "#1",
+            "#1:x",
+            "#1,x",
+            "#99999999999999999999999.x",
+        ] {
+            assert!(
+                encode_column_line("m", "enum", bad, true).is_err(),
+                "encode must reject {bad:?}"
+            );
+            assert!(
+                ColumnType::from_catalog_fields("enum", bad, &mut resolve).is_err(),
+                "decode must reject {bad:?}"
+            );
+            let array = format!("enum,{bad},4");
+            assert!(
+                encode_column_line("m", "array", &array, false).is_err(),
+                "array encode must reject {bad:?}"
+            );
+            assert!(
+                ColumnType::from_catalog_fields("array", &array, &mut resolve).is_err(),
+                "array decode must reject {bad:?}"
+            );
+        }
+        // 他のタグ・欄へは内部キーの文字（`#`・`.`）を持ち込めない。
+        for (tag, param) in [
+            ("text", "#1.x"),
+            ("vector", "#1.3"),
+            ("numeric", "10.2"),
+            ("array", "text,#1.x,4"),
+            ("array", "enum,mood,#1.4"),
+            ("array", "numeric,10.2,4"),
+        ] {
+            assert!(
+                encode_column_line("m", tag, param, false).is_err(),
+                "{tag} {param:?}"
             );
         }
     }
@@ -28378,6 +28650,49 @@ mod tests {
             .expect("create cosine index");
         assert_eq!(gate(HnswScope::Declared, true, cos), targeted);
         assert_eq!(gate(HnswScope::Declared, true, l2), mismatch(cos));
+
+        // 内積（Issue #3303）: 宣言がなければ `<#>` は不一致のまま（Cosine と L2 だけの宣言でも同じ）。
+        let ip = VectorOpClass::Ip;
+        assert_eq!(gate(HnswScope::All, true, ip), mismatch(cos));
+        assert_eq!(gate(HnswScope::Declared, true, ip), mismatch(cos));
+        // ip を宣言すると `<#>` は Targeted、`<=>` も従来どおり Targeted。
+        let mut def = hnsw_def("idx_ip", "docs");
+        def.kind = IndexKind::Hnsw(ip);
+        storage.create_index(&def).expect("create ip index");
+        let targeted_ip = HnswGate::Targeted {
+            metric: ip,
+            options: None,
+        };
+        assert_eq!(gate(HnswScope::Declared, true, ip), targeted_ip);
+        assert_eq!(gate(HnswScope::All, true, ip), targeted_ip);
+        assert_eq!(gate(HnswScope::Declared, true, cos), targeted);
+        // 物理グラフ未対応の L2 は ip 宣言があっても不一致。
+        assert_eq!(gate(HnswScope::Declared, true, l2), mismatch(cos));
+    }
+
+    /// Ip だけを宣言した表では `<=>` は不一致、`<#>` は Targeted（Issue #3303）。
+    #[test]
+    fn hnsw_gate_ip_only_declaration() {
+        let (storage, _guard) = index_fixture_storage("index-hnsw-gate-ip-only");
+        let gate_cache = IndexCatalogGateCache::new();
+        let mut def = hnsw_def("idx_ip", "docs");
+        def.kind = IndexKind::Hnsw(VectorOpClass::Ip);
+        storage.create_index(&def).expect("create ip index");
+        let txn = storage.db().begin_read().expect("begin read");
+        let g = |scope, q| hnsw_gate_in_txn(&txn, &gate_cache, "docs", scope, true, q);
+        assert_eq!(
+            g(HnswScope::Declared, VectorOpClass::Cosine),
+            HnswGate::MetricMismatch {
+                index_metric: VectorOpClass::Ip
+            }
+        );
+        assert_eq!(
+            g(HnswScope::Declared, VectorOpClass::Ip),
+            HnswGate::Targeted {
+                metric: VectorOpClass::Ip,
+                options: None
+            }
+        );
     }
 
     /// 構築パラメータの伝搬（SQL-33 (5)、Issue #2029）: ゲートは問い合わせ metric の宣言の `WITH` を

@@ -1362,26 +1362,22 @@ fn rename_table_stays_in_the_schema() {
     );
 }
 
-/// ENUM 型の SCHEMA 配置は未対応（fail-closed のまま。MATERIALIZED VIEW は Issue #3287 で対応済み）。
-// intentional: docs/design/schema-tenant-namespace.md（ENUM 型の SCHEMA 配置は対象外）
+/// ENUM 型は SCHEMA 配下に作成・削除でき（Issue #3288）、列型でも `s.mood` を解決できる（Issue #3289）。
+/// 列が型を使っている間は `DROP TYPE` が `2BP01`。
 #[test]
-fn enum_type_placement_stays_unsupported() {
-    let (core, _g) = new_core("t27-objects-unsupported");
+fn enum_type_placement_and_column_type_resolution_work() {
+    let (core, _g) = new_core("t27-objects-enum-type");
     let mut s = ddl_session();
     ok(&core, &mut s, "CREATE SCHEMA s");
-    ok(&core, &mut s, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
-    assert_eq!(
-        code(&core, &mut s, "CREATE TYPE s.mood AS ENUM ('a')"),
-        "42601"
+    ok(&core, &mut s, "CREATE TYPE s.mood AS ENUM ('a')");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.mood)",
     );
-    assert_eq!(
-        code(
-            &core,
-            &mut s,
-            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.mood)"
-        ),
-        "42601"
-    );
+    assert_eq!(code(&core, &mut s, "DROP TYPE s.mood"), "2BP01");
+    ok(&core, &mut s, "DROP TABLE s.t");
+    ok(&core, &mut s, "DROP TYPE s.mood");
 }
 
 /// Rust API の生の表名（`EngineCore::insert_row` 等）は裸の識別子だけを受理し、SCHEMA 配下の内部キーを

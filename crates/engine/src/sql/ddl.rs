@@ -3463,6 +3463,78 @@ pub(crate) fn execute_create_sequence(
     Ok(CreateSequenceOutcome {})
 }
 
+/// 要素つき `CREATE SCHEMA` の `CREATE TABLE` 要素を、呼び出し側（`core::schema_elements`）が開いた write txn の
+/// 中で作る（Issue #3286）。begin・commit・表の世代 bump は呼び出し側が行う。単独の
+/// [`execute_create_table`] と同じ検査（SCHEMA 越境依存の拒否・定義の意味検証・暗黙 SEQUENCE の作成）と
+/// 同じ txn 内本体を通し、第 2 の作成経路を作らない。要素側の `IF NOT EXISTS` は構文段が拒否済みのため扱わない。
+/// `Err` の場合は呼び出し側が txn を破棄する（SCHEMA・作成済みの要素を含めて何も残らない）。
+pub(crate) fn create_table_element_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateTable,
+    limits: &SchemaLimits,
+) -> Result<(), SqlSurfaceError> {
+    crate::sql::schema_dependency::check_create_table(validated)?;
+    let schema = build_table_schema(Some(storage), validated, limits)?;
+    let serials = implicit_sequences_in_column_order(&schema, validated)?;
+    let created = if serials.is_empty() {
+        Storage::create_table_in_write_txn(write_txn, &schema)
+    } else {
+        crate::catalog::sequence::create_table_with_implicit_sequences_in_txn(
+            write_txn, &schema, &serials,
+        )
+        .map(|_| ())
+    };
+    created.map_err(map_create_table_catalog_error)?;
+    // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+    crate::storage::commit_log::note_ddl(write_txn, &schema.name);
+    Ok(())
+}
+
+/// 要素つき `CREATE SCHEMA` の `CREATE VIEW` 要素を、呼び出し側の write txn の中で作る（Issue #3286。
+/// [`create_table_element_in_txn`] と同じ位置づけ）。単独の `CREATE VIEW` 腕と同じ SCHEMA 越境依存の拒否と
+/// 事前検証（`Storage::prepare_create_view`）・txn 内本体（`Storage::create_view_in_txn`）を通す。列別名・
+/// `WITH CHECK OPTION`・`OR REPLACE` は構文段が拒否済みで、カタログを引く追加の事前検査は要らない。
+pub(crate) fn create_view_element_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateView,
+) -> Result<(), SqlSurfaceError> {
+    crate::sql::schema_dependency::check_view_body(validated.name(), validated.body_sql())?;
+    let (encoded, shape) = Storage::prepare_create_view(
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        &[],
+        crate::catalog::ViewCheckOption::None,
+    )
+    .map_err(map_create_view_error)?;
+    Storage::create_view_in_txn(
+        write_txn,
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        &encoded,
+        &shape,
+    )
+    .map_err(map_create_view_error)
+}
+
+/// 要素つき `CREATE SCHEMA` の `CREATE SEQUENCE` 要素を、呼び出し側の write txn の中で作る（Issue #3286）。
+/// 意味検証（範囲 `22023`）と既定値の補完は単独の [`execute_create_sequence`] と同じ。
+pub(crate) fn create_sequence_element_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateSequence,
+) -> Result<(), SqlSurfaceError> {
+    let params = resolve_sequence_params(validated)?;
+    crate::catalog::sequence::create_sequence_with_default_acl_in_txn(
+        write_txn,
+        validated.name(),
+        &params,
+    )
+    .map(|_| ())
+    .map_err(|e| map_sequence_error(e, "CREATE SEQUENCE failed"))
+}
+
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1688）。
 /// `Storage::drop_sequence`（同一 write txn 内で依存 DEFAULT の検査・定義と全テナント分の
 /// 状態行の削除）へ委譲する。
@@ -3657,8 +3729,9 @@ impl DropTypeOutcome {
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （Issue #1194）。`Storage::create_enum_type`（単一 write txn 内で名前検証・
-/// 重複判定・件数上限を行う）へ委譲する。ENUM 型は全テナント共有カタログのため
-/// `PolicyContext` は取らない。
+/// 重複判定・件数上限を行う）へ委譲する。ENUM 型のカタログは全テナント共有で `PolicyContext` は取らない。
+/// 型名は裸の名前（public）か、解決器が自テナントの SCHEMA から作った内部キー `#<schema_id>.<name>`
+/// （Issue #3288。呼び出し元 `core::EngineCore` の実行腕が作成先の権限を検査済み）。
 pub(crate) fn execute_create_type(
     storage: &Storage,
     validated: &ValidatedCreateType,
@@ -3677,7 +3750,8 @@ pub(crate) fn execute_create_type(
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （Issue #1194）。`Storage::drop_enum_type`（同一 write txn 内で依存列を判定し、
-/// 残っていれば `DependentObjectsStillExist`）へ委譲する。
+/// 残っていれば `DependentObjectsStillExist`）へ委譲する。型名は [`execute_create_type`] と同じく
+/// 裸の名前か内部キー（Issue #3288）。
 pub(crate) fn execute_drop_type(
     storage: &Storage,
     validated: &ValidatedDropType,
@@ -3701,6 +3775,9 @@ pub(crate) fn execute_drop_type(
 fn map_create_type_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         CatalogError::TypeAlreadyExists(name) => SqlSurfaceError::duplicate_type(name),
+        // 解析と実行の間に作成先の SCHEMA が消えた競合（Issue #3288。表・SEQUENCE の作成と同じ `42P01`）。
+        // 名前は内部キーのまま渡し、ctx を持つ入口の出口（`map_text`）が公開名へ戻す。
+        CatalogError::TableNotFound(name) => SqlSurfaceError::undefined_table(name),
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("invalid enum type definition in CREATE TYPE")
         }

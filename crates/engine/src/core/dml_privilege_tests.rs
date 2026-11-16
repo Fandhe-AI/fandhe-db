@@ -183,6 +183,41 @@ fn joined_dml_returning_needs_select_on_the_from_table() {
     assert_eq!(f.count("ca"), 0);
 }
 
+/// `UPDATE ... FROM` の SET が FROM 側の列を式・行値代入で参照する形（Issue #3296）も、書き込み先の
+/// 権限だけでは足りず FROM 側の表への `SELECT` を要求する（列参照 1 個の形と同じゲート）。拒否時は行不変。
+#[test]
+fn joined_update_set_expression_needs_select_on_the_from_table() {
+    let f = fx("dmlpriv-joined-set-expr");
+    f.admin_run(&ins("ca", 1, "j1"));
+    f.admin_run(&ins("cb", 1, "j2"));
+    f.admin_run("GRANT SELECT, UPDATE ON ca TO alice");
+    let expr = "UPDATE ca SET n = cb.n + 1 FROM cb WHERE ca.id = cb.id";
+    let row = "UPDATE ca SET (n) = ROW(cb.n + 1) FROM cb WHERE ca.id = cb.id";
+    assert_eq!(f.alice_run(expr), "42501");
+    assert_eq!(f.alice_run(row), "42501");
+    f.admin_run("GRANT SELECT ON cb TO alice");
+    assert_eq!(f.alice_run(expr), "ok");
+}
+
+/// FROM／USING 内の `JOIN` で加わる表にも `SELECT` が要る（Issue #3294）。書き込み先（`ca`）の権限だけの
+/// ロールは、JOIN の先の `cb` を読む文を `42501` で拒否され、行は変化しない。付与後は同じ文が通る。
+#[test]
+fn joined_dml_needs_select_on_tables_added_by_join() {
+    let f = fx("dmlpriv-joined-join-on");
+    f.admin_run(&ins("ca", 1, "jj1"));
+    f.admin_run(&ins("cb", 1, "jj2"));
+    f.admin_run("GRANT SELECT, UPDATE, DELETE ON ca TO alice");
+    let upd = "UPDATE ca SET n = 7 FROM ca AS a2 JOIN cb ON a2.id = cb.id WHERE ca.id = a2.id";
+    let del = "DELETE FROM ca USING ca AS a2 JOIN cb ON a2.id = cb.id WHERE ca.id = a2.id";
+    assert_eq!(f.alice_run(upd), "42501");
+    assert_eq!(f.alice_run(del), "42501");
+    assert_eq!(f.count("ca"), 1);
+    f.admin_run("GRANT SELECT ON cb TO alice");
+    assert_eq!(f.alice_run(upd), "ok");
+    assert_eq!(f.alice_run(del), "ok");
+    assert_eq!(f.count("ca"), 0);
+}
+
 /// HTTP（NoSQL）表層の `RETURNING` 付き束縛済み入口（NOSQL-22・Issue #2091）は、書き込み権限に加えて
 /// `SELECT` を要求する（SQL 表層の `RETURNING` 付き文と同じ。全列要求で SQL より厳しい側）。
 /// 拒否時は行・台帳とも変化せず、`SELECT` 付与後の同じ `operation_id` の再送は新規として成功する。

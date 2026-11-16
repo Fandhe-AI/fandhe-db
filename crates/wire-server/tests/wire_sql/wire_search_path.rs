@@ -734,16 +734,14 @@ fn wire_foreign_schema_path_and_unsupported_creates_fail_closed_and_keep_the_con
         select_cells(&mut alice, "SELECT id FROM q1.t;"),
         vec![Some("10".to_string())]
     );
-    // SCHEMA 配置が未対応の作成（ENUM 型）は、path 先頭が SCHEMA のとき `public` へ黙って作らず `0A000`。
+    // MATERIALIZED VIEW は path 先頭の SCHEMA へ作られる（Issue #3287。`WITH DATA` の既定は `SELECT <行数>`）。
     simple_ok(&mut alice, "SET search_path TO q1, public;");
-    simple_err(&mut alice, "CREATE TYPE ty AS ENUM ('a');", "0A000");
-    // MATERIALIZED VIEW は path 先頭の SCHEMA へ作られる（Issue #3287）。
     assert_eq!(
         simple_ok(
             &mut alice,
             "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;"
         ),
-        "CREATE MATERIALIZED VIEW"
+        "SELECT 1"
     );
     assert_eq!(
         select_cells(&mut alice, "SELECT id FROM q1.mv;"),

@@ -209,25 +209,31 @@ fn export_schemas<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Sche
     Ok(())
 }
 
-/// 共有の ENUM 型。
+/// 範囲内の ENUM 型（共有の `public` と、選択したテナントの SCHEMA 配下。Issue #3288）。
+/// 共有は `"name"`、SCHEMA 配下は引用符なしの `schema.name`（SCHEMA 修飾名は引用符付きを受理しないため
+/// [`Namer::qualified_required`] で描画する）。出力順は描画名（共有が先、続いて SCHEMA 名・型名）で決め、
+/// 内部 ID の並びに依存させない（往復で同じ DDL 列にする）。他テナントの型は存在を示さず無視する。
 fn export_enums<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
+    let mut targets = Vec::new();
     for (k, v) in read_str_table::<E>(ctx, ENUM_TYPES_TABLE)? {
         // キーの所属で絞る（デコードより前。他テナントの SCHEMA 配下の型は存在を示さず無視する）。
-        match ctx.namer.scope::<E>(&k)? {
-            KeyScope::Shared if ctx.scope.includes_shared() => {}
-            KeyScope::Shared | KeyScope::Foreign => continue,
-            // `CREATE TYPE` は SCHEMA 修飾名を受理しないため、SCHEMA 配下の型は戻せない。
-            KeyScope::Tenant { .. } => {
-                return Err(unsupported(
-                    "enum type",
-                    "schema-scoped enum type cannot be recreated by SQL",
-                ));
-            }
+        if !in_scope(ctx, &k)? {
+            continue;
         }
+        targets.push((ctx.namer.sort_key::<E>(&k)?, k, v));
+    }
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, k, v) in targets {
         let def: EnumTypeDef = decode_enum_type_def(&k, &v)?;
-        let mut s = String::from("CREATE TYPE ");
-        push_ident(&mut s, def.name())?;
-        s.push_str(" AS ENUM (");
+        let name = match ctx.namer.scope::<E>(&k)? {
+            KeyScope::Shared => {
+                let mut n = String::new();
+                push_ident(&mut n, def.name())?;
+                n
+            }
+            _ => ctx.namer.qualified_required::<E>(&k)?,
+        };
+        let mut s = format!("CREATE TYPE {name} AS ENUM (");
         for (i, label) in def.labels().iter().enumerate() {
             if i > 0 {
                 s.push_str(", ");

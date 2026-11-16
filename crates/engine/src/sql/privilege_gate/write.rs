@@ -311,6 +311,13 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
                 let (t, b) = update_form_bits(&ValidatedUpdateForm::Predicate(u.clone()));
                 WriteRequirement::one(&t, b)
             }
+            // Issue #3293: 非 EXPLAIN の結合形と同じビット（EXPLAIN を抜け道にしない。SQL-40）。
+            ExplainDml::UpdateFrom(v) => {
+                WriteRequirement::one(v.target.table(), PRIV_UPDATE | PRIV_SELECT)
+            }
+            ExplainDml::DeleteUsing(v) => {
+                WriteRequirement::one(v.target.table(), PRIV_DELETE | PRIV_SELECT)
+            }
         },
         // Issue #2055: ANALYZE は実際に書き込むため、内側の DML と同じ権限ビットを実行前に要求する（SQL-40）。
         ParsedSql::ExplainAnalyzeDml(ea) => match &ea.target {
@@ -321,6 +328,12 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
             ExplainAnalyzeDmlTarget::Dml(ExplainDml::Update(u)) => {
                 let (t, b) = update_form_bits(&ValidatedUpdateForm::Predicate(u.clone()));
                 WriteRequirement::one(&t, b)
+            }
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::UpdateFrom(v)) => {
+                WriteRequirement::one(v.target.table(), PRIV_UPDATE | PRIV_SELECT)
+            }
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::DeleteUsing(v)) => {
+                WriteRequirement::one(v.target.table(), PRIV_DELETE | PRIV_SELECT)
             }
             ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
                 crate::sql::insert_explain::ExplainInsertTarget::Values(v) => {

@@ -136,7 +136,8 @@ fn new_core_overflow() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-/// `insert` の件数上限（INDEX-4）を小さく固定したスローアウェイ `EngineCore`
+/// `insert` のチャンク総量上限（INDEX-4 ④。行の形は 1 行 = 1 チャンク。Issue #3308 で
+/// ①ではなく④が行の形の上限になった）を小さく固定したスローアウェイ `EngineCore`
 /// （環境変数の実値に依存せず非 vacuous に誘発するため）。
 fn new_core_with_small_batch_limit(max_files: usize) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("err4-http-projection-batch-limit");
@@ -145,7 +146,7 @@ fn new_core_with_small_batch_limit(max_files: usize) -> (Arc<EngineCore>, temp_d
     storage.create_table(&schema()).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(
         BatchLimits {
-            max_files_per_batch: max_files,
+            max_batch_chunks: max_files,
             ..Default::default()
         },
     );
@@ -308,7 +309,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 99] = [
+const EXPECTED_STATUS: [(&str, u16); 100] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -343,6 +344,8 @@ const EXPECTED_STATUS: [(&str, u16); 99] = [
     ("42P06", 409),
     ("3F000", 404),
     ("42939", 400),
+    // `InvalidSchemaDefinition`（`42P15`。TABLE-27・Issue #3286）: 要素つき `CREATE SCHEMA` の別 SCHEMA 修飾。400。
+    ("42P15", 400),
     // `GeneratedAlways`（TABLE-24・Issue #1695）。
     ("428C9", 400),
     // `WithCheckOptionViolation`（`44000`。TABLE-43 (2)、Issue #1673）: ビューの CHECK OPTION 違反。400。
@@ -556,7 +559,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 103);
+const _: () = assert!(ErrorClass::ALL.len() == 104);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。

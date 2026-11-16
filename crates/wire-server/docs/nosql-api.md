@@ -674,9 +674,10 @@ OFFSET ...` と同じ対象名解決・実行器を共有。第 2 の実行器�
   （台帳照合。TASK-101・RECOVER-10 の再送判定を透過する）
 - 同一テナント内の `id` 重複は `23505`（`code`=`UNIQUE_VIOLATION`。他テナントの同 `id` とは衝突せず、
   応答は「不在時」と同一——TABLE-12・RLS-9）
-- `rows` の行数上限は既定 64（`EngineCore::execute_bound_insert_in_session` が
-  `rows.len()` を INDEX-4 の件数上限相当として判定。起動時 CLI
-  `--batch-max-files`〔優先〕または環境変数 `FANDHE_DB_BATCH_MAX_FILES` で上書き可能）。超過は `54000`
+- `rows` の行数に既定の上限は無い（Issue #3308。INDEX-4 ①〔`--batch-max-files`・`FANDHE_DB_BATCH_MAX_FILES`〕は
+  行の形には掛からない）。起動時 CLI `--max-insert-rows` を指定した場合だけ、その値を超える行数を
+  `54000` で拒否する。INDEX-4 ④（1 行 = 1 チャンクとして `rows.len()` を `max_batch_chunks`〔既定 4096〕と
+  比較。束縛前に判定）が実効上限になり、超過は `54000`
 - 行・バッチ単位のバイト上限（INDEX-4 ②③。`batch_limits::validate_batch_shape`）:
   各行のバイト量を `Σ TEXT 列.len() + VECTOR 列.len() × 4`（`Null` は 0）として
   積算し、1 行あたり `chunking::MAX_INPUT_BYTES`（固定）、またはバッチ合計
@@ -1627,6 +1628,7 @@ Date: <IMF-fixdate>
 | `42P02` | `UNDEFINED_PARAMETER` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で COPY 文に `$n` を置いた。NoSQL の `op` 語彙からは到達しない。Issue #1759 |
 | `42P10` | `INVALID_COLUMN_REFERENCE` | 400 | Bad Request | `upsert` の `on_conflict.columns` が主キー・UNIQUE 制約のどれとも一致しない（`ON CONFLICT` 衝突対象の束縛は SQL 表層と共通。`insert` は `on_conflict` を持たない） |
 | `42P13` | `INVALID_FUNCTION_DEFINITION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION ... RETURNS` の型検査は SQL 表層専用。後述） |
+| `42P15` | `INVALID_SCHEMA_DEFINITION` | 400 | Bad Request | 要素つき `CREATE SCHEMA` の要素が、作成中の SCHEMA とは別の SCHEMA で修飾された名前を作ろうとした（TABLE-27・Issue #3286。NoSQL 表層からは到達しない） |
 | `42P16` | `INVALID_TABLE_DEFINITION` | 400 | Bad Request | `create_table.constraints` に `primary_key` を 2 個以上指定した場合（名前付きを含む。TABLE-22 (d)、Issue #1412・#1437。`ALTER TABLE ... ADD PRIMARY KEY` の重複宣言は SQL 表層専用。後述） |
 | `42P17` | `INVALID_OBJECT_DEFINITION` | 400 | Bad Request | 式索引の式が IMMUTABLE 相当でない（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |
 | `42P18` | `INDETERMINATE_DATATYPE` | 400 | Bad Request | 拡張クエリプロトコル（SQL 表層）の Parse で `$n` の型を決められない。NoSQL の `op` 語彙からは到達しない。Issue #1546 |

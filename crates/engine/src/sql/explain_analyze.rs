@@ -75,6 +75,13 @@ impl ExplainAnalyzeDml {
             ExplainAnalyzeDmlTarget::Dml(ExplainDml::Update(v)) => {
                 v.operation_id().map(|id| id.as_str())
             }
+            // 結合形（Issue #3293）。ANALYZE は台帳に記録される実行なので内側の値を使う。
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::UpdateFrom(v)) => {
+                v.operation_id().map(|id| id.as_str())
+            }
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::DeleteUsing(v)) => {
+                v.operation_id().map(|id| id.as_str())
+            }
             ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
                 ExplainInsertTarget::Values(v) => v.operation_id.as_ref().map(|id| id.as_str()),
                 ExplainInsertTarget::Select { insert, .. } => {

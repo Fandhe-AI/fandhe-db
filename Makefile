@@ -296,6 +296,11 @@ bench-rls-timing: ## 衝突有無で応答時間分布を比較するベンチ�
 bench-aggregate-loop: ## 集計の行ループ（COUNT/SUM/AVG/MIN/MAX・COUNT(*)・COUNT(DISTINCT)）の p95 計測（Issue #1490）
 	cargo bench --bench aggregate_loop_bench -p fandhe-db-engine
 
+# Issue #3310 の大量 COPY FROM の ③（バッチ合計バイト）・④（チャンク数）の計測ベンチを実行する（d=128/768/1536 の text 形式で、どちらの上限が先に効くか・③ 直下の COPY の所要時間・ピークメモリ〔Linux の VmHWM〕を標準出力へ出す。既定値は変えない情報提供専用。時間依存の手動実行専用のため ci には含めない）
+.PHONY: bench-copy-volume
+bench-copy-volume: ## 大量 COPY FROM の ③・④ 計測ベンチ（Issue #3310）
+	cargo bench --bench copy_volume_bench -p fandhe-db-engine
+
 # Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）＋ Issue #547（行数・可視率 opt-in）＋ Issue #660（SQL 表層固定コスト B1-B4 の S0〜S8 内訳再分解）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告、BENCH_HYBRID_PROFILE_ROWS=<1-100000>（既定 25000）で行数、BENCH_HYBRID_PROFILE_VISIBLE_RATIO=1/<1-1000>（既定 1/1）で可視率を指定できる（Issue #547）
 .PHONY: bench-hybrid-profile
 bench-hybrid-profile: ## hybrid_rrf クエリの段別内訳プロファイル（Issue #356 ほか）

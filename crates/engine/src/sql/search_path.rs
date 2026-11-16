@@ -24,8 +24,10 @@
 //!   `public` なら裸のまま。[`creation_target`]・[`resolve_statement_refs`]）。作成先の SCHEMA は USAGE が無ければ
 //!   飛ばさず `42501`。拡張クエリ（Parse・Bind・Describe）も Parse で同じ規則で解決し、Bind・Describe の時点の
 //!   path・カタログで再解決する（Issue #3197。`core::EngineCore::refresh_prepared_in_txn`）。`ALTER TABLE t SET SCHEMA ..` の未修飾の対象も同じ書き換えで修飾形と同じ経路に乗る（#3198・#3199）。
-//!   SCHEMA 配置が未対応の作成（`CREATE TYPE`）は、path 先頭が SCHEMA なら `public` へ黙って作らず
-//!   `0A000`。MATERIALIZED VIEW は Issue #3287 で表・ビューと同じ解決に乗る。
+//!   ENUM 型（`CREATE TYPE`・`DROP TYPE`）も同じ規則に乗る（Issue #3288）。未修飾の `CREATE TYPE` は path 先頭の
+//!   SCHEMA へ作り、未修飾の `DROP TYPE` は型の名前空間（[`NameKind::Type`]。表・ビューとは別）で path を引く
+//!   （共有 `public` の同名の型を取り違えて落とさない）。MATERIALIZED VIEW も表・ビューと同じ解決に乗る
+//!   （Issue #3287）。SCHEMA 配置が未対応の作成は、path 先頭が SCHEMA なら `public` へ黙って作らず `0A000`。
 //! - 一時表以外の未修飾名が解決できず、実効 path に `public` が含まれなければ `42P01`、作成先が
 //!   組み込み SCHEMA・`pg_temp` になる文は `0A000`、どの要素にも作れなければ `3F000`。
 //! - 自テナントの SCHEMA が path に無い既定のセッション（username 無し）はカタログを引かない。wire の
@@ -255,6 +257,8 @@ struct GateRef {
     name: String,
     /// `DROP INDEX`／`ALTER INDEX` の対象名か（一時表の索引は一時 DB の索引カタログで照会する）。
     is_index: bool,
+    /// `DROP TYPE`／`ALTER TYPE` の対象名か（ENUM 型は表・ビューと別の名前空間で、一時版も無い。Issue #3288）。
+    is_type: bool,
 }
 
 /// 添字 `idx` の識別子が、表名ではなく構文語として置かれているか。名前の一致だけでは判定せず、
@@ -317,6 +321,10 @@ fn is_syntax_keyword_here(tokens: &[Token], idx: usize) -> bool {
 /// 列名・別名・構文語・表関数名・CTE 名は含めない。`SKIP LOCKED` の空結果前の RLS 判定
 /// （`core::row_lock_exec`・RLS-13）が、実参照表だけへ `policies_apply` を掛けるために使う。
 pub(crate) fn resolved_relation_names(tokens: &[Token]) -> Vec<String> {
+    // 要素つき `CREATE SCHEMA` は文全体を 1 つの `CREATE TABLE` として走査しない（Issue #3286）。
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Vec::new();
+    }
     let walk = crate::sql::relation_name::relation_positions(tokens);
     let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
     let mut out: Vec<String> = Vec::new();
@@ -376,6 +384,12 @@ pub(crate) fn resolved_relation_ref_names(tokens: &[Token]) -> Vec<String> {
 /// [`unqualified_relation_refs`] と [`resolved_relation_ref_names`] の共通本体。`keep_internal_keys` が
 /// 真なら名前解決済みの内部キーを除外しない。
 fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> Vec<GateRef> {
+    // 要素つき `CREATE SCHEMA` の要素は `core::schema_elements` が要素ごとに名前を解決する。文全体を 1 つの
+    // `CREATE TABLE` として走査すると要素の参照・作成名を誤った位置で数えるため、ここでは何も返さない
+    // （Issue #3286。設計記録 D8）。
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Vec::new();
+    }
     let walk = crate::sql::relation_name::relation_positions(tokens);
     let ctes = crate::sql::relation_name::collect_cte_scopes(tokens);
     // `DROP`／`ALTER`／`REFRESH` のオブジェクト名は `object_ddl_names` が（索引かどうかの区別つきで）
@@ -429,6 +443,7 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
             index: pos.index,
             name: name.to_string(),
             is_index: false,
+            is_type: false,
         });
     }
     // `DROP`／`ALTER`／`REFRESH` の対象名にも位置走査と同じ除外を掛ける。Bind・Describe は書き換え後の
@@ -441,6 +456,42 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
             .map(|(_, r)| r),
     );
     out
+}
+
+/// 列型の位置（`CREATE TABLE`・`ADD COLUMN`・`ALTER COLUMN .. TYPE`）にある、未修飾の ENUM 型名候補
+/// （トークン添字と名前。Issue #3289）。位置判定は `sql::type_name_position` が担う（関係位置には足さない）。
+/// 組み込み型名（`sql::ddl_column_type` の型名解決表の語）・解決済みの内部キー（`#` 始まり）・`skip`
+/// （`public.` 修飾を外した位置）・要素つき `CREATE SCHEMA` は除く。キャストの位置は対象外（カタログを引かない
+/// 従来の契約のまま）。型に一時版は無いので一時表と同名でも除外しない。
+fn column_type_refs(tokens: &[Token], skip: &[usize]) -> Vec<(usize, String)> {
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Vec::new();
+    }
+    crate::sql::type_name_position::type_name_positions(tokens)
+        .into_iter()
+        .filter(|p| p.column_type && !skip.contains(&p.index))
+        .filter_map(|p| {
+            let name = tokens
+                .get(p.index)
+                .and_then(crate::sql::relation_name::unqualified_ident_name)?;
+            if name.starts_with('#') || crate::sql::ddl_column_type::is_type_name_head(name) {
+                return None;
+            }
+            Some((p.index, name.to_string()))
+        })
+        .collect()
+}
+
+/// 要素つき `CREATE SCHEMA` の要素 1 件（`CREATE TABLE`／`VIEW`／`SEQUENCE`）に現れる、未修飾の関係参照
+/// （トークン添字と名前。作成名・構文語・CTE 名・解決済みの内部キーを除く）。`core::schema_elements` が、
+/// 同じ文で先に作られる名前を新しい SCHEMA へ解決するために使う（位置判定は `search_path` の参照ゲートと共有。
+/// 第 2 の走査器は作らない。Issue #3286）。`skip` は既に解決済みの位置。
+pub(crate) fn element_relation_refs(tokens: &[Token], skip: &[usize]) -> Vec<(usize, String)> {
+    relation_refs(tokens, skip, false)
+        .into_iter()
+        .filter(|r| !r.is_index)
+        .map(|r| (r.index, r.name))
+        .collect()
 }
 
 /// `DROP`／`ALTER`／`REFRESH` の `[MATERIALIZED] VIEW`・`SEQUENCE`・`INDEX`・`TYPE` の対象名。
@@ -463,6 +514,7 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
         return Vec::new();
     }
     let is_index = is(i, "INDEX");
+    let is_type = is(i, "TYPE");
     i += 1;
     if is(i, "CONCURRENTLY") {
         i += 1;
@@ -481,6 +533,7 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
                 index: i,
                 name: name.to_string(),
                 is_index,
+                is_type,
             },
         ));
         if matches!(tokens.get(i + 1), Some(Token::Punct(','))) {
@@ -559,7 +612,10 @@ pub(crate) fn check_unqualified_refs(
     for r in unqualified_relation_refs(tokens, skip) {
         // 索引名は一時表名の集合ではなく一時 DB の索引カタログで照会する（一時表の索引に対する
         // `DROP INDEX` を `42P01` で先に拒否しない）。照会に失敗したら存在しない側（fail-closed）。
-        let temp_hit = if r.is_index {
+        // 型に一時版は無いため、一時表と同名でも型の参照は通さない（Issue #3288）。
+        let temp_hit = if r.is_type {
+            false
+        } else if r.is_index {
             temp_index_exists(session, &r.name)
         } else {
             temp.contains(&r.name)
@@ -568,6 +624,13 @@ pub(crate) fn check_unqualified_refs(
             continue;
         }
         return Err(SqlSurfaceError::undefined_table(r.name));
+    }
+    // 列型の位置の未修飾の型名（Issue #3289）。自テナントの SCHEMA に解決される型は [`resolve_path_refs`] が先に
+    // 内部キーへ置換するため（`#` 始まりは数えない）、ここで残るのは path のどこにも無い名前だけ。`public` が
+    // 隠れている以上 public の型へ黙って落とさず `42704` にする（`DROP TYPE` の `42P01` とは異なる。型の
+    // 作成・削除は relation と同じ判定、列型は PostgreSQL と同じ型未定義の分類）。カタログは引かない。
+    if let Some((_, name)) = column_type_refs(tokens, skip).into_iter().next() {
+        return Err(SqlSurfaceError::UndefinedType { name });
     }
     Ok(())
 }
@@ -589,6 +652,8 @@ pub(crate) enum NameKind {
     Index,
     /// `nextval('q')` 等の文字列引数（SEQUENCE だけ）。
     Sequence,
+    /// ENUM 型（`DROP TYPE` の対象名。表・ビューとは別の名前空間。Issue #3288）。
+    Type,
 }
 
 /// 未修飾名の解決（[`resolve_path_refs`]）が使うカタログ照会。呼び出し元（`core::EngineCore`）が
@@ -706,6 +771,8 @@ fn resolve_path_refs_inner(
     let hides_public = session.search_path_hides_public();
     if !(session.search_path_may_hold_tenant_schema() || hides_public)
         || gate_exempt(session, tokens)
+        // 要素つき `CREATE SCHEMA`（Issue #3286。設計記録 D8）: 要素の解決は実行腕だけが行う。
+        || crate::sql::allowlist::is_create_schema_statement(tokens)
     {
         return Ok(out);
     }
@@ -740,38 +807,59 @@ fn resolve_path_refs_inner(
     if has_schema {
         let temp = session.temp_tables();
         // 同じ名前の再照会を避ける（種別ごと）。
-        let mut seen: Vec<(String, bool, Option<String>)> = Vec::new();
+        let mut seen: Vec<(String, NameKind, Option<String>)> = Vec::new();
         for r in relation_refs(tokens, skip, false) {
-            let temp_hit = if r.is_index {
-                temp_index_exists(session, &r.name)
+            let kind = if r.is_type {
+                NameKind::Type
+            } else if r.is_index {
+                NameKind::Index
             } else {
-                temp.contains(&r.name)
+                NameKind::Relation
+            };
+            // 型に一時版は無い（一時表と同名でも型の名前空間で引く）。
+            let temp_hit = match kind {
+                NameKind::Type => false,
+                NameKind::Index => temp_index_exists(session, &r.name),
+                _ => temp.contains(&r.name),
             };
             if temp_hit {
                 continue;
             }
-            let key = match seen
-                .iter()
-                .find(|(n, idx, _)| *n == r.name && *idx == r.is_index)
-            {
+            let key = match seen.iter().find(|(n, k, _)| *n == r.name && *k == kind) {
                 Some((_, _, key)) => key.clone(),
                 None => {
-                    let kind = if r.is_index {
-                        NameKind::Index
-                    } else {
-                        NameKind::Relation
-                    };
                     let key = match find_in_slots(&slots, &r.name, kind, lookup)? {
                         Placement::InSchema(key) => Some(key),
                         Placement::Public | Placement::Missing => None,
                     };
-                    seen.push((r.name.clone(), r.is_index, key.clone()));
+                    seen.push((r.name.clone(), kind, key.clone()));
                     key
                 }
             };
             if let Some(key) = key {
                 out.rewrites.push((r.index, Token::Ident(key)));
                 out.relation_in_schema = true;
+            }
+        }
+    }
+    // 列型の位置の未修飾の型名（Issue #3289）。path の順に型の名前空間で引き、自テナントの SCHEMA の型に
+    // 当たれば内部キーへ置き換える（`public` の型・不在は書き換えない。不在は実行段が `42704`）。
+    if has_schema {
+        let mut seen_types: Vec<(String, Option<String>)> = Vec::new();
+        for (index, name) in column_type_refs(tokens, skip) {
+            let key = match seen_types.iter().find(|(n, _)| *n == name) {
+                Some((_, key)) => key.clone(),
+                None => {
+                    let key = match find_in_slots(&slots, &name, NameKind::Type, lookup)? {
+                        Placement::InSchema(key) => Some(key),
+                        Placement::Public | Placement::Missing => None,
+                    };
+                    seen_types.push((name.clone(), key.clone()));
+                    key
+                }
+            };
+            if let Some(key) = key {
+                out.rewrites.push((index, Token::Ident(key)));
             }
         }
     }
@@ -863,7 +951,7 @@ struct CreationResolution {
     self_refs: Vec<usize>,
 }
 
-/// 作成系 DDL（`CREATE TABLE`／`VIEW`／`SEQUENCE`・CTAS）の未修飾の作成対象名を、`search_path` の先頭が
+/// 作成系 DDL（`CREATE TABLE`／`VIEW`／`SEQUENCE`／`TYPE`・CTAS）の未修飾の作成対象名を、`search_path` の先頭が
 /// 自テナントの SCHEMA なら内部キー（`#<schema_id>.<name>`）へ置き換える対象として返す（Issue #3196）。
 /// 修飾名 `q1.t` の解決後と同じトークン列になるので、以降の ACL・実行は修飾形と同じ経路に乗る。
 ///
@@ -879,6 +967,36 @@ fn resolve_creation_name(
         || !matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("CREATE"))
     {
         return Ok(None);
+    }
+    // `CREATE TYPE <名> AS ENUM (..)`（Issue #3288）。型名は relation の位置走査に載らないため、3 語目を
+    // 作成名として直接扱う。作成先の判定・書き換えは表・SEQUENCE と同じ（自己参照は無い）。
+    if crate::sql::allowlist::is_create_type_statement(tokens) {
+        let Some(Token::Ident(name)) = tokens.get(2) else {
+            return Ok(None);
+        };
+        if name.starts_with('#') || crate::sql::relation_name::collides_with_syntax_word(name) {
+            return Ok(None);
+        }
+        let target = match creation_target(session, lookup.creation_schema_id) {
+            Ok(t) => t,
+            Err(e) if ["42501", "3F000", "0A000"].contains(&e.wire_code()) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let key = match target {
+            CreateTarget::Public => None,
+            CreateTarget::Schema(schema_id) => Some(
+                RelationKey::InSchema {
+                    schema_id,
+                    name: name.clone(),
+                }
+                .encode(),
+            ),
+        };
+        return Ok(Some(CreationResolution {
+            index: 2,
+            key,
+            self_refs: Vec::new(),
+        }));
     }
     let walk = crate::sql::relation_name::relation_positions(tokens);
     // `IF NOT EXISTS` の `IF` も作成名の位置として数えられるため、構文語の `IF`（直後が `NOT`）は飛ばす。
@@ -1503,7 +1621,8 @@ mod tests {
             vec![GateRef {
                 index: 2,
                 name: "i".to_string(),
-                is_index: true
+                is_index: true,
+                is_type: false,
             }]
         );
         let toks = tokenize("DROP VIEW v").expect("lex");
@@ -1540,6 +1659,152 @@ mod tests {
         )
     }
 
+    /// 型の名前空間でだけ存在する名前（`kind` を見て答える `exists`）で解決する。
+    fn run_stmt_kinded(
+        session: &SessionState,
+        sql: &str,
+        schemas: &[(&'static str, u64)],
+        exists_in: &[(&'static str, NameKind)],
+    ) -> Result<PathResolution, SqlSurfaceError> {
+        let toks = tokenize(sql).expect("lex");
+        let schema_id = |n: &str| Ok(schemas.iter().find(|(s, _)| *s == n).map(|(_, i)| *i));
+        let exists =
+            |k: &str, kind: NameKind| Ok(exists_in.iter().any(|(n, x)| *n == k && *x == kind));
+        resolve_statement_refs(
+            session,
+            &toks,
+            &[],
+            &PathLookup {
+                schema_id: &schema_id,
+                creation_schema_id: &schema_id,
+                exists: &exists,
+            },
+        )
+    }
+
+    /// 未修飾の `DROP TYPE` は型の名前空間で path を引く（Issue #3288）。SCHEMA に同名の表しか無いときは
+    /// 型として解決せず（共有 `public` の型を落とす PostgreSQL と同じ解決）、型が在れば内部キーへ書き換える。
+    #[test]
+    fn drop_type_resolves_in_the_type_namespace_only() {
+        let s = ddl_session_with(&["q1", "public"]);
+        let r = run_stmt_kinded(
+            &s,
+            "DROP TYPE mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Type), ("mood", NameKind::Type)],
+        )
+        .unwrap();
+        assert_eq!(rewritten(&r), vec![(2, "#7.mood".to_string())]);
+        let r = run_stmt_kinded(
+            &s,
+            "DROP TYPE IF EXISTS mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Type)],
+        )
+        .unwrap();
+        assert_eq!(rewritten(&r), vec![(4, "#7.mood".to_string())]);
+        // 同名の表だけが SCHEMA にある: 型としては解決しない。
+        let r = run_stmt_kinded(
+            &s,
+            "DROP TYPE mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Relation), ("mood", NameKind::Type)],
+        )
+        .unwrap();
+        assert!(r.rewrites.is_empty());
+    }
+
+    /// 列型の位置の未修飾の型名は、型の名前空間で path を引き内部キーへ書き換える（Issue #3289）。組み込み型名・
+    /// キャストの位置は引かない。SCHEMA が path に無い既定の path ではカタログを引かない。
+    #[test]
+    fn column_type_names_resolve_in_the_type_namespace() {
+        let s = ddl_session_with(&["q1", "public"]);
+        let both = [("#7.mood", NameKind::Type), ("mood", NameKind::Type)];
+        let r = run_stmt_kinded(
+            &s,
+            "CREATE TABLE t (id BIGINT, m mood, ms mood[])",
+            &[("q1", 7)],
+            &both,
+        )
+        .unwrap();
+        let types: Vec<_> = rewritten(&r)
+            .into_iter()
+            .filter(|(_, k)| k == "#7.mood")
+            .collect();
+        assert_eq!(types.len(), 2, "{r:?}");
+        // 組み込み型名は引かない（SCHEMA に同名の型があっても書き換えない）。
+        let r = run_stmt_kinded(
+            &s,
+            "ALTER TABLE t ADD COLUMN c integer",
+            &[("q1", 7)],
+            &[("#7.integer", NameKind::Type)],
+        )
+        .unwrap();
+        assert!(!rewritten(&r).iter().any(|(_, k)| k == "#7.integer"));
+        // キャストの未修飾の型名は引かない（従来どおりカタログ非参照）。
+        let r = run_stmt_kinded(&s, "SELECT 'a'::mood", &[("q1", 7)], &both).unwrap();
+        assert!(r.rewrites.is_empty());
+        // public が先なら public の型（書き換えない）。
+        let s = ddl_session_with(&["public", "q1"]);
+        let r =
+            run_stmt_kinded(&s, "ALTER TABLE t ADD COLUMN m mood", &[("q1", 7)], &both).unwrap();
+        assert!(!rewritten(&r).iter().any(|(_, k)| k == "#7.mood"));
+        // 型の名前空間以外（表）にしか無い名前は型として解決しない。
+        let s = ddl_session_with(&["q1", "public"]);
+        let r = run_stmt_kinded(
+            &s,
+            "ALTER TABLE t ADD COLUMN m mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Relation)],
+        )
+        .unwrap();
+        assert!(!rewritten(&r).iter().any(|(_, k)| k == "#7.mood"));
+    }
+
+    /// `public` が隠れた path のゲートは、列型の位置の解決されない未修飾の型名を `42704` にする。DDL 権限の無い
+    /// セッションは飛ばす（`42501` を維持）。構文語・組み込み型名・解決済みの内部キーは数えない。
+    #[test]
+    fn gate_reports_unresolved_column_type_as_undefined_type() {
+        let toks = |sql: &str| tokenize(sql).expect("lex");
+        let hidden = ddl_session_with(&["q1"]);
+        let e =
+            check_unqualified_refs(&hidden, &toks("CREATE TABLE q1.t (id BIGINT, m mood)"), &[])
+                .expect_err("hidden public");
+        assert_eq!(e.wire_code(), "42704");
+        assert!(check_unqualified_refs(
+            &hidden,
+            &toks("CREATE TABLE q1.t (id BIGINT, m INTEGER, n TEXT[])"),
+            &[]
+        )
+        .is_ok());
+        // 解決済みの内部キーと `public.` を外した位置（skip）は数えない。
+        let mut t = toks("CREATE TABLE q1.t (id BIGINT, m mood)");
+        let idx = t
+            .iter()
+            .position(|x| matches!(x, Token::Ident(n) if n == "mood"))
+            .expect("mood");
+        t[idx] = Token::Ident("#7.mood".to_string());
+        assert!(check_unqualified_refs(&hidden, &t, &[]).is_ok());
+        let t = toks("CREATE TABLE q1.t (id BIGINT, m mood)");
+        assert!(check_unqualified_refs(&hidden, &t, &[idx]).is_ok());
+        // DDL 権限の無いセッションは存在判定より先に `42501` を返すため、ゲートは飛ばす。
+        let denied = session_with(&["q1"]);
+        assert!(check_unqualified_refs(
+            &denied,
+            &toks("CREATE TABLE q1.t (id BIGINT, m mood)"),
+            &[]
+        )
+        .is_ok());
+        // 既定の path（public が見える）は何もしない。
+        let visible = ddl_session_with(&["q1", "public"]);
+        assert!(check_unqualified_refs(
+            &visible,
+            &toks("CREATE TABLE q1.t (id BIGINT, m mood)"),
+            &[]
+        )
+        .is_ok());
+    }
+
     fn ddl_session_with(path: &[&str]) -> SessionState {
         let mut s = session_with(path);
         s.allow_ddl();
@@ -1554,6 +1819,7 @@ mod tests {
             ("CREATE TABLE t (id BIGINT PRIMARY KEY)", 2),
             ("CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY)", 5),
             ("CREATE SEQUENCE t", 2),
+            ("CREATE TYPE t AS ENUM ('a')", 2),
             ("CREATE VIEW t AS SELECT 1", 2),
             ("CREATE MATERIALIZED VIEW t AS SELECT 1", 3),
             ("CREATE MATERIALIZED VIEW IF NOT EXISTS t AS SELECT 1", 6),
@@ -1572,13 +1838,13 @@ mod tests {
     }
 
     /// 解決しない形: 一時表・修飾名・作成先のエラー（実行腕が同じエラーを再現する）。
+    // intentional: docs/design/schema-tenant-namespace.md
     #[test]
     fn creation_name_is_left_alone_for_unsupported_forms() {
         let s = ddl_session_with(&["q1", "public"]);
         for sql in [
             "CREATE TEMP TABLE t (id BIGINT)",
             "CREATE TABLE q1.t (id BIGINT)",
-            "CREATE TYPE t AS ENUM ('a')",
         ] {
             let r = run_stmt(&s, sql, &[("q1", 7)], &[], &[]).unwrap();
             assert!(r.rewrites.is_empty(), "{sql}");

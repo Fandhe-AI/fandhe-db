@@ -318,7 +318,7 @@ fn wire_simple_query_matview_in_tenant_schema_with_trailing_semicolon() {
             &mut alice,
             "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t;"
         ),
-        "CREATE MATERIALIZED VIEW"
+        "SELECT 1"
     );
     send_simple_query(&mut alice, "SELECT id FROM s.mv;");
     let _ = read_message(&mut alice); // RowDescription

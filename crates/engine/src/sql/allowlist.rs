@@ -36,6 +36,11 @@ use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::{expr_node_count, negate_conjunction};
 
 mod grouped_window;
+// 要素つき `CREATE SCHEMA` の要素分割・構文検証（TABLE-27・Issue #3286）。
+mod schema_elements;
+pub(crate) use schema_elements::{
+    create_name_index as schema_element_create_name_index, SchemaElement, SchemaElementKind,
+};
 // `DO` ブロックの構文検証（SQL-68・Issue #2228）。
 mod do_block;
 pub use do_block::ValidatedDo;
@@ -1195,6 +1200,10 @@ pub enum SqlSurfaceError {
     NoSchemaSelected,
     /// 予約名（`pg_` 接頭辞）の SCHEMA 名の指定（TABLE-27・ERR-6、Issue #1713）。`42939`。
     ReservedName { name: String },
+    /// 要素つき `CREATE SCHEMA`（`CREATE SCHEMA s CREATE TABLE x.t ...`）の要素が、作成中の SCHEMA とは別の
+    /// SCHEMA で修飾された名前を作ろうとした（TABLE-27・Issue #3286）。`42P15`。`schema` は利用者が書いた
+    /// 修飾名、`created` は作成中の SCHEMA 名（どちらも利用者自身が書いた識別子のみ）。
+    InvalidSchemaDefinition { schema: String, created: String },
     /// `CREATE ROLE`／`CREATE USER` の名前が同一テナント内の既存ロールと衝突した（SQL-39・ERR-6、
     /// Issue #1962）。`42710`。名前は利用者自身が書いた識別子だけで、内部 ID・他テナントの情報を含めない。
     DuplicateRole { name: String },
@@ -1524,6 +1533,10 @@ impl SqlSurfaceError {
             Self::DuplicateTable { name } => Self::DuplicateTable { name: f(&name) },
             Self::DuplicateSchema { name } => Self::DuplicateSchema { name: f(&name) },
             Self::InvalidSchemaName { name } => Self::InvalidSchemaName { name: f(&name) },
+            Self::InvalidSchemaDefinition { schema, created } => Self::InvalidSchemaDefinition {
+                schema: f(&schema),
+                created: f(&created),
+            },
             Self::DuplicateObject { name } => Self::DuplicateObject { name: f(&name) },
             Self::DuplicateRole { name } => Self::DuplicateRole { name: f(&name) },
             Self::UndefinedRole { name } => Self::UndefinedRole { name: f(&name) },
@@ -1551,6 +1564,10 @@ impl SqlSurfaceError {
             Self::AmbiguousColumn { name } => Self::AmbiguousColumn { name: f(&name) },
             Self::InvalidForeignKey { detail } => Self::InvalidForeignKey { detail: f(&detail) },
             Self::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail: f(&detail) },
+            // ENUM 列のラベル違反の文言は型名を含む。SCHEMA 配下の型の内部キーを公開名へ戻す（Issue #3289）。
+            Self::InvalidTextRepresentation { detail } => {
+                Self::InvalidTextRepresentation { detail: f(&detail) }
+            }
             Self::UndefinedFunction { detail } => Self::UndefinedFunction { detail: f(&detail) },
             Self::DuplicateFunction { detail } => Self::DuplicateFunction { detail: f(&detail) },
             Self::InvalidFunctionDefinition { detail } => {
@@ -2114,6 +2131,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::ReservedName { .. } | SqlSurfaceError::ReservedRoleName { .. } => {
                 ErrorClass::ReservedName
             }
+            SqlSurfaceError::InvalidSchemaDefinition { .. } => ErrorClass::InvalidSchemaDefinition,
             SqlSurfaceError::DuplicateRole { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::UndefinedRole { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::RoleHasDependents { .. } => ErrorClass::DependentObjectsStillExist,
@@ -2373,6 +2391,13 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::NoSchemaSelected => {
                 f.write_str("no schema has been selected to create in")
+            }
+            // 名前は利用者自身が書いた識別子のみ（内部 ID・他テナントの情報は含めない。Issue #3286）。
+            SqlSurfaceError::InvalidSchemaDefinition { schema, created } => {
+                write!(
+                    f,
+                    "CREATE specifies a schema ({schema}) different from the one being created ({created})"
+                )
             }
             SqlSurfaceError::ReservedName { name } => {
                 write!(f, "unacceptable schema name: {name}")
@@ -3077,9 +3102,11 @@ pub enum WherePredicate {
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
     /// 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)`（SQL-9・Issue #3255。親 #3254）。構文段だけが
     /// 生成する。不変条件は `lhs.len() == rhs.len()` かつ 2 以上 [`MAX_ROW_COMPARE_COMPONENTS`] 以下
-    /// （成分 1 個の括弧は従来どおり式として扱い本 variant にしない）。評価（辞書式・三値論理）は
-    /// #3256 の担当で、それまでは束縛段（`sql::parser::bind_where_predicates_recursive`）の暫定
-    /// ゲートが `0A000` で止める（fail-closed）。否定は `where_negation` が演算子反転で押し下げる。
+    /// （成分 1 個の括弧は従来どおり式として扱い本 variant にしない）。評価（辞書式・三値論理。
+    /// Issue #3256）は束縛段（`sql::parser::bind_where_predicates_recursive`）の入口で
+    /// `sql::row_compare` が既存の述語木へ展開する。ポリシー式など未対応の文脈は
+    /// fail-closed で拒否する。否定は `where_negation` が演算子反転で押し下げる。
+    /// 行値の `[NOT] IN`（Issue #3299）も本 variant の `Eq` の `Or`／`Ne` の連言へ構文段で脱糖する。
     ///
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
@@ -3701,6 +3728,10 @@ impl ValidatedMaterializedViewRead {
     }
 }
 
+/// [`Parser::case_expr_starts_at`] の前方走査の上限トークン数（Issue #3279）。`case` を
+/// 列名として多数並べた入力でも、各位置の走査が定数で打ち切られ全体が 2 乗時間にならない。
+const CASE_START_SCAN_LIMIT: usize = 1024;
+
 /// `FROM` なし定数式 SELECT の項目数上限（SQL-43）。1 文あたりの束縛・評価コストを
 /// 有界にするための DoS 対策で、`MAX_EXPR_NODES` と同程度の桁に揃えた。アロケーション
 /// より前に検査する。
@@ -4222,6 +4253,42 @@ pub enum DmlFromSetValue {
     Value(SetValue, Vec<String>),
     /// 列参照 1 個（`SET a = t.b` / `SET a = b`）。
     Column(ColumnRef),
+    /// 列参照を 1 個以上含む式（`SET a = u.x + 1`・`SET (a, b) = (u.x + 1, ...)` の要素。Issue #3296）。
+    /// `expr` の列参照は出現順に予約接頭辞つきのプレースホルダ識別子へ置き換え済みで、`refs[k]` が
+    /// プレースホルダ `k` の元の参照（修飾の有無とも保持）。解決は束縛段（`sql::dml_from`）が
+    /// 対象表と FROM 側を合わせたスコープで行う。名前ベースの書き換えをしないのは、対象表修飾の参照と
+    /// FROM 側の同名列を取り違えないため。
+    ///
+    /// **BREAKING CHANGE**（Issue #3296）: variant 追加。網羅 `match` する呼び出し元は腕の追加が必要。
+    Expr {
+        /// プレースホルダ入りの式。
+        expr: Expr,
+        /// プレースホルダ `k` に対応する元の列参照。
+        refs: Vec<ColumnRef>,
+    },
+}
+
+/// `UPDATE ... FROM`／`DELETE ... USING` の FROM／USING 側 1 relation の解決結果（Issue #3292）。
+/// 構文段（[`resolve_dml_from_relations`]）がカタログから決め、束縛・変換・実行（`core::dml_from_exec`）が
+/// 読み取り源の選択に使う。ビュー・実表以外の形は構文段で `0A000` に倒れるためここには現れない。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DmlFromSource {
+    /// 実表（永続）。
+    Table,
+    /// 単純形ビュー（列別名なし）。読み取りは基底表をセッションの `PolicyContext` で走査し、
+    /// ビュー定義の述語を source 側述語の先頭へ畳み込む。
+    View(DmlFromViewSource),
+}
+
+/// [`DmlFromSource::View`] の中身（`sql::view::Resolved::View` のうち本機能が使う部分）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DmlFromViewSource {
+    /// 連鎖を辿った先の実表名。
+    pub(crate) base_table: String,
+    /// ビュー定義由来の述語（基底表の物理列名で書かれている。内側のビューが先頭）。
+    pub(crate) view_predicates: Vec<WherePredicate>,
+    /// ビューが公開する列（`None` は全列〔疑似列 `id` を含む〕）。公開しない基底列は束縛に参加させない。
+    pub(crate) view_columns: Option<Vec<String>>,
 }
 
 /// 許可形状の構造判定を通過した `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`
@@ -4236,8 +4303,13 @@ pub enum DmlFromSetValue {
 pub struct ValidatedUpdateFrom {
     /// 更新対象の表参照（別名を含む）。
     pub(crate) target: TableRef,
-    /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個）。
+    /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個。JOIN で加わる表を含む平坦な並び）。
     pub(crate) from: Vec<TableRef>,
+    /// FROM 句の結合段（Issue #3294。長さは `from.len() - 1`。k 番目の段が `from[k + 1]` を加える。
+    /// カンマ区切りは [`JoinCondition::Cross`]、`ON` つきは [`JoinCondition::On`]）。
+    pub(crate) from_steps: Vec<JoinStep>,
+    /// `from` と同じ並びの解決結果（実表・単純形ビュー。Issue #3292）。パーサは空で作り、検証入口が埋める。
+    pub(crate) sources: Vec<DmlFromSource>,
     /// SET 句の (列名, 右辺)。宣言順を保持する。
     pub(crate) assignments: Vec<(String, DmlFromSetValue)>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
@@ -4275,8 +4347,12 @@ impl ValidatedUpdateFrom {
 pub struct ValidatedDeleteUsing {
     /// 削除対象の表参照（別名を含む）。
     pub(crate) target: TableRef,
-    /// USING 句の表参照（宣言順）。
+    /// USING 句の表参照（宣言順。JOIN で加わる表を含む平坦な並び）。
     pub(crate) using: Vec<TableRef>,
+    /// USING 句の結合段（Issue #3294。[`ValidatedUpdateFrom::from_steps`] と同じ契約）。
+    pub(crate) using_steps: Vec<JoinStep>,
+    /// `using` と同じ並びの解決結果（[`ValidatedUpdateFrom::sources`] と同じ）。
+    pub(crate) sources: Vec<DmlFromSource>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
     /// `RETURNING` 句（Issue #3204）。省略は `None`。
@@ -5016,7 +5092,7 @@ pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
 
 /// 式 `expr` の直下の子式を `out` へ積む（[`returning_item_rejection`] の明示スタック走査用。
 /// `sql::parser::collect_expr_idents` と同じ変種の網羅）。
-fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+pub(crate) fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     match expr {
         Expr::Number(_)
         | Expr::String(_)
@@ -5045,7 +5121,14 @@ fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             out.extend(expr.array_expr_children().into_iter().flatten());
         }
         Expr::SqlJsonQuery(q) => out.extend(q.children()),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                out.push(op);
+            }
             for (cond, result) in whens {
                 out.push(cond);
                 out.push(result);
@@ -7132,6 +7215,10 @@ struct Parser<'a> {
     /// 非修飾の `Expr::Ident` へ正規化するが、曖昧性検査（`42702`）は非修飾で書かれた名前にだけ
     /// 適用する必要があり、その区別をここで運ぶ。
     dml_from_unqualified: Vec<String>,
+    /// `UPDATE ... FROM` の SET 右辺の式を解析している間だけ `Some`（Issue #3296）。式中の列参照を
+    /// 修飾の有無にかかわらず出現順に積み、式には予約接頭辞つきのプレースホルダ識別子
+    /// （[`crate::sql::dml_from::SET_REF_PREFIX`]）を置く。`RETURNING` 側は `None` のまま従来の挙動。
+    dml_from_set_refs: Option<Vec<ColumnRef>>,
     /// `Parser::new` が `Token::QuotedNull` 等を降格した複製を持つ間だけ、元のトークン列への 1 対 1 の
     /// 別名を `colref_sink` へ登録しておくガード（記録区間が無ければ何もしない）。
     _colref_alias: super::colref_sink::AliasGuard,
@@ -7231,6 +7318,7 @@ impl<'a> Parser<'a> {
             upsert_table: None,
             dml_from_target: None,
             dml_from_unqualified: Vec::new(),
+            dml_from_set_refs: None,
             legacy_implicit_id: false,
         }
     }
@@ -7528,6 +7616,114 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// `pos` の識別子が `CASE` 式（検索形・単純形）の開始かを、消費せずに判定する
+    /// （対象ビヘイビア: SQL-26。Issue #3279）。投影・集計項目・一次式・ORDER BY キーの
+    /// 4 箇所が共有する単一情報源。
+    ///
+    /// - 引用なしの `CASE` の直後が `WHEN` なら検索形（従来と同じ）。
+    /// - そうでなければ前方へ走査し、括弧・入れ子の `CASE ... END` の外（深さ 0）で `WHEN` に
+    ///   当たれば単純形（`CASE x WHEN v ...`）。深さ 0 で `,` `)` `]` `;`・キーワード・
+    ///   `THEN`/`ELSE`/`END`/`AS`/`AND`/`OR` に当たれば列名 `case` の参照（後方互換）。
+    ///
+    /// 走査長は [`CASE_START_SCAN_LIMIT`] で打ち切る（超えたら偽。後続の構文解析で `42601`
+    /// に落ちる fail-closed）。`case + case + ...` のような入力で 2 乗時間にならないための上限。
+    fn case_expr_starts_at(&self, pos: usize) -> bool {
+        let Some(Token::Ident(name)) = self.tokens.get(pos) else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("CASE") {
+            return false;
+        }
+        let word_at = |i: usize, w: &str| {
+            matches!(self.tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w)
+                && !self.quoted_null.contains(&i))
+        };
+        let first = pos.saturating_add(1);
+        if matches!(self.tokens.get(first), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("WHEN"))
+        {
+            return true;
+        }
+        if self.quoted_null.contains(&pos) {
+            return false;
+        }
+        // 直後が被演算子の開始（識別子・数値・文字列・`(`）でなければ列名 `case` の参照
+        // （`THEN case + 1 WHEN ...` の `case` を、外側の `WHEN` まで先読みして単純形と
+        // 取り違えない。検索形 CASE 内の列名 `case` の後方互換。`-x` 等の符号付き被演算子は
+        // 従来 `42601` で、列参照側へ倒す fail-closed）。中置の語（`AND`・`IS` 等）も同様。
+        let operand_start = match self.tokens.get(first) {
+            Some(Token::Number(_) | Token::StringLiteral(_) | Token::Punct('(')) => true,
+            Some(Token::Ident(_)) => ![
+                "AND", "OR", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "THEN", "ELSE", "END", "AS",
+            ]
+            .iter()
+            .any(|w| word_at(first, w)),
+            _ => false,
+        };
+        if !operand_start {
+            return false;
+        }
+        // 括弧の深さと入れ子の `CASE ... END` の深さは別カウンタで数える（列名 `case`・`end` が
+        // 括弧内に現れても、入れ子の CASE と取り違えて括弧の対応を崩さないため）。
+        let mut parens: usize = 0;
+        let mut cases: usize = 0;
+        let mut i = first;
+        let end = first.saturating_add(CASE_START_SCAN_LIMIT);
+        while i < end {
+            let Some(tok) = self.tokens.get(i) else {
+                return false;
+            };
+            let top = parens == 0 && cases == 0;
+            match tok {
+                Token::Punct('(' | '[') => parens = parens.saturating_add(1),
+                Token::Punct(')' | ']') => {
+                    if parens == 0 {
+                        return false;
+                    }
+                    parens -= 1;
+                }
+                Token::Punct(',' | ';') if top => return false,
+                Token::Keyword(_) if top => return false,
+                Token::Ident(_) => {
+                    if word_at(i, "CASE") {
+                        // 直後が WHEN か被演算子の開始なら入れ子の CASE、`)` `,` や演算子なら列名 `case`。
+                        let nested = word_at(i.saturating_add(1), "WHEN")
+                            || matches!(
+                                self.tokens.get(i.saturating_add(1)),
+                                Some(
+                                    Token::Ident(_)
+                                        | Token::Number(_)
+                                        | Token::StringLiteral(_)
+                                        | Token::Punct('(')
+                                )
+                            );
+                        if nested {
+                            cases = cases.saturating_add(1);
+                        }
+                    } else if word_at(i, "END") {
+                        if cases > 0 {
+                            cases -= 1;
+                        } else if parens == 0 {
+                            return false;
+                        }
+                    } else if top {
+                        if word_at(i, "WHEN") {
+                            return true;
+                        }
+                        if ["THEN", "ELSE", "AS", "AND", "OR"]
+                            .iter()
+                            .any(|w| word_at(i, w))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i = i.saturating_add(1);
+        }
+        false
+    }
+
     /// `offset` 個先のトークンが区切り文字 `c` かを消費せずに判定する
     /// （`JOIN ... USING (` の 2 トークン組の判定。Issue #1826）。
     fn peek_punct_at(&self, offset: usize, c: char) -> bool {
@@ -7758,9 +7954,11 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(name)) => {
                 // `WHEN` を伴わない `CASE` は既存の列名 `case` でありうるため 1 トークン
                 // 先読みする。`NULL` は列名との曖昧性を解消できないので式トリガーにしない。
-                let starts_case =
-                    name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
-                let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+                let starts_case = self.case_expr_starts_at(self.pos);
+                // `CASE (x) WHEN ...`（単純形）は `starts_case` が先に真になるため呼び出しと
+                // 取り違えない。後ろに `WHEN` が無い `case(x)` は従来どおり関数呼び出し。
+                let starts_call = !starts_case
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
                 // TABLE-35・Issue #1602: 識別子の直後の `[`（添字・スライス）と、引用なしの
                 // `ARRAY[...]`／`ARRAY(...)`（配列コンストラクタ）も式項目の開始。
@@ -7842,10 +8040,12 @@ impl<'a> Parser<'a> {
                 self.parse_projection_infix(0)?
             }
             // Issue #1593: `'1'::int` のように文字列リテラルへ `::` が続く形だけ式項目として扱う。
+            // Issue #3276（SQL-42）: `'x' || col` の文字列連結も式項目として扱う（束縛段が
+            // text 連結か jsonb 連結かを振り分ける。構文木は従来どおり `JsonAccess { Concat }`）。
             Some(Token::StringLiteral(_))
                 if matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::TypeCast | Token::BitDistanceOp(_))
+                    Some(Token::TypeCast | Token::BitDistanceOp(_) | Token::Concat)
                 ) =>
             {
                 self.parse_projection_infix(0)?
@@ -8965,18 +9165,21 @@ impl<'a> Parser<'a> {
     /// 現在位置が、集計 SELECT リストで式項目として読み始めてよい形かを返す（Issue #1811・
     /// SQL-42 ポインタ）。トリガー集合は通常投影の [`Self::parse_select_item`] に合わせる
     /// （数値・`(`〔スカラーサブクエリを除く〕・`-`・`CASE WHEN`・`ARRAY[`/`ARRAY(`・括弧なし値関数・
-    /// `ident (`・識別子の直後の演算子・文字列リテラルの直後の `::`）。集計呼び出しを含むかは
+    /// `ident (`・識別子の直後の演算子・文字列リテラルの直後の `::`／`||`〔Issue #3277〕）。集計呼び出しを含むかは
     /// 呼び出し側が [`select_range_contains_aggregate_call`] で別に確認する。
     fn aggregate_item_starts_expr(&self) -> bool {
         match self.peek() {
             Some(Token::Number(_)) | Some(Token::Punct('-')) => true,
             Some(Token::Punct('(')) => !self.peek_is_scalar_subquery_start(),
             Some(Token::StringLiteral(_)) => {
-                matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast))
+                matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::TypeCast | Token::Concat)
+                )
             }
             Some(Token::Ident(name)) => {
                 let next = self.tokens.get(self.pos + 1);
-                (name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN"))
+                self.case_expr_starts_at(self.pos)
                     || (name.eq_ignore_ascii_case("ARRAY")
                         && !self.quoted_null.contains(&self.pos)
                         && matches!(next, Some(Token::Punct('[' | '('))))
@@ -10248,6 +10451,10 @@ impl<'a> Parser<'a> {
         if self.row_compare_ahead() {
             return self.parse_row_compare();
         }
+        // 行値の `[NOT] IN`（SQL-9・Issue #3299）。RowCompare の Or／連言へ脱糖する。
+        if let Some((negated, kw_len)) = self.row_in_ahead() {
+            return self.parse_row_in(negated, kw_len);
+        }
         // 左辺が引用なしの裸の `NULL` で直後が `IS [NOT] DISTINCT FROM` なら `NULL` リテラル
         // （SQL-54・Issue #1783。それ以外の位置の `NULL` は従来どおり列参照として読む）。
         let null_lhs = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NULL"))
@@ -10354,12 +10561,23 @@ impl<'a> Parser<'a> {
     /// （`= < > <= >=`・`<>`）のときだけ真。成分 1 個の括弧（`(a) < 3`）は偽で、従来の式経路へ流す。
     /// CHECK 本体では行値を認識しない（従来どおり `42601`）。先読みは `get()` のみで後戻りしない。
     fn row_compare_ahead(&self) -> bool {
-        if self.in_check_body || !matches!(self.peek(), Some(Token::Punct('('))) {
-            return false;
-        }
-        let Some(close) = self.find_matching_close_paren(self.pos) else {
+        let Some(close) = self.row_paren_close() else {
             return false;
         };
+        matches!(
+            close.checked_add(1).and_then(|i| self.tokens.get(i)),
+            Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
+        )
+    }
+
+    /// 現在位置が行値の括弧 `( e1 , e2 ... )`（括弧深さ 1 に `,` を持つ）なら対応する `)` の位置を返す
+    /// （消費しない）。[`Self::row_compare_ahead`] と [`Self::row_in_ahead`] が共用する。
+    /// CHECK 本体では行値を認識しない。走査は `get()` のみで 1 回の線形走査（後戻りしない）。
+    fn row_paren_close(&self) -> Option<usize> {
+        if self.in_check_body || !matches!(self.peek(), Some(Token::Punct('('))) {
+            return None;
+        }
+        let close = self.find_matching_close_paren(self.pos)?;
         let mut depth: u32 = 0;
         // 配列コンストラクタ `ARRAY[1, 2]` 内のカンマを行値の区切りと誤認しないよう角括弧の深さも追跡する
         let mut bracket_depth: u32 = 0;
@@ -10377,11 +10595,92 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        has_top_level_comma
-            && matches!(
-                close.checked_add(1).and_then(|i| self.tokens.get(i)),
-                Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
-            )
+        has_top_level_comma.then_some(close)
+    }
+
+    /// 現在位置が行値の `IN`／`NOT IN` の左辺 `( e1 , e2 ... ) [NOT] IN (`（直後が `SELECT` でない）か
+    /// （消費しない。Issue #3299）。真なら `(negated, キーワード部のトークン数)` を返す。
+    fn row_in_ahead(&self) -> Option<(bool, usize)> {
+        let close = self.row_paren_close()?;
+        match self.expr_lhs_postfix_at(close.checked_add(1)?)? {
+            ExprPostfix::InList { negated, kw_len } => Some((negated, kw_len)),
+            _ => None,
+        }
+    }
+
+    /// 行値の `(l1..ln) [NOT] IN ((r1..rn), ...)`（SQL-9・Issue #3299）。要素ごとの行値等価
+    /// [`WherePredicate::RowCompare`]（`Eq`）の [`WherePredicate::Or`] へ脱糖し（要素 1 個は単独）、
+    /// `NOT IN` は [`negate_conjunction`] で葉まで押し下げる（各要素の `<>` の連言。Kleene 三値論理で厳密）。
+    /// 評価は束縛段（`row_compare`）が既存の比較葉へ展開する。要素数・成分数は積む前に検査し、
+    /// 要素が行でない・成分数不一致・空リストは `42601`、サブクエリ要素は `0A000`。
+    fn parse_row_in(&mut self, negated: bool, kw_len: usize) -> Result<ExprLeaf, SqlSurfaceError> {
+        let lhs = self.parse_row_side(None)?;
+        self.pos = self.pos.saturating_add(kw_len);
+        self.expect_punct('(')?;
+        if matches!(self.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::unsupported("IN list must not be empty"));
+        }
+        let lhs_nodes = lhs
+            .iter()
+            .fold(0usize, |acc, e| acc.saturating_add(expr_node_count(e)));
+        let mut branches: Vec<Vec<WherePredicate>> = Vec::new();
+        loop {
+            if branches.len() >= MAX_IN_LIST_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                )));
+            }
+            if !matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "IN list element must be a row expression",
+                ));
+            }
+            if matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Keyword(Keyword::Select))
+            ) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "row value comparison with a subquery is not supported",
+                ));
+            }
+            let rhs = self.parse_row_side(Some(lhs.len()))?;
+            if rhs.len() != lhs.len() {
+                return Err(SqlSurfaceError::unsupported(
+                    "unequal number of entries in row expressions",
+                ));
+            }
+            // 左辺の複製 1 回分と `RowCompare` 1 ノード。
+            self.charge_expr_nodes(lhs_nodes.saturating_add(1))?;
+            branches.push(vec![WherePredicate::RowCompare {
+                lhs: lhs.clone(),
+                op: ArrayCmpOp::Eq,
+                rhs,
+            }]);
+            match self.peek() {
+                Some(Token::Punct(',')) => {
+                    self.advance();
+                }
+                Some(Token::Punct(')')) => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "expected ',' or ')' in IN list, got {other:?}"
+                    )))
+                }
+            }
+        }
+        let preds = if branches.len() == 1 {
+            branches.pop().unwrap_or_default()
+        } else {
+            vec![WherePredicate::Or(branches)]
+        };
+        Ok(ExprLeaf::Preds(if negated {
+            negate_conjunction(preds, &mut self.expr_node_budget)?
+        } else {
+            preds
+        }))
     }
 
     /// 行の 1 辺 `( e1 , e2 , ... )` を読む。成分数は `limit` 以下に抑え、`push` の**前**に検査する
@@ -10416,7 +10715,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 行値比較の本体（[`Self::row_compare_ahead`] が真のとき呼ばれる。Issue #3255）。
-    /// 右辺が行でない・サブクエリ・成分数不一致は fail-closed（`42601`／`0A000`）。評価は #3256。
+    /// 右辺が行でない・サブクエリ・成分数不一致は fail-closed（`42601`／`0A000`）。評価は束縛段で展開（Issue #3256）。
     fn parse_row_compare(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
         let lhs = self.parse_row_side(None)?;
         let not_equal = matches!(self.peek(), Some(Token::Punct('<')))
@@ -12267,9 +12566,7 @@ impl<'a> Parser<'a> {
             // と同じ方針で、次のトークンが `WHEN` のときのみ `CASE` 式として扱う。
             // 先読み無しで無条件に消費すると既存の VECTOR 列名 `case` の参照
             // （例: `vec_norm(case)`）が構文エラー化する破壊的変更になる。
-            Some(Token::Ident(name))
-                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") =>
-            {
+            Some(Token::Ident(_)) if self.case_expr_starts_at(self.pos) => {
                 self.advance();
                 self.parse_case_expr(depth)
             }
@@ -12707,7 +13004,16 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 self.resolve_upsert_qualified_column(&qualifier, name)
             }
+            // `UPDATE ... SET <式> ... FROM` の右辺の修飾列参照（Issue #3296）。修飾の有無を保ったまま
+            // プレースホルダへ置き換え、解決は束縛段に任せる（FROM 側の列も参照できる）。
+            Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_set_refs.is_some() => {
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
+                self.advance();
+                self.consume_expr_node()?;
+                self.push_dml_from_set_ref(ColumnRef::qualified(qualifier, name))
+            }
             // `UPDATE ... SET <式> ... FROM` の右辺だけで有効な修飾列参照（SQL-53 (b)、Issue #1754）。
+            // `RETURNING` の式項目はこちらを使い、FROM 側の修飾は `0A000` のまま。
             Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_target.is_some() => {
                 self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 self.advance();
@@ -12743,6 +13049,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 if matches!(self.peek(), Some(Token::Punct('('))) {
                     self.parse_call_expr(name, depth)
+                } else if self.dml_from_set_refs.is_some() {
+                    self.consume_expr_node()?;
+                    self.sink_mark(ident_at, super::colref_sink::Role::Value);
+                    self.push_dml_from_set_ref(ColumnRef::unqualified(name))
                 } else {
                     self.consume_expr_node()?;
                     if self.dml_from_target.is_some() {
@@ -12756,6 +13066,26 @@ impl<'a> Parser<'a> {
                 "unsupported expression term near {other:?}"
             ))),
         }
+    }
+
+    /// `UPDATE ... FROM` の SET 右辺の列参照を積み、式へ置くプレースホルダ識別子を返す（Issue #3296）。
+    /// 予約接頭辞（NUL 始まり）の名前は利用者が書けない綴りで、偽装されたものは `42601`（fail-closed）。
+    /// 参照数は呼び出し元が先に消費した式ノード予算（`MAX_EXPR_NODES`）で上限が掛かる。
+    fn push_dml_from_set_ref(&mut self, colref: ColumnRef) -> Result<Expr, SqlSurfaceError> {
+        if colref.name().starts_with('\u{0}') {
+            return Err(SqlSurfaceError::unsupported(
+                "reserved identifier prefix in UPDATE SET expression",
+            ));
+        }
+        let refs = self
+            .dml_from_set_refs
+            .as_mut()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let name = format!("{}{}", crate::sql::dml_from::SET_REF_PREFIX, refs.len());
+        refs.push(colref);
+        Ok(Expr::Ident(name))
     }
 
     /// `DO UPDATE SET` 右辺の修飾列参照を式の列参照へ解決する（SQL-49、Issue #1739）。
@@ -12807,10 +13137,12 @@ impl<'a> Parser<'a> {
     }
 
     /// 検索形 `CASE WHEN <lhs> <cmp> <rhs> THEN <value_expr> {WHEN ...}
-    /// [ELSE <value_expr>] END` を解析する（対象ビヘイビア: SQL-26）。呼び出し元は
-    /// `CASE` トークンを消費済み。単純 CASE（`CASE x WHEN v ...`）・WHEN 条件中の
-    /// `AND`/`OR`/`IS NULL` 等の論理演算は本 Issue の対象外として `42601` で拒否
-    /// する（`cond` は常に `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
+    /// [ELSE <value_expr>] END` と単純形 `CASE <value_expr> WHEN <value_expr> THEN
+    /// <value_expr> {WHEN ...} [ELSE <value_expr>] END`（Issue #3279）を解析する
+    /// （対象ビヘイビア: SQL-26）。呼び出し元は `CASE` トークンを消費済み。検索形の WHEN
+    /// 条件中の `AND`/`OR`/`IS NULL` 等の論理演算・単純形の `WHEN 1, 2` 列挙・被演算子の
+    /// 比較式は `42601` で拒否する（検索形の `cond` は常に
+    /// `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
     fn parse_case_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
         self.enter_case_nesting()?;
@@ -12820,11 +13152,36 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_case_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
-        // 直後が `WHEN` でなければ単純 CASE 形（`CASE x WHEN v ...`）であり、
-        // 本 Issue の対象外として拒否する（`42601`）。
+        // 直後が `WHEN` でなければ単純形（`CASE x WHEN v ...`）。被演算子は AST に
+        // 1 回だけ保持する（複製しない。`Expr::Case` の doc 参照）。単純形はこれまで全体が
+        // `42601` だったため、`NULL` をリテラルとして解析しても互換性は壊れない。
+        let operand = if self.peek_ident_matches("WHEN") {
+            None
+        } else {
+            Some(Box::new(
+                self.parse_value_expr_with_null_context(depth + 1, true)?,
+            ))
+        };
         self.expect_ident_matching("WHEN")?;
         let mut whens = Vec::new();
         loop {
+            if operand.is_some() {
+                // 単純形の WHEN 値（比較値）。NULL は「決して一致しない」比較値として受理する。
+                let value = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                self.expect_ident_matching("THEN")?;
+                let result = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                whens.push((value, result));
+                if whens.len() > MAX_CASE_BRANCHES {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "CASE has too many WHEN branches",
+                    ));
+                }
+                if self.peek_ident_matches("WHEN") {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             // WHEN 条件式（`<value_expr> <cmp_op> <value_expr>`）は
             // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL` は
             // ここでは常に列参照として解析する（`allow_null_literal` を強制的に
@@ -12868,7 +13225,11 @@ impl<'a> Parser<'a> {
         };
         self.expect_ident_matching("END")?;
         self.consume_expr_node()?;
-        Ok(Expr::Case { whens, else_result })
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_result,
+        })
     }
 
     /// `COALESCE '(' <value_expr> {',' <value_expr>} ')'`（対象ビヘイビア:
@@ -13785,7 +14146,7 @@ impl<'a> Parser<'a> {
                 true
             }
             Some(Token::Ident(name)) => {
-                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
+                if self.case_expr_starts_at(self.pos) {
                     return true;
                 }
                 // bit 列の距離式（TABLE-48・Issue #2970）: `ORDER BY v <~> '1010'`。
@@ -15581,6 +15942,18 @@ impl<'a> Parser<'a> {
         &mut self,
         out: &mut Vec<(String, SetValue)>,
     ) -> Result<(), SqlSurfaceError> {
+        self.parse_row_assignment_with(out, Self::parse_update_set_rhs)
+    }
+
+    /// [`Self::parse_update_row_assignment`] の本体。右辺要素の解析器 `parse_value` だけを差し替えられる
+    /// ようにして、単一表 `UPDATE`（[`SetValue`]）と `UPDATE ... FROM`（[`DmlFromSetValue`]。
+    /// Issue #3296）が同じ規則（`ROW`・1 列は `ROW` 必須・個数不一致 `42601`・部分クエリ源 `0A000`・
+    /// 代入数の累計上限）を共有する。
+    fn parse_row_assignment_with<V>(
+        &mut self,
+        out: &mut Vec<(String, V)>,
+        mut parse_value: impl FnMut(&mut Self) -> Result<V, SqlSurfaceError>,
+    ) -> Result<(), SqlSurfaceError> {
         self.expect_punct('(')?;
         let mut columns: Vec<String> = Vec::new();
         loop {
@@ -15643,13 +16016,13 @@ impl<'a> Parser<'a> {
 
         let mismatch =
             || SqlSurfaceError::unsupported("number of columns does not match number of values");
-        let mut values: Vec<SetValue> = Vec::new();
+        let mut values: Vec<V> = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             loop {
                 if values.len() >= columns.len() {
                     return Err(mismatch());
                 }
-                values.push(self.parse_update_set_rhs()?);
+                values.push(parse_value(self)?);
                 if matches!(self.peek(), Some(Token::Punct(','))) {
                     self.advance();
                     continue;
@@ -18773,7 +19146,7 @@ fn check_view_body_pred_leaf(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
-        // 行値比較は評価が #3256 まで未対応のため VIEW 本文では拒否する（tracked: #3256）。
+        // 行値比較は VIEW 本文での評価が未対応のため拒否する（tracked: #3254）。
         | WherePredicate::RowCompare { .. } => Err(rejected()),
     }
 }
@@ -18803,7 +19176,7 @@ fn check_cte_body_predicates(where_predicates: &[WherePredicate]) -> Result<(), 
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
             | WherePredicate::CorrelatedExists(_)
-            // 行値比較は CTE／派生表本文では未対応（tracked: #3256）。
+            // 行値比較は CTE／派生表本文では未対応（tracked: #3254）。
             | WherePredicate::RowCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
@@ -18954,7 +19327,7 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_)
-        // 行値比較は評価後射影形ビューの外側 WHERE では未対応（tracked: #3256）。
+        // 行値比較は評価後射影形ビューの外側 WHERE では未対応（tracked: #3254）。
         | WherePredicate::RowCompare { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
@@ -19435,7 +19808,7 @@ fn check_body_pred(
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
         | WherePredicate::IsNull { .. } => Ok(()),
-        // 行値比較は本文の列走査が成分を辿れないため fail-closed に拒否する（tracked: #3256）。
+        // 行値比較は本文の列走査が成分を辿れないため fail-closed に拒否する（tracked: #3254）。
         WherePredicate::RowCompare { .. } => Err(body_form_unsupported()),
     }
 }
@@ -19570,7 +19943,7 @@ pub(crate) fn rename_column_in_view_body(
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
             | WherePredicate::CorrelatedExists(_)
-            // 行値比較は VIEW 本文では未対応（tracked: #3256）。
+            // 行値比較は VIEW 本文では未対応（tracked: #3254）。
             | WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::unsupported(
                 "view body WHERE predicate form is not supported",
             )),
@@ -19764,7 +20137,7 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
-        // VIEW 本文の検査が行値比較を拒否するため到達しない（tracked: #3256）。
+        // VIEW 本文の検査が行値比較を拒否するため到達しない（tracked: #3254）。
         | WherePredicate::RowCompare { .. } => String::new(),
     }
 }
@@ -21010,7 +21383,7 @@ fn reject_unimplemented_expression_keys(
 /// 余剰トークンがあれば `42601`。永続データは untrusted として扱う（手書きの破損データも
 /// ここで拒否される）。
 pub(crate) fn parse_index_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
     let expr = p.parse_bounded_value_expr()?;
     p.expect_end_of_statement()?;
@@ -21142,6 +21515,9 @@ pub fn validate_drop_index_tokens(tokens: &[Token]) -> Result<ValidatedDropIndex
 pub struct ValidatedCreateType {
     pub(crate) name: String,
     pub(crate) labels: Vec<String>,
+    /// 型名が `public.` で明示修飾されていたか（Issue #3288。`search_path` の先頭が SCHEMA でも `public` へ作る。
+    /// 解決器が設定し、`core::attach_public_qualified` が準備済み文の再 parse 後に戻す）。
+    pub(crate) public_qualified: bool,
 }
 
 impl ValidatedCreateType {
@@ -21192,7 +21568,7 @@ pub(crate) fn is_drop_type_statement(tokens: &[Token]) -> bool {
 
 /// [`ValidatedCreateType`] の構造検証本体（Issue #1194）。型名は識別子形状のみ
 /// ここで検証し（違反は `42601`）、ラベル数は push 前に `MAX_ENUM_LABELS` で
-/// 打ち切る（`54000`）。`IF NOT EXISTS`・スキーマ修飾名・`AS (...)`・空リスト・
+/// 打ち切る（`54000`）。`IF NOT EXISTS`・`AS (...)`・空リスト・
 /// 非文字列リテラルのラベル・`$n` はいずれも期待トークン列と一致せず `42601` へ落ちる。
 pub(crate) fn validate_create_type_tokens(
     tokens: &[Token],
@@ -21207,7 +21583,9 @@ pub(crate) fn validate_create_type_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    // 型名は裸の識別子（public）か、解決器が作る内部キー（SCHEMA 配下。Issue #3288）。利用者が内部キーを
+    // 直接書く経路は無い（字句解析器は `#` を含む識別子を作らない）。予約名の判定はカタログ側が行う。
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in CREATE TYPE"))?;
     p.expect_ident_matching("AS")?;
     p.expect_ident_matching("ENUM")?;
@@ -21222,7 +21600,11 @@ pub(crate) fn validate_create_type_tokens(
     }
     p.expect_punct(')')?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedCreateType { name, labels })
+    Ok(ValidatedCreateType {
+        name,
+        labels,
+        public_qualified: false,
+    })
 }
 
 /// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`RESTRICT`（既定と同義）は受理し、
@@ -21236,7 +21618,7 @@ pub(crate) fn validate_drop_type_tokens(
     p.expect_ident_matching("TYPE")?;
     let if_exists = p.consume_if_exists();
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in DROP TYPE"))?;
     if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
         return Err(SqlSurfaceError::unsupported(
@@ -21255,6 +21637,9 @@ pub struct ValidatedCreateSchema {
     pub(crate) if_not_exists: bool,
     /// `AUTHORIZATION <ロール>` の所有者指定（Issue #2236。省略時は作成者＝現在ロール）。
     pub(crate) authorization: Option<RoleSpec>,
+    /// 見出しの後ろに続くスキーマ要素（`CREATE TABLE`／`VIEW`／`SEQUENCE`。Issue #3286）。記述順で保持し、
+    /// 空なら従来どおりの `CREATE SCHEMA`。実行は `core::schema_elements` が 1 つの write txn で行う。
+    pub(crate) elements: Vec<SchemaElement>,
 }
 
 impl ValidatedCreateSchema {
@@ -21357,8 +21742,10 @@ pub(crate) fn is_drop_schema_statement(tokens: &[Token]) -> bool {
 
 /// [`ValidatedCreateSchema`] の構造検証本体（TABLE-27、Issue #1713）。`AUTHORIZATION <ロール>`
 /// （`CREATE SCHEMA [IF NOT EXISTS] <名> AUTHORIZATION <ロール>` と名前省略形
-/// `CREATE SCHEMA AUTHORIZATION <ロール名>`。Issue #2236）は所有者の指定として受理し、schema_element
-/// （`CREATE SCHEMA s CREATE TABLE ...`）と、`CURRENT_USER` 等で名前を省略する形は黙って無視せず
+/// `CREATE SCHEMA AUTHORIZATION <ロール名>`。Issue #2236）は所有者の指定として受理する。
+/// 見出しの後ろのスキーマ要素（`CREATE SCHEMA s CREATE TABLE ...`。Issue #3286）は
+/// `schema_elements` が分割・構造検証する。受理しない種別・形と `IF NOT EXISTS` との併用は固定文言の
+/// `0A000`（PostgreSQL 17 と同じ。設計記録 D3）。`CURRENT_USER` 等で名前を省略する形も黙って無視せず
 /// `0A000` で拒否する（fail-closed。設計記録 D10）。修飾名・不正な識別子・余分なトークンは `42601`。
 pub(crate) fn validate_create_schema_tokens(
     tokens: &[Token],
@@ -21367,10 +21754,30 @@ pub(crate) fn validate_create_schema_tokens(
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("SCHEMA")?;
     let if_not_exists = p.parse_optional_if_not_exists();
-    let elements = || {
-        SqlSurfaceError::feature_not_supported(
-            "CREATE SCHEMA with schema elements is not supported",
-        )
+    // 見出しの後ろに要素が続く形（`CREATE`／`GRANT`）の検証と格納。`IF NOT EXISTS` との併用は拒否する。
+    let finish = |p: &mut Parser<'_>,
+                  name: String,
+                  authorization: Option<RoleSpec>|
+     -> Result<ValidatedCreateSchema, SqlSurfaceError> {
+        let mut elements = Vec::new();
+        if schema_elements::starts_element(p) {
+            if if_not_exists {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "CREATE SCHEMA IF NOT EXISTS cannot include schema elements",
+                ));
+            }
+            let start = tokens.len().saturating_sub(p.remaining().len());
+            let rest = tokens.get(start..).unwrap_or(&[]);
+            elements = schema_elements::parse_elements(&name, rest)?;
+        } else {
+            p.expect_end_of_statement()?;
+        }
+        Ok(ValidatedCreateSchema {
+            name,
+            if_not_exists,
+            authorization,
+            elements,
+        })
     };
     // 名前省略形: `CREATE SCHEMA [IF NOT EXISTS] AUTHORIZATION <ロール名>`（SCHEMA 名はロール名）。
     if p.peek_ident_matches("AUTHORIZATION") {
@@ -21381,15 +21788,7 @@ pub(crate) fn validate_create_schema_tokens(
                 "CREATE SCHEMA AUTHORIZATION without a schema name requires a role name",
             ));
         };
-        if p.peek_ident_matches("CREATE") {
-            return Err(elements());
-        }
-        p.expect_end_of_statement()?;
-        return Ok(ValidatedCreateSchema {
-            name,
-            if_not_exists,
-            authorization: Some(spec),
-        });
+        return finish(&mut p, name, Some(spec));
     }
     if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
         return Err(SqlSurfaceError::unsupported(
@@ -21405,15 +21804,7 @@ pub(crate) fn validate_create_schema_tokens(
     } else {
         None
     };
-    if p.peek_ident_matches("CREATE") {
-        return Err(elements());
-    }
-    p.expect_end_of_statement()?;
-    Ok(ValidatedCreateSchema {
-        name,
-        if_not_exists,
-        authorization,
-    })
+    finish(&mut p, name, authorization)
 }
 
 /// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713・#1717）。
@@ -22810,42 +23201,103 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// FROM／USING 側の表の並び `<rel>[, <rel>]*`。対象表を含む参照数を [`crate::sql::relation::MAX_TABLE_REFS`]
-    /// で積む前に検査し（超過は `54000`）、公開名の重複は `42601`（`BindingScope::new` と同じ契約）。
+    /// FROM／USING 側の表の並び（Issue #3294）。文法は
+    /// `<rel> { , <rel> | CROSS JOIN <rel> | [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <rel> ON <cond> }*`。
+    /// 戻り値は平坦な表参照の並びと結合段（長さは表数 - 1。カンマは `Cross` 段）。
+    /// 対象表を含む参照数を [`crate::sql::relation::MAX_TABLE_REFS`] で積む前に検査し（超過は `54000`）、
+    /// 公開名の重複は `42601`（`BindingScope::new` と同じ契約）。`JOIN ... USING (...)`・`NATURAL JOIN`・
+    /// カンマの後の `CROSS JOIN` 以外の明示 JOIN は束縛の意味論が結合器の統合列に依存するため
+    /// 固定文言の `0A000` で拒否する（fail-closed。`docs/design/update-from-delete-using.md`）。
+    /// 派生表・関数呼び出しは識別子の検証（`42601`）で従来どおり拒否される。
     fn parse_dml_relation_list(
         &mut self,
         target: &TableRef,
-    ) -> Result<Vec<TableRef>, SqlSurfaceError> {
+    ) -> Result<(Vec<TableRef>, Vec<JoinStep>), SqlSurfaceError> {
         let mut rels: Vec<TableRef> = Vec::new();
+        let mut steps: Vec<JoinStep> = Vec::new();
+        let first = self.parse_dml_from_relation(target, &rels)?;
+        rels.push(first);
+        // PG ではカンマより JOIN が強く結合するため、カンマの後の CROSS 以外の明示 JOIN は
+        // 束縛の意味論がずれる。SELECT の JOIN（Issue #1833）と同じ安全弁で `0A000` にする。
+        let mut after_comma = false;
         loop {
-            if rels.len().saturating_add(1) >= crate::sql::relation::MAX_TABLE_REFS {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "too many table references in UPDATE/DELETE",
-                ));
-            }
-            let table = self.expect_ident()?;
-            crate::catalog::validate_relation_key(&table)
-                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
-            let alias = self.parse_relation_alias(is_dml_target_reserved_word, "FROM")?;
-            let rel = match alias {
-                Some(a) => TableRef::with_alias(table, a),
-                None => TableRef::new(table),
-            };
-            if rel.exposed_name() == target.exposed_name()
-                || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
-            {
-                return Err(SqlSurfaceError::unsupported(
-                    "duplicate table reference name in UPDATE/DELETE",
-                ));
-            }
-            rels.push(rel);
-            if matches!(self.peek(), Some(Token::Punct(','))) {
+            let (kind, form) = if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
-                continue;
-            }
-            break;
+                after_comma = true;
+                (JoinKind::Inner, JoinForm::Cross)
+            } else {
+                match parse_join_kind(self)? {
+                    Some((kind, form)) => {
+                        if after_comma && form != JoinForm::Cross {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "explicit JOIN after a comma-separated FROM / USING item is not supported",
+                            ));
+                        }
+                        (kind, form)
+                    }
+                    None => break,
+                }
+            };
+            let rel = self.parse_dml_from_relation(target, &rels)?;
+            rels.push(rel);
+            let has_using_list = self.peek_ident_matches("USING") && self.peek_punct_at(1, '(');
+            let condition = match form {
+                JoinForm::Cross => {
+                    if self.peek_ident_matches("ON") || has_using_list {
+                        return Err(SqlSurfaceError::unsupported(
+                            "CROSS JOIN or comma-separated FROM item cannot have an ON or USING clause",
+                        ));
+                    }
+                    JoinCondition::Cross
+                }
+                JoinForm::Natural => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "NATURAL JOIN is not supported in UPDATE ... FROM / DELETE ... USING",
+                    ));
+                }
+                JoinForm::Plain => {
+                    if has_using_list {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "JOIN ... USING (...) is not supported in UPDATE ... FROM / DELETE ... USING",
+                        ));
+                    }
+                    self.expect_ident_matching("ON")?;
+                    JoinCondition::On(parse_join_on_conditions(self)?)
+                }
+            };
+            steps.push(JoinStep { kind, condition });
         }
-        Ok(rels)
+        Ok((rels, steps))
+    }
+
+    /// FROM／USING 側の表参照 1 つ（`<表> [[AS] <別名>]`）。参照数の上限検査（`54000`）と公開名の
+    /// 重複検査（`42601`）を、`rels` へ積む前に行う。
+    fn parse_dml_from_relation(
+        &mut self,
+        target: &TableRef,
+        rels: &[TableRef],
+    ) -> Result<TableRef, SqlSurfaceError> {
+        if rels.len().saturating_add(1) >= crate::sql::relation::MAX_TABLE_REFS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many table references in UPDATE/DELETE",
+            ));
+        }
+        let table = self.expect_ident()?;
+        crate::catalog::validate_relation_key(&table)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        let alias = self.parse_relation_alias(is_dml_target_reserved_word, "FROM")?;
+        let rel = match alias {
+            Some(a) => TableRef::with_alias(table, a),
+            None => TableRef::new(table),
+        };
+        if rel.exposed_name() == target.exposed_name()
+            || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "duplicate table reference name in UPDATE/DELETE",
+            ));
+        }
+        Ok(rel)
     }
 
     /// `[WHERE <join_where>]`（JOIN と同じ文法。数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`）。
@@ -22878,7 +23330,8 @@ impl<'a> Parser<'a> {
         }
         match self.tokens.get(self.pos.saturating_add(1)) {
             None => true,
-            Some(Token::Punct(',' | ';')) => true,
+            // `)` は行値代入 `(a, b) = (u.x, u.y)` の要素の終端（Issue #3296）。
+            Some(Token::Punct(',' | ';' | ')')) => true,
             Some(Token::Keyword(Keyword::From | Keyword::Where)) => true,
             Some(Token::Ident(w)) => ["USING", "RETURNING", "PARTITIONED"]
                 .iter()
@@ -22887,15 +23340,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `UPDATE ... FROM` の SET 句 1 要素。行値の代入は `0A000`、左辺の修飾は `42601`（`expect_ident`）。
+    /// `UPDATE ... FROM` の SET 句 1 要素。`<col> = <右辺>` と行値代入 `(<col>, ...) = (<右辺>, ...)`／
+    /// `= ROW(...)`（Issue #3296）を受理する。左辺の修飾は `42601`（`expect_ident`）。
     fn parse_update_from_set_item(
         &mut self,
         out: &mut Vec<(String, DmlFromSetValue)>,
     ) -> Result<(), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct('('))) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "row-value assignment is not supported in UPDATE ... FROM",
-            ));
+            return self.parse_row_assignment_with(out, Self::parse_update_from_set_rhs);
         }
         if out.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
             return Err(SqlSurfaceError::unsupported(
@@ -22904,15 +23356,27 @@ impl<'a> Parser<'a> {
         }
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
-        let value = if self.peek_set_rhs_single_column() {
-            DmlFromSetValue::Column(self.parse_join_colref()?)
-        } else {
-            self.dml_from_unqualified.clear();
-            let v = self.parse_update_set_rhs()?;
-            DmlFromSetValue::Value(v, std::mem::take(&mut self.dml_from_unqualified))
-        };
+        let value = self.parse_update_from_set_rhs()?;
         out.push((column, value));
         Ok(())
+    }
+
+    /// `UPDATE ... FROM` の SET 右辺 1 つ（単純な代入・行値代入の要素で共有）。列参照 1 個は
+    /// [`DmlFromSetValue::Column`]、列参照を含む式は [`DmlFromSetValue::Expr`]（解析中だけ
+    /// `dml_from_set_refs` を有効にし、エラー時も元へ戻す）、それ以外（リテラル・`DEFAULT`・列参照の無い式）は
+    /// [`DmlFromSetValue::Value`]。
+    fn parse_update_from_set_rhs(&mut self) -> Result<DmlFromSetValue, SqlSurfaceError> {
+        if self.peek_set_rhs_single_column() {
+            return Ok(DmlFromSetValue::Column(self.parse_join_colref()?));
+        }
+        let prev = self.dml_from_set_refs.replace(Vec::new());
+        let parsed = self.parse_update_set_rhs();
+        let refs = std::mem::replace(&mut self.dml_from_set_refs, prev).unwrap_or_default();
+        let value = parsed?;
+        Ok(match value {
+            SetValue::Expr(expr) if !refs.is_empty() => DmlFromSetValue::Expr { expr, refs },
+            other => DmlFromSetValue::Value(other, Vec::new()),
+        })
     }
 
     /// `UPDATE <表> [[AS] <別名>] SET <代入>[, ...] FROM <rel>[, ...] [WHERE <join_where>]
@@ -22937,7 +23401,7 @@ impl<'a> Parser<'a> {
         self.dml_from_target = prev;
         items?;
         self.expect_keyword(Keyword::From)?;
-        let from = self.parse_dml_relation_list(&target)?;
+        let (from, from_steps) = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
@@ -22947,6 +23411,8 @@ impl<'a> Parser<'a> {
             stmt: ValidatedUpdateFrom {
                 target,
                 from,
+                from_steps,
+                sources: Vec::new(),
                 assignments,
                 where_clause,
                 returning,
@@ -22963,7 +23429,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let target = self.parse_dml_target_relation()?;
         self.expect_contextual_keyword("USING")?;
-        let using = self.parse_dml_relation_list(&target)?;
+        let (using, using_steps) = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
@@ -22972,6 +23438,8 @@ impl<'a> Parser<'a> {
             stmt: ValidatedDeleteUsing {
                 target,
                 using,
+                using_steps,
+                sources: Vec::new(),
                 where_clause,
                 returning,
                 operation_id,
@@ -23011,23 +23479,59 @@ fn reject_omitted_join_where_for_dml(
     Ok(())
 }
 
-/// FROM／USING 形の DML の対象表・FROM 側の表をカタログで確認する（ビューは `0A000`、未知は `42P01`）。
+/// FROM／USING 形の DML の対象表・FROM 側の表をカタログで確認する（未知は `42P01`）。
 /// 構文の完全な解析（`42601`）の後に呼ぶ（`parse_join_statement` と同じ検証順序）。
+///
+/// 対象表（書き込み先）がビューなら `0A000`（更新可能ビューは別の穴）。FROM／USING 側（読み取り専用）の
+/// 単純形ビュー（列別名なし）は [`DmlFromSource::View`] として返す。列別名つきビュー・評価後射影形ビューは
+/// 公開名から物理名への書き換え・本文の実行が要るため `0A000`（集合演算枝の前例と同じ fail-closed）。
 fn resolve_dml_from_relations(
     lookup: &impl TableLookup,
     target: &TableRef,
     others: &[TableRef],
-) -> Result<(), SqlSurfaceError> {
-    for r in std::iter::once(target).chain(others.iter()) {
-        match crate::sql::view::resolve_from(lookup, r.table())? {
-            crate::sql::view::Resolved::Table => {}
-            crate::sql::view::Resolved::View { .. }
-            | crate::sql::view::Resolved::Buffered { .. } => {
+) -> Result<Vec<DmlFromSource>, SqlSurfaceError> {
+    match crate::sql::view::resolve_from(lookup, target.table())? {
+        crate::sql::view::Resolved::Table => {}
+        crate::sql::view::Resolved::View { .. } | crate::sql::view::Resolved::Buffered { .. } => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "UPDATE ... FROM / DELETE ... USING does not support a view as the target",
+            ));
+        }
+    }
+    let mut sources = Vec::with_capacity(others.len().min(crate::sql::relation::MAX_TABLE_REFS));
+    for r in others {
+        sources.push(match crate::sql::view::resolve_from(lookup, r.table())? {
+            crate::sql::view::Resolved::Table => DmlFromSource::Table,
+            crate::sql::view::Resolved::View {
+                base_table,
+                view_predicates,
+                view_columns,
+                column_map: None,
+                ..
+            } => DmlFromSource::View(DmlFromViewSource {
+                base_table,
+                view_predicates,
+                view_columns,
+            }),
+            crate::sql::view::Resolved::View { .. } | crate::sql::view::Resolved::Buffered { .. } => {
                 return Err(SqlSurfaceError::feature_not_supported(
-                    "UPDATE ... FROM / DELETE ... USING does not support view references",
+                    "UPDATE ... FROM / DELETE ... USING supports only simple views without column aliases as the FROM / USING relation",
                 ));
             }
-        }
+        });
+    }
+    Ok(sources)
+}
+
+/// FROM／USING が 2 表以上（JOIN 連鎖を含む。Issue #3294 の畳み込み source）のとき、ビューの relation を
+/// `0A000` で拒否する。畳み込み source は合成 JOIN 文を実表名で評価するため、ビュー定義の述語・公開列の
+/// 制限を適用できず、通すとビューの絞り込みを黙って外す（fail-open）ことになる。単一表 source のビューだけが
+/// Issue #3292 の対象。
+fn reject_view_in_multi_source(sources: &[DmlFromSource]) -> Result<(), SqlSurfaceError> {
+    if sources.len() > 1 && sources.iter().any(|s| matches!(s, DmlFromSource::View(_))) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "UPDATE ... FROM / DELETE ... USING does not support a view in a multi-relation FROM / USING",
+        ));
     }
     Ok(())
 }
@@ -23049,7 +23553,8 @@ pub(crate) fn validate_update_from_tokens_with_limits(
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
-    resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    reject_view_in_multi_source(&stmt.sources)?;
     // 台帳の文ハッシュ（Issue #1757。SQL-53 (5)）。全検証の後に算出し、検証順とエラーコードは変えない。
     stmt.statement_hash = crate::recovery::content_hash::for_update_from(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
@@ -23075,7 +23580,8 @@ pub(crate) fn validate_delete_using_tokens_with_limits(
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
-    resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    reject_view_in_multi_source(&stmt.sources)?;
     stmt.statement_hash = crate::recovery::content_hash::for_delete_using(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
     )
@@ -23973,10 +24479,15 @@ fn expr_contains_aggregate_call(expr: &Expr) -> bool {
             .flatten()
             .any(expr_contains_aggregate_call),
         Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_aggregate_call),
-        Expr::Case { whens, else_result } => {
-            whens
-                .iter()
-                .any(|(c, r)| expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_aggregate_call)
+                || whens.iter().any(|(c, r)| {
+                    expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r)
+                })
                 || else_result
                     .as_deref()
                     .is_some_and(expr_contains_aggregate_call)
@@ -31093,7 +31604,9 @@ pub(crate) fn validate_create_temp_table_tokens(
 pub(crate) fn parse_check_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let mut tokens = lexer::tokenize(sql)?;
+    // 引用付き `"null"` の列参照を保存本文から復元できるよう、引用付き NULL を区別する字句解析を使う
+    // （単純 CASE の被演算子・比較値は NULL リテラルを許すため。Issue #3279）。
+    let mut tokens = lexer::tokenize_marked(sql)?;
     // 旧版は時刻キーワード名の列参照を引用なしで保存した。CHECK は値関数を禁止しているため、
     // 保存本文中の未引用の予約語は旧形式の列参照として復元する（書き込み不能化を防ぐ）。
     lexer::requote_legacy_value_function_columns(&mut tokens);
@@ -31111,7 +31624,7 @@ pub(crate) fn parse_check_predicate_text(
 pub(crate) fn parse_index_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
     let predicates = p.parse_where()?;
     p.expect_end_of_statement()?;
@@ -32592,13 +33105,54 @@ mod tests {
         };
         ok("UPDATE a SET x = b.y FROM b WHERE a.id = b.id").expect("column rhs");
         ok("UPDATE a z SET x = 'k', y = DEFAULT FROM b q, c WHERE z.id = q.id").expect("alias");
+        // Issue #3296: 行値代入・FROM 側の列を含む式（修飾あり・なし）の構文は受理する。
+        ok("UPDATE a SET x = c.y + 1 FROM b").expect("qualified expression");
+        ok("UPDATE a SET x = y + 1 FROM b").expect("unqualified expression");
+        ok("UPDATE a SET (x, y) = (b.p, b.q) FROM b").expect("row of columns");
+        ok("UPDATE a SET (x, y) = ROW(b.p + 1, DEFAULT) FROM b")
+            .expect("row with expr and default");
+        ok("UPDATE a SET (x) = ROW(b.p), z = 1 FROM b").expect("single column row");
         ok("DELETE FROM a z USING b q WHERE z.id = q.id USING OPERATION_ID 'o'").expect("delete");
+        // FROM／USING 内の JOIN ... ON と多方向結合（Issue #3294）
+        ok("UPDATE a SET x = c.y FROM b JOIN c ON b.id = c.id WHERE a.id = b.id").expect("join");
+        ok("UPDATE a SET x = 1 FROM b LEFT JOIN c ON b.id = c.id AND c.k = 'x' RETURNING a.id")
+            .expect("left join returning");
+        ok("UPDATE a SET x = 1 FROM b CROSS JOIN c, d WHERE a.id = b.id").expect("cross and comma");
+        ok(
+            "DELETE FROM a USING b INNER JOIN c ON b.id = c.id FULL OUTER JOIN d ON c.id = d.id \
+            WHERE a.id = b.id USING OPERATION_ID 'o'",
+        )
+        .expect("delete multi join");
+        ok("DELETE FROM a USING b JOIN c ON b.id = c.id OR b.k = c.k;").expect("or on");
+        ok("DELETE FROM a USING b JOIN c ON b.id = c.id RETURNING a.id").expect("returning");
         for (sql, code) in [
             ("UPDATE a SET a.x = 1 FROM b", "42601"),
-            ("UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id", "42601"),
+            // JOIN の形: USING・NATURAL・カンマの後の明示 JOIN は意図的な拒否（Issue #3294）
+            ("UPDATE a SET x = 1 FROM b JOIN c USING (id)", "0A000"),
+            ("UPDATE a SET x = 1 FROM b NATURAL JOIN c", "0A000"),
+            (
+                "UPDATE a SET x = 1 FROM b, c JOIN d ON c.id = d.id",
+                "0A000",
+            ),
+            (
+                "UPDATE a SET x = 1 FROM b CROSS JOIN c ON b.id = c.id",
+                "42601",
+            ),
+            ("UPDATE a SET x = 1 FROM b JOIN c", "42601"),
+            (
+                "UPDATE a SET x = 1 FROM b JOIN (SELECT 1) c ON b.id = c.id",
+                "42601",
+            ),
+            (
+                "UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id JOIN b ON c.id = b.id",
+                "42601",
+            ),
+            ("DELETE FROM a USING b JOIN c USING (id)", "0A000"),
             ("UPDATE a SET x = 1 FROM a", "42601"),
-            ("UPDATE a SET x = c.y + 1 FROM b", "0A000"),
-            ("UPDATE a SET (x, y) = (1, 2) FROM b", "0A000"),
+            ("UPDATE a SET (x, y) = (b.p) FROM b", "42601"),
+            ("UPDATE a SET (x) = (b.p) FROM b", "42601"),
+            ("UPDATE a SET (x, y) = (b.p, 1, 2) FROM b", "42601"),
+            ("UPDATE a SET (x, y) = (SELECT 1, 2) FROM b", "0A000"),
             ("DELETE FROM a USING b WHERE a.n = 1", "42601"),
             ("DELETE FROM a USING b PARTITIONED", "42601"),
         ] {
@@ -34863,7 +35417,7 @@ mod tests {
     }
 
     /// Issue #3255（SQL-9。親 #3254）: WHERE の行値比較 `(e1, e2, ...) <op> (f1, f2, ...)` の構文と AST。
-    /// 評価は #3256。成分 1 個の括弧は従来どおり式。
+    /// 評価は束縛段で展開される（Issue #3256）。成分 1 個の括弧は従来どおり式。
     #[test]
     fn row_value_comparison_parses_to_row_compare() {
         use crate::sql::udf_call::ArrayCmpOp;
@@ -34931,6 +35485,101 @@ mod tests {
         }
     }
 
+    /// Issue #3299: 行値の `[NOT] IN` は RowCompare の Or／連言へ脱糖される（AST の形を固定する）。
+    #[test]
+    fn row_value_in_list_parses_to_row_compare_or() {
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let preds = |pred: &str| {
+            where_predicates_for(&format!("SELECT * FROM documents WHERE {pred} {tail}"))
+        };
+        let eq_or = |preds: &[WherePredicate], n: usize| match preds {
+            [WherePredicate::Or(branches)] => {
+                branches.len() == n
+                    && branches.iter().all(|b| {
+                        matches!(
+                            b.as_slice(),
+                            [WherePredicate::RowCompare {
+                                op: ArrayCmpOp::Eq,
+                                ..
+                            }]
+                        )
+                    })
+            }
+            _ => false,
+        };
+        let ne_and = |preds: &[WherePredicate], n: usize| {
+            preds.len() == n
+                && preds.iter().all(|p| {
+                    matches!(
+                        p,
+                        WherePredicate::RowCompare {
+                            op: ArrayCmpOp::Ne,
+                            ..
+                        }
+                    )
+                })
+        };
+        for sql in ["(a, b) IN ((1, 2), (3, 4))", "(a, b) in ((1, 2), (3, 4))"] {
+            assert!(eq_or(&preds(sql), 2), "{sql}");
+        }
+        assert!(matches!(
+            preds("(a, b) IN ((1, 2))").as_slice(),
+            [WherePredicate::RowCompare {
+                op: ArrayCmpOp::Eq,
+                ..
+            }]
+        ));
+        for sql in [
+            "(a, b) NOT IN ((1, 2), (3, 4))",
+            "(a, b) Not In ((1, 2), (3, 4))",
+            "NOT (a, b) IN ((1, 2), (3, 4))",
+            "NOT ((a, b) IN ((1, 2), (3, 4)))",
+        ] {
+            assert!(ne_and(&preds(sql), 2), "{sql}");
+        }
+        assert!(eq_or(&preds("NOT (a, b) NOT IN ((1, 2), (3, 4))"), 2));
+        assert_eq!(preds("a = 1 AND (a, b) IN ((1, 2), (3, 4))").len(), 2);
+    }
+
+    /// Issue #3299: 行値の `[NOT] IN` の fail-closed な拒否（形の誤り `42601`・サブクエリ `0A000`・
+    /// 上限超過 `54000`・CHECK 本体では認識しない）。
+    #[test]
+    fn row_value_in_list_rejects_unsupported_forms() {
+        let lookup = catalog_with(&["documents"]);
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let code = |pred: &str| {
+            let sql = format!("SELECT * FROM documents WHERE {pred} {tail}");
+            validate_statement(&sql, &lookup)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} must fail"))
+                .wire_code()
+        };
+        for pred in [
+            "(a, b) IN ()",
+            "(a, b) IN ((1, 2, 3))",
+            "(a, b) IN ((1))",
+            "(a, b) IN (1, 2)",
+            "(a, b) IN (ROW(1, 2))",
+            "(a, b) IN (((1, 2)), (3, 4))",
+            "(a, b) IN ((1, 2) (3, 4))",
+            "(a, b) IN ((1, 2)",
+        ] {
+            assert_eq!(code(pred), "42601", "{pred}");
+        }
+        assert_eq!(code("(a, b) IN ((SELECT 1, 2))"), "0A000");
+        let row = |n: usize| vec!["a"; n].join(", ");
+        assert_eq!(
+            code(&format!(
+                "({}) IN (({}))",
+                row(MAX_ROW_COMPARE_COMPONENTS + 1),
+                row(MAX_ROW_COMPARE_COMPONENTS + 1)
+            )),
+            "54000"
+        );
+        let many = vec!["(1, 2)"; MAX_IN_LIST_ITEMS + 1].join(", ");
+        assert_eq!(code(&format!("(a, b) IN ({many})")), "54000");
+    }
+
     /// Issue #3255: 行値比較の fail-closed な拒否（成分数不一致・未対応形は `42601`／`0A000`、
     /// 上限超過は `54000`、CHECK 本体では認識しない）。
     #[test]
@@ -34951,7 +35600,6 @@ mod tests {
             "(a, b) < ROW(1, 2)",
             "ROW(a, b) < (1, 2)",
             "((a, b), c) < ((1, 2), 3)",
-            "(a, b) IN ((1, 2))",
             "(a, b) IS NULL",
             "(a, b) = ANY (b)",
         ] {
@@ -44033,7 +44681,9 @@ mod tests {
         assert_eq!(items.len(), 3);
         match &items[0] {
             SelectItem::Expr {
-                expr: Expr::Case { whens, else_result },
+                expr: Expr::Case {
+                    whens, else_result, ..
+                },
                 ..
             } => {
                 assert_eq!(whens[0].1, Expr::Null);
@@ -44441,16 +45091,179 @@ mod tests {
         }
     }
 
+    /// 単純 CASE（Issue #3279）は被演算子を AST に 1 回だけ保持して受理する（以前は `42601`）。
     #[test]
-    fn rejects_simple_case_form() {
+    fn accepts_simple_case_form_with_single_operand() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_statement(
-            "SELECT CASE id WHEN 1 THEN 2 END FROM documents \
+        let stmt = validate_statement(
+            "SELECT CASE id WHEN 1 THEN 2 WHEN 3 THEN 4 ELSE 5 END FROM documents \
              ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
             &lookup,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("simple CASE should be accepted");
+        let items = select_expr_items(&stmt);
+        match &items[0] {
+            SelectItem::Expr {
+                expr:
+                    Expr::Case {
+                        operand,
+                        whens,
+                        else_result,
+                    },
+                ..
+            } => {
+                assert_eq!(operand.as_deref(), Some(&Expr::Ident("id".to_string())));
+                assert_eq!(
+                    whens,
+                    &vec![
+                        (Expr::Number("1".to_string()), Expr::Number("2".to_string())),
+                        (Expr::Number("3".to_string()), Expr::Number("4".to_string())),
+                    ]
+                );
+                assert_eq!(else_result.as_deref(), Some(&Expr::Number("5".to_string())));
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+    }
+
+    /// 単純 CASE の被演算子・比較値は `NULL` リテラルとして解析する（Issue #3279）。
+    #[test]
+    fn simple_case_accepts_null_operand_and_null_when_value() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE NULL WHEN NULL THEN 1 ELSE 2 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("simple CASE with NULL should be accepted");
+        match &select_expr_items(&stmt)[0] {
+            SelectItem::Expr {
+                expr: Expr::Case { operand, whens, .. },
+                ..
+            } => {
+                assert_eq!(operand.as_deref(), Some(&Expr::Null));
+                assert_eq!(whens[0].0, Expr::Null);
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+    }
+
+    /// 括弧付き被演算子（`CASE (id) WHEN ...`）は関数呼び出しと取り違えない。後ろに `WHEN` の無い
+    /// `case(x)` は従来どおり関数呼び出し（列名 `case` の互換）。
+    #[test]
+    fn simple_case_with_parenthesized_operand_is_not_a_call() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE (id + 1) WHEN 2 THEN 1 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("parenthesized operand should parse as a simple CASE");
+        assert!(matches!(
+            &select_expr_items(&stmt)[0],
+            SelectItem::Expr {
+                expr: Expr::Case {
+                    operand: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    /// 構文の不正な単純形は `42601`（fail-closed）。
+    #[test]
+    fn rejects_malformed_simple_case_forms() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            // WHEN の無い形・END の無い形・WHEN 値のカンマ列挙・THEN の無い形。
+            "SELECT CASE id END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1 THEN 2 FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1, 2 THEN 3 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            // 被演算子に比較式は書けない。
+            "SELECT CASE id > 1 WHEN 1 THEN 2 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+        ] {
+            let err = validate_statement(sql, &lookup).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 列名 `case`（`WHEN` を伴わない `CASE`）は従来どおり列参照として読む（後方互換）。
+    #[test]
+    fn column_named_case_is_still_a_column_reference() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT case, case + 1 FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("column named case should remain accepted");
+        let items = select_expr_items(&stmt);
+        assert!(
+            matches!(
+                &items[0],
+                SelectItem::Column(name) if name == "case"
+            ) || matches!(
+                &items[0],
+                SelectItem::Expr { expr: Expr::Ident(name), .. } if name == "case"
+            )
+        );
+    }
+
+    /// 検索形 CASE の結果式にある列名 `case` の直後に演算子があっても、外側の `WHEN` まで
+    /// 先読みして単純形と取り違えない（Issue #3279 のレビュー指摘。従来どおり受理）。
+    #[test]
+    fn searched_case_result_may_use_column_named_case_with_operator() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "SELECT CASE WHEN id = 1 THEN case + 1 WHEN id = 2 THEN 0 ELSE 0 END \
+                   FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10";
+        let stmt = validate_statement(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(matches!(
+            &select_expr_items(&stmt)[0],
+            SelectItem::Expr {
+                expr: Expr::Case { operand: None, .. },
+                ..
+            }
+        ));
+    }
+
+    /// 括弧内の列名 `case` は入れ子の CASE と取り違えない（Issue #3279 のレビュー指摘）。
+    #[test]
+    fn simple_case_operand_may_mention_column_named_case_or_end() {
+        let lookup = catalog_with(&["documents"]);
+        for operand in ["(case)", "vec_norm(case)", "(end)", "(case + end)"] {
+            let sql = format!(
+                "SELECT CASE {operand} WHEN 1 THEN 2 END FROM documents \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+            );
+            let stmt = validate_statement(&sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(
+                matches!(
+                    &select_expr_items(&stmt)[0],
+                    SelectItem::Expr {
+                        expr: Expr::Case {
+                            operand: Some(_),
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    /// 単純 CASE の分岐数の上限は検索形と同じ（`54000`）。
+    #[test]
+    fn simple_case_branch_count_is_bounded() {
+        let lookup = catalog_with(&["documents"]);
+        let mut sql = String::from("SELECT CASE id");
+        for i in 0..=MAX_CASE_BRANCHES {
+            sql.push_str(&format!(" WHEN {i} THEN {i}"));
+        }
+        sql.push_str(" END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10");
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

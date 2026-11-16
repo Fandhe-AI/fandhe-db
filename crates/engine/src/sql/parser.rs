@@ -1754,6 +1754,17 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Time),
+        // interval は列束縛と同じ検査（書式不正 22007・フィールドあふれ 22015・範囲外 22008・
+        // infinity 0A000）を経てから格納する（Issue #3234）。
+        E::Interval => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::Interval, raw)? {
+                Value::Interval(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "interval array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Interval),
         // `BIT(n)[]`（Issue #3235）。各要素はスカラー BIT 列と同じ束縛（文字種違反 `22P02`・長さ
         // 不一致 `22026`。空白詰めはしない）。非 NULL 要素数 × 要素バイト幅が配列ペイロード上限を
         // 超えるなら確保前に `54000` にする（巨大 `n` × 多要素の DoS 防止）。
@@ -1774,6 +1785,17 @@ fn convert_array_elements(
             })
             .map(ArrayValue::Bit)
         }
+        // timestamptz は列束縛と同じ検査（offset 無しはセッション TimeZone で解釈・範囲外 22008・
+        // 書式不正 22007・未知の TZ 名 22023）を経てから格納する（Issue #3233）。
+        E::TimestampTz => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::TimestampTz, raw)? {
+                Value::TimestampTz(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "timestamptz array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::TimestampTz),
         E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
             Value::Uuid(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
@@ -3309,6 +3331,26 @@ fn bind_where_predicates_recursive(
     rewrite_total: &mut usize,
     allow_text_range_rewrite: bool,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    // 行値比較（SQL-9・Issue #3256）: 束縛の前に既存の述語（比較葉・`Or`・連言）へ展開し、以降は
+    // 通常の比較と同じ書き換え・束縛を通す（`sql::row_compare`）。`Or` 分岐は再帰でここへ戻る。
+    // 展開で生成した述語は元テキストの等価述語として数えられていない（`sql::params` のダミーフラグは
+    // 元トークン列の走査）ため、`equality_ordinal` を消費させず末尾で別カウンタ・空フラグで束縛する。
+    let lowered;
+    let mut generated: Vec<WherePredicate> = Vec::new();
+    let where_predicates: &[WherePredicate] = if where_predicates.iter().any(|p| {
+        matches!(
+            p,
+            WherePredicate::RowCompare { .. } | WherePredicate::Not(_)
+        )
+    }) {
+        let (kept, produced) =
+            crate::sql::row_compare::lower_top_level(where_predicates, node_budget)?;
+        lowered = kept;
+        generated = produced;
+        &lowered
+    } else {
+        where_predicates
+    };
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
     let mut expr_filters = Vec::new();
@@ -3446,14 +3488,12 @@ fn bind_where_predicates_recursive(
                     )?);
                 }
             }
-            // 行値比較 `(a, b) <op> (c, d)`（SQL-9・Issue #3255）: 構文段は受理するが、評価
-            // （辞書式・三値論理）は #3256 の担当のため、それまでは束縛段のこの単一ゲートで `0A000`
-            // にして止める（fail-closed。式述語・RLS 述語との組み合わせでも評価経路へ流さない）。
-            // tracked: #3256
+            // 行値比較（SQL-9・Issue #3256）は関数先頭で `sql::row_compare` が既存の述語木へ展開済みで、
+            // ここへは届かない。届いたら不変条件違反として fail-closed にする。
             WherePredicate::RowCompare { .. } => {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "row value comparison is not supported yet",
-                ));
+                return Err(SqlSurfaceError::Internal {
+                    detail: "row comparison reached binding unlowered".to_string(),
+                });
             }
             WherePredicate::Expression(expr) => {
                 // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの単純比較は宣言的
@@ -3585,11 +3625,33 @@ fn bind_where_predicates_recursive(
             }
         }
     }
-    let metadata_filters = declarative_filter::bind_all_for_describe(
+    let mut metadata_filters = declarative_filter::bind_all_for_describe(
         &declarative_filters,
         schema,
         &filter_skip_enum_validation,
     )?;
+    if !generated.is_empty() {
+        let mut gen_ordinal = 0usize;
+        let (gen_meta, gen_expr, _gen_rls, gen_or) = bind_where_predicates_recursive(
+            &generated,
+            schema,
+            udfs,
+            node_budget,
+            &[],
+            &mut gen_ordinal,
+            rewrite_total,
+            allow_text_range_rewrite,
+        )?;
+        // 展開葉は別呼び出しで束縛するため `bind_all_for_describe` の件数検査は各呼び出し単位になる。
+        // 合算が `MAX_METADATA_FILTERS` を超えるなら結合前に `54000` で拒否する（無制限 `Vec` 成長の
+        // DoS 防止・fail-closed）。
+        declarative_filter::check_filter_count(
+            metadata_filters.len().saturating_add(gen_meta.len()),
+        )?;
+        metadata_filters.extend(gen_meta);
+        expr_filters.extend(gen_expr);
+        or_filters.extend(gen_or);
+    }
     Ok((
         metadata_filters,
         expr_filters,
@@ -9186,7 +9248,7 @@ fn resolve_string_agg_input(
 ///
 /// - 裸の列: 列の値をネイティブに複製する（`bigint` を f64 へ落とさない）。対応する型は
 ///   text・varchar・boolean・integer・bigint・real・double・date・timestamp・uuid・
-///   numeric(p,s)・bytea・json・jsonb。smallint・char(n)・time・timestamptz・interval・vector・
+///   numeric(p,s)・bytea・json・jsonb。smallint・char(n)・time・interval 以外の timestamptz・vector・
 ///   配列・ENUM と疑似列 `id` は `0A000`（fail-closed。`char(n)` を text 配列へ黙って変換しない）
 /// - それ以外の式: `ARRAY[<式>]` の 1 要素と同じ型規則（[`crate::sql::udf_call::bind_array_agg_element`]）
 fn bind_array_agg_value(
@@ -9234,9 +9296,9 @@ fn bind_array_agg_value(
             ColumnType::Jsonb => ArrayElemType::Jsonb,
             ColumnType::SmallInt => ArrayElemType::SmallInt,
             ColumnType::Time => ArrayElemType::Time,
+            ColumnType::Interval => ArrayElemType::Interval,
+            ColumnType::TimestampTz => ArrayElemType::TimestampTz,
             ColumnType::Bpchar(_)
-            | ColumnType::TimestampTz
-            | ColumnType::Interval
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
@@ -9310,6 +9372,15 @@ fn resolve_array_agg_input(
         node_budget,
         item.func.default_alias(),
     )?;
+    // TIMESTAMPTZ の JSON 化は未対応。確定時の XX000 ではなく束縛時に 0A000 で拒否する（Issue #3233）。
+    if !matches!(output, ArrayAggOutput::Array) && elem == ArrayElemType::TimestampTz {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "{} over timestamptz is not supported yet",
+                item.func.default_alias()
+            ),
+        });
+    }
     let orders_by_value = item.distinct || item.order_by.iter().any(|k| k.expr == *value_expr);
     if orders_by_value {
         match elem {
@@ -9333,6 +9404,14 @@ fn resolve_array_agg_input(
                         .to_string(),
                 })
             }
+            // スカラー INTERVAL の式キーによる並べ替えは未対応（`order_kind_for_expr_type`）。
+            // 配列要素も同じ側に置き、キー束縛段より前に分かりやすく拒否する（Issue #3234）。
+            ArrayElemType::Interval => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "DISTINCT or ORDER BY over interval in array_agg is not supported yet"
+                        .to_string(),
+                })
+            }
             // 比較・順序づけに支障のない要素型。要素型の追加時に判断を強制する（Issue #3229）。
             ArrayElemType::Text
             | ArrayElemType::Varchar(_)
@@ -9346,6 +9425,7 @@ fn resolve_array_agg_input(
             | ArrayElemType::Date
             | ArrayElemType::Timestamp
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Uuid
             | ArrayElemType::Numeric { .. }
             | ArrayElemType::Jsonb
@@ -9992,7 +10072,12 @@ pub(crate) fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -
             lhs: Box::new(f(lhs)),
             rhs: Box::new(f(rhs)),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|o| Box::new(f(o))),
             whens: whens.iter().map(|(c, r)| (f(c), f(r))).collect(),
             else_result: else_result.as_ref().map(|e| Box::new(f(e))),
         },
@@ -12389,7 +12474,14 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(c, out);
             }
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_idents(operand, out);
+            }
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
                 collect_expr_idents(result, out);
@@ -13424,7 +13516,15 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: match operand {
+                Some(o) => Some(Box::new(rec(o)?)),
+                None => None,
+            },
             whens: whens
                 .iter()
                 .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
@@ -14710,6 +14810,47 @@ mod tests {
             &crate::sql::udf_call::UdfRegistry::default(),
         )
         .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// 元の等値条件 `plain` 件＋行値比較 `(lang, body) = (..)`（等価 2 葉へ展開）の述語削除を束縛する
+    /// （Issue #3256。展開葉は別呼び出しで束縛されるため、合算の件数上限を検査する）。
+    fn bind_delete_with_row_compare(plain: usize) -> Result<BoundPredicateDelete, SqlSurfaceError> {
+        use crate::sql::udf_call::Expr;
+        let mut where_predicates: Vec<WherePredicate> = (0..plain)
+            .map(|i| WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: format!("v{i}"),
+            })
+            .collect();
+        where_predicates.push(WherePredicate::RowCompare {
+            lhs: vec![
+                Expr::Ident("lang".to_string()),
+                Expr::Ident("body".to_string()),
+            ],
+            op: crate::sql::udf_call::ArrayCmpOp::Eq,
+            rhs: vec![Expr::String("a".to_string()), Expr::String("b".to_string())],
+        });
+        let stmt = ValidatedPredicateDelete {
+            table_name: "documents".to_string(),
+            where_predicates,
+            operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
+            partitioned: None,
+        };
+        bind_predicate_delete(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn row_compare_expansion_counts_toward_metadata_filter_limit() {
+        let max = crate::declarative_filter::MAX_METADATA_FILTERS;
+        // 元 254 件＋展開 2 件 = 上限ちょうど（受理）、元 255 件＋展開 2 件 = 257（拒否）。
+        assert!(bind_delete_with_row_compare(max - 2).is_ok());
+        let err = bind_delete_with_row_compare(max - 1).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 
