@@ -390,3 +390,102 @@ fn ip_hnsw_path_keeps_tenant_boundary() {
         assert!(!l.contains(&HNSW_ROWS.to_string()), "{l}");
     }
 }
+/// 一致契約（Issue #3304）: HNSW 結果に含まれる行の距離値は厳密全走査とビット一致し、
+/// 並びは距離昇順・同点は id 昇順になる。
+#[test]
+fn hnsw_distances_are_bit_identical_to_exact_scan() {
+    let (baseline, _g0, _) = core_with_two_tenants("sql33-ip-bit-base", HnswScope::Declared);
+    let (core, _g, vb) = core_with_two_tenants("sql33-ip-bit", HnswScope::Declared);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    for qi in 0..5 {
+        let sql = format!(
+            "SELECT id FROM docs ORDER BY embedding <#> '{}' LIMIT 20",
+            vec_literal(&vb[qi * 13])
+        );
+        let (exact, _) = run(&baseline, "tenant-b", &sql);
+        let (got, consulted) = run(&core, "tenant-b", &sql);
+        assert!(consulted > 0);
+        let exact_score: std::collections::BTreeMap<u64, u64> = exact
+            .rows
+            .iter()
+            .map(|r| (r.id, r.score.to_bits()))
+            .collect();
+        for r in &got.rows {
+            if let Some(bits) = exact_score.get(&r.id) {
+                assert_eq!(r.score.to_bits(), *bits, "id {}", r.id);
+            }
+        }
+        assert!(got
+            .rows
+            .windows(2)
+            .all(|w| w[0].score < w[1].score || (w[0].score == w[1].score && w[0].id < w[1].id)));
+    }
+}
+
+/// 全成分 0 のクエリは全行が同点のため全走査へ縮退し、宣言なしの厳密結果（id 昇順の先頭 k 件）と完全一致する。
+#[test]
+fn zero_query_matches_exact_scan() {
+    let (baseline, _g0, _) = core_with_two_tenants("sql33-ip-zero-base", HnswScope::Declared);
+    let (core, _g, _) = core_with_two_tenants("sql33-ip-zero", HnswScope::Declared);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let sql = knn_ip_sql(&[0.0; DIM as usize]);
+    let (exact, _) = run(&baseline, "tenant-b", &sql);
+    let (got, consulted) = run(&core, "tenant-b", &sql);
+    assert!(consulted > 0);
+    assert_eq!(got, exact);
+    assert!(core.hnsw_index_cache_stats().fallbacks > 0);
+}
+
+/// 内積がオーバーフローするクエリでも、宣言あり・なしで結果（またはエラーの SQLSTATE）が一致する。
+#[test]
+fn overflowing_query_matches_exact_scan() {
+    let (baseline, _g0, _) = core_with_two_tenants("sql33-ip-ovf-base", HnswScope::Declared);
+    let (core, _g, _) = core_with_two_tenants("sql33-ip-ovf", HnswScope::Declared);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let sql = knn_ip_sql(&[3.0e38; DIM as usize]);
+    let want = baseline.execute_sql(&ctx("tenant-b"), &sql);
+    let got = core.execute_sql(&ctx("tenant-b"), &sql);
+    match (want, got) {
+        (Ok(w), Ok(g)) => assert_eq!(g, w),
+        (Err(w), Err(g)) => assert_eq!(g.wire_code(), w.wire_code()),
+        (w, g) => panic!("diverged: exact={w:?} hnsw={g:?}"),
+    }
+}
+
+/// cosine と ip の両方を宣言した表: `index=` は宣言名の列挙（現行規則）、`<#>` は `metric=ip`、`<=>` は `metric=cosine`。
+#[test]
+fn explain_with_both_declarations_reports_query_metric() {
+    let (core, _g, vb) = core_with_two_tenants("sql33-ip-both", HnswScope::Declared);
+    ddl(&core, "CREATE INDEX idx_cos ON docs USING hnsw (embedding)");
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let lines = explain_lines(&core, "tenant-b", &knn_ip_sql(&vb[0]));
+    assert_eq!(
+        line(&lines, "ann_plan: "),
+        "ann_plan: hnsw_full_visible index=idx_cos,idx_ip"
+    );
+    assert!(
+        line(&lines, "hnsw_params: ").contains("metric=ip,"),
+        "{lines:?}"
+    );
+    let cos = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 5",
+        vec_literal(&vb[0])
+    );
+    let lines = explain_lines(&core, "tenant-b", &cos);
+    assert!(
+        line(&lines, "hnsw_params: ").contains("metric=cosine,"),
+        "{lines:?}"
+    );
+}
