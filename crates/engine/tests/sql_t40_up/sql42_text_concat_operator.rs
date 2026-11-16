@@ -4,7 +4,7 @@
 //! 未対応の組の fail-closed・jsonb `||` の不変・テナント境界を固定する。
 //! 非 text オペランドの暗黙連結は兄弟 Issue #3278、拒否 SQLSTATE の統一は #3277 の担当。
 
-use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
@@ -92,6 +92,15 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
                 ColumnDef::new("ch", ColumnType::Bpchar(5), true),
                 ColumnDef::new("n", ColumnType::Integer, true),
                 ColumnDef::new("docb", ColumnType::Jsonb, true),
+                ColumnDef::new("doc", ColumnType::Json, true),
+                ColumnDef::new(
+                    "ai",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Integer, engine::catalog::MAX_ARRAY_ELEMENTS)
+                            .expect("array type"),
+                    ),
+                    true,
+                ),
             ],
         ))
         .expect("create table");
@@ -204,24 +213,163 @@ fn result_length_limit_rejected_with_54000() {
     assert_eq!(one(&r).map(|v| v.len()), Some(4_194_304));
 }
 
+/// 構文・名前解決の拒否（型の組の分類とは別段）。
 #[test]
-fn unsupported_pairs_stay_fail_closed() {
+fn syntax_and_name_errors_keep_their_codes() {
     let (core, ctx, _g) = setup();
-    // 非 text の暗黙連結は #3278、コードの統一は #3277。ここでは拒否のままであることだけを固定する。
-    for sql in [
-        "SELECT lang || 1 FROM t",
-        "SELECT docb || lang FROM t",
-        "SELECT lang || FROM t",
-        "SELECT lang || nope_col FROM t",
-    ] {
-        let c = code(&core, &ctx, sql);
-        assert!(
-            ["0A000", "42883", "42601", "42703"].contains(&c.as_str()),
-            "{sql} -> {c}"
-        );
-    }
     assert_eq!(code(&core, &ctx, "SELECT lang || FROM t"), "42601");
     assert_eq!(code(&core, &ctx, "SELECT lang || nope_col FROM t"), "42703");
+    // 反対側の束縛エラーは型の組の判定より先に出る（json 列が左でも `42703`）。
+    assert_eq!(code(&core, &ctx, "SELECT doc || nope_col FROM t"), "42703");
+    assert_eq!(code(&core, &ctx, "SELECT docb || nope_col FROM t"), "42703");
+    assert_eq!(code(&core, &ctx, "SELECT docb || '{' FROM t"), "22P02");
+}
+
+/// PG に演算子が無い組は、被演算子の形（リテラル・列・CAST・json 列の左右）・句の位置
+/// （FROM なし・通常投影・集計リスト・WHERE の式）によらず `42883` に揃う（Issue #3277）。
+#[test]
+fn pairs_without_an_operator_are_42883_in_every_shape() {
+    let (core, ctx, _g) = setup();
+    let wrap = |expr: &str| {
+        [
+            format!("SELECT {expr}"),
+            format!("SELECT {expr} FROM t"),
+            format!("SELECT {expr}, count(*) FROM t GROUP BY lang"),
+            format!("SELECT lang FROM t WHERE ({expr}) IS NOT NULL"),
+        ]
+    };
+    for expr in [
+        "1 || 2",
+        "CAST(1 AS int) || CAST(2 AS int)",
+        "CAST('{}' AS json) || CAST(1 AS int)",
+        "CAST('{}' AS jsonb) || CAST(1 AS int)",
+        "CAST('{}' AS jsonb) || CAST('{}' AS json)",
+        "CAST('{}' AS json) || CAST('{}' AS json)",
+    ] {
+        for sql in wrap(expr) {
+            assert_eq!(code(&core, &ctx, &sql), "42883", "{sql}");
+        }
+    }
+    for sql in [
+        "SELECT n || n FROM t",
+        "SELECT docb || n FROM t",
+        "SELECT docb || doc FROM t",
+        "SELECT doc || docb FROM t",
+        "SELECT doc || doc FROM t",
+        "SELECT doc || n FROM t",
+        "SELECT n || CAST('a' AS bytea) FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+}
+
+/// text と非 text の組は、リテラル・列・CAST の形によらず `0A000`（暗黙連結は #3278）。
+// tracked: #3278
+#[test]
+fn text_with_non_text_is_0a000_in_every_shape() {
+    let (core, ctx, _g) = setup();
+    let wrap = |expr: &str| {
+        [
+            format!("SELECT {expr}"),
+            format!("SELECT {expr} FROM t"),
+            format!("SELECT {expr}, count(*) FROM t GROUP BY lang"),
+            format!("SELECT lang FROM t WHERE ({expr}) IS NOT NULL"),
+        ]
+    };
+    for expr in [
+        "'a' || 1",
+        "1 || 'a'",
+        "CAST('a' AS text) || 1",
+        "CAST(1 AS int) || CAST('a' AS text)",
+    ] {
+        for sql in wrap(expr) {
+            assert_eq!(code(&core, &ctx, &sql), "0A000", "{sql}");
+        }
+    }
+    for sql in [
+        "SELECT lang || 1 FROM t",
+        "SELECT n || lang FROM t",
+        "SELECT docb || lang FROM t",
+        "SELECT lang || docb FROM t",
+        "SELECT doc || lang FROM t",
+        "SELECT lang || doc FROM t",
+        "SELECT doc || '{}' FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+}
+
+/// 配列・vector の `||` は PG／pgvector にあるが未実装のため `0A000`（fail-closed）。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列・bytea・vector・bit の行）を参照。
+#[test]
+fn array_and_vector_concat_stay_0a000() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT ARRAY[1] || '{2}'",
+        "SELECT ARRAY[1] || ARRAY[2]",
+        "SELECT 'x' || ARRAY[1]",
+        "SELECT lang || ARRAY[1] FROM t",
+        "SELECT ARRAY[1] || n FROM t",
+        "SELECT embedding || embedding FROM t",
+        "SELECT embedding || lang FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+}
+
+/// 拒否の SQLSTATE と文言は静的な型だけで決まり、他テナントの行の有無で変わらない。
+#[test]
+fn rejection_does_not_depend_on_other_tenants_rows() {
+    let (core, ctx, _g) = setup();
+    let err = |ctx: &PolicyContext, sql: &str| match run_opt(&core, ctx, sql) {
+        Ok(o) => panic!("{sql:?} should be rejected, got {o:?}"),
+        Err(e) => (e.wire_code().to_string(), format!("{e:?}")),
+    };
+    // t3 は行を持たない（空の表）。t1・t2 は行を持つ。
+    for sql in [
+        "SELECT lang || 1 FROM t",
+        "SELECT n || n FROM t",
+        "SELECT doc || n FROM t",
+    ] {
+        let base = err(&ctx, sql);
+        assert_eq!(err(&ctx_for("t2"), sql), base, "{sql}");
+        assert_eq!(err(&ctx_for("t3"), sql), base, "{sql}");
+        assert!(!base.1.contains("secret"), "{sql}: {}", base.1);
+    }
+}
+
+/// 集計 SELECT リストで文字列リテラルから始まる `||` も式として読める（Issue #3277）。
+#[test]
+fn aggregate_list_item_may_start_with_a_string_literal_concat() {
+    let (core, ctx, _g) = setup();
+    let r = run(
+        &core,
+        &ctx,
+        "SELECT 'x' || lang, count(*) FROM t GROUP BY lang",
+    );
+    let mut got: Vec<Option<String>> = r
+        .rows
+        .iter()
+        .map(|row| match &row.cells[0] {
+            Cell::Text(s) => Some(s.clone()),
+            Cell::Null => None,
+            other => panic!("unexpected cell {other:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![None, s("xen"), s("xja")]);
+    // 他テナントの値は出ない。
+    assert!(!got.iter().flatten().any(|v| v.contains("secret")));
+    // GROUP BY に無い列を使う形は従来どおり拒否される。
+    assert_eq!(
+        code(
+            &core,
+            &ctx,
+            "SELECT 'x' || body, count(*) FROM t GROUP BY lang"
+        ),
+        "42803"
+    );
 }
 
 #[test]

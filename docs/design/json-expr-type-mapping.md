@@ -93,8 +93,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （存在しないパスは変化なし）。スカラーからの削除・オブジェクトへの添字削除・スカラー根への `#-`・
   配列の段の非整数パス要素は `22023`。
 - 型規則: `||` は両辺 jsonb（型なし文字列リテラルは反対側が jsonb のとき jsonb として解釈）。
-  文字列連結に当たる組（text 同士・`json` 列・jsonb と text）は `0A000`、jsonb と数値などは
-  `42883`。`-`・`#-` の左辺は jsonb のみで、`json` 列は `42883`。`- integer` は int4 式のみ。
+  拒否する組の SQLSTATE は「Issue #3277 での変更」の分類表に従う。`-`・`#-` の左辺は jsonb のみで、`json` 列は `42883`。`- integer` は int4 式のみ。
   `#-` の右辺は text[] リテラルのみ（それ以外は `0A000`）。
 - 結果は正規化して上限（長さ・深さ・要素数）を再検証し、超過は `54000`。
 - DML の content hash はタグ 12 の下位種別 10（`||`）・11（`#-`）を追加した
@@ -338,6 +337,33 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 - 対象外: GIN 相当の索引（#2204）、NoSQL filter、`jsonpath` 型の式・列・CAST、`@@` の全文検索版、
   ORDER BY・VIEW 本文での利用（既存の jsonb 述語演算子と同じ受理範囲）。
   期待値は PostgreSQL 17 の挙動に合わせたが、実機との突き合わせは未実施。
+
+## Issue #3277 での変更（`||` の拒否 SQLSTATE の統一）
+
+`||` の型の組が連結に束縛できないときの SQLSTATE を、被演算子の形（リテラル・列・CAST・json 列の左右）と
+句の位置（FROM なし・通常投影・集計リスト・WHERE の式）によらず 1 箇所（`udf_call::reject_concat_pair`）で決める
+（SQL-42 ポインタ）。判定は束縛時の静的な型だけで行い、行の値・他テナントの行の有無で結果を変えない。
+PG に演算子が無い組は PG 準拠の `42883`、PG では通るが本実装が未実装の組は fail-closed の `0A000`。
+
+| 被演算子の組 | 結果 |
+| ------------ | ---- |
+| text × text（型なしリテラル・裸の NULL を含む） | text 連結（#3276） |
+| jsonb × jsonb、jsonb × 型なしリテラル | jsonb 連結（不変） |
+| 配列を含む組 | `0A000`（PG の配列連結。未実装） |
+| text × 非 text（json・数値・bytea・vector 等）とその逆 | `0A000`（暗黙連結。追跡: #3278） |
+| bytea × bytea、vector × vector、bit × bit | `0A000`（PG／pgvector にある連結演算子。未実装） |
+| 上記以外（数値 × 数値、jsonb × json、json × json、json × 数値、bytea × 数値 等） | `42883`（PG に演算子が無い） |
+
+- エラーの優先順位は「左の被演算子の束縛エラー → 右の被演算子の束縛エラー → 型の組の分類」。
+  json 列を左に置いても、右の未知の列は `42703`
+- 配列・bytea・vector・bit の `0A000` は設計上の対象外（fail-closed）で、実装は別の対応になる。
+  テストの `intentional:` 注記はこの節を根拠にする
+- 構文段の補正: 集計 SELECT リストで文字列リテラルから始まる `'x' || col` を式として読む
+  （従来は直後が `::` のときだけで、`42601` になっていた）
+- 文言: `42883` は `operator does not exist: the operand types do not match the || operator`、
+  `0A000` は `the || operator is not supported for these operand types`。値・列の中身は含めない
+- 対象外: WHERE の構造葉・`UPDATE SET`・`INSERT VALUES`・LIKE／正規表現のパターン位置などリテラル始まりの
+  `||` が構文段で拒否される文脈、配列列の式内参照（`22000`）。いずれも本 Issue では変えない
 
 ## 設計判断の所在
 

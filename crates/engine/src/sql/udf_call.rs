@@ -8108,37 +8108,86 @@ fn bind_json_access(
     ))
 }
 
-/// `||` の jsonb オペランドを束縛する。`json` 列は PostgreSQL では text 連結になるが
-/// 本実装に文字列連結は無いため `0A000`（fail-closed）。それ以外は通常の式として束縛する。
+/// `||` のオペランドを通常の式として束縛する（`json` 列・json 値も拒否せず型を返す）。
+/// 型の組の可否は束縛後に [`reject_concat_pair`] が静的な型だけで決める。ここで json を先に
+/// 弾くと、反対側の束縛エラー（`42703` 等）より前に `0A000` が出て、PG の演算子解決順
+/// （被演算子の解決 → 演算子の有無）とずれる（Issue #3277・SQL-42）。
 fn bind_json_concat_operand(
     expr: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    if let Expr::Ident(name) = expr {
-        if !env.params.contains_key(name.to_ascii_lowercase().as_str()) {
-            let is_json_column = env.schema.is_some_and(|sc| {
-                sc.columns
-                    .iter()
-                    .any(|c| &c.name == name && matches!(c.ty, ColumnType::Json))
-            });
-            if is_json_column {
-                return Err(concat_not_supported());
-            }
-        }
-    }
-    // json 値（関数結果・パス演算子の結果）も json 列と同じく text 連結に当たるため `0A000`
-    // に揃える（PR #2390 指摘。型で 42883／0A000 が割れないようにする）。
-    let (bound, ty) = bind_expr_any(expr, env, node_budget)?;
-    if ty == ExprType::JsonText {
-        return Err(concat_not_supported());
-    }
-    Ok((bound, ty))
+    bind_expr_any(expr, env, node_budget)
 }
 
-fn concat_not_supported() -> SqlSurfaceError {
-    SqlSurfaceError::FeatureNotSupported {
-        detail: "the || operator is only supported on jsonb operands".to_string(),
+/// `||` の被演算子の分類（Issue #3277・SQL-42）。[`reject_concat_pair`] の入力。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConcatClass {
+    /// text／varchar／bpchar・型なし文字列リテラル・裸の NULL。
+    Text,
+    /// jsonb。
+    Jsonb,
+    /// json（原文保持）。
+    JsonText,
+    /// 配列。
+    Array,
+    /// bytea。
+    Bytea,
+    /// vector。
+    Vector,
+    /// bit。
+    Bit,
+    /// 上記以外のスカラー（数値・bool・日時・interval・uuid 等）。
+    Other,
+}
+
+/// 束縛済みの式型を `||` の被演算子の分類へ写す。`ExprType` に variant が増えたら
+/// コンパイルエラーにして、未知の型を通す側へ倒さない。
+fn concat_class(ty: ExprType) -> ConcatClass {
+    match ty {
+        ExprType::Text => ConcatClass::Text,
+        ExprType::Json => ConcatClass::Jsonb,
+        ExprType::JsonText => ConcatClass::JsonText,
+        ExprType::Array => ConcatClass::Array,
+        ExprType::Bytea => ConcatClass::Bytea,
+        ExprType::Vector => ConcatClass::Vector,
+        ExprType::Bit => ConcatClass::Bit,
+        ExprType::Scalar
+        | ExprType::Bool
+        | ExprType::Date
+        | ExprType::Timestamp
+        | ExprType::Time
+        | ExprType::TimestampTz
+        | ExprType::Interval
+        | ExprType::Numeric
+        | ExprType::Uuid => ConcatClass::Other,
+    }
+}
+
+/// `||` で連結に束縛できなかった型の組の拒否 SQLSTATE を 1 箇所で決める
+/// （Issue #3277・SQL-42。分類表は `docs/design/json-expr-type-mapping.md`）。
+/// PG が受理するが本実装が未実装の組は `0A000`、PG に演算子が無い組は `42883`。
+/// 判定は束縛時の静的な型だけで行い、行の値・他テナントの有無で結果を変えない。
+/// 兄弟 Issue #3278（非 text の暗黙連結）は、ここの `Text × 非 Text` 行を連結へ置き換える。
+fn reject_concat_pair(l: ConcatClass, r: ConcatClass) -> SqlSurfaceError {
+    use ConcatClass::*;
+    let unimplemented_pair = match (l, r) {
+        // PG の配列の `||`（TABLE-35）。未実装。
+        (Array, _) | (_, Array) => true,
+        // PG の `anynonarray || text`（非 text の暗黙連結。#3278）。
+        (Text, other) | (other, Text) => other != Text,
+        // bytea／vector／bit 同士の連結演算子は PG／pgvector にあるが未実装。
+        (Bytea, Bytea) | (Vector, Vector) | (Bit, Bit) => true,
+        _ => false,
+    };
+    if unimplemented_pair {
+        SqlSurfaceError::FeatureNotSupported {
+            detail: "the || operator is not supported for these operand types".to_string(),
+        }
+    } else {
+        SqlSurfaceError::undefined_function(
+            "operator does not exist: the operand types do not match the || operator".to_string(),
+        )
     }
 }
 
@@ -8207,8 +8256,8 @@ fn try_bind_text_concat(
 }
 
 /// jsonb の連結・パス削除演算子（`||` `#-`。Issue #2181・TABLE-25）の束縛。
-/// `||` は両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として解釈）のみ受理し、
-/// 文字列連結に当たる組は `0A000`、型の合わない組は `42883`。`#-` は左辺 jsonb（`json` 列は
+/// `||` は text 連結（Issue #3276）、両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として
+/// 解釈）のみ受理し、拒否する組の SQLSTATE は [`reject_concat_pair`] が決める（Issue #3277）。`#-` は左辺 jsonb（`json` 列は
 /// `42883`）・右辺 text[] リテラル（NULL 要素は `22004` の分類が未実装のため `0A000`）。
 fn bind_json_modify(
     op: JsonAccessOp,
@@ -8274,51 +8323,30 @@ fn bind_json_modify(
         TextConcatBind::Done(done) => return Ok(done),
         TextConcatBind::Fallback { lhs, rhs } => (lhs, rhs),
     };
-    // `||`。
-    let lhs_is_literal = matches!(lhs, Expr::String(_));
-    let rhs_is_literal = matches!(rhs, Expr::String(_));
-    if lhs_is_literal && rhs_is_literal {
-        return Err(operator_missing());
-    }
-    // 型なしリテラルの反対側の型を確定させる。jsonb ならリテラルを jsonb として解釈、
-    // text なら文字列連結（未実装）、それ以外は演算子なし。束縛済みのオペランドは再束縛しない。
-    let (l_bound, r_bound) = if lhs_is_literal || rhs_is_literal {
-        let (other_expr, other_pre, literal_expr) = if lhs_is_literal {
-            (rhs, pre_r, lhs)
-        } else {
-            (lhs, pre_l, rhs)
-        };
-        let (other, other_ty) = match other_pre {
-            Some(done) => done,
-            None => bind_json_concat_operand(other_expr, env, node_budget)?,
-        };
-        match other_ty {
-            ExprType::Json => {}
-            ExprType::Text => return Err(concat_not_supported()),
-            _ => return Err(operator_missing()),
-        }
-        let lit = bind_json_predicate_literal(literal_expr, node_budget)?;
-        if lhs_is_literal {
-            (lit, other)
-        } else {
-            (other, lit)
-        }
-    } else {
-        let (l, l_ty) = match pre_l {
-            Some(done) => done,
-            None => bind_json_concat_operand(lhs, env, node_budget)?,
-        };
-        let (r, r_ty) = match pre_r {
-            Some(done) => done,
-            None => bind_json_concat_operand(rhs, env, node_budget)?,
-        };
-        match (l_ty, r_ty) {
-            (ExprType::Json, ExprType::Json) => (l, r),
-            (ExprType::Json, ExprType::Text) | (ExprType::Text, ExprType::Json) => {
-                return Err(concat_not_supported())
-            }
-            (ExprType::Json, _) | (_, ExprType::Json) => return Err(operator_missing()),
-            _ => return Err(concat_not_supported()),
+    // `||`（text 連結に束縛できなかった組）。jsonb 同士・jsonb と型なしリテラルだけが jsonb 連結で、
+    // それ以外は静的な型の組から [`reject_concat_pair`] が拒否の SQLSTATE を決める。
+    // 束縛済みのオペランドは再束縛しない。型なしリテラルは葉として扱い、jsonb 側が確定してから束縛する。
+    let is_str = |e: &Expr| matches!(e, Expr::String(_));
+    let l = match pre_l {
+        Some(done) => Some(done),
+        None if is_str(lhs) => None,
+        None => Some(bind_json_concat_operand(lhs, env, node_budget)?),
+    };
+    let r = match pre_r {
+        Some(done) => Some(done),
+        None if is_str(rhs) => None,
+        None => Some(bind_json_concat_operand(rhs, env, node_budget)?),
+    };
+    let (l_bound, r_bound) = match (l, r) {
+        (Some((lb, ExprType::Json)), Some((rb, ExprType::Json))) => (lb, rb),
+        (Some((ob, ExprType::Json)), None) => (ob, bind_json_predicate_literal(rhs, node_budget)?),
+        (None, Some((ob, ExprType::Json))) => (bind_json_predicate_literal(lhs, node_budget)?, ob),
+        (l, r) => {
+            let class_of = |o: &Option<(BoundExpr, ExprType)>| {
+                o.as_ref()
+                    .map_or(ConcatClass::Text, |(_, ty)| concat_class(*ty))
+            };
+            return Err(reject_concat_pair(class_of(&l), class_of(&r)));
         }
     };
     Ok((
