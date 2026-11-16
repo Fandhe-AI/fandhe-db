@@ -252,6 +252,11 @@ pub enum ArrayValue {
     /// variant にして型の区別（OID 1561）を保つ。`n` は値自体では保持せず（空配列・全 NULL 配列から
     /// 復元できない）、正は列宣言の [`ArrayElemType::Bit`] 側にある。
     Bit(Vec<Option<crate::bit_string::BitString>>),
+    /// `INTERVAL[]`（Issue #3234・TABLE-14・TABLE-34）。各要素は月・日・マイクロ秒を独立に持つ
+    /// [`crate::datetime::Interval`]。`Text` と別 variant にして型の区別（OID 1187）を保つ。
+    /// 派生 `PartialEq` は生の三要素の一致（codec の往復用）で、SQL の等価（`1 mon` = `30 days`）は
+    /// [`ArrayValue::equality_payload`] の正規化キーが担う。
+    Interval(Vec<Option<crate::datetime::Interval>>),
     BigInt(Vec<Option<i64>>),
     Real(Vec<Option<f32>>),
     Double(Vec<Option<f64>>),
@@ -455,6 +460,9 @@ impl ArrayValue {
             ArrayValue::Time(items) => bounded(items, dims, max_len, |v| {
                 quote_pg_array_text_elem(&crate::datetime::format_time(*v))
             }),
+            ArrayValue::Interval(items) => bounded(items, dims, max_len, |v| {
+                quote_pg_array_text_elem(&crate::datetime::format_interval(v))
+            }),
             // `0`・`1` だけなので引用は不要。
             ArrayValue::Bit(items) => bounded(items, dims, max_len, |v| v.format_text()),
             ArrayValue::Uuid(items) => bounded(items, dims, max_len, |v| v.to_string()),
@@ -496,6 +504,7 @@ impl ArrayValue {
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => ArrayValue::SmallInt(join(a, b)),
             (ArrayValue::Time(a), ArrayValue::Time(b)) => ArrayValue::Time(join(a, b)),
             (ArrayValue::Bit(a), ArrayValue::Bit(b)) => ArrayValue::Bit(join(a, b)),
+            (ArrayValue::Interval(a), ArrayValue::Interval(b)) => ArrayValue::Interval(join(a, b)),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => ArrayValue::BigInt(join(a, b)),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => ArrayValue::Real(join(a, b)),
             (ArrayValue::Double(a), ArrayValue::Double(b)) => ArrayValue::Double(join(a, b)),
@@ -565,6 +574,10 @@ impl ArrayValue {
             (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Time(a), ArrayValue::Time(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Bit(a), ArrayValue::Bit(b)) => eq(a, i, b, |x, y| x == y),
+            // スカラー INTERVAL と同じ正規化キー（`1 mon` = `30 days`）で比較する。
+            (ArrayValue::Interval(a), ArrayValue::Interval(b)) => eq(a, i, b, |x, y| {
+                crate::datetime::interval_cmp_key(x) == crate::datetime::interval_cmp_key(y)
+            }),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => {
                 eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
@@ -630,6 +643,7 @@ impl ArrayValue {
             ArrayValue::SmallInt(v) => ArrayValue::SmallInt(pick(v, keep)),
             ArrayValue::Time(v) => ArrayValue::Time(pick(v, keep)),
             ArrayValue::Bit(v) => ArrayValue::Bit(pick(v, keep)),
+            ArrayValue::Interval(v) => ArrayValue::Interval(pick(v, keep)),
             ArrayValue::BigInt(v) => ArrayValue::BigInt(pick(v, keep)),
             ArrayValue::Real(v) => ArrayValue::Real(pick(v, keep)),
             ArrayValue::Double(v) => ArrayValue::Double(pick(v, keep)),
@@ -662,6 +676,7 @@ impl ArrayValue {
             ArrayValue::SmallInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Time(v) => map(v, |x| crate::datetime::format_time(*x)),
             ArrayValue::Bit(v) => map(v, |x| x.format_text()),
+            ArrayValue::Interval(v) => map(v, crate::datetime::format_interval),
             ArrayValue::BigInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Real(v) => map(v, |x| crate::scalar_float::format_real(*x)),
             ArrayValue::Double(v) => map(v, |x| crate::scalar_float::format_double(*x)),
@@ -710,6 +725,7 @@ macro_rules! array_dispatch {
             ArrayValue::SmallInt($items) => $body,
             ArrayValue::Time($items) => $body,
             ArrayValue::Bit($items) => $body,
+            ArrayValue::Interval($items) => $body,
             ArrayValue::BigInt($items) => $body,
             ArrayValue::Real($items) => $body,
             ArrayValue::Double($items) => $body,
@@ -762,6 +778,7 @@ impl ArrayValue {
                     .next()
                     .map_or(1, crate::bit_string::BitString::bit_len),
             ),
+            ArrayValue::Interval(_) => ArrayElemType::Interval,
             ArrayValue::BigInt(_) => ArrayElemType::BigInt,
             ArrayValue::Real(_) => ArrayElemType::Real,
             ArrayValue::Double(_) => ArrayElemType::Double,
@@ -816,6 +833,7 @@ impl ArrayValue {
             ArrayValue::SmallInt(v) => cut!(SmallInt, v),
             ArrayValue::Time(v) => cut!(Time, v),
             ArrayValue::Bit(v) => cut!(Bit, v),
+            ArrayValue::Interval(v) => cut!(Interval, v),
             ArrayValue::BigInt(v) => cut!(BigInt, v),
             ArrayValue::Real(v) => cut!(Real, v),
             ArrayValue::Double(v) => cut!(Double, v),
@@ -894,6 +912,9 @@ impl ArrayValue {
                         .saturating_mul(std::mem::size_of::<Option<crate::bit_string::BitString>>()),
                 )
             }
+            ArrayValue::Interval(v) => v
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<crate::datetime::Interval>>()),
             ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::Real(v) => v.len().saturating_mul(std::mem::size_of::<Option<f32>>()),
             ArrayValue::Double(v) => v.len().saturating_mul(std::mem::size_of::<Option<f64>>()),
@@ -931,6 +952,8 @@ impl ArrayValue {
             ArrayValue::Time(_) => 15,
             // Issue #3235 の新規採番（TIMESTAMPTZ・INTERVAL の採番値と重ならない 18）。
             ArrayValue::Bit(_) => 18,
+            // Issue #3234 の新規採番（`constraint::array_elem_tag` と同じ 17）。
+            ArrayValue::Interval(_) => 17,
             // `flat()` は `Multi` を返さない。
             ArrayValue::Multi(_) => {
                 return Err(RowCodecError::Invalid(
@@ -991,6 +1014,14 @@ impl ArrayValue {
                     buf.extend_from_slice(b.as_bytes());
                 }
             }
+            // 行バイトは生の三要素（`1 mon` と `30 days` は別バイト）だが、SQL の等価は同値なので、
+            // 等価ペイロードはスカラー INTERVAL と同じ正規化キー（i128 BE 16 バイト）にする。
+            ArrayValue::Interval(items) => {
+                write_array_null_bitmap(&mut buf, self);
+                for v in items.iter().flatten() {
+                    buf.extend_from_slice(&crate::datetime::interval_cmp_key(v).to_be_bytes());
+                }
+            }
             _ => write_array_elements_payload(&mut buf, self)?,
         }
         Ok(buf)
@@ -1004,6 +1035,7 @@ impl ArrayValue {
             ArrayValue::Numeric(_)
             | ArrayValue::Json(_)
             | ArrayValue::Jsonb(_)
+            | ArrayValue::Interval(_)
             | ArrayValue::Bit(_) => Ok(self.equality_payload()?.len()),
             ArrayValue::Multi(m) => Ok(self
                 .dims_header_len()
@@ -1432,6 +1464,7 @@ impl<'a> ArrayRef<'a> {
             ArrayElemType::Numeric { .. }
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
+            | ArrayElemType::Interval
             | ArrayElemType::Bit(_) => Ok(std::borrow::Cow::Owned(
                 self.to_value()?.equality_payload()?,
             )),
@@ -2094,6 +2127,8 @@ fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
         | ArrayElemType::Timestamp
         | ArrayElemType::Time => Some(8),
         ArrayElemType::Uuid => Some(16),
+        // `INTERVAL`（Issue #3234）: months(i32 LE)・days(i32 LE)・micros(i64 LE) の 16 バイト。
+        ArrayElemType::Interval => Some(16),
         // `BIT(n)`（Issue #3235）: MSB 先頭で `ceil(n / 8)` バイト（詰め物ビットは 0）。
         ArrayElemType::Bit(n) => crate::bit_string::byte_len_for_bits(n),
     }
@@ -2346,6 +2381,7 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
+            | ArrayElemType::Interval
             | ArrayElemType::Bit(_)
             | ArrayElemType::Enum,
             _,
@@ -2515,6 +2551,19 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
         ArrayValue::Uuid(items) => {
             for v in items.iter().flatten() {
                 buf.extend_from_slice(v.as_bytes());
+            }
+        }
+        // 番兵（±infinity の予約値）は永続化させない（fail-closed。値は文言へ反射しない）。
+        ArrayValue::Interval(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_interval(v) {
+                    return Err(RowCodecError::Invalid(
+                        "array INTERVAL element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.months.to_le_bytes());
+                buf.extend_from_slice(&v.days.to_le_bytes());
+                buf.extend_from_slice(&v.micros.to_le_bytes());
             }
         }
         // 幅は列宣言の `n` が決める。要素の長さ照合は [`validate_array_elements`] が担う。
@@ -2820,6 +2869,29 @@ fn decode_array_elements(
             Ok(Uuid::from_bytes(array_le_bytes::<16>(c)?))
         })
         .map(ArrayValue::Uuid),
+        ArrayElemType::Interval => decode_fixed_array_elements(rest, &nulls, 16, |c| {
+            let b = array_le_bytes::<16>(c)?;
+            let (months, rest) = b.split_at(4);
+            let (days, micros) = rest.split_at(4);
+            let v = crate::datetime::Interval {
+                months: i32::from_le_bytes(months.try_into().map_err(|_| {
+                    RowCodecError::Invalid("persisted array INTERVAL element is malformed".into())
+                })?),
+                days: i32::from_le_bytes(days.try_into().map_err(|_| {
+                    RowCodecError::Invalid("persisted array INTERVAL element is malformed".into())
+                })?),
+                micros: i64::from_le_bytes(micros.try_into().map_err(|_| {
+                    RowCodecError::Invalid("persisted array INTERVAL element is malformed".into())
+                })?),
+            };
+            if !crate::datetime::validate_interval(&v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array INTERVAL element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::Interval),
         // `BIT(n)`: 幅は宣言長から決まる。詰め物ビットが非 0 の破損データは `from_parts` が
         // 拒否する（黙って受理しない）。
         ArrayElemType::Bit(n) => {
@@ -8240,6 +8312,115 @@ mod tests {
             decode_array_elements(ArrayElemType::Time, &[0u8, 1, 2, 3, 4, 5, 6, 7], 1, 0),
             Err(RowCodecError::Invalid(_))
         ));
+    }
+
+    /// Issue #3234: `INTERVAL[]` は固定幅 16 バイト（months・days・micros の LE）で往復する
+    /// （NULL 要素・空配列・境界値・2 次元）。番兵・型違い・壊れた幅は encode／decode とも Invalid
+    /// で fail-closed。行バイトは生の三要素だが、等価ペイロードは正規化キー（`1 mon` = `30 days`）。
+    #[test]
+    fn interval_array_roundtrips_with_fixed_sixteen_byte_width() {
+        use crate::datetime::Interval as I;
+        let iv = |months, days, micros| I {
+            months,
+            days,
+            micros,
+        };
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "a",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Interval, 8).expect("ty")),
+                    true,
+                ),
+                ColumnDef::new(
+                    "b",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Interval, 8)
+                            .and_then(|a| a.with_ndims(2))
+                            .expect("ty"),
+                    ),
+                    true,
+                ),
+            ],
+        );
+        let flat = ArrayValue::Interval(vec![
+            Some(iv(i32::MIN, i32::MIN, i64::MIN + 1)),
+            None,
+            Some(iv(i32::MAX, i32::MAX, i64::MAX - 1)),
+            Some(iv(1, -2, 3)),
+        ]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::Interval(vec![
+                Some(iv(0, 1, 0)),
+                Some(iv(0, 2, 0)),
+                Some(iv(0, 3, 0)),
+                Some(iv(0, 4, 0)),
+            ]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::Interval(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        // 要素幅 16 バイトの本文: NULL ビットマップ 1 バイト + 非 NULL 3 要素 x 16 バイト。
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 17);
+        assert_eq!(payload.len(), 1 + 3 * 16);
+        // 型違いは拒否する。
+        let bad = vec![Value::Array(ArrayValue::Time(vec![Some(1)])), Value::Null];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 番兵（±infinity の予約値）は encode で Invalid。
+        for sentinel in [
+            iv(i32::MAX, i32::MAX, i64::MAX),
+            iv(i32::MIN, i32::MIN, i64::MIN),
+        ] {
+            let values = vec![
+                Value::Array(ArrayValue::Interval(vec![Some(sentinel)])),
+                Value::Null,
+            ];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &values),
+                Err(RowCodecError::Invalid(_))
+            ));
+            // 番兵の永続バイト列は decode でも Invalid。
+            let mut body = vec![0u8];
+            body.extend_from_slice(&sentinel.months.to_le_bytes());
+            body.extend_from_slice(&sentinel.days.to_le_bytes());
+            body.extend_from_slice(&sentinel.micros.to_le_bytes());
+            assert!(matches!(
+                decode_array_elements(ArrayElemType::Interval, &body, 1, 0),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+        // 幅 16 の列として壊れた長さ（15 バイト）は復号で Invalid になる。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Interval, &[0u8; 15], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // `1 mon` と `30 days` は等価ペイロードが一致し、行バイト（要素列）は異なる。
+        let month = ArrayValue::Interval(vec![Some(iv(1, 0, 0))]);
+        let days = ArrayValue::Interval(vec![Some(iv(0, 30, 0))]);
+        assert_eq!(
+            month.equality_payload().expect("eq"),
+            days.equality_payload().expect("eq")
+        );
+        assert_ne!(month, days);
+        assert!(month.element_equals(0, &days).expect("eq"));
+        let mut raw_month = Vec::new();
+        let mut raw_days = Vec::new();
+        write_array_elements_payload(&mut raw_month, &month).expect("payload");
+        write_array_elements_payload(&mut raw_days, &days).expect("payload");
+        assert_ne!(raw_month, raw_days);
     }
 
     /// Issue #3235: `BIT(n)[]` は要素ごとに固定幅 `ceil(n / 8)` バイトで往復する（NULL 要素・空配列・

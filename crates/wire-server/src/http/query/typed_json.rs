@@ -289,6 +289,7 @@ pub fn array_literal_text(
                 ArrayElemType::Date
                 | ArrayElemType::Timestamp
                 | ArrayElemType::Time
+                | ArrayElemType::Interval
                 | ArrayElemType::Bit(_)
                 | ArrayElemType::Uuid,
                 JsonValue::String(s),
@@ -358,6 +359,7 @@ pub fn array_literal_text(
                 ArrayElemType::Date
                 | ArrayElemType::Timestamp
                 | ArrayElemType::Time
+                | ArrayElemType::Interval
                 | ArrayElemType::Bit(_)
                 | ArrayElemType::Uuid,
                 _,
@@ -921,6 +923,22 @@ mod tests {
             parse(ArrayElemType::Time, r#"["10:00:00",null,"24:00:00"]"#),
             V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)])
         );
+        assert_eq!(
+            parse(ArrayElemType::Interval, r#"["1 day",null,"2 hours"]"#),
+            V::Interval(vec![
+                Some(engine::datetime::Interval {
+                    months: 0,
+                    days: 1,
+                    micros: 0,
+                }),
+                None,
+                Some(engine::datetime::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 7_200_000_000,
+                }),
+            ])
+        );
         assert!(matches!(
             parse(ArrayElemType::Bit(4), r#"["1010",null,"0101"]"#),
             V::Bit(items) if items.len() == 3 && items[1].is_none()
@@ -945,6 +963,7 @@ mod tests {
             (ArrayElemType::Uuid, JsonValue::Bool(false)),
             (ArrayElemType::Timestamp, num("[]")),
             (ArrayElemType::Time, num("1")),
+            (ArrayElemType::Interval, num("1")),
             (ArrayElemType::Bit(4), num("1010")),
             (ArrayElemType::Bit(4), JsonValue::Bool(true)),
         ] {

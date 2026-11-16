@@ -418,6 +418,7 @@ impl CastType {
             CastType::Date => ArrayElemType::Date,
             CastType::Timestamp => ArrayElemType::Timestamp,
             CastType::Time => ArrayElemType::Time,
+            CastType::Interval => ArrayElemType::Interval,
             CastType::Uuid => ArrayElemType::Uuid,
             CastType::Numeric(Some((precision, scale))) => ArrayElemType::Numeric {
                 precision: *precision,
@@ -430,10 +431,7 @@ impl CastType {
             CastType::Bpchar(n) => ArrayElemType::Bpchar(*n),
             // 対応する要素型が無い CAST 型（束縛段が `0A000` にする）。CastType の追加時・
             // 要素型の追加時にここで対応判断を強制する（Issue #3229）。
-            CastType::Numeric(None)
-            | CastType::TimestampTz
-            | CastType::Interval
-            | CastType::Array(_) => return None,
+            CastType::Numeric(None) | CastType::TimestampTz | CastType::Array(_) => return None,
         })
     }
 
@@ -539,6 +537,7 @@ pub(crate) fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
         ArrayElemType::Date => CastType::Date,
         ArrayElemType::Timestamp => CastType::Timestamp,
         ArrayElemType::Time => CastType::Time,
+        ArrayElemType::Interval => CastType::Interval,
         ArrayElemType::Uuid => CastType::Uuid,
         ArrayElemType::Numeric { precision, scale } => CastType::Numeric(Some((precision, scale))),
         ArrayElemType::Bytea => CastType::Bytea,
@@ -1901,6 +1900,7 @@ mod tests {
             (CastType::Date, ArrayElemType::Date),
             (CastType::Timestamp, ArrayElemType::Timestamp),
             (CastType::Time, ArrayElemType::Time),
+            (CastType::Interval, ArrayElemType::Interval),
             (CastType::Uuid, ArrayElemType::Uuid),
             (
                 CastType::Numeric(Some((10, 2))),
@@ -1920,11 +1920,7 @@ mod tests {
             assert_eq!(arr(elem.clone()).array_elem_type(), Some(want), "{elem:?}");
             assert!(arr(elem).result_column_type().is_some());
         }
-        for elem in [
-            CastType::TimestampTz,
-            CastType::Interval,
-            CastType::Numeric(None),
-        ] {
+        for elem in [CastType::TimestampTz, CastType::Numeric(None)] {
             assert_eq!(arr(elem.clone()).array_elem_type(), None, "{elem:?}");
             assert_eq!(arr(elem).result_column_type(), None);
         }

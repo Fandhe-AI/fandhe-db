@@ -8700,6 +8700,7 @@ fn scalar_numeric_kind(
             | crate::catalog::ArrayElemType::Date
             | crate::catalog::ArrayElemType::Timestamp
             | crate::catalog::ArrayElemType::Time
+            | crate::catalog::ArrayElemType::Interval
             | crate::catalog::ArrayElemType::Uuid
             | crate::catalog::ArrayElemType::Numeric { .. }
             | crate::catalog::ArrayElemType::Bytea
