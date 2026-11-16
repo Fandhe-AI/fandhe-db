@@ -626,16 +626,18 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 応答（`wire_code` `54000`・副作用ゼロ）自体の契約は変わりません。上限を
 指定しない場合でも、既存の SQL 文長上限・1 文あたり総走査行数上限
 （`MAX_SCANNED_ROWS`）は変更されないため、計算量 DoS に対する資源上限は
-引き続き機能します。複数行 `VALUES` は本フラグに加えて一括投入の別上限
-（`batch_limits.max_files_per_batch`。既定 64。Issue #860）も通るため、
-64 行を超える単一の複数行 `VALUES` を受理させるには `--batch-max-files`
-（Issue #1166）または環境変数 `FANDHE_DB_BATCH_MAX_FILES` も併せて引き上げる
-必要があります（`--max-insert-rows` 未指定・既定の上限なし構成でも同様です）。
-`--max-insert-rows` を明示指定し、その値が複数行 `VALUES` の実効上限
-（`max_files_per_batch` と `max_batch_chunks`〔既定 4096。環境変数
-`FANDHE_DB_BATCH_MAX_CHUNKS`〕の小さい方）を超える場合、起動ログへ `WARNING`
-行が 1 行出ます（`--max-insert-rows` 未指定〔既定〕では出ません。詳細:
-`docs/design/predicate-dml-exec.md` §6）。
+引き続き機能します。行の形の一括投入（複数行 `VALUES`・UPSERT・NoSQL `rows[]`・
+`COPY FROM`）の行数は、本フラグ（指定時）に加えて一括投入の別上限
+`batch_limits.max_batch_chunks`（1 行 = 1 チャンク。既定 4096。環境変数
+`FANDHE_DB_BATCH_MAX_CHUNKS`）も通ります。`--batch-max-files`／
+`FANDHE_DB_BATCH_MAX_FILES`（`max_files_per_batch`。既定 64）は行の形に効かない
+（Issue #3308・#3309）ため、実効行数上限は本フラグ（指定時）と
+`max_batch_chunks` の小さい方です。SQL テキストでは、これより先に 1 メッセージ
+1 MiB（`54000`）・SQL のトークン数と文長の上限（`42601`。列数が多いと数千行で
+届きます）が効く場合があります。`--max-insert-rows` を明示指定し、その値が
+`max_batch_chunks` を超える場合、起動ログへ `WARNING` 行が 1 行出ます（引き上げ手段は
+`FANDHE_DB_BATCH_MAX_CHUNKS` のみ案内します。`--max-insert-rows` 未指定〔既定〕では
+出ません。詳細: `docs/design/predicate-dml-exec.md` §6）。
 
 分割実行 DML（Issue #1129。設計: `docs/design/partitioned-dml.md`）は、述語形
 `UPDATE`／`DELETE` の末尾に `USING OPERATION_ID '<id>' PARTITIONED [CHUNK <n>]` を付けると、
@@ -673,9 +675,9 @@ redb トランザクションで DB 内の `change_log` 表へ追記されます
 未指定なら従来どおりの動作です（環境変数なし。範囲外・非数値・値欠落・重複指定は起動エラー）。
 
 `--batch-max-files <N>`（Issue #1166）は `batch_limits.max_files_per_batch`
-（SQL 複数行 `VALUES`・NoSQL `insert` の `rows[]`・ファイル形バッチ・
-`COPY FROM STDIN` が共有する 1 バッチ件数上限。既定 64）をプロセス全体に対して
-起動時に設定します。優先順位は **CLI 明示 > 環境変数 `FANDHE_DB_BATCH_MAX_FILES`
+（ファイル形バッチだけに効く 1 バッチ件数上限。既定 64。複数行 `VALUES`・UPSERT・
+NoSQL `insert` の `rows[]`・`COPY FROM STDIN` には効きません。Issue #3308・#3309）を
+プロセス全体に対して起動時に設定します。優先順位は **CLI 明示 > 環境変数 `FANDHE_DB_BATCH_MAX_FILES`
 > 既定 64** です。指定可能範囲は `1`〜`1,000,000`。範囲外・非数値・値欠落・
 2 回目以降の重複指定は fail-closed で起動エラーです。環境変数側も同じ範囲
 検証を通り、範囲外（上限超過を含む）は既定 64 へ倒れます（従来は 0・非数値のみ

@@ -20733,8 +20733,7 @@ impl EngineCore {
             //
             // INDEX-4 上限も NoSQL 表層と揃える（Issue #860 SQL/NoSQL 機能
             // パリティ。SQL 表層の複数行 VALUES が `self.batch_limits` を迂回して
-            // NoSQL 表層より緩い上限で受理されないようにする）。①（行数上限）・
-            // ②③④（バイト量・チャンク総量）はいずれも [`Self::
+            // NoSQL 表層より緩い上限で受理されないようにする）。②③④（バイト量・チャンク総量）はいずれも [`Self::
             // validate_insert_row_batch_limits`]（`execute_insert_returning_form`
             // の `RowBatch` 分岐と共有）へ委譲する。
             // `sql::parser::MAX_INSERT_ROWS_PER_STATEMENT`（構文解析段階の
@@ -20767,8 +20766,8 @@ impl EngineCore {
             }
             // `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・
             // TASK-193、Issue #872）。複数行 `VALUES` を伴う UPSERT にも
-            // `RowBatch` 分岐と同じ INDEX-4 上限（①行数・②③④バイト量・
-            // チャンク総量）を適用する（SQL/NoSQL 機能パリティの方針を UPSERT
+            // `RowBatch` 分岐と同じ INDEX-4 上限（②③④バイト量・
+            // チャンク総量。①は掛けない）を適用する（SQL/NoSQL 機能パリティの方針を UPSERT
             // にも揃える）。
             crate::sql::parser::BoundInsertForm::Upsert(bound) => {
                 self.validate_upsert_batch_limits(&bound.rows)?;
@@ -20881,7 +20880,7 @@ impl EngineCore {
     }
 
     /// UPSERT（`INSERT ... ON CONFLICT`）の INDEX-4 バッチ上限検査
-    /// （①行数・②③④バイト量・チャンク総量。`RowBatch` と同じ SQL/NoSQL パリティ
+    /// （②③④バイト量・チャンク総量。①は掛けない。`RowBatch` と同じ SQL/NoSQL パリティ
     /// 方針）。[`Self::execute_insert_form`] と
     /// [`Self::execute_insert_returning_form`] の `Upsert` 腕が共有する。
     fn validate_upsert_batch_limits(
