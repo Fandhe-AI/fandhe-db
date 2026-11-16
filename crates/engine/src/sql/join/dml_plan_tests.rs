@@ -201,24 +201,79 @@ fn assert_rejected(sql: &str, code: &str) {
 #[test]
 fn unsupported_shapes_are_rejected_with_feature_not_supported() {
     for sql in [
-        // relation をまたぐ非等値・OR（tracked: #3295）
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n < langs.cnt",
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND (docs.n = '1' OR langs.cnt = '2')",
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang OR docs.n = '1'",
-        // 同じ relation 内の列比較
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.lang = docs.lang",
-        // 畳み込み source でも、対象側の列比較・またぐ非等値は拒否のまま
+        // 畳み込み source（FROM／USING が 2 表以上・JOIN 段あり）では、対象とまたぐ非等値は拒否のまま
         "DELETE FROM docs USING langs, langs AS l2 WHERE docs.lang = langs.lang AND docs.n < l2.cnt",
         "DELETE FROM docs USING langs JOIN langs AS l2 ON langs.lang = l2.lang \
-         WHERE docs.lang = l2.lang AND docs.n = docs.n",
-        // キー化できない型
-        "DELETE FROM docs USING langs WHERE docs.w = langs.w",
+         WHERE docs.lang = l2.lang AND docs.n < l2.cnt",
         // source の疑似列 id・写像できない型を SET の右辺に使う
         "UPDATE docs SET n = langs.id FROM langs WHERE docs.lang = langs.lang",
         "UPDATE docs SET embedding = langs.v FROM langs WHERE docs.lang = langs.lang",
+        // 残余（Issue #3295）の fail-closed: source の疑似列 id・VECTOR 列の参照
+        "DELETE FROM docs USING langs WHERE docs.n < langs.id",
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND (docs.n = 1 OR langs.id = 2)",
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.embedding < langs.v",
     ] {
         assert_rejected(sql, "0A000");
     }
+}
+
+/// 非等値・`OR` をまたぐ述語・キー化できない型の等値・同じ relation 内の列比較は、拒否せず
+/// 残余／押し下げへ振り分ける（Issue #3295）。
+#[test]
+fn non_equi_and_or_shapes_are_planned_as_residual() {
+    // キー無しの非等値はネストループの残余だけで計画できる。
+    let p = del("DELETE FROM docs USING langs WHERE docs.n < langs.cnt").unwrap();
+    assert!(p.keys.is_empty());
+    let r = p.residual.as_ref().expect("residual");
+    assert_eq!(r.source_columns, vec![5]);
+    // 残余が参照する source 列は走査投影の末尾へ載る（SET ビューの添字を動かさない）。
+    assert_eq!(p.scan_columns(), vec![5]);
+
+    let p = del(
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND (docs.n = 1 OR langs.cnt = 2)",
+    )
+    .unwrap();
+    assert_eq!(p.keys, vec![key(Some(1), Some(0))]);
+    assert!(p.residual.is_some());
+
+    let p = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang OR docs.n = 1").unwrap();
+    assert!(p.keys.is_empty());
+    assert_eq!(p.residual.as_ref().unwrap().source_columns, vec![0]);
+
+    // キー化できない型（DOUBLE）の等値は残余へ回る。
+    let p = del("DELETE FROM docs USING langs WHERE docs.w = langs.w").unwrap();
+    assert!(p.keys.is_empty());
+    assert!(p.residual.is_some());
+
+    // 同じ relation 内の列比較は対象側／source 側へ押し下げる。
+    let p =
+        del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.lang = docs.lang")
+            .unwrap();
+    assert_eq!(p.keys.len(), 1);
+    assert!(p.residual.is_none());
+    assert_eq!(target_filter_count(&p), 1);
+
+    // DML 専用の葉: 数値リテラル・IS [NOT] NULL は対象側・source 側へ押し下げる。
+    let p = del(
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n > 5 \
+         AND langs.label IS NULL AND docs.w IS NOT NULL",
+    )
+    .unwrap();
+    assert!(p.residual.is_none());
+    assert_eq!(target_filter_count(&p), 2);
+    assert_eq!(p.source.where_predicates.len(), 1);
+}
+
+/// SET を持つ UPDATE でも残余の source 列は SET／キー列の後ろへ追記される。
+#[test]
+fn residual_columns_follow_set_columns() {
+    let p = upd(
+        "UPDATE docs SET n = langs.cnt FROM langs WHERE docs.n < langs.cnt AND docs.w < langs.w",
+    )
+    .unwrap();
+    assert_eq!(p.source_columns(), vec![5]);
+    assert_eq!(p.scan_columns(), vec![5, 3]);
+    assert!(p.keys.is_empty());
 }
 
 /// 結合キーが無い形（WHERE 省略・source だけの述語）は純粋な交差結合として変換できる（Issue #3294）。

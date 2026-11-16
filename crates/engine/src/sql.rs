@@ -248,6 +248,7 @@ pub(crate) mod cell_sort;
 pub(crate) mod cte_explain;
 pub(crate) mod distinct;
 pub(crate) mod dml_from_returning;
+pub(crate) mod dml_target_alias;
 pub mod exec;
 pub(crate) mod exec_stats;
 pub mod explain;

@@ -108,6 +108,14 @@ const EXECUTABLE: &[(&str, u64)] = &[
     ("DELETE FROM docs USING langs WHERE docs.lang = langs.lang", 1),
     ("DELETE FROM docs d USING langs AS l WHERE d.lang = l.lang", 1),
     ("DELETE FROM docs USING docs AS d2 WHERE docs.id = d2.id", 2),
+    // 非等値・OR をまたぐ述語・DML 専用の葉（Issue #3295。seed: docs = ja/en・n は NULL、langs = ja）
+    ("DELETE FROM docs USING langs WHERE docs.lang < langs.lang", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang >= langs.lang", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang OR docs.n = 1", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang AND langs.label IS NOT NULL", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang AND docs.n IS NULL", 1),
+    ("DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n IN (1, 2)", 0),
+    ("DELETE FROM docs USING langs WHERE docs.lang < langs.lang OR langs.label IS NULL;", 1),
     // FROM／USING 内の JOIN ... ON と多方向結合（Issue #3294）
     (
         "UPDATE docs SET lang = 'x' FROM langs JOIN langs b ON langs.lang = b.lang \
@@ -140,7 +148,7 @@ const EXECUTABLE: &[(&str, u64)] = &[
 
 /// 束縛は通るが、変換器が `0A000` で拒否する形（第 1 弾の対象外。設計記録の変換器節）。
 const CONVERTER_REJECTED: &[&str] = &[
-    // relation をまたぐ OR（tracked: #3295）
+    // 残余（Issue #3295）が FROM 側の疑似列 id を参照する形（固定文言の 0A000）
     "UPDATE docs SET lang = 'x', n = 1 FROM langs WHERE docs.lang = langs.lang OR (docs.id = langs.id)",
 ];
 
@@ -530,17 +538,13 @@ fn rejected_forms_fail_closed_with_expected_codes() {
              USING OPERATION_ID 'p2' PARTITIONED",
             "42601",
         ),
-        // WHERE の対象外構文（サブクエリ・IS NULL・数値リテラル・NOT）
+        // WHERE の対象外構文（サブクエリ・NOT・IS TRUE）
         (
             "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang IN (SELECT lang FROM langs LIMIT 1)",
             "42601",
         ),
         (
-            "UPDATE docs SET lang = 'x' FROM langs WHERE langs.label IS NULL",
-            "42601",
-        ),
-        (
-            "DELETE FROM docs USING langs WHERE docs.n = 1",
+            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND langs.flag IS TRUE",
             "42601",
         ),
         (
@@ -598,12 +602,13 @@ fn rejected_forms_fail_closed_with_expected_codes() {
             "DELETE FROM docs USING langs a JOIN langs b ON docs.lang = b.lang WHERE docs.lang = a.lang",
             "42P01",
         ),
-        // 別名付きで FROM／USING 無し
+        // 別名付きで FROM／USING 無しは Issue #3291 で受理に変わった（`sql53_single_table_dml_alias.rs`）。
+        // 別名を付けた表を本名で修飾する形は `42P01`（intentional: docs/design/update-from-delete-using.md）
         (
-            "UPDATE docs AS d SET lang = 'x' WHERE d.lang = 'en'",
-            "42601",
+            "UPDATE docs AS d SET lang = 'x' WHERE docs.lang = 'en'",
+            "42P01",
         ),
-        ("DELETE FROM docs d WHERE d.lang = 'en'", "42601"),
+        ("DELETE FROM docs d WHERE docs.lang = 'en'", "42P01"),
         // USING に operation_id という名前の表
         ("DELETE FROM docs USING operation_id", "42601"),
         // 参照数の超過（対象表 + 8 個）

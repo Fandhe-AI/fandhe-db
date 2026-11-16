@@ -211,8 +211,8 @@ fn with_state<R>(f: impl FnOnce(&mut SinkState) -> R) -> Option<R> {
     .flatten()
 }
 
-/// 記録区間が有効か（ガードの復元を確かめるテスト用）。
-#[cfg(test)]
+/// 記録区間が有効か。ガードの復元を確かめるテストのほか、`sql::dml_target_alias` が
+/// 記録区間（PL/pgSQL の定義時検証）中はトークン位置の対応を壊さないよう何もしない判定に使う。
 pub(crate) fn is_active() -> bool {
     SINK.try_with(|c| c.try_borrow().map(|b| b.is_some()).unwrap_or(false))
         .unwrap_or(false)

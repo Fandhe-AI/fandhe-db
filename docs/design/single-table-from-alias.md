@@ -21,8 +21,8 @@
 - 書き換え区間: 投影と、FROM 参照以降〜`LIMIT`／`;`／`USING PLAN|MODE`／`HINT ORDER` の手前。関数名形（直後が `(`）・`AS` 直後・`::` 直後・`EXTRACT(` 直後は列参照ではないため残す。
 - 不一致は `42P01`（カタログ非照会）。外側スコープの公開名に一致する修飾（相関）は `42601`。
 - 不透明スコープ（FROM なし・スキーマ修飾 FROM・JOIN・カンマ結合・集合演算・深さ超過・解析不能）は書き換えず、従来のパーサー判定に委ねる。
-- 適用しない経路: 集合演算の枝、JOIN（`BindingScope`）、VIEW 本体、CTE 定義本体、DML、INSERT、CHECK。
-- content_hash は DML 台帳専用で SELECT 経路では計算しない。正規化は DML に適用しないため入力は不変。
+- 適用しない経路: 集合演算の枝、JOIN（`BindingScope`）、VIEW 本体、CTE 定義本体、INSERT、CHECK。別名つき単一表 DML は専用の入口正規化 `sql::dml_target_alias` が別名を解決する（Issue #3291。[update-from-delete-using.md](update-from-delete-using.md) 参照）。
+- content_hash は DML 台帳専用で SELECT 経路では計算しない。本正規化は DML に適用しない。別名つき単一表 DML は `sql::dml_target_alias` が別名なしの同じ文へ書き換えてから解析するため、別名の有無で同じ content_hash になる。
 - `x.id` は非修飾 `id` と同じ扱いになる。
 
 ## 判定順
