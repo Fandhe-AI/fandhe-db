@@ -11,11 +11,12 @@
 //! - R3: 重複指定は非 0 終了・stderr に "specified more than once" を含むこと
 //! - R4: 範囲外（`0`・`1_000_001`）・非数値（先頭 `+`・空白・英字混じり）は
 //!   非 0 終了・stderr にフラグ名を含むこと
-//! - R5（codex-review P1 指摘・PR #1122 対応）: `--max-insert-rows` を
-//!   `batch_limits.max_files_per_batch`（既定 64）超に設定すると起動ログへ
-//!   `WARNING` 行が出ること・環境変数 `FANDHE_DB_BATCH_MAX_FILES` で
-//!   `max_files_per_batch` を引き上げれば同じ `--max-insert-rows` 値でも
-//!   `WARNING` が出ないこと（いずれも `listening on` には到達する。
+//! - R5（codex-review P1 指摘・PR #1122 対応。Issue #3310 で ④ 基準へ改訂）:
+//!   `--max-insert-rows` を `batch_limits.max_batch_chunks`（④。既定 4096）超に設定
+//!   すると起動ログへ `WARNING` 行が出ること・環境変数 `FANDHE_DB_BATCH_MAX_CHUNKS` で
+//!   ④ を引き上げれば同じ `--max-insert-rows` 値でも `WARNING` が出ないこと・
+//!   ① `max_files_per_batch`（既定 64）は行の形に効かないため警告に影響しないこと
+//!   （いずれも `listening on` には到達する。
 //!   `wire_server::dml_limits_opt::insert_rows_cap_warning` 参照）
 //!
 //! 実際に上限値が engine 側の判定（`54000`・副作用ゼロ）へ届くことは
@@ -538,90 +539,74 @@ fn invalid_missing_duplicate_or_out_of_range_values_are_rejected() {
     }
 }
 
-/// R5: `--max-insert-rows` を `batch_limits.max_files_per_batch`（既定 64）超に
-/// 設定すると起動ログへ `WARNING` 行が出る（`listening on` には到達する）。
-/// 環境変数 `FANDHE_DB_BATCH_MAX_FILES` で `max_files_per_batch` を同じ値まで
-/// 引き上げれば `WARNING` は出ない（子プロセスの環境変数は
-/// `Command::env` 経由で設定するため、他テストとのグローバル環境変数の
-/// 競合は起こらない）。
+/// R5: `--max-insert-rows` を `batch_limits.max_batch_chunks`（④。既定 4096）超に
+/// 設定すると起動ログへ `WARNING` 行が出る（`listening on` には到達する）。警告は
+/// ④ の環境変数名だけを案内し、① の `FANDHE_DB_BATCH_MAX_FILES` は案内しない。
+/// 環境変数 `FANDHE_DB_BATCH_MAX_CHUNKS` で ④ を同じ値まで引き上げれば `WARNING` は
+/// 出ない。`--max-insert-rows 100`（① の既定 64 超・④ 以下）は警告しない（Issue #3310。
+/// ① は行の形に効かない）。子プロセスの環境変数は `Command::env` 経由で設定するため、
+/// 他テストとのグローバル環境変数の競合は起こらない。
 #[test]
-fn max_insert_rows_over_batch_limits_default_emits_warning_unless_env_raised() {
-    // ケース 1: `FANDHE_DB_BATCH_MAX_FILES` 未設定 → 既定の 64 を超えるため WARNING。
-    {
-        let fixture = TempFixtureDir::new("r5-warning");
+fn max_insert_rows_over_chunks_cap_emits_warning_unless_env_raised() {
+    let run = |label: &str, rows: &str, chunks_env: Option<&str>| -> Vec<String> {
+        let fixture = TempFixtureDir::new(label);
         let users_path = fixture.users_path_str();
         write_empty_user_store(&users_path);
         let db_path = fixture.db_path_str();
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
-            .args([
-                "--users",
-                &users_path,
-                "--db",
-                &db_path,
-                "--bind",
-                "127.0.0.1:0",
-                "--max-insert-rows",
-                "100",
-            ])
-            .env_remove("FANDHE_DB_BATCH_MAX_FILES")
-            .env_remove("FANDHE_DB_BATCH_MAX_TOTAL_BYTES")
-            .env_remove("FANDHE_DB_BATCH_MAX_CHUNKS")
-            .env_remove("VECTOR_DB_BATCH_MAX_FILES")
-            .env_remove("VECTOR_DB_BATCH_MAX_TOTAL_BYTES")
-            .env_remove("VECTOR_DB_BATCH_MAX_CHUNKS")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn wire-server");
-
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wire-server"));
+        cmd.args([
+            "--users",
+            &users_path,
+            "--db",
+            &db_path,
+            "--bind",
+            "127.0.0.1:0",
+            "--max-insert-rows",
+            rows,
+        ])
+        .env_remove("FANDHE_DB_BATCH_MAX_FILES")
+        .env_remove("FANDHE_DB_BATCH_MAX_TOTAL_BYTES")
+        .env_remove("FANDHE_DB_BATCH_MAX_CHUNKS")
+        .env_remove("VECTOR_DB_BATCH_MAX_FILES")
+        .env_remove("VECTOR_DB_BATCH_MAX_TOTAL_BYTES")
+        .env_remove("VECTOR_DB_BATCH_MAX_CHUNKS")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+        if let Some(v) = chunks_env {
+            cmd.env("FANDHE_DB_BATCH_MAX_CHUNKS", v);
+        }
+        let mut child = cmd.spawn().expect("spawn wire-server");
         let lines = wait_for_listening_lines(&mut child);
         let _ = child.kill();
         let _ = child.wait();
+        lines
+    };
 
-        assert!(
-            lines.iter().any(|l| l.contains("WARNING")
-                && l.contains("--max-insert-rows")
-                && l.contains("FANDHE_DB_BATCH_MAX_FILES")),
-            "expected a WARNING line mentioning --max-insert-rows and \
-             FANDHE_DB_BATCH_MAX_FILES, got: {lines:?}"
-        );
-    }
+    // ケース 1: ④ 既定 4096 を超える → WARNING（④ だけを案内する）。
+    let lines = run("r5-warning", "5000", None);
+    assert!(
+        lines.iter().any(|l| l.contains("WARNING")
+            && l.contains("--max-insert-rows")
+            && l.contains("FANDHE_DB_BATCH_MAX_CHUNKS")
+            && l.contains("4096")
+            && !l.contains("FANDHE_DB_BATCH_MAX_FILES")),
+        "expected a chunks-only WARNING, got: {lines:?}"
+    );
 
-    // ケース 2: `FANDHE_DB_BATCH_MAX_FILES=100` で引き上げ済み → WARNING なし。
-    {
-        let fixture = TempFixtureDir::new("r5-no-warning");
-        let users_path = fixture.users_path_str();
-        write_empty_user_store(&users_path);
-        let db_path = fixture.db_path_str();
+    // ケース 2: ④ を 5000 へ引き上げ済み → WARNING なし。
+    let lines = run("r5-no-warning", "5000", Some("5000"));
+    assert!(
+        !lines.iter().any(|l| l.contains("WARNING")),
+        "expected no WARNING once FANDHE_DB_BATCH_MAX_CHUNKS raises the cap, got: {lines:?}"
+    );
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
-            .args([
-                "--users",
-                &users_path,
-                "--db",
-                &db_path,
-                "--bind",
-                "127.0.0.1:0",
-                "--max-insert-rows",
-                "100",
-            ])
-            .env("FANDHE_DB_BATCH_MAX_FILES", "100")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn wire-server");
-
-        let lines = wait_for_listening_lines(&mut child);
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert!(
-            !lines.iter().any(|l| l.contains("WARNING")),
-            "expected no WARNING line once FANDHE_DB_BATCH_MAX_FILES raises the batch limit, \
-             got: {lines:?}"
-        );
-    }
+    // ケース 3（回帰）: ① の既定 64 超でも ④ 以下なら警告しない。
+    let lines = run("r5-files-cap-ignored", "100", None);
+    assert!(
+        !lines.iter().any(|l| l.contains("WARNING")),
+        "max_files_per_batch must not trigger the warning, got: {lines:?}"
+    );
 }
 
 /// `--batch-max-files`（Issue #1166）付きで起動し、`listening on` までの
@@ -718,13 +703,32 @@ fn batch_max_files_invalid_values_are_rejected() {
     }
 }
 
-/// B5: `--batch-max-files` で `--max-insert-rows` 以上へ引き上げれば WARNING なし。
+/// B5: `--batch-max-files`（①）を引き上げても ④ 超の警告は消えない（① は行の形に効かない。
+/// Issue #3310）。
 #[test]
-fn batch_max_files_flag_silences_insert_rows_warning() {
+fn batch_max_files_flag_does_not_silence_insert_rows_warning() {
     let lines = listening_lines_with(
         "b5",
-        &["--max-insert-rows", "100", "--batch-max-files", "100"],
+        &["--max-insert-rows", "5000", "--batch-max-files", "10000"],
         &[],
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("WARNING") && l.contains("capped at 4096 rows")),
+        "expected WARNING, got: {lines:?}"
+    );
+}
+
+/// B6: `--batch-max-files`／環境変数 `FANDHE_DB_BATCH_MAX_FILES` は行の形の警告に
+/// 影響しない。両方を指定しても起動し、④ 以下の `--max-insert-rows` では WARNING なし。
+/// CLI > 環境変数の優先順位自体は単体テスト（`resolve_batch_limits_*`）が担当する。
+#[test]
+fn batch_max_files_flag_and_env_do_not_affect_insert_rows_warning() {
+    let lines = listening_lines_with(
+        "b6",
+        &["--max-insert-rows", "50", "--batch-max-files", "10"],
+        &[("FANDHE_DB_BATCH_MAX_FILES", "100")],
     );
     assert!(
         !lines.iter().any(|l| l.contains("WARNING")),
@@ -732,31 +736,14 @@ fn batch_max_files_flag_silences_insert_rows_warning() {
     );
 }
 
-/// B6: 優先順位は CLI 明示 > 環境変数。環境変数が 100 でも CLI の 10 が効き、
-/// WARNING は CLI 側の実効上限 10 を報告する。
-#[test]
-fn batch_max_files_flag_takes_precedence_over_env() {
-    let lines = listening_lines_with(
-        "b6",
-        &["--max-insert-rows", "50", "--batch-max-files", "10"],
-        &[("FANDHE_DB_BATCH_MAX_FILES", "100")],
-    );
-    assert!(
-        lines.iter().any(|l| l.contains("WARNING")
-            && l.contains("--max-insert-rows")
-            && l.contains("capped at 10 rows")),
-        "expected WARNING reporting cap 10, got: {lines:?}"
-    );
-}
-
-/// B9: 旧名 `VECTOR_DB_BATCH_MAX_FILES` だけを設定しても値は適用されず（既定 64 の
-/// ままなので 100 行の `--max-insert-rows` は WARNING になる）、旧名ごとに値を含まない
+/// B9: 旧名 `VECTOR_DB_BATCH_MAX_CHUNKS` だけを設定しても値は適用されず（既定 4096 の
+/// ままなので 5000 行の `--max-insert-rows` は WARNING になる）、旧名ごとに値を含まない
 /// 移行警告が 1 行出る。起動は止まらない。
 #[test]
 fn legacy_batch_env_is_ignored_with_warning() {
     let lines = listening_lines_with(
         "b9",
-        &["--max-insert-rows", "100"],
+        &["--max-insert-rows", "5000"],
         &[
             ("VECTOR_DB_BATCH_MAX_FILES", "100"),
             ("VECTOR_DB_BATCH_MAX_CHUNKS", "9999"),
@@ -784,13 +771,12 @@ fn legacy_batch_env_is_ignored_with_warning() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("WARNING") && l.contains("capped at 64 rows")),
+            .any(|l| l.contains("WARNING") && l.contains("capped at 4096 rows")),
         "legacy value must not raise the limit, got: {lines:?}"
     );
 }
 
-/// B8: files 側が十分大きくても `max_batch_chunks`（既定 4096）が実効上限に
-/// なる場合、WARNING は chunks 側の上限と環境変数名を案内する。
+/// B8: WARNING は chunks 側（④。既定 4096）の上限と環境変数名を案内する。
 #[test]
 fn insert_rows_warning_reports_chunks_cap_when_effective() {
     let lines = listening_lines_with(

@@ -347,11 +347,12 @@ fn execute_bound_insert_in_session_rejects_operation_id_mismatch_between_guard_a
 }
 
 #[test]
-fn execute_bound_insert_in_session_row_count_limit_precedes_bind() {
+fn execute_bound_insert_in_session_chunk_limit_precedes_bind() {
+    // Issue #3308: ①（max_files_per_batch）ではなく④（1 行 = 1 チャンク）が束縛より前に効く。
     let (core, path) = open_engine_with_limits(
         "core-insert-session-row-limit",
         engine::batch_limits::BatchLimits {
-            max_files_per_batch: 1,
+            max_batch_chunks: 1,
             ..engine::batch_limits::BatchLimits::default()
         },
     );
@@ -366,7 +367,7 @@ fn execute_bound_insert_in_session_row_count_limit_precedes_bind() {
             TABLE,
             2,
             Some(&op_id),
-            |_schema| panic!("bind must not be called when the row count limit is exceeded"),
+            |_schema| panic!("bind must not be called when the chunk limit is exceeded"),
         )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "54000");
@@ -480,4 +481,159 @@ fn execute_bound_insert_in_session_compare_only_without_ledger_accepts_none() {
         )
         .expect("insert session ok");
     assert_eq!(outcome.rows_affected, 1);
+}
+
+// ---------------------------------------------------------------------
+// Issue #3310: 行数の上限（①）を外したあとも、④（1 行 = 1 チャンク）が束縛・スキーマ
+// 取得より前に働き、入力に比例する確保を起こさないことを固定する。
+// `BatchLimits::default()` は環境変数を読むため使わず、既定値を明示する。
+// ---------------------------------------------------------------------
+
+/// 既定構成（①64・② `MAX_INPUT_BYTES`・③ `MAX_INDEX_TOTAL_BYTES`・④ `MAX_CHUNKS_PER_FILE`）
+/// を環境変数に依らず明示する。
+fn explicit_default_limits() -> engine::batch_limits::BatchLimits {
+    engine::batch_limits::BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: engine::chunking::MAX_INPUT_BYTES,
+        max_batch_total_bytes: engine::incremental::MAX_INDEX_TOTAL_BYTES,
+        max_batch_chunks: engine::incremental::MAX_CHUNKS_PER_FILE,
+    }
+}
+
+/// 固定する上限: ④。巨大な `row_count` は `bind` closure（入力に比例する確保）を
+/// 呼ぶ前に `54000` で拒否され、台帳は未記録のまま。
+#[test]
+fn bound_insert_huge_row_count_is_rejected_before_bind_and_leaves_no_trace() {
+    let (core, path) =
+        open_engine_with_limits("core-insert-huge-row-count", explicit_default_limits());
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a", [Visibility::Public, Visibility::Private]);
+    let op_id = OperationId::parse("op-huge").expect("valid operation_id");
+
+    let err = core
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            10_000_000,
+            Some(&op_id),
+            |_schema| panic!("bind must not run for a row count above the chunk limit"),
+        )
+        .expect_err("must reject");
+    assert_eq!(err.wire_code(), "54000");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("tenant-a"),
+        "error must not echo tenant: {msg}"
+    );
+    assert_eq!(
+        core.operation_recorded(&policy, TABLE, &op_id)
+            .expect("ledger lookup"),
+        LedgerLookup::NotRecorded
+    );
+}
+
+/// 固定する上限: ④ がスキーマ取得より前に走る。存在しない表でも `42P01` ではなく `54000`。
+#[test]
+fn bound_insert_chunk_limit_precedes_schema_lookup() {
+    let (core, path) =
+        open_engine_with_limits("core-insert-limit-before-schema", explicit_default_limits());
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a", [Visibility::Private]);
+    let op_id = OperationId::parse("op-1").expect("valid operation_id");
+    let rows = explicit_default_limits().max_batch_chunks + 1;
+
+    let err = core
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            "no_such_table",
+            rows,
+            Some(&op_id),
+            |_schema| panic!("bind must not run"),
+        )
+        .expect_err("must reject");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+/// 固定する上限: ④。UPSERT 経路でも `bind` を呼ぶ前に拒否される。
+#[test]
+fn bound_upsert_huge_row_count_is_rejected_before_bind() {
+    let (core, path) =
+        open_engine_with_limits("core-upsert-huge-row-count", explicit_default_limits());
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a", [Visibility::Private]);
+    let op_id = OperationId::parse("op-1").expect("valid operation_id");
+
+    let err = core
+        .execute_bound_upsert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            10_000_000,
+            Some(&op_id),
+            |_schema| panic!("bind must not run"),
+        )
+        .expect_err("must reject");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(
+        core.operation_recorded(&policy, TABLE, &op_id)
+            .expect("ledger lookup"),
+        LedgerLookup::NotRecorded
+    );
+}
+
+/// 固定する上限: ④。RETURNING 付き挿入でも `bind` を呼ぶ前に拒否される。
+#[test]
+fn bound_insert_returning_huge_row_count_is_rejected_before_bind() {
+    let (core, path) =
+        open_engine_with_limits("core-insert-ret-huge-row-count", explicit_default_limits());
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a", [Visibility::Private]);
+    let op_id = OperationId::parse("op-1").expect("valid operation_id");
+
+    let err = core
+        .execute_bound_insert_returning_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            10_000_000,
+            Some(&op_id),
+            &engine::sql::allowlist::Projection::All,
+            |_schema| panic!("bind must not run"),
+        )
+        .expect_err("must reject");
+    assert_eq!(err.wire_code(), "54000");
+}
+
+/// 境界: `row_count == max_batch_chunks` なら拒否されず `bind` が呼ばれる。
+#[test]
+fn bound_insert_row_count_at_chunk_limit_reaches_bind() {
+    let (core, path) = open_engine_with_limits(
+        "core-insert-at-chunk-limit",
+        engine::batch_limits::BatchLimits {
+            max_batch_chunks: 2,
+            ..explicit_default_limits()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a", [Visibility::Private]);
+    let op_id = OperationId::parse("op-1").expect("valid operation_id");
+    let called = std::cell::Cell::new(false);
+
+    let outcome = core
+        .execute_bound_insert_in_session(
+            &policy,
+            &engine::sql::mode::SessionState::default(),
+            TABLE,
+            2,
+            Some(&op_id),
+            |_schema| {
+                called.set(true);
+                Ok(vec![bound(1, Some("op-1")), bound(2, Some("op-1"))])
+            },
+        )
+        .expect("at the limit must be accepted");
+    assert!(called.get());
+    assert_eq!(outcome.rows_affected, 2);
 }

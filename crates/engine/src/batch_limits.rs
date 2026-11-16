@@ -10,6 +10,12 @@
 //! 上限であり、複数ファイル合計に対する上限を持たない。本モジュールは
 //! [`BatchLimits`] の各フィールドとして、バッチ全体に対する処理量ガードを追加する。
 //!
+//! ①はファイル形の一括投入にだけ掛かり、複数行 `VALUES`・UPSERT・NoSQL `rows[]`・
+//! `COPY FROM` には掛からない（Issue #3308・#3309）。行の形の行数の実効上限は
+//! `--max-insert-rows`（指定時）と ④（`max_batch_chunks`。1 行 = 1 チャンク）の小さい方で、
+//! SQL 文長・トークン数・1 メッセージの上限も別に効く（Issue #3310）。COPY の ③ は
+//! デコード前の CopyData 累計で数える。
+//!
 //! 各上限の判定タイミングは [`validate_batch_shape`]・[`validate_chunk_total`]・
 //! [`validate_raw_sql_len`] の各関数ドキュメント、および呼び出し元
 //! `core::EngineCore::execute_insert_sql_batch`・`incremental::index_file_batch` の
@@ -264,7 +270,20 @@ pub(crate) fn validate_batch_shape(
             max: limits.max_files_per_batch,
         });
     }
+    validate_row_batch_shape(files, limits)
+}
 
+/// ②③（要素単体のバイト量・バッチ合計のバイト量）だけを判定する（Issue #3308）。
+///
+/// 行の形（複数行 `VALUES`・UPSERT・NoSQL `rows[]`）の書き込みが使う。①（件数上限）は
+/// ファイル形の一括投入向けの値であり、行の形には適用しない（行数の上限は
+/// `--max-insert-rows` 指定時のみ）。`core.rs` の
+/// `validate_insert_batch_byte_and_chunk_limits` が呼ぶ。[`validate_batch_shape`] も
+/// ①の判定後に本関数へ委譲するため、ファイル形の挙動は不変。
+pub(crate) fn validate_row_batch_shape(
+    files: &[(usize, usize)],
+    limits: &BatchLimits,
+) -> Result<(), BatchLimitsError> {
     let mut total: usize = 0;
     for (index, (path_len, body_len)) in files.iter().enumerate() {
         if *body_len > limits.max_file_body_bytes {
@@ -428,23 +447,9 @@ pub(crate) fn validate_raw_sql_len(
     Ok(new_total)
 }
 
-/// ①（バッチあたり最大ファイル数。COPY では「行数」と読み替える）を、CopyDone
-/// を待たず 1 行ずつ逐次判定する（Issue #939・WIRE-17。[`validate_batch_shape`]
-/// が一括判定するのに対し、COPY はストリーミングであるため超過を CopyData
-/// 受信中に検出する必要がある。判定内容自体は同一）。
-pub(crate) fn check_row_count(count: usize, limits: &BatchLimits) -> Result<(), BatchLimitsError> {
-    if count > limits.max_files_per_batch {
-        return Err(BatchLimitsError::TooManyFiles {
-            count,
-            max: limits.max_files_per_batch,
-        });
-    }
-    Ok(())
-}
-
 /// ②（1 ファイルあたり最大本文サイズ。COPY では「1 行あたりのデコード後
 /// バイト量」と読み替える）を、CopyDone を待たず 1 行ずつ逐次判定する
-/// （[`check_row_count`] と同じ理由）。
+/// （CopyData 受信中に超過を検出する必要があるため。判定内容は一括判定と同一）。
 pub(crate) fn check_row_body_len(
     index: usize,
     len: usize,
@@ -461,7 +466,7 @@ pub(crate) fn check_row_body_len(
 }
 
 /// ③（バッチ合計最大サイズ）を、CopyDone を待たず CopyData 受信ごとに逐次
-/// 判定する（[`check_row_count`] と同じ理由。COPY の場合は生 CopyData
+/// 判定する（COPY の場合は生 CopyData
 /// バイト量そのものを累算する——[`validate_batch_shape`] のようにデコード後の
 /// `path.len() + body.len()` ではなく、デコード前のバイト量を上限判定の対象と
 /// することで、レコード分割・エスケープ解決・`Vec<BoundInsert>` への確保より
@@ -771,6 +776,27 @@ mod tests {
         assert_eq!(first, 5);
         let second = validate_raw_sql_len(1, 7, first, &l).unwrap();
         assert_eq!(second, 12);
+    }
+
+    #[test]
+    fn row_batch_shape_ignores_file_count_limit() {
+        // ① は掛けない（limits() は max_files_per_batch=4）。
+        let rows: Vec<(usize, usize)> = (0..10).map(|_| (0, 1)).collect();
+        assert!(validate_row_batch_shape(&rows, &limits()).is_ok());
+        assert!(matches!(
+            validate_batch_shape(&rows, &limits()),
+            Err(BatchLimitsError::TooManyFiles { .. })
+        ));
+    }
+
+    #[test]
+    fn row_batch_shape_still_rejects_byte_limits() {
+        let l = limits();
+        let big = vec![(0, l.max_file_body_bytes + 1)];
+        assert!(matches!(
+            validate_row_batch_shape(&big, &l),
+            Err(BatchLimitsError::FileBodyTooLarge { .. })
+        ));
     }
 
     #[test]

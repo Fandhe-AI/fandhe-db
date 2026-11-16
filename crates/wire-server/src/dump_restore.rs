@@ -418,7 +418,7 @@ fn restore_copy(
     };
     let mut total: u64 = 0;
     // 現在のバッチ（セッション・行数・合計バイト）と、engine のバッチ上限から求めた 1 バッチの上限。
-    // 上限は行数（①）・生成チャンク数（④。1 行 1 チャンク）・合計バイト（③）のすべてを見る。
+    // 上限は行数（`--max-insert-rows`）・生成チャンク数（④。1 行 1 チャンク。①は掛からない）・合計バイト（③）のすべてを見る。
     let mut current: Option<(CopyInSession, usize, usize)> = None;
     let mut max_rows: usize = 1;
     let mut max_bytes: usize = COPY_CHUNK_BYTES;
@@ -441,7 +441,7 @@ fn restore_copy(
                 if current.is_none() {
                     let copy = begin(session)?;
                     let l = copy.batch_limits();
-                    max_rows = l.max_files_per_batch.min(l.max_batch_chunks).max(1);
+                    max_rows = copy.max_rows_per_batch();
                     max_bytes = l.max_batch_total_bytes.clamp(1, COPY_CHUNK_BYTES);
                     current = Some((copy, 0, 0));
                 }

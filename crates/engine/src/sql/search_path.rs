@@ -458,6 +458,30 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
     out
 }
 
+/// 列型の位置（`CREATE TABLE`・`ADD COLUMN`・`ALTER COLUMN .. TYPE`）にある、未修飾の ENUM 型名候補
+/// （トークン添字と名前。Issue #3289）。位置判定は `sql::type_name_position` が担う（関係位置には足さない）。
+/// 組み込み型名（`sql::ddl_column_type` の型名解決表の語）・解決済みの内部キー（`#` 始まり）・`skip`
+/// （`public.` 修飾を外した位置）・要素つき `CREATE SCHEMA` は除く。キャストの位置は対象外（カタログを引かない
+/// 従来の契約のまま）。型に一時版は無いので一時表と同名でも除外しない。
+fn column_type_refs(tokens: &[Token], skip: &[usize]) -> Vec<(usize, String)> {
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Vec::new();
+    }
+    crate::sql::type_name_position::type_name_positions(tokens)
+        .into_iter()
+        .filter(|p| p.column_type && !skip.contains(&p.index))
+        .filter_map(|p| {
+            let name = tokens
+                .get(p.index)
+                .and_then(crate::sql::relation_name::unqualified_ident_name)?;
+            if name.starts_with('#') || crate::sql::ddl_column_type::is_type_name_head(name) {
+                return None;
+            }
+            Some((p.index, name.to_string()))
+        })
+        .collect()
+}
+
 /// 要素つき `CREATE SCHEMA` の要素 1 件（`CREATE TABLE`／`VIEW`／`SEQUENCE`）に現れる、未修飾の関係参照
 /// （トークン添字と名前。作成名・構文語・CTE 名・解決済みの内部キーを除く）。`core::schema_elements` が、
 /// 同じ文で先に作られる名前を新しい SCHEMA へ解決するために使う（位置判定は `search_path` の参照ゲートと共有。
@@ -600,6 +624,13 @@ pub(crate) fn check_unqualified_refs(
             continue;
         }
         return Err(SqlSurfaceError::undefined_table(r.name));
+    }
+    // 列型の位置の未修飾の型名（Issue #3289）。自テナントの SCHEMA に解決される型は [`resolve_path_refs`] が先に
+    // 内部キーへ置換するため（`#` 始まりは数えない）、ここで残るのは path のどこにも無い名前だけ。`public` が
+    // 隠れている以上 public の型へ黙って落とさず `42704` にする（`DROP TYPE` の `42P01` とは異なる。型の
+    // 作成・削除は relation と同じ判定、列型は PostgreSQL と同じ型未定義の分類）。カタログは引かない。
+    if let Some((_, name)) = column_type_refs(tokens, skip).into_iter().next() {
+        return Err(SqlSurfaceError::UndefinedType { name });
     }
     Ok(())
 }
@@ -808,6 +839,27 @@ fn resolve_path_refs_inner(
             if let Some(key) = key {
                 out.rewrites.push((r.index, Token::Ident(key)));
                 out.relation_in_schema = true;
+            }
+        }
+    }
+    // 列型の位置の未修飾の型名（Issue #3289）。path の順に型の名前空間で引き、自テナントの SCHEMA の型に
+    // 当たれば内部キーへ置き換える（`public` の型・不在は書き換えない。不在は実行段が `42704`）。
+    if has_schema {
+        let mut seen_types: Vec<(String, Option<String>)> = Vec::new();
+        for (index, name) in column_type_refs(tokens, skip) {
+            let key = match seen_types.iter().find(|(n, _)| *n == name) {
+                Some((_, key)) => key.clone(),
+                None => {
+                    let key = match find_in_slots(&slots, &name, NameKind::Type, lookup)? {
+                        Placement::InSchema(key) => Some(key),
+                        Placement::Public | Placement::Missing => None,
+                    };
+                    seen_types.push((name.clone(), key.clone()));
+                    key
+                }
+            };
+            if let Some(key) = key {
+                out.rewrites.push((index, Token::Ident(key)));
             }
         }
     }
@@ -1660,6 +1712,97 @@ mod tests {
         )
         .unwrap();
         assert!(r.rewrites.is_empty());
+    }
+
+    /// 列型の位置の未修飾の型名は、型の名前空間で path を引き内部キーへ書き換える（Issue #3289）。組み込み型名・
+    /// キャストの位置は引かない。SCHEMA が path に無い既定の path ではカタログを引かない。
+    #[test]
+    fn column_type_names_resolve_in_the_type_namespace() {
+        let s = ddl_session_with(&["q1", "public"]);
+        let both = [("#7.mood", NameKind::Type), ("mood", NameKind::Type)];
+        let r = run_stmt_kinded(
+            &s,
+            "CREATE TABLE t (id BIGINT, m mood, ms mood[])",
+            &[("q1", 7)],
+            &both,
+        )
+        .unwrap();
+        let types: Vec<_> = rewritten(&r)
+            .into_iter()
+            .filter(|(_, k)| k == "#7.mood")
+            .collect();
+        assert_eq!(types.len(), 2, "{r:?}");
+        // 組み込み型名は引かない（SCHEMA に同名の型があっても書き換えない）。
+        let r = run_stmt_kinded(
+            &s,
+            "ALTER TABLE t ADD COLUMN c integer",
+            &[("q1", 7)],
+            &[("#7.integer", NameKind::Type)],
+        )
+        .unwrap();
+        assert!(!rewritten(&r).iter().any(|(_, k)| k == "#7.integer"));
+        // キャストの未修飾の型名は引かない（従来どおりカタログ非参照）。
+        let r = run_stmt_kinded(&s, "SELECT 'a'::mood", &[("q1", 7)], &both).unwrap();
+        assert!(r.rewrites.is_empty());
+        // public が先なら public の型（書き換えない）。
+        let s = ddl_session_with(&["public", "q1"]);
+        let r =
+            run_stmt_kinded(&s, "ALTER TABLE t ADD COLUMN m mood", &[("q1", 7)], &both).unwrap();
+        assert!(!rewritten(&r).iter().any(|(_, k)| k == "#7.mood"));
+        // 型の名前空間以外（表）にしか無い名前は型として解決しない。
+        let s = ddl_session_with(&["q1", "public"]);
+        let r = run_stmt_kinded(
+            &s,
+            "ALTER TABLE t ADD COLUMN m mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Relation)],
+        )
+        .unwrap();
+        assert!(!rewritten(&r).iter().any(|(_, k)| k == "#7.mood"));
+    }
+
+    /// `public` が隠れた path のゲートは、列型の位置の解決されない未修飾の型名を `42704` にする。DDL 権限の無い
+    /// セッションは飛ばす（`42501` を維持）。構文語・組み込み型名・解決済みの内部キーは数えない。
+    #[test]
+    fn gate_reports_unresolved_column_type_as_undefined_type() {
+        let toks = |sql: &str| tokenize(sql).expect("lex");
+        let hidden = ddl_session_with(&["q1"]);
+        let e =
+            check_unqualified_refs(&hidden, &toks("CREATE TABLE q1.t (id BIGINT, m mood)"), &[])
+                .expect_err("hidden public");
+        assert_eq!(e.wire_code(), "42704");
+        assert!(check_unqualified_refs(
+            &hidden,
+            &toks("CREATE TABLE q1.t (id BIGINT, m INTEGER, n TEXT[])"),
+            &[]
+        )
+        .is_ok());
+        // 解決済みの内部キーと `public.` を外した位置（skip）は数えない。
+        let mut t = toks("CREATE TABLE q1.t (id BIGINT, m mood)");
+        let idx = t
+            .iter()
+            .position(|x| matches!(x, Token::Ident(n) if n == "mood"))
+            .expect("mood");
+        t[idx] = Token::Ident("#7.mood".to_string());
+        assert!(check_unqualified_refs(&hidden, &t, &[]).is_ok());
+        let t = toks("CREATE TABLE q1.t (id BIGINT, m mood)");
+        assert!(check_unqualified_refs(&hidden, &t, &[idx]).is_ok());
+        // DDL 権限の無いセッションは存在判定より先に `42501` を返すため、ゲートは飛ばす。
+        let denied = session_with(&["q1"]);
+        assert!(check_unqualified_refs(
+            &denied,
+            &toks("CREATE TABLE q1.t (id BIGINT, m mood)"),
+            &[]
+        )
+        .is_ok());
+        // 既定の path（public が見える）は何もしない。
+        let visible = ddl_session_with(&["q1", "public"]);
+        assert!(check_unqualified_refs(
+            &visible,
+            &toks("CREATE TABLE q1.t (id BIGINT, m mood)"),
+            &[]
+        )
+        .is_ok());
     }
 
     fn ddl_session_with(path: &[&str]) -> SessionState {

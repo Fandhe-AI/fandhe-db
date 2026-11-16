@@ -335,24 +335,26 @@
 //! predicate-dml-exec.md` §6 参照）。上限を指定しない場合でも、既存の
 //! SQL 文長上限・1 文あたり総走査行数上限（`MAX_SCANNED_ROWS`。既定はハード上限で、
 //! `--max-scanned-rows` により下げる方向にのみ設定できる）が機能するため資源上限は
-//! 引き続き機能する。複数行 `VALUES` は本上限に加えて独立した
-//! 別上限 `batch_limits.max_files_per_batch`（既定 64。Issue #860）も通るため、
-//! `--max-insert-rows` を明示指定した値・または未指定時の既定（上限なし）が
-//! 64 超であっても、`--batch-max-files`（下記）または環境変数
-//! `FANDHE_DB_BATCH_MAX_FILES` を併せて引き上げない限り複数行 `VALUES` は
-//! 64 行超で `54000` のまま。`--max-insert-rows` を明示指定してこの実効上限
-//! を超える場合のみ起動ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
-//! `wire_server::dml_limits_opt::insert_rows_cap_warning`）。
+//! 引き続き機能する。行の形の一括投入（複数行 `VALUES`・UPSERT・NoSQL `rows[]`・COPY
+//! FROM）は本上限に加えて独立した別上限 `batch_limits.max_batch_chunks`（④。既定 4096・
+//! 環境変数 `FANDHE_DB_BATCH_MAX_CHUNKS`）も通る。`batch_limits.max_files_per_batch`（①）は
+//! Issue #3308・#3309 以降これらに効かないため、実効行数上限は本フラグ（指定時）と ④ の
+//! 小さい方である。SQL テキストでは 1 メッセージ 1 MiB・トークン数・文長の上限が先に
+//! 効きうる（README 参照）。`--max-insert-rows` を明示指定して ④ を超える場合のみ起動
+//! ログへ `WARNING` 行を出す（未指定〔既定〕では出さない。
+//! `wire_server::dml_limits_opt::insert_rows_cap_warning`。Issue #3310）。
 //!
 //! `--batch-max-files <N>`（Issue #1166）: `batch_limits.max_files_per_batch`
-//! （SQL 複数行 `VALUES`・NoSQL `insert rows[]`・ファイル形バッチ・COPY FROM が
-//! 共有する 1 バッチ件数上限）をプロセス全体に対して起動時に設定する。
+//! （ファイル形の一括投入にだけ効く 1 バッチ件数上限。複数行 `VALUES`・UPSERT・
+//! NoSQL `rows[]`・COPY FROM には効かない。Issue #3308・#3309）をプロセス全体に対して
+//! 起動時に設定する。
 //! 優先順位は **CLI 明示 > 環境変数 `FANDHE_DB_BATCH_MAX_FILES` > 既定 64**。
 //! 指定可能範囲は `1`〜`1,000,000`
 //! （`engine::batch_limits::MAX_BATCH_MAX_FILES`）。範囲外・非数値・値欠落・
 //! 2 回目以降の重複指定は fail-closed で起動エラー。解決は
 //! `wire_server::dml_limits_opt::resolve_batch_limits` に一本化し、同じ値を
-//! `EngineCore::with_batch_limits` と `insert_rows_cap_warning` の両方へ渡す。
+//! `EngineCore::with_batch_limits` と `insert_rows_cap_warning` の両方へ渡す
+//! （警告は ④ だけを見る）。
 //!
 //! `--partitioned-dml-chunk-rows <N>`／`--partitioned-dml-scan-budget <N>`／
 //! `--partitioned-dml-max-hold-ms <MS>`／`--partitioned-dml-max-jobs-per-tenant <N>`／
@@ -3843,13 +3845,12 @@ fn run_server(args: &[String]) -> ExitCode {
         );
     }
 
-    // Issue #997（codex-review P1 指摘・PR #1122）: `--max-insert-rows` を
-    // `batch_limits` の実効上限（`--batch-max-files`／環境変数／既定で解決済み。
-    // Issue #1166）超に設定した場合、複数行 `VALUES` は引き続き batch_limits
-    // 側で `54000` になり CLI の引き上げが黙って無効化される。`--durability none` の
-    // `WARNING` 行と同じ「安全上の含意を見落とさせない」設計判断でログへ
-    // 出す（エラーにはしない。`dml_limits_opt::insert_rows_cap_warning`
-    // ドキュメント参照）。
+    // Issue #997（codex-review P1 指摘・PR #1122）・Issue #3310: `--max-insert-rows` を
+    // `batch_limits.max_batch_chunks`（④）超に設定した場合、行の形の一括投入は引き続き
+    // ④ で `54000` になり CLI の引き上げが黙って無効化される。`--durability none` の
+    // `WARNING` 行と同じ「安全上の含意を見落とさせない」設計判断でログへ出す
+    // （エラーにはしない。①は行の形に効かないため見ない。
+    // `dml_limits_opt::insert_rows_cap_warning` ドキュメント参照）。
     if let Some(warning) =
         wire_server::dml_limits_opt::insert_rows_cap_warning(&dml_limits, &batch_limits)
     {

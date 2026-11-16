@@ -1564,6 +1564,10 @@ impl SqlSurfaceError {
             Self::AmbiguousColumn { name } => Self::AmbiguousColumn { name: f(&name) },
             Self::InvalidForeignKey { detail } => Self::InvalidForeignKey { detail: f(&detail) },
             Self::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail: f(&detail) },
+            // ENUM 列のラベル違反の文言は型名を含む。SCHEMA 配下の型の内部キーを公開名へ戻す（Issue #3289）。
+            Self::InvalidTextRepresentation { detail } => {
+                Self::InvalidTextRepresentation { detail: f(&detail) }
+            }
             Self::UndefinedFunction { detail } => Self::UndefinedFunction { detail: f(&detail) },
             Self::DuplicateFunction { detail } => Self::DuplicateFunction { detail: f(&detail) },
             Self::InvalidFunctionDefinition { detail } => {
@@ -4249,6 +4253,19 @@ pub enum DmlFromSetValue {
     Value(SetValue, Vec<String>),
     /// 列参照 1 個（`SET a = t.b` / `SET a = b`）。
     Column(ColumnRef),
+    /// 列参照を 1 個以上含む式（`SET a = u.x + 1`・`SET (a, b) = (u.x + 1, ...)` の要素。Issue #3296）。
+    /// `expr` の列参照は出現順に予約接頭辞つきのプレースホルダ識別子へ置き換え済みで、`refs[k]` が
+    /// プレースホルダ `k` の元の参照（修飾の有無とも保持）。解決は束縛段（`sql::dml_from`）が
+    /// 対象表と FROM 側を合わせたスコープで行う。名前ベースの書き換えをしないのは、対象表修飾の参照と
+    /// FROM 側の同名列を取り違えないため。
+    ///
+    /// **BREAKING CHANGE**（Issue #3296）: variant 追加。網羅 `match` する呼び出し元は腕の追加が必要。
+    Expr {
+        /// プレースホルダ入りの式。
+        expr: Expr,
+        /// プレースホルダ `k` に対応する元の列参照。
+        refs: Vec<ColumnRef>,
+    },
 }
 
 /// `UPDATE ... FROM`／`DELETE ... USING` の FROM／USING 側 1 relation の解決結果（Issue #3292）。
@@ -4286,8 +4303,11 @@ pub(crate) struct DmlFromViewSource {
 pub struct ValidatedUpdateFrom {
     /// 更新対象の表参照（別名を含む）。
     pub(crate) target: TableRef,
-    /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個）。
+    /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個。JOIN で加わる表を含む平坦な並び）。
     pub(crate) from: Vec<TableRef>,
+    /// FROM 句の結合段（Issue #3294。長さは `from.len() - 1`。k 番目の段が `from[k + 1]` を加える。
+    /// カンマ区切りは [`JoinCondition::Cross`]、`ON` つきは [`JoinCondition::On`]）。
+    pub(crate) from_steps: Vec<JoinStep>,
     /// `from` と同じ並びの解決結果（実表・単純形ビュー。Issue #3292）。パーサは空で作り、検証入口が埋める。
     pub(crate) sources: Vec<DmlFromSource>,
     /// SET 句の (列名, 右辺)。宣言順を保持する。
@@ -4327,8 +4347,10 @@ impl ValidatedUpdateFrom {
 pub struct ValidatedDeleteUsing {
     /// 削除対象の表参照（別名を含む）。
     pub(crate) target: TableRef,
-    /// USING 句の表参照（宣言順）。
+    /// USING 句の表参照（宣言順。JOIN で加わる表を含む平坦な並び）。
     pub(crate) using: Vec<TableRef>,
+    /// USING 句の結合段（Issue #3294。[`ValidatedUpdateFrom::from_steps`] と同じ契約）。
+    pub(crate) using_steps: Vec<JoinStep>,
     /// `using` と同じ並びの解決結果（[`ValidatedUpdateFrom::sources`] と同じ）。
     pub(crate) sources: Vec<DmlFromSource>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
@@ -7193,6 +7215,10 @@ struct Parser<'a> {
     /// 非修飾の `Expr::Ident` へ正規化するが、曖昧性検査（`42702`）は非修飾で書かれた名前にだけ
     /// 適用する必要があり、その区別をここで運ぶ。
     dml_from_unqualified: Vec<String>,
+    /// `UPDATE ... FROM` の SET 右辺の式を解析している間だけ `Some`（Issue #3296）。式中の列参照を
+    /// 修飾の有無にかかわらず出現順に積み、式には予約接頭辞つきのプレースホルダ識別子
+    /// （[`crate::sql::dml_from::SET_REF_PREFIX`]）を置く。`RETURNING` 側は `None` のまま従来の挙動。
+    dml_from_set_refs: Option<Vec<ColumnRef>>,
     /// `Parser::new` が `Token::QuotedNull` 等を降格した複製を持つ間だけ、元のトークン列への 1 対 1 の
     /// 別名を `colref_sink` へ登録しておくガード（記録区間が無ければ何もしない）。
     _colref_alias: super::colref_sink::AliasGuard,
@@ -7292,6 +7318,7 @@ impl<'a> Parser<'a> {
             upsert_table: None,
             dml_from_target: None,
             dml_from_unqualified: Vec::new(),
+            dml_from_set_refs: None,
             legacy_implicit_id: false,
         }
     }
@@ -12977,7 +13004,16 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 self.resolve_upsert_qualified_column(&qualifier, name)
             }
+            // `UPDATE ... SET <式> ... FROM` の右辺の修飾列参照（Issue #3296）。修飾の有無を保ったまま
+            // プレースホルダへ置き換え、解決は束縛段に任せる（FROM 側の列も参照できる）。
+            Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_set_refs.is_some() => {
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
+                self.advance();
+                self.consume_expr_node()?;
+                self.push_dml_from_set_ref(ColumnRef::qualified(qualifier, name))
+            }
             // `UPDATE ... SET <式> ... FROM` の右辺だけで有効な修飾列参照（SQL-53 (b)、Issue #1754）。
+            // `RETURNING` の式項目はこちらを使い、FROM 側の修飾は `0A000` のまま。
             Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_target.is_some() => {
                 self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 self.advance();
@@ -13013,6 +13049,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 if matches!(self.peek(), Some(Token::Punct('('))) {
                     self.parse_call_expr(name, depth)
+                } else if self.dml_from_set_refs.is_some() {
+                    self.consume_expr_node()?;
+                    self.sink_mark(ident_at, super::colref_sink::Role::Value);
+                    self.push_dml_from_set_ref(ColumnRef::unqualified(name))
                 } else {
                     self.consume_expr_node()?;
                     if self.dml_from_target.is_some() {
@@ -13026,6 +13066,26 @@ impl<'a> Parser<'a> {
                 "unsupported expression term near {other:?}"
             ))),
         }
+    }
+
+    /// `UPDATE ... FROM` の SET 右辺の列参照を積み、式へ置くプレースホルダ識別子を返す（Issue #3296）。
+    /// 予約接頭辞（NUL 始まり）の名前は利用者が書けない綴りで、偽装されたものは `42601`（fail-closed）。
+    /// 参照数は呼び出し元が先に消費した式ノード予算（`MAX_EXPR_NODES`）で上限が掛かる。
+    fn push_dml_from_set_ref(&mut self, colref: ColumnRef) -> Result<Expr, SqlSurfaceError> {
+        if colref.name().starts_with('\u{0}') {
+            return Err(SqlSurfaceError::unsupported(
+                "reserved identifier prefix in UPDATE SET expression",
+            ));
+        }
+        let refs = self
+            .dml_from_set_refs
+            .as_mut()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let name = format!("{}{}", crate::sql::dml_from::SET_REF_PREFIX, refs.len());
+        refs.push(colref);
+        Ok(Expr::Ident(name))
     }
 
     /// `DO UPDATE SET` 右辺の修飾列参照を式の列参照へ解決する（SQL-49、Issue #1739）。
@@ -15882,6 +15942,18 @@ impl<'a> Parser<'a> {
         &mut self,
         out: &mut Vec<(String, SetValue)>,
     ) -> Result<(), SqlSurfaceError> {
+        self.parse_row_assignment_with(out, Self::parse_update_set_rhs)
+    }
+
+    /// [`Self::parse_update_row_assignment`] の本体。右辺要素の解析器 `parse_value` だけを差し替えられる
+    /// ようにして、単一表 `UPDATE`（[`SetValue`]）と `UPDATE ... FROM`（[`DmlFromSetValue`]。
+    /// Issue #3296）が同じ規則（`ROW`・1 列は `ROW` 必須・個数不一致 `42601`・部分クエリ源 `0A000`・
+    /// 代入数の累計上限）を共有する。
+    fn parse_row_assignment_with<V>(
+        &mut self,
+        out: &mut Vec<(String, V)>,
+        mut parse_value: impl FnMut(&mut Self) -> Result<V, SqlSurfaceError>,
+    ) -> Result<(), SqlSurfaceError> {
         self.expect_punct('(')?;
         let mut columns: Vec<String> = Vec::new();
         loop {
@@ -15944,13 +16016,13 @@ impl<'a> Parser<'a> {
 
         let mismatch =
             || SqlSurfaceError::unsupported("number of columns does not match number of values");
-        let mut values: Vec<SetValue> = Vec::new();
+        let mut values: Vec<V> = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             loop {
                 if values.len() >= columns.len() {
                     return Err(mismatch());
                 }
-                values.push(self.parse_update_set_rhs()?);
+                values.push(parse_value(self)?);
                 if matches!(self.peek(), Some(Token::Punct(','))) {
                     self.advance();
                     continue;
@@ -23143,42 +23215,103 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// FROM／USING 側の表の並び `<rel>[, <rel>]*`。対象表を含む参照数を [`crate::sql::relation::MAX_TABLE_REFS`]
-    /// で積む前に検査し（超過は `54000`）、公開名の重複は `42601`（`BindingScope::new` と同じ契約）。
+    /// FROM／USING 側の表の並び（Issue #3294）。文法は
+    /// `<rel> { , <rel> | CROSS JOIN <rel> | [INNER|LEFT|RIGHT|FULL [OUTER]] JOIN <rel> ON <cond> }*`。
+    /// 戻り値は平坦な表参照の並びと結合段（長さは表数 - 1。カンマは `Cross` 段）。
+    /// 対象表を含む参照数を [`crate::sql::relation::MAX_TABLE_REFS`] で積む前に検査し（超過は `54000`）、
+    /// 公開名の重複は `42601`（`BindingScope::new` と同じ契約）。`JOIN ... USING (...)`・`NATURAL JOIN`・
+    /// カンマの後の `CROSS JOIN` 以外の明示 JOIN は束縛の意味論が結合器の統合列に依存するため
+    /// 固定文言の `0A000` で拒否する（fail-closed。`docs/design/update-from-delete-using.md`）。
+    /// 派生表・関数呼び出しは識別子の検証（`42601`）で従来どおり拒否される。
     fn parse_dml_relation_list(
         &mut self,
         target: &TableRef,
-    ) -> Result<Vec<TableRef>, SqlSurfaceError> {
+    ) -> Result<(Vec<TableRef>, Vec<JoinStep>), SqlSurfaceError> {
         let mut rels: Vec<TableRef> = Vec::new();
+        let mut steps: Vec<JoinStep> = Vec::new();
+        let first = self.parse_dml_from_relation(target, &rels)?;
+        rels.push(first);
+        // PG ではカンマより JOIN が強く結合するため、カンマの後の CROSS 以外の明示 JOIN は
+        // 束縛の意味論がずれる。SELECT の JOIN（Issue #1833）と同じ安全弁で `0A000` にする。
+        let mut after_comma = false;
         loop {
-            if rels.len().saturating_add(1) >= crate::sql::relation::MAX_TABLE_REFS {
-                return Err(SqlSurfaceError::payload_too_large(
-                    "too many table references in UPDATE/DELETE",
-                ));
-            }
-            let table = self.expect_ident()?;
-            crate::catalog::validate_relation_key(&table)
-                .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
-            let alias = self.parse_relation_alias(is_dml_target_reserved_word, "FROM")?;
-            let rel = match alias {
-                Some(a) => TableRef::with_alias(table, a),
-                None => TableRef::new(table),
-            };
-            if rel.exposed_name() == target.exposed_name()
-                || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
-            {
-                return Err(SqlSurfaceError::unsupported(
-                    "duplicate table reference name in UPDATE/DELETE",
-                ));
-            }
-            rels.push(rel);
-            if matches!(self.peek(), Some(Token::Punct(','))) {
+            let (kind, form) = if matches!(self.peek(), Some(Token::Punct(','))) {
                 self.advance();
-                continue;
-            }
-            break;
+                after_comma = true;
+                (JoinKind::Inner, JoinForm::Cross)
+            } else {
+                match parse_join_kind(self)? {
+                    Some((kind, form)) => {
+                        if after_comma && form != JoinForm::Cross {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "explicit JOIN after a comma-separated FROM / USING item is not supported",
+                            ));
+                        }
+                        (kind, form)
+                    }
+                    None => break,
+                }
+            };
+            let rel = self.parse_dml_from_relation(target, &rels)?;
+            rels.push(rel);
+            let has_using_list = self.peek_ident_matches("USING") && self.peek_punct_at(1, '(');
+            let condition = match form {
+                JoinForm::Cross => {
+                    if self.peek_ident_matches("ON") || has_using_list {
+                        return Err(SqlSurfaceError::unsupported(
+                            "CROSS JOIN or comma-separated FROM item cannot have an ON or USING clause",
+                        ));
+                    }
+                    JoinCondition::Cross
+                }
+                JoinForm::Natural => {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "NATURAL JOIN is not supported in UPDATE ... FROM / DELETE ... USING",
+                    ));
+                }
+                JoinForm::Plain => {
+                    if has_using_list {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "JOIN ... USING (...) is not supported in UPDATE ... FROM / DELETE ... USING",
+                        ));
+                    }
+                    self.expect_ident_matching("ON")?;
+                    JoinCondition::On(parse_join_on_conditions(self)?)
+                }
+            };
+            steps.push(JoinStep { kind, condition });
         }
-        Ok(rels)
+        Ok((rels, steps))
+    }
+
+    /// FROM／USING 側の表参照 1 つ（`<表> [[AS] <別名>]`）。参照数の上限検査（`54000`）と公開名の
+    /// 重複検査（`42601`）を、`rels` へ積む前に行う。
+    fn parse_dml_from_relation(
+        &mut self,
+        target: &TableRef,
+        rels: &[TableRef],
+    ) -> Result<TableRef, SqlSurfaceError> {
+        if rels.len().saturating_add(1) >= crate::sql::relation::MAX_TABLE_REFS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many table references in UPDATE/DELETE",
+            ));
+        }
+        let table = self.expect_ident()?;
+        crate::catalog::validate_relation_key(&table)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        let alias = self.parse_relation_alias(is_dml_target_reserved_word, "FROM")?;
+        let rel = match alias {
+            Some(a) => TableRef::with_alias(table, a),
+            None => TableRef::new(table),
+        };
+        if rel.exposed_name() == target.exposed_name()
+            || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "duplicate table reference name in UPDATE/DELETE",
+            ));
+        }
+        Ok(rel)
     }
 
     /// `[WHERE <join_where>]`（JOIN と同じ文法。数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`）。
@@ -23211,7 +23344,8 @@ impl<'a> Parser<'a> {
         }
         match self.tokens.get(self.pos.saturating_add(1)) {
             None => true,
-            Some(Token::Punct(',' | ';')) => true,
+            // `)` は行値代入 `(a, b) = (u.x, u.y)` の要素の終端（Issue #3296）。
+            Some(Token::Punct(',' | ';' | ')')) => true,
             Some(Token::Keyword(Keyword::From | Keyword::Where)) => true,
             Some(Token::Ident(w)) => ["USING", "RETURNING", "PARTITIONED"]
                 .iter()
@@ -23220,15 +23354,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `UPDATE ... FROM` の SET 句 1 要素。行値の代入は `0A000`、左辺の修飾は `42601`（`expect_ident`）。
+    /// `UPDATE ... FROM` の SET 句 1 要素。`<col> = <右辺>` と行値代入 `(<col>, ...) = (<右辺>, ...)`／
+    /// `= ROW(...)`（Issue #3296）を受理する。左辺の修飾は `42601`（`expect_ident`）。
     fn parse_update_from_set_item(
         &mut self,
         out: &mut Vec<(String, DmlFromSetValue)>,
     ) -> Result<(), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct('('))) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "row-value assignment is not supported in UPDATE ... FROM",
-            ));
+            return self.parse_row_assignment_with(out, Self::parse_update_from_set_rhs);
         }
         if out.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
             return Err(SqlSurfaceError::unsupported(
@@ -23237,15 +23370,27 @@ impl<'a> Parser<'a> {
         }
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
-        let value = if self.peek_set_rhs_single_column() {
-            DmlFromSetValue::Column(self.parse_join_colref()?)
-        } else {
-            self.dml_from_unqualified.clear();
-            let v = self.parse_update_set_rhs()?;
-            DmlFromSetValue::Value(v, std::mem::take(&mut self.dml_from_unqualified))
-        };
+        let value = self.parse_update_from_set_rhs()?;
         out.push((column, value));
         Ok(())
+    }
+
+    /// `UPDATE ... FROM` の SET 右辺 1 つ（単純な代入・行値代入の要素で共有）。列参照 1 個は
+    /// [`DmlFromSetValue::Column`]、列参照を含む式は [`DmlFromSetValue::Expr`]（解析中だけ
+    /// `dml_from_set_refs` を有効にし、エラー時も元へ戻す）、それ以外（リテラル・`DEFAULT`・列参照の無い式）は
+    /// [`DmlFromSetValue::Value`]。
+    fn parse_update_from_set_rhs(&mut self) -> Result<DmlFromSetValue, SqlSurfaceError> {
+        if self.peek_set_rhs_single_column() {
+            return Ok(DmlFromSetValue::Column(self.parse_join_colref()?));
+        }
+        let prev = self.dml_from_set_refs.replace(Vec::new());
+        let parsed = self.parse_update_set_rhs();
+        let refs = std::mem::replace(&mut self.dml_from_set_refs, prev).unwrap_or_default();
+        let value = parsed?;
+        Ok(match value {
+            SetValue::Expr(expr) if !refs.is_empty() => DmlFromSetValue::Expr { expr, refs },
+            other => DmlFromSetValue::Value(other, Vec::new()),
+        })
     }
 
     /// `UPDATE <表> [[AS] <別名>] SET <代入>[, ...] FROM <rel>[, ...] [WHERE <join_where>]
@@ -23270,7 +23415,7 @@ impl<'a> Parser<'a> {
         self.dml_from_target = prev;
         items?;
         self.expect_keyword(Keyword::From)?;
-        let from = self.parse_dml_relation_list(&target)?;
+        let (from, from_steps) = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
@@ -23280,6 +23425,7 @@ impl<'a> Parser<'a> {
             stmt: ValidatedUpdateFrom {
                 target,
                 from,
+                from_steps,
                 sources: Vec::new(),
                 assignments,
                 where_clause,
@@ -23297,7 +23443,7 @@ impl<'a> Parser<'a> {
         self.expect_keyword(Keyword::From)?;
         let target = self.parse_dml_target_relation()?;
         self.expect_contextual_keyword("USING")?;
-        let using = self.parse_dml_relation_list(&target)?;
+        let (using, using_steps) = self.parse_dml_relation_list(&target)?;
         let where_clause = self.parse_dml_from_where()?;
         let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
         let operation_id = self.parse_operation_id_clause()?;
@@ -23306,6 +23452,7 @@ impl<'a> Parser<'a> {
             stmt: ValidatedDeleteUsing {
                 target,
                 using,
+                using_steps,
                 sources: Vec::new(),
                 where_clause,
                 returning,
@@ -23390,6 +23537,19 @@ fn resolve_dml_from_relations(
     Ok(sources)
 }
 
+/// FROM／USING が 2 表以上（JOIN 連鎖を含む。Issue #3294 の畳み込み source）のとき、ビューの relation を
+/// `0A000` で拒否する。畳み込み source は合成 JOIN 文を実表名で評価するため、ビュー定義の述語・公開列の
+/// 制限を適用できず、通すとビューの絞り込みを黙って外す（fail-open）ことになる。単一表 source のビューだけが
+/// Issue #3292 の対象。
+fn reject_view_in_multi_source(sources: &[DmlFromSource]) -> Result<(), SqlSurfaceError> {
+    if sources.len() > 1 && sources.iter().any(|s| matches!(s, DmlFromSource::View(_))) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "UPDATE ... FROM / DELETE ... USING does not support a view in a multi-relation FROM / USING",
+        ));
+    }
+    Ok(())
+}
+
 /// `UPDATE ... FROM` の検証入口（SQL-53 (b)、Issue #1754）。検証順序: 構造（`42601`。`RETURNING` の構造を含む）→
 /// `operation_id` 必須化 → `WHERE` 省略ガード（opt-in）→ 各表のカタログ確認。`RETURNING` の束縛は
 /// `sql::dml_from`（Issue #3204）。
@@ -23408,6 +23568,7 @@ pub(crate) fn validate_update_from_tokens_with_limits(
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
     stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    reject_view_in_multi_source(&stmt.sources)?;
     // 台帳の文ハッシュ（Issue #1757。SQL-53 (5)）。全検証の後に算出し、検証順とエラーコードは変えない。
     stmt.statement_hash = crate::recovery::content_hash::for_update_from(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
@@ -23434,6 +23595,7 @@ pub(crate) fn validate_delete_using_tokens_with_limits(
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
     stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    reject_view_in_multi_source(&stmt.sources)?;
     stmt.statement_hash = crate::recovery::content_hash::for_delete_using(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
     )
@@ -32957,13 +33119,54 @@ mod tests {
         };
         ok("UPDATE a SET x = b.y FROM b WHERE a.id = b.id").expect("column rhs");
         ok("UPDATE a z SET x = 'k', y = DEFAULT FROM b q, c WHERE z.id = q.id").expect("alias");
+        // Issue #3296: 行値代入・FROM 側の列を含む式（修飾あり・なし）の構文は受理する。
+        ok("UPDATE a SET x = c.y + 1 FROM b").expect("qualified expression");
+        ok("UPDATE a SET x = y + 1 FROM b").expect("unqualified expression");
+        ok("UPDATE a SET (x, y) = (b.p, b.q) FROM b").expect("row of columns");
+        ok("UPDATE a SET (x, y) = ROW(b.p + 1, DEFAULT) FROM b")
+            .expect("row with expr and default");
+        ok("UPDATE a SET (x) = ROW(b.p), z = 1 FROM b").expect("single column row");
         ok("DELETE FROM a z USING b q WHERE z.id = q.id USING OPERATION_ID 'o'").expect("delete");
+        // FROM／USING 内の JOIN ... ON と多方向結合（Issue #3294）
+        ok("UPDATE a SET x = c.y FROM b JOIN c ON b.id = c.id WHERE a.id = b.id").expect("join");
+        ok("UPDATE a SET x = 1 FROM b LEFT JOIN c ON b.id = c.id AND c.k = 'x' RETURNING a.id")
+            .expect("left join returning");
+        ok("UPDATE a SET x = 1 FROM b CROSS JOIN c, d WHERE a.id = b.id").expect("cross and comma");
+        ok(
+            "DELETE FROM a USING b INNER JOIN c ON b.id = c.id FULL OUTER JOIN d ON c.id = d.id \
+            WHERE a.id = b.id USING OPERATION_ID 'o'",
+        )
+        .expect("delete multi join");
+        ok("DELETE FROM a USING b JOIN c ON b.id = c.id OR b.k = c.k;").expect("or on");
+        ok("DELETE FROM a USING b JOIN c ON b.id = c.id RETURNING a.id").expect("returning");
         for (sql, code) in [
             ("UPDATE a SET a.x = 1 FROM b", "42601"),
-            ("UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id", "42601"),
+            // JOIN の形: USING・NATURAL・カンマの後の明示 JOIN は意図的な拒否（Issue #3294）
+            ("UPDATE a SET x = 1 FROM b JOIN c USING (id)", "0A000"),
+            ("UPDATE a SET x = 1 FROM b NATURAL JOIN c", "0A000"),
+            (
+                "UPDATE a SET x = 1 FROM b, c JOIN d ON c.id = d.id",
+                "0A000",
+            ),
+            (
+                "UPDATE a SET x = 1 FROM b CROSS JOIN c ON b.id = c.id",
+                "42601",
+            ),
+            ("UPDATE a SET x = 1 FROM b JOIN c", "42601"),
+            (
+                "UPDATE a SET x = 1 FROM b JOIN (SELECT 1) c ON b.id = c.id",
+                "42601",
+            ),
+            (
+                "UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id JOIN b ON c.id = b.id",
+                "42601",
+            ),
+            ("DELETE FROM a USING b JOIN c USING (id)", "0A000"),
             ("UPDATE a SET x = 1 FROM a", "42601"),
-            ("UPDATE a SET x = c.y + 1 FROM b", "0A000"),
-            ("UPDATE a SET (x, y) = (1, 2) FROM b", "0A000"),
+            ("UPDATE a SET (x, y) = (b.p) FROM b", "42601"),
+            ("UPDATE a SET (x) = (b.p) FROM b", "42601"),
+            ("UPDATE a SET (x, y) = (b.p, 1, 2) FROM b", "42601"),
+            ("UPDATE a SET (x, y) = (SELECT 1, 2) FROM b", "0A000"),
             ("DELETE FROM a USING b WHERE a.n = 1", "42601"),
             ("DELETE FROM a USING b PARTITIONED", "42601"),
         ] {
