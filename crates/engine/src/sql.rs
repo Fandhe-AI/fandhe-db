@@ -324,6 +324,7 @@ pub(crate) mod string_fn;
 pub(crate) mod subquery;
 pub(crate) mod time_fn;
 pub mod transaction;
+pub(crate) mod type_name_position;
 pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod view_alias;

@@ -821,7 +821,7 @@ def _run_phases(
 
         # --- ingest_bulk: fixture の全 docs を COPY FROM STDIN（CSV）で投入する ---
         # TASK-220・WIRE-17（`docs/design/wire-copy-protocol.md`）。1 回の COPY は
-        # INDEX-4 ① の既定 64 行までのため複数 COPY に分割する（詳細・pgvector との
+        # 過去の計測と比較できるよう 64 行ずつの複数 COPY に分割する（INDEX-4 ① は Issue #3309 以降 COPY に掛からない）（詳細・pgvector との
         # 計測区間の差は `self_copy` のモジュール docstring と結果の `note`）。
         # 投入先は専用テーブル `docs_bulk`（fixture の `docs` は不変）。
         if docs_file is None or not os.path.exists(docs_file):

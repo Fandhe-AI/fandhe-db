@@ -608,21 +608,18 @@ fn delete_returning_is_rejected_on_nonsession_entry_without_consuming_the_ledger
 // `EngineCore::validate_insert_row_batch_limits`）を共有していることを固定する。
 // ---------------------------------------------------------------------
 
-/// `RETURNING` 付き複数行 `INSERT ... VALUES` が、運用者が絞った
-/// `self.batch_limits.max_files_per_batch`（ここでは 2）を超える行数（3 行）
-/// で `54000` 拒否され、行が一切書き込まれないこと（
-/// `insert_multi_row.rs::multi_row_insert_over_batch_limits_row_count_is_rejected_with_54000`
-/// の `RETURNING` 版。`execute_insert_returning_form` の `RowBatch` 分岐が
-/// 非 `RETURNING` 経路と同一の判定本体〔`validate_insert_row_batch_limits`〕を
-/// 共有していることの直接証拠）。
+/// `RETURNING` 付き複数行 `INSERT ... VALUES` にも、`max_files_per_batch`（①。ここでは 2）
+/// は掛からない（Issue #3308。`insert_multi_row.rs::multi_row_insert_ignores_batch_file_limit`
+/// の `RETURNING` 版。②③④の判定本体は非 `RETURNING` 経路と共有）。
 #[test]
-fn insert_returning_multi_row_over_batch_limits_row_count_is_rejected_with_54000() {
+fn insert_returning_multi_row_ignores_batch_file_limit() {
     let path = unique_db_path("sql-returning-batch-limits-row-count");
     let storage = Storage::open(&path).expect("open storage");
     storage.create_table(&schema(TABLE)).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(
         engine::batch_limits::BatchLimits {
             max_files_per_batch: 2,
+            max_batch_chunks: 10_000,
             ..engine::batch_limits::BatchLimits::default()
         },
     );
@@ -630,7 +627,8 @@ fn insert_returning_multi_row_over_batch_limits_row_count_is_rejected_with_54000
     let alice = ctx_for("alice", true);
     let mut session = SessionState::default();
 
-    let err = core
+    // Issue #3308: ①は行の形には掛からない。3 行が成功し RETURNING も 3 行返す。
+    let outcome = core
         .execute_sql_in_session(
             &alice,
             &mut session,
@@ -641,11 +639,9 @@ fn insert_returning_multi_row_over_batch_limits_row_count_is_rejected_with_54000
                  RETURNING id USING OPERATION_ID 'op-insert-returning-batch-limit'"
             ),
         )
-        .expect_err("row count over batch_limits.max_files_per_batch must be rejected");
-    assert_eq!(err.wire_code(), "54000");
-
-    // 行は一切書き込まれていない（副作用ゼロ）。
-    assert_eq!(count_star(&core, &alice, TABLE), 0);
+        .expect("max_files_per_batch must not apply to row-shaped INSERT");
+    assert!(format!("{outcome:?}").contains("rows"), "{outcome:?}");
+    assert_eq!(count_star(&core, &alice, TABLE), 3);
 }
 // ---------------------------------------------------------------------
 // UPDATE・述語形 DELETE・UPSERT の RETURNING（Issue #1182・SQL-21）

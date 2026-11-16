@@ -533,10 +533,12 @@ fn compare_only_without_ledger_mode_allows_upsert_without_operation_id() {
     assert_eq!(insert_rows_affected(outcome), 1);
 }
 
+/// Issue #3308: ①（`max_files_per_batch`）は UPSERT の行数に掛からない。
 #[test]
-fn upsert_row_count_exceeding_batch_limit_is_rejected_with_54000() {
+fn upsert_row_count_ignores_batch_file_limit() {
     let limits = engine::batch_limits::BatchLimits {
         max_files_per_batch: 2,
+        max_batch_chunks: 10_000,
         ..Default::default()
     };
     let (core, path) = open_engine_with_limits("sql-upsert-index4-row-limit", limits);
@@ -544,10 +546,40 @@ fn upsert_row_count_exceeding_batch_limit_is_rejected_with_54000() {
     let ctx = ctx_for("tenant-a");
     let mut session = SessionState::default();
 
+    for (clause, op) in [
+        ("DO NOTHING", "op-upsert-16a"),
+        ("DO UPDATE SET lang = EXCLUDED.lang", "op-upsert-16b"),
+    ] {
+        let values: Vec<String> = (1..=100)
+            .map(|i| format!("({i}, '[0.1,0.1]', 'ja')"))
+            .collect();
+        let sql = format!(
+            "INSERT INTO {TABLE} (id, embedding, lang) VALUES {} \
+             ON CONFLICT (id) {clause} USING OPERATION_ID '{op}'",
+            values.join(", ")
+        );
+        let outcome = run_sql(&core, &ctx, &mut session, &sql).expect("100-row upsert ok");
+        assert!(insert_rows_affected(outcome) > 0);
+    }
+    assert_eq!(read_back(&core, &ctx).len(), 100);
+}
+
+/// Issue #3308: UPSERT でも④（1 行 = 1 チャンク）超過は `54000`・副作用ゼロ。
+#[test]
+fn upsert_row_count_exceeding_chunk_limit_is_rejected_with_54000() {
+    let limits = engine::batch_limits::BatchLimits {
+        max_batch_chunks: 2,
+        ..Default::default()
+    };
+    let (core, path) = open_engine_with_limits("sql-upsert-index4-chunk-limit", limits);
+    let _guard = CleanupGuard(path);
+    let ctx = ctx_for("tenant-a");
+    let mut session = SessionState::default();
+
     let sql = format!(
         "INSERT INTO {TABLE} (id, embedding, lang) VALUES \
          (1, '[0.1,0.1]', 'ja'), (2, '[0.2,0.2]', 'en'), (3, '[0.3,0.3]', 'fr') \
-         ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-16'"
+         ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-upsert-16c'"
     );
     let err = run_sql(&core, &ctx, &mut session, &sql).unwrap_err();
     assert_eq!(err.wire_code(), "54000");

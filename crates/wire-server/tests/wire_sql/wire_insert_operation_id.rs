@@ -229,8 +229,9 @@ fn wire_insert_multi_row_command_complete_tag_reports_row_count() {
 /// 層テストが確定オラクル）。
 #[test]
 fn wire_insert_multi_row_over_batch_limits_is_rejected_with_54000_and_connection_survives() {
+    // Issue #3308: 行の形では①ではなく④（1 行 = 1 チャンク）が拒否を担う。
     let (core, _guard) = new_core_with_docs_table_and_limits(engine::batch_limits::BatchLimits {
-        max_files_per_batch: 1,
+        max_batch_chunks: 1,
         ..engine::batch_limits::BatchLimits::default()
     });
     let mut stream = spawn_with_alice(core);
@@ -249,6 +250,41 @@ fn wire_insert_multi_row_over_batch_limits_is_rejected_with_54000_and_connection
     );
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #3308: 既定の ①（64）を超える 65・100 行の複数行 `VALUES` と UPSERT が、psql と同じ
+/// 末尾 `;` 付きの単独送信で成功する。
+#[test]
+fn wire_insert_multi_row_and_upsert_over_64_rows_succeed_with_trailing_semicolon() {
+    let (core, _guard) = new_core_with_docs_table_and_limits(engine::batch_limits::BatchLimits {
+        max_files_per_batch: 64,
+        max_batch_chunks: 10_000,
+        ..engine::batch_limits::BatchLimits::default()
+    });
+    let mut stream = spawn_with_alice(core);
+
+    for (n, start) in [(65u64, 1u64), (100, 1001)] {
+        let ids: Vec<u64> = (start..start + n).collect();
+        let sql = format!(
+            "{};",
+            multi_row_insert_sql(&ids, &format!("wire-op-many-{n}"))
+        );
+        send_simple_query(&mut stream, &sql);
+        assert_eq!(read_command_complete(&mut stream), format!("INSERT 0 {n}"));
+        read_ready_for_query(&mut stream);
+    }
+
+    let values: Vec<String> = (2001..2066)
+        .map(|id| format!("({id}, '[0.1,0.2,0.3]', 'ja')"))
+        .collect();
+    let sql = format!(
+        "INSERT INTO docs (id, embedding, lang) VALUES {} ON CONFLICT (id) DO NOTHING \
+         USING OPERATION_ID 'wire-op-upsert-65';",
+        values.join(", ")
+    );
+    send_simple_query(&mut stream, &sql);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 65");
     read_ready_for_query(&mut stream);
 }
 
