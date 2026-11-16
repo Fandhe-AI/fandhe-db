@@ -5,7 +5,7 @@
 //! 判定した WHERE 部分木（列同士の比較・relation を跨ぐ `OR`）を、`sql::join::exec`
 //! が返した結合タプルに対して評価する。単一 relation で完結する部分木は束縛済みの
 //! 述語（単一テーブル経路と同じ `BoundOrGroup`）を、結合行のセルから組み立てた
-//! `scanned`（[`super::values::cell_scalar`]）に当てて評価する——リテラルの型解析・
+//! `scanned`（[`super::values::cell_scalar`]・[`super::dml::source_scalar`]）に当てて評価する——リテラルの型解析・
 //! 評価規則の第 2 実装を作らない。
 //!
 //! 3 値論理の扱い: 受理する木は `AND`／`OR` のみ（`NOT` を受理しない）で単調なため、
@@ -17,7 +17,7 @@ use crate::sql::exec::ResultRow;
 use crate::sql::expr_program::StackValue;
 
 use super::plan::{ColCompare, PlainOrder, ResNode, SingleFilter};
-use super::values::{cell_scalar, cmp_val, compare_order, compare_vals, op_holds};
+use super::values::{cmp_val, compare_order, compare_vals, op_holds};
 use super::JoinBudget;
 
 /// 結合タプルの `rel` 番目の relation の行（NULL 補完なら `None`）。
@@ -87,10 +87,14 @@ fn eval_single(
     tuple: &[Option<u32>],
     scratch: &mut Vec<StackValue>,
 ) -> Result<bool, SqlSurfaceError> {
-    let row = match row_at(sides, tuple, f.rel)? {
-        Some(r) => r,
-        // NULL 補完された relation を参照する部分木は偽（不定）。
-        None => return Ok(false),
+    let Some(row) = row_at(sides, tuple, f.rel)? else {
+        // NULL 補完された relation を参照する部分木は偽（不定）。ただし非 strict な葉（`IS NULL`）を
+        // 含む部分木は全列 NULL の行として評価する（行 `id` の参照は束縛時に拒否済み）。
+        if !f.eval_padded {
+            return Ok(false);
+        }
+        let scanned: Vec<Option<crate::row_codec::ScalarRef<'_>>> = vec![None; f.schema_len];
+        return f.group.matches(&scanned, 0, &[], 0, scratch);
     };
     let mut scanned: Vec<Option<crate::row_codec::ScalarRef<'_>>> = vec![None; f.schema_len];
     for (schema_idx, pos, ty) in &f.cols {
@@ -110,7 +114,8 @@ fn eval_single(
                     })?,
                 ))
             }
-            _ => cell_scalar(cell, ty)?,
+            // TIME・TIMESTAMPTZ・INTERVAL・JSONB は `source_scalar` で写す（束縛段階で受理済みの型）。
+            _ => super::dml::source_scalar(cell, ty, None)?,
         };
         if let Some(slot) = scanned.get_mut(*schema_idx) {
             *slot = scalar;
