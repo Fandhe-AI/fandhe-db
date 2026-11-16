@@ -710,7 +710,8 @@ pub(crate) fn rewrite_relation_names_full(
             Ok(Resolved::Public) => {
                 // 同名の CTE があると、置換後の裸の名前が CTE に解決され永続表を指さなくなる。
                 // `public.` が永続側を指す契約を守れないため拒否する（fail-closed）。
-                if cte_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                // 型名の位置は relation と別の名前空間なので CTE 名とは衝突しない（検査しない）。
+                if !pos.type_pos && cte_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "public-qualified relation conflicts with a CTE name",
                     ));
@@ -1764,6 +1765,11 @@ mod tests {
         ] {
             assert_eq!(rewrite(sql).expect_err(sql).wire_code(), "0A000", "{sql}");
         }
+        // 型名の位置（キャストの `public.<型>`）は CTE 名と衝突しない（別名前空間）。
+        same(
+            "WITH integer AS (SELECT 1 AS n) SELECT n::public.integer FROM integer",
+            "WITH integer AS (SELECT 1 AS n) SELECT n::integer FROM integer",
+        );
         // 別名の CTE とは衝突しない。
         same(
             "WITH c AS (SELECT id FROM public.t) SELECT id FROM c",
