@@ -317,7 +317,7 @@ CTE 本文の集計・`GROUP BY`・`SELECT DISTINCT`・ウィンドウ関数を�
 - 発火する入口: セッション最上位の `SELECT`（`validate_sql_tokens_impl`）と非再帰 `WITH`（`validate_with_statement`）の
   `AllowMaterialize` のみ。ビュー本文・cursor・COPY・CTAS・サブクエリ内側・`EXPLAIN`・`WITH RECURSIVE`・
   深さ 0 に集合演算子を持つ文は従来どおり `42601`。
-- 位置: `FROM`・`JOIN`・FROM 句内のカンマの直後。`LATERAL` は固定 `0A000`。
+- 位置: `FROM`・`JOIN`・FROM 句内のカンマの直後。`LATERAL` は固定 `0A000`（実行方式の設計は [lateral-derived-table.md](lateral-derived-table.md)）。
 - 本文の解析・検証は CTE と共有する部品（`parse_cte_select_body`・`validate_cte_definition_at`）。
   `WITH` の主クエリの派生表からは先行する CTE が見える。派生表どうしは互いに見えず、1 件ずつ独立に検証する。
   データ変更 CTE を含む文は解決の前に固定 `0A000`（書き込みを発生させない）。
