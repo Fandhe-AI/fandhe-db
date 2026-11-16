@@ -24,8 +24,8 @@ use crate::catalog::TableSchema;
 use crate::recovery::required_op_id::OperationId;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{
-    DmlFromSetValue, DmlFromSource, JoinWhereExpr, JoinWherePredicate, SetValue, SqlSurfaceError,
-    ValidatedDeleteUsing, ValidatedUpdateFrom,
+    DmlFromSetValue, DmlFromSource, JoinCondition, JoinStep, JoinWhereExpr, JoinWherePredicate,
+    SetValue, SqlSurfaceError, ValidatedDeleteUsing, ValidatedUpdateFrom,
 };
 use crate::sql::dml_from_returning::{bind_from_returning, BoundFromReturning};
 use crate::sql::relation::{BindingScope, ColumnRef, ResolvedColumn, TableRef};
@@ -37,6 +37,8 @@ use crate::sql::set_expr::BoundSetExpr;
 #[non_exhaustive]
 pub struct BoundUpdateFrom {
     relations: Vec<TableRef>,
+    /// FROM 側の結合段（Issue #3294。長さは `relations.len() - 2`、空なら FROM 側が 1 表）。
+    steps: Vec<JoinStep>,
     where_columns: Vec<ResolvedColumn>,
     set_columns: Vec<(usize, ResolvedColumn)>,
     set_literals: Vec<(usize, Value)>,
@@ -51,6 +53,11 @@ impl BoundUpdateFrom {
     /// 参照の並び（先頭が更新対象、続いて FROM 側の宣言順）。
     pub fn relations(&self) -> &[TableRef] {
         &self.relations
+    }
+
+    /// FROM 側の結合段（Issue #3294）。`relations[k + 2]` を加える段が `steps[k]`。
+    pub(crate) fn steps(&self) -> &[JoinStep] {
+        &self.steps
     }
 
     /// `WHERE` の各葉が参照する列の解決結果（葉の出現順）。
@@ -106,6 +113,8 @@ impl BoundUpdateFrom {
 #[non_exhaustive]
 pub struct BoundDeleteUsing {
     relations: Vec<TableRef>,
+    /// USING 側の結合段（Issue #3294。[`BoundUpdateFrom`] の `steps` と同じ契約）。
+    steps: Vec<JoinStep>,
     where_columns: Vec<ResolvedColumn>,
     where_clause: Option<JoinWhereExpr>,
     returning: Option<BoundFromReturning>,
@@ -122,6 +131,11 @@ impl BoundDeleteUsing {
     /// 束縛に使った `WHERE` の論理木（変換器 `sql::join::dml_plan` が conjunct を振り分ける）。
     pub(crate) fn where_clause(&self) -> Option<&JoinWhereExpr> {
         self.where_clause.as_ref()
+    }
+
+    /// USING 側の結合段（Issue #3294）。
+    pub(crate) fn steps(&self) -> &[JoinStep] {
+        &self.steps
     }
 
     /// 参照の並び（先頭が削除対象、続いて USING 側の宣言順）。
@@ -185,6 +199,35 @@ pub(crate) fn visible_of(sources: &[DmlFromSource]) -> Vec<Option<Vec<String>>> 
             DmlFromSource::Table => None,
         })
         .collect()
+}
+
+/// FROM／USING 内の `JOIN ... ON` の列参照を、FROM 側の表だけのスコープで解決する（Issue #3294）。
+/// PG と同じく `ON` からは更新・削除の対象表を参照できない（修飾参照は `42P01`、対象表にしか無い
+/// 非修飾列は `42703`）。段 k の `ON` が参照できるのは FROM 側の先頭から k + 1 番目までの表で、
+/// 後続の表への参照も `42P01` になる。非修飾で複数の FROM 側の表に該当すれば `42702`。
+/// 列の型検証と結合キー／残余の分類は結合実行器（`sql::join`）が担う。
+fn bind_join_steps(
+    steps: &[JoinStep],
+    others: &[TableRef],
+    other_schemas: &[&TableSchema],
+    other_visible: &[Option<Vec<String>>],
+) -> Result<(), SqlSurfaceError> {
+    for (k, step) in steps.iter().enumerate() {
+        let JoinCondition::On(expr) = &step.condition else {
+            continue;
+        };
+        let upto = k.saturating_add(2);
+        let relations: Vec<(TableRef, &TableSchema)> = others
+            .iter()
+            .zip(other_schemas.iter())
+            .take(upto)
+            .map(|(r, s)| (r.clone(), *s))
+            .collect();
+        let visible = other_visible.iter().take(upto).cloned().collect();
+        let scope = BindingScope::new(relations)?.with_visible(visible);
+        resolve_where_columns(&scope, Some(expr))?;
+    }
+    Ok(())
 }
 
 /// `WHERE` の論理木が参照する列を出現順に集め、スコープで解決する。
@@ -268,7 +311,7 @@ pub(crate) fn check_set_expr_scope(
     Ok(())
 }
 
-/// `UPDATE ... FROM` を束縛する。判定順は決定的: スコープ構築（`54000`・`42601`）→ `WHERE` の列解決 →
+/// `UPDATE ... FROM` を束縛する。判定順は決定的: スコープ構築（`54000`・`42601`）→ `JOIN ... ON` の列解決（Issue #3294）→ `WHERE` の列解決 →
 /// SET 左辺の検査（重複・疑似列・未知列・`GENERATED ALWAYS`）→ SET 右辺（列参照は解決と型照合〔`42804`〕、
 /// 式はスコープ照合の後に既存の式束縛、リテラルは既存のリテラル束縛）。
 pub fn bind_update_from(
@@ -295,6 +338,12 @@ pub(crate) fn bind_update_from_with_udfs(
     let scope = build_scope(
         &stmt.target,
         target_schema,
+        &stmt.from,
+        from_schemas,
+        &visible_of(&stmt.sources),
+    )?;
+    bind_join_steps(
+        &stmt.from_steps,
         &stmt.from,
         from_schemas,
         &visible_of(&stmt.sources),
@@ -350,6 +399,7 @@ pub(crate) fn bind_update_from_with_udfs(
         relations: std::iter::once(stmt.target.clone())
             .chain(stmt.from.iter().cloned())
             .collect(),
+        steps: stmt.from_steps.clone(),
         where_columns,
         set_columns,
         set_literals,
@@ -389,6 +439,12 @@ pub(crate) fn bind_delete_using_with_udfs(
         using_schemas,
         &visible_of(&stmt.sources),
     )?;
+    bind_join_steps(
+        &stmt.using_steps,
+        &stmt.using,
+        using_schemas,
+        &visible_of(&stmt.sources),
+    )?;
     let where_columns = resolve_where_columns(&scope, stmt.where_clause.as_deref())?;
     let returning = stmt
         .returning
@@ -399,6 +455,7 @@ pub(crate) fn bind_delete_using_with_udfs(
         relations: std::iter::once(stmt.target.clone())
             .chain(stmt.using.iter().cloned())
             .collect(),
+        steps: stmt.using_steps.clone(),
         where_columns,
         where_clause: stmt.where_clause.as_deref().cloned(),
         returning,
