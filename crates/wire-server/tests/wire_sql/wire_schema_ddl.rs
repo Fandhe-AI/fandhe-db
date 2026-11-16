@@ -355,9 +355,7 @@ fn wire_schema_with_elements_extended_query_and_permission_gate() {
 
 /// ENUM 型の SCHEMA 配置（Issue #3288）。psql 形（末尾 `;` 付き・1 メッセージ 1 文）の簡易クエリで、修飾名の
 /// `CREATE TYPE`／`DROP TYPE` と `DROP SCHEMA ... CASCADE` が通り、固定タグを返す。同名の `public` の型と
-/// 共存し、拒否後も接続が使える。列型の `s.mood` は従来どおり構文エラー（Issue #3289）。
-// intentional: docs/design/schema-tenant-namespace.md
-// tracked: #3289
+/// 共存し、拒否後も接続が使える。列型・キャストの型名位置の `s.mood`（Issue #3289）も末尾 `;` 付きで通る。
 #[test]
 fn wire_enum_type_in_schema_simple_query() {
     let (core, _guard) = new_core();
@@ -388,15 +386,44 @@ fn wire_enum_type_in_schema_simple_query() {
         expect_error_response_with_sqlstate(&mut stream, sqlstate);
         read_ready_for_query(&mut stream);
     }
-    // 拒否の後も接続は使える。列型の SCHEMA 修飾は未対応のまま。
-    send_simple_query(&mut stream, "CREATE SCHEMA s;");
-    assert_eq!(read_command_complete(&mut stream), "CREATE SCHEMA");
-    read_ready_for_query(&mut stream);
-    send_simple_query(&mut stream, "CREATE TYPE s.mood AS ENUM ('a');");
-    assert_eq!(read_command_complete(&mut stream), "CREATE TYPE");
-    read_ready_for_query(&mut stream);
-    send_simple_query(&mut stream, "CREATE TABLE t (id BIGINT, m s.mood);");
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+    // 拒否の後も接続は使える。列型・キャストの型名位置の SCHEMA 修飾（Issue #3289）も末尾 `;` 付きで通る。
+    for (sql, tag) in [
+        ("CREATE SCHEMA s;", "CREATE SCHEMA"),
+        ("CREATE TYPE s.mood AS ENUM ('c', 'a', 'b');", "CREATE TYPE"),
+        (
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.mood, ms s.mood[]);",
+            "CREATE TABLE",
+        ),
+        ("INSERT INTO s.t (id, m) VALUES (1, 'b');", "INSERT 0 1"),
+        ("INSERT INTO s.t (id, m) VALUES (2, 'c');", "INSERT 0 1"),
+        ("ALTER TABLE s.t ADD COLUMN m2 s.mood;", "ALTER TABLE"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+    // 語彙外ラベルは `22P02`。型が使われている間の `DROP TYPE` は `2BP01`。
+    for (sql, sqlstate) in [
+        ("INSERT INTO s.t (id, m) VALUES (3, 'zzz');", "22P02"),
+        ("DROP TYPE s.mood;", "2BP01"),
+        ("CREATE TABLE t (id BIGINT, m z.mood);", "3F000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+    // ORDER BY は宣言順（c < a < b）。ENUM の値はラベルのテキストで返る。
+    send_simple_query(&mut stream, "SELECT id, m FROM s.t ORDER BY m, id;");
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("2".to_string()), Some("c".to_string())]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("b".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     read_ready_for_query(&mut stream);
 }
 
@@ -417,6 +444,18 @@ fn wire_enum_type_in_schema_extended_query() {
             "CREATE TYPE s.m2 AS ENUM ('a');",
             &b"CREATE TYPE\0"[..],
         ),
+        // 列型の型名位置の修飾（Issue #3289）も拡張クエリの Parse・Bind・Execute で通る。
+        (
+            "t1",
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.m2);",
+            &b"CREATE TABLE\0"[..],
+        ),
+        (
+            "a1",
+            "ALTER TABLE s.t ADD COLUMN m3 s.m2[];",
+            &b"ALTER TABLE\0"[..],
+        ),
+        ("x1", "DROP TABLE s.t;", &b"DROP TABLE\0"[..]),
         ("d1", "DROP TYPE s.m2;", &b"DROP TYPE\0"[..]),
     ] {
         send_length_prefixed_message(&mut stream, b'P', &parse_body(name, sql, 0));

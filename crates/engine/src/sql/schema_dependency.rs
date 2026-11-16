@@ -36,35 +36,35 @@ fn forbid<'a>(owner: &str, mut deps: impl Iterator<Item = &'a str>) -> Result<()
     Ok(())
 }
 
-/// ENUM 型（配列要素を含む）を使う列型か。ENUM 型は全テナント共有のカタログ（public 相当）にだけ
-/// 存在するため、SCHEMA 配下の表がこれを使うと SEQUENCE や FK と同じ「SCHEMA → public」依存になる。
-fn column_type_uses_enum(ty: &crate::catalog::ColumnType) -> bool {
+/// 列型が使う ENUM 型のキー（配列要素を含む。裸の名前＝public、内部キー＝SCHEMA 配下。Issue #3289）。
+fn column_type_enum_key(ty: &crate::catalog::ColumnType) -> Option<&str> {
     match ty {
-        crate::catalog::ColumnType::Enum(_) => true,
-        crate::catalog::ColumnType::Array(a) => a.enum_def().is_some(),
-        _ => false,
+        crate::catalog::ColumnType::Enum(def) => Some(def.name()),
+        crate::catalog::ColumnType::Array(a) => a.enum_def().map(|d| d.name()),
+        _ => None,
     }
 }
 
-/// [`column_type_uses_enum`] の型名（構文木）版。`ALTER TABLE` の `ADD COLUMN`・型変更が使う。
-fn type_name_uses_enum(ty: &crate::sql::ddl_column_type::SqlColumnTypeName) -> bool {
+/// [`column_type_enum_key`] の型名（構文木）版。`ALTER TABLE` の `ADD COLUMN`・型変更が使う。名前は
+/// 解析段の名前解決（`sql::relation_name`・`sql::search_path`）が書き換えた後のキーで、カタログは引かない。
+fn type_name_enum_key(ty: &crate::sql::ddl_column_type::SqlColumnTypeName) -> Option<&str> {
     use crate::sql::ddl_column_type::SqlColumnTypeName as T;
     match ty {
-        T::Enum(_) => true,
-        T::Array { elem, .. } => type_name_uses_enum(elem),
-        T::Alias { target, .. } => type_name_uses_enum(target),
-        _ => false,
+        T::Enum(name) => Some(name.as_str()),
+        T::Array { elem, .. } => type_name_enum_key(elem),
+        T::Alias { target, .. } => type_name_enum_key(target),
+        _ => None,
     }
 }
 
-/// SCHEMA 配下の表（`owner`）が ENUM 型を使うことを拒否する。型の存在確認を伴わず（存在オラクルに
-/// しない）、型名の形だけで判定する。DROP TYPE の依存判定が全テナントを走査するため、他テナントの
-/// 非公開の依存の有無が `DROP TYPE` の結果（成功／`2BP01`）で漏れるのを防ぐ（ADR D7）。
-fn forbid_enum(owner: &str, uses_enum: bool) -> Result<(), SqlSurfaceError> {
-    if uses_enum && is_schema_key(owner) {
-        return Err(SqlSurfaceError::SchemaDependencyForbidden);
-    }
-    Ok(())
+/// 表（`owner`）が使う ENUM 型が表と同じ所属（public か SCHEMA 配下か）であることを求める。型の存在確認を
+/// 伴わず（存在オラクルにしない）、トークン由来のキーの形だけで判定する。SCHEMA 配下の表が public の型を
+/// 使う向きは、public 側の `DROP TYPE` の依存判定が全テナントを走査するため他テナントの非公開の依存の
+/// 有無で結果が分かれる経路になり、public の表が SCHEMA 配下の型を使う向きは SCHEMA の削除が public の定義を
+/// 壊す経路になる。どちらも拒否する（ADR D7）。SCHEMA 配下どうし（同一テナントの別 SCHEMA を含む）は
+/// FK・SEQUENCE の [`forbid`] と同じ粒度で許可する（Issue #3289）。
+fn forbid_enum(owner: &str, enum_key: Option<&str>) -> Result<(), SqlSurfaceError> {
+    forbid(owner, enum_key.into_iter())
 }
 
 /// `DEFAULT nextval('<名前>')` が参照する SEQUENCE 名（それ以外のリテラルは `None`）。
@@ -84,14 +84,16 @@ pub(crate) fn check_create_table(stmt: &ValidatedCreateTable) -> Result<(), SqlS
         _ => None,
     });
     forbid(&stmt.table_name, fk_parents.chain(sequences))?;
-    forbid_enum(
+    forbid(
         &stmt.table_name,
-        stmt.columns.iter().any(|c| column_type_uses_enum(&c.ty)),
+        stmt.columns
+            .iter()
+            .filter_map(|c| column_type_enum_key(&c.ty)),
     )
 }
 
 /// `ALTER TABLE`: 追加する外部キーの参照先・`ADD COLUMN`／`SET DEFAULT` の `DEFAULT nextval` が
-/// 表と同じ所属であること。SCHEMA 配下の表への ENUM 型列の追加・型変更も拒否する。複数アクションは各アクションを検査する。
+/// 表と同じ所属であること。ENUM 型列の追加・型変更も ENUM 型と表の所属が異なれば拒否する。複数アクションは各アクションを検査する。
 pub(crate) fn check_alter_table(stmt: &ValidatedAlterTable) -> Result<(), SqlSurfaceError> {
     match stmt {
         ValidatedAlterTable::Multiple(m) => m.actions.iter().try_for_each(check_alter_table),
@@ -100,10 +102,10 @@ pub(crate) fn check_alter_table(stmt: &ValidatedAlterTable) -> Result<(), SqlSur
                 &a.table_name,
                 sequence_of_literal(a.default.as_ref()).into_iter(),
             )?;
-            forbid_enum(&a.table_name, type_name_uses_enum(&a.column_type))
+            forbid_enum(&a.table_name, type_name_enum_key(&a.column_type))
         }
         ValidatedAlterTable::AlterColumnType(a) => {
-            forbid_enum(&a.table_name, type_name_uses_enum(&a.column_type))
+            forbid_enum(&a.table_name, type_name_enum_key(&a.column_type))
         }
         ValidatedAlterTable::AddForeignKey(a) => {
             forbid(&a.table_name, std::iter::once(a.foreign_key.parent_table()))
