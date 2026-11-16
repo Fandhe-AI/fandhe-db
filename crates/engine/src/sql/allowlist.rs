@@ -4250,6 +4250,29 @@ pub enum DmlFromSetValue {
     Column(ColumnRef),
 }
 
+/// `UPDATE ... FROM`／`DELETE ... USING` の FROM／USING 側 1 relation の解決結果（Issue #3292）。
+/// 構文段（[`resolve_dml_from_relations`]）がカタログから決め、束縛・変換・実行（`core::dml_from_exec`）が
+/// 読み取り源の選択に使う。ビュー・実表以外の形は構文段で `0A000` に倒れるためここには現れない。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DmlFromSource {
+    /// 実表（永続）。
+    Table,
+    /// 単純形ビュー（列別名なし）。読み取りは基底表をセッションの `PolicyContext` で走査し、
+    /// ビュー定義の述語を source 側述語の先頭へ畳み込む。
+    View(DmlFromViewSource),
+}
+
+/// [`DmlFromSource::View`] の中身（`sql::view::Resolved::View` のうち本機能が使う部分）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DmlFromViewSource {
+    /// 連鎖を辿った先の実表名。
+    pub(crate) base_table: String,
+    /// ビュー定義由来の述語（基底表の物理列名で書かれている。内側のビューが先頭）。
+    pub(crate) view_predicates: Vec<WherePredicate>,
+    /// ビューが公開する列（`None` は全列〔疑似列 `id` を含む〕）。公開しない基底列は束縛に参加させない。
+    pub(crate) view_columns: Option<Vec<String>>,
+}
+
 /// 許可形状の構造判定を通過した `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`
 /// （SQL-53 (b)、Issue #1754。親 #1753）。保証するのは構文と表の存在確認（ビュー拒否）まで。
 /// 列の解決・型検証は `sql::dml_from` の束縛、結合の実行は #1755、RLS と `RETURNING` は #1756、
@@ -4264,6 +4287,8 @@ pub struct ValidatedUpdateFrom {
     pub(crate) target: TableRef,
     /// FROM 句の表参照（宣言順。1..=`MAX_TABLE_REFS - 1` 個）。
     pub(crate) from: Vec<TableRef>,
+    /// `from` と同じ並びの解決結果（実表・単純形ビュー。Issue #3292）。パーサは空で作り、検証入口が埋める。
+    pub(crate) sources: Vec<DmlFromSource>,
     /// SET 句の (列名, 右辺)。宣言順を保持する。
     pub(crate) assignments: Vec<(String, DmlFromSetValue)>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
@@ -4303,6 +4328,8 @@ pub struct ValidatedDeleteUsing {
     pub(crate) target: TableRef,
     /// USING 句の表参照（宣言順）。
     pub(crate) using: Vec<TableRef>,
+    /// `using` と同じ並びの解決結果（[`ValidatedUpdateFrom::sources`] と同じ）。
+    pub(crate) sources: Vec<DmlFromSource>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
     /// `RETURNING` 句（Issue #3204）。省略は `None`。
@@ -23131,6 +23158,7 @@ impl<'a> Parser<'a> {
             stmt: ValidatedUpdateFrom {
                 target,
                 from,
+                sources: Vec::new(),
                 assignments,
                 where_clause,
                 returning,
@@ -23156,6 +23184,7 @@ impl<'a> Parser<'a> {
             stmt: ValidatedDeleteUsing {
                 target,
                 using,
+                sources: Vec::new(),
                 where_clause,
                 returning,
                 operation_id,
@@ -23195,25 +23224,48 @@ fn reject_omitted_join_where_for_dml(
     Ok(())
 }
 
-/// FROM／USING 形の DML の対象表・FROM 側の表をカタログで確認する（ビューは `0A000`、未知は `42P01`）。
+/// FROM／USING 形の DML の対象表・FROM 側の表をカタログで確認する（未知は `42P01`）。
 /// 構文の完全な解析（`42601`）の後に呼ぶ（`parse_join_statement` と同じ検証順序）。
+///
+/// 対象表（書き込み先）がビューなら `0A000`（更新可能ビューは別の穴）。FROM／USING 側（読み取り専用）の
+/// 単純形ビュー（列別名なし）は [`DmlFromSource::View`] として返す。列別名つきビュー・評価後射影形ビューは
+/// 公開名から物理名への書き換え・本文の実行が要るため `0A000`（集合演算枝の前例と同じ fail-closed）。
 fn resolve_dml_from_relations(
     lookup: &impl TableLookup,
     target: &TableRef,
     others: &[TableRef],
-) -> Result<(), SqlSurfaceError> {
-    for r in std::iter::once(target).chain(others.iter()) {
-        match crate::sql::view::resolve_from(lookup, r.table())? {
-            crate::sql::view::Resolved::Table => {}
-            crate::sql::view::Resolved::View { .. }
-            | crate::sql::view::Resolved::Buffered { .. } => {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "UPDATE ... FROM / DELETE ... USING does not support view references",
-                ));
-            }
+) -> Result<Vec<DmlFromSource>, SqlSurfaceError> {
+    match crate::sql::view::resolve_from(lookup, target.table())? {
+        crate::sql::view::Resolved::Table => {}
+        crate::sql::view::Resolved::View { .. } | crate::sql::view::Resolved::Buffered { .. } => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "UPDATE ... FROM / DELETE ... USING does not support a view as the target",
+            ));
         }
     }
-    Ok(())
+    let mut sources = Vec::with_capacity(others.len().min(crate::sql::relation::MAX_TABLE_REFS));
+    for r in others {
+        sources.push(match crate::sql::view::resolve_from(lookup, r.table())? {
+            crate::sql::view::Resolved::Table => DmlFromSource::Table,
+            crate::sql::view::Resolved::View {
+                base_table,
+                view_predicates,
+                view_columns,
+                column_map: None,
+                ..
+            } => DmlFromSource::View(DmlFromViewSource {
+                base_table,
+                view_predicates,
+                view_columns,
+            }),
+            crate::sql::view::Resolved::View { .. } | crate::sql::view::Resolved::Buffered { .. } => {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "UPDATE ... FROM / DELETE ... USING supports only simple views without column aliases as the FROM / USING relation",
+                ));
+            }
+        });
+    }
+    Ok(sources)
 }
 
 /// `UPDATE ... FROM` の検証入口（SQL-53 (b)、Issue #1754）。検証順序: 構造（`42601`。`RETURNING` の構造を含む）→
@@ -23233,7 +23285,7 @@ pub(crate) fn validate_update_from_tokens_with_limits(
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
-    resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
     // 台帳の文ハッシュ（Issue #1757。SQL-53 (5)）。全検証の後に算出し、検証順とエラーコードは変えない。
     stmt.statement_hash = crate::recovery::content_hash::for_update_from(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
@@ -23259,7 +23311,7 @@ pub(crate) fn validate_delete_using_tokens_with_limits(
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
-    resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
     stmt.statement_hash = crate::recovery::content_hash::for_delete_using(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
     )

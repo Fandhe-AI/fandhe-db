@@ -183,6 +183,9 @@ impl ResolvedColumn {
 #[derive(Debug)]
 pub struct BindingScope<'a> {
     relations: Vec<(TableRef, &'a TableSchema)>,
+    /// relation ごとの「見える列」（Issue #3292）。`None`（または空）は制限なし。ビューを FROM／USING に
+    /// 置く DML が、ビューの公開列だけを束縛へ参加させるために使う（基底表の隠れた列を解決しない）。
+    visible: Vec<Option<Vec<String>>>,
 }
 
 impl<'a> BindingScope<'a> {
@@ -210,7 +213,22 @@ impl<'a> BindingScope<'a> {
                 )));
             }
         }
-        Ok(Self { relations })
+        Ok(Self {
+            relations,
+            visible: Vec::new(),
+        })
+    }
+
+    /// relation ごとの見える列（`relations` と同じ並び。足りない分は制限なし）を設定する。
+    /// 隠れた列は解決せず、非修飾解決の曖昧判定（`42702`）にも参加しない。
+    pub(crate) fn with_visible(mut self, visible: Vec<Option<Vec<String>>>) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    /// relation `position` の見える列の制限（なければ `None`）。
+    pub(crate) fn visible_columns(&self, position: usize) -> Option<&[String]> {
+        self.visible.get(position).and_then(|v| v.as_deref())
     }
 
     /// スコープが保持する参照数。
@@ -279,6 +297,11 @@ impl<'a> BindingScope<'a> {
         schema: &TableSchema,
         name: &str,
     ) -> Option<ResolvedColumn> {
+        if let Some(visible) = self.visible_columns(position) {
+            if !visible.iter().any(|v| v == name) {
+                return None;
+            }
+        }
         if let Some(index) = schema.columns.iter().position(|c| c.name == name) {
             return Some(ResolvedColumn {
                 relation: position,
@@ -328,6 +351,40 @@ mod tests {
 
     fn schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
         TableSchema::new(name, columns)
+    }
+
+    #[test]
+    fn visible_columns_hide_base_columns_and_ambiguity() {
+        let a = schema("a", vec![ColumnDef::new("x", ColumnType::Text, false)]);
+        let b = schema(
+            "b",
+            vec![
+                ColumnDef::new("x", ColumnType::Text, false),
+                ColumnDef::new("hidden", ColumnType::Text, false),
+            ],
+        );
+        let scope = BindingScope::new(vec![(TableRef::new("a"), &a), (TableRef::new("b"), &b)])
+            .expect("scope")
+            .with_visible(vec![None, Some(vec!["hidden".to_string()])]);
+        // b.x は隠れているので非修飾 x は a だけに解決する（42702 にならない）。
+        let r = scope.resolve(&ColumnRef::unqualified("x")).expect("x");
+        assert_eq!(r.relation(), 0);
+        assert!(scope.resolve(&ColumnRef::qualified("b", "x")).is_err());
+        assert_eq!(
+            scope
+                .resolve(&ColumnRef::qualified("b", "hidden"))
+                .expect("hidden")
+                .relation(),
+            1
+        );
+        // 一覧に無い疑似列 id は解決しない（a の id だけ）。
+        assert_eq!(
+            scope
+                .resolve(&ColumnRef::unqualified("id"))
+                .expect("id")
+                .relation(),
+            0
+        );
     }
 
     #[test]
