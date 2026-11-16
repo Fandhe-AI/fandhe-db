@@ -3331,6 +3331,26 @@ fn bind_where_predicates_recursive(
     rewrite_total: &mut usize,
     allow_text_range_rewrite: bool,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    // 行値比較（SQL-9・Issue #3256）: 束縛の前に既存の述語（比較葉・`Or`・連言）へ展開し、以降は
+    // 通常の比較と同じ書き換え・束縛を通す（`sql::row_compare`）。`Or` 分岐は再帰でここへ戻る。
+    // 展開で生成した述語は元テキストの等価述語として数えられていない（`sql::params` のダミーフラグは
+    // 元トークン列の走査）ため、`equality_ordinal` を消費させず末尾で別カウンタ・空フラグで束縛する。
+    let lowered;
+    let mut generated: Vec<WherePredicate> = Vec::new();
+    let where_predicates: &[WherePredicate] = if where_predicates.iter().any(|p| {
+        matches!(
+            p,
+            WherePredicate::RowCompare { .. } | WherePredicate::Not(_)
+        )
+    }) {
+        let (kept, produced) =
+            crate::sql::row_compare::lower_top_level(where_predicates, node_budget)?;
+        lowered = kept;
+        generated = produced;
+        &lowered
+    } else {
+        where_predicates
+    };
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
     let mut expr_filters = Vec::new();
@@ -3468,14 +3488,12 @@ fn bind_where_predicates_recursive(
                     )?);
                 }
             }
-            // 行値比較 `(a, b) <op> (c, d)`（SQL-9・Issue #3255）: 構文段は受理するが、評価
-            // （辞書式・三値論理）は #3256 の担当のため、それまでは束縛段のこの単一ゲートで `0A000`
-            // にして止める（fail-closed。式述語・RLS 述語との組み合わせでも評価経路へ流さない）。
-            // tracked: #3256
+            // 行値比較（SQL-9・Issue #3256）は関数先頭で `sql::row_compare` が既存の述語木へ展開済みで、
+            // ここへは届かない。届いたら不変条件違反として fail-closed にする。
             WherePredicate::RowCompare { .. } => {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "row value comparison is not supported yet",
-                ));
+                return Err(SqlSurfaceError::Internal {
+                    detail: "row comparison reached binding unlowered".to_string(),
+                });
             }
             WherePredicate::Expression(expr) => {
                 // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの単純比較は宣言的
@@ -3607,11 +3625,33 @@ fn bind_where_predicates_recursive(
             }
         }
     }
-    let metadata_filters = declarative_filter::bind_all_for_describe(
+    let mut metadata_filters = declarative_filter::bind_all_for_describe(
         &declarative_filters,
         schema,
         &filter_skip_enum_validation,
     )?;
+    if !generated.is_empty() {
+        let mut gen_ordinal = 0usize;
+        let (gen_meta, gen_expr, _gen_rls, gen_or) = bind_where_predicates_recursive(
+            &generated,
+            schema,
+            udfs,
+            node_budget,
+            &[],
+            &mut gen_ordinal,
+            rewrite_total,
+            allow_text_range_rewrite,
+        )?;
+        // 展開葉は別呼び出しで束縛するため `bind_all_for_describe` の件数検査は各呼び出し単位になる。
+        // 合算が `MAX_METADATA_FILTERS` を超えるなら結合前に `54000` で拒否する（無制限 `Vec` 成長の
+        // DoS 防止・fail-closed）。
+        declarative_filter::check_filter_count(
+            metadata_filters.len().saturating_add(gen_meta.len()),
+        )?;
+        metadata_filters.extend(gen_meta);
+        expr_filters.extend(gen_expr);
+        or_filters.extend(gen_or);
+    }
     Ok((
         metadata_filters,
         expr_filters,
@@ -14770,6 +14810,47 @@ mod tests {
             &crate::sql::udf_call::UdfRegistry::default(),
         )
         .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// 元の等値条件 `plain` 件＋行値比較 `(lang, body) = (..)`（等価 2 葉へ展開）の述語削除を束縛する
+    /// （Issue #3256。展開葉は別呼び出しで束縛されるため、合算の件数上限を検査する）。
+    fn bind_delete_with_row_compare(plain: usize) -> Result<BoundPredicateDelete, SqlSurfaceError> {
+        use crate::sql::udf_call::Expr;
+        let mut where_predicates: Vec<WherePredicate> = (0..plain)
+            .map(|i| WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: format!("v{i}"),
+            })
+            .collect();
+        where_predicates.push(WherePredicate::RowCompare {
+            lhs: vec![
+                Expr::Ident("lang".to_string()),
+                Expr::Ident("body".to_string()),
+            ],
+            op: crate::sql::udf_call::ArrayCmpOp::Eq,
+            rhs: vec![Expr::String("a".to_string()), Expr::String("b".to_string())],
+        });
+        let stmt = ValidatedPredicateDelete {
+            table_name: "documents".to_string(),
+            where_predicates,
+            operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
+            partitioned: None,
+        };
+        bind_predicate_delete(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn row_compare_expansion_counts_toward_metadata_filter_limit() {
+        let max = crate::declarative_filter::MAX_METADATA_FILTERS;
+        // 元 254 件＋展開 2 件 = 上限ちょうど（受理）、元 255 件＋展開 2 件 = 257（拒否）。
+        assert!(bind_delete_with_row_compare(max - 2).is_ok());
+        let err = bind_delete_with_row_compare(max - 1).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 

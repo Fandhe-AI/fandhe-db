@@ -3098,9 +3098,10 @@ pub enum WherePredicate {
     CorrelatedExists(crate::sql::join::semi::CorrelatedProbeRef),
     /// 行値比較 `(e1, e2, ...) <op> (f1, f2, ...)`（SQL-9・Issue #3255。親 #3254）。構文段だけが
     /// 生成する。不変条件は `lhs.len() == rhs.len()` かつ 2 以上 [`MAX_ROW_COMPARE_COMPONENTS`] 以下
-    /// （成分 1 個の括弧は従来どおり式として扱い本 variant にしない）。評価（辞書式・三値論理）は
-    /// #3256 の担当で、それまでは束縛段（`sql::parser::bind_where_predicates_recursive`）の暫定
-    /// ゲートが `0A000` で止める（fail-closed）。否定は `where_negation` が演算子反転で押し下げる。
+    /// （成分 1 個の括弧は従来どおり式として扱い本 variant にしない）。評価（辞書式・三値論理。
+    /// Issue #3256）は束縛段（`sql::parser::bind_where_predicates_recursive`）の入口で
+    /// `sql::row_compare` が既存の述語木へ展開する。ポリシー式など未対応の文脈は
+    /// fail-closed で拒否する。否定は `where_negation` が演算子反転で押し下げる。
     ///
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
@@ -10560,7 +10561,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 行値比較の本体（[`Self::row_compare_ahead`] が真のとき呼ばれる。Issue #3255）。
-    /// 右辺が行でない・サブクエリ・成分数不一致は fail-closed（`42601`／`0A000`）。評価は #3256。
+    /// 右辺が行でない・サブクエリ・成分数不一致は fail-closed（`42601`／`0A000`）。評価は束縛段で展開（Issue #3256）。
     fn parse_row_compare(&mut self) -> Result<ExprLeaf, SqlSurfaceError> {
         let lhs = self.parse_row_side(None)?;
         let not_equal = matches!(self.peek(), Some(Token::Punct('<')))
@@ -18947,7 +18948,7 @@ fn check_view_body_pred_leaf(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
-        // 行値比較は評価が #3256 まで未対応のため VIEW 本文では拒否する（tracked: #3256）。
+        // 行値比較は VIEW 本文での評価が未対応のため拒否する（tracked: #3254）。
         | WherePredicate::RowCompare { .. } => Err(rejected()),
     }
 }
@@ -18977,7 +18978,7 @@ fn check_cte_body_predicates(where_predicates: &[WherePredicate]) -> Result<(), 
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
             | WherePredicate::CorrelatedExists(_)
-            // 行値比較は CTE／派生表本文では未対応（tracked: #3256）。
+            // 行値比較は CTE／派生表本文では未対応（tracked: #3254）。
             | WherePredicate::RowCompare { .. } => {
                 return Err(SqlSurfaceError::unsupported(
                     "view body WHERE predicate form is not supported",
@@ -19128,7 +19129,7 @@ fn check_buffered_outer_pred(pred: &WherePredicate) -> Result<(), SqlSurfaceErro
         | WherePredicate::InSubquery { .. }
         | WherePredicate::Exists { .. }
         | WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_)
-        // 行値比較は評価後射影形ビューの外側 WHERE では未対応（tracked: #3256）。
+        // 行値比較は評価後射影形ビューの外側 WHERE では未対応（tracked: #3254）。
         | WherePredicate::RowCompare { .. }
         | WherePredicate::Prefix { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
@@ -19609,7 +19610,7 @@ fn check_body_pred(
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
         | WherePredicate::IsNull { .. } => Ok(()),
-        // 行値比較は本文の列走査が成分を辿れないため fail-closed に拒否する（tracked: #3256）。
+        // 行値比較は本文の列走査が成分を辿れないため fail-closed に拒否する（tracked: #3254）。
         WherePredicate::RowCompare { .. } => Err(body_form_unsupported()),
     }
 }
@@ -19744,7 +19745,7 @@ pub(crate) fn rename_column_in_view_body(
             | WherePredicate::QuantifiedSubqueryCompare { .. }
             | WherePredicate::IdCompare { .. }
             | WherePredicate::CorrelatedExists(_)
-            // 行値比較は VIEW 本文では未対応（tracked: #3256）。
+            // 行値比較は VIEW 本文では未対応（tracked: #3254）。
             | WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::unsupported(
                 "view body WHERE predicate form is not supported",
             )),
@@ -19938,7 +19939,7 @@ fn render_where_predicate(pred: &WherePredicate) -> String {
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_)
-        // VIEW 本文の検査が行値比較を拒否するため到達しない（tracked: #3256）。
+        // VIEW 本文の検査が行値比較を拒否するため到達しない（tracked: #3254）。
         | WherePredicate::RowCompare { .. } => String::new(),
     }
 }
@@ -35053,7 +35054,7 @@ mod tests {
     }
 
     /// Issue #3255（SQL-9。親 #3254）: WHERE の行値比較 `(e1, e2, ...) <op> (f1, f2, ...)` の構文と AST。
-    /// 評価は #3256。成分 1 個の括弧は従来どおり式。
+    /// 評価は束縛段で展開される（Issue #3256）。成分 1 個の括弧は従来どおり式。
     #[test]
     fn row_value_comparison_parses_to_row_compare() {
         use crate::sql::udf_call::ArrayCmpOp;
