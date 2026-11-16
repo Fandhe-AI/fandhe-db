@@ -336,6 +336,29 @@ fn incompatible_array_concat_is_42883() {
     }
 }
 
+/// 同じ要素型の json／jsonb／bytea 配列とスカラー、timestamp と timestamptz の配列連結は
+/// PG で成立するため `0A000`（未実装）。要素型が違う組は `42883`。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列を含む組の行）を参照。
+#[test]
+fn compatible_array_concat_of_special_scalars_is_0a000() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT ARRAY[CAST('{}' AS jsonb)] || CAST('{}' AS jsonb)",
+        "SELECT CAST('{}' AS jsonb) || ARRAY[CAST('{}' AS jsonb)]",
+        "SELECT ARRAY[CAST('a' AS bytea)] || CAST('a' AS bytea)",
+        "SELECT ARRAY[CAST('2024-01-01 00:00:00' AS timestamp)] || CAST('2024-01-01 00:00:00+00' AS timestamptz)",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+    for sql in [
+        "SELECT ARRAY[CAST('a' AS bytea)] || CAST('{}' AS jsonb)",
+        "SELECT ARRAY[1] || CAST('a' AS bytea)",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+}
+
 /// 拒否の SQLSTATE と文言は静的な型だけで決まり、他テナントの行の有無で変わらない。
 #[test]
 fn rejection_does_not_depend_on_other_tenants_rows() {

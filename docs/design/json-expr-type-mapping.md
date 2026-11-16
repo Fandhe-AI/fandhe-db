@@ -349,8 +349,8 @@ PG に演算子が無い組は PG 準拠の `42883`、PG では通るが本実�
 | ------------ | ---- |
 | text × text（型なしリテラル・裸の NULL を含む） | text 連結（#3276） |
 | jsonb × jsonb、jsonb × 型なしリテラル | jsonb 連結（不変） |
-| 配列を含む組（配列の要素型と反対側の型が互換するもの。型なしリテラルを含む） | `0A000`（PG の配列連結。未実装） |
-| 配列を含む組（要素型が互換しないもの。`integer[]` × `boolean[]`、text × `integer[]`、jsonb／bytea／vector／bit × 配列 等） | `42883`（PG に演算子が無い） |
+| 配列を含む組（配列の要素型と反対側の型が互換するもの。型なしリテラル、同じ要素型の json／jsonb／bytea／bit、date／timestamp／timestamptz 間の暗黙変換を含む） | `0A000`（PG の配列連結。未実装） |
+| 配列を含む組（要素型が互換しないもの。`integer[]` × `boolean[]`、text × `integer[]`、要素型が異なる jsonb／bytea／bit × 配列、vector × 配列 等） | `42883`（PG に演算子が無い） |
 | text × 非 text（json・数値・bytea・vector 等）とその逆 | `0A000`（暗黙連結。追跡: #3278） |
 | bytea × bytea、vector × vector、bit × bit | `0A000`（PG／pgvector にある連結演算子。未実装） |
 | 上記以外（数値 × 数値、jsonb × json、json × json、json × 数値、bytea × 数値 等） | `42883`（PG に演算子が無い） |

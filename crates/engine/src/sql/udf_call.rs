@@ -8196,7 +8196,9 @@ fn reject_concat_pair(l: ConcatClass, r: ConcatClass, array_compatible: bool) ->
 /// 配列を含む `||` の組で、配列の要素型と反対側（配列なら要素型、スカラーならその型）が
 /// PG の演算子解決で成立し得るかを静的な型だけで判定する（Issue #3277 の PR 指摘）。
 /// 型なしリテラル・裸の NULL（`None`）と、型を表せない要素（ENUM 等）は成立し得る側（`0A000`）へ倒す。
-/// json・bytea・vector・bit など配列と連結できない型は成立しない。
+/// json・jsonb・bytea・bit のスカラーは、反対側が同じ要素型の配列（`jsonb[] || jsonb` 等）のときだけ
+/// 成立し得る。vector は配列要素型にならないので常に成立しない。
+/// 日付・時刻系の要素型（date／timestamp／timestamptz）は PG の暗黙変換で互いに成立し得る。
 fn concat_array_pair_compatible(
     lhs: &Expr,
     l: &Option<(BoundExpr, ExprType)>,
@@ -8205,16 +8207,35 @@ fn concat_array_pair_compatible(
     env: &BindEnv<'_>,
 ) -> bool {
     use crate::sql::cast::{source_cast_kind, CastKind, SourceKind};
+    let is_special = |ty: &ExprType| {
+        matches!(
+            ty,
+            ExprType::Json | ExprType::JsonText | ExprType::Bytea | ExprType::Bit
+        )
+    };
     let mut kinds: Vec<CastKind> = Vec::new();
-    for (expr, side) in [(lhs, l), (rhs, r)] {
+    let sides = [(lhs, l, r), (rhs, r, l)];
+    for (expr, side, other) in sides {
         let Some((bound, ty)) = side else { continue };
-        match ty {
-            ExprType::Json
-            | ExprType::JsonText
-            | ExprType::Bytea
-            | ExprType::Vector
-            | ExprType::Bit => return false,
-            _ => {}
+        if matches!(ty, ExprType::Vector) {
+            return false;
+        }
+        if is_special(ty) {
+            // 反対側が同じ要素型の配列のときだけ成立し得る（`bytea[] || bytea` 等）。
+            let Some((other_bound, other_ty)) = other else {
+                return false;
+            };
+            let other_expr = if std::ptr::eq(expr, lhs) { rhs } else { lhs };
+            return match source_cast_kind(other_expr, other_bound, *other_ty, env.schema()) {
+                SourceKind::Array(None) => true,
+                SourceKind::Array(Some(t)) => {
+                    match source_cast_kind(expr, bound, *ty, env.schema()) {
+                        SourceKind::Known(k) => k == t.kind(),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
         }
         match source_cast_kind(expr, bound, *ty, env.schema()) {
             SourceKind::Known(k) => kinds.push(k),
@@ -8223,10 +8244,20 @@ fn concat_array_pair_compatible(
             SourceKind::Array(None) | SourceKind::Outside | SourceKind::Bit => return true,
         }
     }
-    !matches!(
-        crate::sql::array_expr::common_element_type(&kinds),
-        Err(SqlSurfaceError::DatatypeMismatch { .. })
-    )
+    // date／timestamp／timestamptz は PG が暗黙変換で成立させる。ARRAY 構築の共通型判定
+    // （`common_element_type`）は timestamp と timestamptz を不一致にするため別に判定する。
+    let all_datetime = !kinds.is_empty()
+        && kinds.iter().all(|k| {
+            matches!(
+                k,
+                CastKind::Date | CastKind::Timestamp | CastKind::TimestampTz
+            )
+        });
+    all_datetime
+        || !matches!(
+            crate::sql::array_expr::common_element_type(&kinds),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        )
 }
 
 /// [`try_bind_text_concat`] の結果。text 連結に束縛できたか、従来経路へ流すかを表す。
