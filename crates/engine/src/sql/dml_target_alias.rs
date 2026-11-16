@@ -144,6 +144,11 @@ pub(crate) fn normalize(tokens: Vec<Token>) -> Result<Vec<Token>, SqlSurfaceErro
         Some(Token::QualifiedIdent { name, .. }) => name.clone(),
         _ => return Ok(tokens),
     };
+    // `UPDATE ONLY t` / `DELETE FROM ONLY t` の ONLY を表名と誤認しないよう、書き換えず従来経路
+    // （42601 拒否）へ渡す（fail-closed）。
+    if target_name.eq_ignore_ascii_case("ONLY") {
+        return Ok(tokens);
+    }
     let after_target = target_idx.saturating_add(1);
     let Some(rest) = tokens.get(after_target..) else {
         return Ok(tokens);
@@ -386,6 +391,18 @@ mod tests {
         assert!(got
             .iter()
             .any(|t| matches!(t, Token::QualifiedIdent { qualifier, .. } if qualifier == "s")));
+    }
+
+    #[test]
+    fn only_inheritance_marker_is_not_rewritten() {
+        for sql in [
+            "UPDATE ONLY t SET a = 1",
+            "DELETE FROM ONLY t WHERE a = 1",
+            "UPDATE ONLY t x SET a = 1",
+        ] {
+            let before = tokenize(sql).unwrap();
+            assert_eq!(normalize(before.clone()).unwrap(), before, "{sql}");
+        }
     }
 
     #[test]
