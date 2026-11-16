@@ -104,6 +104,57 @@ pub(super) fn check_post_ddl_statement(
     }
 }
 
+/// 拡張クエリの Execute（Parse・Bind 済みの [`ParsedSql`] を実行する入口）で、DDL を積んだ Tx に実行してよいか
+/// 判定する（SQL-80・Issue #3313。V7。受け皿は #3314）。Parse・Bind は確定済みカタログで文を束縛・検証して
+/// おり、同じ Tx で変更した表のスキーマと食い違いうるため、DDL・Tx 制御・`SET`/`SHOW` だけを許す。
+/// DDL を積んでいない Tx では何もしない。永続側を包んだ文（`SessionRouted`）は中身で判定する。
+pub(super) fn check_extended_execute_after_ddl(
+    txn: &SessionTransaction<'_>,
+    parsed: &ParsedSql,
+) -> Result<(), SqlSurfaceError> {
+    if !txn.has_ddl() {
+        return Ok(());
+    }
+    let inner = match parsed {
+        ParsedSql::SessionRouted(routed) if routed.is_persistent() => routed.inner(),
+        other => other,
+    };
+    let allowed = match inner {
+        ParsedSql::CreateTable(_)
+        | ParsedSql::DropTable(_)
+        | ParsedSql::AlterTable(_)
+        | ParsedSql::CreateIndex(_)
+        | ParsedSql::DropIndex(_)
+        | ParsedSql::Transaction(_)
+        | ParsedSql::SetTransaction(_) => true,
+        ParsedSql::Statement(stmt) => matches!(
+            stmt,
+            Statement::SetSearchMode { .. }
+                | Statement::SetTimeZone { .. }
+                | Statement::ShowTimeZone
+                | Statement::SetSearchPath { .. }
+                | Statement::ShowSearchPath
+                | Statement::SetRowSecurity { .. }
+                | Statement::ShowRowSecurity
+                | Statement::ShowRestoreGeneration
+                | Statement::SetStatementTimeout { .. }
+                | Statement::ShowStatementTimeout
+                | Statement::SetHnswEfSearch { .. }
+                | Statement::ShowHnswEfSearch
+                | Statement::SetHnswScanSetting { .. }
+                | Statement::ShowHnswScanSetting(_)
+        ),
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(SqlSurfaceError::transaction_feature_not_supported(
+            "this statement is not supported after DDL inside a transaction block yet",
+        ))
+    }
+}
+
 impl EngineCore {
     /// 明示・暗黙 Tx の表・索引の DDL を、Tx の共有 write txn へ積む（`execute_in_active_txn_inner` の
     /// `CreateTable`・`DropTable`・`AlterTable`・`CreateIndex`・`DropIndex` の腕から呼ばれる）。

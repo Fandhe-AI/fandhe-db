@@ -694,3 +694,105 @@ fn a_second_writer_waits_and_does_not_observe_the_pending_table() {
     core.execute_sql_in_session(&ctx("bob"), &mut other, CREATE_T)
         .expect("create after the writer is released");
 }
+#[test]
+fn deferred_foreign_key_violation_on_tables_created_in_the_transaction_fails_the_commit() {
+    // 親子を同じ Tx で作り、`INITIALLY DEFERRED` の FK 違反は COMMIT で `23503`。何も残らない。
+    let (core, _guard) = new_core("sql80-deferred-fk");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE TABLE p (id BIGINT PRIMARY KEY)",
+    );
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE TABLE c (id BIGINT PRIMARY KEY, pid BIGINT REFERENCES p DEFERRABLE INITIALLY DEFERRED)",
+    );
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "INSERT INTO c (id, pid) VALUES (1, 99) USING OPERATION_ID 'fk-1'",
+    );
+    assert_eq!(tx_code(&core, &mut session, &mut txn, "COMMIT"), "23503");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+    assert_eq!(read_rows(&core, "alice", "SELECT id FROM c"), Err("42P01"));
+    assert_eq!(read_rows(&core, "alice", "SELECT id FROM p"), Err("42P01"));
+}
+
+#[test]
+fn drop_if_exists_of_a_missing_table_in_a_transaction_commits_without_effect() {
+    let (core, _guard) = new_core("sql80-drop-ghost");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(&core, &mut session, &mut txn, "DROP TABLE IF EXISTS ghost");
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+    assert_eq!(txn.status(), TransactionStatus::Idle);
+}
+
+#[test]
+// tracked: #3314
+fn extended_execute_after_ddl_is_rejected_for_everything_but_ddl() {
+    // V7: Parse 済み（確定済みカタログで束縛した）文は、DDL を積んだ Tx では実行しない。
+    // 古いスキーマで INSERT を束縛してしまう経路を作らない。
+    let (core, _guard) = new_core("sql80-extended");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    let parsed_insert = core
+        .parse_sql(&insert(1, "a"))
+        .expect("parse insert against the committed schema");
+    let parsed_index = core
+        .parse_sql("CREATE UNIQUE INDEX t_body_u ON t (body)")
+        .expect("parse index");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    // DDL 自体は拡張クエリ経由でも受理される。
+    core.execute_parsed_in_txn(&ctx("alice"), &mut session, &mut txn, &parsed_index)
+        .expect("DDL through the extended path");
+    let err = core
+        .execute_parsed_in_txn(&ctx("alice"), &mut session, &mut txn, &parsed_insert)
+        .expect_err("INSERT after DDL through the extended path");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+    // 何も残らない（索引は作られていない）。
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(1, "a"))
+        .expect("first");
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(2, "a"))
+        .expect("no unique index remains");
+}
+
+#[test]
+// tracked: #3314
+fn copy_after_ddl_is_rejected_with_0a000() {
+    let (core, _guard) = new_core("sql80-copy");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE UNIQUE INDEX t_body_u ON t (body)",
+    );
+    let err = core
+        .begin_copy_in_txn(
+            &ctx("alice"),
+            &session,
+            &mut txn,
+            "COPY t (id, body) FROM STDIN USING OPERATION_ID 'copy-1'",
+        )
+        .expect_err("COPY after DDL");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+}

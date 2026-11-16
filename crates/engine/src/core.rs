@@ -7136,6 +7136,13 @@ impl EngineCore {
                 return Err(e);
             }
         }
+        // SQL-80・Issue #3313（V7。受け皿は #3314）: DDL を積んだ Tx では、拡張クエリで Parse 済みの文
+        // （確定済みカタログで束縛・検証した文）をそのまま実行しない。DDL・Tx 制御・`SET`/`SHOW` 以外は
+        // `0A000` で Tx を失敗にする（簡易クエリは文ごとに write txn 上のスキーマで解析し直す）。
+        if let Err(e) = txn_ddl::check_extended_execute_after_ddl(txn, parsed) {
+            txn.fail();
+            return Err(e);
+        }
         self.execute_parsed_in_txn_inner(ctx, session, txn, parsed)
     }
 
@@ -18357,6 +18364,14 @@ impl EngineCore {
             TransactionStatus::Idle => self.begin_copy_unscrubbed(ctx, session, sql, pin),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
+                // SQL-80・Issue #3313（受け皿は #3314）: DDL を積んだ Tx の `COPY` は、確定済みカタログと
+                // write txn の食い違いを避けるため結線までは `0A000`（Tx は失敗状態）。
+                if txn.has_ddl() {
+                    txn.fail();
+                    return Err(crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                        "this statement is not supported after DDL inside a transaction block yet",
+                    ));
+                }
                 let result = self.begin_copy_active(ctx, session, txn, sql, pin);
                 if let Err(e) = &result {
                     txn.fail_for(e);
