@@ -128,7 +128,8 @@ fn sql_multi_row_values_can_exceed_default_when_raised() {
 }
 
 #[test]
-fn copy_from_stdin_respects_cli_resolved_limit() {
+fn copy_from_stdin_ignores_cli_resolved_file_limit() {
+    // Issue #3309: ① は COPY の行数にも掛からない。
     let (core, _guard) = new_core(limits_from_cli("3"));
     let mut stream = spawn_with_alice(core);
 
@@ -142,7 +143,7 @@ fn copy_from_stdin_respects_cli_resolved_limit() {
         b"1\t[1.0,0.0]\tja\n2\t[1.0,0.0]\tja\n3\t[1.0,0.0]\tja\n4\t[1.0,0.0]\tja\n",
     );
     send_copy_done(&mut stream);
-    expect_error_response_with_sqlstate(&mut stream, "54000");
+    assert_eq!(read_command_complete(&mut stream), "COPY 4");
     read_ready_for_query(&mut stream);
-    assert_row_count(&mut stream, 0);
+    assert_row_count(&mut stream, 4);
 }

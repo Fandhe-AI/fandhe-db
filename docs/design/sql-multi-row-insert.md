@@ -124,6 +124,7 @@ limits`）が想定外に大きい `Vec<BoundInsert>` を受け取ることは�
   超過は `54000`・副作用ゼロ。
 - ④は束縛前（`row_count` だけで判定できる時点）にも判定し、`--max-insert-rows` 未指定でも
   束縛の作業量を有界に保つ（`EngineCore::validate_row_count_chunk_limit`）。
-- ファイル形の一括投入（`execute_insert_sql_batch`・`incremental::index_file_batch`）の ① と
-  `COPY FROM` の逐次判定は変更しない（COPY は Issue #3309）。警告・README の整合は Issue #3310。
+- ファイル形の一括投入（`execute_insert_sql_batch`・`incremental::index_file_batch`）の ① は変更しない。
+  `COPY FROM` は Issue #3309 で ① を外し、`--max-insert-rows` 指定時だけ行数を `54000` で拒否する
+  （[wire-copy-protocol.md](wire-copy-protocol.md) の既知の相違 5）。警告・README の整合は Issue #3310。
 - 関連 ID: SQL-16・INDEX-4・NOSQL-6（ポインタのみ）。
