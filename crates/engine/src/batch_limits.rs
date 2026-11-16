@@ -10,6 +10,10 @@
 //! 上限であり、複数ファイル合計に対する上限を持たない。本モジュールは
 //! [`BatchLimits`] の各フィールドとして、バッチ全体に対する処理量ガードを追加する。
 //!
+//! ①はファイル形の一括投入と `COPY FROM`（Issue #3309 まで）にだけ掛かり、複数行
+//! `VALUES`・UPSERT・NoSQL `rows[]` には掛からない（Issue #3308。行の形の行数上限は
+//! `--max-insert-rows` 指定時のみ）。
+//!
 //! 各上限の判定タイミングは [`validate_batch_shape`]・[`validate_chunk_total`]・
 //! [`validate_raw_sql_len`] の各関数ドキュメント、および呼び出し元
 //! `core::EngineCore::execute_insert_sql_batch`・`incremental::index_file_batch` の
@@ -264,7 +268,20 @@ pub(crate) fn validate_batch_shape(
             max: limits.max_files_per_batch,
         });
     }
+    validate_row_batch_shape(files, limits)
+}
 
+/// ②③（要素単体のバイト量・バッチ合計のバイト量）だけを判定する（Issue #3308）。
+///
+/// 行の形（複数行 `VALUES`・UPSERT・NoSQL `rows[]`）の書き込みが使う。①（件数上限）は
+/// ファイル形の一括投入向けの値であり、行の形には適用しない（行数の上限は
+/// `--max-insert-rows` 指定時のみ）。`core.rs` の
+/// `validate_insert_batch_byte_and_chunk_limits` が呼ぶ。[`validate_batch_shape`] も
+/// ①の判定後に本関数へ委譲するため、ファイル形の挙動は不変。
+pub(crate) fn validate_row_batch_shape(
+    files: &[(usize, usize)],
+    limits: &BatchLimits,
+) -> Result<(), BatchLimitsError> {
     let mut total: usize = 0;
     for (index, (path_len, body_len)) in files.iter().enumerate() {
         if *body_len > limits.max_file_body_bytes {
@@ -771,6 +788,27 @@ mod tests {
         assert_eq!(first, 5);
         let second = validate_raw_sql_len(1, 7, first, &l).unwrap();
         assert_eq!(second, 12);
+    }
+
+    #[test]
+    fn row_batch_shape_ignores_file_count_limit() {
+        // ① は掛けない（limits() は max_files_per_batch=4）。
+        let rows: Vec<(usize, usize)> = (0..10).map(|_| (0, 1)).collect();
+        assert!(validate_row_batch_shape(&rows, &limits()).is_ok());
+        assert!(matches!(
+            validate_batch_shape(&rows, &limits()),
+            Err(BatchLimitsError::TooManyFiles { .. })
+        ));
+    }
+
+    #[test]
+    fn row_batch_shape_still_rejects_byte_limits() {
+        let l = limits();
+        let big = vec![(0, l.max_file_body_bytes + 1)];
+        assert!(matches!(
+            validate_row_batch_shape(&big, &l),
+            Err(BatchLimitsError::FileBodyTooLarge { .. })
+        ));
     }
 
     #[test]

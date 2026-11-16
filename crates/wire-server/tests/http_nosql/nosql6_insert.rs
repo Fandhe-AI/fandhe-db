@@ -682,22 +682,34 @@ fn limits(
     }
 }
 
+/// Issue #3308: ①（max_files_per_batch）は NoSQL `rows[]` に掛からない。上限 2 でも 3 行が成功する。
 #[test]
-fn rows_over_max_files_per_batch_is_54000_without_side_effects() {
+fn rows_ignore_max_files_per_batch() {
     let (core, _guard) = new_core(Some(limits(2, 10_000, 10_000, 10_000)));
     let (both, _sql) = spawn_both(core.clone());
 
-    let resp = query(&both, &insert_body_n_rows(3, "nosql-op-too-many-files"));
+    let ok = query(&both, &insert_body_n_rows(3, "nosql-op-ignore-files-limit"));
+    let (inserted, _) = parse_insert_success_body(&ok);
+    assert_eq!(inserted, 3);
+}
+
+/// ④（1 行 = 1 チャンク）超過は 413・`54000`・副作用ゼロ。
+#[test]
+fn rows_over_max_batch_chunks_is_54000_without_side_effects() {
+    let (core, _guard) = new_core(Some(limits(10, 10_000, 10_000, 2)));
+    let (both, _sql) = spawn_both(core.clone());
+
+    let resp = query(&both, &insert_body_n_rows(3, "nosql-op-too-many-chunks"));
     assert_eq!(resp.status, 413, "body={resp:?}");
     assert_eq!(http_common::wire_code_of(&resp), "54000");
     assert_eq!(
-        ledger_state(&core, "nosql-op-too-many-files"),
+        ledger_state(&core, "nosql-op-too-many-chunks"),
         LedgerLookup::NotRecorded
     );
     assert!(read_back_ids(&core).is_empty());
 
     // 境界値（上限ちょうど＝2 行）は成功する。
-    let ok = query(&both, &insert_body_n_rows(2, "nosql-op-too-many-files"));
+    let ok = query(&both, &insert_body_n_rows(2, "nosql-op-too-many-chunks"));
     let (inserted, _) = parse_insert_success_body(&ok);
     assert_eq!(inserted, 2);
 }
@@ -707,7 +719,7 @@ fn rows_over_max_files_per_batch_matches_sql_batch_wire_code() {
     let (core, _guard) = new_core(Some(limits(2, 10_000, 10_000, 10_000)));
     let ctx = PolicyContext::new(TENANT_A).expect("valid tenant ctx");
 
-    // ①（バッチあたり最大ファイル数）はテーブル参照・束縛より前に判定されるため
+    // ファイル形の一括投入の ①（バッチあたり最大ファイル数）はテーブル参照・束縛より前に判定されるため
     // （`core.rs::execute_insert_sql_batch` 冒頭）、"documents" テーブル・埋め込み
     // 未接続でも到達する。文の中身は判定に無関係なプレースホルダでよい。
     let err = core
@@ -979,7 +991,7 @@ fn rls9_conflict_error_bytes_are_identical_regardless_of_foreign_tenant_rows() {
 /// rejections_do_not_poison_session_token` と同型）。
 #[test]
 fn rejections_do_not_poison_session_token() {
-    let (core, _guard) = new_core(Some(limits(2, 10_000, 10_000, 10_000)));
+    let (core, _guard) = new_core(Some(limits(10, 10_000, 10_000, 2)));
     let (both, _sql) = spawn_both(core);
 
     let missing = query(&both, &insert_body_with(1, None, OpId::Omitted));
