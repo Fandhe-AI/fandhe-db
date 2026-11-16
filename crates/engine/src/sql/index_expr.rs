@@ -506,7 +506,7 @@ fn check_one_predicate(pred: &WherePredicate, udf: &UdfHook<'_>) -> Result<(), S
         WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => Err(
             SqlSurfaceError::unsupported("unsupported predicate in an index predicate"),
         ),
-        // 行値比較は索引述語として評価できないため `0A000` で拒否する（tracked: #3256）。
+        // 行値比較は索引述語として評価できないため `0A000` で拒否する（tracked: #3254）。
         WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "row value comparison is not supported in an index predicate".to_string(),
         }),
@@ -764,9 +764,7 @@ fn array_source_elem(
         Expr::Coalesce(items) => merge_branch_elems(items.iter(), schema),
         Expr::NullIf(a, b) => merge_branch_elems([a.as_ref(), b.as_ref()].into_iter(), schema),
         Expr::Case {
-            whens,
-            else_result,
-            operand: _,
+            whens, else_result, ..
         } => merge_branch_elems(
             whens.iter().map(|(_, r)| r).chain(else_result.as_deref()),
             schema,

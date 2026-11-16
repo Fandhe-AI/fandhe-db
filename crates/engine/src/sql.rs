@@ -304,6 +304,7 @@ pub(crate) mod relation_name;
 pub mod relation_snapshot;
 pub(crate) mod rerank_stage;
 pub mod returning;
+pub(crate) mod row_compare;
 pub mod row_lock;
 pub(crate) mod row_policy;
 pub(crate) mod savepoint;
