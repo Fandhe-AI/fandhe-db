@@ -125,10 +125,32 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - **`USING OPERATION_ID` 付き**（Issue #3203・RECOVER-10/11）: 台帳へ結線済み。構文段で検証した `operation_id` と content_hash を実行器へ渡し、FROM／USING 側の走査より前の事前照合で再送は `23505`、別文への再利用は `22023`、確定記録は書き込み本体と同じ txn で行う。束縛・変換・実行のエラーは txn が commit されないため台帳を消費しない。`parsed_operation_id` は実値を返し、同一 Tx 内の再利用は既存 DML と同じく拒否される（Tx は `Failed`）。`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体は op id 付きを拒否側に倒す。`--require-operation-id` 構成でも使える（省略は `23502`）
 - **`PARTITIONED`**: 構文段が `42601` で拒否する。`ValidatedUpdateFrom`／`ValidatedDeleteUsing` は `partitioned` を持たず、`run_partitioned_*` は述語形だけを受け取るため、結合形が分割実行器へ入る経路は構造上存在しない（autocommit・明示 Tx の両方を結合テストで固定）
 - **多重一致**: 実行器の規約どおり、対象行ごとに 1 回だけ更新・削除し、UPDATE の値は走査順で最初の source 行を採る
-- **まだ拒否する形**: 変換器の対象外（上記の変換器節。`0A000`）、ビュー・一時表が関与する形、データ変更 CTE の本文と `EXPLAIN`。いずれも第 1 弾の設計上の対象外で、fail-closed の安全弁
+- **まだ拒否する形**: 変換器の対象外（上記の変換器節。`0A000`）、ビュー・一時表が関与する形のうち「ビュー・一時表（Issue #3292）」節で受理した以外、データ変更 CTE の本文と `EXPLAIN`。いずれも第 1 弾の設計上の対象外で、fail-closed の安全弁
+
+## ビュー・一時表（Issue #3292）
+
+ポインタ: SQL-53 (b)・RLS-10・RECOVER-10/11・SQL-28。
+
+| 形 | 扱い | 理由 |
+| -- | ---- | ---- |
+| FROM／USING 側が単純形ビュー（列別名なし） | 受理 | 基底表 1 つと述語へ畳み込める（集合演算枝のビュー展開と同じ前例） |
+| FROM／USING 側が列別名つきビュー | `0A000` | 公開名から物理名への書き換えが未対応 |
+| FROM／USING 側が評価後射影形ビュー（集計・LIMIT・JOIN 本文・matview） | `0A000` | インライン展開できない |
+| target がビュー | `0A000` | 更新可能ビューは別の穴 |
+| 一時表だけ（target・source とも一時表） | 受理 | 一時コアが自分の一時 DB の write txn で実行する |
+| 一時表だけの形に `USING OPERATION_ID` | `0A000` | 一時表の書き込みは台帳の対象外。黙って捨てず拒否する |
+| 永続表・ビューと一時表の混在（向きを問わない） | `0A000` | 書き込みが一時側と永続側にまたがる。振り分け・Bind の再検証が永続／一時の二択を前提にしている |
+
+- **ビュー source の実行**: 構文段（`resolve_dml_from_relations`）が `DmlFromSource` を決め、`dml_from_exec::apply_view_source` が計画の読み取り先を基底表へ張り替え、ビュー述語を source 側述語の先頭へ畳み込む（基底スキーマで再検証）。スキーマは射影せず、束縛スコープだけを狭める
+- **列のスコープ**: `BindingScope::with_visible` がビューの公開列だけを解決する。公開しない基底列は `42703`、非修飾解決の曖昧判定（`42702`）にも参加しない。`RETURNING v.*`／`*` は公開列だけを公開順に展開する。疑似列 `id` は公開列に含まれるときだけ解決する
+- **RLS（P0）**: ビュー定義はテナント情報を持たないため、作成者の可視性は引き継がない。基底表は書き込むセッションの `PolicyContext` で走査され、他テナントの行はビュー経由でも結合に入らない。ビュー述語は絞り込みで、セキュリティ境界ではない
+- **自己結合**: ビューの基底表が target と同じ表でもよい（source の走査は書き込みより前に完了する既存の規約）
+- **権限**: `classify_write` は従来どおり target のビットだけを課し、source のビュー名はトークン走査の読み取りゲートで判定される。準備済み文の陳腐化はトークン列に現れる名前の同一性検査が覆う
+- **一時表だけの形**: `is_routable` が `UpdateFrom`／`DeleteUsing` を受理し、`temp_dispatch` が一時コアの `execute_update_from_on`／`execute_delete_using_on` を呼ぶ。総バイト数の上限（`54000`）・明示 Tx・Describe は既存の一時表経路に乗る
 
 ## テスト
 
+- Issue #3292 の追加テスト: `sql53_dml_from_using_view.rs`（sql_t40_up）・`table44_temp_table_dml_from.rs`（table_rls）
 - `crates/engine/tests/sql_t40_up/sql53_dml_from_using_bind.rs`: 構文・束縛・変換器の拒否表・台帳の基本
 - `crates/engine/tests/sql_t40_up/sql53_dml_from_using_exec.rs`: dispatch の最小固定と RETURNING
 - `crates/engine/tests/sql_t40_up/sql53_dml_from_using_multi_join.rs`（Issue #3294）: JOIN ON・多方向結合・LEFT の NULL 補完・交差結合・多重一致・上限・RLS（3 表の越境）・RETURNING・再送冪等・fail-closed の拒否・Describe の一致・`search_path` ゲート

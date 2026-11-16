@@ -61,6 +61,7 @@ mod sql53_dml_from_using_acceptance;
 mod sql53_dml_from_using_bind;
 mod sql53_dml_from_using_exec;
 mod sql53_dml_from_using_multi_join;
+mod sql53_dml_from_using_view;
 mod sql53_dml_where_subquery;
 mod sql54_ilike;
 mod sql54_is_distinct_from;

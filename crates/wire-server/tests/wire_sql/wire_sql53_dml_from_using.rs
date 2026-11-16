@@ -210,3 +210,68 @@ fn join_on_and_three_table_forms_report_exact_tags() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
     assert_eq!(count(&mut stream, ALL), 2);
 }
+
+/// 管理用セッションで DDL を 1 文実行する（wire 経由の DDL 権限とは独立）。
+fn admin_ddl(core: &EngineCore, sql: &str) {
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    let ctx = engine::policy::PolicyContext::new("tenant-a").expect("valid tenant id");
+    core.execute_sql_in_session(&ctx, &mut session, sql)
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+/// Issue #3292: FROM／USING 側の単純形ビューは、末尾 `;` 付き単独送信でも `UPDATE n`／`DELETE n` を返す。
+#[test]
+fn view_source_reports_exact_tags_with_trailing_semicolon() {
+    let (core, _g) = new_core();
+    admin_ddl(&core, "CREATE VIEW lv AS SELECT id, lang FROM langs");
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = 9 FROM lv WHERE docs.lang = lv.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, UPDATED), 2);
+    expect_tag(
+        &mut stream,
+        "DELETE FROM docs USING lv WHERE docs.lang = lv.lang;",
+        "DELETE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, ALL), 1);
+}
+
+/// Issue #3292: 一時表だけの形は同じ接続の簡易クエリで通る（同名の永続表には作用しない）。
+#[test]
+fn temp_only_joined_dml_reports_exact_tags() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+    for sql in [
+        "CREATE TEMP TABLE docs (id BIGINT PRIMARY KEY, lang TEXT, n INTEGER);",
+        "CREATE TEMP TABLE langs (id BIGINT PRIMARY KEY, lang TEXT);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        let _ = read_command_complete(&mut stream);
+        assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
+    }
+    expect_tag(
+        &mut stream,
+        "INSERT INTO docs (id, lang, n) VALUES (1, 'ja', 0), (2, 'en', 0), (3, 'fr', 0);",
+        "INSERT 0 3",
+        b'I',
+    );
+    expect_tag(
+        &mut stream,
+        "INSERT INTO langs (id, lang) VALUES (1, 'ja'), (2, 'en');",
+        "INSERT 0 2",
+        b'I',
+    );
+    expect_tag(&mut stream, UPD, "UPDATE 2", b'I');
+    assert_eq!(count(&mut stream, UPDATED), 2);
+    expect_tag(&mut stream, DEL, "DELETE 2", b'I');
+    assert_eq!(count(&mut stream, ALL), 1);
+}

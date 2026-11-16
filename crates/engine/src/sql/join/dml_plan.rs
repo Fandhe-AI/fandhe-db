@@ -305,6 +305,7 @@ fn split_where(
     target_schema: &TableSchema,
     other_schemas: &[&TableSchema],
     map: &mut SourceMap,
+    other_visible: &[Option<Vec<String>>],
 ) -> Result<Split, SqlSurfaceError> {
     let (Some(target_ref), others) = (relations.first(), relations.get(1..).unwrap_or(&[])) else {
         return Err(internal("DML join without a target relation"));
@@ -326,6 +327,7 @@ fn split_where(
         target_schema,
         others,
         other_schemas,
+        other_visible,
     )?);
 
     let mut conjuncts: Vec<&JoinWhereExpr> = Vec::new();
@@ -705,6 +707,8 @@ struct PlanInput<'a> {
     where_clause: Option<&'a JoinWhereExpr>,
     update: Option<&'a BoundUpdateFrom>,
     returning: Option<&'a BoundFromReturning>,
+    /// relation ごとの見える列（ビュー source の公開列。Issue #3292）。
+    source_visible: &'a [Option<Vec<String>>],
 }
 
 fn plan_joined(
@@ -731,6 +735,7 @@ fn plan_joined(
         target_schema,
         other_schemas,
         &mut map,
+        input.source_visible,
     )?;
     let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
     let (update, columns) = match input.update {
@@ -812,6 +817,7 @@ pub(crate) fn plan_update_from(
             where_clause: bound.where_clause(),
             update: Some(bound),
             returning: bound.returning(),
+            source_visible: bound.source_visible(),
         },
         target_schema,
         from_schemas,
@@ -833,6 +839,7 @@ pub(crate) fn plan_delete_using(
             where_clause: bound.where_clause(),
             update: None,
             returning: bound.returning(),
+            source_visible: bound.source_visible(),
         },
         target_schema,
         using_schemas,

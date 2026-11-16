@@ -4250,6 +4250,29 @@ pub enum DmlFromSetValue {
     Column(ColumnRef),
 }
 
+/// `UPDATE ... FROM`／`DELETE ... USING` の FROM／USING 側 1 relation の解決結果（Issue #3292）。
+/// 構文段（[`resolve_dml_from_relations`]）がカタログから決め、束縛・変換・実行（`core::dml_from_exec`）が
+/// 読み取り源の選択に使う。ビュー・実表以外の形は構文段で `0A000` に倒れるためここには現れない。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DmlFromSource {
+    /// 実表（永続）。
+    Table,
+    /// 単純形ビュー（列別名なし）。読み取りは基底表をセッションの `PolicyContext` で走査し、
+    /// ビュー定義の述語を source 側述語の先頭へ畳み込む。
+    View(DmlFromViewSource),
+}
+
+/// [`DmlFromSource::View`] の中身（`sql::view::Resolved::View` のうち本機能が使う部分）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DmlFromViewSource {
+    /// 連鎖を辿った先の実表名。
+    pub(crate) base_table: String,
+    /// ビュー定義由来の述語（基底表の物理列名で書かれている。内側のビューが先頭）。
+    pub(crate) view_predicates: Vec<WherePredicate>,
+    /// ビューが公開する列（`None` は全列〔疑似列 `id` を含む〕）。公開しない基底列は束縛に参加させない。
+    pub(crate) view_columns: Option<Vec<String>>,
+}
+
 /// 許可形状の構造判定を通過した `UPDATE <表> [[AS] <別名>] SET ... FROM <表の並び> [WHERE ...]`
 /// （SQL-53 (b)、Issue #1754。親 #1753）。保証するのは構文と表の存在確認（ビュー拒否）まで。
 /// 列の解決・型検証は `sql::dml_from` の束縛、結合の実行は #1755、RLS と `RETURNING` は #1756、
@@ -4267,6 +4290,8 @@ pub struct ValidatedUpdateFrom {
     /// FROM 句の結合段（Issue #3294。長さは `from.len() - 1`。k 番目の段が `from[k + 1]` を加える。
     /// カンマ区切りは [`JoinCondition::Cross`]、`ON` つきは [`JoinCondition::On`]）。
     pub(crate) from_steps: Vec<JoinStep>,
+    /// `from` と同じ並びの解決結果（実表・単純形ビュー。Issue #3292）。パーサは空で作り、検証入口が埋める。
+    pub(crate) sources: Vec<DmlFromSource>,
     /// SET 句の (列名, 右辺)。宣言順を保持する。
     pub(crate) assignments: Vec<(String, DmlFromSetValue)>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
@@ -4308,6 +4333,8 @@ pub struct ValidatedDeleteUsing {
     pub(crate) using: Vec<TableRef>,
     /// USING 句の結合段（Issue #3294。[`ValidatedUpdateFrom::from_steps`] と同じ契約）。
     pub(crate) using_steps: Vec<JoinStep>,
+    /// `using` と同じ並びの解決結果（[`ValidatedUpdateFrom::sources`] と同じ）。
+    pub(crate) sources: Vec<DmlFromSource>,
     /// `WHERE` 句（JOIN と同じ文法）。省略は `None`。
     pub(crate) where_clause: Option<Box<JoinWhereExpr>>,
     /// `RETURNING` 句（Issue #3204）。省略は `None`。
@@ -23197,6 +23224,7 @@ impl<'a> Parser<'a> {
                 target,
                 from,
                 from_steps,
+                sources: Vec::new(),
                 assignments,
                 where_clause,
                 returning,
@@ -23223,6 +23251,7 @@ impl<'a> Parser<'a> {
                 target,
                 using,
                 using_steps,
+                sources: Vec::new(),
                 where_clause,
                 returning,
                 operation_id,
@@ -23262,23 +23291,59 @@ fn reject_omitted_join_where_for_dml(
     Ok(())
 }
 
-/// FROM／USING 形の DML の対象表・FROM 側の表をカタログで確認する（ビューは `0A000`、未知は `42P01`）。
+/// FROM／USING 形の DML の対象表・FROM 側の表をカタログで確認する（未知は `42P01`）。
 /// 構文の完全な解析（`42601`）の後に呼ぶ（`parse_join_statement` と同じ検証順序）。
+///
+/// 対象表（書き込み先）がビューなら `0A000`（更新可能ビューは別の穴）。FROM／USING 側（読み取り専用）の
+/// 単純形ビュー（列別名なし）は [`DmlFromSource::View`] として返す。列別名つきビュー・評価後射影形ビューは
+/// 公開名から物理名への書き換え・本文の実行が要るため `0A000`（集合演算枝の前例と同じ fail-closed）。
 fn resolve_dml_from_relations(
     lookup: &impl TableLookup,
     target: &TableRef,
     others: &[TableRef],
-) -> Result<(), SqlSurfaceError> {
-    for r in std::iter::once(target).chain(others.iter()) {
-        match crate::sql::view::resolve_from(lookup, r.table())? {
-            crate::sql::view::Resolved::Table => {}
-            crate::sql::view::Resolved::View { .. }
-            | crate::sql::view::Resolved::Buffered { .. } => {
+) -> Result<Vec<DmlFromSource>, SqlSurfaceError> {
+    match crate::sql::view::resolve_from(lookup, target.table())? {
+        crate::sql::view::Resolved::Table => {}
+        crate::sql::view::Resolved::View { .. } | crate::sql::view::Resolved::Buffered { .. } => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "UPDATE ... FROM / DELETE ... USING does not support a view as the target",
+            ));
+        }
+    }
+    let mut sources = Vec::with_capacity(others.len().min(crate::sql::relation::MAX_TABLE_REFS));
+    for r in others {
+        sources.push(match crate::sql::view::resolve_from(lookup, r.table())? {
+            crate::sql::view::Resolved::Table => DmlFromSource::Table,
+            crate::sql::view::Resolved::View {
+                base_table,
+                view_predicates,
+                view_columns,
+                column_map: None,
+                ..
+            } => DmlFromSource::View(DmlFromViewSource {
+                base_table,
+                view_predicates,
+                view_columns,
+            }),
+            crate::sql::view::Resolved::View { .. } | crate::sql::view::Resolved::Buffered { .. } => {
                 return Err(SqlSurfaceError::feature_not_supported(
-                    "UPDATE ... FROM / DELETE ... USING does not support view references",
+                    "UPDATE ... FROM / DELETE ... USING supports only simple views without column aliases as the FROM / USING relation",
                 ));
             }
-        }
+        });
+    }
+    Ok(sources)
+}
+
+/// FROM／USING が 2 表以上（JOIN 連鎖を含む。Issue #3294 の畳み込み source）のとき、ビューの relation を
+/// `0A000` で拒否する。畳み込み source は合成 JOIN 文を実表名で評価するため、ビュー定義の述語・公開列の
+/// 制限を適用できず、通すとビューの絞り込みを黙って外す（fail-open）ことになる。単一表 source のビューだけが
+/// Issue #3292 の対象。
+fn reject_view_in_multi_source(sources: &[DmlFromSource]) -> Result<(), SqlSurfaceError> {
+    if sources.len() > 1 && sources.iter().any(|s| matches!(s, DmlFromSource::View(_))) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "UPDATE ... FROM / DELETE ... USING does not support a view in a multi-relation FROM / USING",
+        ));
     }
     Ok(())
 }
@@ -23300,7 +23365,8 @@ pub(crate) fn validate_update_from_tokens_with_limits(
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
-    resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.from)?;
+    reject_view_in_multi_source(&stmt.sources)?;
     // 台帳の文ハッシュ（Issue #1757。SQL-53 (5)）。全検証の後に算出し、検証順とエラーコードは変えない。
     stmt.statement_hash = crate::recovery::content_hash::for_update_from(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
@@ -23326,7 +23392,8 @@ pub(crate) fn validate_delete_using_tokens_with_limits(
     let mut stmt = parsed.stmt;
     mode.require(stmt.operation_id.as_ref())?;
     reject_omitted_join_where_for_dml(require_where_for_dml, stmt.where_clause.is_some())?;
-    resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    stmt.sources = resolve_dml_from_relations(lookup, &stmt.target, &stmt.using)?;
+    reject_view_in_multi_source(&stmt.sources)?;
     stmt.statement_hash = crate::recovery::content_hash::for_delete_using(
         crate::recovery::content_hash::strip_operation_id_clause(tokens),
     )
