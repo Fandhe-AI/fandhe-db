@@ -241,6 +241,48 @@ pub(crate) fn is_joined_dml(tokens: &[Token]) -> bool {
         || crate::sql::allowlist::looks_like_delete_using(body)
 }
 
+/// 結合 DML の Describe 用ダミーフラグの全体（Issue #3297）。`UPDATE ... FROM` は
+/// 「SET の代入ごと（宣言順。`<列> = $n` で `$n` の置換種別が String なら真）」に続けて
+/// 「WHERE の連言分ごと」（[`joined_where_conjunct_flags`]）を並べる。`DELETE ... USING` は WHERE 分だけ。
+/// 消費側（`core::dml_from_exec`）が代入数で前後を分け、個数が合わなければ全て検証側へ倒す。
+pub(crate) fn joined_dml_dummy_flags(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<bool> {
+    let body = strip_explain(tokens);
+    let mut flags = Vec::new();
+    if crate::sql::allowlist::looks_like_update_from(body) {
+        if let Some((set_idx, end)) = set_region(body) {
+            let region = body
+                .get(set_idx.saturating_add(1)..end.min(body.len()))
+                .unwrap_or(&[]);
+            let mut depth: usize = 0;
+            let mut seg_start = 0usize;
+            let finish = |seg: &[Token], flags: &mut Vec<bool>| {
+                flags.push(matches!(
+                    seg,
+                    [
+                        Token::Ident(_) | Token::QuotedNull(_),
+                        Token::Punct('='),
+                        Token::Param(n),
+                    ] if kind_of(kinds, *n) == ParamLiteralKind::String
+                ));
+            };
+            for (i, t) in region.iter().enumerate() {
+                match t {
+                    Token::Punct('(') | Token::Punct('[') => depth = depth.saturating_add(1),
+                    Token::Punct(')') | Token::Punct(']') => depth = depth.saturating_sub(1),
+                    Token::Punct(',') if depth == 0 => {
+                        finish(region.get(seg_start..i).unwrap_or(&[]), &mut flags);
+                        seg_start = i.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            finish(region.get(seg_start..).unwrap_or(&[]), &mut flags);
+        }
+    }
+    flags.extend(joined_where_conjunct_flags(tokens, kinds));
+    flags
+}
+
 /// 結合 DML の WHERE の連言分（深さ 0 の `AND` 区切り）ごとの Describe 用ダミーフラグ（Issue #3297）。
 /// 連言分が `<列|修飾列> = $n`（`$n` の置換種別が String）なら真。`sql::join::dml_plan` が対象側・
 /// source 側の述語列へ振り分け、`$n` 由来のダミー値に限って DATE・UUID・ENUM 等の値検証を省く。
@@ -365,10 +407,39 @@ pub(crate) fn joined_dml_relations(tokens: &[Token]) -> Option<Vec<(String, Stri
         };
         let (next, alias) = alias_at(i + 1);
         rels.push((alias.unwrap_or_else(|| table.clone()), table));
-        if matches!(body.get(next), Some(Token::Punct(','))) {
-            i = next + 1;
-        } else {
-            break;
+        // 次の関係の開始位置（`,` または `JOIN` の直後）を探す。`INNER`／`LEFT` 等の修飾や `ON` 条件は
+        // トップレベルで読み飛ばし、`WHERE` 等の句境界か末尾に達したら打ち切る（JOIN 連鎖の後続表も型推論の対象）。
+        let mut depth: usize = 0;
+        let mut j = next;
+        let mut found = None;
+        while let Some(t) = body.get(j) {
+            match t {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => depth = depth.saturating_sub(1),
+                Token::Punct(',') if depth == 0 => {
+                    found = j.checked_add(1);
+                    break;
+                }
+                Token::Ident(w) if depth == 0 && w.eq_ignore_ascii_case("JOIN") => {
+                    found = j.checked_add(1);
+                    break;
+                }
+                Token::Keyword(lexer::Keyword::Where) if depth == 0 => break,
+                Token::Ident(w)
+                    if depth == 0
+                        && ["RETURNING", "ORDER", "LIMIT", "OPERATION_ID"]
+                            .iter()
+                            .any(|k| w.eq_ignore_ascii_case(k)) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        match found {
+            Some(n) => i = n,
+            None => break,
         }
     }
     Some(rels)
@@ -4922,6 +4993,11 @@ mod typed_value_tests {
             Some(vec![pair("d", "docs"), pair("langs", "langs")])
         );
         assert_eq!(rels("UPDATE docs SET x = 1 WHERE id = 1"), None);
+        // JOIN 連鎖の後続表も関係一覧に入る。
+        assert_eq!(
+            rels("DELETE FROM a USING b JOIN c ON b.k = c.k LEFT JOIN d x ON x.k = c.k WHERE a.k = b.k"),
+            Some(vec![pair("a", "a"), pair("b", "b"), pair("c", "c"), pair("x", "d")])
+        );
     }
 
     /// Issue #3297: 結合 DML の WHERE の `$n` は修飾列を受理し、`OR`・括弧内・非等価は拒否する。

@@ -388,9 +388,13 @@ fn split_where(
                 split.target.extend(preds);
             }
             (false, true) if map.is_folded() => {
-                split
-                    .source_join
-                    .push(qualify_expr(c, &scope, relations, &schemas)?);
+                // 列の解決（`42703`／`42702`）は常に行う。`$n` 由来のダミー値の連言分は、後段の合成 JOIN 文の
+                // 再束縛（`fold.prepare`）へダミーフラグを運べないため、Describe 用計画からだけ外して値検証を
+                // Bind へ遅延する（Describe の計画は実行されず、Bind は実値で改めて計画する。Issue #3297）。
+                let q = qualify_expr(c, &scope, relations, &schemas)?;
+                if !dummy {
+                    split.source_join.push(q);
+                }
             }
             (false, true) => {
                 if contains_column_compare(c) {

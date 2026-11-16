@@ -29,6 +29,7 @@ fn new_core(label: &str) -> (EngineCore, std::path::PathBuf) {
                 ColumnDef::new("lang", ColumnType::Text, false),
                 ColumnDef::new("n", ColumnType::Integer, true),
                 ColumnDef::new("c", ColumnType::Integer, true),
+                ColumnDef::new("d", ColumnType::Date, true),
             ],
         ))
         .expect("create docs");
@@ -275,6 +276,54 @@ fn describe_with_date_where_param() {
         let prepared = core.parse_sql_prepared(sql).expect(sql);
         let ty = prepared.param_types().first().cloned().expect("slot");
         assert!(matches!(ty, PreparedParamType::Column(_)), "{ty:?}");
+        core.describe_prepared_in_session(&SessionState::default(), &prepared)
+            .expect("describe");
+        exec_bound(&core, sql, &["2024-01-02"]).expect(sql);
+    }
+}
+
+/// SET の `$n` 由来のダミー値は、DATE 列でも Describe の値検証に落ちない（Bind で実値を検証する）。
+/// 実リテラルの不正値は従来どおり拒否する。
+#[test]
+fn describe_with_date_set_param() {
+    let (core, path) = new_core("p3297-describe-set-date");
+    let _g = CleanupGuard(path);
+    seed(&core);
+    let sql = "UPDATE docs SET d = $1 FROM langs WHERE docs.lang = langs.lang";
+    let prepared = core.parse_sql_prepared(sql).expect(sql);
+    core.describe_prepared_in_session(&SessionState::default(), &prepared)
+        .expect("describe");
+    exec_bound(&core, sql, &["2024-01-02"]).expect(sql);
+    // 実値の不正は Bind で拒否される。
+    assert!(exec_bound(&core, sql, &["not-a-date"]).is_err());
+    // 実リテラルの検証は維持する。
+    assert!(run(
+        &core,
+        "UPDATE docs SET d = 'not-a-date' FROM langs WHERE docs.lang = langs.lang"
+    )
+    .is_err());
+}
+
+/// JOIN 連鎖の後続表の列型も `$n` の型推論に使う（`b.flag` は BOOLEAN）。畳み込み source
+/// （2 表以上・JOIN）のソースのみの連言分でも Describe が DATE 列で落ちない。
+#[test]
+fn join_chain_param_types_and_folded_source_describe() {
+    let (core, path) = new_core("p3297-join-chain");
+    let _g = CleanupGuard(path);
+    seed(&core);
+    let sql = "DELETE FROM docs USING langs a JOIN langs b ON a.lang = b.lang \
+               WHERE docs.lang = a.lang AND b.flag = $1";
+    let prepared = core.parse_sql_prepared(sql).expect(sql);
+    let ty = prepared.param_types().first().cloned().expect("slot");
+    assert!(matches!(ty, PreparedParamType::Column(_)), "{ty:?}");
+    exec_bound(&core, sql, &["true"]).expect(sql);
+    for sql in [
+        "DELETE FROM docs USING langs a JOIN langs b ON a.lang = b.lang \
+         WHERE docs.lang = a.lang AND b.d = $1",
+        "UPDATE docs SET lang = 'x' FROM langs a, langs b \
+         WHERE docs.lang = a.lang AND a.lang = b.lang AND b.d = $1",
+    ] {
+        let prepared = core.parse_sql_prepared(sql).expect(sql);
         core.describe_prepared_in_session(&SessionState::default(), &prepared)
             .expect("describe");
         exec_bound(&core, sql, &["2024-01-02"]).expect(sql);

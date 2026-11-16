@@ -350,6 +350,21 @@ pub(crate) fn bind_update_from_with_udfs(
     from_schemas: &[&TableSchema],
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundUpdateFrom, SqlSurfaceError> {
+    bind_update_from_describe(stmt, target_schema, from_schemas, udfs, &[])
+}
+
+/// [`bind_update_from_with_udfs`] の Describe 用版（Issue #3297）。`set_dummy` は SET 句の代入ごと
+/// （宣言順）の「`$n` 由来のダミー値か」で、真の文字列リテラル項は左辺（重複・疑似列・未知列・
+/// `GENERATED ALWAYS`）だけを検査し、値の検証（DATE・UUID・ENUM 等）は Bind まで遅延する。
+/// 代入数と一致しないフラグ列は使わない（全て検証側へ倒す。fail-closed）。実リテラルは常に検証する。
+pub(crate) fn bind_update_from_describe(
+    stmt: &ValidatedUpdateFrom,
+    target_schema: &TableSchema,
+    from_schemas: &[&TableSchema],
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    set_dummy: &[bool],
+) -> Result<BoundUpdateFrom, SqlSurfaceError> {
+    let usable_set_flags = set_dummy.len() == stmt.assignments.len();
     let scope = build_scope(
         &stmt.target,
         target_schema,
@@ -368,7 +383,7 @@ pub(crate) fn bind_update_from_with_udfs(
     let mut seen: HashSet<&str> = HashSet::new();
     let mut set_columns: Vec<(usize, ResolvedColumn)> = Vec::new();
     let mut plain: Vec<(String, SetValue)> = Vec::new();
-    for (name, value) in &stmt.assignments {
+    for (ai, (name, value)) in stmt.assignments.iter().enumerate() {
         if !seen.insert(name.as_str()) {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "duplicate column in SET clause: {name}"
@@ -396,6 +411,16 @@ pub(crate) fn bind_update_from_with_udfs(
             DmlFromSetValue::Value(v, unqualified) => {
                 if let SetValue::Expr(_) = v {
                     check_set_expr_scope(&scope, unqualified)?;
+                }
+                let is_dummy = usable_set_flags
+                    && set_dummy.get(ai).copied().unwrap_or(false)
+                    && matches!(
+                        v,
+                        SetValue::Literal(crate::sql::allowlist::InsertLiteral::String(_))
+                    );
+                if is_dummy {
+                    check_set_target(name, target_schema)?;
+                    continue;
                 }
                 plain.push((name.clone(), v.clone()));
             }

@@ -8937,7 +8937,7 @@ impl EngineCore {
         // 結合 DML（Issue #3297）は連言分ごとのフラグ（`sql::join::dml_plan` が対象側・source 側へ
         // 振り分ける）。それ以外は従来どおり等価述語の序数ごと。
         let where_equality_dummy_flags = if crate::sql::params::is_joined_dml(&tokens) {
-            crate::sql::params::joined_where_conjunct_flags(&tokens, &kinds)
+            crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
         } else {
             crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
         };
