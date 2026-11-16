@@ -1372,3 +1372,150 @@ fn copy_from_stdin_rows_at_chunk_limit_are_accepted() {
     .expect("rows exactly at chunk limit must be accepted");
     assert_eq!(read_back_ids(&core, "acme"), vec![1, 2]);
 }
+
+// ---------------------------------------------------------------------
+// Issue #3310: 行数の上限（①）を外したあとの資源上限。`BatchLimits::default()` は環境変数を
+// 読むため使わず、既定値を明示する。拒否は行 0 件・台帳 NotRecorded（同じ operation_id が
+// 上限内の入力で再送できる）で確かめる。
+// ---------------------------------------------------------------------
+
+fn explicit_default_limits() -> engine::batch_limits::BatchLimits {
+    engine::batch_limits::BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: engine::chunking::MAX_INPUT_BYTES,
+        max_batch_total_bytes: engine::incremental::MAX_INDEX_TOTAL_BYTES,
+        max_batch_chunks: engine::incremental::MAX_CHUNKS_PER_FILE,
+    }
+}
+
+fn assert_op_unused(core: &EngineCore, op: &str) {
+    assert_eq!(count_rows(core, "acme"), 0);
+    let outcome = run_copy_from(core, "acme", &copy_sql(op), &[&rows_text(1, 1)])
+        .expect("operation_id must be unused after the rejected COPY");
+    assert_eq!(outcome.rows_affected, 1);
+}
+
+/// 固定する上限: ④。既定の 4096 行ちょうどは成功し、数万行を 1 回の `feed` で渡すと、その
+/// `feed` が `finish` を待たず `54000`。保持量は上限で止まり、行・台帳とも残らない。
+#[test]
+fn copy_from_default_chunk_limit_accepts_4096_and_rejects_30k_in_one_feed() {
+    let (core, _guard) = open_engine_with_limits("copy-from-4096-ok", explicit_default_limits());
+    let limit = explicit_default_limits().max_batch_chunks as u64;
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &copy_sql("copy-4096"),
+        &[&rows_text(1, limit)],
+    )
+    .expect("rows at the chunk limit");
+    assert_eq!(outcome.rows_affected as u64, limit);
+
+    let (core, _guard2) = open_engine_with_limits("copy-from-30k", explicit_default_limits());
+    let mut s = begin_from(&core, "copy-30k");
+    let err = s.feed(&rows_text(1, 30_000)).expect_err("30,000 rows");
+    assert_eq!(err.wire_code(), "54000");
+    let msg = err.to_string();
+    assert!(!msg.contains("acme"), "error must not echo tenant: {msg}");
+    drop(s);
+    assert_op_unused(&core, "copy-30k");
+}
+
+/// 固定する上限: ④ が束縛より先に走る。4097 行目だけ不正な行でも `54000`（束縛エラーに
+/// ならない）。対照として 4096 行目が不正なら束縛側のエラー（`54000` 以外）。
+#[test]
+fn copy_from_chunk_limit_is_checked_before_binding_row() {
+    let limit = explicit_default_limits().max_batch_chunks as u64;
+    let (core, _guard) =
+        open_engine_with_limits("copy-from-limit-before-bind", explicit_default_limits());
+
+    let mut s = begin_from(&core, "copy-lbb-over");
+    s.feed(&rows_text(1, limit)).expect("rows at the limit");
+    let err = s
+        .feed(format!("{}\t[1.0]\tja\n", limit + 1).as_bytes())
+        .expect_err("row over the limit");
+    assert_eq!(err.wire_code(), "54000");
+    drop(s);
+
+    let mut s = begin_from(&core, "copy-lbb-at");
+    s.feed(&rows_text(1, limit - 1))
+        .expect("rows below the limit");
+    let err = s
+        .feed(format!("{limit}\t[1.0]\tja\n").as_bytes())
+        .expect_err("malformed row at the limit must fail binding");
+    assert_ne!(err.wire_code(), "54000");
+    drop(s);
+    assert_eq!(count_rows(&core, "acme"), 0);
+}
+
+/// 固定する上限: ③（既定 64 MiB）。改行のない巨大な 1 行を 1 MiB ずつ `feed` し続けても、
+/// 累計が ③ を超えた回の `feed` が `54000` を返す（`pending` の保持量は ③ で止まる）。
+#[test]
+fn copy_from_endless_line_is_stopped_by_total_bytes_limit() {
+    let limits = explicit_default_limits();
+    let (core, _guard) = open_engine_with_limits("copy-from-endless-line", limits);
+    let mut s = begin_from(&core, "copy-endless");
+    let chunk = vec![b'a'; 1 << 20];
+    let mut fed = 0usize;
+    let err = loop {
+        match s.feed(&chunk) {
+            Ok(_) => {
+                fed += chunk.len();
+                assert!(
+                    fed <= limits.max_batch_total_bytes,
+                    "feed must be rejected once the total exceeds the limit"
+                );
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(err.wire_code(), "54000");
+    assert!(fed + chunk.len() > limits.max_batch_total_bytes);
+    drop(s);
+    assert_op_unused(&core, "copy-endless");
+}
+
+/// 固定する上限: ②（既定 16 MiB）。16 MiB + 1 バイトの `lang` を持つ 1 行（改行あり）を
+/// 1 MiB 単位で `feed` すると `54000`。
+#[test]
+fn copy_from_single_row_over_default_row_bytes_limit_is_rejected() {
+    let (core, _guard) = open_engine_with_limits("copy-from-big-row", explicit_default_limits());
+    let mut s = begin_from(&core, "copy-bigrow");
+    let mut row = b"1\t[1.0,0.0]\t".to_vec();
+    row.extend(std::iter::repeat(b'z').take(engine::chunking::MAX_INPUT_BYTES + 1));
+    row.push(b'\n');
+    let mut result = Ok(());
+    for piece in row.chunks(1 << 20) {
+        if let Err(e) = s.feed(piece) {
+            result = Err(e);
+            break;
+        }
+    }
+    let err = result.expect_err("oversized row");
+    assert_eq!(err.wire_code(), "54000");
+    drop(s);
+    assert_op_unused(&core, "copy-bigrow");
+}
+
+/// 固定する上限: ③ を行数の増加で踏む。④ を大きく・③ を縮めた構成で、小さな行を多数 `feed`
+/// すると、③ を超えた回で `54000`（① とは無関係に効く）。
+#[test]
+fn copy_from_many_small_rows_hit_total_bytes_limit_not_row_cap() {
+    let limits = engine::batch_limits::BatchLimits {
+        max_batch_total_bytes: 4096,
+        max_batch_chunks: 1_000_000,
+        ..explicit_default_limits()
+    };
+    let (core, _guard) = open_engine_with_limits("copy-from-many-small", limits);
+    let mut s = begin_from(&core, "copy-many-small");
+    let mut result = Ok(());
+    for i in 1..=1000u64 {
+        if let Err(e) = s.feed(&rows_text(i, i)) {
+            result = Err(e);
+            break;
+        }
+    }
+    let err = result.expect_err("total bytes over the limit");
+    assert_eq!(err.wire_code(), "54000");
+    drop(s);
+    assert_op_unused(&core, "copy-many-small");
+}
