@@ -112,6 +112,51 @@ impl EngineCore {
             .map(|(plan, _read_txn)| plan)
     }
 
+    /// Describe（拡張クエリの Parse 時のダミー値の計画を含む）用の [`Self::plan_update_from_stmt`]。
+    /// `conjunct_dummy` は WHERE の連言分ごとの「`$n` 由来のダミー値か」（Issue #3297）。
+    pub(super) fn plan_update_from_stmt_for_describe(
+        &self,
+        stmt: &ValidatedUpdateFrom,
+        udfs: &UdfRegistry,
+        conjunct_dummy: &[bool],
+    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+        let (_read_txn, target, others) =
+            self.dml_from_schemas(stmt.target_table(), &stmt.from, &stmt.sources)?;
+        let refs: Vec<&TableSchema> = others.iter().collect();
+        let bound = crate::sql::dml_from::bind_update_from_with_udfs(stmt, &target, &refs, udfs)?;
+        let mut plan = crate::sql::join::dml_plan::plan_update_from_describe(
+            &bound,
+            &target,
+            &refs,
+            udfs,
+            conjunct_dummy,
+        )?;
+        apply_view_source(&mut plan, &stmt.sources, udfs)?;
+        Ok(plan)
+    }
+
+    /// [`Self::plan_delete_using_stmt`] の Describe 用版（Issue #3297。上と同じ契約）。
+    pub(super) fn plan_delete_using_stmt_for_describe(
+        &self,
+        stmt: &ValidatedDeleteUsing,
+        udfs: &UdfRegistry,
+        conjunct_dummy: &[bool],
+    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+        let (_read_txn, target, others) =
+            self.dml_from_schemas(stmt.target_table(), &stmt.using, &stmt.sources)?;
+        let refs: Vec<&TableSchema> = others.iter().collect();
+        let bound = crate::sql::dml_from::bind_delete_using_with_udfs(stmt, &target, &refs, udfs)?;
+        let mut plan = crate::sql::join::dml_plan::plan_delete_using_describe(
+            &bound,
+            &target,
+            &refs,
+            udfs,
+            conjunct_dummy,
+        )?;
+        apply_view_source(&mut plan, &stmt.sources, udfs)?;
+        Ok(plan)
+    }
+
     /// [`Self::plan_update_from_stmt`] が使った読み取りトランザクションも返す版
     /// （`EXPLAIN UPDATE ... FROM` が GIN 宣言を同じスナップショットで読む。Issue #3293）。
     pub(super) fn plan_update_from_stmt_with_txn(

@@ -56,6 +56,41 @@ struct Split {
     target: Vec<WherePredicate>,
     source: Vec<WherePredicate>,
     keys: Vec<EquiKey>,
+    /// 対象側・source 側の述語列それぞれの Describe 用ダミーフラグ（Issue #3297）。
+    /// 束縛の等価序数（`Equality`・`Compare`・`Between` の葉ごとに 1 つ進む）に揃えた並び。
+    target_dummy: Vec<bool>,
+    source_dummy: Vec<bool>,
+}
+
+/// 束縛の等価序数を進める葉の数（`bind_where_predicates` の `dummy_equality_flags` の並びと対応。
+/// `Equality`・`Compare`・`Between` が 1 葉 1 つ、`Not` は内側、`Or` は分岐の合計）。
+fn ordinal_leaf_count(pred: &WherePredicate) -> usize {
+    match pred {
+        WherePredicate::Equality { .. }
+        | WherePredicate::Compare { .. }
+        | WherePredicate::Between { .. } => 1,
+        WherePredicate::Not(inner) => ordinal_leaf_count(inner),
+        WherePredicate::Or(branches) => branches
+            .iter()
+            .flatten()
+            .map(ordinal_leaf_count)
+            .fold(0usize, usize::saturating_add),
+        _ => 0,
+    }
+}
+
+/// 1 連言分（`preds`）が積むダミーフラグ。単一の葉で、その連言分が `$n` 由来のときだけ真を積み、
+/// それ以外は葉の数だけ偽（実リテラルは必ず検証する。fail-closed）を積む。
+fn push_dummy_flags(out: &mut Vec<bool>, preds: &[WherePredicate], dummy: bool) {
+    let n = preds
+        .iter()
+        .map(ordinal_leaf_count)
+        .fold(0usize, usize::saturating_add);
+    if n == 0 {
+        return;
+    }
+    out.push(dummy && matches!(preds, [WherePredicate::Equality { .. }]));
+    out.extend(std::iter::repeat_n(false, n.saturating_sub(1)));
 }
 
 /// 部分木に列同士の比較が含まれるか。
@@ -149,6 +184,7 @@ fn split_where(
     target_schema: &TableSchema,
     other_schemas: &[&TableSchema],
     other_visible: &[Option<Vec<String>>],
+    conjunct_dummy: &[bool],
 ) -> Result<Split, SqlSurfaceError> {
     let (Some(target_ref), [source_ref]) = (relations.first(), relations.get(1..).unwrap_or(&[]))
     else {
@@ -174,9 +210,14 @@ fn split_where(
         target: Vec::new(),
         source: Vec::new(),
         keys: Vec::new(),
+        target_dummy: Vec::new(),
+        source_dummy: Vec::new(),
     };
     let schemas = [target_schema, *source_schema];
-    for c in conjuncts {
+    // 連言分の数と一致しないフラグ列は使わない（対応を保証できないため全て検証側へ倒す）。
+    let usable_flags = conjunct_dummy.len() == conjuncts.len();
+    for (ci, c) in conjuncts.into_iter().enumerate() {
+        let dummy = usable_flags && conjunct_dummy.get(ci).copied().unwrap_or(false);
         if let JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare { lhs, op, rhs }) = c {
             let (l, r) = (scope.resolve(lhs)?, scope.resolve(rhs)?);
             if l.relation() != r.relation() && *op == BinOp::Eq {
@@ -191,12 +232,16 @@ fn split_where(
             return Err(SqlSurfaceError::feature_not_supported(UNSUPPORTED_WHERE));
         }
         match relation_set(c, &scope)? {
-            (true, false) => split
-                .target
-                .extend(to_where_predicates(c, &scope, &schemas)?),
-            (false, true) => split
-                .source
-                .extend(to_where_predicates(c, &scope, &schemas)?),
+            (true, false) => {
+                let preds = to_where_predicates(c, &scope, &schemas)?;
+                push_dummy_flags(&mut split.target_dummy, &preds, dummy);
+                split.target.extend(preds);
+            }
+            (false, true) => {
+                let preds = to_where_predicates(c, &scope, &schemas)?;
+                push_dummy_flags(&mut split.source_dummy, &preds, dummy);
+                split.source.extend(preds);
+            }
             _ => return Err(SqlSurfaceError::feature_not_supported(UNSUPPORTED_WHERE)),
         }
     }
@@ -212,11 +257,18 @@ fn build_target(
     table: &str,
     schema: &TableSchema,
     preds: &[WherePredicate],
+    dummy_flags: &[bool],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlTarget, SqlSurfaceError> {
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let (metadata_filters, expr_filters, _rls, or_filters) =
-        crate::sql::parser::bind_where_predicates(preds, schema, udfs, &mut node_budget, &[])?;
+        crate::sql::parser::bind_where_predicates(
+            preds,
+            schema,
+            udfs,
+            &mut node_budget,
+            dummy_flags,
+        )?;
     if expr_filters
         .iter()
         .any(crate::sql::udf_call::references_embedding)
@@ -235,18 +287,18 @@ fn build_target(
     })
 }
 
-/// source 側述語を検証する（束縛結果は捨て、実行時の側スキャンと同じ型解析をここで前倒しする）。
+/// source 側述語（とその Describe 用ダミーフラグ）を検証する（束縛結果は捨て、実行時の側スキャンと同じ型解析をここで前倒しする）。
 fn build_source(
     table: &str,
     schema: &TableSchema,
-    preds: Vec<WherePredicate>,
+    (preds, dummy_flags): (Vec<WherePredicate>, &[bool]),
     columns: Vec<usize>,
     returning_columns: Vec<usize>,
     include_pseudo_id: bool,
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlSource, SqlSurfaceError> {
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    crate::sql::parser::bind_where_predicates(&preds, schema, udfs, &mut node_budget, &[])?;
+    crate::sql::parser::bind_where_predicates(&preds, schema, udfs, &mut node_budget, dummy_flags)?;
     Ok(JoinedDmlSource {
         table: table.to_string(),
         schema: schema.clone(),
@@ -458,24 +510,44 @@ pub(crate) fn plan_update_from(
     from_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+    plan_update_from_describe(bound, target_schema, from_schemas, udfs, &[])
+}
+
+/// [`plan_update_from`] の Describe 用版（Issue #3297）。`conjunct_dummy` は WHERE の連言分ごとの
+/// 「`$n` 由来のダミー値か」で、真の連言分に限り値の検証（DATE・UUID・ENUM 等）を省く。Execute と
+/// Bind は空を渡し、実リテラルは常に検証する。
+pub(crate) fn plan_update_from_describe(
+    bound: &BoundUpdateFrom,
+    target_schema: &TableSchema,
+    from_schemas: &[&TableSchema],
+    udfs: &UdfRegistry,
+    conjunct_dummy: &[bool],
+) -> Result<JoinedDmlPlan, SqlSurfaceError> {
     let split = split_where(
         bound.relations(),
         bound.where_clause(),
         target_schema,
         from_schemas,
         bound.source_visible(),
+        conjunct_dummy,
     )?;
     let ([target_ref, source_ref], [source_schema]) = (bound.relations(), from_schemas) else {
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
     };
-    let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
+    let target = build_target(
+        target_ref.table(),
+        target_schema,
+        &split.target,
+        &split.target_dummy,
+        udfs,
+    )?;
     let (update, columns) = plan_set(bound, target_schema, source_schema)?;
     let mut returning_columns = Vec::new();
     let include_pseudo_id = returning_source_columns(bound.returning(), &mut returning_columns)?;
     let source = build_source(
         source_ref.table(),
         source_schema,
-        split.source,
+        (split.source, &split.source_dummy),
         columns,
         returning_columns,
         include_pseudo_id,
@@ -499,24 +571,42 @@ pub(crate) fn plan_delete_using(
     using_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+    plan_delete_using_describe(bound, target_schema, using_schemas, udfs, &[])
+}
+
+/// [`plan_delete_using`] の Describe 用版（Issue #3297。[`plan_update_from_describe`] と同じ契約）。
+pub(crate) fn plan_delete_using_describe(
+    bound: &BoundDeleteUsing,
+    target_schema: &TableSchema,
+    using_schemas: &[&TableSchema],
+    udfs: &UdfRegistry,
+    conjunct_dummy: &[bool],
+) -> Result<JoinedDmlPlan, SqlSurfaceError> {
     let split = split_where(
         bound.relations(),
         bound.where_clause(),
         target_schema,
         using_schemas,
         bound.source_visible(),
+        conjunct_dummy,
     )?;
     let ([target_ref, source_ref], [source_schema]) = (bound.relations(), using_schemas) else {
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
     };
-    let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
+    let target = build_target(
+        target_ref.table(),
+        target_schema,
+        &split.target,
+        &split.target_dummy,
+        udfs,
+    )?;
     let columns = Vec::new();
     let mut returning_columns = Vec::new();
     let include_pseudo_id = returning_source_columns(bound.returning(), &mut returning_columns)?;
     let source = build_source(
         source_ref.table(),
         source_schema,
-        split.source,
+        (split.source, &split.source_dummy),
         columns,
         returning_columns,
         include_pseudo_id,
