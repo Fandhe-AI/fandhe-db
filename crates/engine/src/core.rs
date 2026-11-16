@@ -75,6 +75,8 @@ mod ctas_exec;
 mod matview_exec;
 mod row_lock_exec;
 mod schema_elements;
+// 明示・暗黙トランザクション内の表・索引の DDL（SQL-80・Issue #3313）。
+mod txn_ddl;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
@@ -3251,6 +3253,14 @@ impl<'a> InsertSchemaLookup<'a> {
     /// `table_exists` が最後に取得したスキーマを、要求されたテーブル名と
     /// 一致する場合にのみ返す（消費型。1 回取り出したら空になる）。
     fn take_schema(&self, table_name: &str) -> Option<TableSchema> {
+        // DDL を積んだ明示・暗黙 Tx は、変更した表のスキーマを write txn 上のもので重ねて見る
+        // （確定済みカタログは同じ Tx で作った表・変更した列を知らない。SQL-80・Issue #3313）。
+        if let Some(Some(schema)) =
+            crate::sql::txn_overlay::overlay_schema(self.storage, table_name)
+        {
+            *self.cached.borrow_mut() = None;
+            return Some(schema);
+        }
         let mut cached = self.cached.borrow_mut();
         match cached.take() {
             Some((name, schema)) if name == table_name => Some(schema),
@@ -3267,7 +3277,9 @@ impl<'a> InsertSchemaLookup<'a> {
 
 impl crate::sql::allowlist::TableLookup for InsertSchemaLookup<'_> {
     fn table_exists(&self, name: &str) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
-        match self.storage.get_table_schema(name) {
+        // DDL を積んだ Tx では、同じ Tx で作った表・変更した表を write txn 上のスキーマで見る（重ね見。
+        // SQL-80・Issue #3313）。それ以外は確定済みカタログ。
+        match crate::sql::txn_overlay::table_schema_overlaid(self.storage, name) {
             Ok(schema) => {
                 *self.cached.borrow_mut() = Some((name.to_string(), schema));
                 Ok(true)
@@ -10708,6 +10720,16 @@ impl EngineCore {
         {
             return Err(txn.take_failed_error());
         }
+        // SQL-80・Issue #3313: DDL を積んだ Tx では、確定済みカタログを読む解析（INSERT の存在確認）が
+        // 同じ Tx で作った表を見落とさないよう、write txn 上のスキーマを文の区間だけ重ねて見る。
+        let _overlay_scope =
+            match crate::sql::txn_overlay::TxnCatalogOverlayScope::enter(&self.storage, txn) {
+                Ok(scope) => scope,
+                Err(e) => {
+                    txn.fail();
+                    return Err(e);
+                }
+            };
         // 構文・許可リスト検証のエラーも、明示トランザクション中なら種類を問わず
         // `Failed` へ遷移させる（PostgreSQL と同じ。`Active` のまま残すと後続の
         // `COMMIT` が先行する書き込みを永続化してしまう。PR #1041 レビュー指摘）。
@@ -10967,6 +10989,9 @@ impl EngineCore {
         {
             return Err(SqlSurfaceError::ReadOnlySqlTransaction);
         }
+        // SQL-80・Issue #3313: 表・索引の DDL を積んだ Tx は、結線を済ませた種類の文だけを実行する
+        // （暫定の許可リスト。受け皿は #3314）。writer・台帳・採番・カタログへ触れる前に拒否する。
+        txn_ddl::check_post_ddl_statement(session, txn, parsed)?;
 
         // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
         // （`Active` なのに開始時刻が無い場合は fail-closed の `Internal`）。
@@ -11578,6 +11603,13 @@ impl EngineCore {
             ParsedSql::LockingSelect(locking) => {
                 self.execute_locking_select_in_active_txn(ctx, session, txn, locking)
             }
+            // SQL-80・Issue #3313: 表・索引の DDL は共有 write txn へ積み、COMMIT で原子的に確定する
+            // （`core/txn_ddl.rs`。権限・作成先・未対応の形の拒否は autocommit の腕と同じ順）。
+            ParsedSql::CreateTable(_)
+            | ParsedSql::DropTable(_)
+            | ParsedSql::AlterTable(_)
+            | ParsedSql::CreateIndex(_)
+            | ParsedSql::DropIndex(_) => self.execute_table_ddl_in_txn(ctx, session, txn, parsed),
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),

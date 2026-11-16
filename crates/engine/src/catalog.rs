@@ -13293,6 +13293,18 @@ impl Storage {
         Self::create_table_in_txn(write_txn, &schema, pre_encoded)
     }
 
+    /// 共有 write txn（明示・暗黙 Tx）の中で表を作る（begin・commit を含まない。SQL-80・Issue #3313）。
+    /// [`Self::create_table`] と同じ前処理・本体を通し、commit 記録と表世代の bump を本体の直後に行う
+    /// （共有 txn の commit は Tx 側が 1 回だけ行う）。`Err` の場合は呼び出し側が Tx を復帰不可の失敗にする。
+    pub(crate) fn create_table_in_shared_txn(
+        write_txn: &redb::WriteTransaction,
+        schema: &TableSchema,
+    ) -> Result<()> {
+        Self::create_table_in_write_txn(write_txn, schema)?;
+        crate::storage::commit_log::note_ddl(write_txn, &schema.name);
+        bump_table_generation_in_txn(write_txn, &schema.name)
+    }
+
     /// [`Self::create_table`] の txn 前処理（UNIQUE 制約名の確定・スキーマ検証。write txn を開く前に
     /// fail-closed に拒否できる判定だけ）。暗黙 SEQUENCE 付きの作成
     /// （[`Self::create_table_with_implicit_sequences`]）も同じ処理を通す。FK を持たないスキーマは
@@ -13530,6 +13542,20 @@ impl Storage {
         Ok(report)
     }
 
+    /// [`Self::drop_tables`] の共有 write txn 版（明示・暗黙 Tx の `DROP TABLE`。SQL-80・Issue #3313）。
+    /// 判定・依存検査・連鎖削除・世代 bump・commit 記録は autocommit と同じ本体を通る（begin・commit を含まない）。
+    /// 返り値の第 2 要素は道連れに削除した所有 SEQUENCE の内部 ID で、呼び出し側が Tx の commit 成功後に
+    /// 採番器から捨てる。`dropped == 0`（全件が `IF EXISTS` で skip）は何も書いていない。
+    pub(crate) fn drop_tables_in_shared_txn(
+        &self,
+        write_txn: &redb::WriteTransaction,
+        table_names: &[String],
+        if_exists: bool,
+        behavior: DropBehavior,
+    ) -> Result<(DropTablesReport, Vec<u64>)> {
+        self.drop_tables_collecting_sequences(write_txn, table_names, if_exists, behavior)
+    }
+
     /// [`Self::drop_tables`] の write txn 内本体（begin・commit を含まない）。呼び出し側が commit
     /// するか、`Err`／`dropped == 0` なら破棄する。一時 DB の `ON COMMIT` 処理が行の全削除と
     /// 表の削除を単一 txn で原子的に適用するために切り出した（Issue #1684）。
@@ -13753,6 +13779,25 @@ impl Storage {
         crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// [`Self::alter_table_in_single_txn`] の共有 write txn 版（明示・暗黙 Tx の `ALTER TABLE`。SQL-80・
+    /// Issue #3313）。`f` が `Err` なら呼び出し側が Tx を復帰不可の失敗にする（部分的な適用を commit しない）。
+    /// `f` が `changed == false` を返したら commit 記録・世代 bump をしない。返り値の第 2 要素は DROP COLUMN
+    /// が道連れに削除した所有 SEQUENCE の内部 ID（呼び出し側が Tx の commit 成功後に採番器から捨てる）。
+    pub(crate) fn alter_table_in_shared_txn<T>(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        f: impl FnOnce(
+            &redb::WriteTransaction,
+        ) -> std::result::Result<(T, bool, Vec<u64>), AlterCheckError>,
+    ) -> std::result::Result<(T, Vec<u64>), AlterCheckError> {
+        let (out, changed, dropped_sequence_ids) = f(write_txn)?;
+        if changed {
+            crate::storage::commit_log::note_ddl(write_txn, table_name);
+            bump_table_generation_in_txn(write_txn, table_name)?;
+        }
+        Ok((out, dropped_sequence_ids))
     }
 
     /// 複数の ALTER アクションを単一の write txn で適用する共通入口（Issue #1633・TABLE-39 (5)
@@ -16654,6 +16699,45 @@ impl Storage {
         predicate: Option<&[WherePredicate]>,
         hnsw_family: Option<HnswOpClassFamily>,
     ) -> std::result::Result<(), CreateIndexError> {
+        Self::validate_create_index_input(def, exprs, predicate)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::create_index_bound_body(&write_txn, def, exprs, predicate, hnsw_family)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, &def.table);
+        bump_table_generation_in_txn(&write_txn, &def.table)?;
+        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
+        // `IndexCatalogGateCache` が古い HNSW 宣言判定を再利用しないようにする）。
+        bump_index_catalog_generation_in_txn(&write_txn)?;
+        crate::recovery::commit_boundary::commit(write_txn)
+            .map_err(convert_storage_error)
+            .map_err(CreateIndexError::Catalog)
+    }
+
+    /// [`Self::create_index_bound`] の共有 write txn 版（begin・commit を含まない。明示・暗黙 Tx の
+    /// `CREATE INDEX`。SQL-80・Issue #3313）。名前衝突・対象の判定・束縛・既存行の検証・保存・世代 bump は
+    /// autocommit と同じ本体を通る。`Err` の場合は呼び出し側が Tx を復帰不可の失敗にし、部分的な書き込みを
+    /// commit しない。メモリ上の状態は変えない（キャッシュは世代を鍵にし、commit 前の世代は誰にも見せない）。
+    pub(crate) fn create_index_in_shared_txn(
+        write_txn: &redb::WriteTransaction,
+        def: &IndexDef,
+        exprs: &[Option<Expr>],
+        predicate: Option<&[WherePredicate]>,
+        hnsw_family: Option<HnswOpClassFamily>,
+    ) -> std::result::Result<(), CreateIndexError> {
+        Self::validate_create_index_input(def, exprs, predicate)?;
+        Self::create_index_bound_body(write_txn, def, exprs, predicate, hnsw_family)?;
+        crate::storage::commit_log::note_ddl(write_txn, &def.table);
+        bump_table_generation_in_txn(write_txn, &def.table)?;
+        bump_index_catalog_generation_in_txn(write_txn)?;
+        Ok(())
+    }
+
+    /// [`Self::create_index_bound`] の write txn を開く前の入力検証（カタログ・行に依存しない判定だけ）。
+    fn validate_create_index_input(
+        def: &IndexDef,
+        exprs: &[Option<Expr>],
+        predicate: Option<&[WherePredicate]>,
+    ) -> std::result::Result<(), CreateIndexError> {
         validate_relation_key(&def.name)?;
         validate_relation_key(&def.table)?;
         if def.has_expressions() || def.has_predicate() {
@@ -16739,8 +16823,19 @@ impl Storage {
         if let Some(dup) = first_duplicate_column(&def.columns) {
             return Err(CatalogError::Invalid(format!("duplicate index column: {dup}")).into());
         }
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        namespace::ensure_key_schema_alive_in_txn(&*write_txn, &def.name)?;
+        Ok(())
+    }
+
+    /// [`Self::create_index_bound`] の write txn 内本体（begin・世代 bump・commit を含まない）。
+    fn create_index_bound_body(
+        write_txn: &redb::WriteTransaction,
+        def: &IndexDef,
+        exprs: &[Option<Expr>],
+        predicate: Option<&[WherePredicate]>,
+        hnsw_family: Option<HnswOpClassFamily>,
+    ) -> std::result::Result<(), CreateIndexError> {
+        let has_exprs = exprs.iter().any(Option::is_some);
+        namespace::ensure_key_schema_alive_in_txn(write_txn, &def.name)?;
         {
             let views_contains = |name: &str| -> Result<bool> {
                 match write_txn.open_table_logged(VIEWS_TABLE) {
@@ -16758,23 +16853,23 @@ impl Storage {
             };
             if table_contains(&def.name)?
                 || views_contains(&def.name)?
-                || index_name_exists_in_txn(&write_txn, &def.name)?
-                || materialized_view_exists_in_txn(&write_txn, &def.name)?
-                || sequence::sequence_exists_in_txn(&write_txn, &def.name)?
+                || index_name_exists_in_txn(write_txn, &def.name)?
+                || materialized_view_exists_in_txn(write_txn, &def.name)?
+                || sequence::sequence_exists_in_txn(write_txn, &def.name)?
             {
                 return Err(CatalogError::IndexAlreadyExists(def.name.clone()).into());
             }
             // 対象がビュー・既存の索引（relation 名前空間を共有するが行を持たない）
             // なら種別不一致（`42809`）。テーブル不在（`42P01`）へ落とさない。
             if views_contains(&def.table)?
-                || index_name_exists_in_txn(&write_txn, &def.table)?
-                || sequence::sequence_exists_in_txn(&write_txn, &def.table)?
+                || index_name_exists_in_txn(write_txn, &def.table)?
+                || sequence::sequence_exists_in_txn(write_txn, &def.table)?
             {
                 return Err(CatalogError::WrongObjectKind(def.table.clone()).into());
             }
             // matview への索引（TABLE-42 (5)(6)、Issue #1667）は宣言だけを登録し、UNIQUE は
             // 文脈ごとの一意性を強制する。表用の制約・永続一意索引・行走査は通さない。
-            if materialized_view_exists_in_txn(&write_txn, &def.table)? {
+            if materialized_view_exists_in_txn(write_txn, &def.table)? {
                 if predicate.is_some() {
                     // matview への部分索引は対象外（fail-closed。述語を黙って落とさない）。
                     return Err(CreateIndexError::Sql(
@@ -16794,16 +16889,12 @@ impl Storage {
                     ));
                 }
                 let encoded = encode_index_def(def)?;
-                materialized::create_matview_index_in_txn(&write_txn, def, &encoded)?;
-                // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
-                crate::storage::commit_log::note_ddl(&write_txn, &def.table);
-                bump_table_generation_in_txn(&write_txn, &def.table)?;
-                bump_index_catalog_generation_in_txn(&write_txn)?;
-                return crate::recovery::commit_boundary::commit(write_txn)
-                    .map_err(convert_storage_error)
-                    .map_err(CreateIndexError::Catalog);
+                materialized::create_matview_index_in_txn(write_txn, def, &encoded)?;
+                // 世代の bump・commit 記録は呼び出し側（autocommit の `create_index_bound`・共有 txn の
+                // `create_index_in_shared_txn`）が通常経路と同じ順序で行う。
+                return Ok(());
             }
-            let schema = require_table_schema_write_any_identity(&write_txn, &def.table)?;
+            let schema = require_table_schema_write_any_identity(write_txn, &def.table)?;
             validate_index_columns(def, &schema)?;
             // 演算子クラスの系列と索引列の列型の照合（Issue #2016・TABLE-46 (3)。PostgreSQL と同じ
             // `42804`）。同一 write txn で読んだスキーマと照合するため TOCTOU が無い。
@@ -16937,7 +17028,7 @@ impl Storage {
             // 追加後スキーマの検証 → 既存行の重複走査 の順で、スキーマ側の UNIQUE 制約
             // （強制の唯一の入力）を組み立てる。データに依存するのは最後の走査だけ。
             let unique_schema = if def.unique && !has_exprs && predicate.is_none() {
-                Some(build_unique_index_schema_in_txn(&write_txn, def, &schema)?)
+                Some(build_unique_index_schema_in_txn(write_txn, def, &schema)?)
             } else {
                 None
             };
@@ -16963,7 +17054,7 @@ impl Storage {
                     opclass,
                 };
                 crate::gin_index::build_all_tenants_in_txn(
-                    &write_txn,
+                    write_txn,
                     &def.table,
                     &schema,
                     &decl,
@@ -16978,15 +17069,7 @@ impl Storage {
             write_txn
                 .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
         }
-        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, &def.table);
-        bump_table_generation_in_txn(&write_txn, &def.table)?;
-        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。
-        // `IndexCatalogGateCache` が古い HNSW 宣言判定を再利用しないようにする）。
-        bump_index_catalog_generation_in_txn(&write_txn)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(convert_storage_error)
-            .map_err(CreateIndexError::Catalog)
+        Ok(())
     }
 
     /// 索引宣言を削除する（`DROP INDEX`。TASK-206・INDEX-7、Issue #908）。名前が
@@ -16997,6 +17080,33 @@ impl Storage {
     pub fn drop_index(&self, name: &str) -> Result<()> {
         validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let def = Self::drop_index_body(&write_txn, name)?;
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, &def.table);
+        bump_table_generation_in_txn(&write_txn, &def.table)?;
+        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
+        // `Storage::create_index` と同じ）。
+        bump_index_catalog_generation_in_txn(&write_txn)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// [`Self::drop_index`] の共有 write txn 版（begin・commit を含まない。明示・暗黙 Tx の `DROP INDEX`。
+    /// SQL-80・Issue #3313）。判定・削除・世代 bump は autocommit と同じ本体を通る。`Err`（`IndexNotFound`
+    /// を含む）の場合は呼び出し側が `IF EXISTS` の読み替えか Tx の失敗を決める。
+    pub(crate) fn drop_index_in_shared_txn(
+        write_txn: &redb::WriteTransaction,
+        name: &str,
+    ) -> Result<()> {
+        validate_relation_key(name)?;
+        let def = Self::drop_index_body(write_txn, name)?;
+        crate::storage::commit_log::note_ddl(write_txn, &def.table);
+        bump_table_generation_in_txn(write_txn, &def.table)?;
+        bump_index_catalog_generation_in_txn(write_txn)?;
+        Ok(())
+    }
+
+    /// [`Self::drop_index`] の write txn 内本体（begin・世代 bump・commit を含まない）。削除した宣言を返す。
+    fn drop_index_body(write_txn: &redb::WriteTransaction, name: &str) -> Result<IndexDef> {
         let removed = {
             match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
                 Ok(mut index_table) => {
@@ -17024,16 +17134,16 @@ impl Storage {
                     Err(e) => return Err(e.into()),
                 }
             }
-            if materialized_view_exists_in_txn(&write_txn, name)?
-                || sequence::sequence_exists_in_txn(&write_txn, name)?
+            if materialized_view_exists_in_txn(write_txn, name)?
+                || sequence::sequence_exists_in_txn(write_txn, name)?
             {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
             return Err(CatalogError::IndexNotFound(name.to_string()));
         };
-        delete_gin_index_table_in_txn(&write_txn, &def)?;
+        delete_gin_index_table_in_txn(write_txn, &def)?;
         // matview の索引宣言（Issue #1667）は表の UNIQUE 制約を持たないので外す制約が無い。
-        if def.unique && !materialized_view_exists_in_txn(&write_txn, &def.table)? {
+        if def.unique && !materialized_view_exists_in_txn(write_txn, &def.table)? {
             if def.has_expressions() || def.has_predicate() {
                 // 一意の式索引（Issue #1651）・部分 UNIQUE 索引（Issue #1657）は UNIQUE 制約へ展開して
                 // いないので外す制約が無い。
@@ -17042,16 +17152,10 @@ impl Storage {
                 write_txn
                     .delete_table_logged(user_uniq_table_def(&user_uniq_table_name(&def.table)))?;
             } else {
-                drop_unique_index_constraint_in_txn(&write_txn, &def)?;
+                drop_unique_index_constraint_in_txn(write_txn, &def)?;
             }
         }
-        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, &def.table);
-        bump_table_generation_in_txn(&write_txn, &def.table)?;
-        // 索引カタログ自体を変えたので専用世代も進める（Issue #1154。理由は
-        // `Storage::create_index` と同じ）。
-        bump_index_catalog_generation_in_txn(&write_txn)?;
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        Ok(def)
     }
 
     /// `name` が索引宣言として存在するかをスナップショット読み取りで判定する
@@ -17854,7 +17958,7 @@ impl Storage {
 /// メッセージ経由で漏れないよう汎用メッセージへ丸める（security.md「情報漏えい」対応）。
 impl TableLookup for Storage {
     fn table_exists(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
-        match self.get_table_schema(name) {
+        match crate::sql::txn_overlay::table_schema_overlaid(self, name) {
             Ok(_) => Ok(true),
             Err(CatalogError::TableNotFound(_)) => Ok(false),
             Err(other) => Err(table_lookup_error(other)),
@@ -17882,7 +17986,7 @@ impl TableLookup for Storage {
         &self,
         name: &str,
     ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
-        match self.get_table_schema(name) {
+        match crate::sql::txn_overlay::table_schema_overlaid(self, name) {
             Ok(schema) => Ok(Some(lookup_columns_of(&schema))),
             Err(CatalogError::TableNotFound(_)) => Ok(None),
             Err(other) => Err(table_lookup_error(other)),
@@ -17890,7 +17994,7 @@ impl TableLookup for Storage {
     }
 
     fn table_is_allocated(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
-        match self.get_table_schema(name) {
+        match crate::sql::txn_overlay::table_schema_overlaid(self, name) {
             Ok(schema) => Ok(schema.is_allocated()),
             Err(CatalogError::TableNotFound(_)) => Ok(false),
             Err(other) => Err(table_lookup_error(other)),
@@ -17901,7 +18005,7 @@ impl TableLookup for Storage {
         &self,
         name: &str,
     ) -> std::result::Result<bool, SqlSurfaceError> {
-        match self.get_table_schema(name) {
+        match crate::sql::txn_overlay::table_schema_overlaid(self, name) {
             Ok(schema) => Ok(schema_has_non_byte_collation(&schema)),
             Err(CatalogError::TableNotFound(_)) => Ok(false),
             Err(other) => Err(table_lookup_error(other)),
@@ -17912,7 +18016,7 @@ impl TableLookup for Storage {
         &self,
         name: &str,
     ) -> std::result::Result<TableMaterializationHazards, SqlSurfaceError> {
-        match self.get_table_schema(name) {
+        match crate::sql::txn_overlay::table_schema_overlaid(self, name) {
             Ok(schema) => Ok(schema_materialization_hazards(&schema)),
             Err(CatalogError::TableNotFound(_)) => Ok(TableMaterializationHazards::default()),
             Err(other) => Err(table_lookup_error(other)),
@@ -17925,7 +18029,7 @@ impl TableLookup for Storage {
         &self,
         name: &str,
     ) -> std::result::Result<Option<Vec<String>>, SqlSurfaceError> {
-        match self.get_table_schema(name) {
+        match crate::sql::txn_overlay::table_schema_overlaid(self, name) {
             Ok(schema) => Ok(Some(lookup_star_columns_of(&schema))),
             Err(CatalogError::TableNotFound(_)) => Ok(None),
             Err(other) => Err(table_lookup_error(other)),

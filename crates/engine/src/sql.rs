@@ -207,6 +207,7 @@ mod serial_expansion_tests;
 pub(crate) mod set_expr;
 pub(crate) mod string_agg;
 pub(crate) mod temp_catalog;
+// DDL を積んだ Tx の文の区間だけ張る、write txn 上の表スキーマの重ね見（SQL-80・Issue #3313）。
 #[cfg(test)]
 mod temp_catalog_tests;
 #[cfg(test)]
@@ -216,6 +217,7 @@ pub(crate) mod temp_rows;
 mod temp_rows_tests;
 #[cfg(test)]
 mod truncate_restart_identity_tests;
+pub(crate) mod txn_overlay;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。

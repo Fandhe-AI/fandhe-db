@@ -241,10 +241,10 @@ fn permission_and_transaction_gates_are_unchanged() {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&ctx(), &mut s, &mut txn, sql)
-            .expect_err("DDL inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
+        // SQL-80・Issue #3313: 明示トランザクション内でも受理される（既存名は no-op 成功、新規名は作成。
+        // ROLLBACK で痕跡を残さない）。
+        core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
         core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, "ROLLBACK")
             .expect("rollback");
     }

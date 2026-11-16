@@ -310,10 +310,9 @@ fn permission_and_transaction_gates_apply_to_cascade() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "DROP TABLE p CASCADE")
-        .expect_err("DDL in txn");
-    assert_eq!(err.wire_code(), "0A000");
+    // SQL-80・Issue #3313: CASCADE の連鎖削除（依存ビュー・FK）も同じ write txn で行い、ROLLBACK で全部戻る。
+    core.execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "DROP TABLE p CASCADE")
+        .expect("DDL is accepted inside an explicit transaction");
     core.execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
     for r in ["p", "c", "v1", "v2"] {

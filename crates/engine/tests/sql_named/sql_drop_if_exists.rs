@@ -225,22 +225,31 @@ fn permission_denied_regardless_of_existence() {
 }
 
 #[test]
+// tracked: #3315, #3316
 fn explicit_transaction_rejects_if_exists_ddl() {
+    // SQL-80・Issue #3313: `DROP TABLE`・`DROP INDEX` は共有 write txn で受理される（対象が無ければ no-op 成功）。
+    // `DROP VIEW`・`DROP TYPE` は未対応のまま `0A000`（受け皿は VIEW・型が #3315）。
     let (core, _g) = open_fixture("drop-ie-txn");
     let mut s = allowed_session();
     for kind in KINDS {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        let err = core
-            .execute_sql_in_txn(
-                &ctx(),
-                &mut s,
-                &mut txn,
-                &format!("DROP {kind} IF EXISTS ghost"),
-            )
-            .expect_err("DDL in txn");
-        assert_eq!(err.wire_code(), "0A000", "{kind}");
+        let result = core.execute_sql_in_txn(
+            &ctx(),
+            &mut s,
+            &mut txn,
+            &format!("DROP {kind} IF EXISTS ghost"),
+        );
+        match kind {
+            "TABLE" | "INDEX" => {
+                result.unwrap_or_else(|e| panic!("{kind}: {e:?}"));
+            }
+            _ => {
+                let err = result.expect_err("DDL in txn");
+                assert_eq!(err.wire_code(), "0A000", "{kind}");
+            }
+        }
         core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, "ROLLBACK")
             .expect("rollback");
     }
