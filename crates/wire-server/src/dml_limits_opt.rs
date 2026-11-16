@@ -261,50 +261,34 @@ pub fn resolve(
     })
 }
 
-/// 複数行 `VALUES`（`BoundInsertForm::RowBatch`）は本モジュールの
-/// `max_insert_rows_per_statement`（構文解析段の上限。`Some` のときのみ判定）に
-/// 加え、独立した別上限 `engine::batch_limits::BatchLimits` の
-/// `max_files_per_batch`（既定 64。Issue #860）と `max_batch_chunks`
-/// （既定 4096）も通る多重ゲートであり、実効行数上限は両者の小さい方になる
-/// （`docs/design/predicate-dml-exec.md` §6 参照）。`--max-insert-rows` が
-/// この実効上限を超えると引き上げが黙って無効化されるため（codex-review P1
-/// 指摘・PR #1122）、`--max-insert-rows` を**明示指定**した場合に限り起動ログへ
+/// 行の形の一括投入（複数行 `VALUES`・UPSERT・NoSQL `rows[]`・COPY FROM）の行数は、
+/// 本モジュールの `max_insert_rows_per_statement`（`Some` のときのみ判定）に加え、
+/// 独立した別上限 `engine::batch_limits::BatchLimits::max_batch_chunks`（④。既定
+/// 4096。1 行 = 1 チャンク）でも判定される。`max_files_per_batch`（①）は Issue
+/// #3308・#3309 以降ファイル形の一括投入にだけ効き、行の形には効かないため、実効行数
+/// 上限は「`--max-insert-rows`（指定時）と ④ の小さい方」である。
+/// `--max-insert-rows` が ④ を超えると引き上げが黙って無効化されるため（codex-review
+/// P1 指摘・PR #1122）、`--max-insert-rows` を**明示指定**した場合に限り起動ログへ
 /// 英語の `WARNING` 行を出す（`--durability none` と同じ「明示選択した非既定値の
-/// 安全上の含意を見落とさせない」設計判断。エラーにはしない）。
-/// `max_insert_rows_per_statement` が `None`（未指定・既定）の場合は警告しない。
-/// `batch_limits` には main.rs が `EngineCore::with_batch_limits` へ渡すのと
-/// **同じ解決済みの値**（`--batch-max-files` > 環境変数 > 既定。Issue #1166）を
-/// 渡すこと。メッセージには効いている側の上限と引き上げ手段を含める。
+/// 安全上の含意を見落とさせない」設計判断。エラーにはしない）。`None`（未指定・既定）
+/// の場合は警告しない。文長・トークン数・1 メッセージの上限は列数に依存し見積もれない
+/// ため警告の対象外（README 参照）。`batch_limits` には main.rs が
+/// `EngineCore::with_batch_limits` へ渡すのと**同じ解決済みの値**を渡すこと
+/// （Issue #3310 で ① を判定から外した）。
 pub fn insert_rows_cap_warning(
     limits: &DmlLimits,
     batch_limits: &engine::batch_limits::BatchLimits,
 ) -> Option<String> {
     let limit = limits.max_insert_rows_per_statement?;
-    let files_cap = batch_limits.max_files_per_batch;
     let chunks_cap = batch_limits.max_batch_chunks;
-    let effective = files_cap.min(chunks_cap);
-    if limit.get() <= effective {
+    if limit.get() <= chunks_cap {
         return None;
     }
-    // 指定行数を下回る上限はすべて列挙する（片方だけ案内すると、案内どおり
-    // 引き上げても他方の上限で VALUES が頭打ちのままになるため。codex-review P2）。
-    let mut remedies = Vec::new();
-    if files_cap < limit.get() {
-        remedies.push(format!(
-            "batch_limits.max_files_per_batch ({files_cap}; set {BATCH_MAX_FILES_FLAG} \
-             or the FANDHE_DB_BATCH_MAX_FILES environment variable to raise it)"
-        ));
-    }
-    if chunks_cap < limit.get() {
-        remedies.push(format!(
-            "batch_limits.max_batch_chunks ({chunks_cap}; set the FANDHE_DB_BATCH_MAX_CHUNKS \
-             environment variable to raise it)"
-        ));
-    }
-    let remedy = remedies.join(" and ");
     Some(format!(
-        "{MAX_INSERT_ROWS_FLAG} is set to {limit} but multi-row VALUES statements are still \
-         capped at {effective} rows by {remedy}"
+        "{MAX_INSERT_ROWS_FLAG} is set to {limit} but row-shaped bulk inserts (multi-row VALUES, \
+         UPSERT, NoSQL rows[] and COPY FROM) are still capped at {chunks_cap} rows by \
+         batch_limits.max_batch_chunks (set the FANDHE_DB_BATCH_MAX_CHUNKS environment variable \
+         to raise it)"
     ))
 }
 
@@ -646,77 +630,83 @@ mod tests {
         assert!(resolve(Some("5 "), None).is_err());
     }
 
-    #[test]
-    fn insert_rows_cap_warning_fires_when_configured_limit_exceeds_batch_limits() {
-        let limits = DmlLimits {
+    fn limits_with(rows: Option<usize>) -> DmlLimits {
+        DmlLimits {
             max_affected_rows: None,
-            max_insert_rows_per_statement: Some(NonZeroUsize::new(100).unwrap()),
-        };
+            max_insert_rows_per_statement: rows.map(|n| NonZeroUsize::new(n).unwrap()),
+        }
+    }
+
+    #[test]
+    fn insert_rows_cap_warning_fires_only_on_chunks_cap() {
         let batch_limits = engine::batch_limits::BatchLimits {
             max_files_per_batch: 64,
+            max_batch_chunks: 4096,
             ..engine::batch_limits::BatchLimits::default()
         };
-        let warning = insert_rows_cap_warning(&limits, &batch_limits)
-            .expect("expected a warning when max_insert_rows_per_statement > max_files_per_batch");
+        let warning = insert_rows_cap_warning(&limits_with(Some(4097)), &batch_limits)
+            .expect("warning expected when limit > max_batch_chunks");
         assert!(
             warning.contains(MAX_INSERT_ROWS_FLAG),
             "unexpected: {warning}"
         );
-        assert!(warning.contains("100"), "unexpected: {warning}");
-        assert!(warning.contains("64"), "unexpected: {warning}");
-        assert!(
-            warning.contains("FANDHE_DB_BATCH_MAX_FILES"),
-            "unexpected: {warning}"
-        );
-        assert!(
-            warning.contains(BATCH_MAX_FILES_FLAG),
-            "unexpected: {warning}"
-        );
-    }
-
-    #[test]
-    fn insert_rows_cap_warning_names_chunks_when_chunks_cap_is_effective() {
-        let limits = DmlLimits {
-            max_affected_rows: None,
-            max_insert_rows_per_statement: Some(NonZeroUsize::new(5000).unwrap()),
-        };
-        let batch_limits = engine::batch_limits::BatchLimits {
-            max_files_per_batch: 10000,
-            max_batch_chunks: 4096,
-            ..engine::batch_limits::BatchLimits::default()
-        };
-        let warning = insert_rows_cap_warning(&limits, &batch_limits).expect("warning expected");
-        assert!(warning.contains("4096"), "unexpected: {warning}");
-        assert!(
-            warning.contains("FANDHE_DB_BATCH_MAX_CHUNKS"),
-            "unexpected: {warning}"
-        );
-    }
-
-    #[test]
-    fn insert_rows_cap_warning_names_both_caps_when_both_are_below_limit() {
-        let limits = DmlLimits {
-            max_affected_rows: None,
-            max_insert_rows_per_statement: Some(NonZeroUsize::new(100_000).unwrap()),
-        };
-        let batch_limits = engine::batch_limits::BatchLimits {
-            max_files_per_batch: 54000,
-            max_batch_chunks: 4096,
-            ..engine::batch_limits::BatchLimits::default()
-        };
-        let warning = insert_rows_cap_warning(&limits, &batch_limits).expect("warning expected");
+        assert!(warning.contains("4097"), "unexpected: {warning}");
         assert!(
             warning.contains("capped at 4096 rows"),
             "unexpected: {warning}"
         );
         assert!(
-            warning.contains("FANDHE_DB_BATCH_MAX_FILES"),
-            "unexpected: {warning}"
-        );
-        assert!(
             warning.contains("FANDHE_DB_BATCH_MAX_CHUNKS"),
             "unexpected: {warning}"
         );
+        // ① は行の形に効かないので引き上げ手段として案内しない。
+        assert!(
+            !warning.contains("FANDHE_DB_BATCH_MAX_FILES"),
+            "unexpected: {warning}"
+        );
+        assert!(
+            !warning.contains(BATCH_MAX_FILES_FLAG),
+            "unexpected: {warning}"
+        );
+    }
+
+    #[test]
+    fn insert_rows_cap_warning_ignores_files_cap() {
+        // ① が小さくても警告は出ない（回帰: 旧実装は 100 > 64 で警告していた）。
+        let batch_limits = engine::batch_limits::BatchLimits {
+            max_files_per_batch: 64,
+            max_batch_chunks: 4096,
+            ..engine::batch_limits::BatchLimits::default()
+        };
+        assert!(insert_rows_cap_warning(&limits_with(Some(100)), &batch_limits).is_none());
+    }
+
+    #[test]
+    fn insert_rows_cap_warning_names_chunks_only_even_when_files_cap_is_small() {
+        let batch_limits = engine::batch_limits::BatchLimits {
+            max_files_per_batch: 1,
+            max_batch_chunks: 4096,
+            ..engine::batch_limits::BatchLimits::default()
+        };
+        let warning = insert_rows_cap_warning(&limits_with(Some(100_000)), &batch_limits)
+            .expect("warning expected");
+        assert!(
+            warning.contains("capped at 4096 rows"),
+            "unexpected: {warning}"
+        );
+        assert!(
+            !warning.contains("max_files_per_batch"),
+            "unexpected: {warning}"
+        );
+    }
+
+    #[test]
+    fn insert_rows_cap_warning_is_silent_at_chunks_boundary() {
+        let batch_limits = engine::batch_limits::BatchLimits {
+            max_batch_chunks: 4096,
+            ..engine::batch_limits::BatchLimits::default()
+        };
+        assert!(insert_rows_cap_warning(&limits_with(Some(4096)), &batch_limits).is_none());
     }
 
     #[test]
@@ -770,19 +760,6 @@ mod tests {
             max_insert_rows_per_statement: None,
         };
         let batch_limits = engine::batch_limits::BatchLimits::default();
-        assert!(insert_rows_cap_warning(&limits, &batch_limits).is_none());
-    }
-
-    #[test]
-    fn insert_rows_cap_warning_is_silent_within_batch_limits() {
-        let limits = DmlLimits {
-            max_affected_rows: None,
-            max_insert_rows_per_statement: Some(NonZeroUsize::new(64).unwrap()),
-        };
-        let batch_limits = engine::batch_limits::BatchLimits {
-            max_files_per_batch: 64,
-            ..engine::batch_limits::BatchLimits::default()
-        };
         assert!(insert_rows_cap_warning(&limits, &batch_limits).is_none());
     }
 }

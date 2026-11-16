@@ -1056,3 +1056,92 @@ fn rejections_do_not_poison_session_token() {
     let (inserted_after, _) = parse_insert_success_body(&after);
     assert_eq!(inserted_after, 1);
 }
+
+// --- Issue #3310: ① を外したあとの資源上限（既定構成・明示値） -----------------
+
+/// 既定構成（①64・② 16 MiB・③ 64 MiB・④ 4096）を環境変数に依らず明示した上限。
+fn explicit_default_limits() -> BatchLimits {
+    limits(
+        64,
+        engine::chunking::MAX_INPUT_BYTES,
+        engine::incremental::MAX_INDEX_TOTAL_BYTES,
+        engine::incremental::MAX_CHUNKS_PER_FILE,
+    )
+}
+
+/// 固定する上限: ④（既定 4096）。4096 行ちょうどは成功し、4097 行は 413・`54000`・
+/// 行 0 件・台帳 NotRecorded。本文 1 MiB 以内でも件数だけで拒否される。
+#[test]
+fn rows_default_chunk_limit_boundary_4096_ok_4097_rejected() {
+    let limit = engine::incremental::MAX_CHUNKS_PER_FILE as u64;
+    let (core, _guard) = new_core(Some(explicit_default_limits()));
+    let (both, _sql) = spawn_both(core.clone());
+
+    let resp = query(&both, &insert_body_n_rows(limit + 1, "nosql-op-4097"));
+    assert_eq!(resp.status, 413, "body={resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "54000");
+    assert_eq!(
+        ledger_state(&core, "nosql-op-4097"),
+        LedgerLookup::NotRecorded
+    );
+    assert!(read_back_ids(&core).is_empty());
+
+    let ok = query(&both, &insert_body_n_rows(limit, "nosql-op-4097"));
+    let (inserted, _) = parse_insert_success_body(&ok);
+    assert_eq!(inserted, limit);
+}
+
+/// 固定する上限: ④ が束縛より先に走る。4097 行で最終行だけ型不一致でも、束縛エラーではなく
+/// `54000`（入力に比例する束縛が行われない）。副作用ゼロ。
+#[test]
+fn rows_chunk_limit_precedes_binding_of_malformed_last_row() {
+    let limit = engine::incremental::MAX_CHUNKS_PER_FILE as u64;
+    let (core, _guard) = new_core(Some(explicit_default_limits()));
+    let (both, _sql) = spawn_both(core.clone());
+
+    let mut rows: Vec<String> = (1..=limit)
+        .map(|id| format!(r#"{{"id":{id},"embedding":[0.1,0.2,0.3]}}"#))
+        .collect();
+    rows.push(format!(
+        r#"{{"id":{},"embedding":"not-a-vector"}}"#,
+        limit + 1
+    ));
+    let body = format!(
+        r#"{{"op":"insert","table":"docs","rows":[{}],"operation_id":"nosql-op-bad-last"}}"#,
+        rows.join(",")
+    );
+    let resp = query(&both, body.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "54000", "body={resp:?}");
+    assert_eq!(
+        ledger_state(&core, "nosql-op-bad-last"),
+        LedgerLookup::NotRecorded
+    );
+    assert!(read_back_ids(&core).is_empty());
+}
+
+/// 固定する上限: 1 MiB 本文上限・JSON 要素数・④ のうち最初に効くもの。本文 1 MiB 以内に
+/// 収まる 20,000 行の `rows[]` は、いずれの上限でも拒否され（成功しない）、副作用ゼロ。
+#[test]
+fn rows_tens_of_thousands_are_rejected_without_side_effects() {
+    let (core, _guard) = new_core(Some(explicit_default_limits()));
+    let (both, _sql) = spawn_both(core.clone());
+
+    let rows: Vec<String> = (1..=20_000u64)
+        .map(|id| format!(r#"{{"id":{id},"embedding":[1,2,3]}}"#))
+        .collect();
+    let body = format!(
+        r#"{{"op":"insert","table":"docs","rows":[{}],"operation_id":"nosql-op-20k"}}"#,
+        rows.join(",")
+    );
+    assert!(
+        body.len() < 1 << 20,
+        "fixture must fit in the 1 MiB body limit"
+    );
+    let resp = query(&both, body.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "54000", "body={resp:?}");
+    assert_eq!(
+        ledger_state(&core, "nosql-op-20k"),
+        LedgerLookup::NotRecorded
+    );
+    assert!(read_back_ids(&core).is_empty());
+}

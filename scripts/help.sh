@@ -211,6 +211,9 @@ cat <<'EOF'
   bench-aggregate-loop
       集計の行ループ（COUNT/SUM/AVG/MIN/MAX・COUNT(*)・COUNT(DISTINCT)）の p95 計測（Issue #1490）
       $ cargo bench --bench aggregate_loop_bench -p fandhe-db-engine
+  bench-copy-volume
+      大量 COPY FROM の ③・④ 計測ベンチ（Issue #3310）
+      $ cargo bench --bench copy_volume_bench -p fandhe-db-engine
   bench-hybrid-profile
       hybrid_rrf クエリの段別内訳プロファイル（Issue #356 ほか）
       $ cargo bench --bench hybrid_profile_bench -p fandhe-db-engine --features bench-internals

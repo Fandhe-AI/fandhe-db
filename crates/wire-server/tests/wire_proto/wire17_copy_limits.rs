@@ -365,3 +365,56 @@ fn wire17_copy_respects_max_insert_rows_when_specified() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
     assert_eq!(count_docs(&mut stream), 3);
 }
+
+// --- Issue #3310: ① を外したあとの既定構成での資源上限 ---------------------------
+
+/// 既定構成（①64・② 16 MiB・③ 64 MiB・④ 4096）を環境変数に依らず明示した上限。
+fn explicit_default_limits() -> BatchLimits {
+    BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: engine::chunking::MAX_INPUT_BYTES,
+        max_batch_total_bytes: engine::incremental::MAX_INDEX_TOTAL_BYTES,
+        max_batch_chunks: engine::incremental::MAX_CHUNKS_PER_FILE,
+    }
+}
+
+/// 固定する上限: ④（既定 4096）。1 MiB 以内の CopyData 1 通に収まる 30,000 行は `54000` の
+/// ErrorResponse → ReadyForQuery `I` → 行 0 件で、接続は維持される。
+#[test]
+fn wire17_copy_tens_of_thousands_of_rows_are_54000_under_default_limits() {
+    let (core, _guard) = new_core(explicit_default_limits());
+    let mut stream = connect(core);
+    start_copy(&mut stream, "wire-3310-30k");
+    let rows = rows_text(1, 30_000);
+    assert!(
+        rows.len() < 1 << 20,
+        "fixture must fit in one CopyData frame"
+    );
+    send_copy_data(&mut stream, &rows);
+    send_copy_done(&mut stream);
+    expect_limit_error(&mut stream, "batch chunk count");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_no_rows_and_connection_alive(&mut stream);
+}
+
+/// 固定する上限: ②（既定 16 MiB）。1 行を 1000 KiB の CopyData 複数通に分け、最後の通で改行を
+/// 送る。行が 16 MiB を超えた時点で `54000`・行 0 件・接続維持（読み捨ての予算内）。
+#[test]
+fn wire17_copy_single_huge_row_is_54000_under_default_limits() {
+    let (core, _guard) = new_core(explicit_default_limits());
+    let mut stream = connect(core);
+    start_copy(&mut stream, "wire-3310-huge-row");
+    let piece = vec![b'q'; 1000 * 1024];
+    let mut first = b"1\t[1.0,0.0]\t".to_vec();
+    first.extend_from_slice(&piece);
+    send_copy_data(&mut stream, &first);
+    let pieces = engine::chunking::MAX_INPUT_BYTES / piece.len() + 1;
+    for _ in 0..pieces {
+        send_copy_data(&mut stream, &piece);
+    }
+    send_copy_data(&mut stream, b"\n");
+    send_copy_done(&mut stream);
+    expect_limit_error(&mut stream, "");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_no_rows_and_connection_alive(&mut stream);
+}

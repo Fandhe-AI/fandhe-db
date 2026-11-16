@@ -7,9 +7,10 @@
 //! （ただし `base` に `BatchLimits::default()` を使うので `max_batch_chunks` 等は
 //! 既定に従う）。
 //!
-//! - SQL 複数行 `VALUES`: 上限ちょうどは成功・上限 + 1 は `54000`・副作用ゼロ
-//! - COPY FROM STDIN: 同じ値を共有し、上限 + 1 行目で `54000`・副作用ゼロ
-//! - 引き上げ方向: 既定 64 より大きい値なら 65 行以上でも成功する
+//! - SQL 複数行 `VALUES`・COPY FROM STDIN: `max_files_per_batch`（①）は行の形に効かない
+//!   （Issue #3308・#3309）ため、CLI で解決した値を小さくしても行数で `54000` にならない
+//!   （効く上限は ④ `max_batch_chunks`・`--max-insert-rows`）。本ファイルはその不変を固定する
+//! - 引き上げ方向: 既定 64 より大きい値でも 65 行以上は成功する
 //!
 //! NoSQL `op=insert rows[]` の上限超過（`54000`）は `nosql6_insert.rs`、ファイル形
 //! バッチ（engine ローカル API・wire 経路なし）は `crates/engine/tests/

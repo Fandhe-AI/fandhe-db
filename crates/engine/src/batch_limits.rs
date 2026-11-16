@@ -11,8 +11,10 @@
 //! [`BatchLimits`] の各フィールドとして、バッチ全体に対する処理量ガードを追加する。
 //!
 //! ①はファイル形の一括投入にだけ掛かり、複数行 `VALUES`・UPSERT・NoSQL `rows[]`・
-//! `COPY FROM` には掛からない（Issue #3308・#3309。行の形の行数上限は `--max-insert-rows`
-//! 指定時のみ）。
+//! `COPY FROM` には掛からない（Issue #3308・#3309）。行の形の行数の実効上限は
+//! `--max-insert-rows`（指定時）と ④（`max_batch_chunks`。1 行 = 1 チャンク）の小さい方で、
+//! SQL 文長・トークン数・1 メッセージの上限も別に効く（Issue #3310）。COPY の ③ は
+//! デコード前の CopyData 累計で数える。
 //!
 //! 各上限の判定タイミングは [`validate_batch_shape`]・[`validate_chunk_total`]・
 //! [`validate_raw_sql_len`] の各関数ドキュメント、および呼び出し元
