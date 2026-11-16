@@ -15,8 +15,9 @@
 //!   すべて `0A000` で拒否する。取りこぼした述語は書き込み範囲を広げる（fail-open になる）ため、
 //!   分類は全域にして未分類を必ず拒否する。
 //!
-//! SET: リテラルと対象表の列だけを使う式はそのまま運び、列参照（右辺が source 列のものを含む）は
-//! 「対象列 ++ source の取り出し列」の合成スキーマ上の式として束縛する。エラー文言は固定文言と
+//! SET: リテラルと対象表の列だけを使う式はそのまま運び、列参照（右辺が source 列のものを含む）と
+//! source 列を含む式（行値代入の要素を含む。Issue #3296）は「対象列 ++ source の取り出し列」の
+//! 合成スキーマ上の式として束縛する。エラー文言は固定文言と
 //! 入力された名前だけで、他テナントの存在・件数・行 id を含めない（変換はデータに依存しない）。
 
 use crate::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -378,46 +379,25 @@ fn plan_set(
         let mut copy_pos: Option<usize> = None;
         let name = match resolved.relation() {
             0 => slot_name(resolved.slot(), target_schema)?,
-            1 => match resolved.slot() {
-                // 結合ビューは source の疑似列 `id` を運ばない。
-                ColumnSlot::Id => return Err(SqlSurfaceError::feature_not_supported(
-                    "UPDATE ... FROM: the pseudo column id of the FROM table cannot be used in SET",
-                )),
-                ColumnSlot::Column(i) => {
-                    let col = source_schema
-                        .columns
-                        .get(i)
-                        .ok_or_else(|| internal("source column out of range"))?;
-                    if !source_type_supported(&col.ty) {
-                        return Err(SqlSurfaceError::feature_not_supported(
-                            "UPDATE ... FROM: the FROM-table column type is not supported in SET",
-                        ));
+            1 => {
+                let i = source_column_index(resolved)?;
+                let col = source_schema
+                    .columns
+                    .get(i)
+                    .ok_or_else(|| internal("source column out of range"))?;
+                let pos = register_source_column(i, source_schema, &mut columns, &mut combined)?;
+                if !set_expr_accepts_target(&target_col.ty) {
+                    // 式経路が受理しない型の単純コピー。型が一致する組だけを運ぶ。
+                    if col.ty != target_col.ty {
+                        return Err(SqlSurfaceError::datatype_mismatch(format!(
+                            "column {:?} cannot be assigned a value of a different type",
+                            target_col.name
+                        )));
                     }
-                    let pos = match columns.iter().position(|&c| c == i) {
-                        Some(p) => p,
-                        None => {
-                            columns.push(i);
-                            combined.columns.push(ColumnDef::new(
-                                synthetic_name(columns.len() - 1),
-                                col.ty.clone(),
-                                true,
-                            ));
-                            columns.len() - 1
-                        }
-                    };
-                    if !set_expr_accepts_target(&target_col.ty) {
-                        // 式経路が受理しない型の単純コピー。型が一致する組だけを運ぶ。
-                        if col.ty != target_col.ty {
-                            return Err(SqlSurfaceError::datatype_mismatch(format!(
-                                "column {:?} cannot be assigned a value of a different type",
-                                target_col.name
-                            )));
-                        }
-                        copy_pos = Some(pos);
-                    }
-                    synthetic_name(pos)
+                    copy_pos = Some(pos);
                 }
-            },
+                synthetic_name(pos)
+            }
             _ => return Err(internal("SET relation index out of range")),
         };
         if let Some(source_pos) = copy_pos {
@@ -441,7 +421,76 @@ fn plan_set(
             set: bound_set,
         });
     }
+    // FROM 側の列を含む式（Issue #3296）。参照ごとに合成スキーマ上の名前へ写してから、単一表 SET と
+    // 同じ `bind_set_expr` で束縛する（型の照合・暗黙キャスト・式非対応の代入先型の `0A000` も同じ）。
+    for (target_idx, expr, refs) in bound.set_joined_exprs() {
+        let target_col = target_schema
+            .columns
+            .get(*target_idx)
+            .ok_or_else(|| internal("SET column out of range"))?;
+        let mut names = Vec::with_capacity(refs.len());
+        for resolved in refs {
+            names.push(match resolved.relation() {
+                0 => slot_name(resolved.slot(), target_schema)?,
+                1 => {
+                    let i = source_column_index(resolved)?;
+                    let pos =
+                        register_source_column(i, source_schema, &mut columns, &mut combined)?;
+                    synthetic_name(pos)
+                }
+                _ => return Err(internal("SET relation index out of range")),
+            });
+        }
+        let mapped = crate::sql::dml_from::restore_set_refs(expr, &names);
+        let bound_set =
+            crate::sql::set_expr::bind_set_expr(&target_col.name, &mapped, target_col, &combined)?;
+        set.items.push(JoinedSetItem {
+            column_index: *target_idx,
+            set: bound_set,
+        });
+    }
     Ok((set, columns))
+}
+
+/// 解決済みの source 側の列から `source_schema.columns` の添字を取り出す。結合ビューは source の疑似列
+/// `id` を運ばないため、それを指す参照は `0A000`（SET の右辺・式の双方で共通）。
+fn source_column_index(resolved: &ResolvedColumn) -> Result<usize, SqlSurfaceError> {
+    match resolved.slot() {
+        ColumnSlot::Id => Err(SqlSurfaceError::feature_not_supported(
+            "UPDATE ... FROM: the pseudo column id of the FROM table cannot be used in SET",
+        )),
+        ColumnSlot::Column(i) => Ok(i),
+    }
+}
+
+/// source 列 `i` を取り出し列（`columns`。初出順・重複なし）へ登録し、合成スキーマ `combined` へ
+/// 合成名つきの列を追記して、取り出し列内の位置を返す。写像できない型は `0A000`。
+/// 単純コピー・式の双方が共有する（source の列を合成スキーマへ写す箇所をここに閉じ込める）。
+fn register_source_column(
+    i: usize,
+    source_schema: &TableSchema,
+    columns: &mut Vec<usize>,
+    combined: &mut TableSchema,
+) -> Result<usize, SqlSurfaceError> {
+    let col = source_schema
+        .columns
+        .get(i)
+        .ok_or_else(|| internal("source column out of range"))?;
+    if !source_type_supported(&col.ty) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "UPDATE ... FROM: the FROM-table column type is not supported in SET",
+        ));
+    }
+    if let Some(p) = columns.iter().position(|&c| c == i) {
+        return Ok(p);
+    }
+    columns.push(i);
+    combined.columns.push(ColumnDef::new(
+        synthetic_name(columns.len() - 1),
+        col.ty.clone(),
+        true,
+    ));
+    Ok(columns.len() - 1)
 }
 
 /// 組み立てた計画の形を検証して返す（添字の範囲外は変換の段階で `Internal` にする）。
