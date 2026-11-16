@@ -8169,11 +8169,13 @@ fn concat_class(ty: ExprType) -> ConcatClass {
 /// PG が受理するが本実装が未実装の組は `0A000`、PG に演算子が無い組は `42883`。
 /// 判定は束縛時の静的な型だけで行い、行の値・他テナントの有無で結果を変えない。
 /// 兄弟 Issue #3278（非 text の暗黙連結）は、ここの `Text × 非 Text` 行を連結へ置き換える。
-fn reject_concat_pair(l: ConcatClass, r: ConcatClass) -> SqlSurfaceError {
+/// `array_compatible` は、配列を含む組で配列の要素型と反対側の型が PG の演算子解決で
+/// 成立し得るか（[`concat_array_pair_compatible`]）。成立しない組（`integer[] || boolean[]` 等）は `42883`。
+fn reject_concat_pair(l: ConcatClass, r: ConcatClass, array_compatible: bool) -> SqlSurfaceError {
     use ConcatClass::*;
     let unimplemented_pair = match (l, r) {
-        // PG の配列の `||`（TABLE-35）。未実装。
-        (Array, _) | (_, Array) => true,
+        // PG の配列の `||`（TABLE-35）。解決できる組だけ未実装（`0A000`）。
+        (Array, _) | (_, Array) => array_compatible,
         // PG の `anynonarray || text`（非 text の暗黙連結。#3278）。
         (Text, other) | (other, Text) => other != Text,
         // bytea／vector／bit 同士の連結演算子は PG／pgvector にあるが未実装。
@@ -8189,6 +8191,42 @@ fn reject_concat_pair(l: ConcatClass, r: ConcatClass) -> SqlSurfaceError {
             "operator does not exist: the operand types do not match the || operator".to_string(),
         )
     }
+}
+
+/// 配列を含む `||` の組で、配列の要素型と反対側（配列なら要素型、スカラーならその型）が
+/// PG の演算子解決で成立し得るかを静的な型だけで判定する（Issue #3277 の PR 指摘）。
+/// 型なしリテラル・裸の NULL（`None`）と、型を表せない要素（ENUM 等）は成立し得る側（`0A000`）へ倒す。
+/// json・bytea・vector・bit など配列と連結できない型は成立しない。
+fn concat_array_pair_compatible(
+    lhs: &Expr,
+    l: &Option<(BoundExpr, ExprType)>,
+    rhs: &Expr,
+    r: &Option<(BoundExpr, ExprType)>,
+    env: &BindEnv<'_>,
+) -> bool {
+    use crate::sql::cast::{source_cast_kind, CastKind, SourceKind};
+    let mut kinds: Vec<CastKind> = Vec::new();
+    for (expr, side) in [(lhs, l), (rhs, r)] {
+        let Some((bound, ty)) = side else { continue };
+        match ty {
+            ExprType::Json
+            | ExprType::JsonText
+            | ExprType::Bytea
+            | ExprType::Vector
+            | ExprType::Bit => return false,
+            _ => {}
+        }
+        match source_cast_kind(expr, bound, *ty, env.schema()) {
+            SourceKind::Known(k) => kinds.push(k),
+            SourceKind::Array(Some(t)) => kinds.push(t.kind()),
+            SourceKind::UnknownNumeric => kinds.push(CastKind::Int4),
+            SourceKind::Array(None) | SourceKind::Outside | SourceKind::Bit => return true,
+        }
+    }
+    !matches!(
+        crate::sql::array_expr::common_element_type(&kinds),
+        Err(SqlSurfaceError::DatatypeMismatch { .. })
+    )
 }
 
 /// [`try_bind_text_concat`] の結果。text 連結に束縛できたか、従来経路へ流すかを表す。
@@ -8346,7 +8384,12 @@ fn bind_json_modify(
                 o.as_ref()
                     .map_or(ConcatClass::Text, |(_, ty)| concat_class(*ty))
             };
-            return Err(reject_concat_pair(class_of(&l), class_of(&r)));
+            let array_compatible = concat_array_pair_compatible(lhs, &l, rhs, &r, env);
+            return Err(reject_concat_pair(
+                class_of(&l),
+                class_of(&r),
+                array_compatible,
+            ));
         }
     };
     Ok((

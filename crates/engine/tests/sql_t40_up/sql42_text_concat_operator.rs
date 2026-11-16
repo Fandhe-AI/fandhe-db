@@ -309,12 +309,30 @@ fn array_and_vector_concat_stay_0a000() {
         "SELECT ARRAY[1] || '{2}'",
         "SELECT ARRAY[1] || ARRAY[2]",
         "SELECT 'x' || ARRAY[1]",
-        "SELECT lang || ARRAY[1] FROM t",
         "SELECT ARRAY[1] || n FROM t",
+        "SELECT ARRAY['a'] || lang FROM t",
         "SELECT embedding || embedding FROM t",
         "SELECT embedding || lang FROM t",
     ] {
         assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+}
+
+/// 要素型が互換しない配列の `||` は PG に演算子が無く `42883`（解決できる組だけ `0A000`）。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列を含む組の行）を参照。
+#[test]
+fn incompatible_array_concat_is_42883() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT ARRAY[1] || ARRAY[CAST(1 AS boolean)]",
+        "SELECT ARRAY[CAST(1 AS boolean)] || ARRAY[1]",
+        "SELECT ARRAY[1] || CAST(1 AS boolean)",
+        "SELECT lang || ARRAY[1] FROM t",
+        "SELECT ARRAY[1] || lang FROM t",
+        "SELECT doc || ARRAY[1] FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
     }
 }
 
