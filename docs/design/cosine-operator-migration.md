@@ -135,7 +135,7 @@ SQL の `<=>` は、内積の降順から pgvector と同じコサイン距離 `
 ### 移行時の注意
 
 - `USING MODE 'precision'` と `<#>` の併用は `0A000`。precision を使う問い合わせは `<=>` のまま使う
-- HNSW（opt-in）の物理グラフが対応する距離種別はコサインだけ（`catalog::hnsw_supported_metric`）。`<#>` に書き換えると opclass が合わず、厳密全走査へ倒れる（`ann_plan: plain_scan_opclass_mismatch`）。結果は正しいが性能が変わる。`<=>` の HNSW は内積のグラフで候補を出し、厳密なコサインで再採点する（入力が L2 正規化済みであることが契約。取りこぼしは補わない）
+- HNSW（opt-in）の物理グラフが対応する距離種別はコサインと内積（`catalog::hnsw_supported_metric`。内積は Issue #3303）。`<#>` に書き換えても `vector_ip_ops` を宣言すれば HNSW、宣言しなければ opclass が合わず厳密全走査へ倒れる（`ann_plan: plain_scan_opclass_mismatch`）。結果は正しいが性能が変わる。`<=>` の HNSW は内積のグラフで候補を出し、厳密なコサインで再採点する（入力が L2 正規化済みであることが契約。取りこぼしは補わない）
 - ゼロノルムの行は、`<=>` の全走査では距離 NaN で昇順の末尾（`DESC` では先頭）に並び、`k` の枠を消費する。コサイン専用の HNSW 索引では結果に出ない。現在の SQL の HNSW opt-in（内積グラフ＋再採点）では候補に入れば NaN 行として現れ得る（#2240・#2241）
 - `<->`／`<+>` は受理されるが、SQL 実行は未接続で `0A000` のまま。書く前に現状を確かめる
 - NoSQL(HTTP) の `search` は新しい `<=>` と同じ意味（`distance_kind = Cosine`）。`<#>` に当たる指定は #2243 で入る予定で、それまで NoSQL から旧い順位を得る手段は無い
