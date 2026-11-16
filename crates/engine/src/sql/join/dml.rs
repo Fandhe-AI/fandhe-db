@@ -802,6 +802,10 @@ fn source_scalar<'a>(
         (ColumnType::TimestampTz, Cell::TimestampTz(t)) => Some(ScalarRef::TimestampTz(*t)),
         (ColumnType::Interval, Cell::Interval(i)) => Some(ScalarRef::Interval(*i)),
         (ColumnType::Bpchar(_), Cell::Text(s)) => Some(ScalarRef::Text(s)),
+        // 畳み込み source の疑似列 `id`（Issue #3294）は射影結果で符号なしの `Cell::Integer` のまま運ばれ、
+        // 結合キー専用に走査列へ載る。SET 右辺は疑似列 `id` を拒否するため式から読まれることはなく、
+        // ビューの位置合わせのためだけに写す。`i64` に収まらない値は NULL 扱い（読まれないため安全）。
+        (ColumnType::BigInt, Cell::Integer(v)) => i64::try_from(*v).ok().map(ScalarRef::BigInt),
         // JSONB は JSON と値表現を共有するため、既存の式評価と同じ Json 借用形へ写す。
         (ColumnType::Jsonb, Cell::Json(s)) => Some(ScalarRef::Json(s)),
         (ColumnType::Array(_), Cell::Array(a)) => {

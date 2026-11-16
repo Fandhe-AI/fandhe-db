@@ -277,6 +277,28 @@ fn three_way_comma_and_cross_joins() {
     );
 }
 
+/// 疑似列 `id` を結合キーに使う畳み込み source（符号なしの `Cell::Integer` を運ぶ）でも、SET が他の
+/// source 列を読む正常な文が `XX000` にならず、一致した行だけが更新される。
+#[test]
+fn pseudo_id_join_key_with_folded_source_set_from_other_column() {
+    let alice = ctx("alice");
+    let (core, _g) = new_core("sql53-mj-idkey");
+    seed(&core, &alice);
+    let sql = "UPDATE t SET x = u.w FROM s JOIN u ON s.k = u.k WHERE t.id = s.id";
+    assert_eq!(run(&core, &alice, sql).expect("update"), tag("UPD", 2));
+    assert_eq!(
+        xs(&core, &alice),
+        vec![(1, Some(7)), (2, Some(8)), (3, Some(30))]
+    );
+
+    // 疑似列 `id` が結合の ON と WHERE の両方に現れる形（DELETE）。
+    let (core, _g) = new_core("sql53-mj-idkey-del");
+    seed(&core, &alice);
+    let sql = "DELETE FROM t USING s JOIN u ON s.id = u.id WHERE t.id = u.id";
+    assert_eq!(run(&core, &alice, sql).expect("delete"), tag("DEL", 2));
+    assert_eq!(xs(&core, &alice), vec![(3, Some(30))]);
+}
+
 /// 4 表（対象 + source 3 表）の連鎖。`ON` で連結した source を対象表と突き合わせる。
 #[test]
 fn four_way_chain_with_self_join_inside_source() {
