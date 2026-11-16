@@ -213,8 +213,15 @@ embedding 変更は「未変更」と判定されうる。最終スコアは常�
 - `HnswCacheAccess::graph_metric` が問い合わせの引く metric を運ぶ。ゲートが `Targeted` で、
   `hnsw_graph_metric_for`（問い合わせ opclass → `HnswMetric` の唯一の写像）が `Some` を返したときだけ
   `Some`。`None` の prepare 系は `FullScan` を返す（結線漏れでも誤ったグラフを引かない）。
-  写像は暫定値で（`<=>` はコサイン距離で実行され、内積グラフの候補を後段でコサイン再採点する）、`Cosine -> InnerProduct`、`Ip`・`L2`・`L1` は未対応（`None`）。
+  写像は `Cosine -> InnerProduct`（`<=>` はコサイン距離で実行され、内積グラフの候補を後段でコサイン再採点する。暫定値）と
+  `Ip -> InnerProduct`（Issue #3303。`<#>` は内積グラフの探索結果がそのまま答えで、再採点は要らない）。`L2`・`L1` は未対応（`None`）。
   `catalog::hnsw_supported_metric` との一致は単体テストで固定している。
+- キー共有（Issue #3303）: `Cosine` と `Ip` はどちらも `InnerProduct` へ写るため、同じ `(table, ctx)` の索引済みベースを共有する
+  （キャッシュのコードは変えない）。索引ヒットの再採点・delta・全走査縮退はいずれもスコア定義が `dot` で揃い、
+  DISTANCE 段は `-score` を距離値にする（厳密経路の `<#>` と同じ定義）。#2241 で `Cosine` が `HnswMetric::Cosine` へ移れば別エントリになる。
+  帰結（性能のみで正しさには影響しない）: ゲートは構築パラメータを問い合わせ metric の宣言から返し、構築済みグラフと
+  `m`／`ef_construction` が食い違うと `Miss` として再構築する。同じ表で cosine 宣言と ip 宣言の `WITH` が違うと、
+  問い合わせが交互に来るたびに作り直す（古いグラフは使わない）。キーへの構築パラメータの導入は対象外。
 - 索引ヒットの再採点は索引の metric の score 関数で行う。現状は内積のみ（`kernel::dot` とビット同一）で、
   それ以外は全走査へ縮退する（delta・全走査が provider の内積 `search` のため）。
 - 永続化: HNSW グラフ自体にディスク形式は無くメモリ上だけ。永続化されるのはカタログの宣言 opclass

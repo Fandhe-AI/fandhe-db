@@ -23,6 +23,7 @@ mod sql33_cosine_negip_execution;
 mod sql33_cosine_parallel_parity;
 mod sql33_crossdb_self_shapes;
 mod sql33_distance_kind_acceptance;
+mod sql33_hnsw_ip_ops;
 mod sql33_hnsw_opclass_ddl;
 mod sql33_hnsw_with_params;
 mod sql33_knn_desc;

@@ -7,7 +7,7 @@
 //! - 演算子クラス省略の既存構文は `vector_cosine_ops` の別名（同じ `IndexKind`・同じ EXPLAIN）
 //! - `WITH (m, ef_construction)` との併用が演算子クラスと構築パラメータの両方を保つ
 //! - 未知の演算子クラスは `42704`、既存の未対応の形は従来どおり拒否される
-//! - `Declared` では非 cosine の宣言が厳密全走査へ縮退し、`All` の暗黙の HNSW は cosine
+//! - `Declared` では L2／L1 の宣言が厳密全走査へ縮退し（ip は `<#>` で HNSW。Issue #3303）、`All` の暗黙の HNSW は cosine
 //! - 縮退経路でもテナント境界（他テナント混入 0 件）を保つ
 
 use engine::catalog::{ColumnDef, ColumnType, IndexKind, TableSchema, VectorOpClass};
