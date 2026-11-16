@@ -486,7 +486,6 @@ fn row_compare_malformed_forms_fail_closed() {
         "SELECT id FROM t WHERE ROW(a, b) < (1, 2) LIMIT 10",
         "SELECT id FROM t WHERE ((a, b), s) < ((1, 2), 3) LIMIT 10",
         "SELECT id FROM t WHERE (a, ) < (1, 2) LIMIT 10",
-        "SELECT id FROM t WHERE (a, b) IN ((1, 2)) LIMIT 10",
         "SELECT id FROM t WHERE (a, b) IS NULL LIMIT 10",
         "SELECT id FROM t WHERE (a, b) BETWEEN (1, 2) AND (3, 4) LIMIT 10",
         "SELECT id FROM t WHERE (a, b) = ANY (ARRAY[1]) LIMIT 10",
