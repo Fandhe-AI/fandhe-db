@@ -1408,7 +1408,7 @@ fn copy_from_default_chunk_limit_accepts_4096_and_rejects_30k_in_one_feed() {
         &[&rows_text(1, limit)],
     )
     .expect("rows at the chunk limit");
-    assert_eq!(outcome.rows_affected as u64, limit);
+    assert_eq!(outcome.rows_affected, limit);
 
     let (core, _guard2) = open_engine_with_limits("copy-from-30k", explicit_default_limits());
     let mut s = begin_from(&core, "copy-30k");
@@ -1481,7 +1481,10 @@ fn copy_from_single_row_over_default_row_bytes_limit_is_rejected() {
     let (core, _guard) = open_engine_with_limits("copy-from-big-row", explicit_default_limits());
     let mut s = begin_from(&core, "copy-bigrow");
     let mut row = b"1\t[1.0,0.0]\t".to_vec();
-    row.extend(std::iter::repeat(b'z').take(engine::chunking::MAX_INPUT_BYTES + 1));
+    row.extend(std::iter::repeat_n(
+        b'z',
+        engine::chunking::MAX_INPUT_BYTES + 1,
+    ));
     row.push(b'\n');
     let mut result = Ok(());
     for piece in row.chunks(1 << 20) {

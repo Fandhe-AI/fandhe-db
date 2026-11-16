@@ -1088,7 +1088,7 @@ fn rows_default_chunk_limit_boundary_4096_ok_4097_rejected() {
 
     let ok = query(&both, &insert_body_n_rows(limit, "nosql-op-4097"));
     let (inserted, _) = parse_insert_success_body(&ok);
-    assert_eq!(inserted as u64, limit);
+    assert_eq!(inserted, limit);
 }
 
 /// 固定する上限: ④ が束縛より先に走る。4097 行で最終行だけ型不一致でも、束縛エラーではなく
