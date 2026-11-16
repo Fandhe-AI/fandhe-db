@@ -2194,8 +2194,6 @@ main に無く現行の `parse_order_by` は `<=>` のみ受理するため、�
 
 ### Issue #3291: 別名つき単一表の UPDATE／DELETE（FROM／USING なし）
 
-||||||| 5f72cd91b
-
 SQL-53・RLS-10・RECOVER-10/11 のポインタ。`UPDATE t [AS] x SET ... WHERE x.a = 1 RETURNING x.*`・`DELETE FROM t [AS] x WHERE ...` を受理する。入口のトークン正規化 `sql::dml_target_alias::normalize`（`EngineCore::normalize_row_count_clauses` から呼ぶ。冪等）が、別名トークンの除去と `<別名>.<列>` から `<列>` への 1 対 1 置換で別名なしの同じ文へ書き換える。`parse_update`／`parse_delete` は不変で、以降の経路（名前解決・一時表・`$n` 推論・ビュー DML・台帳・RLS・分割実行）は別名なし文と同一。`allowlist::probe_dml_target_alias` が別名規則を FROM／USING 形（`is_dml_target_reserved_word`）と共有する。別名を付けた表の本名・他表名での修飾は `42P01`、SET 左辺の修飾・予約語の別名・余剰トークンは `42601`。`EXPLAIN`・データ変更 CTE の本文・PL/pgSQL・非セッション入口では従来どおり `42601`。`sql53_dml_from_using_bind.rs` の拒否固定 2 件を新しい挙動へ更新し、受け入れ結合テスト `sql53_single_table_dml_alias.rs`・`wire_sql53_single_table_alias.rs` を追加した。判断は [update-from-delete-using.md](update-from-delete-using.md) の「別名つき単一表 DML」節。依存・unsafe・CI の変更なし。併せて main の `index_expr.rs` の単純 CASE（`operand` 追加）とのビルド不整合を最小修正した。
 
 Issue #3278（親 #3275・SQL-42 のポインタ）: `||` の非 text オペランドの暗黙連結。片側が text（型なしリテラル・裸の NULL を含む）で他方が `CAST(.. AS text)` で変換できる型（数値・boolean・日時・interval・uuid・json）のとき、`sql::cast::cast_bound`／`bind_cast` で text へ変えて `BuiltinFn::TextConcat` に束縛する（`udf_call::try_bind_text_concat`。葉でないオペランドは 1 回だけ束縛）。jsonb と型付き text の組・配列・bytea・vector・bit との組・種別不明の数値は拒否のまま（SQLSTATE は #3277 の `reject_concat_pair` が決める。理由は `json-expr-type-mapping.md` の Issue #3278 節）。`UPDATE ... SET c = '<文字列>' || n` のため `expect_literal_or_set_expr` が文字列リテラル直後の `||` を式として読む。テスト: `sql42_text_concat_operator.rs`・`json_modify_operators.rs`・`wire_sql42_text_concat.rs`。main 合流で壊れていた `index_expr` の `Expr::Case` パターンも修正。依存・unsafe・CI の変更なし。

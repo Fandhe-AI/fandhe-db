@@ -9217,8 +9217,18 @@ impl EngineCore {
             // 引く `FROM` は括弧深さ 0 の最初のものに限る。
             _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
                 Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                // スキーマ修飾の参照表（`SELECT ... FROM public.t`・`DELETE FROM public.t`）も表名部分を引く。
+                Some(Token::QualifiedIdent { name, .. }) => Some(name.clone()),
                 _ => None,
             }),
+        };
+        // Issue #3257: 行値比較の成分の `$n` が当たる列と、相手列を引く関係名の一覧。
+        // 主表で引けない列は `FROM`／`JOIN`／`USING` の関係から引く（下の `WhereColumn` と後段で共有）。
+        let row_slots = crate::sql::params::row_compare_column_slots(tokens);
+        let rels = if row_slots.is_empty() {
+            Vec::new()
+        } else {
+            row_compare_relation_names(tokens)
         };
         // 表スキーマの引き先。再 Parse は `BEGIN` 時点のスナップショット、通常の Parse は最新カタログ。
         let schema_of = |table: &str| -> Option<crate::catalog::TableSchema> {
@@ -9339,7 +9349,18 @@ impl EngineCore {
                         // `USING PLAN`／`USING OPERATION_ID` は本 DB 固有の句で判定対象外。
                         ParamPosition::Text => (Some(PreparedParamType::Text), None),
                         ParamPosition::WhereColumn(col) => (
-                            where_table.as_deref().and_then(|t| column_type(t, col)),
+                            where_table
+                                .as_deref()
+                                .and_then(|t| column_type(t, col))
+                                .or_else(|| {
+                                    // 行値比較の相手列は主表以外（結合・`FROM`・`USING` の相手表）にもありうる。
+                                    // 行値比較の列に限り、追加関係から型を引く（整数・真偽値でも Text に落とさない）。
+                                    if row_slots.values().any(|c| c == col) {
+                                        rels.iter().find_map(|t| column_type(t, col))
+                                    } else {
+                                        None
+                                    }
+                                }),
                             Some(ParamContextKind::Operator),
                         ),
                         ParamPosition::SetColumn(col) => (
@@ -9453,13 +9474,7 @@ impl EngineCore {
         // Issue #3257・パターン 12: 行値比較の成分の `$n` に使う、相手列の型の Describe 用ダミー候補
         // （トークン添字・番号・ダミー）。種別が `String` のものだけが後段で採用される。
         let mut row_dummies: Vec<(usize, u16, Token)> = Vec::new();
-        let row_slots = crate::sql::params::row_compare_column_slots(tokens);
-        // 参照表一覧と候補はスロットごとに作り直さず 1 回だけ構築して使い回す。
-        let rels = if row_slots.is_empty() {
-            Vec::new()
-        } else {
-            row_compare_relation_names(tokens)
-        };
+        // 参照表一覧と候補はスロットごとに作り直さず 1 回だけ構築して使い回す（上で構築済み）。
         let candidates: Vec<&str> = where_table
             .as_deref()
             .into_iter()

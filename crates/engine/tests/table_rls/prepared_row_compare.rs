@@ -582,3 +582,34 @@ fn row_compare_params_on_schema_qualified_update_parse_and_describe() {
     core.describe_prepared_in_session(&session, &prepared)
         .unwrap_or_else(|e| panic!("{sql}: describe {}", e.wire_code()));
 }
+
+/// スキーマ修飾の参照表（`FROM public.t`・`DELETE FROM public.t`）でも、行値比較の `$n` が相手列の型
+/// （整数・真偽値）で Parse／Describe／Bind／Execute を通り、リテラル形と同じ行集合になる（Issue #3257）。
+#[test]
+fn schema_qualified_relation_row_compare_params_use_column_types() {
+    let (_p, _g, core) = setup("prep-row-cmp-qualified");
+    for (prepared_sql, literal_sql, values) in [
+        (
+            "SELECT id FROM public.t WHERE (a, bg) < ($1, $2) LIMIT 10",
+            "SELECT id FROM public.t WHERE (a, bg) < (3, 30) LIMIT 10",
+            vec![some("3"), some("30")],
+        ),
+        (
+            "SELECT id FROM public.t WHERE (bo, a) = ($1, $2) LIMIT 10",
+            "SELECT id FROM public.t WHERE (bo, a) = (true, 2) LIMIT 10",
+            vec![some("true"), some("2")],
+        ),
+    ] {
+        let got = prepared_ids(&core, "alice", prepared_sql, &values);
+        let want = literal_ids(&core, "alice", literal_sql);
+        assert!(got.is_ok(), "{prepared_sql}: {got:?}");
+        assert_eq!(got, want, "{prepared_sql}");
+    }
+    // DELETE も Parse／Describe が通る（型は整数）。
+    let sql = "DELETE FROM public.t WHERE (a, bg) < ($1, $2)";
+    let prepared = core
+        .parse_sql_prepared(sql)
+        .unwrap_or_else(|e| panic!("{sql}: {}", e.wire_code()));
+    core.describe_prepared_in_session(&SessionState::default(), &prepared)
+        .unwrap_or_else(|e| panic!("{sql}: describe {}", e.wire_code()));
+}
