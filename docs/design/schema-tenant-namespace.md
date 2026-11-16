@@ -377,7 +377,7 @@ TABLE-27 のポインタ。テナントの SCHEMA 配下に表・ビュー・索
   エラー文言も、Parse に使ったテナントの SCHEMA 名へ戻す
 - **破壊的変更**: `SqlSurfaceError::SchemaDependencyForbidden` の追加（外部の網羅的 `match` は追随が必要）、
   `Storage::list_tables`／`list_indexes` が SCHEMA 配下を返さなくなる、`ValidatedDropSchema` が `CASCADE` を保持
-- **対象外**: MATERIALIZED VIEW・ENUM 型の SCHEMA 配置（`0A000`／`42601` のまま。ADR D5 は ENUM 型の
+- **対象外**: MATERIALIZED VIEW（Issue #3287 で対応済み。末尾の追記を参照）・ENUM 型の SCHEMA 配置（`0A000`／`42601` のまま。ADR D5 は ENUM 型の
   修飾を #1717 としていたが、型名の解決位置〔列型・キャスト〕が加わり範囲が倍増するため見送った）、
   NoSQL（HTTP）表層・Rust API の修飾名、`search_path`（#1715）、`SET SCHEMA`・SCHEMA の改名（#1716）、
   `ALTER VIEW`（未実装）、UDF の永続化
@@ -540,10 +540,10 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 
 - **方式**: 未修飾名は、解析の前に修飾名と同じ内部キー（`#<schema_id>.<name>`）へ置き換える。置換後のトークン列は利用者が `q1.t` と書いた文と同じなので、ACL・一時表の振り分け・ビュー本文の保存・実行は修飾形と同じ経路に乗り、受理・拒否も修飾形と一致する（public のビューから SCHEMA の表を参照する形の `42501` など）。文種ごとの個別の実行経路は作らない
 - **作成先**: path の先頭の要素。自テナントの SCHEMA なら内部キー、`public` なら裸のまま。`pg_catalog`・`information_schema`・`pg_temp` は `0A000`、どの要素にも作れなければ `3F000`。USAGE の無い自テナントの SCHEMA は飛ばさず `42501`（K4）。作成先の SCHEMA には CREATE 権限を検査する（K5）。権限ゲート（`42501`）→ 作成先（`3F000`／`0A000`／`42501`）→ 既存名（`42P07`）の順は変えない
-- **安全弁**: 解析時の書き換えを通らない経路（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・構文語と衝突する名前・解析と実行の間の SCHEMA 作成の競合）は、path 先頭が自テナントの SCHEMA のとき固定文言の `0A000` にし、`public` へ黙って作らない
+- **安全弁**（`CREATE MATERIALIZED VIEW` は Issue #3287 で解析時の書き換えに乗った）: 解析時の書き換えを通らない経路（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・構文語と衝突する名前・解析と実行の間の SCHEMA 作成の競合）は、path 先頭が自テナントの SCHEMA のとき固定文言の `0A000` にし、`public` へ黙って作らない
 - **自己参照 FK**: `REFERENCES <作成名>` は作成先に合わせる（作成先が SCHEMA なら同じ内部キー、`public` なら裸のまま）。書き換え自体は単体テストで固定している（行 ID モードの親への `REFERENCES parent (id)` は #3385 で受理に変わった）
 - **明示トランザクション**: DDL は従来どおり `0A000`。DML の存在照会は確定済みのスナップショットを見る（`COPY` は `BEGIN` 時点）
-- **残る `0A000`**: `ALTER TABLE .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形（#3198）、`ENUM` 型・`MATERIALIZED VIEW` の SCHEMA 配置と組み込み SCHEMA への作成（本 ADR の対象外。専用の Issue が必要）
+- **残る `0A000`**（MATERIALIZED VIEW の SCHEMA 配置は Issue #3287 で対応済み）: `ALTER TABLE .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形（#3198）、`ENUM` 型・`MATERIALIZED VIEW` の SCHEMA 配置と組み込み SCHEMA への作成（本 ADR の対象外。専用の Issue が必要）
 - **意図的な差**: 重複作成の `42P07` の文言は、PostgreSQL の裸の名前ではなく `q1.t` 形（修飾形と同じ）で出す。内部 ID は出ない
 
 ## 追記（Issue #3197）
@@ -564,7 +564,7 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 親 #3194 の締めとして、`search_path` の固定テストを新挙動へ更新し、越境試験を足した（ポインタ: TABLE-27）。
 
 - **未修飾の `ALTER TABLE t SET SCHEMA <s>` を受理に変えた**: 未修飾名は解析前に修飾名と同じ内部キーへ書き換わるため、以降は修飾形（`q1.t SET SCHEMA ..`）と同じ経路に乗る。`PathGate` にあった「対象が SCHEMA に解決された SET SCHEMA は `0A000`」の特例は、修飾形の `42501` に先回りするためだけに残っていたので撤去した。判定順・エラーは #3198 のまま（DDL 権限 → 存在 → 移動先の解決（不在・他テナントは同一の `3F000`）→ `public` 境界の `42501` → CREATE 権限 → 実移動）。移動先の識別子が同名の表に引きずられて書き換わらないことは、結合テスト（`table27_search_path.rs`）で固定した
-- **意図的な拒否（`intentional`）**: `public` とテナント SCHEMA の間の移動の `42501`、他テナントの SCHEMA への移動（不在と同じ `3F000`）、システム SCHEMA・一時表への移動の `0A000`、`ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` の `0A000`、明示トランザクション内の DDL の `0A000`、SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）の `0A000`（`CREATE TYPE` の SCHEMA 配置は Issue #3288 で対応済み。「追記（Issue #3288）」参照） は、いずれも fail-closed の安全弁として残す
+- **意図的な拒否（`intentional`）**: `public` とテナント SCHEMA の間の移動の `42501`、他テナントの SCHEMA への移動（不在と同じ `3F000`）、システム SCHEMA・一時表への移動の `0A000`、`ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` の `0A000`、明示トランザクション内の DDL の `0A000`、SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）の `0A000`（`CREATE TYPE` は Issue #3288、`CREATE MATERIALIZED VIEW` は Issue #3287 で対応済み。「追記」参照）は、いずれも fail-closed の安全弁として残す
 - **越境試験（`table27_tenant_boundary.rs` の T9）**: 他テナントだけが持つ SCHEMA 名を `search_path` に置いた閲覧側の未修飾の書き込み・DDL・移動・削除の応答が、その SCHEMA がどこにも無い DB と完全一致する（autocommit・明示トランザクション・可視性 2 モード）。2 テナントが同名の SCHEMA・同名の表・同じ id を持つとき、一方の未修飾の INSERT／UPDATE／UPSERT／DELETE／`CREATE INDEX`／`ADD COLUMN`／TRUNCATE／`SET SCHEMA`／DROP が他方の行・構造を変えない（試行総数の固定と負の対照つき）
 - **wire の結合試験（`wire_search_path.rs`）**: psql 形（末尾 `;` 付き・1 メッセージ 1 文）で、同名 SCHEMA を持つ 2 接続の未修飾の書き込み・`SET SCHEMA`・TRUNCATE・DROP の分離と、他テナントの SCHEMA 名を path に置いた接続の拒否（`#` を含む文言なし）、拒否後も接続が使えることを固定した
 - **全面改訂の扱い**: §12 の「現状の挙動として固定したもの」と #3196 追記の自己参照 FK の記述は、陳腐化した箇所に現状へのポインタを足した（履歴として本文は残す）。D5・D11 の契約自体は変わらない
@@ -623,3 +623,16 @@ SCHEMA 配下の ENUM 型を、列型（`CREATE TABLE`・`ALTER TABLE .. ADD COL
 - **NoSQL（HTTP）**: 修飾名を扱わず public の表だけ。public の表は D7 で SCHEMA 配下の型を持てないため、`columns[].type`（種別のみ）・エラー文言へ内部キーは届かない
 - **残る未対応（受け皿 Issue 未起票。起票にはユーザー承認が要る）**: ENUM ⇄ 文字列のキャスト変換本体（SQL-47）、`DROP TYPE ... CASCADE` の SQL 表層、要素つき `CREATE SCHEMA` の `CREATE TYPE` 要素と要素内の `CREATE TABLE` での SCHEMA 配下の型の解決（D8 の実行腕）、`ALTER TYPE ... SET SCHEMA`／`ADD VALUE` の SQL 表層、`CREATE FUNCTION` の引数型・`RETURNS`・PL/pgSQL の `DECLARE` での型名の解決、型の総数上限のテナント単位の割り当て。いずれも従来どおり fail-closed
 - **テスト**: `crates/engine/tests/table_rls/table27_enum_schema.rs`（列型・ALTER・配列・public との比較・path・D7 両向き・依存・改名・2 テナント・キャスト・一時表・拡張クエリ）、`logical_dump_schema.rs`（DDL 書き出しの往復）、`sql::type_name_position`・`sql::relation_name`・`sql::search_path`・`catalog` の単体、`crates/wire-server/tests/wire_sql/wire_schema_ddl.rs`（簡易・拡張クエリ。末尾 `;` 付き）。拒否を固定していた `unsupported_forms_stay_rejected`・`table27_schema_objects.rs`・`wire_schema_ddl.rs`・`relation_name.rs` の単体は新挙動へ更新した。`table_generation_bump_coverage.rs` の行番号を追随。依存の追加・更新なし
+
+## 追記（Issue #3287）
+
+MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: TABLE-27・TABLE-42・TABLE-44・SQL-39・SQL-40・RLS-7・RLS-8・RLS-10）。§8 と #3196・#3199 追記の「対象外」「安全弁」「残る `0A000`」のうち MATERIALIZED VIEW に関する部分は、本追記が現状である（履歴として本文は残す）。
+
+- **方式**: 新しい実行経路は作らない。名前解決器の「MATERIALIZED VIEW は `0A000`」の分岐を外し、`s.mv` を表・ビューと同じ内部キー（`#<schema_id>.<name>`）の `Ident` へ置き換える。未修飾名（`search_path` 経由の作成・参照・更新・削除）は #3195・#3196 の既存の書き換えに乗る。`REFRESH MATERIALIZED VIEW CONCURRENTLY <名>` の名前位置も解決の対象にした。`CREATE`・`REFRESH`・`DROP`・`SELECT` の実行腕は内部キーを受けるだけで、拡張クエリ（Parse・Bind・Describe）も #3197 の再解決で同じ契約になる
+- **本文の参照先（D7）**: 既存の `view_body_relations` による検査をそのまま使う。SCHEMA 配下の matview は SCHEMA 配下の relation だけを読め、public の relation を読む形（と public の matview が SCHEMA 配下を読む形）は `42501`。matview から matview への連鎖は同じ SCHEMA 内で受理する
+- **物理名**: 定義表のキー・実体メタ・行表（`matview_rows/{内部キー}`）は `user_rows/{内部キー}` と同じ流儀で内部キーをそのまま使う。`#`・`.` は識別子に現れないため public の同名と衝突しない。格納形式の版は上げない（内部キーを持つ DB を旧バイナリで開くと復号で `CorruptSchema`。fail-closed）。基表名の復号上限は、内部キーを収める専用の定数（`#` + `u64` の 10 進最大 20 桁 + `.` + 識別子上限）に変えた
+- **実体化の文脈（テナント境界）**: 内部キーの matview は、実体化の対象文脈を作成・更新者と同じテナントの文脈（可視性の違いは残す）に絞る。他テナントの文脈は名前解決でこの matview に到達できないため、その文脈で本文を評価して他テナントの文脈キーの実体を書く理由が無い。public の matview は従来どおり。作成の第 1 段で SCHEMA の存在を同じ txn 内で再確認する（解析と書き込みの間の `DROP SCHEMA` で孤児を作らない）
+- **`DROP SCHEMA`**: RESTRICT は matview があれば `2BP01`（従来どおり）。CASCADE は配下の matview を、実体・索引宣言・ACL・所有者・世代まで同じ txn・1 回の commit で消す。別 SCHEMA の matview が消える SCHEMA の表を読む外部依存も、根集合に matview を加えた依存列挙で先に消える。所有者ゲートの「配下に共有カタログの relation がある」判定に matview を含める。ENUM 型は `enum_types` に列挙され、`unsupported_kinds` を設定する種別は現在ない
+- **論理ダンプ**: SCHEMA 配下の matview を含むダンプを固定文言で全体失敗させていた 2 か所の拒否を外した。拒否の根拠（SQL で作り直せない）が消えたため。`CREATE MATERIALIZED VIEW s.mv` の描画と本文の内部キーの逆変換は表・ビューと同じ経路
+- **意図的な拒否（`intentional`）**: `ALTER MATERIALIZED VIEW ... SET SCHEMA`（修飾・未修飾とも。fail-closed の拒否のまま。専用の Issue が必要）のみ引き続き対象外
+- **PostgreSQL との差**: 本追記で新たに生じた差は無い（D7 による SCHEMA をまたぐ本文参照の `42501` は既存の意図的な差）
