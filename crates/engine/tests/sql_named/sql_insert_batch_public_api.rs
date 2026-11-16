@@ -347,11 +347,12 @@ fn execute_bound_insert_in_session_rejects_operation_id_mismatch_between_guard_a
 }
 
 #[test]
-fn execute_bound_insert_in_session_row_count_limit_precedes_bind() {
+fn execute_bound_insert_in_session_chunk_limit_precedes_bind() {
+    // Issue #3308: ①（max_files_per_batch）ではなく④（1 行 = 1 チャンク）が束縛より前に効く。
     let (core, path) = open_engine_with_limits(
         "core-insert-session-row-limit",
         engine::batch_limits::BatchLimits {
-            max_files_per_batch: 1,
+            max_batch_chunks: 1,
             ..engine::batch_limits::BatchLimits::default()
         },
     );
@@ -366,7 +367,7 @@ fn execute_bound_insert_in_session_row_count_limit_precedes_bind() {
             TABLE,
             2,
             Some(&op_id),
-            |_schema| panic!("bind must not be called when the row count limit is exceeded"),
+            |_schema| panic!("bind must not be called when the chunk limit is exceeded"),
         )
         .expect_err("must reject");
     assert_eq!(err.wire_code(), "54000");
