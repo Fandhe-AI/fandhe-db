@@ -252,3 +252,103 @@ fn wire_schema_ddl_is_tenant_scoped_and_hides_existence() {
     expect_error_response_with_sqlstate(&mut alice, "42P06");
     read_ready_for_query(&mut alice);
 }
+
+/// 要素つき `CREATE SCHEMA`（Issue #3286）。psql のように末尾 `;` を付けた単独の簡易クエリで SCHEMA と
+/// 全要素が作られ（タグは `CREATE SCHEMA`）、作った表・ビューへ書き込み・読み取りできる。
+/// 別 SCHEMA での作成は `42P15`、途中で失敗した文は SCHEMA を残さない（`3F000`）。
+// intentional: docs/design/schema-tenant-namespace.md
+#[test]
+fn wire_schema_with_elements_simple_query_creates_schema_table_and_view() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut stream,
+        "CREATE SCHEMA s CREATE TABLE t (id BIGINT PRIMARY KEY, a INTEGER) \
+         CREATE VIEW v AS SELECT id, a FROM t;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE SCHEMA");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "INSERT INTO s.t (id, a) VALUES (1, 10)");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id, a FROM s.v ORDER BY id LIMIT 10");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("10".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    for (sql, sqlstate) in [
+        ("CREATE SCHEMA s2 CREATE TABLE public.x (a INT)", "42P15"),
+        (
+            "CREATE SCHEMA s3 CREATE TABLE t (id BIGINT) CREATE VIEW v AS SELECT id FROM s3.nosuch",
+            "42P01",
+        ),
+        ("DROP SCHEMA s3", "3F000"),
+        ("CREATE SCHEMA s4 CREATE INDEX i ON t (a)", "0A000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// 要素つき `CREATE SCHEMA` は拡張クエリ（Parse／Bind／Execute）でも同じ結果になり、権限の無い
+/// ユーザーは常に `42501`。
+#[test]
+fn wire_schema_with_elements_extended_query_and_permission_gate() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("carol", "tenant-a", "tr0ub4dor"),
+        ],
+        &["alice"],
+    );
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    let sql =
+        "CREATE SCHEMA ex CREATE TABLE t (id BIGINT PRIMARY KEY) CREATE VIEW v AS SELECT id FROM t";
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("s1", sql, 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(
+        kind,
+        b'1',
+        "ParseComplete: {}",
+        String::from_utf8_lossy(&body)
+    );
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("p1", "s1"));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "BindComplete");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "CommandComplete");
+    assert_eq!(body, b"CREATE SCHEMA\0");
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+
+    send_simple_query(&mut stream, "SELECT id FROM ex.v LIMIT 1");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
+    read_ready_for_query(&mut stream);
+
+    // DDL を許可されていないユーザーは、SCHEMA の有無・要素の中身に関わらず `42501`。
+    let mut carol = authenticate_to_ready_for_query(addr, "carol", "tr0ub4dor");
+    for sql in [
+        "CREATE SCHEMA ex2 CREATE TABLE t (id BIGINT)",
+        "CREATE SCHEMA ex CREATE TABLE t (id BIGINT)",
+    ] {
+        send_simple_query(&mut carol, sql);
+        expect_error_response_with_sqlstate(&mut carol, "42501");
+        read_ready_for_query(&mut carol);
+    }
+}

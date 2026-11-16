@@ -518,17 +518,23 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     assert_eq!(micros(&core, "SELECT id, v FROM t LIMIT 5").len(), 2);
 }
 
-/// `TIMESTAMPTZ(p)`・`TIMESTAMPTZ[]` は構文段で `0A000`。
+/// `TIMESTAMPTZ(p)`（配列を含む）は構文段で `0A000`。`TIMESTAMPTZ[]` 系は Issue #3233 で専用の
+/// 要素型として受理する（拒否固定から反転）。
 #[test]
 fn unsupported_timestamptz_type_spellings_are_rejected() {
     let (_p, _g, core) = open("tz-spellings");
     for sql in [
         "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ(3))",
-        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ[])",
-        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ[3])",
-        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMP WITH TIME ZONE[])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v TIMESTAMPTZ(3)[])",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
+    }
+    for sql in [
+        "CREATE TABLE ta (id BIGINT PRIMARY KEY, v TIMESTAMPTZ[])",
+        "CREATE TABLE tb (id BIGINT PRIMARY KEY, v TIMESTAMPTZ[3])",
+        "CREATE TABLE tc (id BIGINT PRIMARY KEY, v TIMESTAMP WITH TIME ZONE[])",
+    ] {
+        ok(&core, sql);
     }
     ok(
         &core,

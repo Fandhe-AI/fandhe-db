@@ -1754,6 +1754,17 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Time),
+        // interval は列束縛と同じ検査（書式不正 22007・フィールドあふれ 22015・範囲外 22008・
+        // infinity 0A000）を経てから格納する（Issue #3234）。
+        E::Interval => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::Interval, raw)? {
+                Value::Interval(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "interval array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Interval),
         // `BIT(n)[]`（Issue #3235）。各要素はスカラー BIT 列と同じ束縛（文字種違反 `22P02`・長さ
         // 不一致 `22026`。空白詰めはしない）。非 NULL 要素数 × 要素バイト幅が配列ペイロード上限を
         // 超えるなら確保前に `54000` にする（巨大 `n` × 多要素の DoS 防止）。
@@ -1774,6 +1785,17 @@ fn convert_array_elements(
             })
             .map(ArrayValue::Bit)
         }
+        // timestamptz は列束縛と同じ検査（offset 無しはセッション TimeZone で解釈・範囲外 22008・
+        // 書式不正 22007・未知の TZ 名 22023）を経てから格納する（Issue #3233）。
+        E::TimestampTz => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::TimestampTz, raw)? {
+                Value::TimestampTz(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "timestamptz array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::TimestampTz),
         E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
             Value::Uuid(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
@@ -9220,7 +9242,7 @@ fn resolve_string_agg_input(
 ///
 /// - 裸の列: 列の値をネイティブに複製する（`bigint` を f64 へ落とさない）。対応する型は
 ///   text・varchar・boolean・integer・bigint・real・double・date・timestamp・uuid・
-///   numeric(p,s)・bytea・json・jsonb。smallint・char(n)・time・timestamptz・interval・vector・
+///   numeric(p,s)・bytea・json・jsonb。smallint・char(n)・time・interval 以外の timestamptz・vector・
 ///   配列・ENUM と疑似列 `id` は `0A000`（fail-closed。`char(n)` を text 配列へ黙って変換しない）
 /// - それ以外の式: `ARRAY[<式>]` の 1 要素と同じ型規則（[`crate::sql::udf_call::bind_array_agg_element`]）
 fn bind_array_agg_value(
@@ -9268,9 +9290,9 @@ fn bind_array_agg_value(
             ColumnType::Jsonb => ArrayElemType::Jsonb,
             ColumnType::SmallInt => ArrayElemType::SmallInt,
             ColumnType::Time => ArrayElemType::Time,
+            ColumnType::Interval => ArrayElemType::Interval,
+            ColumnType::TimestampTz => ArrayElemType::TimestampTz,
             ColumnType::Bpchar(_)
-            | ColumnType::TimestampTz
-            | ColumnType::Interval
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
@@ -9344,6 +9366,15 @@ fn resolve_array_agg_input(
         node_budget,
         item.func.default_alias(),
     )?;
+    // TIMESTAMPTZ の JSON 化は未対応。確定時の XX000 ではなく束縛時に 0A000 で拒否する（Issue #3233）。
+    if !matches!(output, ArrayAggOutput::Array) && elem == ArrayElemType::TimestampTz {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "{} over timestamptz is not supported yet",
+                item.func.default_alias()
+            ),
+        });
+    }
     let orders_by_value = item.distinct || item.order_by.iter().any(|k| k.expr == *value_expr);
     if orders_by_value {
         match elem {
@@ -9367,6 +9398,14 @@ fn resolve_array_agg_input(
                         .to_string(),
                 })
             }
+            // スカラー INTERVAL の式キーによる並べ替えは未対応（`order_kind_for_expr_type`）。
+            // 配列要素も同じ側に置き、キー束縛段より前に分かりやすく拒否する（Issue #3234）。
+            ArrayElemType::Interval => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "DISTINCT or ORDER BY over interval in array_agg is not supported yet"
+                        .to_string(),
+                })
+            }
             // 比較・順序づけに支障のない要素型。要素型の追加時に判断を強制する（Issue #3229）。
             ArrayElemType::Text
             | ArrayElemType::Varchar(_)
@@ -9380,6 +9419,7 @@ fn resolve_array_agg_input(
             | ArrayElemType::Date
             | ArrayElemType::Timestamp
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Uuid
             | ArrayElemType::Numeric { .. }
             | ArrayElemType::Jsonb
@@ -10026,7 +10066,12 @@ pub(crate) fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -
             lhs: Box::new(f(lhs)),
             rhs: Box::new(f(rhs)),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|o| Box::new(f(o))),
             whens: whens.iter().map(|(c, r)| (f(c), f(r))).collect(),
             else_result: else_result.as_ref().map(|e| Box::new(f(e))),
         },
@@ -12423,7 +12468,14 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(c, out);
             }
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_idents(operand, out);
+            }
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
                 collect_expr_idents(result, out);
@@ -13458,7 +13510,15 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: match operand {
+                Some(o) => Some(Box::new(rec(o)?)),
+                None => None,
+            },
             whens: whens
                 .iter()
                 .map(|(c, r)| Ok((rec(c)?, rec(r)?)))

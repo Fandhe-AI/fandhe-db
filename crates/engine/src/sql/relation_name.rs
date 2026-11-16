@@ -531,12 +531,18 @@ pub(crate) fn rewrite_relation_names_full(
     tokens: &mut [Token],
     resolver: Option<SchemaResolver<'_>>,
 ) -> Result<RewriteInfo, SqlSurfaceError> {
-    rewrite_sequence_name_literals(tokens, resolver)?;
     let mut info = RewriteInfo {
         names: Vec::new(),
         positions: Vec::new(),
         create_public: false,
     };
+    // 要素つき `CREATE SCHEMA` は文全体を解決しない（Issue #3286。設計記録 D8）。要素の修飾名・未修飾名は
+    // 新しい SCHEMA の内部 ID が払い出された後に `core::schema_elements` が要素ごとに解決する。ここで
+    // 解決すると、まだ存在しない作成中の SCHEMA への修飾が `3F000` になる。
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Ok(info);
+    }
+    rewrite_sequence_name_literals(tokens, resolver)?;
     if !tokens
         .iter()
         .any(|t| matches!(t, Token::QualifiedIdent { .. }))

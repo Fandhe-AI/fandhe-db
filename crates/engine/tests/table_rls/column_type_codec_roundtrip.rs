@@ -104,6 +104,8 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::SmallInt => "smallint",
         ArrayElemType::Time => "time",
         ArrayElemType::Bit(_) => "bit",
+        ArrayElemType::Interval => "interval",
+        ArrayElemType::TimestampTz => "timestamptz",
     }
 }
 
@@ -321,6 +323,7 @@ fn all_column_type_variants_are_covered_by_case_table() {
         ArrayElemType::Enum,
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
+        ArrayElemType::TimestampTz,
     ]
     .iter()
     .map(array_elem_label)
@@ -343,7 +346,8 @@ fn all_column_type_variants_are_covered_by_case_table() {
             "jsonb",
             "enum",
             "smallint",
-            "time"
+            "time",
+            "timestamptz"
         ])
     );
 }
@@ -1553,6 +1557,28 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
                 Some(86_400_000_000),
             ]),
         ),
+        // Issue #3234: `INTERVAL[]`（月・日・マイクロ秒の三要素。符号違い・境界値を含む）。
+        (
+            ArrayElemType::Interval,
+            ArrayValue::Interval(vec![
+                Some(engine::datetime::Interval {
+                    months: 1,
+                    days: -2,
+                    micros: 3_000_000,
+                }),
+                None,
+                Some(engine::datetime::Interval {
+                    months: i32::MIN,
+                    days: i32::MIN,
+                    micros: i64::MIN + 1,
+                }),
+                Some(engine::datetime::Interval {
+                    months: i32::MAX,
+                    days: i32::MAX,
+                    micros: i64::MAX - 1,
+                }),
+            ]),
+        ),
         // Issue #3235: `BIT(n)[]`（宣言長 `n` の要素。端数ビットを含む）。
         (
             ArrayElemType::Bit(4),
@@ -1561,6 +1587,10 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
                 None,
                 Some(engine::bit_string::BitString::parse_text("0001", 4).expect("bit")),
             ]),
+        ),
+        (
+            ArrayElemType::TimestampTz,
+            ArrayValue::TimestampTz(vec![Some(0), None, Some(1_700_000_000_000_000), Some(-1)]),
         ),
         (
             ArrayElemType::BigInt,
@@ -1614,6 +1644,8 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::SmallInt(_) => ArrayValue::SmallInt(vec![]),
             ArrayValue::Time(_) => ArrayValue::Time(vec![]),
             ArrayValue::Bit(_) => ArrayValue::Bit(vec![]),
+            ArrayValue::Interval(_) => ArrayValue::Interval(vec![]),
+            ArrayValue::TimestampTz(_) => ArrayValue::TimestampTz(vec![]),
             ArrayValue::BigInt(_) => ArrayValue::BigInt(vec![]),
             ArrayValue::Real(_) => ArrayValue::Real(vec![]),
             ArrayValue::Double(_) => ArrayValue::Double(vec![]),

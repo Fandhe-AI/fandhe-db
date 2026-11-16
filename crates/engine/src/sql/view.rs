@@ -928,7 +928,14 @@ pub(crate) fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(),
             }
             Ok(())
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                expr_columns_within(columns, operand)?;
+            }
             for (cond, result) in whens {
                 expr_columns_within(columns, cond)?;
                 expr_columns_within(columns, result)?;

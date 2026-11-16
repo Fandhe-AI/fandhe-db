@@ -5862,7 +5862,7 @@ fn validate_view_body_matches_base_relation(
 /// `relations` は本文が読む relation 名（先頭が `base_relation`。JOIN は両辺）、
 /// `buffered` は評価後射影形（集計・`LIMIT`・`ORDER BY`・JOIN を含む本文）か、
 /// `join` は JOIN 本文か。
-struct ViewBodyShape {
+pub(crate) struct ViewBodyShape {
     relations: Vec<String>,
     buffered: bool,
     join: bool,
@@ -7231,6 +7231,14 @@ pub enum ArrayElemType {
     /// `BitString` のバイト列と同じ）。OID は別（`_bit` = 1561）なので Text へは丸めない。
     /// 長さなしの `BIT[]` は `BIT(1)[]`（スカラーと同じ）。`VARBIT[]`（OID 1563）は未対応。
     Bit(u32),
+    /// `INTERVAL`（Issue #3234・TABLE-14・TABLE-34・TABLE-35）。行内表現は要素ごとに固定幅
+    /// 16 バイト（`months: i32 LE`・`days: i32 LE`・`micros: i64 LE`。[`crate::datetime::Interval`]
+    /// のフィールド順）。OID は別（`_interval` = 1187）なので他型へは丸めない。等価・比較は
+    /// スカラー INTERVAL と同じ正規化キー（1 か月 = 30 日）で行うが、行バイトは生の三要素を保つ。
+    Interval,
+    /// `TIMESTAMPTZ`（Issue #3233）。行内表現は UTC 起点のマイクロ秒 8 バイト LE（`Timestamp`・
+    /// `Time` と同形）。OID は別（`_timestamptz` = 1185）なので他の要素型へは丸めない。
+    TimestampTz,
 }
 
 impl ArrayElemType {
@@ -7238,7 +7246,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 19] = [
+    pub const ALL_KINDS: [ArrayElemType; 21] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7261,6 +7269,8 @@ impl ArrayElemType {
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
         ArrayElemType::Bit(4),
+        ArrayElemType::Interval,
+        ArrayElemType::TimestampTz,
     ];
 
     /// 種別の序数（[`ArrayElemType::ALL_KINDS`] の添字）。ワイルドカード無しの網羅 match の
@@ -7288,6 +7298,8 @@ impl ArrayElemType {
             ArrayElemType::SmallInt => 16,
             ArrayElemType::Time => 17,
             ArrayElemType::Bit(_) => 18,
+            ArrayElemType::Interval => 19,
+            ArrayElemType::TimestampTz => 20,
         }
     }
 
@@ -7317,6 +7329,8 @@ impl ArrayElemType {
             ArrayElemType::Bit(_) => "bit",
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
+            ArrayElemType::Interval => "interval",
+            ArrayElemType::TimestampTz => "timestamptz",
         }
     }
 
@@ -7331,6 +7345,8 @@ impl ArrayElemType {
             "bigint" => Ok(ArrayElemType::BigInt),
             "smallint" => Ok(ArrayElemType::SmallInt),
             "time" => Ok(ArrayElemType::Time),
+            "interval" => Ok(ArrayElemType::Interval),
+            "timestamptz" => Ok(ArrayElemType::TimestampTz),
             "real" => Ok(ArrayElemType::Real),
             "double" => Ok(ArrayElemType::Double),
             "date" => Ok(ArrayElemType::Date),
@@ -7412,7 +7428,9 @@ impl ArrayType {
             | ArrayElemType::Json
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
-            | ArrayElemType::Time => {}
+            | ArrayElemType::Time
+            | ArrayElemType::Interval
+            | ArrayElemType::TimestampTz => {}
         }
         Ok(Self {
             elem,
@@ -7517,7 +7535,9 @@ impl ArrayType {
                 | ArrayElemType::Jsonb
                 | ArrayElemType::Varchar(None)
                 | ArrayElemType::SmallInt
-                | ArrayElemType::Time,
+                | ArrayElemType::Time
+                | ArrayElemType::Interval
+                | ArrayElemType::TimestampTz,
                 _,
             ) => format!("{},{}", self.elem.catalog_tag(), self.max_len),
         };
@@ -8234,6 +8254,8 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Bpchar(_)
         | ArrayElemType::SmallInt
         | ArrayElemType::Time
+        | ArrayElemType::Interval
+        | ArrayElemType::TimestampTz
         | ArrayElemType::Bit(_) => false,
     }
 }
@@ -16345,6 +16367,23 @@ impl Storage {
         column_aliases: &[String],
         check_option: ViewCheckOption,
     ) -> Result<()> {
+        let (encoded, shape) =
+            Self::prepare_create_view(name, base_relation, body_sql, column_aliases, check_option)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::create_view_in_txn(&write_txn, name, base_relation, body_sql, &encoded, &shape)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// [`Self::create_view_with_check_option`] の txn 前処理（識別子・本文サイズ・別名の形状検証と定義のエンコード。
+    /// write txn を開く前に fail-closed に拒否できる判定だけ）。要素つき `CREATE SCHEMA` の実行器
+    /// （`core::schema_elements`）も同じ処理を通す（第 2 の検証経路を作らない。Issue #3286）。
+    pub(crate) fn prepare_create_view(
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        column_aliases: &[String],
+        check_option: ViewCheckOption,
+    ) -> Result<(Vec<u8>, ViewBodyShape)> {
         validate_relation_key(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
@@ -16372,8 +16411,22 @@ impl Storage {
             column_aliases: column_aliases.to_vec(),
             check_option,
         })?;
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
+        Ok((encoded, shape))
+    }
+
+    /// [`Self::create_view_with_check_option`] の write txn 内本体（begin・commit を含まない）。`encoded`・`shape`
+    /// は [`Self::prepare_create_view`] の結果。名前空間の衝突・参照先の存在と深さ・件数上限・保存・commit 記録・
+    /// 所有者の適用を行う。`Err` の場合は呼び出し側が txn を破棄する。単独の `CREATE VIEW` と、要素つき
+    /// `CREATE SCHEMA` が SCHEMA・表と同じ txn にビューを載せる経路が共有する（Issue #3286）。
+    pub(crate) fn create_view_in_txn(
+        write_txn: &redb::WriteTransaction,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        encoded: &[u8],
+        shape: &ViewBodyShape,
+    ) -> Result<()> {
+        namespace::ensure_key_schema_alive_in_txn(write_txn, name)?;
         {
             let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -16384,19 +16437,19 @@ impl Storage {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
-            if index_name_exists_in_txn(&write_txn, name)?
-                || materialized_view_exists_in_txn(&write_txn, name)?
-                || sequence::sequence_exists_in_txn(&write_txn, name)?
+            if index_name_exists_in_txn(write_txn, name)?
+                || materialized_view_exists_in_txn(write_txn, name)?
+                || sequence::sequence_exists_in_txn(write_txn, name)?
             {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             validate_new_view_body_in_txn(
-                &write_txn,
+                write_txn,
                 &catalog_table,
                 &views_table,
                 body_sql,
                 base_relation,
-                &shape,
+                shape,
             )?;
             let count = views_table.len()?;
             if count >= MAX_VIEWS as u64 {
@@ -16404,13 +16457,13 @@ impl Storage {
                     "too many views".to_string(),
                 ));
             }
-            views_table.insert(name, encoded.as_slice())?;
+            views_table.insert(name, encoded)?;
             // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
-            crate::storage::commit_log::note_ddl(&write_txn, name);
+            crate::storage::commit_log::note_ddl(write_txn, name);
             // 予約された作成者を所有者として同じ txn に書く（Issue #2236）。
-            privilege::owner::apply_pending_relation_owner_in_txn(&write_txn, name)?;
+            privilege::owner::apply_pending_relation_owner_in_txn(write_txn, name)?;
         }
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        Ok(())
     }
 
     /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）。他のビューが
@@ -21002,6 +21055,8 @@ mod tests {
             (ArrayElemType::BigInt, "bigint"),
             (ArrayElemType::SmallInt, "smallint"),
             (ArrayElemType::Time, "time"),
+            (ArrayElemType::Interval, "interval"),
+            (ArrayElemType::TimestampTz, "timestamptz"),
             (ArrayElemType::Real, "real"),
             (ArrayElemType::Double, "double"),
             (ArrayElemType::Date, "date"),
@@ -21280,6 +21335,36 @@ mod tests {
         assert_eq!(array_param_enum_name("bit,4,8").ok(), Some(None));
         assert!(ArrayType::new(ArrayElemType::Bit(0), 8).is_err());
         assert!(ArrayType::new(ArrayElemType::Bit(beyond), 8).is_err());
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` の param は `timestamptz,<max_len>`（2 次元は末尾 `d2`）で
+    /// 往復し、既存の `timestamp` の param を変えない。
+    #[test]
+    fn timestamptz_array_param_roundtrips_and_leaves_timestamp_param_unchanged() {
+        let one =
+            ColumnType::Array(ArrayType::new(ArrayElemType::TimestampTz, 4).expect("array ty"));
+        assert_eq!(one.catalog_fields(), ("array", "timestamptz,4".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4", &mut array_resolver)
+                .expect("decode"),
+            one
+        );
+        let two = ColumnType::Array(
+            ArrayType::new(ArrayElemType::TimestampTz, 4)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(
+            two.catalog_fields(),
+            ("array", "timestamptz,4,d2".to_string())
+        );
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4,d2", &mut array_resolver)
+                .expect("decode 2d"),
+            two
+        );
+        let ts = ColumnType::Array(ArrayType::new(ArrayElemType::Timestamp, 4).expect("array ty"));
+        assert_eq!(ts.catalog_fields(), ("array", "timestamp,4".to_string()));
     }
 
     /// Issue #1605: 2 次元以上の宣言は param 末尾の `d<N>` で往復し、1 次元の param は従来の

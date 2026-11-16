@@ -501,3 +501,28 @@ fn partitioned_resend_with_another_zone_does_not_rewrite() {
     assert_eq!(stored(&core, 1), first);
     assert_eq!(utc_text(first.unwrap()), "2026-01-01 00:00:00+00");
 }
+
+#[test]
+fn partitioned_resend_with_another_zone_rejected_for_timestamptz_array() {
+    let (_g, core) = open("sz-partitioned-arr");
+    let mut s = session();
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, v TIMESTAMPTZ[], n INTEGER)",
+    );
+    for i in 1..=3 {
+        ok(
+            &core,
+            &mut s,
+            &format!("INSERT INTO t (id, n) VALUES ({i}, {i}) USING OPERATION_ID 'seed{i}'"),
+        );
+    }
+    let sql = "UPDATE t SET v = ARRAY['2026-01-01 09:00:00']::TIMESTAMPTZ[] WHERE n >= 0 \
+               USING OPERATION_ID 'pa1' PARTITIONED CHUNK 2";
+    ok(&core, &mut s, "SET TIME ZONE 'Asia/Tokyo'");
+    ok(&core, &mut s, sql);
+    assert_eq!(code(&core, &mut s, sql), "23505");
+    ok(&core, &mut s, "SET TIME ZONE 'UTC'");
+    assert_eq!(code(&core, &mut s, sql), "22023");
+}

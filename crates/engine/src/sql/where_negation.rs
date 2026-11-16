@@ -71,8 +71,15 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
             .children()
             .into_iter()
             .fold(1usize, |acc, c| acc.saturating_add(expr_node_count(c))),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
             let mut n = 1usize;
+            if let Some(o) = operand {
+                n = n.saturating_add(expr_node_count(o));
+            }
             for (c, r) in whens {
                 n = n
                     .saturating_add(expr_node_count(c))

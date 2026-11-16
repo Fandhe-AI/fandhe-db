@@ -104,6 +104,7 @@ pub(crate) fn binary_param_for_wire_type(t: crate::result_encoder::WireType) -> 
         | WireType::BoolArray
         | WireType::Int2Array
         | WireType::TimeArray
+        | WireType::TimestampTzArray
         | WireType::Int4Array
         | WireType::Int8Array
         | WireType::Float4Array
@@ -118,6 +119,7 @@ pub(crate) fn binary_param_for_wire_type(t: crate::result_encoder::WireType) -> 
         | WireType::VarcharArray
         | WireType::BpcharArray
         | WireType::BitArray
+        | WireType::IntervalArray
         | WireType::Record
         | WireType::RecordArray => BinaryParam::Unsupported,
     }

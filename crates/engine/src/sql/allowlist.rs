@@ -36,6 +36,11 @@ use crate::sql::using_operation_id::OperationId;
 use crate::sql::where_negation::{expr_node_count, negate_conjunction};
 
 mod grouped_window;
+// 要素つき `CREATE SCHEMA` の要素分割・構文検証（TABLE-27・Issue #3286）。
+mod schema_elements;
+pub(crate) use schema_elements::{
+    create_name_index as schema_element_create_name_index, SchemaElement, SchemaElementKind,
+};
 // `DO` ブロックの構文検証（SQL-68・Issue #2228）。
 mod do_block;
 pub use do_block::ValidatedDo;
@@ -1195,6 +1200,10 @@ pub enum SqlSurfaceError {
     NoSchemaSelected,
     /// 予約名（`pg_` 接頭辞）の SCHEMA 名の指定（TABLE-27・ERR-6、Issue #1713）。`42939`。
     ReservedName { name: String },
+    /// 要素つき `CREATE SCHEMA`（`CREATE SCHEMA s CREATE TABLE x.t ...`）の要素が、作成中の SCHEMA とは別の
+    /// SCHEMA で修飾された名前を作ろうとした（TABLE-27・Issue #3286）。`42P15`。`schema` は利用者が書いた
+    /// 修飾名、`created` は作成中の SCHEMA 名（どちらも利用者自身が書いた識別子のみ）。
+    InvalidSchemaDefinition { schema: String, created: String },
     /// `CREATE ROLE`／`CREATE USER` の名前が同一テナント内の既存ロールと衝突した（SQL-39・ERR-6、
     /// Issue #1962）。`42710`。名前は利用者自身が書いた識別子だけで、内部 ID・他テナントの情報を含めない。
     DuplicateRole { name: String },
@@ -1524,6 +1533,10 @@ impl SqlSurfaceError {
             Self::DuplicateTable { name } => Self::DuplicateTable { name: f(&name) },
             Self::DuplicateSchema { name } => Self::DuplicateSchema { name: f(&name) },
             Self::InvalidSchemaName { name } => Self::InvalidSchemaName { name: f(&name) },
+            Self::InvalidSchemaDefinition { schema, created } => Self::InvalidSchemaDefinition {
+                schema: f(&schema),
+                created: f(&created),
+            },
             Self::DuplicateObject { name } => Self::DuplicateObject { name: f(&name) },
             Self::DuplicateRole { name } => Self::DuplicateRole { name: f(&name) },
             Self::UndefinedRole { name } => Self::UndefinedRole { name: f(&name) },
@@ -2114,6 +2127,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::ReservedName { .. } | SqlSurfaceError::ReservedRoleName { .. } => {
                 ErrorClass::ReservedName
             }
+            SqlSurfaceError::InvalidSchemaDefinition { .. } => ErrorClass::InvalidSchemaDefinition,
             SqlSurfaceError::DuplicateRole { .. } => ErrorClass::DuplicateObject,
             SqlSurfaceError::UndefinedRole { .. } => ErrorClass::UndefinedObject,
             SqlSurfaceError::RoleHasDependents { .. } => ErrorClass::DependentObjectsStillExist,
@@ -2373,6 +2387,13 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::NoSchemaSelected => {
                 f.write_str("no schema has been selected to create in")
+            }
+            // 名前は利用者自身が書いた識別子のみ（内部 ID・他テナントの情報は含めない。Issue #3286）。
+            SqlSurfaceError::InvalidSchemaDefinition { schema, created } => {
+                write!(
+                    f,
+                    "CREATE specifies a schema ({schema}) different from the one being created ({created})"
+                )
             }
             SqlSurfaceError::ReservedName { name } => {
                 write!(f, "unacceptable schema name: {name}")
@@ -3702,6 +3723,10 @@ impl ValidatedMaterializedViewRead {
     }
 }
 
+/// [`Parser::case_expr_starts_at`] の前方走査の上限トークン数（Issue #3279）。`case` を
+/// 列名として多数並べた入力でも、各位置の走査が定数で打ち切られ全体が 2 乗時間にならない。
+const CASE_START_SCAN_LIMIT: usize = 1024;
+
 /// `FROM` なし定数式 SELECT の項目数上限（SQL-43）。1 文あたりの束縛・評価コストを
 /// 有界にするための DoS 対策で、`MAX_EXPR_NODES` と同程度の桁に揃えた。アロケーション
 /// より前に検査する。
@@ -5017,7 +5042,7 @@ pub(crate) fn scalar_subquery_placeholder_index(name: &str) -> Option<usize> {
 
 /// 式 `expr` の直下の子式を `out` へ積む（[`returning_item_rejection`] の明示スタック走査用。
 /// `sql::parser::collect_expr_idents` と同じ変種の網羅）。
-fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+pub(crate) fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     match expr {
         Expr::Number(_)
         | Expr::String(_)
@@ -5046,7 +5071,14 @@ fn push_expr_children<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
             out.extend(expr.array_expr_children().into_iter().flatten());
         }
         Expr::SqlJsonQuery(q) => out.extend(q.children()),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                out.push(op);
+            }
             for (cond, result) in whens {
                 out.push(cond);
                 out.push(result);
@@ -7529,6 +7561,114 @@ impl<'a> Parser<'a> {
         )
     }
 
+    /// `pos` の識別子が `CASE` 式（検索形・単純形）の開始かを、消費せずに判定する
+    /// （対象ビヘイビア: SQL-26。Issue #3279）。投影・集計項目・一次式・ORDER BY キーの
+    /// 4 箇所が共有する単一情報源。
+    ///
+    /// - 引用なしの `CASE` の直後が `WHEN` なら検索形（従来と同じ）。
+    /// - そうでなければ前方へ走査し、括弧・入れ子の `CASE ... END` の外（深さ 0）で `WHEN` に
+    ///   当たれば単純形（`CASE x WHEN v ...`）。深さ 0 で `,` `)` `]` `;`・キーワード・
+    ///   `THEN`/`ELSE`/`END`/`AS`/`AND`/`OR` に当たれば列名 `case` の参照（後方互換）。
+    ///
+    /// 走査長は [`CASE_START_SCAN_LIMIT`] で打ち切る（超えたら偽。後続の構文解析で `42601`
+    /// に落ちる fail-closed）。`case + case + ...` のような入力で 2 乗時間にならないための上限。
+    fn case_expr_starts_at(&self, pos: usize) -> bool {
+        let Some(Token::Ident(name)) = self.tokens.get(pos) else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("CASE") {
+            return false;
+        }
+        let word_at = |i: usize, w: &str| {
+            matches!(self.tokens.get(i), Some(Token::Ident(n)) if n.eq_ignore_ascii_case(w)
+                && !self.quoted_null.contains(&i))
+        };
+        let first = pos.saturating_add(1);
+        if matches!(self.tokens.get(first), Some(Token::Ident(n)) if n.eq_ignore_ascii_case("WHEN"))
+        {
+            return true;
+        }
+        if self.quoted_null.contains(&pos) {
+            return false;
+        }
+        // 直後が被演算子の開始（識別子・数値・文字列・`(`）でなければ列名 `case` の参照
+        // （`THEN case + 1 WHEN ...` の `case` を、外側の `WHEN` まで先読みして単純形と
+        // 取り違えない。検索形 CASE 内の列名 `case` の後方互換。`-x` 等の符号付き被演算子は
+        // 従来 `42601` で、列参照側へ倒す fail-closed）。中置の語（`AND`・`IS` 等）も同様。
+        let operand_start = match self.tokens.get(first) {
+            Some(Token::Number(_) | Token::StringLiteral(_) | Token::Punct('(')) => true,
+            Some(Token::Ident(_)) => ![
+                "AND", "OR", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "THEN", "ELSE", "END", "AS",
+            ]
+            .iter()
+            .any(|w| word_at(first, w)),
+            _ => false,
+        };
+        if !operand_start {
+            return false;
+        }
+        // 括弧の深さと入れ子の `CASE ... END` の深さは別カウンタで数える（列名 `case`・`end` が
+        // 括弧内に現れても、入れ子の CASE と取り違えて括弧の対応を崩さないため）。
+        let mut parens: usize = 0;
+        let mut cases: usize = 0;
+        let mut i = first;
+        let end = first.saturating_add(CASE_START_SCAN_LIMIT);
+        while i < end {
+            let Some(tok) = self.tokens.get(i) else {
+                return false;
+            };
+            let top = parens == 0 && cases == 0;
+            match tok {
+                Token::Punct('(' | '[') => parens = parens.saturating_add(1),
+                Token::Punct(')' | ']') => {
+                    if parens == 0 {
+                        return false;
+                    }
+                    parens -= 1;
+                }
+                Token::Punct(',' | ';') if top => return false,
+                Token::Keyword(_) if top => return false,
+                Token::Ident(_) => {
+                    if word_at(i, "CASE") {
+                        // 直後が WHEN か被演算子の開始なら入れ子の CASE、`)` `,` や演算子なら列名 `case`。
+                        let nested = word_at(i.saturating_add(1), "WHEN")
+                            || matches!(
+                                self.tokens.get(i.saturating_add(1)),
+                                Some(
+                                    Token::Ident(_)
+                                        | Token::Number(_)
+                                        | Token::StringLiteral(_)
+                                        | Token::Punct('(')
+                                )
+                            );
+                        if nested {
+                            cases = cases.saturating_add(1);
+                        }
+                    } else if word_at(i, "END") {
+                        if cases > 0 {
+                            cases -= 1;
+                        } else if parens == 0 {
+                            return false;
+                        }
+                    } else if top {
+                        if word_at(i, "WHEN") {
+                            return true;
+                        }
+                        if ["THEN", "ELSE", "AS", "AND", "OR"]
+                            .iter()
+                            .any(|w| word_at(i, w))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i = i.saturating_add(1);
+        }
+        false
+    }
+
     /// `offset` 個先のトークンが区切り文字 `c` かを消費せずに判定する
     /// （`JOIN ... USING (` の 2 トークン組の判定。Issue #1826）。
     fn peek_punct_at(&self, offset: usize, c: char) -> bool {
@@ -7759,9 +7899,11 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(name)) => {
                 // `WHEN` を伴わない `CASE` は既存の列名 `case` でありうるため 1 トークン
                 // 先読みする。`NULL` は列名との曖昧性を解消できないので式トリガーにしない。
-                let starts_case =
-                    name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN");
-                let starts_call = matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
+                let starts_case = self.case_expr_starts_at(self.pos);
+                // `CASE (x) WHEN ...`（単純形）は `starts_case` が先に真になるため呼び出しと
+                // 取り違えない。後ろに `WHEN` が無い `case(x)` は従来どおり関数呼び出し。
+                let starts_call = !starts_case
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')));
                 // TABLE-28・Issue #1609: 識別子の直後の `COLLATE` も式項目の継続。
                 // TABLE-35・Issue #1602: 識別子の直後の `[`（添字・スライス）と、引用なしの
                 // `ARRAY[...]`／`ARRAY(...)`（配列コンストラクタ）も式項目の開始。
@@ -7843,10 +7985,12 @@ impl<'a> Parser<'a> {
                 self.parse_projection_infix(0)?
             }
             // Issue #1593: `'1'::int` のように文字列リテラルへ `::` が続く形だけ式項目として扱う。
+            // Issue #3276（SQL-42）: `'x' || col` の文字列連結も式項目として扱う（束縛段が
+            // text 連結か jsonb 連結かを振り分ける。構文木は従来どおり `JsonAccess { Concat }`）。
             Some(Token::StringLiteral(_))
                 if matches!(
                     self.tokens.get(self.pos + 1),
-                    Some(Token::TypeCast | Token::BitDistanceOp(_))
+                    Some(Token::TypeCast | Token::BitDistanceOp(_) | Token::Concat)
                 ) =>
             {
                 self.parse_projection_infix(0)?
@@ -8977,7 +9121,7 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Ident(name)) => {
                 let next = self.tokens.get(self.pos + 1);
-                (name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN"))
+                self.case_expr_starts_at(self.pos)
                     || (name.eq_ignore_ascii_case("ARRAY")
                         && !self.quoted_null.contains(&self.pos)
                         && matches!(next, Some(Token::Punct('[' | '('))))
@@ -12268,9 +12412,7 @@ impl<'a> Parser<'a> {
             // と同じ方針で、次のトークンが `WHEN` のときのみ `CASE` 式として扱う。
             // 先読み無しで無条件に消費すると既存の VECTOR 列名 `case` の参照
             // （例: `vec_norm(case)`）が構文エラー化する破壊的変更になる。
-            Some(Token::Ident(name))
-                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") =>
-            {
+            Some(Token::Ident(_)) if self.case_expr_starts_at(self.pos) => {
                 self.advance();
                 self.parse_case_expr(depth)
             }
@@ -12808,10 +12950,12 @@ impl<'a> Parser<'a> {
     }
 
     /// 検索形 `CASE WHEN <lhs> <cmp> <rhs> THEN <value_expr> {WHEN ...}
-    /// [ELSE <value_expr>] END` を解析する（対象ビヘイビア: SQL-26）。呼び出し元は
-    /// `CASE` トークンを消費済み。単純 CASE（`CASE x WHEN v ...`）・WHEN 条件中の
-    /// `AND`/`OR`/`IS NULL` 等の論理演算は本 Issue の対象外として `42601` で拒否
-    /// する（`cond` は常に `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
+    /// [ELSE <value_expr>] END` と単純形 `CASE <value_expr> WHEN <value_expr> THEN
+    /// <value_expr> {WHEN ...} [ELSE <value_expr>] END`（Issue #3279）を解析する
+    /// （対象ビヘイビア: SQL-26）。呼び出し元は `CASE` トークンを消費済み。検索形の WHEN
+    /// 条件中の `AND`/`OR`/`IS NULL` 等の論理演算・単純形の `WHEN 1, 2` 列挙・被演算子の
+    /// 比較式は `42601` で拒否する（検索形の `cond` は常に
+    /// `<value_expr> <cmp_op> <value_expr>` のみを受理する）。
     fn parse_case_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
         self.check_expr_depth(depth)?;
         self.enter_case_nesting()?;
@@ -12821,11 +12965,36 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_case_expr_inner(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
-        // 直後が `WHEN` でなければ単純 CASE 形（`CASE x WHEN v ...`）であり、
-        // 本 Issue の対象外として拒否する（`42601`）。
+        // 直後が `WHEN` でなければ単純形（`CASE x WHEN v ...`）。被演算子は AST に
+        // 1 回だけ保持する（複製しない。`Expr::Case` の doc 参照）。単純形はこれまで全体が
+        // `42601` だったため、`NULL` をリテラルとして解析しても互換性は壊れない。
+        let operand = if self.peek_ident_matches("WHEN") {
+            None
+        } else {
+            Some(Box::new(
+                self.parse_value_expr_with_null_context(depth + 1, true)?,
+            ))
+        };
         self.expect_ident_matching("WHEN")?;
         let mut whens = Vec::new();
         loop {
+            if operand.is_some() {
+                // 単純形の WHEN 値（比較値）。NULL は「決して一致しない」比較値として受理する。
+                let value = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                self.expect_ident_matching("THEN")?;
+                let result = self.parse_value_expr_with_null_context(depth + 1, true)?;
+                whens.push((value, result));
+                if whens.len() > MAX_CASE_BRANCHES {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "CASE has too many WHEN branches",
+                    ));
+                }
+                if self.peek_ident_matches("WHEN") {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
             // WHEN 条件式（`<value_expr> <cmp_op> <value_expr>`）は
             // `Expr::Null` の束縛が許可される 3 箇所に含まれないため、`NULL` は
             // ここでは常に列参照として解析する（`allow_null_literal` を強制的に
@@ -12869,7 +13038,11 @@ impl<'a> Parser<'a> {
         };
         self.expect_ident_matching("END")?;
         self.consume_expr_node()?;
-        Ok(Expr::Case { whens, else_result })
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_result,
+        })
     }
 
     /// `COALESCE '(' <value_expr> {',' <value_expr>} ')'`（対象ビヘイビア:
@@ -13786,7 +13959,7 @@ impl<'a> Parser<'a> {
                 true
             }
             Some(Token::Ident(name)) => {
-                if name.eq_ignore_ascii_case("CASE") && self.peek_ident_matches_at(1, "WHEN") {
+                if self.case_expr_starts_at(self.pos) {
                     return true;
                 }
                 // bit 列の距離式（TABLE-48・Issue #2970）: `ORDER BY v <~> '1010'`。
@@ -21011,7 +21184,7 @@ fn reject_unimplemented_expression_keys(
 /// 余剰トークンがあれば `42601`。永続データは untrusted として扱う（手書きの破損データも
 /// ここで拒否される）。
 pub(crate) fn parse_index_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
     let expr = p.parse_bounded_value_expr()?;
     p.expect_end_of_statement()?;
@@ -21256,6 +21429,9 @@ pub struct ValidatedCreateSchema {
     pub(crate) if_not_exists: bool,
     /// `AUTHORIZATION <ロール>` の所有者指定（Issue #2236。省略時は作成者＝現在ロール）。
     pub(crate) authorization: Option<RoleSpec>,
+    /// 見出しの後ろに続くスキーマ要素（`CREATE TABLE`／`VIEW`／`SEQUENCE`。Issue #3286）。記述順で保持し、
+    /// 空なら従来どおりの `CREATE SCHEMA`。実行は `core::schema_elements` が 1 つの write txn で行う。
+    pub(crate) elements: Vec<SchemaElement>,
 }
 
 impl ValidatedCreateSchema {
@@ -21358,8 +21534,10 @@ pub(crate) fn is_drop_schema_statement(tokens: &[Token]) -> bool {
 
 /// [`ValidatedCreateSchema`] の構造検証本体（TABLE-27、Issue #1713）。`AUTHORIZATION <ロール>`
 /// （`CREATE SCHEMA [IF NOT EXISTS] <名> AUTHORIZATION <ロール>` と名前省略形
-/// `CREATE SCHEMA AUTHORIZATION <ロール名>`。Issue #2236）は所有者の指定として受理し、schema_element
-/// （`CREATE SCHEMA s CREATE TABLE ...`）と、`CURRENT_USER` 等で名前を省略する形は黙って無視せず
+/// `CREATE SCHEMA AUTHORIZATION <ロール名>`。Issue #2236）は所有者の指定として受理する。
+/// 見出しの後ろのスキーマ要素（`CREATE SCHEMA s CREATE TABLE ...`。Issue #3286）は
+/// `schema_elements` が分割・構造検証する。受理しない種別・形と `IF NOT EXISTS` との併用は固定文言の
+/// `0A000`（PostgreSQL 17 と同じ。設計記録 D3）。`CURRENT_USER` 等で名前を省略する形も黙って無視せず
 /// `0A000` で拒否する（fail-closed。設計記録 D10）。修飾名・不正な識別子・余分なトークンは `42601`。
 pub(crate) fn validate_create_schema_tokens(
     tokens: &[Token],
@@ -21368,10 +21546,30 @@ pub(crate) fn validate_create_schema_tokens(
     p.expect_ident_matching("CREATE")?;
     p.expect_ident_matching("SCHEMA")?;
     let if_not_exists = p.parse_optional_if_not_exists();
-    let elements = || {
-        SqlSurfaceError::feature_not_supported(
-            "CREATE SCHEMA with schema elements is not supported",
-        )
+    // 見出しの後ろに要素が続く形（`CREATE`／`GRANT`）の検証と格納。`IF NOT EXISTS` との併用は拒否する。
+    let finish = |p: &mut Parser<'_>,
+                  name: String,
+                  authorization: Option<RoleSpec>|
+     -> Result<ValidatedCreateSchema, SqlSurfaceError> {
+        let mut elements = Vec::new();
+        if schema_elements::starts_element(p) {
+            if if_not_exists {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "CREATE SCHEMA IF NOT EXISTS cannot include schema elements",
+                ));
+            }
+            let start = tokens.len().saturating_sub(p.remaining().len());
+            let rest = tokens.get(start..).unwrap_or(&[]);
+            elements = schema_elements::parse_elements(&name, rest)?;
+        } else {
+            p.expect_end_of_statement()?;
+        }
+        Ok(ValidatedCreateSchema {
+            name,
+            if_not_exists,
+            authorization,
+            elements,
+        })
     };
     // 名前省略形: `CREATE SCHEMA [IF NOT EXISTS] AUTHORIZATION <ロール名>`（SCHEMA 名はロール名）。
     if p.peek_ident_matches("AUTHORIZATION") {
@@ -21382,15 +21580,7 @@ pub(crate) fn validate_create_schema_tokens(
                 "CREATE SCHEMA AUTHORIZATION without a schema name requires a role name",
             ));
         };
-        if p.peek_ident_matches("CREATE") {
-            return Err(elements());
-        }
-        p.expect_end_of_statement()?;
-        return Ok(ValidatedCreateSchema {
-            name,
-            if_not_exists,
-            authorization: Some(spec),
-        });
+        return finish(&mut p, name, Some(spec));
     }
     if matches!(p.peek(), Some(Token::QualifiedIdent { .. })) {
         return Err(SqlSurfaceError::unsupported(
@@ -21406,15 +21596,7 @@ pub(crate) fn validate_create_schema_tokens(
     } else {
         None
     };
-    if p.peek_ident_matches("CREATE") {
-        return Err(elements());
-    }
-    p.expect_end_of_statement()?;
-    Ok(ValidatedCreateSchema {
-        name,
-        if_not_exists,
-        authorization,
-    })
+    finish(&mut p, name, authorization)
 }
 
 /// [`ValidatedDropSchema`] の構造検証本体（TABLE-27・TABLE-36 のポインタ、Issue #1713・#1717）。
@@ -23974,10 +24156,15 @@ fn expr_contains_aggregate_call(expr: &Expr) -> bool {
             .flatten()
             .any(expr_contains_aggregate_call),
         Expr::SqlJsonQuery(q) => q.children().into_iter().any(expr_contains_aggregate_call),
-        Expr::Case { whens, else_result } => {
-            whens
-                .iter()
-                .any(|(c, r)| expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_contains_aggregate_call)
+                || whens.iter().any(|(c, r)| {
+                    expr_contains_aggregate_call(c) || expr_contains_aggregate_call(r)
+                })
                 || else_result
                     .as_deref()
                     .is_some_and(expr_contains_aggregate_call)
@@ -31094,7 +31281,9 @@ pub(crate) fn validate_create_temp_table_tokens(
 pub(crate) fn parse_check_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let mut tokens = lexer::tokenize(sql)?;
+    // 引用付き `"null"` の列参照を保存本文から復元できるよう、引用付き NULL を区別する字句解析を使う
+    // （単純 CASE の被演算子・比較値は NULL リテラルを許すため。Issue #3279）。
+    let mut tokens = lexer::tokenize_marked(sql)?;
     // 旧版は時刻キーワード名の列参照を引用なしで保存した。CHECK は値関数を禁止しているため、
     // 保存本文中の未引用の予約語は旧形式の列参照として復元する（書き込み不能化を防ぐ）。
     lexer::requote_legacy_value_function_columns(&mut tokens);
@@ -31112,7 +31301,7 @@ pub(crate) fn parse_check_predicate_text(
 pub(crate) fn parse_index_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
     let predicates = p.parse_where()?;
     p.expect_end_of_statement()?;
@@ -44034,7 +44223,9 @@ mod tests {
         assert_eq!(items.len(), 3);
         match &items[0] {
             SelectItem::Expr {
-                expr: Expr::Case { whens, else_result },
+                expr: Expr::Case {
+                    whens, else_result, ..
+                },
                 ..
             } => {
                 assert_eq!(whens[0].1, Expr::Null);
@@ -44442,16 +44633,179 @@ mod tests {
         }
     }
 
+    /// 単純 CASE（Issue #3279）は被演算子を AST に 1 回だけ保持して受理する（以前は `42601`）。
     #[test]
-    fn rejects_simple_case_form() {
+    fn accepts_simple_case_form_with_single_operand() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_statement(
-            "SELECT CASE id WHEN 1 THEN 2 END FROM documents \
+        let stmt = validate_statement(
+            "SELECT CASE id WHEN 1 THEN 2 WHEN 3 THEN 4 ELSE 5 END FROM documents \
              ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
             &lookup,
         )
-        .unwrap_err();
-        assert_eq!(err.wire_code(), "42601");
+        .expect("simple CASE should be accepted");
+        let items = select_expr_items(&stmt);
+        match &items[0] {
+            SelectItem::Expr {
+                expr:
+                    Expr::Case {
+                        operand,
+                        whens,
+                        else_result,
+                    },
+                ..
+            } => {
+                assert_eq!(operand.as_deref(), Some(&Expr::Ident("id".to_string())));
+                assert_eq!(
+                    whens,
+                    &vec![
+                        (Expr::Number("1".to_string()), Expr::Number("2".to_string())),
+                        (Expr::Number("3".to_string()), Expr::Number("4".to_string())),
+                    ]
+                );
+                assert_eq!(else_result.as_deref(), Some(&Expr::Number("5".to_string())));
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+    }
+
+    /// 単純 CASE の被演算子・比較値は `NULL` リテラルとして解析する（Issue #3279）。
+    #[test]
+    fn simple_case_accepts_null_operand_and_null_when_value() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE NULL WHEN NULL THEN 1 ELSE 2 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("simple CASE with NULL should be accepted");
+        match &select_expr_items(&stmt)[0] {
+            SelectItem::Expr {
+                expr: Expr::Case { operand, whens, .. },
+                ..
+            } => {
+                assert_eq!(operand.as_deref(), Some(&Expr::Null));
+                assert_eq!(whens[0].0, Expr::Null);
+            }
+            other => panic!("expected SelectItem::Expr(Case), got {other:?}"),
+        }
+    }
+
+    /// 括弧付き被演算子（`CASE (id) WHEN ...`）は関数呼び出しと取り違えない。後ろに `WHEN` の無い
+    /// `case(x)` は従来どおり関数呼び出し（列名 `case` の互換）。
+    #[test]
+    fn simple_case_with_parenthesized_operand_is_not_a_call() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT CASE (id + 1) WHEN 2 THEN 1 END FROM documents \
+             ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("parenthesized operand should parse as a simple CASE");
+        assert!(matches!(
+            &select_expr_items(&stmt)[0],
+            SelectItem::Expr {
+                expr: Expr::Case {
+                    operand: Some(_),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    /// 構文の不正な単純形は `42601`（fail-closed）。
+    #[test]
+    fn rejects_malformed_simple_case_forms() {
+        let lookup = catalog_with(&["documents"]);
+        for sql in [
+            // WHEN の無い形・END の無い形・WHEN 値のカンマ列挙・THEN の無い形。
+            "SELECT CASE id END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1 THEN 2 FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1, 2 THEN 3 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            "SELECT CASE id WHEN 1 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            // 被演算子に比較式は書けない。
+            "SELECT CASE id > 1 WHEN 1 THEN 2 END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+        ] {
+            let err = validate_statement(sql, &lookup).unwrap_err();
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+        }
+    }
+
+    /// 列名 `case`（`WHEN` を伴わない `CASE`）は従来どおり列参照として読む（後方互換）。
+    #[test]
+    fn column_named_case_is_still_a_column_reference() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT case, case + 1 FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10",
+            &lookup,
+        )
+        .expect("column named case should remain accepted");
+        let items = select_expr_items(&stmt);
+        assert!(
+            matches!(
+                &items[0],
+                SelectItem::Column(name) if name == "case"
+            ) || matches!(
+                &items[0],
+                SelectItem::Expr { expr: Expr::Ident(name), .. } if name == "case"
+            )
+        );
+    }
+
+    /// 検索形 CASE の結果式にある列名 `case` の直後に演算子があっても、外側の `WHEN` まで
+    /// 先読みして単純形と取り違えない（Issue #3279 のレビュー指摘。従来どおり受理）。
+    #[test]
+    fn searched_case_result_may_use_column_named_case_with_operator() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "SELECT CASE WHEN id = 1 THEN case + 1 WHEN id = 2 THEN 0 ELSE 0 END \
+                   FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10";
+        let stmt = validate_statement(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(matches!(
+            &select_expr_items(&stmt)[0],
+            SelectItem::Expr {
+                expr: Expr::Case { operand: None, .. },
+                ..
+            }
+        ));
+    }
+
+    /// 括弧内の列名 `case` は入れ子の CASE と取り違えない（Issue #3279 のレビュー指摘）。
+    #[test]
+    fn simple_case_operand_may_mention_column_named_case_or_end() {
+        let lookup = catalog_with(&["documents"]);
+        for operand in ["(case)", "vec_norm(case)", "(end)", "(case + end)"] {
+            let sql = format!(
+                "SELECT CASE {operand} WHEN 1 THEN 2 END FROM documents \
+                 ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10"
+            );
+            let stmt = validate_statement(&sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(
+                matches!(
+                    &select_expr_items(&stmt)[0],
+                    SelectItem::Expr {
+                        expr: Expr::Case {
+                            operand: Some(_),
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "{sql}"
+            );
+        }
+    }
+
+    /// 単純 CASE の分岐数の上限は検索形と同じ（`54000`）。
+    #[test]
+    fn simple_case_branch_count_is_bounded() {
+        let lookup = catalog_with(&["documents"]);
+        let mut sql = String::from("SELECT CASE id");
+        for i in 0..=MAX_CASE_BRANCHES {
+            sql.push_str(&format!(" WHEN {i} THEN {i}"));
+        }
+        sql.push_str(" END FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10");
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

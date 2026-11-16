@@ -190,6 +190,26 @@ pub(crate) fn concat2(a: &str, b: &str) -> Result<String, SqlSurfaceError> {
     check_result_len(out)
 }
 
+/// `a || b`（text 連結演算子。Issue #3276・SQL-42）。`CONCAT()` と違い strict（NULL の
+/// 扱いは呼び出し元 `apply_builtin` の一律ガードが担う）で、結果長を**確保前に**検査する
+/// （`concat2` は作ってから検査するため流用しない）。上限超過・確保失敗は `54000`。
+pub(crate) fn concat_strict(a: &str, b: &str) -> Result<String, SqlSurfaceError> {
+    let total = a
+        .len()
+        .checked_add(b.len())
+        .filter(|n| *n <= MAX_RESULT_LEN)
+        .ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("concatenation result exceeds the maximum length")
+        })?;
+    let mut out = String::new();
+    out.try_reserve_exact(total).map_err(|_| {
+        SqlSurfaceError::payload_too_large("concatenation result exceeds available memory")
+    })?;
+    out.push_str(a);
+    out.push_str(b);
+    Ok(out)
+}
+
 /// `TRIM(s)`: 先頭・末尾の半角空白 `' '` のみを除去する（PostgreSQL の既定。
 /// タブ・改行・全角空白は対象外）。
 pub(crate) fn trim(s: &str) -> Result<String, SqlSurfaceError> {
@@ -660,6 +680,16 @@ mod tests {
     fn substr_start_at_two_pow_63_is_rejected() {
         let err = substr("hello", 9_223_372_036_854_775_808.0, Some(1.0)).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn concat_strict_limits_before_allocation() {
+        assert_eq!(concat_strict("a", "b").unwrap(), "ab");
+        assert_eq!(concat_strict("", "").unwrap(), "");
+        let half = "x".repeat(MAX_RESULT_LEN - 1);
+        assert_eq!(concat_strict(&half, "z").unwrap().len(), MAX_RESULT_LEN);
+        let err = concat_strict(&half, "zz").unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

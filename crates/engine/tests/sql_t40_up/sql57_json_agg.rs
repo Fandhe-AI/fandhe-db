@@ -398,6 +398,15 @@ fn unsupported_forms_are_rejected() {
         ("SELECT json_agg(embedding) FROM t", "0A000"),
         ("SELECT json_agg(id) FROM t", "0A000"),
         ("SELECT json_agg(NULL) FROM t", "42804"),
+        // TIMESTAMPTZ の JSON 化は未対応。確定時の XX000 でなく束縛時に 0A000（Issue #3233）。
+        (
+            "SELECT json_agg(CAST('2026-01-01 00:00:00+00' AS TIMESTAMPTZ)) FROM t",
+            "0A000",
+        ),
+        (
+            "SELECT jsonb_agg(CAST('2026-01-01 00:00:00+00' AS TIMESTAMPTZ)) FROM t",
+            "0A000",
+        ),
         (
             "SELECT g, json_agg(k) FROM t GROUP BY g ORDER BY 2",
             "0A000",

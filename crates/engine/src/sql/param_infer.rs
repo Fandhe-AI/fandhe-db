@@ -302,7 +302,9 @@ impl Inferrer<'_> {
                     (Ty::Untyped, Ty::Untyped) => Ty::Untyped,
                 }
             }
-            Expr::Case { whens, else_result } => {
+            Expr::Case {
+                whens, else_result, ..
+            } => {
                 let branches = whens
                     .iter()
                     .map(|(_, r)| r)
@@ -485,9 +487,15 @@ impl Inferrer<'_> {
                     }
                 }
             }
-            Expr::Case { whens, else_result } => {
-                for (cond, _) in whens {
-                    self.walk(cond)?;
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                // 単純形（Issue #3279）は `operand = v_i` へ下げた条件を辿り、`$n` の被演算子・比較値を
+                // 検索形の `x = v` と同じ規則で型付けする。
+                for cond in crate::sql::udf_call::case_condition_exprs(operand.as_deref(), whens) {
+                    self.walk(&cond)?;
                 }
                 let branches: Vec<&Expr> = whens
                     .iter()

@@ -109,6 +109,7 @@ mod table27_alter_schema;
 mod table27_current_schema;
 mod table27_qualified_names;
 mod table27_schema_ddl;
+mod table27_schema_elements;
 mod table27_schema_objects;
 mod table27_search_path;
 mod table27_tenant_boundary;
