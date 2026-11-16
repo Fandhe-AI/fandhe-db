@@ -14638,9 +14638,10 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
+            // `VALUES ('n=' || 5)` のようにリテラルへ `||` が続く形も式として読み直す（Issue #3278）。
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast | Token::Concat)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(lit);
@@ -14732,9 +14733,10 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
+            // `SET c = 'x' || n` のように文字列リテラルへ `||` が続く形は式として読み直す（Issue #3278）。
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast | Token::Concat)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(SetValue::Literal(lit));

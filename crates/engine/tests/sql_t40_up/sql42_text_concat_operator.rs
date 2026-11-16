@@ -2,9 +2,12 @@
 //! 実 `Storage`＋`CpuScalarProvider` を `EngineCore::execute_sql_in_session` 経由で使い、
 //! FROM なし／列投影・NULL 伝播（`CONCAT()` との違い）・結果長上限の 54000・文脈のスモーク・
 //! 未対応の組の fail-closed・jsonb `||` の不変・テナント境界を固定する。
-//! 非 text オペランドの暗黙連結は兄弟 Issue #3278、拒否 SQLSTATE の統一は #3277 の担当。
+//! 非 text オペランドの暗黙連結（Issue #3278。`CAST(.. AS text)` と同じ変換）・曖昧な型の組の
+//! fail-closed・多段連鎖の線形束縛もここで固定する。非 text 同士の拒否 SQLSTATE の統一は #3277 の担当。
 
-use engine::catalog::{ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema};
+use engine::catalog::{
+    ArrayElemType, ArrayType, ColumnDef, ColumnType, TableSchema, MAX_ARRAY_ELEMENTS,
+};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
@@ -92,6 +95,29 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
                 ColumnDef::new("ch", ColumnType::Bpchar(5), true),
                 ColumnDef::new("n", ColumnType::Integer, true),
                 ColumnDef::new("docb", ColumnType::Jsonb, true),
+                ColumnDef::new("f", ColumnType::Double, true),
+                ColumnDef::new(
+                    "nm",
+                    ColumnType::Numeric {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    true,
+                ),
+                ColumnDef::new("flag", ColumnType::Boolean, true),
+                ColumnDef::new("d", ColumnType::Date, true),
+                ColumnDef::new("tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("u", ColumnType::Uuid, true),
+                ColumnDef::new("j", ColumnType::Json, true),
+                ColumnDef::new("bt", ColumnType::Bytea, true),
+                ColumnDef::new(
+                    "arr",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Integer, MAX_ARRAY_ELEMENTS)
+                            .expect("array type"),
+                    ),
+                    true,
+                ),
                 ColumnDef::new("doc", ColumnType::Json, true),
                 ColumnDef::new(
                     "ai",
@@ -124,9 +150,12 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
             &core,
             &ctx,
             &format!(
-                "INSERT INTO t (id, embedding, lang, body, vc, ch, n, docb) VALUES \
-                 ({id}, '[0.{id},0.1]', {lang}, {body}, {vc}, {ch}, 1, '{{\"a\":1}}') \
-                 USING OPERATION_ID 'seed-{id}'"
+                "INSERT INTO t (id, embedding, lang, body, vc, ch, n, docb, f, nm, flag, d, tz, u, \
+                 j, bt, arr) VALUES \
+                 ({id}, '[0.{id},0.1]', {lang}, {body}, {vc}, {ch}, 1, '{{\"a\":1}}', \
+                 {id}.5, {id}.25, TRUE, '2026-01-0{id}', '2026-01-0{id} 10:00:00+00', \
+                 '00000000-0000-0000-0000-00000000000{id}', '{{\"k\": {id}}}', '\\x0{id}', \
+                 '{{1,{id}}}') USING OPERATION_ID 'seed-{id}'"
             ),
         )
         .unwrap_or_else(|e| panic!("insert should succeed: {e:?}"));
@@ -222,15 +251,159 @@ fn result_length_limit_rejected_with_54000() {
 }
 
 /// 構文・名前解決の拒否（型の組の分類とは別段）。
+// intentional: docs/design/json-expr-type-mapping.md
 #[test]
 fn syntax_and_name_errors_keep_their_codes() {
     let (core, ctx, _g) = setup();
+    // jsonb と型付き text の組・自前の `||` を持つ型との組は曖昧なため拒否のまま（Issue #3278）。
+    for sql in [
+        "SELECT docb || lang FROM t",
+        "SELECT lang || docb FROM t",
+        "SELECT embedding || 'x' FROM t",
+        // 種別を静的に決められない数値は CAST と同じく拒否。
+        "SELECT 'x' || id FROM t",
+        "SELECT 'x' || length(lang) FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+    // PG に演算子が無い組は 42883（#3277）。
+    assert_eq!(code(&core, &ctx, "SELECT n || n FROM t"), "42883");
     assert_eq!(code(&core, &ctx, "SELECT lang || FROM t"), "42601");
     assert_eq!(code(&core, &ctx, "SELECT lang || nope_col FROM t"), "42703");
+    // CAST が拒否する形と一致する。
+    assert_eq!(code(&core, &ctx, "SELECT CAST(id AS text) FROM t"), "0A000");
     // 反対側の束縛エラーは型の組の判定より先に出る（json 列が左でも `42703`）。
     assert_eq!(code(&core, &ctx, "SELECT doc || nope_col FROM t"), "42703");
     assert_eq!(code(&core, &ctx, "SELECT docb || nope_col FROM t"), "42703");
     assert_eq!(code(&core, &ctx, "SELECT docb || '{' FROM t"), "22P02");
+}
+
+#[test]
+fn non_text_operands_concat_like_cast() {
+    let (core, ctx, _g) = setup();
+    let r = run(&core, &ctx, "SELECT 'n=' || 5");
+    assert_eq!(one(&r), s("n=5"));
+    assert_eq!(first_ty(&r), Some(ColumnType::Text));
+    for (sql, want) in [
+        ("SELECT 'n=' || 5;", "n=5"),
+        ("SELECT 5 || 'x'", "5x"),
+        ("SELECT 'x' || 1.5", "x1.5"),
+    ] {
+        assert_eq!(one(&run(&core, &ctx, sql)), s(want), "{sql}");
+    }
+    let r = run(&core, &ctx, "SELECT lang || n FROM t");
+    assert_eq!(texts(&r), vec![s("ja1"), None, s("en1")]);
+    let r = run(&core, &ctx, "SELECT n || lang FROM t");
+    assert_eq!(texts(&r), vec![s("1ja"), None, s("1en")]);
+    let r = run(&core, &ctx, "SELECT lang || '-' || n || '-' || body FROM t");
+    assert_eq!(texts(&r), vec![s("ja-1--a"), None, s("en-1--c")]);
+    // 型ごとに `CAST(c AS text)` と同じ値になる。
+    for c in ["n", "f", "nm", "flag", "d", "tz", "u", "j"] {
+        let lhs = run(&core, &ctx, &format!("SELECT 'x' || {c} FROM t"));
+        let rhs = run(
+            &core,
+            &ctx,
+            &format!("SELECT 'x' || CAST({c} AS text) FROM t"),
+        );
+        assert_eq!(texts(&lhs), texts(&rhs), "column {c}");
+        assert_eq!(texts(&lhs).len(), 3, "column {c}");
+        assert!(texts(&lhs).iter().all(Option::is_some), "column {c}");
+    }
+    // json は原文のまま text 連結になる。
+    let r = run(&core, &ctx, "SELECT j || 'x' FROM t");
+    assert_eq!(texts(&r)[0], s("{\"k\": 1}x"));
+    // NULL は NULL。
+    let r = run(&core, &ctx, "SELECT CAST(NULL AS integer) || 'x'");
+    assert_eq!(texts(&r), vec![None]);
+}
+
+#[test]
+fn timestamptz_concat_follows_session_time_zone() {
+    let (core, ctx, _g) = setup();
+    let mut sess = SessionState::default();
+    for zone in ["UTC", "Asia/Tokyo"] {
+        core.execute_sql_in_session(&ctx, &mut sess, &format!("SET TIME ZONE '{zone}'"))
+            .unwrap_or_else(|e| panic!("set time zone: {e:?}"));
+        let q = |sql: &str, sess: &mut SessionState| match core
+            .execute_sql_in_session(&ctx, sess, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+        {
+            SqlOutcome::Query(r) => texts(&r),
+            other => panic!("expected Query, got {other:?}"),
+        };
+        let a = q("SELECT 'x' || tz FROM t", &mut sess);
+        let b = q("SELECT 'x' || CAST(tz AS text) FROM t", &mut sess);
+        assert_eq!(a, b, "{zone}");
+    }
+}
+
+#[test]
+fn deep_chain_with_non_text_leaves_binds_in_linear_time() {
+    let (core, ctx, _g) = setup();
+    let mut sql = String::from("SELECT lang");
+    for i in 0..40 {
+        sql.push_str(&format!(" || {i}"));
+    }
+    sql.push_str(" FROM t WHERE id = 1");
+    let started = std::time::Instant::now();
+    let r = run(&core, &ctx, &sql);
+    let want: String = (0..40).map(|i| i.to_string()).collect();
+    assert_eq!(one(&r), Some(format!("ja{want}")));
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
+#[test]
+fn non_text_concat_in_where_update_and_limit() {
+    let (core, ctx, _g) = setup();
+    let r = run(
+        &core,
+        &ctx,
+        "SELECT body FROM t WHERE 'n=' || n = 'n=1' AND id = 1",
+    );
+    assert_eq!(texts(&r), vec![s("-a")]);
+    run_opt(
+        &core,
+        &ctx,
+        "UPDATE t SET body = 'n=' || n WHERE id = 1 USING OPERATION_ID 'upd-3278'",
+    )
+    .unwrap_or_else(|e| panic!("update should succeed: {e:?}"));
+    let r = run(&core, &ctx, "SELECT body FROM t WHERE id = 1");
+    assert_eq!(texts(&r), vec![s("n=1")]);
+    assert_eq!(
+        code(&core, &ctx, "SELECT lpad('x', 4194304, 'y') || 1"),
+        "54000"
+    );
+    let r = run(&core, &ctx, "SELECT lpad('x', 4194303, 'y') || 1");
+    assert_eq!(one(&r).map(|v| v.len()), Some(4_194_304));
+}
+
+#[test]
+fn non_text_concat_in_insert_values() {
+    let (core, ctx, _g) = setup();
+    // リテラルの直後の `||` も INSERT VALUES では式として読む（Issue #3278）。
+    run_opt(
+        &core,
+        &ctx,
+        "INSERT INTO t (id, embedding, lang, body, vc, ch, n, docb) VALUES \
+         (7, '[0.7,0.1]', 'n=' || 5, 5 || 'x', 'v7', 'c', 1, '{}') USING OPERATION_ID 'ins-3278'",
+    )
+    .unwrap_or_else(|e| panic!("insert should succeed: {e:?}"));
+    let r = run(&core, &ctx, "SELECT lang FROM t WHERE id = 7");
+    assert_eq!(texts(&r), vec![s("n=5")]);
+    let r = run(&core, &ctx, "SELECT body FROM t WHERE id = 7");
+    assert_eq!(texts(&r), vec![s("5x")]);
+}
+
+#[test]
+fn non_text_concat_respects_tenant_boundary() {
+    let (core, ctx, _g) = setup();
+    let r = run(&core, &ctx, "SELECT lang || n FROM t");
+    assert_eq!(texts(&r).len(), 3);
+    for v in texts(&r).into_iter().flatten() {
+        assert!(!v.contains("secret"), "other tenant value leaked: {v}");
+    }
+    let r = run(&core, &ctx_for("t2"), "SELECT lang || n FROM t");
+    assert_eq!(texts(&r), vec![s("secret1")]);
 }
 
 /// PG に演算子が無い組は、被演算子の形（リテラル・列・CAST・json 列の左右）・句の位置
@@ -271,37 +444,18 @@ fn pairs_without_an_operator_are_42883_in_every_shape() {
     }
 }
 
-/// text と非 text の組は、リテラル・列・CAST の形によらず `0A000`（暗黙連結は #3278）。
-// tracked: #3278
+/// text と jsonb の組（曖昧な組）は、被演算子の形によらず `0A000`。text と変換できる非 text の組は
+/// 連結になる（Issue #3278）。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3278 での変更」の拒否する組の項を参照。
 #[test]
-fn text_with_non_text_is_0a000_in_every_shape() {
+fn text_with_jsonb_is_0a000_in_every_shape() {
     let (core, ctx, _g) = setup();
-    let wrap = |expr: &str| {
-        [
-            format!("SELECT {expr}"),
-            format!("SELECT {expr} FROM t"),
-            format!("SELECT {expr}, count(*) FROM t GROUP BY lang"),
-            format!("SELECT lang FROM t WHERE ({expr}) IS NOT NULL"),
-        ]
-    };
-    for expr in [
-        "'a' || 1",
-        "1 || 'a'",
-        "CAST('a' AS text) || 1",
-        "CAST(1 AS int) || CAST('a' AS text)",
-    ] {
-        for sql in wrap(expr) {
-            assert_eq!(code(&core, &ctx, &sql), "0A000", "{sql}");
-        }
-    }
     for sql in [
-        "SELECT lang || 1 FROM t",
-        "SELECT n || lang FROM t",
         "SELECT docb || lang FROM t",
         "SELECT lang || docb FROM t",
-        "SELECT doc || lang FROM t",
-        "SELECT lang || doc FROM t",
-        "SELECT doc || '{}' FROM t",
+        "SELECT docb || CAST('a' AS text) FROM t",
+        "SELECT lang FROM t WHERE (docb || lang) IS NOT NULL",
     ] {
         assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
     }
@@ -403,7 +557,7 @@ fn rejection_does_not_depend_on_other_tenants_rows() {
     };
     // t3 は行を持たない（空の表）。t1・t2 は行を持つ。
     for sql in [
-        "SELECT lang || 1 FROM t",
+        "SELECT lang || docb FROM t",
         "SELECT n || n FROM t",
         "SELECT doc || n FROM t",
     ] {
@@ -459,6 +613,8 @@ fn jsonb_concat_is_unchanged() {
         cells0(&r),
         vec![Cell::Json("{\"a\":1,\"z\":2}".to_string())]
     );
+    // jsonb と数値は演算子なし（非 text 同士の組。統一は #3277）。
+    assert_eq!(code(&core, &ctx, "SELECT docb || n FROM t"), "42883");
 }
 
 /// 左結合の jsonb `||` を多段に連ねても束縛時間が段数に対して線形に収まる
