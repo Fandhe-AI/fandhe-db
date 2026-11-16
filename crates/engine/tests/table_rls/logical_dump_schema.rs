@@ -888,6 +888,56 @@ fn logical_dump_refreshes_only_materialized_views_with_the_tenants_own_entity() 
     assert_eq!(read(&src, "SELECT a FROM mv_empty"), Err("55000"));
 }
 
+/// SCHEMA 配下の matview（Issue #3287）は `CREATE MATERIALIZED VIEW s.mv` として往復し、実体を持つものは
+/// 末尾で `REFRESH` される。復元先で内部キーが振り直されても再ダンプが一致し、public の同名とも混ざらない。
+#[test]
+fn schema_scoped_materialized_views_round_trip() {
+    let p1 = unique_db_path("dump-scoped-matview-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-scoped-matview-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.base (a INTEGER PRIMARY KEY, b TEXT)",
+        "INSERT INTO app.base (a, b) VALUES (1, 'x'), (2, 'y')",
+        "CREATE MATERIALIZED VIEW app.mv_z (x, y) AS SELECT a, b FROM app.base",
+        "CREATE MATERIALIZED VIEW app.mv_a AS SELECT x FROM app.mv_z",
+        "CREATE MATERIALIZED VIEW app.mv_empty AS SELECT a FROM app.base WITH NO DATA",
+        "CREATE UNIQUE INDEX mv_z_uq ON app.mv_z (x)",
+        "CREATE TABLE pub_base (a INTEGER PRIMARY KEY)",
+        "CREATE MATERIALIZED VIEW mv_z AS SELECT a FROM pub_base WITH NO DATA",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let first = logical(&src, &scope);
+    let text: String = first
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("CREATE MATERIALIZED VIEW app."), "{text}");
+    assert!(!text.contains('#'), "{text}");
+    assert!(text.contains("REFRESH MATERIALIZED VIEW app."), "{text}");
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &first);
+    assert_eq!(first, logical(&dst, &scope), "re-dump must match");
+    let read = |core: &EngineCore, sql: &str| match run(core, "tenant-a", sql) {
+        Ok(SqlOutcome::Query(r)) => Ok(r.rows.len()),
+        Ok(other) => panic!("unexpected {other:?}"),
+        Err(e) => Err(e.wire_code()),
+    };
+    assert_eq!(read(&src, "SELECT x FROM app.mv_a LIMIT 10"), Ok(2));
+    // データは流していないので、再計算は空の基表を実体化する。
+    assert_eq!(read(&dst, "SELECT x FROM app.mv_a LIMIT 10"), Ok(0));
+    assert_eq!(
+        read(&dst, "SELECT a FROM app.mv_empty LIMIT 10"),
+        Err("55000")
+    );
+    assert_eq!(read(&dst, "SELECT a FROM mv_z LIMIT 10"), Err("55000"));
+}
+
 /// 他テナントの REFRESH・実体は、自テナントのダンプの成否にも内容にも影響しない。
 /// 共有の `populated` ではなく、自テナントの実体の有無で再計算を出すため（Issue #3097）。
 #[test]
