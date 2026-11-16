@@ -421,6 +421,56 @@ fn other_tenants_schema_scoped_sequences_do_not_affect_the_dump() {
     assert!(!b.iter().any(|(_, s)| s.contains("app.q")));
 }
 
+/// SCHEMA 配下の ENUM 型（`CREATE TYPE s.mood`。Issue #3288）が、同名の public の型と並んで往復で一致し、
+/// SCHEMA 修飾の `CREATE TYPE` として書き出される（共有の型が先）。他テナントの同名 SCHEMA・型は自テナントの
+/// ダンプの成否にも内容にも影響しない。
+#[test]
+fn schema_scoped_enum_types_round_trip_and_other_tenants_do_not_leak() {
+    let p1 = unique_db_path("dump-scoped-enum-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-scoped-enum-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TYPE mood AS ENUM ('p')",
+        "CREATE TYPE app.zeta AS ENUM ('a', 'it''s')",
+        "CREATE TYPE app.mood AS ENUM ('s')",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let before = dump(&src, &scope).expect("dump");
+    // 他テナントの同名 SCHEMA・型は自テナントのダンプを変えない。
+    ok(&src, "tenant-b", "CREATE SCHEMA app");
+    ok(&src, "tenant-b", "CREATE TYPE app.secret AS ENUM ('b')");
+    let after = dump(&src, &scope).expect("dump with other tenant state");
+    assert_eq!(before, after);
+    let types: Vec<&str> = after
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .filter(|s| s.starts_with("CREATE TYPE "))
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "CREATE TYPE \"mood\" AS ENUM ('p')",
+            "CREATE TYPE app.mood AS ENUM ('s')",
+            "CREATE TYPE app.zeta AS ENUM ('a', 'it''s')",
+        ]
+    );
+    assert!(!after.iter().any(|(_, s)| s.contains("secret")));
+    // 空の DB へ復元して再書き出しが一致する。
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &before);
+    assert_eq!(dump(&dst, &scope).expect("dump again"), before);
+    // tenant-b 自身のダンプには自分の型が出る。
+    let b = dump(&src, &SchemaDdlScope::shared_and_tenant("tenant-b")).expect("dump b");
+    assert!(b
+        .iter()
+        .any(|(_, s)| s == "CREATE TYPE app.secret AS ENUM ('b')"));
+}
+
 fn user(line: usize, name: &str, tenant: &str, ddl: bool) -> BootstrapUser {
     BootstrapUser {
         line,

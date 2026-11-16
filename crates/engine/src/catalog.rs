@@ -105,8 +105,10 @@ pub(crate) use materialized::read_materialized_view_in;
 const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog");
 
 /// ENUM 型定義（TABLE-14・TASK-198、Issue #890）を格納するテーブル。キーは
-/// 型名（`validate_identifier` で検証済み）、値は [`encode_enum_type_def`] で
-/// エンコードした語彙 blob。`CATALOG_TABLE`（列定義）とは独立したライフサイクルを
+/// 型名（裸の識別子＝public、または解決器が作る内部キー `#<schema_id>.<name>`＝テナントの SCHEMA 配下。
+/// [`validate_enum_type_name`] で検証済み。Issue #3288）、値は [`encode_enum_type_def`] で
+/// エンコードした語彙 blob。利用者向けの一覧 API・DDL 書き出しは内部キーをそのまま返さない
+/// （書き出しは `ddl_export` の所属判定で自テナントの SCHEMA 分だけ公開名へ戻す）。`CATALOG_TABLE`（列定義）とは独立したライフサイクルを
 /// 持つ名前空間で、列は型名の参照（[`ColumnType::Enum`]）のみを保持する。
 const ENUM_TYPES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("enum_types");
 
@@ -5477,15 +5479,23 @@ fn validate_enum_labels(labels: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// ENUM 型名の検証。識別子形式（[`validate_identifier`]）に加え、組み込み型名
-/// （[`RESERVED_TYPE_NAMES`]。大文字小文字を区別しない）との衝突を拒否する
-/// （Issue #890 D1。将来 SQL-23 の `CREATE TABLE` 型名解決での曖昧さを防ぐ）。
+/// ENUM 型名の検証。識別子形式に加え、組み込み型名（[`RESERVED_TYPE_NAMES`]。大文字小文字を
+/// 区別しない）との衝突を拒否する（Issue #890 D1。将来 SQL-23 の `CREATE TABLE` 型名解決での
+/// 曖昧さを防ぐ）。
+///
+/// Issue #3288: 型名は裸の名前（public）または解決器が作る内部キー `#<schema_id>.<name>`
+/// （[`namespace::RelationKey`]。SCHEMA 配下）を受理する。予約名の判定は名前部だけで行うため、
+/// SCHEMA 配下でも `s.int4` のような組み込み型名との衝突は同じく拒否される。
 fn validate_enum_type_name(name: &str) -> Result<()> {
-    validate_identifier(name)?;
-    let lower = name.to_ascii_lowercase();
+    let key = namespace::RelationKey::parse(name)?;
+    let bare = match &key {
+        namespace::RelationKey::Public(n) => n.as_str(),
+        namespace::RelationKey::InSchema { name, .. } => name.as_str(),
+    };
+    let lower = bare.to_ascii_lowercase();
     if RESERVED_TYPE_NAMES.contains(&lower.as_str()) {
         return Err(CatalogError::Invalid(format!(
-            "enum type name collides with a built-in type name: {name:?}"
+            "enum type name collides with a built-in type name: {bare:?}"
         )));
     }
     Ok(())
@@ -16192,9 +16202,11 @@ impl Storage {
     /// 呼ばれる。同名の型が既に存在する場合は上書きせず
     /// `Err(CatalogError::TypeAlreadyExists)`。
     pub fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<Arc<EnumTypeDef>> {
-        if CREATE_ONLY_RESERVED_TYPE_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        // 予約名の判定は名前部だけで行う（SCHEMA 配下の内部キーでも組み込み型の別名と衝突させない）。
+        let bare_name = namespace::relation_name_part(name);
+        if CREATE_ONLY_RESERVED_TYPE_NAMES.contains(&bare_name.to_ascii_lowercase().as_str()) {
             return Err(CatalogError::Invalid(format!(
-                "enum type name collides with a built-in type alias: {name:?}"
+                "enum type name collides with a built-in type alias: {bare_name:?}"
             )));
         }
         let encoded = encode_enum_type_def(name, &labels)?;
@@ -16222,7 +16234,7 @@ impl Storage {
 
     /// 定義済みの ENUM 型をスナップショット読み取りで取得する。
     pub fn get_enum_type(&self, name: &str) -> Result<Arc<EnumTypeDef>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(ENUM_TYPES_TABLE) {
             Ok(t) => t,
@@ -16247,7 +16259,7 @@ impl Storage {
     /// 世代を進行させる（多層防御。同一クエリ内でスキーマが再取得されない
     /// キャッシュ経路が新ラベルを見落とす可能性を保守的に潰す）。
     pub fn alter_enum_type_add_value(&self, name: &str, label: String) -> Result<Arc<EnumTypeDef>> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         validate_enum_label(&label)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         let updated = {
@@ -16284,7 +16296,7 @@ impl Storage {
     /// `Err(CatalogError::DependentObjectsStillExist)` で拒否する（SQL-23 結線時は
     /// `2BP01` へ写像する。Issue #890 D5・Issue #1194）。
     pub fn drop_enum_type(&self, name: &str) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
         {
             let dependents = dependent_tables_in_txn(&write_txn, name)?;
@@ -18241,6 +18253,18 @@ fn catalog_value_references_enum_type_in_table(
     type_name: &str,
     table_name: Option<&str>,
 ) -> Result<bool> {
+    catalog_value_references_any_enum_type(bytes, &|name| name == type_name, table_name)
+}
+
+/// [`catalog_value_references_enum_type_in_table`] の述語版（Issue #3288）。`is_target` が真を返す
+/// ENUM 型（列型・配列要素型）を 1 つでも参照すれば真。`DROP SCHEMA ... CASCADE` が配下の型の
+/// 集合を 1 回の走査で照合するために使う（型ごとに全表を再解析する「型数 × 表数」を避ける）。
+/// 破損時の fail-closed（`CorruptSchema`）は単一型版と同一。
+fn catalog_value_references_any_enum_type(
+    bytes: &[u8],
+    is_target: &dyn Fn(&str) -> bool,
+    table_name: Option<&str>,
+) -> Result<bool> {
     if bytes.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::CorruptSchema(format!(
             "catalog value too large: {} bytes",
@@ -18545,12 +18569,12 @@ fn catalog_value_references_enum_type_in_table(
                 "duplicate column name: {name:?}"
             )));
         }
-        if tag == "enum" && param == type_name {
+        if tag == "enum" && is_target(param) {
             found = true;
         }
         // 配列の要素型としての参照（Issue #1357）。見落とすと `DROP TYPE` が
         // `enum[]` 列の残るテーブルを素通しし fail-open になる。
-        if tag == "array" && array_param_enum_name(param)? == Some(type_name) {
+        if tag == "array" && array_param_enum_name(param)?.is_some_and(is_target) {
             found = true;
         }
     }
@@ -18857,6 +18881,56 @@ fn dependent_tables_in_txn(
         }
     }
     Ok(dependents)
+}
+
+/// `DROP SCHEMA ... CASCADE`（Issue #3288）が配下の ENUM 型 `types`（内部キー）を消す。
+/// [`CATALOG_TABLE`] を 1 回だけ走査して（各値の解析は 1 回。型数 × 表数にしない）、`types` のどれかを
+/// 参照する列が残っていれば `DependentObjectsStillExist`（`2BP01`）で何も消さずに返す。呼び出し元は
+/// 同じ write txn を commit せず破棄するため、不可逆な削除は起きない。破損した値は `CorruptSchema`。
+pub(super) fn drop_schema_enum_types_in_txn(
+    write_txn: &redb::WriteTransaction,
+    types: &[String],
+) -> Result<()> {
+    let set: std::collections::HashSet<&str> = types.iter().map(String::as_str).collect();
+    // 読み取り専用オープン（欠落時に空のカタログ表を作らない）。
+    match crate::storage::read_source::ReadSource::open_table(write_txn, CATALOG_TABLE) {
+        Ok(table) => {
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                if catalog_value_references_any_enum_type(
+                    value.value(),
+                    &|param| set.contains(param),
+                    Some(key.value()),
+                )? {
+                    return Err(CatalogError::DependentObjectsStillExist(
+                        "enum type".to_string(),
+                    ));
+                }
+            }
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
+    for ty in types {
+        table.remove(ty.as_str())?;
+    }
+    Ok(())
+}
+
+/// ENUM 型 `key`（裸の名前または内部キー）が定義済みか（Issue #3288。search_path の未修飾 `DROP TYPE`
+/// の参照ゲートが、SCHEMA 配下に同名の型があるかを引く）。読み取り専用で開き、表が無ければ偽。
+pub(crate) fn enum_type_exists_in<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    key: &str,
+) -> Result<bool> {
+    let table = match src.open_table(ENUM_TYPES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let found = table.get(key)?.is_some();
+    Ok(found)
 }
 
 /// `create_table` の write txn 内で、`schema` の各 `FOREIGN KEY` 宣言の参照先を
