@@ -66,6 +66,7 @@ mod sql53_dml_from_using_residual;
 mod sql53_dml_from_using_view;
 mod sql53_dml_where_subquery;
 mod sql53_explain_dml_from_using;
+mod sql53_single_table_dml_alias;
 mod sql54_ilike;
 mod sql54_is_distinct_from;
 mod sql54_is_distinct_from_params;
