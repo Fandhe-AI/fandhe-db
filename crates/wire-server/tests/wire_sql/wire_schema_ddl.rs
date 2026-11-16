@@ -352,3 +352,154 @@ fn wire_schema_with_elements_extended_query_and_permission_gate() {
         read_ready_for_query(&mut carol);
     }
 }
+
+/// ENUM 型の SCHEMA 配置（Issue #3288）。psql 形（末尾 `;` 付き・1 メッセージ 1 文）の簡易クエリで、修飾名の
+/// `CREATE TYPE`／`DROP TYPE` と `DROP SCHEMA ... CASCADE` が通り、固定タグを返す。同名の `public` の型と
+/// 共存し、拒否後も接続が使える。列型の `s.mood` は従来どおり構文エラー（Issue #3289）。
+// intentional: docs/design/schema-tenant-namespace.md
+// tracked: #3289
+#[test]
+fn wire_enum_type_in_schema_simple_query() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (sql, tag) in [
+        ("CREATE SCHEMA s;", "CREATE SCHEMA"),
+        ("CREATE TYPE s.mood AS ENUM ('a');", "CREATE TYPE"),
+        ("CREATE TYPE mood AS ENUM ('b');", "CREATE TYPE"),
+        ("DROP TYPE s.mood;", "DROP TYPE"),
+        ("DROP TYPE IF EXISTS s.mood;", "DROP TYPE"),
+        ("CREATE TYPE s.mood2 AS ENUM ('a');", "CREATE TYPE"),
+        ("DROP SCHEMA s CASCADE;", "DROP SCHEMA"),
+        ("DROP TYPE mood;", "DROP TYPE"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+    for (sql, sqlstate) in [
+        ("DROP TYPE s.mood;", "3F000"),
+        ("CREATE TYPE ghost.mood AS ENUM ('a');", "3F000"),
+        ("CREATE TYPE pg_catalog.mood AS ENUM ('a');", "0A000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+    // 拒否の後も接続は使える。列型の SCHEMA 修飾は未対応のまま。
+    send_simple_query(&mut stream, "CREATE SCHEMA s;");
+    assert_eq!(read_command_complete(&mut stream), "CREATE SCHEMA");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "CREATE TYPE s.mood AS ENUM ('a');");
+    assert_eq!(read_command_complete(&mut stream), "CREATE TYPE");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "CREATE TABLE t (id BIGINT, m s.mood);");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}
+
+/// 拡張クエリ（Parse／Bind／Execute）でも、末尾 `;` 付きの修飾名の `CREATE TYPE`／`DROP TYPE` が通る。
+#[test]
+fn wire_enum_type_in_schema_extended_query() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    send_simple_query(&mut stream, "CREATE SCHEMA s");
+    assert_eq!(read_command_complete(&mut stream), "CREATE SCHEMA");
+    read_ready_for_query(&mut stream);
+
+    for (name, sql, tag) in [
+        (
+            "c1",
+            "CREATE TYPE s.m2 AS ENUM ('a');",
+            &b"CREATE TYPE\0"[..],
+        ),
+        ("d1", "DROP TYPE s.m2;", &b"DROP TYPE\0"[..]),
+    ] {
+        send_length_prefixed_message(&mut stream, b'P', &parse_body(name, sql, 0));
+        let (kind, body) = read_message(&mut stream);
+        assert_eq!(
+            kind,
+            b'1',
+            "ParseComplete: {}",
+            String::from_utf8_lossy(&body)
+        );
+        send_length_prefixed_message(&mut stream, b'B', &bind_body("p1", name));
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b'2', "BindComplete");
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+        let (kind, body) = read_message(&mut stream);
+        assert_eq!(kind, b'C', "CommandComplete");
+        assert_eq!(body, tag);
+        send_length_prefixed_message(&mut stream, b'S', b"");
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b'Z');
+    }
+}
+
+/// 同名の SCHEMA・型を持つ 2 テナントの接続が互いに影響せず、SCHEMA を持たないテナントの応答は、どのテナント
+/// にも無い SCHEMA 名の応答と区別できない（`3F000`・名前以外は同一文言）。拒否後も接続が使える。
+#[test]
+fn wire_enum_type_in_schema_is_tenant_scoped() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+            ("carol", "tenant-c", "tr0ub4dor"),
+        ],
+        &["alice", "bob", "carol"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    let mut carol = authenticate_to_ready_for_query(addr, "carol", "tr0ub4dor");
+
+    for stream in [&mut alice, &mut bob] {
+        for (sql, tag) in [
+            ("CREATE SCHEMA shared;", "CREATE SCHEMA"),
+            ("CREATE TYPE shared.mood AS ENUM ('a');", "CREATE TYPE"),
+        ] {
+            send_simple_query(stream, sql);
+            assert_eq!(read_command_complete(stream), tag);
+            read_ready_for_query(stream);
+        }
+    }
+    // carol は SCHEMA `shared` を持たない。どのテナントにも無い `ghost` と同じ SQLSTATE・文言（名前以外）。
+    for (sql, ghost_sql) in [
+        ("DROP TYPE shared.mood;", "DROP TYPE ghost.mood;"),
+        (
+            "CREATE TYPE shared.mood AS ENUM ('a');",
+            "CREATE TYPE ghost.mood AS ENUM ('a');",
+        ),
+    ] {
+        send_simple_query(&mut carol, sql);
+        expect_error_response_with_sqlstate_and_message(
+            &mut carol,
+            "3F000",
+            "schema does not exist: shared",
+        );
+        read_ready_for_query(&mut carol);
+        send_simple_query(&mut carol, ghost_sql);
+        expect_error_response_with_sqlstate_and_message(
+            &mut carol,
+            "3F000",
+            "schema does not exist: ghost",
+        );
+        read_ready_for_query(&mut carol);
+    }
+    // bob の型の削除は alice の型に影響しない。
+    send_simple_query(&mut bob, "DROP TYPE shared.mood;");
+    assert_eq!(read_command_complete(&mut bob), "DROP TYPE");
+    read_ready_for_query(&mut bob);
+    send_simple_query(&mut alice, "CREATE TYPE shared.mood AS ENUM ('z');");
+    expect_error_response_with_sqlstate(&mut alice, "42710");
+    read_ready_for_query(&mut alice);
+    // 拒否の後も接続が使える。
+    send_simple_query(&mut carol, "CREATE SCHEMA own;");
+    assert_eq!(read_command_complete(&mut carol), "CREATE SCHEMA");
+    read_ready_for_query(&mut carol);
+}
