@@ -211,7 +211,7 @@ fn reject_forbidden_elements(predicates: &[WherePredicate]) -> Result<(), SqlSur
                         walk(branch)?;
                     }
                 }
-                // 行値比較は評価が未対応（tracked: #3256）。
+                // 行値比較は評価が未対応の文脈（tracked: #3254）。
                 WherePredicate::IdCompare { .. }
                 | WherePredicate::CorrelatedExists(_)
                 | WherePredicate::RowCompare { .. } => {
