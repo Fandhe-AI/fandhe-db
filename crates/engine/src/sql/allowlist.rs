@@ -22955,6 +22955,20 @@ pub(super) fn probe_from_table_ref(tokens: &[Token]) -> Option<(TableRef, usize)
     p.from_ref.take().map(|r| (r, consumed))
 }
 
+/// 別名つき単一表 `UPDATE`／`DELETE`（FROM／USING なし。Issue #3291・SQL-53 ポインタ）の対象表の
+/// 直後のトークン列から `[[AS] <別名>]` を試し解析し、別名と消費トークン数を返す（別名が無い・
+/// 解析不能なら `None`）。`sql::dml_target_alias` が入口のトークン正規化の前に別名の有無を
+/// 先読みするための入口で、別名・予約語の規則を [`Parser::parse_relation_alias`]
+/// （FROM／USING 形の対象表と同じ [`is_dml_target_reserved_word`]）に一本化する（第 2 の実装を
+/// 持たない）。`AS` の直後が予約語・不正な識別子の場合は `None` とし、既存解析器の `42601` に委ねる。
+pub(super) fn probe_dml_target_alias(tokens: &[Token]) -> Option<(String, usize)> {
+    let mut p = Parser::new(tokens);
+    let alias = p
+        .parse_relation_alias(is_dml_target_reserved_word, "DML target")
+        .ok()??;
+    Some((alias, p.pos))
+}
+
 /// JOIN 構文かどうかをバックトラックせず先読みだけで判定する（Issue #925
 /// §2.2・#926。Issue #1833 でカンマ区切りの表参照〔`FROM a, b`〕も対象に加えた）。
 /// `validate_sql_tokens_impl` の集計・`DISTINCT`・集合演算の判定より前に呼ぶ。括弧深さ 0 の最初の `FROM` の直後が `<ident> [[AS] <alias>]
