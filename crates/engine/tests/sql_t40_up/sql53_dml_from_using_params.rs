@@ -173,6 +173,22 @@ fn set_and_where_params_match_literal_forms() {
     );
 }
 
+/// 公開名は大文字小文字を区別して完全一致で解決する（束縛段と同じ）。別名 `x` と `X` は別の表を指し、
+/// `X.c`（FROM 側 Text）の型は先頭の `x`（対象表 Integer）に引き寄せられない（Issue #3297）。
+#[test]
+fn where_param_type_uses_exact_case_qualifier() {
+    let (core, path) = new_core("p3297-exact-case");
+    let _g = CleanupGuard(path);
+    let prepared = core
+        .parse_sql_prepared("DELETE FROM docs x USING langs X WHERE x.lang = X.lang AND X.c = $1")
+        .expect("parse");
+    let t = prepared.param_types().first().cloned().expect("slot");
+    assert!(
+        matches!(t, PreparedParamType::Text | PreparedParamType::Column(_)),
+        "{t:?}"
+    );
+}
+
 /// WHERE の修飾付き列の型は修飾子の表で引く（対象表の同名列 `c` は Integer、FROM 側は Text）。
 #[test]
 fn where_param_type_follows_the_qualifier() {

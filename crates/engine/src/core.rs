@@ -9201,7 +9201,7 @@ impl EngineCore {
                     Some(rels) => match name.split_once('\u{1}') {
                         Some((qualifier, col)) => rels
                             .iter()
-                            .find(|(exposed, _)| exposed.eq_ignore_ascii_case(qualifier))
+                            .find(|(exposed, _)| exposed == qualifier)
                             .and_then(|(_, t)| column_type(t, col)),
                         None => {
                             let mut hits = rels.iter().filter_map(|(_, t)| column_type(t, name));
@@ -9274,9 +9274,7 @@ impl EngineCore {
                             joined_rels
                                 .as_deref()
                                 .and_then(|rels| {
-                                    rels.iter().find(|(exposed, _)| {
-                                        exposed.eq_ignore_ascii_case(qualifier)
-                                    })
+                                    rels.iter().find(|(exposed, _)| exposed == qualifier)
                                 })
                                 .and_then(|(_, t)| column_type(t, column)),
                             Some(ParamContextKind::Operator),
