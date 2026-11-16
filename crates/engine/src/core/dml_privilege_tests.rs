@@ -183,6 +183,22 @@ fn joined_dml_returning_needs_select_on_the_from_table() {
     assert_eq!(f.count("ca"), 0);
 }
 
+/// `UPDATE ... FROM` の SET が FROM 側の列を式・行値代入で参照する形（Issue #3296）も、書き込み先の
+/// 権限だけでは足りず FROM 側の表への `SELECT` を要求する（列参照 1 個の形と同じゲート）。拒否時は行不変。
+#[test]
+fn joined_update_set_expression_needs_select_on_the_from_table() {
+    let f = fx("dmlpriv-joined-set-expr");
+    f.admin_run(&ins("ca", 1, "j1"));
+    f.admin_run(&ins("cb", 1, "j2"));
+    f.admin_run("GRANT SELECT, UPDATE ON ca TO alice");
+    let expr = "UPDATE ca SET n = cb.n + 1 FROM cb WHERE ca.id = cb.id";
+    let row = "UPDATE ca SET (n) = ROW(cb.n + 1) FROM cb WHERE ca.id = cb.id";
+    assert_eq!(f.alice_run(expr), "42501");
+    assert_eq!(f.alice_run(row), "42501");
+    f.admin_run("GRANT SELECT ON cb TO alice");
+    assert_eq!(f.alice_run(expr), "ok");
+}
+
 /// FROM／USING 内の `JOIN` で加わる表にも `SELECT` が要る（Issue #3294）。書き込み先（`ca`）の権限だけの
 /// ロールは、JOIN の先の `cb` を読む文を `42501` で拒否され、行は変化しない。付与後は同じ文が通る。
 #[test]

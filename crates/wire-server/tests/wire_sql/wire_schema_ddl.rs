@@ -355,9 +355,7 @@ fn wire_schema_with_elements_extended_query_and_permission_gate() {
 
 /// ENUM 型の SCHEMA 配置（Issue #3288）。psql 形（末尾 `;` 付き・1 メッセージ 1 文）の簡易クエリで、修飾名の
 /// `CREATE TYPE`／`DROP TYPE` と `DROP SCHEMA ... CASCADE` が通り、固定タグを返す。同名の `public` の型と
-/// 共存し、拒否後も接続が使える。列型の `s.mood` は従来どおり構文エラー（Issue #3289）。
-// intentional: docs/design/schema-tenant-namespace.md
-// tracked: #3289
+/// 共存し、拒否後も接続が使える。列型・キャストの型名位置の `s.mood`（Issue #3289）も末尾 `;` 付きで通る。
 #[test]
 fn wire_enum_type_in_schema_simple_query() {
     let (core, _guard) = new_core();
@@ -388,15 +386,47 @@ fn wire_enum_type_in_schema_simple_query() {
         expect_error_response_with_sqlstate(&mut stream, sqlstate);
         read_ready_for_query(&mut stream);
     }
-    // 拒否の後も接続は使える。列型の SCHEMA 修飾は未対応のまま。
-    send_simple_query(&mut stream, "CREATE SCHEMA s;");
-    assert_eq!(read_command_complete(&mut stream), "CREATE SCHEMA");
+    // 拒否の後も接続は使える。列型・キャストの型名位置の SCHEMA 修飾（Issue #3289）も末尾 `;` 付きで通る。
+    for (sql, tag) in [
+        ("CREATE SCHEMA s;", "CREATE SCHEMA"),
+        ("CREATE TYPE s.mood AS ENUM ('c', 'a', 'b');", "CREATE TYPE"),
+        (
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.mood, ms s.mood[]);",
+            "CREATE TABLE",
+        ),
+        ("INSERT INTO s.t (id, m) VALUES (1, 'b');", "INSERT 0 1"),
+        ("INSERT INTO s.t (id, m) VALUES (2, 'c');", "INSERT 0 1"),
+        ("ALTER TABLE s.t ADD COLUMN m2 s.mood;", "ALTER TABLE"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+    // 語彙外ラベルは `22P02`。型が使われている間の `DROP TYPE` は `2BP01`。
+    // ラベル違反の文言は公開名（`s.mood`）で、内部キーの `#` を含まない。
+    send_simple_query(&mut stream, "INSERT INTO s.t (id, m) VALUES (3, 'zzz');");
+    expect_error_response_with_sqlstate_and_message(&mut stream, "22P02", "(enum \"s.mood\")");
     read_ready_for_query(&mut stream);
-    send_simple_query(&mut stream, "CREATE TYPE s.mood AS ENUM ('a');");
-    assert_eq!(read_command_complete(&mut stream), "CREATE TYPE");
-    read_ready_for_query(&mut stream);
-    send_simple_query(&mut stream, "CREATE TABLE t (id BIGINT, m s.mood);");
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+    for (sql, sqlstate) in [
+        ("DROP TYPE s.mood;", "2BP01"),
+        ("CREATE TABLE t (id BIGINT, m z.mood);", "3F000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+    // ORDER BY は宣言順（c < a < b）。ENUM の値はラベルのテキストで返る。
+    send_simple_query(&mut stream, "SELECT id, m FROM s.t ORDER BY m, id;");
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("2".to_string()), Some("c".to_string())]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("b".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
     read_ready_for_query(&mut stream);
 }
 
@@ -417,6 +447,18 @@ fn wire_enum_type_in_schema_extended_query() {
             "CREATE TYPE s.m2 AS ENUM ('a');",
             &b"CREATE TYPE\0"[..],
         ),
+        // 列型の型名位置の修飾（Issue #3289）も拡張クエリの Parse・Bind・Execute で通る。
+        (
+            "t1",
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.m2);",
+            &b"CREATE TABLE\0"[..],
+        ),
+        (
+            "a1",
+            "ALTER TABLE s.t ADD COLUMN m3 s.m2[];",
+            &b"ALTER TABLE\0"[..],
+        ),
+        ("x1", "DROP TABLE s.t;", &b"DROP TABLE\0"[..]),
         ("d1", "DROP TYPE s.m2;", &b"DROP TYPE\0"[..]),
     ] {
         send_length_prefixed_message(&mut stream, b'P', &parse_body(name, sql, 0));
@@ -502,4 +544,95 @@ fn wire_enum_type_in_schema_is_tenant_scoped() {
     send_simple_query(&mut carol, "CREATE SCHEMA own;");
     assert_eq!(read_command_complete(&mut carol), "CREATE SCHEMA");
     read_ready_for_query(&mut carol);
+}
+/// 値 1 個（テキスト形式）を束縛する Bind メッセージ本体。
+fn bind_body_one_text_param(portal: &str, statement: &str, value: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(portal.as_bytes());
+    body.push(0);
+    body.extend_from_slice(statement.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i16.to_be_bytes()); // param format code count
+    body.extend_from_slice(&1i16.to_be_bytes()); // param count
+    body.extend_from_slice(&(value.len() as i32).to_be_bytes());
+    body.extend_from_slice(value.as_bytes());
+    body.extend_from_slice(&0i16.to_be_bytes()); // result format code count
+    body
+}
+
+/// SCHEMA 配下の型を使う列へ、拡張クエリで `$1` に ENUM ラベルを渡して INSERT できる（Issue #3289）。語彙外の
+/// ラベルは `22P02` で、文言は公開名の型名を含み内部キーの `#` を含まない。拒否後も接続が使える。
+#[test]
+fn wire_schema_enum_column_accepts_bound_label_in_extended_query() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    for (sql, tag) in [
+        ("CREATE SCHEMA s;", "CREATE SCHEMA"),
+        ("CREATE TYPE s.mood AS ENUM ('a', 'b');", "CREATE TYPE"),
+        (
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.mood);",
+            "CREATE TABLE",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("ins", "INSERT INTO s.t (id, m) VALUES (1, $1);", 0),
+    );
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(
+        kind,
+        b'1',
+        "ParseComplete: {}",
+        String::from_utf8_lossy(&body)
+    );
+    send_length_prefixed_message(
+        &mut stream,
+        b'B',
+        &bind_body_one_text_param("p1", "ins", "a"),
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'2', "BindComplete");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p1", 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "CommandComplete");
+    assert_eq!(body, &b"INSERT 0 1\0"[..]);
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+
+    // 語彙外のラベル。Bind か Execute のどちらかで `22P02`（公開名の型名つき）。
+    send_length_prefixed_message(
+        &mut stream,
+        b'B',
+        &bind_body_one_text_param("p2", "ins", "zzz"),
+    );
+    let (mut kind, mut body) = read_message(&mut stream);
+    if kind == b'2' {
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 0));
+        (kind, body) = read_message(&mut stream);
+    }
+    assert_eq!(kind, b'E', "ErrorResponse");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("22P02"), "{text}");
+    assert!(text.contains("s.mood"), "{text}");
+    assert!(!text.contains('#'), "{text}");
+    send_length_prefixed_message(&mut stream, b'S', b"");
+    loop {
+        let (kind, _) = read_message(&mut stream);
+        if kind == b'Z' {
+            break;
+        }
+    }
+    send_simple_query(&mut stream, "SELECT id FROM s.t;");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("1".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
 }
