@@ -1191,6 +1191,40 @@ fn restore_splits_copy_by_every_engine_batch_limit() {
     assert!(!Path::new(&dest).exists());
     assert_no_temp_leftovers(&dir);
 }
+/// 既定の分割幅（4096 行）を超える 1 回の COPY を、復元が複数バッチに分けて commit できる。
+/// 環境変数は変えず既定のまま検証する（分割境界の前後 4100 行がすべて復元される）。
+#[test]
+fn restore_splits_copy_beyond_default_row_width() {
+    let fx = common::TempFixtureDir::new("dump-default-width");
+    let dir = dir_of(&fx.db_path_str());
+    let from = s(&dir.join("o.sql")).to_string();
+    const N: usize = 4100;
+    write_dump_with(
+        &from,
+        header(DumpScope::Tenant("t1".into()), DumpParts::All),
+        |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.copy_header("COPY t (id, b) FROM STDIN").expect("c");
+            for i in 0..N {
+                w.copy_row(&format!("{i}\tv{i}")).expect("r");
+            }
+            w.copy_end().expect("e");
+        },
+    );
+    let dest = s(&dir.join("d.redb")).to_string();
+    let o = run(&["dump-restore", "--from", &from, "--db", &dest]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let again = s(&dir.join("d.sql")).to_string();
+    let o = run(&dump_args(&dest, &again, &["--tenant", "t1"]));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let text = read_text(&again);
+    for i in [0, 4095, 4096, N - 1] {
+        assert!(text.contains(&format!("{i}\tv{i}\n")), "row {i}");
+    }
+    assert_eq!(text.matches("\tv").count(), N);
+    assert_no_temp_leftovers(&dir);
+}
+
 /// `dir` に `name` の通常ファイルを `mode` で置く。
 fn put_file(dir: &Path, name: &str, mode: u32) {
     let p = dir.join(name);
