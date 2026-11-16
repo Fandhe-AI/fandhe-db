@@ -255,7 +255,8 @@ fn plain_scan_order_by_remainder_key_is_rejected_and_keeps_connection() {
     expect_error_response_with_sqlstate(&mut a, "42601");
     read_ready_for_query(&mut a);
     let rows = read_rows(&mut a, "SELECT id FROM t WHERE n % 2 = 1 ORDER BY id;", 1);
-    assert_eq!(rows, strs(&[&["1"], &["2"], &["3"]]));
+    // -7 % 2 = -1（符号は被除数に従う）ため id 3 は含まれない。
+    assert_eq!(rows, strs(&[&["1"], &["2"]]));
 }
 
 #[test]

@@ -6317,17 +6317,17 @@ mod tests {
         let [single, atomic, part] = set_expr_hashes(&bin(BinOp::Rem, ident("n"), num("3")));
         assert_eq!(
             to_hex_1545(single.as_bytes()),
-            "GOLDEN_SINGLE",
+            "8c1c402b138483451c007c56593685d1aa864c494325524e8209a6e8bf572a29",
             "single-row SET n % 3 layout changed"
         );
         assert_eq!(
             to_hex_1545(atomic.as_bytes()),
-            "GOLDEN_ATOMIC",
+            "b96390d3e3a93c86a654ad32b0e4380a4a03284326bd8d27f9ca756b564fc829",
             "predicate-form SET n % 3 layout changed"
         );
         assert_eq!(
             to_hex_1545(part.as_bytes()),
-            "GOLDEN_PART",
+            "dda83443bb9b43c425fd012ef05de50d4514d57c8ff1f932222864d1cb1b038b",
             "partitioned SET n % 3 layout changed"
         );
 
