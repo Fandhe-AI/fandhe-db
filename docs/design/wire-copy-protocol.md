@@ -138,7 +138,7 @@
   - `HEADER`: 最初に確定した 1 レコードをヘッダ行として扱う（引用付き・チャンク境界をまたぐ
     ヘッダも同じ splitter で 1 レコードになる）。`true` は破棄、`MATCH` は列数と各列名
     （`id` 疑似列を含む COPY 列リスト。大小区別・NULL 不可）の一致を検査し、不一致は固定文言の
-    `22000`（ヘッダの内容は含めない）。ヘッダ行は行数①・チャンク数④・束縛の対象外で、生バイトは
+    `22000`（ヘッダの内容は含めない）。ヘッダ行は行数・チャンク数④・束縛の対象外で、生バイトは
     ③に従来どおり計上される（ヘッダ用の保持は 1 レコード分で③により有界）。
   - csv で `QUOTE`／`ESCAPE` が CR／LF の場合は、レコード終端と曖昧になるため CopyInResponse
     送出前に `0A000` で拒否する。
@@ -155,7 +155,7 @@
 - INDEX-4 の 4 上限（`batch_limits.rs`）: 複数行 `INSERT` は行を全て集めて
   から一括判定するのに対し、COPY はストリーミングであるため CopyDone を
   待たずに超過を検出する。`check_running_total`（③生 CopyData バイト量）は
-  `feed` の先頭で `pending` へ追加する前に判定し、①（行数）・④（生成チャンク
+  `feed` の先頭で `pending` へ追加する前に判定し、`--max-insert-rows`（行数。指定時のみ）・④（生成チャンク
   数。1 行=1 チャンクと読み替える既存の単文 INSERT 経路と同じ読み替え）・
   ②（当該行のデコード後バイト量）は完了したレコードごとに判定する。いずれの
   超過も副作用ゼロ（`Vec<BoundInsert>` へ積む前に拒否）。
@@ -220,9 +220,13 @@
    読み飛ばす）。(b) csv の `ESCAPE != QUOTE` で閉じ引用符直後の引用符は引用の再開として
    受理せず `22000`（PostgreSQL は受理。COPY TO はこの形を出力しない）。(c) text の
    `\<LF>`（エスケープされた改行による行継続）は未対応で、生 LF は常に行終端。
-5. **既定の①（`max_files_per_batch`）が 64 行**: 既定設定では 65 行以上の
-   COPY は `54000` になる。契約どおりの挙動だが、既知の運用上の制約
-   （起動時 CLI `--batch-max-files`〔優先〕または環境変数 `FANDHE_DB_BATCH_MAX_FILES` で上書き可能）として記録する。
+5. **行数の上限（Issue #3309 で変更。旧「既定の①が 64 行」）**: INDEX-4 ①
+   （`max_files_per_batch`）は COPY の行数に掛からない。既定構成でも 65 行以上の
+   COPY FROM STDIN（text・CSV・binary）が成功する。行数の上限は `--max-insert-rows`
+   指定時だけで（複数行 `VALUES` と同じ。超過は CopyData 受信中に `54000`）、未指定時の実効上限は
+   ④（1 行 = 1 チャンクで `max_batch_chunks`。既定 4096）になる。②（1 行のデコード後バイト量）・
+   ③（生 CopyData の累計）・④と 1 メッセージ上限（`framing::MAX_MESSAGE_LEN`）は従来どおり
+   受信中に `54000` で判定し、原子性（全行巻き戻し）・`operation_id` 台帳は変えない。
 6. **Flush（'H'）／Sync（'S'）の受理形状**: PostgreSQL wire v3 上この 2 種類は
    length=4（body 厳密に空）以外の形状を持たない。COPY サブプロトコル中に
    届いた場合は本文なしの no-op として無視するが、本文付き（宣言長が
@@ -252,7 +256,7 @@
 | `crates/engine/src/sql/allowlist.rs` | `validate_sql` → `validate_sql_tokens` への純粋な切り出し、`validate_copy`／`validate_copy_tokens`・`CopyStatement`・`ValidatedCopyFrom`／`ValidatedCopyTo`・`CopyFormat` |
 | `crates/engine/src/sql/copy.rs`（新設） | `is_copy_statement`・`RecordSplitter`・text／CSV デコーダ・`bind_copy_record`・`CopyInSession`／`CopyInBatch` |
 | `crates/engine/src/core.rs` | `CopyPlan`・`EngineCore::begin_copy`／`commit_copy_in` |
-| `crates/engine/src/batch_limits.rs` | 逐次判定ヘルパー（`check_row_count`／`check_row_body_len`／`check_running_total`） |
+| `crates/engine/src/batch_limits.rs` | 逐次判定ヘルパー（`check_row_body_len`／`check_running_total`） |
 | `crates/engine/tests/copy_from.rs`（新設） | engine API の層 A（原子性・INDEX-4・台帳共有・RLS・fail-closed） |
 | `crates/wire-server/src/copy.rs`（新設） | CopyIn／CopyOut サブプロトコル・行エンコーダ |
 | `crates/wire-server/src/handshake.rs` | 'Q' 分岐での COPY 委譲（`is_copy_statement` の覗き見） |
@@ -418,7 +422,7 @@ ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tes
 - 責務分割: フレーム解析（`BinaryCopyReader`）と型変換は wire-server、束縛・INDEX-4 上限・commit は engine。
   engine へは型変換済みの正規テキスト（`Vec<Option<String>>`）だけを `CopyInSession::feed_fields` で渡す。
   text/csv の `feed` と binary の `feed_fields` は、非公開の `RecordSink::push_record` を共有する
-  （判定順序は フィールド数照合 → ① 行数 → ④ チャンク数 → 束縛 → ② 行あたりのバイト量）。
+  （判定順序は フィールド数照合 → `--max-insert-rows`（指定時のみ）→ ④ チャンク数 → 束縛 → ② 行あたりのバイト量）。
   ③（生 CopyData 累計）は binary でも全 payload を `account_raw_bytes` で計上し、フレーム解析より前に判定する。
 - 事前拒否: 列リストに非対応型（VECTOR・DATE・TIMESTAMP・JSON・JSONB・配列・ENUM）があれば、
   `copy_binary_types::resolve_columns`（Issue #1768）で `CopyInResponse` を送る前に `0A000` で拒否する。

@@ -693,6 +693,34 @@ fn rows_ignore_max_files_per_batch() {
     assert_eq!(inserted, 3);
 }
 
+/// Issue #3309: 既定の ①（64）を超える 100 行が `rows[]` で受理され、SQL の複数行 `VALUES`
+/// （別 core）と同じ件数・同じ行集合になる（両表層が同じ束縛経路を共有する契約の確認）。
+#[test]
+fn rows_over_64_are_accepted_and_match_sql_multi_row_values() {
+    let default_like = limits(64, 100_000, 1_000_000, 4096);
+    let (http_core, _g1) = new_core(Some(default_like));
+    let (both, _sql) = spawn_both(http_core.clone());
+    let ok = query(&both, &insert_body_n_rows(100, "nosql-op-100-rows"));
+    let (inserted, _) = parse_insert_success_body(&ok);
+    assert_eq!(inserted, 100);
+
+    let (sql_core, _g2) = new_core(Some(default_like));
+    let ctx = PolicyContext::with_visibilities(TENANT_A, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant-a ctx");
+    let mut session = SessionState::default();
+    let rows: Vec<(u64, &str)> = (1..=100).map(|id| (id, "ja")).collect();
+    sql_core
+        .execute_sql_in_session(&ctx, &mut session, &multi_row_sql(&rows, "sql-op-100-rows"))
+        .expect("SQL multi-row VALUES over 64 rows succeeds");
+
+    let mut http_ids = read_back_ids(&http_core);
+    let mut sql_ids = read_back_ids(&sql_core);
+    http_ids.sort_unstable();
+    sql_ids.sort_unstable();
+    assert_eq!(http_ids.len(), 100);
+    assert_eq!(http_ids, sql_ids);
+}
+
 /// ④（1 行 = 1 チャンク）超過は 413・`54000`・副作用ゼロ。
 #[test]
 fn rows_over_max_batch_chunks_is_54000_without_side_effects() {

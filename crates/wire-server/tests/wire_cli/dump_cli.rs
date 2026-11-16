@@ -245,7 +245,7 @@ fn populated(label: &str, extra_alice: &[&str]) -> Fixture {
              (6, '\\N', 7, '[9,9,9]'), \
              (7, '', 8, '[8,8,8]')",
         );
-        // 1 回の COPY がバッチ上限を超える行数（復元が分割して commit できること）。
+        // 1 回の COPY が 1 バッチ分（既定 64 行の分割幅）を超える行数（復元が分割して commit できること）。
         for chunk in 0..3 {
             let values: Vec<String> = (0..50)
                 .map(|i| {

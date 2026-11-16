@@ -317,7 +317,9 @@ fn copy_from_binary_without_rows_is_rejected_like_text() {
 #[test]
 fn copy_from_binary_enforces_row_and_raw_byte_limits() {
     let limits = engine::batch_limits::BatchLimits {
+        // ① は COPY の行数に掛からない（Issue #3309）。行数の拒否は ④（1 行 = 1 チャンク）で行う。
         max_files_per_batch: 1,
+        max_batch_chunks: 1,
         max_batch_total_bytes: 64,
         ..engine::batch_limits::BatchLimits::default()
     };
@@ -329,13 +331,13 @@ fn copy_from_binary_enforces_row_and_raw_byte_limits() {
         .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
         .with_batch_limits(limits);
 
-    // ① 行数: 2 行目で 54000。
+    // ④ チャンク数（1 行 = 1 チャンク）: 2 行目で 54000。
     let mut s = begin_binary(&core, "copy-bin-3");
     s.feed_fields(record("1", "[1.0,0.0]", "ja"))
         .expect("row 1");
     let err = s
         .feed_fields(record("2", "[0.0,1.0]", "ja"))
-        .expect_err("row limit");
+        .expect_err("chunk limit");
     assert_eq!(err.wire_code(), "54000");
 
     // ③ 生バイト累計: 64 バイト超で 54000。
@@ -558,38 +560,148 @@ fn copy_from_stdin_empty_payload_is_rejected() {
 }
 
 #[test]
-fn copy_from_stdin_rejects_batch_over_row_count_limit() {
+fn copy_from_stdin_ignores_file_count_limit_for_rows() {
+    // INDEX-4 ①（`max_files_per_batch`）は COPY の行数に掛からない（Issue #3309）。
     let limits = engine::batch_limits::BatchLimits {
         max_files_per_batch: 2,
         ..engine::batch_limits::BatchLimits::default()
     };
-    let path = unique_db_path("copy-from-row-limit");
-    let _guard = CleanupGuard(path.clone());
-    let storage = Storage::open(&path).expect("open storage");
-    storage.create_table(&schema()).expect("create table");
-    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_ledger_mode(engine::recovery::required_op_id::LedgerMode::Ledgered)
-        .with_batch_limits(limits);
+    let (core, _guard) = open_engine_with_limits("copy-from-row-limit", limits);
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &copy_sql("copy-op-6"),
+        &[b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n3\t[1.0,1.0]\tja\n"],
+    )
+    .expect("rows over the file count limit are accepted");
+    assert_eq!(outcome.rows_affected, 3);
+    let mut ids = read_back_ids(&core, "acme");
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
 
-    let sql =
-        format!("COPY {TABLE} (id, embedding, lang) FROM STDIN USING OPERATION_ID 'copy-op-6'");
-    let policy = ctx("acme");
-    let session = SessionState::default();
-    let plan = core
-        .begin_copy(&policy, &session, &sql)
-        .expect("begin_copy");
-    let mut copy_session = match plan {
+fn begin_from(core: &EngineCore, op: &str) -> engine::sql::copy::CopyInSession {
+    match core
+        .begin_copy(&ctx("acme"), &SessionState::default(), &copy_sql(op))
+        .expect("begin_copy")
+    {
         CopyPlan::From(s) => s,
         CopyPlan::To(..) => panic!("expected FROM plan"),
-    };
-    // 上限 2 行を超える 3 行目で、CopyDone（`finish`）を待たずに拒否される
-    // ことを確認する。
-    let err = copy_session
-        .feed(b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n3\t[1.0,1.0]\tja\n")
-        .expect_err("row count over limit must be rejected before CopyDone");
-    assert_eq!(err.wire_code(), "54000");
+    }
+}
 
-    assert!(read_back_ids(&core, "acme").is_empty());
+fn rows_text(from: u64, to: u64) -> Vec<u8> {
+    let mut out = String::new();
+    for i in from..=to {
+        out.push_str(&format!("{i}\t[1.0,0.0]\tja\n"));
+    }
+    out.into_bytes()
+}
+
+fn count_rows(core: &EngineCore, tenant: &str) -> usize {
+    read_back_ids(core, tenant).len()
+}
+
+#[test]
+fn copy_from_stdin_accepts_more_than_64_rows_with_default_limits() {
+    let (core, path) = open_engine("copy-from-100-rows");
+    let _guard = CleanupGuard(path);
+    // text
+    let outcome = run_copy_from(
+        &core,
+        "acme",
+        &copy_sql("copy-100-t"),
+        &[&rows_text(1, 100)],
+    )
+    .expect("100 rows (text)");
+    assert_eq!(outcome.rows_affected, 100);
+    // csv
+    let sql = format!(
+        "COPY {TABLE} (id, embedding, lang) FROM STDIN WITH (FORMAT csv) USING OPERATION_ID 'copy-100-c'"
+    );
+    let csv: String = (101..=200)
+        .map(|i| format!("{i},\"[1.0,0.0]\",ja\n"))
+        .collect();
+    let outcome = run_copy_from(&core, "acme", &sql, &[csv.as_bytes()]).expect("100 rows (csv)");
+    assert_eq!(outcome.rows_affected, 100);
+    // binary（`feed_fields`）
+    let mut s = begin_binary(&core, "copy-100-b");
+    for i in 201..=300u32 {
+        s.feed_fields(record(&i.to_string(), "[1.0,0.0]", "ja"))
+            .expect("row");
+    }
+    let policy = ctx("acme");
+    let outcome = core
+        .commit_copy_in(&policy, s.finish().expect("finish"))
+        .expect("commit");
+    assert_eq!(outcome.rows_affected, 100);
+    // 他テナントからは見えない（RLS 相当の境界）。
+    assert_eq!(count_rows(&core, "other"), 0);
+}
+
+#[test]
+fn copy_from_stdin_rejects_chunk_and_body_overrun_after_64_rows() {
+    // ④: 80 行まで。81 行目で 54000（① 既定の 64 を過ぎた後も ④ で拒否される）。
+    let limits = engine::batch_limits::BatchLimits {
+        max_batch_chunks: 80,
+        ..engine::batch_limits::BatchLimits::default()
+    };
+    let (core, _guard) = open_engine_with_limits("copy-from-after64-chunk", limits);
+    let mut s = begin_from(&core, "copy-a64-c");
+    s.feed(&rows_text(1, 80)).expect("80 rows");
+    let err = s.feed(&rows_text(81, 81)).expect_err("81st row");
+    assert_eq!(err.wire_code(), "54000");
+    drop(s);
+    assert_eq!(count_rows(&core, "acme"), 0);
+
+    // ②: 70 行目の `lang` だけ大きい。
+    let limits = engine::batch_limits::BatchLimits {
+        max_file_body_bytes: ROW_BODY_LIMIT,
+        ..engine::batch_limits::BatchLimits::default()
+    };
+    let (core, _guard2) = open_engine_with_limits("copy-from-after64-body", limits);
+    let mut s = begin_from(&core, "copy-a64-b");
+    s.feed(&rows_text(1, 69)).expect("69 rows");
+    let err = s
+        .feed(b"70\t[1.0,0.0]\televenbytes\n")
+        .expect_err("oversized row");
+    assert_eq!(err.wire_code(), "54000");
+    drop(s);
+    assert_eq!(count_rows(&core, "acme"), 0);
+
+    // ③: 生 CopyData 累計。
+    let limits = engine::batch_limits::BatchLimits {
+        max_batch_total_bytes: 1500,
+        ..engine::batch_limits::BatchLimits::default()
+    };
+    let (core, _guard3) = open_engine_with_limits("copy-from-after64-total", limits);
+    let mut s = begin_from(&core, "copy-a64-t");
+    s.feed(&rows_text(1, 70)).expect("70 rows");
+    let err = s.feed(&rows_text(71, 100)).expect_err("total bytes");
+    assert_eq!(err.wire_code(), "54000");
+    drop(s);
+    assert_eq!(count_rows(&core, "acme"), 0);
+}
+
+#[test]
+fn copy_from_stdin_rejects_rows_over_max_insert_rows_before_copy_done() {
+    let (core, path) = open_engine("copy-from-max-insert-rows");
+    let _guard = CleanupGuard(path);
+    let core = core.with_dml_limits(engine::sql::parser::DmlLimits {
+        max_insert_rows_per_statement: std::num::NonZeroUsize::new(3),
+        ..engine::sql::parser::DmlLimits::default()
+    });
+    // ちょうど 3 行は成功する。
+    let outcome = run_copy_from(&core, "acme", &copy_sql("copy-mir-ok"), &[&rows_text(1, 3)])
+        .expect("3 rows at the limit");
+    assert_eq!(outcome.rows_affected, 3);
+    // 4 行目で CopyDone を待たず 54000。行も台帳も残らない。
+    let mut s = begin_from(&core, "copy-mir-ng");
+    let err = s.feed(&rows_text(11, 14)).expect_err("4th row");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(s.max_rows_per_batch(), 3);
+    drop(s);
+    assert_eq!(count_rows(&core, "acme"), 3);
 }
 
 #[test]
@@ -1170,7 +1282,7 @@ fn body_limit_limits() -> engine::batch_limits::BatchLimits {
 }
 
 fn chunk_limit_limits() -> engine::batch_limits::BatchLimits {
-    // ④ < ① にして ① が先に発火しないようにする。
+    // ④ だけを小さくして、行数の拒否が ④ で発火することを固定する（① は COPY に掛からない）。
     engine::batch_limits::BatchLimits {
         max_files_per_batch: 64,
         max_file_body_bytes: 1024 * 1024,

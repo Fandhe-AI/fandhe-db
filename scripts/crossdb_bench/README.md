@@ -232,7 +232,7 @@ doc・`crates/wire-server/docs/nosql-api.md`「転送路の共通規則」節）
 | `where_compound_count` | `filter[].op` が `eq`／`prefix` のみで範囲比較演算子が無く `id > 100` を表現できない |
 | `udf_call` | 宣言的 UDF 呼び出しに対応する `op` が許可リスト（4 値）に無い |
 | `explain` | `vector` 指定検索への `explain:true` は `42601` で拒否される契約（`plan` 検索の `EXPLAIN` は LLM プランナー未接続のため対象外） |
-| `ingest_bulk` | COPY 相当のストリーミング一括投入 op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当（1 要求あたり既定上限 64 行・INDEX-4 ①・要求ごとに commit）で、SQL 表層の COPY 計測と同形の分割投入は未実装 |
+| `ingest_bulk` | COPY 相当のストリーミング一括投入 op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当（INDEX-4 ① は掛からない〔Issue #3308〕・要求ごとに commit）で、SQL 表層の COPY 計測と同形の分割投入は未実装 |
 
 `group_by_having` は NoSQL の `aggregate`（`group_by`／`having`）に `ORDER BY`／
 `LIMIT` 相当のフィールドが無いため、`self_db.py` の `... ORDER BY n DESC

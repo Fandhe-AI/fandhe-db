@@ -17901,9 +17901,9 @@ impl EngineCore {
         }
 
         // 判定 3（`--max-insert-rows`）: NoSQL 表層の入口（`privilege` が `Some`）だけが掛ける。
-        // COPY の commit 経路（`privilege` が `None`）の行数判定は逐次判定側（Issue #3309 の範囲）
-        // が担い、ここで新たに拒否して挙動を変えない。①（max_files_per_batch）は行の形には
-        // 掛けない（Issue #3308）。
+        // COPY の commit 経路（`privilege` が `None`）の行数（`--max-insert-rows`・④）は
+        // `RecordSink::push_record` が CopyData 受信中に逐次判定済みで、ここで二重に拒否しない。
+        // ①（max_files_per_batch）は行の形には掛けない（Issue #3308・#3309）。
         if privilege.is_some() {
             self.check_insert_row_count_limit(row_count)?;
         }
@@ -18280,6 +18280,7 @@ impl EngineCore {
                         clock,
                         session.time_zone().clone(),
                         defer_not_null,
+                        self.dml_limits.max_insert_rows_per_statement,
                     )?
                     .with_row_security(session.row_security())
                     .with_privilege_recheck(
