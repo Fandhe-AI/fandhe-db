@@ -9,6 +9,7 @@
 
 ### Changed
 
+- 別名つき単一表の `UPDATE`／`DELETE`（`FROM`／`USING` なし）を受理するようにした（Issue #3291・SQL-53・RLS-10・RECOVER-10/11 ポインタ。判断は [update-from-delete-using.md](docs/design/update-from-delete-using.md) の「別名つき単一表 DML」節）。入口のトークン正規化で別名なしの同じ文へ書き換え、WHERE・SET 右辺・RETURNING の別名修飾が別名なし文と同じ結果になる。別名を付けた表を本名で修飾すると `42P01`。**挙動の変更**: 従来 `42601` で拒否していた `UPDATE t AS x SET ...`・`DELETE FROM t x WHERE ...` が通る。公開 API の型変更はない。
 - `--max-insert-rows` の起動時警告を、行の形の一括投入の実効上限である INDEX-4 ④（`max_batch_chunks`。既定 4096）の超過だけを判定するようにした（Issue #3310・WIRE-17・INDEX-4・SQL-16 ポインタ。判断は [sql-multi-row-insert.md](docs/design/sql-multi-row-insert.md) の「Issue #3310 追記」）。従来は ①（`max_files_per_batch`）も実効上限に含めており、`--max-insert-rows 100` で誤って警告した。警告は `FANDHE_DB_BATCH_MAX_CHUNKS` だけを案内し、`--batch-max-files` は案内しない。公開関数のシグネチャの変更・依存の追加はない。行数を増やした入力・巨大な 1 行に対する ②③④・文長・トークン数の拒否と副作用ゼロの試験、大量 COPY の ③ の計測ベンチ（`make bench-copy-volume`）を追加した。
 
 - `COPY FROM STDIN`（text・CSV・binary）の行数に、INDEX-4 ①（`--batch-max-files`／`FANDHE_DB_BATCH_MAX_FILES`。既定 64）を適用しないようにした（Issue #3309・WIRE-17・INDEX-4・NOSQL-6 ポインタ。判断は [wire-copy-protocol.md](docs/design/wire-copy-protocol.md) の既知の相違 5）。NoSQL `rows[]` は #3308 の変更どおりで、既定構成での 65 行以上の受理と SQL 経路との一致を結合テストで固定した。**挙動の変更**: 65 行以上の COPY が既定構成で受理される。行数の上限は `--max-insert-rows` を指定した場合だけ掛かり（従来 COPY には効かなかった）、超過は CopyData 受信中に `54000`・副作用ゼロ。②③④と 1 メッセージ上限は従来どおり、未指定時の実効上限は ④（既定 4096）。`dump-restore` の COPY 分割幅も ① でなく実効上限から求める。公開 API に `CopyInSession::max_rows_per_batch` を追加した。依存の追加はない。
