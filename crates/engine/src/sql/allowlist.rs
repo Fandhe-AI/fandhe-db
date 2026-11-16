@@ -4265,6 +4265,19 @@ pub enum DmlFromSetValue {
     Value(SetValue, Vec<String>),
     /// 列参照 1 個（`SET a = t.b` / `SET a = b`）。
     Column(ColumnRef),
+    /// 列参照を 1 個以上含む式（`SET a = u.x + 1`・`SET (a, b) = (u.x + 1, ...)` の要素。Issue #3296）。
+    /// `expr` の列参照は出現順に予約接頭辞つきのプレースホルダ識別子へ置き換え済みで、`refs[k]` が
+    /// プレースホルダ `k` の元の参照（修飾の有無とも保持）。解決は束縛段（`sql::dml_from`）が
+    /// 対象表と FROM 側を合わせたスコープで行う。名前ベースの書き換えをしないのは、対象表修飾の参照と
+    /// FROM 側の同名列を取り違えないため。
+    ///
+    /// **BREAKING CHANGE**（Issue #3296）: variant 追加。網羅 `match` する呼び出し元は腕の追加が必要。
+    Expr {
+        /// プレースホルダ入りの式。
+        expr: Expr,
+        /// プレースホルダ `k` に対応する元の列参照。
+        refs: Vec<ColumnRef>,
+    },
 }
 
 /// `UPDATE ... FROM`／`DELETE ... USING` の FROM／USING 側 1 relation の解決結果（Issue #3292）。
@@ -7214,6 +7227,10 @@ struct Parser<'a> {
     /// 非修飾の `Expr::Ident` へ正規化するが、曖昧性検査（`42702`）は非修飾で書かれた名前にだけ
     /// 適用する必要があり、その区別をここで運ぶ。
     dml_from_unqualified: Vec<String>,
+    /// `UPDATE ... FROM` の SET 右辺の式を解析している間だけ `Some`（Issue #3296）。式中の列参照を
+    /// 修飾の有無にかかわらず出現順に積み、式には予約接頭辞つきのプレースホルダ識別子
+    /// （[`crate::sql::dml_from::SET_REF_PREFIX`]）を置く。`RETURNING` 側は `None` のまま従来の挙動。
+    dml_from_set_refs: Option<Vec<ColumnRef>>,
     /// `Parser::new` が `Token::QuotedNull` 等を降格した複製を持つ間だけ、元のトークン列への 1 対 1 の
     /// 別名を `colref_sink` へ登録しておくガード（記録区間が無ければ何もしない）。
     _colref_alias: super::colref_sink::AliasGuard,
@@ -7313,6 +7330,7 @@ impl<'a> Parser<'a> {
             upsert_table: None,
             dml_from_target: None,
             dml_from_unqualified: Vec::new(),
+            dml_from_set_refs: None,
             legacy_implicit_id: false,
         }
     }
@@ -12998,7 +13016,16 @@ impl<'a> Parser<'a> {
                 self.consume_expr_node()?;
                 self.resolve_upsert_qualified_column(&qualifier, name)
             }
+            // `UPDATE ... SET <式> ... FROM` の右辺の修飾列参照（Issue #3296）。修飾の有無を保ったまま
+            // プレースホルダへ置き換え、解決は束縛段に任せる（FROM 側の列も参照できる）。
+            Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_set_refs.is_some() => {
+                self.sink_mark(self.pos, super::colref_sink::Role::Value);
+                self.advance();
+                self.consume_expr_node()?;
+                self.push_dml_from_set_ref(ColumnRef::qualified(qualifier, name))
+            }
             // `UPDATE ... SET <式> ... FROM` の右辺だけで有効な修飾列参照（SQL-53 (b)、Issue #1754）。
+            // `RETURNING` の式項目はこちらを使い、FROM 側の修飾は `0A000` のまま。
             Some(Token::QualifiedIdent { qualifier, name }) if self.dml_from_target.is_some() => {
                 self.sink_mark(self.pos, super::colref_sink::Role::Value);
                 self.advance();
@@ -13034,6 +13061,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 if matches!(self.peek(), Some(Token::Punct('('))) {
                     self.parse_call_expr(name, depth)
+                } else if self.dml_from_set_refs.is_some() {
+                    self.consume_expr_node()?;
+                    self.sink_mark(ident_at, super::colref_sink::Role::Value);
+                    self.push_dml_from_set_ref(ColumnRef::unqualified(name))
                 } else {
                     self.consume_expr_node()?;
                     if self.dml_from_target.is_some() {
@@ -13047,6 +13078,26 @@ impl<'a> Parser<'a> {
                 "unsupported expression term near {other:?}"
             ))),
         }
+    }
+
+    /// `UPDATE ... FROM` の SET 右辺の列参照を積み、式へ置くプレースホルダ識別子を返す（Issue #3296）。
+    /// 予約接頭辞（NUL 始まり）の名前は利用者が書けない綴りで、偽装されたものは `42601`（fail-closed）。
+    /// 参照数は呼び出し元が先に消費した式ノード予算（`MAX_EXPR_NODES`）で上限が掛かる。
+    fn push_dml_from_set_ref(&mut self, colref: ColumnRef) -> Result<Expr, SqlSurfaceError> {
+        if colref.name().starts_with('\u{0}') {
+            return Err(SqlSurfaceError::unsupported(
+                "reserved identifier prefix in UPDATE SET expression",
+            ));
+        }
+        let refs = self
+            .dml_from_set_refs
+            .as_mut()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?;
+        let name = format!("{}{}", crate::sql::dml_from::SET_REF_PREFIX, refs.len());
+        refs.push(colref);
+        Ok(Expr::Ident(name))
     }
 
     /// `DO UPDATE SET` 右辺の修飾列参照を式の列参照へ解決する（SQL-49、Issue #1739）。
@@ -15903,6 +15954,18 @@ impl<'a> Parser<'a> {
         &mut self,
         out: &mut Vec<(String, SetValue)>,
     ) -> Result<(), SqlSurfaceError> {
+        self.parse_row_assignment_with(out, Self::parse_update_set_rhs)
+    }
+
+    /// [`Self::parse_update_row_assignment`] の本体。右辺要素の解析器 `parse_value` だけを差し替えられる
+    /// ようにして、単一表 `UPDATE`（[`SetValue`]）と `UPDATE ... FROM`（[`DmlFromSetValue`]。
+    /// Issue #3296）が同じ規則（`ROW`・1 列は `ROW` 必須・個数不一致 `42601`・部分クエリ源 `0A000`・
+    /// 代入数の累計上限）を共有する。
+    fn parse_row_assignment_with<V>(
+        &mut self,
+        out: &mut Vec<(String, V)>,
+        mut parse_value: impl FnMut(&mut Self) -> Result<V, SqlSurfaceError>,
+    ) -> Result<(), SqlSurfaceError> {
         self.expect_punct('(')?;
         let mut columns: Vec<String> = Vec::new();
         loop {
@@ -15965,13 +16028,13 @@ impl<'a> Parser<'a> {
 
         let mismatch =
             || SqlSurfaceError::unsupported("number of columns does not match number of values");
-        let mut values: Vec<SetValue> = Vec::new();
+        let mut values: Vec<V> = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
             loop {
                 if values.len() >= columns.len() {
                     return Err(mismatch());
                 }
-                values.push(self.parse_update_set_rhs()?);
+                values.push(parse_value(self)?);
                 if matches!(self.peek(), Some(Token::Punct(','))) {
                     self.advance();
                     continue;
@@ -23280,7 +23343,8 @@ impl<'a> Parser<'a> {
         }
         match self.tokens.get(self.pos.saturating_add(1)) {
             None => true,
-            Some(Token::Punct(',' | ';')) => true,
+            // `)` は行値代入 `(a, b) = (u.x, u.y)` の要素の終端（Issue #3296）。
+            Some(Token::Punct(',' | ';' | ')')) => true,
             Some(Token::Keyword(Keyword::From | Keyword::Where)) => true,
             Some(Token::Ident(w)) => ["USING", "RETURNING", "PARTITIONED"]
                 .iter()
@@ -23289,15 +23353,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `UPDATE ... FROM` の SET 句 1 要素。行値の代入は `0A000`、左辺の修飾は `42601`（`expect_ident`）。
+    /// `UPDATE ... FROM` の SET 句 1 要素。`<col> = <右辺>` と行値代入 `(<col>, ...) = (<右辺>, ...)`／
+    /// `= ROW(...)`（Issue #3296）を受理する。左辺の修飾は `42601`（`expect_ident`）。
     fn parse_update_from_set_item(
         &mut self,
         out: &mut Vec<(String, DmlFromSetValue)>,
     ) -> Result<(), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct('('))) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "row-value assignment is not supported in UPDATE ... FROM",
-            ));
+            return self.parse_row_assignment_with(out, Self::parse_update_from_set_rhs);
         }
         if out.len() >= MAX_UPDATE_SET_ASSIGNMENTS {
             return Err(SqlSurfaceError::unsupported(
@@ -23306,15 +23369,27 @@ impl<'a> Parser<'a> {
         }
         let column = self.expect_ident()?;
         self.expect_punct('=')?;
-        let value = if self.peek_set_rhs_single_column() {
-            DmlFromSetValue::Column(self.parse_join_colref()?)
-        } else {
-            self.dml_from_unqualified.clear();
-            let v = self.parse_update_set_rhs()?;
-            DmlFromSetValue::Value(v, std::mem::take(&mut self.dml_from_unqualified))
-        };
+        let value = self.parse_update_from_set_rhs()?;
         out.push((column, value));
         Ok(())
+    }
+
+    /// `UPDATE ... FROM` の SET 右辺 1 つ（単純な代入・行値代入の要素で共有）。列参照 1 個は
+    /// [`DmlFromSetValue::Column`]、列参照を含む式は [`DmlFromSetValue::Expr`]（解析中だけ
+    /// `dml_from_set_refs` を有効にし、エラー時も元へ戻す）、それ以外（リテラル・`DEFAULT`・列参照の無い式）は
+    /// [`DmlFromSetValue::Value`]。
+    fn parse_update_from_set_rhs(&mut self) -> Result<DmlFromSetValue, SqlSurfaceError> {
+        if self.peek_set_rhs_single_column() {
+            return Ok(DmlFromSetValue::Column(self.parse_join_colref()?));
+        }
+        let prev = self.dml_from_set_refs.replace(Vec::new());
+        let parsed = self.parse_update_set_rhs();
+        let refs = std::mem::replace(&mut self.dml_from_set_refs, prev).unwrap_or_default();
+        let value = parsed?;
+        Ok(match value {
+            SetValue::Expr(expr) if !refs.is_empty() => DmlFromSetValue::Expr { expr, refs },
+            other => DmlFromSetValue::Value(other, Vec::new()),
+        })
     }
 
     /// `UPDATE <表> [[AS] <別名>] SET <代入>[, ...] FROM <rel>[, ...] [WHERE <join_where>]
@@ -33164,6 +33239,13 @@ mod tests {
         };
         ok("UPDATE a SET x = b.y FROM b WHERE a.id = b.id").expect("column rhs");
         ok("UPDATE a z SET x = 'k', y = DEFAULT FROM b q, c WHERE z.id = q.id").expect("alias");
+        // Issue #3296: 行値代入・FROM 側の列を含む式（修飾あり・なし）の構文は受理する。
+        ok("UPDATE a SET x = c.y + 1 FROM b").expect("qualified expression");
+        ok("UPDATE a SET x = y + 1 FROM b").expect("unqualified expression");
+        ok("UPDATE a SET (x, y) = (b.p, b.q) FROM b").expect("row of columns");
+        ok("UPDATE a SET (x, y) = ROW(b.p + 1, DEFAULT) FROM b")
+            .expect("row with expr and default");
+        ok("UPDATE a SET (x) = ROW(b.p), z = 1 FROM b").expect("single column row");
         ok("DELETE FROM a z USING b q WHERE z.id = q.id USING OPERATION_ID 'o'").expect("delete");
         // FROM／USING 内の JOIN ... ON と多方向結合（Issue #3294）
         ok("UPDATE a SET x = c.y FROM b JOIN c ON b.id = c.id WHERE a.id = b.id").expect("join");
@@ -33201,8 +33283,10 @@ mod tests {
             ),
             ("DELETE FROM a USING b JOIN c USING (id)", "0A000"),
             ("UPDATE a SET x = 1 FROM a", "42601"),
-            ("UPDATE a SET x = c.y + 1 FROM b", "0A000"),
-            ("UPDATE a SET (x, y) = (1, 2) FROM b", "0A000"),
+            ("UPDATE a SET (x, y) = (b.p) FROM b", "42601"),
+            ("UPDATE a SET (x) = (b.p) FROM b", "42601"),
+            ("UPDATE a SET (x, y) = (b.p, 1, 2) FROM b", "42601"),
+            ("UPDATE a SET (x, y) = (SELECT 1, 2) FROM b", "0A000"),
             ("DELETE FROM a USING b PARTITIONED", "42601"),
         ] {
             assert_eq!(ok(sql).expect_err(sql).wire_code(), code, "{sql}");

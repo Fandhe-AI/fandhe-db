@@ -551,23 +551,32 @@ fn rejected_forms_fail_closed_with_expected_codes() {
             "DELETE FROM docs USING langs WHERE NOT docs.lang = langs.lang",
             "42601",
         ),
-        // SET 左辺の修飾・行値代入
+        // SET 左辺の修飾
         (
             "UPDATE docs SET docs.lang = 'x' FROM langs WHERE docs.lang = langs.lang",
             "42601",
         ),
+        // 行値代入の形の誤り（Issue #3296。受理される形は sql53_dml_from_set_row_expr.rs）
         (
-            "UPDATE docs SET (lang, n) = ('x', 1) FROM langs WHERE docs.lang = langs.lang",
-            "0A000",
-        ),
-        // FROM 表の列を使う式
-        (
-            "UPDATE docs SET lang = upper(langs.lang) FROM langs WHERE docs.lang = langs.lang",
-            "0A000",
+            "UPDATE docs SET (lang, n) = ('x') FROM langs WHERE docs.lang = langs.lang",
+            "42601",
         ),
         (
-            "UPDATE docs SET lang = upper(label) FROM langs WHERE docs.lang = langs.lang",
+            "UPDATE docs SET (lang) = (langs.label) FROM langs WHERE docs.lang = langs.lang",
+            "42601",
+        ),
+        (
+            "UPDATE docs SET (lang, n) = (SELECT 'x', 1) FROM langs WHERE docs.lang = langs.lang",
             "0A000",
+        ),
+        // FROM 表の列を使う式の誤り（未知列・未知の修飾子・両表共通の非修飾名）
+        (
+            "UPDATE docs SET lang = upper(langs.nope) FROM langs WHERE docs.lang = langs.lang",
+            "42703",
+        ),
+        (
+            "UPDATE docs SET lang = upper(zz.lang) FROM langs WHERE docs.lang = langs.lang",
+            "42P01",
         ),
         // FROM 内の JOIN ... USING・NATURAL JOIN・カンマの後の明示 JOIN は意図的な拒否（0A000）
         (

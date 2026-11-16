@@ -335,6 +335,44 @@ fn view_source_reports_exact_tags_with_trailing_semicolon() {
     assert_eq!(count(&mut stream, ALL), 1);
 }
 
+/// Issue #3296: SET の行値代入と FROM 側の列を含む式は、末尾 `;` 付き単独送信でも `UPDATE n` を返し、
+/// 値が変わる（拒否されていた形が通る）。列数の不一致は `42601` で拒否される。
+#[test]
+fn set_row_value_and_source_expression_report_exact_tags() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = length(langs.lang) + 7 FROM langs WHERE docs.lang = langs.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(
+        count(&mut stream, "SELECT id FROM docs WHERE n = 9 LIMIT 10"),
+        2
+    );
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET (n, lang) = (length(langs.lang) + 1, langs.lang) FROM langs \
+         WHERE docs.lang = langs.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(
+        count(&mut stream, "SELECT id FROM docs WHERE n = 3 LIMIT 10"),
+        2
+    );
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET (n, lang) = (langs.lang) FROM langs WHERE docs.lang = langs.lang;",
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'E');
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
 /// Issue #3292: 一時表だけの形は同じ接続の簡易クエリで通る（同名の永続表には作用しない）。
 #[test]
 fn temp_only_joined_dml_reports_exact_tags() {

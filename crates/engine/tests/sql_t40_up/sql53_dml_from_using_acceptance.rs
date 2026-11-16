@@ -563,24 +563,26 @@ fn failed_joined_statement_fails_the_transaction() {
 // ---- 6. 自己結合 ----
 
 /// 自己結合（別名で公開名を分ける）: 同キー 3 行の自己結合で、多重一致でも各行 1 回だけ更新し、値は走査順で
-/// 最初の source 行（id=1。x=10）のもの。FROM 側列を含む算術式は未対応（`0A000`）で行は不変。
+/// 最初の source 行（id=1。x=10）のもの。FROM 側列を含む式（Issue #3296）も同じ規則で、
+/// autocommit と明示 Tx の両方で同じ結果になる。
 #[test]
-fn self_join_update_applies_first_source_once_and_rejects_unsupported_expressions() {
+fn self_join_update_applies_first_source_once_for_columns_and_expressions() {
     let alice = ctx("alice");
     for explicit in [false, true] {
         let (core, _g) = new_core("sql53-acc-self-upd");
         insert(&core, &alice, "t", 1, "a", 10);
         insert(&core, &alice, "t", 2, "a", 20);
         insert(&core, &alice, "t", 3, "a", 30);
-        let before = rows_t(&core, &alice);
-        let unsupported = "UPDATE t SET x = d2.x + t.x FROM t AS d2 WHERE t.k = d2.k";
-        let r = if explicit {
-            explicit_one(&core, &alice, unsupported, "ROLLBACK")
-        } else {
-            run(&core, &alice, unsupported).map_err(|e| e.wire_code().to_string())
-        };
-        assert_eq!(r.expect_err("expression"), "0A000");
-        assert_eq!(before, rows_t(&core, &alice));
+        let sql = "UPDATE t SET x = d2.x * 100 + t.x FROM t AS d2 WHERE t.k = d2.k";
+        assert_eq!(exec(&core, &alice, sql, explicit), tag("UPD", 3));
+        let rows = rows_t(&core, &alice);
+        for expected in ["1010", "1020", "1030"] {
+            assert!(rows.contains(expected), "{rows}");
+        }
+        let (core, _g) = new_core("sql53-acc-self-upd-col");
+        insert(&core, &alice, "t", 1, "a", 10);
+        insert(&core, &alice, "t", 2, "a", 20);
+        insert(&core, &alice, "t", 3, "a", 30);
         let sql = "UPDATE t SET x = d2.x FROM t AS d2 WHERE t.k = d2.k";
         assert_eq!(exec(&core, &alice, sql, explicit), tag("UPD", 3));
         let rows = rows_t(&core, &alice);
