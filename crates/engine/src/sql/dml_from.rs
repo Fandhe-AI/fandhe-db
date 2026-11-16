@@ -24,7 +24,7 @@ use crate::catalog::TableSchema;
 use crate::recovery::required_op_id::OperationId;
 use crate::row_codec::Value;
 use crate::sql::allowlist::{
-    DmlFromSetValue, JoinWhereExpr, JoinWherePredicate, SetValue, SqlSurfaceError,
+    DmlFromSetValue, DmlFromSource, JoinWhereExpr, JoinWherePredicate, SetValue, SqlSurfaceError,
     ValidatedDeleteUsing, ValidatedUpdateFrom,
 };
 use crate::sql::dml_from_returning::{bind_from_returning, BoundFromReturning};
@@ -44,6 +44,7 @@ pub struct BoundUpdateFrom {
     where_clause: Option<JoinWhereExpr>,
     returning: Option<BoundFromReturning>,
     operation_id: Option<OperationId>,
+    source_visible: Vec<Option<Vec<String>>>,
 }
 
 impl BoundUpdateFrom {
@@ -88,6 +89,12 @@ impl BoundUpdateFrom {
         self.returning.as_ref()
     }
 
+    /// FROM／USING 側の relation ごとの見える列（Issue #3292。ビュー source の公開列。`None` は制限なし）。
+    /// 変換器が同じ束縛スコープを再構築するために使う。
+    pub(crate) fn source_visible(&self) -> &[Option<Vec<String>>] {
+        &self.source_visible
+    }
+
     /// 検証済みの `operation_id`。
     pub fn operation_id(&self) -> Option<&OperationId> {
         self.operation_id.as_ref()
@@ -103,6 +110,7 @@ pub struct BoundDeleteUsing {
     where_clause: Option<JoinWhereExpr>,
     returning: Option<BoundFromReturning>,
     operation_id: Option<OperationId>,
+    source_visible: Vec<Option<Vec<String>>>,
 }
 
 impl BoundDeleteUsing {
@@ -126,6 +134,12 @@ impl BoundDeleteUsing {
         &self.where_columns
     }
 
+    /// FROM／USING 側の relation ごとの見える列（Issue #3292。ビュー source の公開列。`None` は制限なし）。
+    /// 変換器が同じ束縛スコープを再構築するために使う。
+    pub(crate) fn source_visible(&self) -> &[Option<Vec<String>>] {
+        &self.source_visible
+    }
+
     /// 検証済みの `operation_id`。
     pub fn operation_id(&self) -> Option<&OperationId> {
         self.operation_id.as_ref()
@@ -138,6 +152,7 @@ pub(crate) fn build_scope<'a>(
     target_schema: &'a TableSchema,
     others: &[TableRef],
     other_schemas: &[&'a TableSchema],
+    other_visible: &[Option<Vec<String>>],
 ) -> Result<BindingScope<'a>, SqlSurfaceError> {
     if others.len() != other_schemas.len() {
         return Err(SqlSurfaceError::Internal {
@@ -154,7 +169,22 @@ pub(crate) fn build_scope<'a>(
     for (r, s) in others.iter().zip(other_schemas.iter()) {
         relations.push((r.clone(), *s));
     }
-    BindingScope::new(relations)
+    // 先頭（対象表）は制限なし。FROM／USING 側はビューの公開列だけを見せる（Issue #3292）。
+    let visible = std::iter::once(None)
+        .chain(other_visible.iter().cloned())
+        .collect();
+    Ok(BindingScope::new(relations)?.with_visible(visible))
+}
+
+/// FROM／USING 側の解決結果から、relation ごとの見える列を作る（ビューは公開列、それ以外は制限なし）。
+pub(crate) fn visible_of(sources: &[DmlFromSource]) -> Vec<Option<Vec<String>>> {
+    sources
+        .iter()
+        .map(|s| match s {
+            DmlFromSource::View(v) => v.view_columns.clone(),
+            DmlFromSource::Table => None,
+        })
+        .collect()
 }
 
 /// `WHERE` の論理木が参照する列を出現順に集め、スコープで解決する。
@@ -262,7 +292,13 @@ pub(crate) fn bind_update_from_with_udfs(
     from_schemas: &[&TableSchema],
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundUpdateFrom, SqlSurfaceError> {
-    let scope = build_scope(&stmt.target, target_schema, &stmt.from, from_schemas)?;
+    let scope = build_scope(
+        &stmt.target,
+        target_schema,
+        &stmt.from,
+        from_schemas,
+        &visible_of(&stmt.sources),
+    )?;
     let where_columns = resolve_where_columns(&scope, stmt.where_clause.as_deref())?;
 
     let mut seen: HashSet<&str> = HashSet::new();
@@ -321,6 +357,7 @@ pub(crate) fn bind_update_from_with_udfs(
         where_clause: stmt.where_clause.as_deref().cloned(),
         returning,
         operation_id: stmt.operation_id.clone(),
+        source_visible: visible_of(&stmt.sources),
     })
 }
 
@@ -345,7 +382,13 @@ pub(crate) fn bind_delete_using_with_udfs(
     using_schemas: &[&TableSchema],
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundDeleteUsing, SqlSurfaceError> {
-    let scope = build_scope(&stmt.target, target_schema, &stmt.using, using_schemas)?;
+    let scope = build_scope(
+        &stmt.target,
+        target_schema,
+        &stmt.using,
+        using_schemas,
+        &visible_of(&stmt.sources),
+    )?;
     let where_columns = resolve_where_columns(&scope, stmt.where_clause.as_deref())?;
     let returning = stmt
         .returning
@@ -360,5 +403,6 @@ pub(crate) fn bind_delete_using_with_udfs(
         where_clause: stmt.where_clause.as_deref().cloned(),
         returning,
         operation_id: stmt.operation_id.clone(),
+        source_visible: visible_of(&stmt.sources),
     })
 }
