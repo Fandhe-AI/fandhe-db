@@ -1348,9 +1348,10 @@ fn rename_table_stays_in_the_schema() {
     );
 }
 
-/// MATERIALIZED VIEW と ENUM 型の SCHEMA 配置は未対応（fail-closed のまま）。
+/// MATERIALIZED VIEW の SCHEMA 配置は未対応（fail-closed のまま。Issue #3287）。
+// tracked: #3287
 #[test]
-fn matview_and_enum_type_placement_stay_unsupported() {
+fn matview_placement_stays_unsupported() {
     let (core, _g) = new_core("t27-objects-unsupported");
     let mut s = ddl_session();
     ok(&core, &mut s, "CREATE SCHEMA s");
@@ -1363,10 +1364,17 @@ fn matview_and_enum_type_placement_stay_unsupported() {
         ),
         "0A000"
     );
-    assert_eq!(
-        code(&core, &mut s, "CREATE TYPE s.mood AS ENUM ('a')"),
-        "42601"
-    );
+}
+
+/// ENUM 型は SCHEMA 配下に作成・削除できる（Issue #3288）。列型・キャストでの `s.mood` の解決は未対応
+/// （Issue #3289）で、従来どおり `42601`。
+// tracked: #3289
+#[test]
+fn enum_type_placement_works_but_column_type_resolution_stays_unsupported() {
+    let (core, _g) = new_core("t27-objects-enum-type");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "CREATE SCHEMA s");
+    ok(&core, &mut s, "CREATE TYPE s.mood AS ENUM ('a')");
     assert_eq!(
         code(
             &core,
@@ -1375,6 +1383,7 @@ fn matview_and_enum_type_placement_stay_unsupported() {
         ),
         "42601"
     );
+    ok(&core, &mut s, "DROP TYPE s.mood");
 }
 
 /// Rust API の生の表名（`EngineCore::insert_row` 等）は裸の識別子だけを受理し、SCHEMA 配下の内部キーを
