@@ -3041,6 +3041,18 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
     }
 }
 
+/// 行値比較の成分の `$n`（パターン 12。Issue #3257）の Describe 用ダミー候補
+/// （トークン添字・パラメータ番号・ダミー）。種別が `String` の番号のものだけが採用される。
+type RowDummyCandidate = (usize, u16, crate::sql::lexer::Token);
+
+/// [`EngineCore::infer_param_types`] の結果（`$n` ごとの型公告・宣言型の変換可否判定の入力・行値比較の
+/// Describe 用ダミー候補）。
+type InferredParams = (
+    Vec<crate::sql::params::PreparedParamType>,
+    Vec<crate::sql::param_coerce::ParamCheck>,
+    Vec<RowDummyCandidate>,
+);
+
 /// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
 /// 拡張クエリプロトコルの Parse が `$n` を含む SQL テキストを値未確定のまま
 /// 構造検証した「束縛前テンプレート」を運ぶ。行・台帳・世代のいずれにも触れて
@@ -3085,6 +3097,10 @@ pub struct PreparedSql {
     /// （PR #1012 Cursor Bugbot 指摘対応: `$n` を含まない等価述語では `false`
     /// のままとなり、実リテラルは通常の Describe と同じく必ず検証される）。
     where_equality_dummy_flags: Vec<bool>,
+    /// 行値比較の成分の `$n`（パターン 12。Issue #3257）に使った、相手列の型の Describe 用ダミー
+    /// （トークン添字 → ダミー）。`BEGIN` 時点のスナップショットでの再 parse
+    /// （[`EngineCore::reparse_dummy_with_snapshot`]）が `dummy_parsed` と同じ置換を再現するために保持する。
+    dummy_overrides: Vec<(usize, crate::sql::lexer::Token)>,
     /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
     /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
     param_types: Vec<crate::sql::params::PreparedParamType>,
@@ -8856,6 +8872,7 @@ impl EngineCore {
                 )),
                 literal_skip: crate::sql::parser::LiteralSkip::NONE,
                 where_equality_dummy_flags: Vec::new(),
+                dummy_overrides: Vec::new(),
                 param_types: Vec::new(),
                 declared: Vec::new(),
                 typed_positions: crate::sql::params::TypedPositions::default(),
@@ -8910,7 +8927,7 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let (param_types, param_checks) = match self.infer_param_types(
+        let (param_types, param_checks, row_dummies) = match self.infer_param_types(
             &tokens,
             param_count,
             declared,
@@ -8940,7 +8957,21 @@ impl EngineCore {
             crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds);
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
-        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
+        let dummy_overrides: Vec<(usize, crate::sql::lexer::Token)> = row_dummies
+            .into_iter()
+            .filter(|(_, n, _)| {
+                usize::from(*n)
+                    .checked_sub(1)
+                    .and_then(|k| kinds.get(k))
+                    .is_some_and(|k| *k == crate::sql::params::ParamLiteralKind::String)
+            })
+            .map(|(i, _, tok)| (i, tok))
+            .collect();
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed_with(
+            &tokens,
+            &kinds,
+            &dummy_overrides.iter().cloned().collect(),
+        );
         let parse_hits = crate::sql::temp_catalog::RelationHits::default();
         let dummy_parsed = {
             let positions: Vec<usize> = tokens
@@ -9008,6 +9039,7 @@ impl EngineCore {
             dummy_parsed,
             literal_skip,
             where_equality_dummy_flags,
+            dummy_overrides,
             param_types,
             declared: (0..usize::from(param_count))
                 .map(|i| declared.get(i).copied().flatten())
@@ -9048,13 +9080,7 @@ impl EngineCore {
         param_count: u16,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
         read_snap: Option<&redb::ReadTransaction>,
-    ) -> Result<
-        (
-            Vec<crate::sql::params::PreparedParamType>,
-            Vec<crate::sql::param_coerce::ParamCheck>,
-        ),
-        crate::sql::allowlist::SqlSurfaceError,
-    > {
+    ) -> Result<InferredParams, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::exec::ColumnMeta;
         use crate::sql::lexer::Token;
@@ -9305,7 +9331,23 @@ impl EngineCore {
                 }
             });
         }
-        Ok((out, checks))
+        // Issue #3257・パターン 12: 行値比較の成分の `$n` に使う、相手列の型の Describe 用ダミー候補
+        // （トークン添字・番号・ダミー）。種別が `String` のものだけが後段で採用される。
+        let mut row_dummies: Vec<(usize, u16, Token)> = Vec::new();
+        for (i, col) in crate::sql::params::row_compare_column_slots(tokens) {
+            let Some(Token::Param(n)) = tokens.get(i) else {
+                continue;
+            };
+            if let Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })) =
+                where_table.as_deref().and_then(|t| column_type(t, &col))
+            {
+                if let Some(tok) = crate::sql::params::row_compare_dummy_token(&ty)? {
+                    row_dummies.push((i, *n, tok));
+                }
+            }
+        }
+        row_dummies.sort_by_key(|(i, _, _)| *i);
+        Ok((out, checks, row_dummies))
     }
 
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
@@ -12067,7 +12109,11 @@ impl EngineCore {
             .iter()
             .map(|t| t.literal_kind())
             .collect();
-        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&prepared.tokens, &kinds);
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed_with(
+            &prepared.tokens,
+            &kinds,
+            &prepared.dummy_overrides.iter().cloned().collect(),
+        );
         let positions: Vec<usize> = prepared
             .tokens
             .iter()

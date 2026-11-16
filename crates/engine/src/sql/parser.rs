@@ -3632,7 +3632,7 @@ fn bind_where_predicates_recursive(
     )?;
     if !generated.is_empty() {
         let mut gen_ordinal = 0usize;
-        let (gen_meta, gen_expr, _gen_rls, gen_or) = bind_where_predicates_recursive(
+        let (gen_meta, gen_expr, gen_rls, gen_or) = bind_where_predicates_recursive(
             &generated,
             schema,
             udfs,
@@ -3651,6 +3651,9 @@ fn bind_where_predicates_recursive(
         metadata_filters.extend(gen_meta);
         expr_filters.extend(gen_expr);
         or_filters.extend(gen_or);
+        // 生成葉の `visible()` の有無も取りこぼさない（Issue #3257。捨てると可視性の絞り込みが
+        // 呼び出し元へ伝わらない fail-open の芽になる）。
+        rls_predicate_present |= gen_rls;
     }
     Ok((
         metadata_filters,

@@ -72,6 +72,15 @@
 //!     等価の葉ではないため序数に数えない。逆向き（`$n ~ <列>`）・両辺 `$n`・式の内側の `$n`
 //!     （`lower(s) ~ $1`）・`$1::text` は `42601` のまま。判定は `noneq_leaf_at` に集約する。
 //!
+//! 12. `SELECT／UPDATE／DELETE ... WHERE (<c1>, ..., <ck>) (= | <> | < | <= | > | >=) (<d1>, ..., <dk>)` の
+//!     成分のうち、成分全体が `$n` 単独の位置（Issue #3257・SQL-9・WIRE-12 のポインタ。パターン 9 と同じ
+//!     文種・`WHERE` 領域・左右の境界規則）。同じ位置の相手成分が裸の列なら `$n` の型はその列の型、
+//!     相手も `$n` なら型を決められず宣言型が無ければ `42P18`。相手がリテラル・式・修飾列の位置、
+//!     `$n` が式の内側（`$1 + 1`）の形は登録せず `42601`。`EXPLAIN` 前置・`WITH`・集合演算は先頭語・
+//!     集合演算の allowlist で対象外のまま `42601`。判定は `row_compare_param_slots` に集約し、受理・
+//!     推論・Describe 用ダミー置換が同じ表を参照する。展開で生成される比較葉は等価述語の序数に数えない。
+//!     Describe・構造検証用のダミーは相手列の型で有効な値（`row_compare_dummy_token`）。
+//!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
 //! 引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
@@ -692,6 +701,173 @@ fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option
     }
 }
 
+/// `tokens[open]`（`(`）に対応する `)` の添字を `end` 未満の範囲で線形に探す（深さ追跡のみ。
+/// 呼び出し側は比較演算子が続く場合に限って呼ぶため、文全体での走査量は有界）。
+fn matching_close(tokens: &[Token], open: usize, end: usize) -> Option<usize> {
+    let mut depth: usize = 0;
+    let mut j = open;
+    while j < end {
+        match tokens.get(j)? {
+            Token::Punct('(') => depth = depth.checked_add(1)?,
+            Token::Punct(')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// 行の 1 辺 `( e1 , ... , en )`（`open` が `(`、`close` が対応する `)`）を、括弧深さ 1・角括弧深さ 0 の
+/// `,` で区切った成分の `(開始, 終了)` 範囲（終了は排他）に分ける。成分数が
+/// [`crate::sql::allowlist::MAX_ROW_COMPARE_COMPONENTS`] を超える・空の成分がある場合は `None`
+/// （構文段が `54000`／`42601` で拒否する形のため、ここでは登録しない）。
+fn row_components(tokens: &[Token], open: usize, close: usize) -> Option<Vec<(usize, usize)>> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let (mut depth, mut bracket) = (0usize, 0usize);
+    let mut from = open + 1;
+    for j in open..=close {
+        match tokens.get(j)? {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Punct('[') => bracket += 1,
+            Token::Punct(']') => bracket = bracket.saturating_sub(1),
+            Token::Punct(',') if depth == 1 && bracket == 0 => {
+                if from >= j || out.len() >= crate::sql::allowlist::MAX_ROW_COMPARE_COMPONENTS {
+                    return None;
+                }
+                out.push((from, j));
+                from = j + 1;
+            }
+            _ => {}
+        }
+    }
+    if from >= close || out.len() >= crate::sql::allowlist::MAX_ROW_COMPARE_COMPONENTS {
+        return None;
+    }
+    out.push((from, close));
+    Some(out)
+}
+
+/// パターン 12 の構造判定の単一情報源（Issue #3257・SQL-9・WIRE-12 のポインタ）。
+/// `WHERE` 領域 `(start, end)` 内の行値比較 `( C1 , ... , Ck ) op ( D1 , ... , Dk )`
+/// （左 `(` の直前が [`is_noneq_left_boundary`]、右 `)` の直後が [`is_noneq_right_boundary`]、
+/// `op` は `= <> < <= > >=`、`2 <= k <= MAX_ROW_COMPARE_COMPONENTS`・左右同数）の成分のうち、
+/// 成分全体が `$n` 単独の位置だけを返す（トークン添字 → 分類）。分類は同じ位置の相手成分で決まる。
+/// - 裸の列（`true`／`false`／`null` を除く）: [`WhereParamShape::Column`]。
+/// - 単独の `$m`: [`WhereParamShape::Indeterminate`]。
+/// - それ以外（リテラル・式・修飾列。`$n` が式の内側の場合も含む）は登録せず、呼び出し側の
+///   既存経路で `42601` になる（fail-closed）。
+///
+/// 展開で生成される比較葉は Describe 用ダミーフラグの序数に数えられない（束縛段が別カウンタ・空フラグで
+/// 束縛する）ため、この `$n` は等価述語の序数にも数えない。
+fn row_compare_param_slots(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+) -> HashMap<usize, WhereParamShape> {
+    let mut out = HashMap::new();
+    let mut i = start + 1;
+    while i < end {
+        if !matches!(tokens.get(i), Some(Token::Punct('('))) || !is_noneq_left_boundary(tokens, i) {
+            i += 1;
+            continue;
+        }
+        let Some(close) = matching_close(tokens, i, end) else {
+            i += 1;
+            continue;
+        };
+        let op_at = close + 1;
+        let op_len = match tokens.get(op_at) {
+            Some(Token::Punct('=')) => Some(1),
+            _ => noneq_op_len(tokens, op_at),
+        };
+        let Some(op_len) = op_len else {
+            i += 1;
+            continue;
+        };
+        let r_open = op_at + op_len;
+        if !matches!(tokens.get(r_open), Some(Token::Punct('('))) {
+            i += 1;
+            continue;
+        }
+        let Some(r_close) = matching_close(tokens, r_open, end) else {
+            i += 1;
+            continue;
+        };
+        if !is_noneq_right_boundary(tokens, r_close + 1, end) {
+            i += 1;
+            continue;
+        }
+        let (Some(left), Some(right)) = (
+            row_components(tokens, i, close),
+            row_components(tokens, r_open, r_close),
+        ) else {
+            i += 1;
+            continue;
+        };
+        if left.len() != right.len() || left.len() < 2 {
+            i += 1;
+            continue;
+        }
+        let single = |range: (usize, usize)| -> Option<&Token> {
+            (range.1 == range.0 + 1)
+                .then(|| tokens.get(range.0))
+                .flatten()
+        };
+        let classify = |other: Option<&Token>| match other {
+            Some(Token::Param(_)) => Some(WhereParamShape::Indeterminate),
+            Some(Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
+            Some(Token::Ident(c))
+                if !c.eq_ignore_ascii_case("true")
+                    && !c.eq_ignore_ascii_case("false")
+                    && !c.eq_ignore_ascii_case("null") =>
+            {
+                Some(WhereParamShape::Column(c.clone()))
+            }
+            _ => None,
+        };
+        for (l, r) in left.iter().zip(right.iter()) {
+            for (mine, other) in [(*l, *r), (*r, *l)] {
+                if let (Some(Token::Param(_)), Some(shape)) =
+                    (single(mine), classify(single(other)))
+                {
+                    out.insert(mine.0, shape);
+                }
+            }
+        }
+        i = r_close + 1;
+    }
+    out
+}
+
+/// パターン 12 の `$n` のうち、相手成分が列のもの（トークン添字 → 列名）。`core.rs` が Describe・構造検証用の
+/// 型付きダミーを作るために使う（受理・推論と同じ [`row_compare_param_slots`] を参照する）。
+pub(crate) fn row_compare_column_slots(tokens: &[Token]) -> HashMap<usize, String> {
+    let head_ok = matches!(
+        tokens.first(),
+        Some(Token::Keyword(crate::sql::lexer::Keyword::Select))
+    ) || ident_eq_ignore_case(tokens.first(), "UPDATE")
+        || ident_eq_ignore_case(tokens.first(), "DELETE");
+    if !head_ok || has_set_operator_branch(tokens) {
+        return HashMap::new();
+    }
+    let Some((start, end)) = where_region(tokens) else {
+        return HashMap::new();
+    };
+    row_compare_param_slots(tokens, start, end)
+        .into_iter()
+        .filter_map(|(i, shape)| match shape {
+            WhereParamShape::Column(c) => Some((i, c)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// パターン 9 の `$n` のトークン添字 → 分類。先頭語が `SELECT`／`UPDATE`／`DELETE`（Issue #2431）
 /// で集合演算を持たない文に限る（集合演算は枝ごとに Describe 用フラグの序数が
 /// 0 から始まり対応がずれるため対象外）。それ以外は空で、該当する `$n` は `42601` のまま。
@@ -741,6 +917,8 @@ fn where_noneq_param_slots_and_bounds(
         Some(Token::Ident(c) | Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
         _ => None,
     };
+    // パターン 12: 行値比較の成分の `$n`（Issue #3257）。
+    out.extend(row_compare_param_slots(tokens, start, end));
     let mut i = start + 1;
     while i < end {
         let Some(leaf) = noneq_leaf_at(tokens, i, start, end) else {
@@ -2570,6 +2748,56 @@ fn substitute_with<E>(
     Ok(out)
 }
 
+/// 行値比較の成分の `$n`（パターン 12）に使う、相手列の型で有効な Describe・構造検証用ダミー（Issue #3257）。
+/// `Ok(None)` は既定のダミー（`'0'`・数値・真偽値）のままでよい型。未対応の型は `0A000`
+/// （固定文言・値を含めない。リテラル同士の行値比較が束縛段で拒否する型と同じ側へ倒す fail-closed）。
+/// 利用者入力は含まず、固定の定数かカタログの ENUM ラベルだけから作る。
+pub(crate) fn row_compare_dummy_token(
+    ty: &crate::catalog::ColumnType,
+) -> Result<Option<Token>, SqlSurfaceError> {
+    use crate::catalog::ColumnType as T;
+    let lit = |s: &str| Ok(Some(Token::StringLiteral(s.to_string())));
+    match ty {
+        T::Text
+        | T::Varchar(_)
+        | T::Bpchar(_)
+        | T::Numeric { .. }
+        | T::SmallInt
+        | T::Integer
+        | T::BigInt
+        | T::Real
+        | T::Double
+        | T::Boolean => Ok(None),
+        T::Date => lit("2000-01-01"),
+        T::Timestamp => lit("2000-01-01 00:00:00"),
+        // 明示オフセット付き: セッション TimeZone の読み取り（`session_tz_dependent`）を起こさない。
+        T::TimestampTz => lit("2000-01-01 00:00:00+00"),
+        T::Time => lit("00:00:00"),
+        T::Interval => lit("0 seconds"),
+        T::Uuid => lit("00000000-0000-0000-0000-000000000000"),
+        T::Bytea => lit("\\x00"),
+        T::Enum(def) => match def.labels().first() {
+            Some(label) => lit(label),
+            None => Err(row_compare_param_type_unsupported()),
+        },
+        T::Vector(_)
+        | T::HalfVec(_)
+        | T::Int8Vec(_)
+        | T::SparseVec(_)
+        | T::Bit(_)
+        | T::Array(_)
+        | T::Json
+        | T::Jsonb => Err(row_compare_param_type_unsupported()),
+    }
+}
+
+fn row_compare_param_type_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "parameter placeholders in a row value comparison are not supported for this column type"
+            .to_string(),
+    }
+}
+
 /// Parse 時点の構造検証専用: すべての `$n` を、位置に依存しない固定ダミー値へ
 /// 置換する。ダミーは非空・非制御文字（[`crate::sql::using_operation_id::
 /// OperationId::parse`]・[`crate::sql::allowlist::validate_using_plan_question`]
@@ -2585,6 +2813,19 @@ pub fn substitute_dummy(tokens: &[Token]) -> Vec<Token> {
 /// `Number("0")`、`Boolean` 種別は `Ident("false")` のダミーへ置換し、数値・真偽値
 /// 列の位置でも Describe 用の構造検証が通るようにする。
 pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<Token> {
+    substitute_dummy_typed_with(tokens, kinds, &HashMap::new())
+}
+
+/// [`substitute_dummy_typed`] の上書き付き版（Issue #3257）。`overrides`（トークン添字 → ダミー）に
+/// ある位置のうち `String` 種別の `$n` は、上書きのトークンへ置換する。行値比較の成分の `$n`
+/// （パターン 12）が、相手列の型（DATE・UUID・ENUM 等）で有効な値になるよう `core.rs` が作る。
+/// 展開で生成される比較葉は Describe 用ダミーフラグで検証を省けないため、ダミー自体を型に合わせる。
+/// 上書きは Parse の構造検証・Describe 専用で、Bind は常に実値で置換し直す。
+pub(crate) fn substitute_dummy_typed_with(
+    tokens: &[Token],
+    kinds: &[ParamLiteralKind],
+    overrides: &HashMap<usize, Token>,
+) -> Vec<Token> {
     let (_, between_bounds, distinct_slots) = where_noneq_param_slots_and_bounds(tokens);
     substitute_with(tokens, |n, i| {
         // パターン 10: `IS [NOT] DISTINCT FROM $n` は列型に依らず束縛が通る `NULL` ダミーにする
@@ -2593,7 +2834,10 @@ pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind
             return Ok::<_, std::convert::Infallible>(vec![Token::Ident("NULL".to_string())]);
         }
         Ok::<_, std::convert::Infallible>(vec![match kind_of(kinds, n) {
-            ParamLiteralKind::String => Token::StringLiteral("0".to_string()),
+            ParamLiteralKind::String => overrides
+                .get(&i)
+                .cloned()
+                .unwrap_or_else(|| Token::StringLiteral("0".to_string())),
             ParamLiteralKind::Integer | ParamLiteralKind::Float => Token::Number("0".to_string()),
             // BETWEEN の境界は既存構文処理が文字列リテラルのみ受理するため文字列で置換する。
             ParamLiteralKind::Boolean if between_bounds.contains(&i) => {
@@ -4649,5 +4893,140 @@ mod typed_value_tests {
         let big = vec![b'1'; max_plain];
         let err = decode_bind_values_nullable_typed(&tokens, &[Some(big)], &typed).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    // --- パターン 12: WHERE の行値比較の成分の `$n`（Issue #3257） ---------------------------
+
+    fn positions(sql: &str) -> Result<u16, SqlSurfaceError> {
+        let tokens = lexer::tokenize_with_params(sql).expect("tokenize_with_params");
+        validate_param_positions(&tokens)
+    }
+
+    fn positions_of(sql: &str) -> Vec<Vec<ParamPosition>> {
+        let tokens = lexer::tokenize_with_params(sql).expect("tokenize");
+        let n = validate_param_positions(&tokens).expect("positions should validate");
+        infer_param_positions(&tokens, n)
+    }
+
+    fn flags(sql: &str) -> Vec<bool> {
+        let tokens = lexer::tokenize_with_params(sql).expect("tokenize");
+        where_equality_literal_is_param(&tokens)
+    }
+
+    #[test]
+    fn accepts_row_compare_component_params_and_classifies_them() {
+        for sql in [
+            "SELECT id FROM t WHERE (a, b) < ($1, $2)",
+            "SELECT id FROM t WHERE ($1, $2) >= (a, b)",
+            "SELECT id FROM t WHERE (a, b) <> ($1, $2) LIMIT 5;",
+            "SELECT id FROM t WHERE x = 1 AND ((a, b) = ($1, $2))",
+            "UPDATE t SET s = 'z' WHERE (a, b) > ($1, $2) USING OPERATION_ID $3",
+            "DELETE FROM t WHERE (a, b) <= ($1, $2) USING OPERATION_ID $3",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+        let got = positions_of("SELECT id FROM t WHERE (a, b) < ($1, $2)");
+        assert_eq!(got[0], vec![ParamPosition::WhereColumn("a".to_string())]);
+        assert_eq!(got[1], vec![ParamPosition::WhereColumn("b".to_string())]);
+        let got = positions_of("SELECT id FROM t WHERE ($1, $2) < (a, b)");
+        assert_eq!(got[0], vec![ParamPosition::WhereColumn("a".to_string())]);
+        // 片側が `$n`・片側がリテラルでも、`$n` の相手が列なら受理する。
+        assert!(positions("SELECT id FROM t WHERE (a, b) < ($1, 5)").is_ok());
+    }
+
+    #[test]
+    fn row_compare_pair_of_params_is_indeterminate() {
+        let got = positions_of("SELECT id FROM t WHERE ($1, a) < ($2, b)");
+        assert_eq!(got[0], vec![ParamPosition::WhereIndeterminate]);
+        assert_eq!(got[1], vec![ParamPosition::WhereIndeterminate]);
+    }
+
+    #[test]
+    fn rejects_row_compare_params_outside_pattern_12() {
+        for sql in [
+            // 相手がリテラル・式・修飾列
+            "SELECT id FROM t WHERE (a, 7) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, a + 1) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, t.b) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, true) < ($1, $2)",
+            // `$n` が式の内側・型キャスト付き
+            "SELECT id FROM t WHERE (a, b) < ($1 + 1, $2)",
+            "SELECT id FROM t WHERE (a, b) < ($1::int, $2)",
+            "SELECT id FROM t WHERE (a, b) < (lower($1), $2)",
+            // 成分数の不一致・成分 1 個
+            "SELECT id FROM t WHERE (a, b) < ($1, $2, $3)",
+            "SELECT id FROM t WHERE (a) < ($1)",
+            // 先頭語・文種・領域の外
+            "EXPLAIN SELECT id FROM t WHERE (a, b) < ($1, $2)",
+            "WITH c AS (SELECT 1) SELECT id FROM t WHERE (a, b) < ($1, $2)",
+            "INSERT INTO t (id, embedding) VALUES (1, '[0,0]') ON CONFLICT (id) DO UPDATE SET a = 1 WHERE (a, b) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, b) < ($1, $2) UNION SELECT id FROM t WHERE a = 1",
+            "SELECT a FROM t GROUP BY a HAVING (a, b) < ($1, $2)",
+        ] {
+            let r = positions(sql);
+            assert!(
+                matches!(&r, Err(e) if e.wire_code() == "42601"),
+                "{sql}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_compare_params_do_not_shift_dummy_flag_ordinals() {
+        // 行値の `$n` は序数に数えない。兄弟の等価・範囲の葉の序数は従来どおり。
+        assert_eq!(
+            flags("SELECT id FROM t WHERE (a, b) = ($1, $2) AND lang = 'en'"),
+            vec![false]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE ($1, x) < (a, b) AND lang = $3"),
+            vec![true]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE s = 'p' OR (a, b) < ($1, $2)"),
+            vec![false]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE (a, b) < ($1, $2) OR m = $3 AND lang = 'x'"),
+            vec![true, false]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE NOT (a, b) < ($1, $2) AND m = $3"),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn row_compare_slots_are_found_in_linear_time_for_nested_parens() {
+        // 入れ子の括弧を大量に並べても、左境界ごとの再走査で二次時間にならない（有界時間で完了する）。
+        let depth = 3000;
+        let sql = format!(
+            "SELECT id FROM t WHERE {}a{} < 1",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let tokens = lexer::tokenize_with_params(&sql).expect("tokenize");
+        let started = std::time::Instant::now();
+        let _ = where_noneq_param_slots(&tokens);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn row_compare_dummy_tokens_match_column_types() {
+        use crate::catalog::ColumnType;
+        assert_eq!(row_compare_dummy_token(&ColumnType::Text).unwrap(), None);
+        assert_eq!(row_compare_dummy_token(&ColumnType::Integer).unwrap(), None);
+        assert!(matches!(
+            row_compare_dummy_token(&ColumnType::Date).unwrap(),
+            Some(Token::StringLiteral(s)) if s == "2000-01-01"
+        ));
+        assert!(matches!(
+            row_compare_dummy_token(&ColumnType::TimestampTz).unwrap(),
+            Some(Token::StringLiteral(s)) if s.ends_with("+00")
+        ));
+        for ty in [ColumnType::Json, ColumnType::Jsonb, ColumnType::Bit(3)] {
+            let err = row_compare_dummy_token(&ty).unwrap_err();
+            assert_eq!(err.wire_code(), "0A000");
+        }
     }
 }
