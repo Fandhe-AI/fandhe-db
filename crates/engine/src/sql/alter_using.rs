@@ -391,6 +391,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::SerializationFailure
         | E::ReadOnlySqlTransaction
         | E::MaterializedViewNotPopulated
+        | E::CursorCanOnlyScanForward
         | E::SequenceNotYetDefined
         | E::LastvalNotYetDefined
         | E::SequenceGeneratorLimitExceeded { .. }

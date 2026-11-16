@@ -1143,6 +1143,9 @@ pub enum SqlSurfaceError {
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
+    /// 逆方向に移動できない（SCROLL でない）カーソルへ逆方向の取得を要求した（`55000`。
+    /// WIRE-27 (2)・Issue #3334）。文言は PG と同じ固定文で、カーソル名・件数を含めない。
+    CursorCanOnlyScanForward,
     /// `currval` を、そのセッションで `nextval` を一度も呼んでいない SEQUENCE に対して呼んだ
     /// （TABLE-24・ERR-6: `55000`。Issue #1690）。名前・値・テナントを含まない固定文言。
     SequenceNotYetDefined,
@@ -2108,6 +2111,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::SerializationFailure => ErrorClass::SerializationFailure,
             SqlSurfaceError::ReadOnlySqlTransaction => ErrorClass::ReadOnlySqlTransaction,
             SqlSurfaceError::MaterializedViewNotPopulated
+            | SqlSurfaceError::CursorCanOnlyScanForward
             | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
             | SqlSurfaceError::SequenceNotYetDefined
             | SqlSurfaceError::LastvalNotYetDefined
@@ -2344,6 +2348,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::MaterializedViewNotPopulated => {
                 write!(f, "materialized view has not been populated")
+            }
+            SqlSurfaceError::CursorCanOnlyScanForward => {
+                write!(f, "cursor can only scan forward")
             }
             SqlSurfaceError::MaterializedViewNotRefreshableConcurrently => {
                 write!(f, "cannot refresh materialized view concurrently")
