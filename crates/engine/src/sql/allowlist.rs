@@ -21160,7 +21160,7 @@ fn reject_unimplemented_expression_keys(
 /// 余剰トークンがあれば `42601`。永続データは untrusted として扱う（手書きの破損データも
 /// ここで拒否される）。
 pub(crate) fn parse_index_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
     let expr = p.parse_bounded_value_expr()?;
     p.expect_end_of_statement()?;
@@ -31268,7 +31268,7 @@ pub(crate) fn parse_check_predicate_text(
 pub(crate) fn parse_index_predicate_text(
     sql: &str,
 ) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
+    let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
     let predicates = p.parse_where()?;
     p.expect_end_of_statement()?;

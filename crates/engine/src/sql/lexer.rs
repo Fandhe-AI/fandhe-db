@@ -436,7 +436,7 @@ pub(crate) fn requote_legacy_value_function_columns(tokens: &mut [Token]) {
 /// 未引用が真偽リテラルを意味する形式）は戻さない。`= true` のような値位置は対象外。
 /// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
 pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
-    let mut tokens = tokenize_impl(input, false, false, true, None)?;
+    let mut tokens = tokenize_impl(input, false, true, true, None)?;
     requote_legacy_value_function_columns(&mut tokens);
     if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
         return Ok(tokens);

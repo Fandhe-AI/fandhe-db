@@ -6478,7 +6478,21 @@ fn bind_case(
         for (idx, (cond, result)) in whens.iter().enumerate() {
             let (cond_bound, cond_ty) = match (&simple_conds, operand) {
                 (Some(conds), Some(op)) => match conds.get(idx).and_then(Option::as_ref) {
-                    Some(lowered) => bind_expr_in(lowered, env, node_budget)?,
+                    Some(lowered) => {
+                        // 被演算子が文字列リテラル（unknown）で比較値が文字列リテラルでない場合、
+                        // PostgreSQL は被演算子を先に text へ確定して比較するため、比較値の型が
+                        // text でなければ拒否する（分岐ごとに比較相手の型へ再解釈しない）。
+                        if matches!(op, Expr::String(_)) && !matches!(cond, Expr::String(_)) {
+                            let mut probe_budget = *node_budget;
+                            let (_, vty) = bind_expr_in(cond, env, &mut probe_budget)?;
+                            if vty != ExprType::Text {
+                                return Err(SqlSurfaceError::DatatypeMismatch {
+                                    detail: "simple CASE operand of unknown type is resolved as text and cannot be compared with a non-text value".to_string(),
+                                });
+                            }
+                        }
+                        bind_expr_in(lowered, env, node_budget)?
+                    }
                     None => {
                         // 一致しない分岐（NULL を含む）でも、NULL でない側を束縛して列の存在・型・
                         // 権限を検査し、評価時も `x = NULL`／`NULL = v` として両辺を評価する
@@ -15006,6 +15020,36 @@ mod tests {
             let err = bind_expr(&case, &schema, &registry, &mut budget).unwrap_err();
             assert_eq!(err.wire_code(), "0A000", "function {name}");
         }
+    }
+
+    /// 単純 CASE の被演算子が文字列リテラル（unknown）のとき、数値の比較値との比較は
+    /// PostgreSQL と同じく text と数値の比較として拒否する（Issue #3279 のレビュー指摘）。
+    #[test]
+    fn simple_case_unknown_string_operand_is_not_coerced_to_numeric_when_value() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mk = |v: Expr| Expr::Case {
+            operand: Some(Box::new(Expr::String("1".to_string()))),
+            whens: vec![(v, Expr::String("yes".to_string()))],
+            else_result: Some(Box::new(Expr::String("no".to_string()))),
+        };
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(
+            &mk(Expr::Number("1".to_string())),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42804");
+        let mut budget = MAX_EXPR_NODES;
+        assert!(bind_expr(
+            &mk(Expr::String("1".to_string())),
+            &schema,
+            &registry,
+            &mut budget
+        )
+        .is_ok());
     }
 
     #[test]
