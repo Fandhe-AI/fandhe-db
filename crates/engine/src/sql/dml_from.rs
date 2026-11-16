@@ -267,7 +267,9 @@ fn resolve_where_columns(
                 | JoinWherePredicate::Compare { column, .. }
                 | JoinWherePredicate::BoolEquality { column, .. }
                 | JoinWherePredicate::BoolColumn { column }
-                | JoinWherePredicate::InList { column, .. } => out.push(column),
+                | JoinWherePredicate::InList { column, .. }
+                | JoinWherePredicate::NumericCompare { column, .. }
+                | JoinWherePredicate::IsNull { column, .. } => out.push(column),
                 JoinWherePredicate::ColumnCompare { lhs, rhs, .. } => {
                     out.push(lhs);
                     out.push(rhs);
