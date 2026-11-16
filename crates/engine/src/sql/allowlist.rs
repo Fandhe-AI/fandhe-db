@@ -4054,6 +4054,22 @@ pub(crate) enum JoinWherePredicate {
         op: BinOp,
         rhs: ColumnRef,
     },
+    /// 数値リテラルとの比較 `<colref> <op> [-]<number>`（`op` は `= < <= > >=`）。
+    /// **`UPDATE ... FROM`／`DELETE ... USING` の WHERE（Issue #3295）だけが生成する**。SELECT の
+    /// JOIN の WHERE／ON の文法は生成しない（`42601` のまま）。値は通常の WHERE の数値比較と同じ
+    /// 文字列形で、型に応じた解析は束縛器が行う。`sql::join` の SELECT 計画器は受理しない。
+    NumericCompare {
+        column: ColumnRef,
+        op: BinOp,
+        value: String,
+    },
+    /// `<colref> IS [NOT] NULL`。**`UPDATE ... FROM`／`DELETE ... USING` の WHERE（Issue #3295）
+    /// だけが生成する**。NULL に対して真になりうる（非 strict）ため、外部結合の簡約規則が前提と
+    /// する `is_null_rejecting` は偽を返す。SELECT 計画器は受理しない。
+    IsNull {
+        column: ColumnRef,
+        negated: bool,
+    },
 }
 
 /// JOIN の `WHERE` 句の論理木（Issue #1190）。`OR`・括弧を含む。`NOT` は
@@ -14656,9 +14672,10 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
+            // `VALUES ('n=' || 5)` のようにリテラルへ `||` が続く形も式として読み直す（Issue #3278）。
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast | Token::Concat)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(lit);
@@ -14750,9 +14767,10 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
+            // `SET c = 'x' || n` のように文字列リテラルへ `||` が続く形は式として読み直す（Issue #3278）。
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast | Token::Concat)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(SetValue::Literal(lit));
@@ -23320,11 +23338,12 @@ impl<'a> Parser<'a> {
         Ok(rel)
     }
 
-    /// `[WHERE <join_where>]`（JOIN と同じ文法。数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`）。
+    /// `[WHERE <join_where>]`（JOIN と同じ文法に、DML 専用の葉として数値リテラルとの比較・数値 `IN`・
+    /// `IS [NOT] NULL` を加える（Issue #3295）。`NOT`・サブクエリは構造的に `42601`）。
     fn parse_dml_from_where(&mut self) -> Result<Option<Box<JoinWhereExpr>>, SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             self.advance();
-            Ok(Some(Box::new(parse_join_where(self)?)))
+            Ok(Some(Box::new(parse_join_where_dml(self)?)))
         } else {
             Ok(None)
         }
@@ -23775,6 +23794,7 @@ fn parse_join_on_conditions(p: &mut Parser<'_>) -> Result<JoinWhereExpr, SqlSurf
     let cap = LeafCap {
         max: MAX_JOIN_CONDITIONS,
         msg: "too many JOIN ON conditions",
+        dml_leaves: false,
     };
     let mut leaves = 0usize;
     parse_join_where_or(p, 0, &mut leaves, &cap)
@@ -23818,15 +23838,31 @@ fn parse_join_where(p: &mut Parser<'_>) -> Result<JoinWhereExpr, SqlSurfaceError
     let cap = LeafCap {
         max: MAX_JOIN_WHERE_CONJUNCTS,
         msg: "too many JOIN WHERE predicates",
+        dml_leaves: false,
+    };
+    parse_join_where_or(p, 0, &mut leaves, &cap)
+}
+
+/// `UPDATE ... FROM`／`DELETE ... USING` の WHERE（Issue #3295）。[`parse_join_where`] と同じ論理木
+/// 文法で、葉に数値リテラルとの比較・数値 `IN`・`IS [NOT] NULL` を加える。SELECT の JOIN の
+/// WHERE／ON には広げない（外部結合の strict 簡約の前提を保つため）。上限は [`parse_join_where`] と同じ。
+fn parse_join_where_dml(p: &mut Parser<'_>) -> Result<JoinWhereExpr, SqlSurfaceError> {
+    let mut leaves = 0usize;
+    let cap = LeafCap {
+        max: MAX_JOIN_WHERE_CONJUNCTS,
+        msg: "too many JOIN WHERE predicates",
+        dml_leaves: true,
     };
     parse_join_where_or(p, 0, &mut leaves, &cap)
 }
 
 /// 共有パーサ（WHERE／ON）の葉数上限と超過時の文言。呼び出し元（`parse_join_where`・
-/// `parse_join_on_conditions`）が句ごとに渡す。
+/// `parse_join_on_conditions`・`parse_join_where_dml`）が句ごとに渡す。
 struct LeafCap {
     max: usize,
     msg: &'static str,
+    /// DML 専用の葉（数値リテラル比較・数値 `IN`・`IS [NOT] NULL`）を受理するか。
+    dml_leaves: bool,
 }
 
 fn parse_join_where_or(
@@ -23888,9 +23924,72 @@ fn parse_join_where_atom(
     if *leaves >= cap.max {
         return Err(SqlSurfaceError::payload_too_large(cap.msg));
     }
-    let leaf = parse_join_where_leaf(p)?;
+    let expr = parse_join_where_leaf_expr(p, leaves, cap)?;
     *leaves += 1;
-    Ok(JoinWhereExpr::Leaf(leaf))
+    Ok(expr)
+}
+
+/// 葉 1 個を論理木として読む。DML 専用の数値 `IN` は等価の `OR` へ脱糖する（新しい variant を
+/// 作らない）。脱糖で増える葉は、積む**前**に [`LeafCap::max`] で検査する（超過は `54000`）。
+/// 呼び出し元（[`parse_join_where_atom`]）が先頭の 1 葉分を加算するため、ここでは 2 個目以降だけ数える。
+fn parse_join_where_leaf_expr(
+    p: &mut Parser<'_>,
+    leaves: &mut usize,
+    cap: &LeafCap,
+) -> Result<JoinWhereExpr, SqlSurfaceError> {
+    if cap.dml_leaves
+        && matches!(
+            p.tokens.get(p.pos),
+            Some(Token::Ident(_) | Token::QualifiedIdent { .. })
+        )
+        && matches!(
+            p.tokens.get(p.pos.saturating_add(1)),
+            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("IN")
+        )
+        && matches!(
+            p.tokens.get(p.pos.saturating_add(2)),
+            Some(Token::Punct('('))
+        )
+        && p.signed_number_at(p.pos.saturating_add(3))
+    {
+        let column = p.parse_join_colref()?;
+        p.advance(); // IN
+        p.expect_punct('(')?;
+        let mut branches: Vec<JoinWhereExpr> = Vec::new();
+        loop {
+            if branches.len() >= MAX_IN_LIST_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many items in JOIN WHERE IN list",
+                ));
+            }
+            if !branches.is_empty() && leaves.saturating_add(branches.len()) >= cap.max {
+                return Err(SqlSurfaceError::payload_too_large(cap.msg));
+            }
+            let value = p.expect_signed_number("IN list elements")?;
+            branches.push(JoinWhereExpr::Leaf(JoinWherePredicate::NumericCompare {
+                column: column.clone(),
+                op: BinOp::Eq,
+                value,
+            }));
+            if matches!(p.peek(), Some(Token::Punct(','))) {
+                p.advance();
+                continue;
+            }
+            break;
+        }
+        p.expect_punct(')')?;
+        // 2 個目以降の葉を加算する（先頭 1 個は呼び出し元が加算する）。
+        *leaves = leaves.saturating_add(branches.len().saturating_sub(1));
+        return Ok(if branches.len() == 1 {
+            branches.pop().unwrap_or(JoinWhereExpr::Or(Vec::new()))
+        } else {
+            JoinWhereExpr::Or(branches)
+        });
+    }
+    Ok(JoinWhereExpr::Leaf(parse_join_where_leaf(
+        p,
+        cap.dml_leaves,
+    )?))
 }
 
 /// 比較演算子の右辺が列参照（`Ident`／`QualifiedIdent`。`true`／`false` を除く）か。
@@ -23904,11 +24003,38 @@ fn join_rhs_is_colref(tok: Option<&Token>) -> bool {
     }
 }
 
-fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSurfaceError> {
+fn parse_join_where_leaf(
+    p: &mut Parser<'_>,
+    dml: bool,
+) -> Result<JoinWherePredicate, SqlSurfaceError> {
     let column = p.parse_join_colref()?;
     let pred = match p.peek() {
+        // DML 専用: `<colref> IS [NOT] NULL`（Issue #3295）。`IS` に続く形がこれ以外
+        // （`IS TRUE`・`IS [NOT] DISTINCT FROM` 等）は従来どおり `42601`。
+        Some(Token::Ident(w)) if dml && w.eq_ignore_ascii_case("IS") => {
+            p.advance();
+            let negated = p.peek_ident_matches("NOT");
+            if negated {
+                p.advance();
+            }
+            if !p.peek_ident_matches("NULL") {
+                return Err(SqlSurfaceError::unsupported(
+                    "only IS NULL / IS NOT NULL are supported in JOIN WHERE",
+                ));
+            }
+            p.advance();
+            JoinWherePredicate::IsNull { column, negated }
+        }
         Some(Token::Punct('=')) => {
             p.advance();
+            if dml && p.signed_number_at(p.pos) {
+                let value = p.expect_signed_number("JOIN WHERE comparison")?;
+                return Ok(JoinWherePredicate::NumericCompare {
+                    column,
+                    op: BinOp::Eq,
+                    value,
+                });
+            }
             if join_rhs_is_colref(p.peek()) {
                 let rhs = p.parse_join_colref()?;
                 return Ok(JoinWherePredicate::ColumnCompare {
@@ -23981,6 +24107,20 @@ fn parse_join_where_leaf(p: &mut Parser<'_>) -> Result<JoinWherePredicate, SqlSu
                     lhs: column,
                     op: bin,
                     rhs,
+                });
+            }
+            if dml && p.signed_number_at(p.pos) {
+                let bin = match op {
+                    CompareOp::Lt => BinOp::Lt,
+                    CompareOp::Le => BinOp::Le,
+                    CompareOp::Gt => BinOp::Gt,
+                    CompareOp::Ge => BinOp::Ge,
+                };
+                let value = p.expect_signed_number("JOIN WHERE comparison")?;
+                return Ok(JoinWherePredicate::NumericCompare {
+                    column,
+                    op: bin,
+                    value,
                 });
             }
             let value = p.expect_string_literal()?;
@@ -33173,10 +33313,66 @@ mod tests {
             ("UPDATE a SET (x) = (b.p) FROM b", "42601"),
             ("UPDATE a SET (x, y) = (b.p, 1, 2) FROM b", "42601"),
             ("UPDATE a SET (x, y) = (SELECT 1, 2) FROM b", "0A000"),
-            ("DELETE FROM a USING b WHERE a.n = 1", "42601"),
             ("DELETE FROM a USING b PARTITIONED", "42601"),
         ] {
             assert_eq!(ok(sql).expect_err(sql).wire_code(), code, "{sql}");
+        }
+    }
+
+    /// Issue #3295: DML の WHERE だけが数値リテラル比較・数値 `IN`・`IS [NOT] NULL` の葉を受理する。
+    /// SELECT の JOIN の WHERE／ON は同じ入力で `42601` のまま。`NOT`・サブクエリ・`IS TRUE` は `42601`、
+    /// 葉数の上限（`IN` の脱糖後を含む）は `54000`。
+    #[test]
+    fn dml_where_accepts_numeric_and_is_null_leaves_but_select_join_does_not() {
+        use super::*;
+        let dml = |sql: &str| {
+            let toks = crate::sql::lexer::tokenize(sql).expect("lex");
+            let mut p = Parser::new(&toks);
+            let r = if looks_like_update_from(&toks) {
+                p.parse_update_from().map(|_| ())
+            } else {
+                p.parse_delete_using().map(|_| ())
+            };
+            r.and_then(|()| p.expect_end_of_statement())
+        };
+        for sql in [
+            "DELETE FROM a USING b WHERE a.n = 1",
+            "DELETE FROM a USING b WHERE a.n = -1 AND b.m >= 2.5",
+            "DELETE FROM a USING b WHERE a.id = b.id AND b.m IS NULL AND a.n IS NOT NULL",
+            "DELETE FROM a USING b WHERE a.id = b.id AND a.n IN (1, 2, -3)",
+            "UPDATE a SET x = b.y FROM b WHERE a.id = b.id OR (a.n < 5 AND b.y IS NULL)",
+        ] {
+            dml(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        for sql in [
+            "DELETE FROM a USING b WHERE a.id = b.id AND NOT a.n = 1",
+            "DELETE FROM a USING b WHERE a.id = b.id AND a.n IS TRUE",
+            "DELETE FROM a USING b WHERE a.id = b.id AND a.n IS DISTINCT FROM 1",
+            "DELETE FROM a USING b WHERE a.id = b.id AND a.n <> 1",
+            "DELETE FROM a USING b WHERE a.id = b.id AND a.n IN (SELECT 1)",
+        ] {
+            assert_eq!(dml(sql).expect_err(sql).wire_code(), "42601", "{sql}");
+        }
+        // 葉数の上限は脱糖後の葉ごとに数える（`IN` の要素数を含む）。
+        let many = (0..300)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let e = dml(&format!("DELETE FROM a USING b WHERE a.n IN ({many})")).unwrap_err();
+        assert_eq!(e.wire_code(), "54000");
+        let lookup = catalog_with(&["a", "b"]);
+        for sql in [
+            "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.n = 1 LIMIT 1",
+            "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.n > 1 LIMIT 1",
+            "SELECT * FROM a JOIN b ON a.id = b.id WHERE b.m IS NULL LIMIT 1",
+            "SELECT * FROM a JOIN b ON a.id = b.id AND a.n IS NULL LIMIT 1",
+            "SELECT * FROM a JOIN b ON a.id = b.id AND a.n = 1 LIMIT 1",
+        ] {
+            assert_eq!(
+                validate_sql(sql, &lookup).expect_err(sql).wire_code(),
+                "42601",
+                "{sql}"
+            );
         }
     }
 

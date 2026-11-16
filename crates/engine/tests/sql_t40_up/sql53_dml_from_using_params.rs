@@ -213,13 +213,10 @@ fn where_param_type_follows_the_qualifier() {
         matches!(t, PreparedParamType::Text | PreparedParamType::Column(_)),
         "{t:?}"
     );
-    // 対象表側の整数列は結合 WHERE が数値を受理しないため Parse で拒否される。
-    assert_eq!(
-        code(core.parse_sql_prepared(
-            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND docs.c = $1"
-        )),
-        "42601"
-    );
+    // 対象表側の整数列は、結合 WHERE が数値比較を受理する（Issue #3295）ため列型で解決される。
+    let t =
+        ty("UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND docs.c = $1");
+    assert!(matches!(t, PreparedParamType::Column(_)), "{t:?}");
 }
 
 #[test]
@@ -231,8 +228,6 @@ fn unsupported_positions_are_rejected() {
         "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND langs.label LIKE $1",
         "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang RETURNING $1",
         "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND langs.label IN ($1)",
-        // 整数列の WHERE は結合 WHERE が数値を受理しないため（簡易クエリと同じ拒否）。
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n = $1",
     ] {
         assert_eq!(code(core.parse_sql_prepared(sql)), "42601", "{sql}");
     }
