@@ -366,22 +366,35 @@ pub(crate) fn joined_where_conjunct_flags(
         region = rest;
     }
     let mut flags = Vec::new();
-    push_conjunct_flags(region, kinds, &mut flags);
+    push_conjunct_flags(region, kinds, &mut flags, 0);
     flags
 }
+
+/// 連言分フラグ算出で括弧を外して再帰する最大段数（WHERE の式深さ上限と同じ値）。
+const MAX_PAREN_FLATTEN_DEPTH: usize = crate::sql::udf_call::MAX_EXPR_DEPTH;
 
 /// [`joined_where_conjunct_flags`] の本体。深さ 0 の `AND` で分割し、全体が 1 組の括弧で包まれた
 /// 連言分は `sql::join::plan::flatten_conjuncts` と同じく括弧内を再帰的に平坦化する（個数を AST と揃える）。
 /// 括弧内に深さ 0 の `OR` がある連言分は AST でも 1 葉なので偽フラグ 1 個とする。
-fn push_conjunct_flags(region: &[Token], kinds: &[ParamLiteralKind], flags: &mut Vec<bool>) {
+///
+/// 本関数は構文解析（既存の WHERE 深さ上限）より前に走るため、括弧の入れ子は `nest` で
+/// [`MAX_PAREN_FLATTEN_DEPTH`] までしか辿らない。超えた連言分は偽フラグ 1 個で打ち切る
+/// （AST の連言分数と食い違い、`split_where` が全フラグを検証側へ倒す。fail-closed）。
+/// 過剰な入れ子そのものは、この後の構文解析が `54000` で拒否する（スタック枯渇の防止）。
+fn push_conjunct_flags(
+    region: &[Token],
+    kinds: &[ParamLiteralKind],
+    flags: &mut Vec<bool>,
+    nest: usize,
+) {
     let mut depth: usize = 0;
     let mut seg_start = 0usize;
     let finish = |seg: &[Token], flags: &mut Vec<bool>| {
         if let Some(inner) = strip_outer_parens(seg) {
-            if has_top_level_or(inner) {
+            if nest >= MAX_PAREN_FLATTEN_DEPTH || has_top_level_or(inner) {
                 flags.push(false);
             } else {
-                push_conjunct_flags(inner, kinds, flags);
+                push_conjunct_flags(inner, kinds, flags, nest.saturating_add(1));
             }
             return;
         }
@@ -5149,6 +5162,20 @@ mod typed_value_tests {
         assert_eq!(
             joined_where_conjunct_flags(&tk, &[ParamLiteralKind::String]),
             vec![false, false, false, true]
+        );
+        // 括弧を過剰に重ねた入力でも再帰が打ち切られる（構文解析前の経路でスタックを枯渇させない）。
+        let depth = 5000;
+        let sql = format!(
+            "DELETE FROM a USING b WHERE {}a.k = b.k{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let tk = tokenize_with_params(&sql).expect("tokenize");
+        let flags = joined_where_conjunct_flags(&tk, &[]);
+        assert!(
+            flags.len() <= MAX_PAREN_FLATTEN_DEPTH + 2,
+            "{}",
+            flags.len()
         );
         let tk = tokenize_with_params(
             "DELETE FROM a USING b WHERE (b.l = 'J' OR b.f = 'x') AND b.d = $1",

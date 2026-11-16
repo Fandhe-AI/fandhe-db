@@ -234,6 +234,19 @@ fn unsupported_positions_are_rejected() {
 }
 
 #[test]
+fn deeply_nested_where_parens_are_rejected_without_overflow() {
+    let (core, path) = new_core("p3297-deep");
+    let _g = CleanupGuard(path);
+    let depth = 3000;
+    let sql = format!(
+        "DELETE FROM docs USING langs WHERE {}docs.lang = langs.lang{}",
+        "(".repeat(depth),
+        ")".repeat(depth)
+    );
+    assert!(core.parse_sql_prepared(&sql).is_err());
+}
+
+#[test]
 fn operation_id_param_replays_and_conflicts() {
     let (core, path) = new_core("p3297-opid");
     let _g = CleanupGuard(path);

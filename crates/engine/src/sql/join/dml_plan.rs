@@ -346,8 +346,7 @@ fn split_where(
     other_schemas: &[&TableSchema],
     map: &mut SourceMap,
     other_visible: &[Option<Vec<String>>],
-    conjunct_dummy: &[bool],
-    udfs: &UdfRegistry,
+    (conjunct_dummy, udfs): (&[bool], &UdfRegistry),
 ) -> Result<Split, SqlSurfaceError> {
     let (Some(target_ref), others) = (relations.first(), relations.get(1..).unwrap_or(&[])) else {
         return Err(internal("DML join without a target relation"));
@@ -856,8 +855,7 @@ fn plan_joined(
         other_schemas,
         &mut map,
         input.source_visible,
-        conjunct_dummy,
-        udfs,
+        (conjunct_dummy, udfs),
     )?;
     let target = build_target(
         target_ref.table(),
