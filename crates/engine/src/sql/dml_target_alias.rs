@@ -102,10 +102,16 @@ fn mark_set_lhs(tokens: &[Token], set_idx: usize, keep: &mut [bool]) {
                 Some(Token::Punct(';')) | Some(Token::Keyword(Keyword::Where)) if depth == 0 => {
                     break
                 }
+                // 項目先頭で `=` が続く RETURNING／PARTITIONED は代入の列名であり終端ではない。
                 Some(Token::Ident(w))
                     if depth == 0
                         && (w.eq_ignore_ascii_case("RETURNING")
-                            || w.eq_ignore_ascii_case("PARTITIONED")) =>
+                            || w.eq_ignore_ascii_case("PARTITIONED"))
+                        && !(j == i
+                            && matches!(
+                                tokens.get(j.saturating_add(1)),
+                                Some(Token::Punct('='))
+                            )) =>
                 {
                     break
                 }
@@ -156,6 +162,11 @@ pub(crate) fn normalize(tokens: Vec<Token>) -> Result<Vec<Token>, SqlSurfaceErro
     let Some((alias, consumed)) = probe_dml_target_alias(rest) else {
         return Ok(tokens);
     };
+    // 表名の後ろの `ONLY` は継承マーカーの誤置であり別名ではない。別名として消費すると ONLY が落ちて
+    // 無別名 DML として実行されるため、書き換えず従来経路（42601 拒否）へ渡す（fail-closed）。
+    if alias.eq_ignore_ascii_case("ONLY") {
+        return Ok(tokens);
+    }
     let after = after_target.saturating_add(consumed);
     if !follow_ok(is_update, &tokens, after) {
         return Ok(tokens);
@@ -245,7 +256,12 @@ pub(crate) fn normalize(tokens: Vec<Token>) -> Result<Vec<Token>, SqlSurfaceErro
                         "qualified default column reference is not supported",
                     ));
                 }
-                if is_syntax_word(name)
+                // 修飾を外した Ident の直後が文字列リテラルだと型付きリテラル（`integer '7'` 等）として
+                // 再解釈され列検証が消えるため、型名を問わず拒否する（fail-closed）。
+                if matches!(
+                    tokens.get(i.saturating_add(1)),
+                    Some(Token::StringLiteral(_))
+                ) || is_syntax_word(name)
                     || is_dml_syntax_word(name)
                     || is_contextual_syntax_use(&tokens, i, name)
                 {
@@ -435,6 +451,37 @@ mod tests {
             let before = tokenize(sql).unwrap();
             assert_eq!(normalize(before.clone()).unwrap(), before, "{sql}");
         }
+    }
+
+    #[test]
+    fn only_after_target_is_not_an_alias() {
+        for sql in [
+            "DELETE FROM t ONLY;",
+            "UPDATE t ONLY SET a = 1",
+            "DELETE FROM t ONLY WHERE a = 1",
+        ] {
+            let before = tokenize(sql).unwrap();
+            assert_eq!(normalize(before.clone()).unwrap(), before, "{sql}");
+        }
+    }
+
+    #[test]
+    fn qualified_column_before_string_literal_is_rejected() {
+        for sql in [
+            "UPDATE t x SET n = x.integer '7' WHERE id = 1",
+            "UPDATE t x SET n = 1 WHERE x.a = x.time '10:00'",
+            "UPDATE t x SET n = x.interval '1 day'",
+        ] {
+            assert_eq!(code(sql), "42601", "{sql}");
+        }
+    }
+
+    #[test]
+    fn set_lhs_named_returning_does_not_end_the_list() {
+        let got = norm("UPDATE t x SET returning = 1, x.a = 2").unwrap();
+        assert!(got
+            .iter()
+            .any(|t| matches!(t, Token::QualifiedIdent { .. })));
     }
 
     #[test]
