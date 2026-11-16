@@ -8220,12 +8220,27 @@ fn concat_array_pair_compatible(
         if matches!(ty, ExprType::Vector) {
             return false;
         }
+        let other_expr = if std::ptr::eq(expr, lhs) { rhs } else { lhs };
+        // `BIT(n)[]` はスカラー BIT と同じ `SourceKind::Bit` になるため、`ExprType` で配列側を区別する
+        // （Issue #3277 の PR 指摘）。BIT 配列は反対側が BIT スカラー・BIT 配列のときだけ成立し得る。
+        let is_bit_array = |e: &Expr, b: &BoundExpr, t: &ExprType| {
+            *t == ExprType::Array
+                && matches!(source_cast_kind(e, b, *t, env.schema()), SourceKind::Bit)
+        };
+        if is_bit_array(expr, bound, ty) {
+            return match other {
+                None => true,
+                Some((ob, oty)) => *oty == ExprType::Bit || is_bit_array(other_expr, ob, oty),
+            };
+        }
         if is_special(ty) {
             // 反対側が同じ要素型の配列のときだけ成立し得る（`bytea[] || bytea` 等）。
             let Some((other_bound, other_ty)) = other else {
                 return false;
             };
-            let other_expr = if std::ptr::eq(expr, lhs) { rhs } else { lhs };
+            if is_bit_array(other_expr, other_bound, other_ty) {
+                return *ty == ExprType::Bit;
+            }
             return match source_cast_kind(other_expr, other_bound, *other_ty, env.schema()) {
                 SourceKind::Array(None) => true,
                 SourceKind::Array(Some(t)) => {

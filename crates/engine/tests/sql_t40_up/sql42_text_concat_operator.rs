@@ -101,6 +101,14 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
                     ),
                     true,
                 ),
+                ColumnDef::new(
+                    "bv",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Bit(4), engine::catalog::MAX_ARRAY_ELEMENTS)
+                            .expect("bit array type"),
+                    ),
+                    true,
+                ),
             ],
         ))
         .expect("create table");
@@ -356,6 +364,32 @@ fn compatible_array_concat_of_special_scalars_is_0a000() {
         "SELECT ARRAY[1] || CAST('a' AS bytea)",
     ] {
         assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+}
+
+/// BIT スカラーと配列の `||` は、BIT 配列を要素型つきで区別して判定する（Issue #3277 の PR 指摘）。
+/// BIT 配列の値そのものは式の中で未解禁（`ARRAY[bit]` の構築・配列列の裸参照は fail-closed）のため、
+/// 現状で到達できる組（BIT スカラーと非 BIT 配列は `42883`）と、未解禁の BIT 配列の構築が `0A000` の
+/// ままであることを固定する。BIT 配列どうしの互換判定は `concat_array_pair_compatible` が担う。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列を含む組の行）を参照。
+#[test]
+fn bit_scalar_with_array_concat_sqlstate_is_consistent_across_operand_order() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT bv[1] || ARRAY[1] FROM t",
+        "SELECT ARRAY[1] || bv[1] FROM t",
+        "SELECT bv[1] || ARRAY['a'] FROM t",
+        "SELECT ARRAY['a'] || bv[1] FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+    for sql in [
+        "SELECT ARRAY[bv[1]] || ARRAY[1] FROM t",
+        "SELECT bv[1] || ARRAY[bv[1]] FROM t",
+        "SELECT ARRAY[bv[1]] || bv[1] FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
     }
 }
 
