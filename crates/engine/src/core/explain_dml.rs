@@ -8,20 +8,27 @@
 //! 副作用ゼロ（SQL-75 (3)）: write txn・writer・台帳・ジョブ表・行・シーケンス・トリガ・世代のいずれにも
 //! 触れない。使うのは読み取りのスキーマ取得（`load_table_schema_for_dml`）と純粋な束縛・ハッシュ計算だけ。
 //!
+//! 結合形 `UPDATE ... FROM`／`DELETE ... USING`（Issue #3293）も同じ入口で受理し、実行器
+//! （`sql::join::dml`）と同じ束縛・変換・走査前検証・source 走査の束縛（`source_bound_scan`）で
+//! 木を組む。source 側の行・索引には触れず、読むのはスキーマと GIN 宣言だけ。
+//!
 //! 権限・テナント境界: 権限は `sql::privilege_gate::write` が実行した場合と同じ DELETE／UPDATE 権限を
 //! 要求する（SQL-40）。行を読まないので他テナントの行・件数・存在は出力に影響しない（SQL-75 (5)・RLS-10）。
 
 use super::{EngineCore, LedgerMode, ParsedSql};
 use crate::policy::PolicyContext;
 use crate::sql::allowlist::{DeleteStatement, SqlSurfaceError, ValidatedUpdateForm};
-use crate::sql::explain_dml::{explain_tree, ExplainDml, ExplainDmlShape};
+use crate::sql::explain_dml::{
+    explain_tree, joined_explain_tree, ExplainDml, ExplainDmlShape, JoinedExplainShape,
+};
 
 impl EngineCore {
     /// `EXPLAIN UPDATE|DELETE`（分割実行修飾なし）の構文段。先頭の `EXPLAIN` を除いた文を
     /// 非 EXPLAIN の DML と**同じ入口**（`parse_tokens_in_impl`）で解析する。構造検証・WHERE 省略ガード・
     /// 存在確認・採番表の単一行形→述語形の変換・ビュー判定の順序とエラーが実行時と一致する（SQL-75 (3)）。
-    /// 述語形の表への DML だけを受理し、それ以外の形は固定文の `42601`（fail-closed）で拒否する。
-    /// 一時表は呼び出し元の振り分けが `0A000` にする。
+    /// 述語形の表への DML と結合形（`UPDATE ... FROM`／`DELETE ... USING`。Issue #3293）を受理し、
+    /// それ以外の形は固定文の `42601`（fail-closed）で拒否する。一時表・ビューが関与する形は
+    /// 呼び出し元の振り分けが `0A000` にする。
     pub(super) fn parse_explain_dml(
         &self,
         tokens: &[crate::sql::lexer::Token],
@@ -62,16 +69,21 @@ impl EngineCore {
             ParsedSql::ViewDelete(_) | ParsedSql::ViewUpdate(_) => Err(reject(
                 "EXPLAIN is not supported for UPDATE/DELETE on a view",
             )),
+            // 結合形は非 EXPLAIN と同じ解析器が返した検証済みの値をそのまま包む（第 2 の解析器を持たない）。
+            // `$n` は構文入口（拡張クエリの Parse ゲート）が前置つきでも `42601` で拒否済み。
+            ParsedSql::UpdateFrom(v) => Ok(ParsedSql::ExplainDml(ExplainDml::UpdateFrom(v))),
+            ParsedSql::DeleteUsing(v) => Ok(ParsedSql::ExplainDml(ExplainDml::DeleteUsing(v))),
             // 一時表（`SessionRouted`）は呼び出し元の振り分けが分類するため、ここへは来ない想定。
-            // それ以外（UPDATE ... FROM／DELETE ... USING など）は固定文で拒否する。
+            // それ以外は固定文で拒否する（fail-closed）。
             _ => Err(reject(
-                "EXPLAIN is not supported for UPDATE ... FROM / DELETE ... USING",
+                "EXPLAIN is not supported for this UPDATE/DELETE form",
             )),
         }
     }
 
     /// 受理済みの `EXPLAIN UPDATE|DELETE` の実行段。実行時と同じ束縛（`prepare_predicate_*`）で
-    /// 未知の列・型不一致を同じ `wire_code` にし、書き込まずに計画の木を返す。
+    /// 未知の列・型不一致を同じ `wire_code` にし、書き込まずに計画の木を返す。結合形は
+    /// [`Self::joined_explain_outcome`] へ回す（Issue #3293）。
     pub(super) fn run_explain_dml(
         &self,
         ctx: &PolicyContext,
@@ -111,8 +123,61 @@ impl EngineCore {
                     has_operation_id: stmt.operation_id().is_some(),
                 }
             }
+            ExplainDml::UpdateFrom(stmt) => {
+                let (plan, read_txn) = self.plan_update_from_stmt_with_txn(stmt, udfs)?;
+                return self.joined_explain_outcome(
+                    &read_txn,
+                    &plan,
+                    Some(stmt.assignments.len()),
+                    stmt.returning.is_some(),
+                    stmt.operation_id().is_some(),
+                    udfs,
+                );
+            }
+            ExplainDml::DeleteUsing(stmt) => {
+                let (plan, read_txn) = self.plan_delete_using_stmt_with_txn(stmt, udfs)?;
+                return self.joined_explain_outcome(
+                    &read_txn,
+                    &plan,
+                    None,
+                    stmt.returning.is_some(),
+                    stmt.operation_id().is_some(),
+                    udfs,
+                );
+            }
         };
         let node = explain_tree(&shape).map_err(|e| e.into_surface_error())?;
+        Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
+    }
+
+    /// 結合形 DML の木を組む（Issue #3293）。実行時と同じ順序（束縛・変換 → 走査前の形検証・キー型クラス →
+    /// source 走査の束縛）で検証するため、拒否の `wire_code` は実行と一致する。読むのはスキーマと GIN 宣言だけで、
+    /// 行・台帳・writer・世代には触れない。`read_txn` は束縛に使ったスナップショット。
+    fn joined_explain_outcome(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        plan: &crate::sql::join::dml::JoinedDmlPlan,
+        assignments: Option<usize>,
+        has_returning: bool,
+        has_operation_id: bool,
+        udfs: &crate::sql::udf_call::UdfRegistry,
+    ) -> Result<crate::sql::SqlOutcome, SqlSurfaceError> {
+        let limits = self.joined_dml_limits();
+        plan.validate(&limits)?;
+        plan.key_classes()?;
+        let bound = crate::sql::join::dml::source_bound_scan(plan, udfs, &limits)?;
+        let gins = Self::gin_decls_for_explain(read_txn, &bound)?;
+        let source_lines = Self::scan_explain_lines(&plan.source.schema, &bound, &gins);
+        let shape = JoinedExplainShape {
+            assignments,
+            has_filter: !plan.target.metadata_filters.is_empty()
+                || !plan.target.expr_filters.is_empty()
+                || !plan.target.or_filters.is_empty(),
+            has_returning,
+            has_operation_id,
+            join_keys: plan.keys.len(),
+        };
+        let node = joined_explain_tree(&shape, source_lines).map_err(|e| e.into_surface_error())?;
         Ok(crate::sql::SqlOutcome::Explain(node.into_query_result()))
     }
 }

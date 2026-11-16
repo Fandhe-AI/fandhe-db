@@ -557,7 +557,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   トランザクションでも実行できる。未知の列・型不一致・不存在表は実行と同じ `wire_code`。
 - **権限**: 実行した場合と同じ DELETE／UPDATE 権限を write gate で要求する（`42501`。SQL-40）。
 - **対象外（`42601`、一時表は `0A000`）**: 採番でない表の単一行形（物理キー直接指定の語彙が未定義）、
-  `UPDATE ... FROM`／`DELETE ... USING`、自動更新可能なビュー、WHERE の部分クエリ、一時表、セッション無しの入口。
+  自動更新可能なビュー、WHERE の部分クエリ、一時表、セッション無しの入口。
   `$n` 付きの拡張クエリの EXPLAIN は既存の EXPLAIN の規則どおり。
 
 ## #2059 追記: `EXPLAIN (FORMAT JSON)`（SQL-76 (1)(6) ポインタ）
@@ -664,7 +664,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   （`RETURNING` の RLS 適用後の可視行。無ければ 0）。変更行数（`rows_affected`）は出さない（PostgreSQL の ModifyTable 段と
   同じ。件数の出し方を `RETURNING` に一本化し、SQL-76 (3) の境界を保つ）。`RETURNING` の行そのものは返さない。
 - **fail-closed**: 実行時のエラーは通常の DML と同じ `wire_code` で返し、計画は返さない。分割実行（`PARTITIONED`）は
-  非原子・autocommit 専用のため `0A000`。一時表・単一行の id 形・ビュー・`UPDATE ... FROM`／`DELETE ... USING`・WHERE の
+  非原子・autocommit 専用のため `0A000`。一時表・単一行の id 形・ビュー・WHERE の
   部分クエリは静的な `EXPLAIN` と同じ拒否のまま。`$n` 付きは Parse で `42601`、セッション無しの入口は `42601`。
 - **対象外**: 子の段（`scan`／`result`）の実測（#2053）、HNSW の可視化（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。
 
@@ -756,3 +756,7 @@ EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた�
 - **JSON**: `"rerank"` という 1 属性になる。値に `": "` を含めない。
 - `USING PLAN` の EXPLAIN は対象外（`LIMIT + OFFSET` が届かない。rerank-wiring-policy.md 第 10 節）。
 - 融合方式は `hybrid_rrf:`（#3051）で表すため、融合の行は追加していない。
+
+## 追記（Issue #3293）
+
+`EXPLAIN [ANALYZE] UPDATE ... FROM`／`DELETE ... USING` を受理した。静的な `EXPLAIN` は結合計画の木（`join` と 2 つの `scan`）を返し、行数・見積もりは出さない（JOIN の `EXPLAIN` と同じ SQL-75 (5) の契約）。`ANALYZE` は DML ANALYZE（#2055）と同じ契約。詳細は [update-from-delete-using.md](update-from-delete-using.md) の「EXPLAIN（Issue #3293）」節。

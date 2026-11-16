@@ -3102,6 +3102,7 @@ pub enum WherePredicate {
     /// Issue #3256）は束縛段（`sql::parser::bind_where_predicates_recursive`）の入口で
     /// `sql::row_compare` が既存の述語木へ展開する。ポリシー式など未対応の文脈は
     /// fail-closed で拒否する。否定は `where_negation` が演算子反転で押し下げる。
+    /// 行値の `[NOT] IN`（Issue #3299）も本 variant の `Eq` の `Or`／`Ne` の連言へ構文段で脱糖する。
     ///
     /// **BREAKING CHANGE**: 本 variant の追加は非網羅的 `match` を破壊する
     /// （既存の破壊的変更運用を踏襲）。
@@ -10420,6 +10421,10 @@ impl<'a> Parser<'a> {
         if self.row_compare_ahead() {
             return self.parse_row_compare();
         }
+        // 行値の `[NOT] IN`（SQL-9・Issue #3299）。RowCompare の Or／連言へ脱糖する。
+        if let Some((negated, kw_len)) = self.row_in_ahead() {
+            return self.parse_row_in(negated, kw_len);
+        }
         // 左辺が引用なしの裸の `NULL` で直後が `IS [NOT] DISTINCT FROM` なら `NULL` リテラル
         // （SQL-54・Issue #1783。それ以外の位置の `NULL` は従来どおり列参照として読む）。
         let null_lhs = matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("NULL"))
@@ -10526,12 +10531,23 @@ impl<'a> Parser<'a> {
     /// （`= < > <= >=`・`<>`）のときだけ真。成分 1 個の括弧（`(a) < 3`）は偽で、従来の式経路へ流す。
     /// CHECK 本体では行値を認識しない（従来どおり `42601`）。先読みは `get()` のみで後戻りしない。
     fn row_compare_ahead(&self) -> bool {
-        if self.in_check_body || !matches!(self.peek(), Some(Token::Punct('('))) {
-            return false;
-        }
-        let Some(close) = self.find_matching_close_paren(self.pos) else {
+        let Some(close) = self.row_paren_close() else {
             return false;
         };
+        matches!(
+            close.checked_add(1).and_then(|i| self.tokens.get(i)),
+            Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
+        )
+    }
+
+    /// 現在位置が行値の括弧 `( e1 , e2 ... )`（括弧深さ 1 に `,` を持つ）なら対応する `)` の位置を返す
+    /// （消費しない）。[`Self::row_compare_ahead`] と [`Self::row_in_ahead`] が共用する。
+    /// CHECK 本体では行値を認識しない。走査は `get()` のみで 1 回の線形走査（後戻りしない）。
+    fn row_paren_close(&self) -> Option<usize> {
+        if self.in_check_body || !matches!(self.peek(), Some(Token::Punct('('))) {
+            return None;
+        }
+        let close = self.find_matching_close_paren(self.pos)?;
         let mut depth: u32 = 0;
         // 配列コンストラクタ `ARRAY[1, 2]` 内のカンマを行値の区切りと誤認しないよう角括弧の深さも追跡する
         let mut bracket_depth: u32 = 0;
@@ -10549,11 +10565,92 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
         }
-        has_top_level_comma
-            && matches!(
-                close.checked_add(1).and_then(|i| self.tokens.get(i)),
-                Some(Token::Punct('>' | '<' | '=') | Token::Ge | Token::Le)
-            )
+        has_top_level_comma.then_some(close)
+    }
+
+    /// 現在位置が行値の `IN`／`NOT IN` の左辺 `( e1 , e2 ... ) [NOT] IN (`（直後が `SELECT` でない）か
+    /// （消費しない。Issue #3299）。真なら `(negated, キーワード部のトークン数)` を返す。
+    fn row_in_ahead(&self) -> Option<(bool, usize)> {
+        let close = self.row_paren_close()?;
+        match self.expr_lhs_postfix_at(close.checked_add(1)?)? {
+            ExprPostfix::InList { negated, kw_len } => Some((negated, kw_len)),
+            _ => None,
+        }
+    }
+
+    /// 行値の `(l1..ln) [NOT] IN ((r1..rn), ...)`（SQL-9・Issue #3299）。要素ごとの行値等価
+    /// [`WherePredicate::RowCompare`]（`Eq`）の [`WherePredicate::Or`] へ脱糖し（要素 1 個は単独）、
+    /// `NOT IN` は [`negate_conjunction`] で葉まで押し下げる（各要素の `<>` の連言。Kleene 三値論理で厳密）。
+    /// 評価は束縛段（`row_compare`）が既存の比較葉へ展開する。要素数・成分数は積む前に検査し、
+    /// 要素が行でない・成分数不一致・空リストは `42601`、サブクエリ要素は `0A000`。
+    fn parse_row_in(&mut self, negated: bool, kw_len: usize) -> Result<ExprLeaf, SqlSurfaceError> {
+        let lhs = self.parse_row_side(None)?;
+        self.pos = self.pos.saturating_add(kw_len);
+        self.expect_punct('(')?;
+        if matches!(self.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::unsupported("IN list must not be empty"));
+        }
+        let lhs_nodes = lhs
+            .iter()
+            .fold(0usize, |acc, e| acc.saturating_add(expr_node_count(e)));
+        let mut branches: Vec<Vec<WherePredicate>> = Vec::new();
+        loop {
+            if branches.len() >= MAX_IN_LIST_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "IN list item count exceeds limit {MAX_IN_LIST_ITEMS}"
+                )));
+            }
+            if !matches!(self.peek(), Some(Token::Punct('('))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "IN list element must be a row expression",
+                ));
+            }
+            if matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Keyword(Keyword::Select))
+            ) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "row value comparison with a subquery is not supported",
+                ));
+            }
+            let rhs = self.parse_row_side(Some(lhs.len()))?;
+            if rhs.len() != lhs.len() {
+                return Err(SqlSurfaceError::unsupported(
+                    "unequal number of entries in row expressions",
+                ));
+            }
+            // 左辺の複製 1 回分と `RowCompare` 1 ノード。
+            self.charge_expr_nodes(lhs_nodes.saturating_add(1))?;
+            branches.push(vec![WherePredicate::RowCompare {
+                lhs: lhs.clone(),
+                op: ArrayCmpOp::Eq,
+                rhs,
+            }]);
+            match self.peek() {
+                Some(Token::Punct(',')) => {
+                    self.advance();
+                }
+                Some(Token::Punct(')')) => {
+                    self.advance();
+                    break;
+                }
+                other => {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "expected ',' or ')' in IN list, got {other:?}"
+                    )))
+                }
+            }
+        }
+        let preds = if branches.len() == 1 {
+            branches.pop().unwrap_or_default()
+        } else {
+            vec![WherePredicate::Or(branches)]
+        };
+        Ok(ExprLeaf::Preds(if negated {
+            negate_conjunction(preds, &mut self.expr_node_budget)?
+        } else {
+            preds
+        }))
     }
 
     /// 行の 1 辺 `( e1 , e2 , ... )` を読む。成分数は `limit` 以下に抑え、`push` の**前**に検査する
@@ -35183,6 +35280,101 @@ mod tests {
         }
     }
 
+    /// Issue #3299: 行値の `[NOT] IN` は RowCompare の Or／連言へ脱糖される（AST の形を固定する）。
+    #[test]
+    fn row_value_in_list_parses_to_row_compare_or() {
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let preds = |pred: &str| {
+            where_predicates_for(&format!("SELECT * FROM documents WHERE {pred} {tail}"))
+        };
+        let eq_or = |preds: &[WherePredicate], n: usize| match preds {
+            [WherePredicate::Or(branches)] => {
+                branches.len() == n
+                    && branches.iter().all(|b| {
+                        matches!(
+                            b.as_slice(),
+                            [WherePredicate::RowCompare {
+                                op: ArrayCmpOp::Eq,
+                                ..
+                            }]
+                        )
+                    })
+            }
+            _ => false,
+        };
+        let ne_and = |preds: &[WherePredicate], n: usize| {
+            preds.len() == n
+                && preds.iter().all(|p| {
+                    matches!(
+                        p,
+                        WherePredicate::RowCompare {
+                            op: ArrayCmpOp::Ne,
+                            ..
+                        }
+                    )
+                })
+        };
+        for sql in ["(a, b) IN ((1, 2), (3, 4))", "(a, b) in ((1, 2), (3, 4))"] {
+            assert!(eq_or(&preds(sql), 2), "{sql}");
+        }
+        assert!(matches!(
+            preds("(a, b) IN ((1, 2))").as_slice(),
+            [WherePredicate::RowCompare {
+                op: ArrayCmpOp::Eq,
+                ..
+            }]
+        ));
+        for sql in [
+            "(a, b) NOT IN ((1, 2), (3, 4))",
+            "(a, b) Not In ((1, 2), (3, 4))",
+            "NOT (a, b) IN ((1, 2), (3, 4))",
+            "NOT ((a, b) IN ((1, 2), (3, 4)))",
+        ] {
+            assert!(ne_and(&preds(sql), 2), "{sql}");
+        }
+        assert!(eq_or(&preds("NOT (a, b) NOT IN ((1, 2), (3, 4))"), 2));
+        assert_eq!(preds("a = 1 AND (a, b) IN ((1, 2), (3, 4))").len(), 2);
+    }
+
+    /// Issue #3299: 行値の `[NOT] IN` の fail-closed な拒否（形の誤り `42601`・サブクエリ `0A000`・
+    /// 上限超過 `54000`・CHECK 本体では認識しない）。
+    #[test]
+    fn row_value_in_list_rejects_unsupported_forms() {
+        let lookup = catalog_with(&["documents"]);
+        let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
+        let code = |pred: &str| {
+            let sql = format!("SELECT * FROM documents WHERE {pred} {tail}");
+            validate_statement(&sql, &lookup)
+                .err()
+                .unwrap_or_else(|| panic!("{sql} must fail"))
+                .wire_code()
+        };
+        for pred in [
+            "(a, b) IN ()",
+            "(a, b) IN ((1, 2, 3))",
+            "(a, b) IN ((1))",
+            "(a, b) IN (1, 2)",
+            "(a, b) IN (ROW(1, 2))",
+            "(a, b) IN (((1, 2)), (3, 4))",
+            "(a, b) IN ((1, 2) (3, 4))",
+            "(a, b) IN ((1, 2)",
+        ] {
+            assert_eq!(code(pred), "42601", "{pred}");
+        }
+        assert_eq!(code("(a, b) IN ((SELECT 1, 2))"), "0A000");
+        let row = |n: usize| vec!["a"; n].join(", ");
+        assert_eq!(
+            code(&format!(
+                "({}) IN (({}))",
+                row(MAX_ROW_COMPARE_COMPONENTS + 1),
+                row(MAX_ROW_COMPARE_COMPONENTS + 1)
+            )),
+            "54000"
+        );
+        let many = vec!["(1, 2)"; MAX_IN_LIST_ITEMS + 1].join(", ");
+        assert_eq!(code(&format!("(a, b) IN ({many})")), "54000");
+    }
+
     /// Issue #3255: 行値比較の fail-closed な拒否（成分数不一致・未対応形は `42601`／`0A000`、
     /// 上限超過は `54000`、CHECK 本体では認識しない）。
     #[test]
@@ -35203,7 +35395,6 @@ mod tests {
             "(a, b) < ROW(1, 2)",
             "ROW(a, b) < (1, 2)",
             "((a, b), c) < ((1, 2), 3)",
-            "(a, b) IN ((1, 2))",
             "(a, b) IS NULL",
             "(a, b) = ANY (b)",
         ] {
