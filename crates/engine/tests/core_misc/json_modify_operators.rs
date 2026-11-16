@@ -352,9 +352,15 @@ fn type_errors_use_fixed_sqlstates() {
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
     seed(&core, &alice, &[Some(r#"{"a":1}"#)]);
-    // 文字列連結は未実装（PostgreSQL では text の連結）。
-    assert_eq!(select_code(&core, &alice, "lang || 'x'"), "0A000");
+    // text 同士の連結は Issue #3276 で実装済み（strict な文字列連結）。
+    assert_eq!(
+        cell(&core, &alice, "lang || 'x'", 1),
+        Cell::Text("kx".to_string())
+    );
+    // 非 text オペランドの連結は未実装のまま拒否する。
+    // tracked: #3278
     assert_eq!(select_code(&core, &alice, "docb || lang"), "0A000");
+    // tracked: #3278
     assert_eq!(select_code(&core, &alice, "doc || '{}'"), "0A000");
     // jsonb と数値は演算子なし。リテラル同士も 42883。
     assert_eq!(select_code(&core, &alice, "docb || n"), "42883");

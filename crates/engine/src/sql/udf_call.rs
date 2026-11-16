@@ -1969,6 +1969,10 @@ pub enum BuiltinFn {
     /// `concat(a: Text, b: Text) -> Text`。可変長 `CONCAT` は束縛段
     /// （[`bind_call`]）でこの 2 引数版の左畳み込みへ展開する。
     Concat2,
+    /// `a || b`（text 連結演算子。Issue #3276・SQL-42）。`concat` と違い strict
+    /// （NULL が 1 つでもあれば NULL）。演算子専用で関数名からは呼べない
+    /// （`builtin_from_name` は返さない）。結果長は確保前に検査する。
+    TextConcat,
     /// `trim(s: Text) -> Text`（半角空白のみ除去。PostgreSQL 既定）。
     Trim,
     /// `replace(s: Text, from: Text, to: Text) -> Text`。
@@ -2521,7 +2525,9 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
             &[ExprType::Text, ExprType::Text, ExprType::Scalar],
             ExprType::Text,
         ),
-        BuiltinFn::Concat2 => (&[ExprType::Text, ExprType::Text], ExprType::Text),
+        BuiltinFn::Concat2 | BuiltinFn::TextConcat => {
+            (&[ExprType::Text, ExprType::Text], ExprType::Text)
+        }
         BuiltinFn::Trim => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Replace => (
             &[ExprType::Text, ExprType::Text, ExprType::Text],
@@ -2689,6 +2695,7 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Rpad3
         | BuiltinFn::SplitPart
         | BuiltinFn::Concat2
+        | BuiltinFn::TextConcat
         | BuiltinFn::Trim
         | BuiltinFn::Replace
         | BuiltinFn::Position
@@ -7963,6 +7970,70 @@ fn concat_not_supported() -> SqlSurfaceError {
     }
 }
 
+/// [`try_bind_text_concat`] の結果。text 連結に束縛できたか、従来経路へ流すかを表す。
+enum TextConcatBind {
+    /// text 連結として束縛済み。
+    Done((BoundExpr, ExprType)),
+    /// text 連結ではない。リテラル（`Expr::String`／`Expr::Null`）以外の束縛済みオペランドを
+    /// 従来の jsonb 経路へ引き渡す（再束縛しない）。リテラルは `None`。
+    Fallback {
+        lhs: Option<(BoundExpr, ExprType)>,
+        rhs: Option<(BoundExpr, ExprType)>,
+    },
+}
+
+/// `||` の text 連結束縛（Issue #3276・SQL-42）。両オペランドの型が text（型なしリテラル・
+/// 裸の NULL を含む）に揃うときだけ [`BuiltinFn::TextConcat`] に束縛して返す。jsonb・非 text が
+/// 絡むときは束縛済みオペランドを [`TextConcatBind::Fallback`] で返し、呼び出し元の従来経路
+/// （jsonb 連結／拒否）がそれを再利用する。リテラル以外のオペランドは必ず 1 回だけ束縛する
+/// （左結合の `||` 連鎖で部分木を二重に束縛すると束縛時間が段数に対して指数的になるため。
+/// PR #3453 指摘）。リテラルは葉であり、text 判明後にだけ束縛する。
+fn try_bind_text_concat(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<TextConcatBind, SqlSurfaceError> {
+    let is_lit = |e: &Expr| matches!(e, Expr::String(_) | Expr::Null);
+    let l = if is_lit(lhs) {
+        None
+    } else {
+        Some(bind_json_concat_operand(lhs, env, node_budget)?)
+    };
+    let r = if is_lit(rhs) {
+        None
+    } else {
+        Some(bind_json_concat_operand(rhs, env, node_budget)?)
+    };
+    let text_like =
+        |t: &Option<(BoundExpr, ExprType)>| t.as_ref().is_none_or(|(_, ty)| *ty == ExprType::Text);
+    if !(text_like(&l) && text_like(&r)) {
+        return Ok(TextConcatBind::Fallback { lhs: l, rhs: r });
+    }
+    let finish = |pre: Option<(BoundExpr, ExprType)>,
+                  expr: &Expr,
+                  env: &mut BindEnv<'_>,
+                  budget: &mut usize|
+     -> Result<BoundExpr, SqlSurfaceError> {
+        match pre {
+            Some((b, _)) => Ok(b),
+            None => Ok(bind_null_aware(expr, env, budget)?.0),
+        }
+    };
+    let lb = finish(l, lhs, env, node_budget)?;
+    let rb = finish(r, rhs, env, node_budget)?;
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    Ok(TextConcatBind::Done((
+        BoundExpr::Builtin {
+            f: BuiltinFn::TextConcat,
+            args: vec![lb, rb],
+        },
+        ExprType::Text,
+    )))
+}
+
 /// jsonb の連結・パス削除演算子（`||` `#-`。Issue #2181・TABLE-25）の束縛。
 /// `||` は両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として解釈）のみ受理し、
 /// 文字列連結に当たる組は `0A000`、型の合わない組は `42883`。`#-` は左辺 jsonb（`json` 列は
@@ -8025,6 +8096,12 @@ fn bind_json_modify(
             ExprType::Json,
         ));
     }
+    // `||`。text／varchar／型なしリテラル／NULL だけの組は strict な text 連結
+    // （Issue #3276・SQL-42）。jsonb が絡む組・非 text の組は従来の jsonb 経路へ流す。
+    let (pre_l, pre_r) = match try_bind_text_concat(lhs, rhs, env, node_budget)? {
+        TextConcatBind::Done(done) => return Ok(done),
+        TextConcatBind::Fallback { lhs, rhs } => (lhs, rhs),
+    };
     // `||`。
     let lhs_is_literal = matches!(lhs, Expr::String(_));
     let rhs_is_literal = matches!(rhs, Expr::String(_));
@@ -8032,14 +8109,17 @@ fn bind_json_modify(
         return Err(operator_missing());
     }
     // 型なしリテラルの反対側の型を確定させる。jsonb ならリテラルを jsonb として解釈、
-    // text なら文字列連結（未実装）、それ以外は演算子なし。
+    // text なら文字列連結（未実装）、それ以外は演算子なし。束縛済みのオペランドは再束縛しない。
     let (l_bound, r_bound) = if lhs_is_literal || rhs_is_literal {
-        let (other_expr, literal_expr) = if lhs_is_literal {
-            (rhs, lhs)
+        let (other_expr, other_pre, literal_expr) = if lhs_is_literal {
+            (rhs, pre_r, lhs)
         } else {
-            (lhs, rhs)
+            (lhs, pre_l, rhs)
         };
-        let (other, other_ty) = bind_json_concat_operand(other_expr, env, node_budget)?;
+        let (other, other_ty) = match other_pre {
+            Some(done) => done,
+            None => bind_json_concat_operand(other_expr, env, node_budget)?,
+        };
         match other_ty {
             ExprType::Json => {}
             ExprType::Text => return Err(concat_not_supported()),
@@ -8052,8 +8132,14 @@ fn bind_json_modify(
             (other, lit)
         }
     } else {
-        let (l, l_ty) = bind_json_concat_operand(lhs, env, node_budget)?;
-        let (r, r_ty) = bind_json_concat_operand(rhs, env, node_budget)?;
+        let (l, l_ty) = match pre_l {
+            Some(done) => done,
+            None => bind_json_concat_operand(lhs, env, node_budget)?,
+        };
+        let (r, r_ty) = match pre_r {
+            Some(done) => done,
+            None => bind_json_concat_operand(rhs, env, node_budget)?,
+        };
         match (l_ty, r_ty) {
             (ExprType::Json, ExprType::Json) => (l, r),
             (ExprType::Json, ExprType::Text) | (ExprType::Text, ExprType::Json) => {
@@ -12470,6 +12556,19 @@ pub(crate) fn apply_builtin<'a>(
                 _ => Ok(ExprValue::Null),
             }
         }
+        BuiltinFn::TextConcat => {
+            // strict: NULL は冒頭の一律ガードで返済み。長さは確保前に検査する（#3276）。
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_text_or_null_arg(args, 1)?,
+            ) {
+                (Some(a), Some(b)) => {
+                    let out = string_fn::concat_strict(&a, &b)?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
         BuiltinFn::Concat2 => {
             let a = take_text_or_null_arg(args, 0)?.unwrap_or(Cow::Borrowed(""));
             let b = take_text_or_null_arg(args, 1)?.unwrap_or(Cow::Borrowed(""));
@@ -14410,6 +14509,7 @@ mod tests {
             BuiltinFn::Rpad3,
             BuiltinFn::SplitPart,
             BuiltinFn::Concat2,
+            BuiltinFn::TextConcat,
             BuiltinFn::Trim,
             BuiltinFn::Replace,
             BuiltinFn::Position,

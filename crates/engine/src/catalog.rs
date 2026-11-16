@@ -5862,7 +5862,7 @@ fn validate_view_body_matches_base_relation(
 /// `relations` は本文が読む relation 名（先頭が `base_relation`。JOIN は両辺）、
 /// `buffered` は評価後射影形（集計・`LIMIT`・`ORDER BY`・JOIN を含む本文）か、
 /// `join` は JOIN 本文か。
-struct ViewBodyShape {
+pub(crate) struct ViewBodyShape {
     relations: Vec<String>,
     buffered: bool,
     join: bool,
@@ -16367,6 +16367,23 @@ impl Storage {
         column_aliases: &[String],
         check_option: ViewCheckOption,
     ) -> Result<()> {
+        let (encoded, shape) =
+            Self::prepare_create_view(name, base_relation, body_sql, column_aliases, check_option)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::create_view_in_txn(&write_txn, name, base_relation, body_sql, &encoded, &shape)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// [`Self::create_view_with_check_option`] の txn 前処理（識別子・本文サイズ・別名の形状検証と定義のエンコード。
+    /// write txn を開く前に fail-closed に拒否できる判定だけ）。要素つき `CREATE SCHEMA` の実行器
+    /// （`core::schema_elements`）も同じ処理を通す（第 2 の検証経路を作らない。Issue #3286）。
+    pub(crate) fn prepare_create_view(
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        column_aliases: &[String],
+        check_option: ViewCheckOption,
+    ) -> Result<(Vec<u8>, ViewBodyShape)> {
         validate_relation_key(name)?;
         if body_sql.len() > MAX_VIEW_BODY_BYTES {
             return Err(CatalogError::ViewLimitExceeded(
@@ -16394,8 +16411,22 @@ impl Storage {
             column_aliases: column_aliases.to_vec(),
             check_option,
         })?;
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
+        Ok((encoded, shape))
+    }
+
+    /// [`Self::create_view_with_check_option`] の write txn 内本体（begin・commit を含まない）。`encoded`・`shape`
+    /// は [`Self::prepare_create_view`] の結果。名前空間の衝突・参照先の存在と深さ・件数上限・保存・commit 記録・
+    /// 所有者の適用を行う。`Err` の場合は呼び出し側が txn を破棄する。単独の `CREATE VIEW` と、要素つき
+    /// `CREATE SCHEMA` が SCHEMA・表と同じ txn にビューを載せる経路が共有する（Issue #3286）。
+    pub(crate) fn create_view_in_txn(
+        write_txn: &redb::WriteTransaction,
+        name: &str,
+        base_relation: &str,
+        body_sql: &str,
+        encoded: &[u8],
+        shape: &ViewBodyShape,
+    ) -> Result<()> {
+        namespace::ensure_key_schema_alive_in_txn(write_txn, name)?;
         {
             let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -16406,19 +16437,19 @@ impl Storage {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             // 索引名とも名前空間を共有する（TASK-206・INDEX-7、Issue #908）。
-            if index_name_exists_in_txn(&write_txn, name)?
-                || materialized_view_exists_in_txn(&write_txn, name)?
-                || sequence::sequence_exists_in_txn(&write_txn, name)?
+            if index_name_exists_in_txn(write_txn, name)?
+                || materialized_view_exists_in_txn(write_txn, name)?
+                || sequence::sequence_exists_in_txn(write_txn, name)?
             {
                 return Err(CatalogError::TableAlreadyExists(name.to_string()));
             }
             validate_new_view_body_in_txn(
-                &write_txn,
+                write_txn,
                 &catalog_table,
                 &views_table,
                 body_sql,
                 base_relation,
-                &shape,
+                shape,
             )?;
             let count = views_table.len()?;
             if count >= MAX_VIEWS as u64 {
@@ -16426,13 +16457,13 @@ impl Storage {
                     "too many views".to_string(),
                 ));
             }
-            views_table.insert(name, encoded.as_slice())?;
+            views_table.insert(name, encoded)?;
             // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
-            crate::storage::commit_log::note_ddl(&write_txn, name);
+            crate::storage::commit_log::note_ddl(write_txn, name);
             // 予約された作成者を所有者として同じ txn に書く（Issue #2236）。
-            privilege::owner::apply_pending_relation_owner_in_txn(&write_txn, name)?;
+            privilege::owner::apply_pending_relation_owner_in_txn(write_txn, name)?;
         }
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+        Ok(())
     }
 
     /// `DROP VIEW <name>`（TABLE-18・SQL-23・TASK-205、Issue #909）。他のビューが

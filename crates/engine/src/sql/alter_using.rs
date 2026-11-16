@@ -397,6 +397,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::DuplicateSchema { .. }
         | E::InvalidSchemaName { .. }
         | E::ReservedName { .. }
+        | E::InvalidSchemaDefinition { .. }
         | E::DuplicateRole { .. }
         | E::UndefinedRole { .. }
         | E::RoleHasDependents { .. }
