@@ -3729,8 +3729,9 @@ impl DropTypeOutcome {
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （Issue #1194）。`Storage::create_enum_type`（単一 write txn 内で名前検証・
-/// 重複判定・件数上限を行う）へ委譲する。ENUM 型は全テナント共有カタログのため
-/// `PolicyContext` は取らない。
+/// 重複判定・件数上限を行う）へ委譲する。ENUM 型のカタログは全テナント共有で `PolicyContext` は取らない。
+/// 型名は裸の名前（public）か、解決器が自テナントの SCHEMA から作った内部キー `#<schema_id>.<name>`
+/// （Issue #3288。呼び出し元 `core::EngineCore` の実行腕が作成先の権限を検査済み）。
 pub(crate) fn execute_create_type(
     storage: &Storage,
     validated: &ValidatedCreateType,
@@ -3749,7 +3750,8 @@ pub(crate) fn execute_create_type(
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （Issue #1194）。`Storage::drop_enum_type`（同一 write txn 内で依存列を判定し、
-/// 残っていれば `DependentObjectsStillExist`）へ委譲する。
+/// 残っていれば `DependentObjectsStillExist`）へ委譲する。型名は [`execute_create_type`] と同じく
+/// 裸の名前か内部キー（Issue #3288）。
 pub(crate) fn execute_drop_type(
     storage: &Storage,
     validated: &ValidatedDropType,
@@ -3773,6 +3775,9 @@ pub(crate) fn execute_drop_type(
 fn map_create_type_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         CatalogError::TypeAlreadyExists(name) => SqlSurfaceError::duplicate_type(name),
+        // 解析と実行の間に作成先の SCHEMA が消えた競合（Issue #3288。表・SEQUENCE の作成と同じ `42P01`）。
+        // 名前は内部キーのまま渡し、ctx を持つ入口の出口（`map_text`）が公開名へ戻す。
+        CatalogError::TableNotFound(name) => SqlSurfaceError::undefined_table(name),
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("invalid enum type definition in CREATE TYPE")
         }

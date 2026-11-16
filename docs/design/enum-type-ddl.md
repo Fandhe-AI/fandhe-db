@@ -12,9 +12,10 @@ SQL から発生しなかった。本 Issue で `sql::ddl` へ結線した。
 
 - `CREATE TYPE <name> AS ENUM ('<label>'[, '<label>']*)`
 - `DROP TYPE <name>`
-- 上記以外（`CREATE TYPE` の `IF NOT EXISTS`・`CASCADE`／`RESTRICT`・スキーマ修飾名・複合型・空リスト・
-  非文字列リテラルのラベル・`$n`・`ALTER TYPE`）は構造検証で `42601`。
-- 型名は識別子形状（`validate_identifier`）のみ構文検証段で確認し、大文字小文字は区別して保持する。
+- 上記以外（`CREATE TYPE` の `IF NOT EXISTS`・`CASCADE`／`RESTRICT`・複合型・空リスト・
+  非文字列リテラルのラベル・`$n`・`ALTER TYPE`）は構造検証で `42601`。スキーマ修飾名は Issue #3288 から名前解決の対象
+  （型名位置の `s.mood` は自テナントの SCHEMA 配下の型。[schema-tenant-namespace.md](schema-tenant-namespace.md) の「追記（Issue #3288）」）。
+- 型名は識別子形状（`validate_identifier`。Issue #3288 から、解決器が作る内部キー `#<id>.<name>` も受理する `validate_relation_key`）のみ構文検証段で確認し、大文字小文字は区別して保持する。
 - ラベル数は push 前に `MAX_ENUM_LABELS`（256）で打ち切り `54000`。ラベルの重複・空・
   長さ・組み込み型名との衝突はカタログ側 `create_enum_type` の検証に一本化し `42601`。
 
@@ -24,7 +25,7 @@ SQL から発生しなかった。本 Issue で `sql::ddl` へ結線した。
 2. DDL 実行権限（`require_ddl_permission`、`--ddl-allowed-users`）→ 型の有無を問わず `42501`
 3. 実行本体（単一 write txn 内で存在・依存を判定。TOCTOU なし）
 
-ENUM 型は全テナント共有カタログで `PolicyContext` を取らない。RLS 判定は変更しない。
+ENUM 型のカタログ API は `PolicyContext` を取らない（public の型は全テナント共有。SCHEMA 配下の型は解決器が自テナントの内部 ID だけを渡す。Issue #3288）。RLS 判定は変更しない。
 
 ## エラー写像
 

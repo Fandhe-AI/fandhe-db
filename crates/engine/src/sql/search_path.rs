@@ -24,8 +24,10 @@
 //!   `public` なら裸のまま。[`creation_target`]・[`resolve_statement_refs`]）。作成先の SCHEMA は USAGE が無ければ
 //!   飛ばさず `42501`。拡張クエリ（Parse・Bind・Describe）も Parse で同じ規則で解決し、Bind・Describe の時点の
 //!   path・カタログで再解決する（Issue #3197。`core::EngineCore::refresh_prepared_in_txn`）。`ALTER TABLE t SET SCHEMA ..` の未修飾の対象も同じ書き換えで修飾形と同じ経路に乗る（#3198・#3199）。
-//!   SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）は、path 先頭が SCHEMA なら
-//!   `public` へ黙って作らず `0A000`。
+//!   ENUM 型（`CREATE TYPE`・`DROP TYPE`）も同じ規則に乗る（Issue #3288）。未修飾の `CREATE TYPE` は path 先頭の
+//!   SCHEMA へ作り、未修飾の `DROP TYPE` は型の名前空間（[`NameKind::Type`]。表・ビューとは別）で path を引く
+//!   （共有 `public` の同名の型を取り違えて落とさない）。SCHEMA 配置が未対応の作成（`CREATE MATERIALIZED VIEW`）は、
+//!   path 先頭が SCHEMA なら `public` へ黙って作らず `0A000`。
 //! - 一時表以外の未修飾名が解決できず、実効 path に `public` が含まれなければ `42P01`、作成先が
 //!   組み込み SCHEMA・`pg_temp` になる文は `0A000`、どの要素にも作れなければ `3F000`。
 //! - 自テナントの SCHEMA が path に無い既定のセッション（username 無し）はカタログを引かない。wire の
@@ -255,6 +257,8 @@ struct GateRef {
     name: String,
     /// `DROP INDEX`／`ALTER INDEX` の対象名か（一時表の索引は一時 DB の索引カタログで照会する）。
     is_index: bool,
+    /// `DROP TYPE`／`ALTER TYPE` の対象名か（ENUM 型は表・ビューと別の名前空間で、一時版も無い。Issue #3288）。
+    is_type: bool,
 }
 
 /// 添字 `idx` の識別子が、表名ではなく構文語として置かれているか。名前の一致だけでは判定せず、
@@ -439,6 +443,7 @@ fn relation_refs(tokens: &[Token], skip: &[usize], keep_internal_keys: bool) -> 
             index: pos.index,
             name: name.to_string(),
             is_index: false,
+            is_type: false,
         });
     }
     // `DROP`／`ALTER`／`REFRESH` の対象名にも位置走査と同じ除外を掛ける。Bind・Describe は書き換え後の
@@ -485,6 +490,7 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
         return Vec::new();
     }
     let is_index = is(i, "INDEX");
+    let is_type = is(i, "TYPE");
     i += 1;
     if is(i, "CONCURRENTLY") {
         i += 1;
@@ -503,6 +509,7 @@ fn object_ddl_names(tokens: &[Token]) -> Vec<(usize, GateRef)> {
                 index: i,
                 name: name.to_string(),
                 is_index,
+                is_type,
             },
         ));
         if matches!(tokens.get(i + 1), Some(Token::Punct(','))) {
@@ -581,7 +588,10 @@ pub(crate) fn check_unqualified_refs(
     for r in unqualified_relation_refs(tokens, skip) {
         // 索引名は一時表名の集合ではなく一時 DB の索引カタログで照会する（一時表の索引に対する
         // `DROP INDEX` を `42P01` で先に拒否しない）。照会に失敗したら存在しない側（fail-closed）。
-        let temp_hit = if r.is_index {
+        // 型に一時版は無いため、一時表と同名でも型の参照は通さない（Issue #3288）。
+        let temp_hit = if r.is_type {
+            false
+        } else if r.is_index {
             temp_index_exists(session, &r.name)
         } else {
             temp.contains(&r.name)
@@ -611,6 +621,8 @@ pub(crate) enum NameKind {
     Index,
     /// `nextval('q')` 等の文字列引数（SEQUENCE だけ）。
     Sequence,
+    /// ENUM 型（`DROP TYPE` の対象名。表・ビューとは別の名前空間。Issue #3288）。
+    Type,
 }
 
 /// 未修飾名の解決（[`resolve_path_refs`]）が使うカタログ照会。呼び出し元（`core::EngineCore`）が
@@ -764,32 +776,32 @@ fn resolve_path_refs_inner(
     if has_schema {
         let temp = session.temp_tables();
         // 同じ名前の再照会を避ける（種別ごと）。
-        let mut seen: Vec<(String, bool, Option<String>)> = Vec::new();
+        let mut seen: Vec<(String, NameKind, Option<String>)> = Vec::new();
         for r in relation_refs(tokens, skip, false) {
-            let temp_hit = if r.is_index {
-                temp_index_exists(session, &r.name)
+            let kind = if r.is_type {
+                NameKind::Type
+            } else if r.is_index {
+                NameKind::Index
             } else {
-                temp.contains(&r.name)
+                NameKind::Relation
+            };
+            // 型に一時版は無い（一時表と同名でも型の名前空間で引く）。
+            let temp_hit = match kind {
+                NameKind::Type => false,
+                NameKind::Index => temp_index_exists(session, &r.name),
+                _ => temp.contains(&r.name),
             };
             if temp_hit {
                 continue;
             }
-            let key = match seen
-                .iter()
-                .find(|(n, idx, _)| *n == r.name && *idx == r.is_index)
-            {
+            let key = match seen.iter().find(|(n, k, _)| *n == r.name && *k == kind) {
                 Some((_, _, key)) => key.clone(),
                 None => {
-                    let kind = if r.is_index {
-                        NameKind::Index
-                    } else {
-                        NameKind::Relation
-                    };
                     let key = match find_in_slots(&slots, &r.name, kind, lookup)? {
                         Placement::InSchema(key) => Some(key),
                         Placement::Public | Placement::Missing => None,
                     };
-                    seen.push((r.name.clone(), r.is_index, key.clone()));
+                    seen.push((r.name.clone(), kind, key.clone()));
                     key
                 }
             };
@@ -887,7 +899,7 @@ struct CreationResolution {
     self_refs: Vec<usize>,
 }
 
-/// 作成系 DDL（`CREATE TABLE`／`VIEW`／`SEQUENCE`・CTAS）の未修飾の作成対象名を、`search_path` の先頭が
+/// 作成系 DDL（`CREATE TABLE`／`VIEW`／`SEQUENCE`／`TYPE`・CTAS）の未修飾の作成対象名を、`search_path` の先頭が
 /// 自テナントの SCHEMA なら内部キー（`#<schema_id>.<name>`）へ置き換える対象として返す（Issue #3196）。
 /// 修飾名 `q1.t` の解決後と同じトークン列になるので、以降の ACL・実行は修飾形と同じ経路に乗る。
 ///
@@ -903,6 +915,36 @@ fn resolve_creation_name(
         || !matches!(tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("CREATE"))
     {
         return Ok(None);
+    }
+    // `CREATE TYPE <名> AS ENUM (..)`（Issue #3288）。型名は relation の位置走査に載らないため、3 語目を
+    // 作成名として直接扱う。作成先の判定・書き換えは表・SEQUENCE と同じ（自己参照は無い）。
+    if crate::sql::allowlist::is_create_type_statement(tokens) {
+        let Some(Token::Ident(name)) = tokens.get(2) else {
+            return Ok(None);
+        };
+        if name.starts_with('#') || crate::sql::relation_name::collides_with_syntax_word(name) {
+            return Ok(None);
+        }
+        let target = match creation_target(session, lookup.creation_schema_id) {
+            Ok(t) => t,
+            Err(e) if ["42501", "3F000", "0A000"].contains(&e.wire_code()) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let key = match target {
+            CreateTarget::Public => None,
+            CreateTarget::Schema(schema_id) => Some(
+                RelationKey::InSchema {
+                    schema_id,
+                    name: name.clone(),
+                }
+                .encode(),
+            ),
+        };
+        return Ok(Some(CreationResolution {
+            index: 2,
+            key,
+            self_refs: Vec::new(),
+        }));
     }
     let walk = crate::sql::relation_name::relation_positions(tokens);
     // `IF NOT EXISTS` の `IF` も作成名の位置として数えられるため、構文語の `IF`（直後が `NOT`）は飛ばす。
@@ -1527,7 +1569,8 @@ mod tests {
             vec![GateRef {
                 index: 2,
                 name: "i".to_string(),
-                is_index: true
+                is_index: true,
+                is_type: false,
             }]
         );
         let toks = tokenize("DROP VIEW v").expect("lex");
@@ -1564,6 +1607,61 @@ mod tests {
         )
     }
 
+    /// 型の名前空間でだけ存在する名前（`kind` を見て答える `exists`）で解決する。
+    fn run_stmt_kinded(
+        session: &SessionState,
+        sql: &str,
+        schemas: &[(&'static str, u64)],
+        exists_in: &[(&'static str, NameKind)],
+    ) -> Result<PathResolution, SqlSurfaceError> {
+        let toks = tokenize(sql).expect("lex");
+        let schema_id = |n: &str| Ok(schemas.iter().find(|(s, _)| *s == n).map(|(_, i)| *i));
+        let exists =
+            |k: &str, kind: NameKind| Ok(exists_in.iter().any(|(n, x)| *n == k && *x == kind));
+        resolve_statement_refs(
+            session,
+            &toks,
+            &[],
+            &PathLookup {
+                schema_id: &schema_id,
+                creation_schema_id: &schema_id,
+                exists: &exists,
+            },
+        )
+    }
+
+    /// 未修飾の `DROP TYPE` は型の名前空間で path を引く（Issue #3288）。SCHEMA に同名の表しか無いときは
+    /// 型として解決せず（共有 `public` の型を落とす PostgreSQL と同じ解決）、型が在れば内部キーへ書き換える。
+    #[test]
+    fn drop_type_resolves_in_the_type_namespace_only() {
+        let s = ddl_session_with(&["q1", "public"]);
+        let r = run_stmt_kinded(
+            &s,
+            "DROP TYPE mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Type), ("mood", NameKind::Type)],
+        )
+        .unwrap();
+        assert_eq!(rewritten(&r), vec![(2, "#7.mood".to_string())]);
+        let r = run_stmt_kinded(
+            &s,
+            "DROP TYPE IF EXISTS mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Type)],
+        )
+        .unwrap();
+        assert_eq!(rewritten(&r), vec![(4, "#7.mood".to_string())]);
+        // 同名の表だけが SCHEMA にある: 型としては解決しない。
+        let r = run_stmt_kinded(
+            &s,
+            "DROP TYPE mood",
+            &[("q1", 7)],
+            &[("#7.mood", NameKind::Relation), ("mood", NameKind::Type)],
+        )
+        .unwrap();
+        assert!(r.rewrites.is_empty());
+    }
+
     fn ddl_session_with(path: &[&str]) -> SessionState {
         let mut s = session_with(path);
         s.allow_ddl();
@@ -1578,6 +1676,7 @@ mod tests {
             ("CREATE TABLE t (id BIGINT PRIMARY KEY)", 2),
             ("CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY)", 5),
             ("CREATE SEQUENCE t", 2),
+            ("CREATE TYPE t AS ENUM ('a')", 2),
             ("CREATE VIEW t AS SELECT 1", 2),
             ("CREATE OR REPLACE VIEW t AS SELECT 1", 4),
         ] {
@@ -1594,6 +1693,7 @@ mod tests {
     }
 
     /// 解決しない形: 一時表・MATERIALIZED VIEW・修飾名・作成先のエラー（実行腕が同じエラーを再現する）。
+    // intentional: docs/design/schema-tenant-namespace.md
     #[test]
     fn creation_name_is_left_alone_for_unsupported_forms() {
         let s = ddl_session_with(&["q1", "public"]);
@@ -1601,7 +1701,6 @@ mod tests {
             "CREATE TEMP TABLE t (id BIGINT)",
             "CREATE MATERIALIZED VIEW t AS SELECT 1",
             "CREATE TABLE q1.t (id BIGINT)",
-            "CREATE TYPE t AS ENUM ('a')",
         ] {
             let r = run_stmt(&s, sql, &[("q1", 7)], &[], &[]).unwrap();
             assert!(r.rewrites.is_empty(), "{sql}");

@@ -302,7 +302,8 @@ fn copy_is_gated_by_search_path() {
         .is_ok());
 }
 
-// intentional: docs/design/schema-tenant-namespace.md（ENUM 型・MATERIALIZED VIEW・組み込み SCHEMA への作成は対象外）
+// intentional: docs/design/schema-tenant-namespace.md
+// tracked: #3287
 #[test]
 fn creation_target_follows_the_path() {
     let (core, _g, mut s) = with_table("sp-create");
@@ -350,11 +351,11 @@ fn creation_target_follows_the_path() {
     ok(&core, &mut s, "DROP SEQUENCE s.sq2");
     // 読み取りは public の表を引ける（空でない s に無い名前は後ろの public へ落ちる）。
     ok(&core, &mut s, "SELECT id FROM t LIMIT 5");
-    // SCHEMA 配置が未対応の作成（ENUM 型・MATERIALIZED VIEW）は public へ黙って作らず `0A000`。
-    assert_eq!(
-        code(&core, &mut s, "CREATE TYPE ty2 AS ENUM ('a')"),
-        "0A000"
-    );
+    // ENUM 型も path 先頭の SCHEMA へ作る（Issue #3288）。public には無い。
+    ok(&core, &mut s, "CREATE TYPE ty2 AS ENUM ('a')");
+    assert_eq!(code(&core, &mut s, "DROP TYPE public.ty2"), "42704");
+    ok(&core, &mut s, "DROP TYPE s.ty2");
+    // SCHEMA 配置が未対応の作成（MATERIALIZED VIEW）は public へ黙って作らず `0A000`。
     assert_eq!(
         code(
             &core,

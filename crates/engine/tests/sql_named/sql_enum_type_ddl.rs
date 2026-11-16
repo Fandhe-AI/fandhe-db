@@ -109,7 +109,6 @@ fn malformed_statements_are_syntax_errors_regardless_of_permission() {
         "CREATE TYPE t1 AS (a int)",
         "CREATE TYPE t1",
         "CREATE TYPE IF NOT EXISTS t1 AS ENUM ('a')",
-        "CREATE TYPE s.t1 AS ENUM ('a')",
         "CREATE TYPE t1 AS ENUM ('a') junk",
         "DROP TYPE t1 CASCADE",
         "DROP TYPE a, b",
@@ -118,6 +117,27 @@ fn malformed_statements_are_syntax_errors_regardless_of_permission() {
         assert_eq!(code(&core, &mut denied, sql), "42601", "denied: {sql}");
         assert_eq!(code(&core, &mut allowed, sql), "42601", "allowed: {sql}");
     }
+}
+
+/// SCHEMA 修飾の型名（Issue #3288）は構文エラーではなく名前解決の対象。存在しない SCHEMA は権限の有無に
+/// 依らず同じ `3F000`（`CREATE SEQUENCE nosuch.q` と同じ解析段の判定順。他テナントの SCHEMA も同じ応答）。
+#[test]
+fn qualified_type_name_in_unknown_schema_is_3f000_regardless_of_permission() {
+    let (_p, _g, core) = open_fixture("enum-ddl-qualified-unknown");
+    let mut denied = SessionState::default();
+    let mut allowed = allowed_session();
+    for sql in [
+        "CREATE TYPE s.t1 AS ENUM ('a')",
+        "DROP TYPE s.t1",
+        "DROP TYPE IF EXISTS s.t1",
+    ] {
+        assert_eq!(code(&core, &mut denied, sql), "3F000", "denied: {sql}");
+        assert_eq!(code(&core, &mut allowed, sql), "3F000", "allowed: {sql}");
+    }
+    assert_eq!(
+        code(&core, &mut denied, "CREATE SEQUENCE s.q"),
+        code(&core, &mut denied, "CREATE TYPE s.t1 AS ENUM ('a')")
+    );
 }
 
 #[test]
