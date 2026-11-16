@@ -37,6 +37,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             vec![
                 ColumnDef::new("lang", ColumnType::Text, false),
                 ColumnDef::new("label", ColumnType::Text, true),
+                ColumnDef::new("n", ColumnType::BigInt, true),
             ],
         ))
         .expect("create langs");
@@ -172,4 +173,50 @@ fn duplicate_exposed_names_report_42712() {
     );
     expect_error_response_with_sqlstate(&mut stream, "42712");
     assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// SET 右辺の FROM 側修飾列（`langs.n`）は FROM 側の表の列型で `$n` を推論する（書き込み先の
+/// 同名列 `docs.n`〔INTEGER〕ではなく `langs.n`〔TEXT〕）。
+#[test]
+fn set_expr_param_type_follows_from_side_qualified_column() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body(
+            "",
+            "UPDATE docs SET n = langs.n + $1 FROM langs WHERE docs.lang = langs.lang",
+            0,
+        ),
+    );
+    send_length_prefixed_message(&mut stream, b'D', &describe_statement_body(""));
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+    let mut oids = Vec::new();
+    loop {
+        let (t, body) = read_message(&mut stream);
+        match t {
+            b't' => {
+                let n = usize::from(u16::from_be_bytes([body[0], body[1]]));
+                for i in 0..n {
+                    let at = 2 + i * 4;
+                    oids.push(u32::from_be_bytes([
+                        body[at],
+                        body[at + 1],
+                        body[at + 2],
+                        body[at + 3],
+                    ]));
+                }
+            }
+            b'Z' => break,
+            b'1' | b'n' => {}
+            other => panic!(
+                "unexpected message {} {}",
+                other as char,
+                String::from_utf8_lossy(&body)
+            ),
+        }
+    }
+    assert_eq!(oids, vec![20]); // int8（BIGINT）
 }

@@ -256,6 +256,27 @@ pub(crate) fn joined_dml_dummy_flags(tokens: &[Token], kinds: &[ParamLiteralKind
             let mut depth: usize = 0;
             let mut seg_start = 0usize;
             let finish = |seg: &[Token], flags: &mut Vec<bool>| {
+                // 行値代入 `(a, b) = (...)` は構文解析後に左辺の列ごとの代入へ展開される。
+                // 代入数と揃えるため左辺の列数ぶんの偽フラグを積む（`$n` 由来のダミー検証省略の対象外）。
+                if matches!(seg.first(), Some(Token::Punct('('))) {
+                    let mut d: usize = 0;
+                    let mut cols: usize = 1;
+                    for t in seg {
+                        match t {
+                            Token::Punct('(') => d = d.saturating_add(1),
+                            Token::Punct(')') => {
+                                d = d.saturating_sub(1);
+                                if d == 0 {
+                                    break;
+                                }
+                            }
+                            Token::Punct(',') if d == 1 => cols = cols.saturating_add(1),
+                            _ => {}
+                        }
+                    }
+                    flags.extend(std::iter::repeat_n(false, cols));
+                    return;
+                }
                 flags.push(matches!(
                     seg,
                     [

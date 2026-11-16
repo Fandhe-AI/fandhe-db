@@ -9167,7 +9167,11 @@ impl EngineCore {
                 tokens
                     .iter()
                     .map(|t| match t {
-                        Token::QualifiedIdent { name, .. } => Token::Ident(name.clone()),
+                        // 修飾子は区切り文字（`\u{1}`）で名前に畳み込み、下の `lookup` が結合 DML の
+                        // スコープ（書き込み先 + FROM 側）で解決する。
+                        Token::QualifiedIdent { qualifier, name } => {
+                            Token::Ident(format!("{qualifier}\u{1}{name}"))
+                        }
                         other => other.clone(),
                     })
                     .collect(),
@@ -9190,7 +9194,26 @@ impl EngineCore {
                 ),
             };
             let root_type = table.zip(root_col).and_then(|(t, c)| column_type(t, c));
-            let lookup = |name: &str| table.and_then(|t| column_type(t, name));
+            let lookup = |name: &str| -> Option<PreparedParamType> {
+                match joined_rels.as_deref() {
+                    // 結合 DML は修飾列を修飾子が指す表の列で、非修飾列を「その列を持つ表がちょうど
+                    // 1 つ」のときだけその型で引く（0 件・複数件は未解決。束縛段の `42703`／`42702` に委ねる）。
+                    Some(rels) => match name.split_once('\u{1}') {
+                        Some((qualifier, col)) => rels
+                            .iter()
+                            .find(|(exposed, _)| exposed.eq_ignore_ascii_case(qualifier))
+                            .and_then(|(_, t)| column_type(t, col)),
+                        None => {
+                            let mut hits = rels.iter().filter_map(|(_, t)| column_type(t, name));
+                            match (hits.next(), hits.next()) {
+                                (Some(t), None) => Some(t),
+                                _ => None,
+                            }
+                        }
+                    },
+                    None => table.and_then(|t| column_type(t, name)),
+                }
+            };
             for (n, inferred, kind) in crate::sql::param_infer::infer_segment(
                 &infer_tokens,
                 seg,
