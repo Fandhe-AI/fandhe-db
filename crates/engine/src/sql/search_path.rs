@@ -24,8 +24,8 @@
 //!   `public` なら裸のまま。[`creation_target`]・[`resolve_statement_refs`]）。作成先の SCHEMA は USAGE が無ければ
 //!   飛ばさず `42501`。拡張クエリ（Parse・Bind・Describe）も Parse で同じ規則で解決し、Bind・Describe の時点の
 //!   path・カタログで再解決する（Issue #3197。`core::EngineCore::refresh_prepared_in_txn`）。`ALTER TABLE t SET SCHEMA ..` の未修飾の対象も同じ書き換えで修飾形と同じ経路に乗る（#3198・#3199）。
-//!   SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）は、path 先頭が SCHEMA なら
-//!   `public` へ黙って作らず `0A000`。
+//!   SCHEMA 配置が未対応の作成（`CREATE TYPE`）は、path 先頭が SCHEMA なら `public` へ黙って作らず
+//!   `0A000`。MATERIALIZED VIEW は Issue #3287 で表・ビューと同じ解決に乗る。
 //! - 一時表以外の未修飾名が解決できず、実効 path に `public` が含まれなければ `42P01`、作成先が
 //!   組み込み SCHEMA・`pg_temp` になる文は `0A000`、どの要素にも作れなければ `3F000`。
 //! - 自テナントの SCHEMA が path に無い既定のセッション（username 無し）はカタログを引かない。wire の
@@ -867,7 +867,7 @@ struct CreationResolution {
 /// 自テナントの SCHEMA なら内部キー（`#<schema_id>.<name>`）へ置き換える対象として返す（Issue #3196）。
 /// 修飾名 `q1.t` の解決後と同じトークン列になるので、以降の ACL・実行は修飾形と同じ経路に乗る。
 ///
-/// 解決しない（`None`）形: 作成名が未修飾の `Ident` ではない・MATERIALIZED VIEW・構文語と
+/// 解決しない（`None`）形: 作成名が未修飾の `Ident` ではない・構文語と
 /// 衝突する名前・作成先の判定が `42501`／`3F000`／`0A000` になる形。最後の 3 つは解析時には返さず、実行腕の
 /// `require_creation_target` が同じエラーを（権限ゲート `42501` の後に）再現する。他の照会エラーは伝播する。
 fn resolve_creation_name(
@@ -890,7 +890,7 @@ fn resolve_creation_name(
     let Some(pos) = walk
         .positions
         .iter()
-        .find(|p| p.create_name && !p.matview && !is_if_clause(p.index))
+        .find(|p| p.create_name && !is_if_clause(p.index))
     else {
         return Ok(None);
     };
@@ -1555,6 +1555,8 @@ mod tests {
             ("CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY)", 5),
             ("CREATE SEQUENCE t", 2),
             ("CREATE VIEW t AS SELECT 1", 2),
+            ("CREATE MATERIALIZED VIEW t AS SELECT 1", 3),
+            ("CREATE MATERIALIZED VIEW IF NOT EXISTS t AS SELECT 1", 6),
             ("CREATE OR REPLACE VIEW t AS SELECT 1", 4),
         ] {
             let r = run_stmt(&s, sql, &[("q1", 7)], &[], &[]).unwrap();
@@ -1569,13 +1571,12 @@ mod tests {
         assert!(r.rewrites.is_empty());
     }
 
-    /// 解決しない形: 一時表・MATERIALIZED VIEW・修飾名・作成先のエラー（実行腕が同じエラーを再現する）。
+    /// 解決しない形: 一時表・修飾名・作成先のエラー（実行腕が同じエラーを再現する）。
     #[test]
     fn creation_name_is_left_alone_for_unsupported_forms() {
         let s = ddl_session_with(&["q1", "public"]);
         for sql in [
             "CREATE TEMP TABLE t (id BIGINT)",
-            "CREATE MATERIALIZED VIEW t AS SELECT 1",
             "CREATE TABLE q1.t (id BIGINT)",
             "CREATE TYPE t AS ENUM ('a')",
         ] {

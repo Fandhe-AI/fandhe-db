@@ -389,11 +389,13 @@ pub(crate) struct SchemaObjects {
     pub(crate) tables: Vec<String>,
     /// ビュー。
     pub(crate) views: Vec<String>,
+    /// MATERIALIZED VIEW（`#<id>.<name>`。Issue #3287）。
+    pub(crate) matviews: Vec<String>,
     /// 索引（表と同じ SCHEMA に属する宣言。通常は表と一緒に消える）。
     pub(crate) indexes: Vec<String>,
     /// SEQUENCE（`#<id>.<name>`）。
     pub(crate) sequences: Vec<String>,
-    /// 現状 SCHEMA 配下には置けない種別（matview・ENUM 型）が 1 件でもあるか。あれば
+    /// 現状 SCHEMA 配下には置けない種別（ENUM 型）が 1 件でもあるか。あれば
     /// `DROP SCHEMA ... CASCADE` は不整合として拒否する（fail-closed）。
     pub(crate) unsupported_kinds: bool,
 }
@@ -435,15 +437,16 @@ pub(crate) fn enumerate_schema_objects_in_txn<R: ReadSource>(
     let mut objects = SchemaObjects {
         tables: str_keys_in_range(src, CATALOG_TABLE, &start, &end)?,
         views: str_keys_in_range(src, VIEWS_TABLE, &start, &end)?,
+        matviews: str_keys_in_range(
+            src,
+            super::materialized::MATERIALIZED_VIEWS_TABLE,
+            &start,
+            &end,
+        )?,
         indexes: str_keys_in_range(src, INDEX_CATALOG_TABLE, &start, &end)?,
         ..SchemaObjects::default()
     };
-    objects.unsupported_kinds = str_key_range_nonempty(
-        src,
-        super::materialized::MATERIALIZED_VIEWS_TABLE,
-        &start,
-        &end,
-    )? || str_key_range_nonempty(src, ENUM_TYPES_TABLE, &start, &end)?;
+    objects.unsupported_kinds = str_key_range_nonempty(src, ENUM_TYPES_TABLE, &start, &end)?;
     let seq_key = sequence_schema_key(schema_id);
     match src.open_table(super::sequence::SEQUENCES_TABLE) {
         Ok(seqs) => {
@@ -639,7 +642,7 @@ impl Storage {
     /// `tenant_id` の SCHEMA `name` を `CASCADE` で削除する（TABLE-27・Issue #1717、設計記録 D8）。
     /// 判定順は [`Self::drop_schema`] の存在判定まで同じ。以降は**単一の write txn・1 回の commit**で、
     /// (1) SCHEMA 配下の表・ビューを根として外部の依存（別 SCHEMA のビュー・外部キー。public からの
-    /// 依存は D7 で存在しない）を既存の依存列挙で求めて先に削除 → (2) 配下のビュー（キー昇順）→
+    /// 依存は D7 で存在しない）を既存の依存列挙で求めて先に削除 → (2) 配下の matview・ビュー（キー昇順）→
     /// (3) 配下の表（既存の `DROP TABLE ... CASCADE` 本体。索引宣言・行ストア・世代・台帳・キャッシュ
     /// 世代・所有 SEQUENCE を継承）→ (4) 残りの SEQUENCE（キー昇順）→ (5) SCHEMA 行の順に消す。
     /// 依存を正確に判定できない場合・外部の表が配下の SEQUENCE を `DEFAULT nextval` で参照している
@@ -684,6 +687,7 @@ impl Storage {
         if gate != OwnerGate::Skip
             && (!objects.tables.is_empty()
                 || !objects.views.is_empty()
+                || !objects.matviews.is_empty()
                 || !objects.sequences.is_empty()
                 || objects.unsupported_kinds)
         {
@@ -703,6 +707,12 @@ impl Storage {
                     .iter()
                     .map(|v| super::dependency::DropTarget::View(v.clone())),
             )
+            .chain(
+                objects
+                    .matviews
+                    .iter()
+                    .map(|m| super::dependency::DropTarget::MaterializedView(m.clone())),
+            )
             .collect();
         if !roots.is_empty() {
             let closure = super::dependency::enumerate_drop_dependents_in_txn(&write_txn, &roots)?;
@@ -711,7 +721,12 @@ impl Storage {
             }
             super::apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
         }
-        // (2) 配下のビュー。
+        // (2) 配下の matview（キー昇順。実体・索引宣言・ACL・所有者まで同じ txn。Issue #3287）→ ビュー。
+        for mv in &objects.matviews {
+            super::materialized::drop_materialized_view_in_txn(&write_txn, mv)?;
+            crate::storage::commit_log::note_ddl(&write_txn, mv);
+            super::bump_table_generation_in_txn(&write_txn, mv)?;
+        }
         for view in &objects.views {
             super::drop_view_in_txn(&write_txn, view)?;
         }

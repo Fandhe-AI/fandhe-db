@@ -734,12 +734,45 @@ fn wire_foreign_schema_path_and_unsupported_creates_fail_closed_and_keep_the_con
         select_cells(&mut alice, "SELECT id FROM q1.t;"),
         vec![Some("10".to_string())]
     );
-    // SCHEMA 配置が未対応の作成は、path 先頭が SCHEMA のとき `public` へ黙って作らず `0A000`。
+    // SCHEMA 配置が未対応の作成（ENUM 型）は、path 先頭が SCHEMA のとき `public` へ黙って作らず `0A000`。
     simple_ok(&mut alice, "SET search_path TO q1, public;");
-    simple_err(
-        &mut alice,
-        "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;",
-        "0A000",
+    simple_err(&mut alice, "CREATE TYPE ty AS ENUM ('a');", "0A000");
+    // MATERIALIZED VIEW は path 先頭の SCHEMA へ作られる（Issue #3287）。
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;"
+        ),
+        "CREATE MATERIALIZED VIEW"
+    );
+    assert_eq!(
+        select_cells(&mut alice, "SELECT id FROM q1.mv;"),
+        vec![Some("10".to_string())]
+    );
+    simple_err(&mut alice, "SELECT id FROM public.mv;", "42P01");
+    // 他テナントの接続（path に alice の SCHEMA 名）からは不在と同じ拒否で、`#` を出さない。
+    for (sql, code) in [
+        ("SELECT id FROM mv;", "C42P01"),
+        ("REFRESH MATERIALIZED VIEW mv;", "C42P01"),
+        ("DROP MATERIALIZED VIEW mv;", "C42P01"),
+        ("REFRESH MATERIALIZED VIEW q1.mv;", "C3F000"),
+        ("DROP MATERIALIZED VIEW q1.mv;", "C3F000"),
+    ] {
+        send_simple_query(&mut bob, sql);
+        let (kind, body) = read_message(&mut bob);
+        assert_eq!(kind, b'E', "ErrorResponse: {sql}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains(code), "{sql}: {text}");
+        assert!(!text.contains('#'), "{sql}: {text}");
+        read_ready_for_query(&mut bob);
+    }
+    assert_eq!(
+        simple_ok(&mut alice, "REFRESH MATERIALIZED VIEW mv;"),
+        "REFRESH MATERIALIZED VIEW"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "DROP MATERIALIZED VIEW mv;"),
+        "DROP MATERIALIZED VIEW"
     );
     // 拒否の後も同じ接続で読み取りができる。
     assert_eq!(

@@ -697,14 +697,28 @@ fn views_in_schema_bind_early_and_public_views_cannot_depend_on_schema() {
     ok(&core, &mut s, "DROP VIEW s.v");
     assert_eq!(code(&core, &mut s, "DROP VIEW s.v"), "42P01");
     ok(&core, &mut s, "DROP VIEW IF EXISTS s.v");
-    // MATERIALIZED VIEW の SCHEMA 配置は未対応（fail-closed）。
+    // MATERIALIZED VIEW も同じ（Issue #3287）。SCHEMA 配下の表を読む形は受理し、public の表を読む形は
+    // D7 で `42501`。
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW s.m AS SELECT id FROM s.t",
+    );
+    assert_eq!(
+        query_rows(&core, &mut s, "SELECT id FROM s.m ORDER BY id LIMIT 10"),
+        [
+            "[SignedInteger(1)]",
+            "[SignedInteger(2)]",
+            "[SignedInteger(3)]"
+        ]
+    );
     assert_eq!(
         code(
             &core,
             &mut s,
-            "CREATE MATERIALIZED VIEW s.m AS SELECT id FROM t"
+            "CREATE MATERIALIZED VIEW s.m2 AS SELECT id FROM t"
         ),
-        "0A000"
+        "42501"
     );
     assert_eq!(
         code(
@@ -1348,21 +1362,14 @@ fn rename_table_stays_in_the_schema() {
     );
 }
 
-/// MATERIALIZED VIEW と ENUM 型の SCHEMA 配置は未対応（fail-closed のまま）。
+/// ENUM 型の SCHEMA 配置は未対応（fail-closed のまま。MATERIALIZED VIEW は Issue #3287 で対応済み）。
+// intentional: docs/design/schema-tenant-namespace.md（ENUM 型の SCHEMA 配置は対象外）
 #[test]
-fn matview_and_enum_type_placement_stay_unsupported() {
+fn enum_type_placement_stays_unsupported() {
     let (core, _g) = new_core("t27-objects-unsupported");
     let mut s = ddl_session();
     ok(&core, &mut s, "CREATE SCHEMA s");
     ok(&core, &mut s, "CREATE TABLE t (id BIGINT PRIMARY KEY)");
-    assert_eq!(
-        code(
-            &core,
-            &mut s,
-            "CREATE MATERIALIZED VIEW s.m AS SELECT id FROM t"
-        ),
-        "0A000"
-    );
     assert_eq!(
         code(&core, &mut s, "CREATE TYPE s.mood AS ENUM ('a')"),
         "42601"

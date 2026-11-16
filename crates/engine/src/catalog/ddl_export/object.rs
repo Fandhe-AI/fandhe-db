@@ -344,14 +344,6 @@ fn view_like_order_with_deps<E>(
     }
     for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
         if in_scope(ctx, &k)? {
-            // `CREATE MATERIALIZED VIEW` は SCHEMA 修飾名を受理しない（共有にしか作れない）ため、
-            // SCHEMA 配下の定義は戻せない。デコードより前に、固定文言で全体を失敗させる。
-            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
-                return Err(unsupported(
-                    "materialized view",
-                    "schema-scoped materialized view cannot be recreated by SQL",
-                ));
-            }
             let def = decode_materialized_view_def(&k, &v)?;
             pending.insert(k, ViewLike::Materialized(def));
         }
@@ -396,19 +388,13 @@ fn view_like_order_with_deps<E>(
 }
 
 /// 範囲内のマテリアライズド VIEW の定義を返す（論理ダンプ前の列構成の照合用。Issue #3097）。
-/// SCHEMA 配下の定義は戻せないため、`view_like_order_with_deps` と同じく固定文言で全体を失敗させる。
+/// SCHEMA 配下の定義も範囲内なら含む（`CREATE MATERIALIZED VIEW s.mv` で戻せる。Issue #3287）。
 pub(super) fn in_scope_materialized_defs<E>(
     ctx: &Ctx<'_>,
 ) -> Result<Vec<MaterializedViewDef>, SchemaDdlError<E>> {
     let mut out = Vec::new();
     for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
         if in_scope(ctx, &k)? {
-            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
-                return Err(unsupported(
-                    "materialized view",
-                    "schema-scoped materialized view cannot be recreated by SQL",
-                ));
-            }
             out.push(decode_materialized_view_def(&k, &v)?);
         }
     }

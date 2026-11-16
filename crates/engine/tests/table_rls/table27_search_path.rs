@@ -302,7 +302,7 @@ fn copy_is_gated_by_search_path() {
         .is_ok());
 }
 
-// intentional: docs/design/schema-tenant-namespace.md（ENUM 型・MATERIALIZED VIEW・組み込み SCHEMA への作成は対象外）
+// intentional: docs/design/schema-tenant-namespace.md（ENUM 型・組み込み SCHEMA への作成は対象外）
 #[test]
 fn creation_target_follows_the_path() {
     let (core, _g, mut s) = with_table("sp-create");
@@ -350,18 +350,30 @@ fn creation_target_follows_the_path() {
     ok(&core, &mut s, "DROP SEQUENCE s.sq2");
     // 読み取りは public の表を引ける（空でない s に無い名前は後ろの public へ落ちる）。
     ok(&core, &mut s, "SELECT id FROM t LIMIT 5");
-    // SCHEMA 配置が未対応の作成（ENUM 型・MATERIALIZED VIEW）は public へ黙って作らず `0A000`。
+    // SCHEMA 配置が未対応の作成（ENUM 型）は public へ黙って作らず `0A000`。
     assert_eq!(
         code(&core, &mut s, "CREATE TYPE ty2 AS ENUM ('a')"),
         "0A000"
+    );
+    // MATERIALIZED VIEW は表・ビューと同じく path 先頭の SCHEMA へ作る（Issue #3287）。本文は D7 により
+    // SCHEMA 配下の relation だけを読める（public の `t` は `42501`）。
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id FROM w",
+    );
+    ok(&core, &mut s, "SELECT id FROM s.mv LIMIT 5");
+    assert_eq!(
+        code(&core, &mut s, "SELECT id FROM public.mv LIMIT 5"),
+        "42P01"
     );
     assert_eq!(
         code(
             &core,
             &mut s,
-            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t"
+            "CREATE MATERIALIZED VIEW mv2 AS SELECT id FROM t"
         ),
-        "0A000"
+        "42501"
     );
     // 組み込み SCHEMA・pg_temp への作成は拒否する。
     ok(&core, &mut s, "SET search_path = pg_catalog, public");
