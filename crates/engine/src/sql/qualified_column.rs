@@ -290,7 +290,7 @@ fn is_select_item_star_position(tokens: &[Token], i: usize) -> bool {
 /// 直後のトークンにより `DATE '...'`／`TIMESTAMP '...'` の型付きリテラル、または
 /// window 句の `PARTITION BY` として再解釈される位置か（PR #2309 指摘・P1）。
 /// `x.date` を通常の列参照として使う場合（直後が文字列リテラルでない）は拒否しない。
-fn is_contextual_syntax_use(tokens: &[Token], i: usize, name: &str) -> bool {
+pub(crate) fn is_contextual_syntax_use(tokens: &[Token], i: usize, name: &str) -> bool {
     let next = tokens.get(i.wrapping_add(1));
     if name.eq_ignore_ascii_case("date") || name.eq_ignore_ascii_case("timestamp") {
         return matches!(next, Some(Token::StringLiteral(_)));
@@ -326,7 +326,7 @@ fn token_word(tok: &Token) -> Option<&str> {
 }
 
 /// 後段パーサが `Ident` を構文語として消費しうる語か（修飾列名の再解釈防止用）。
-fn is_syntax_word(name: &str) -> bool {
+pub(crate) fn is_syntax_word(name: &str) -> bool {
     const WORDS: &[&str] = &[
         "distinct",
         "all",
@@ -373,7 +373,7 @@ fn in_range(r: (usize, usize), i: usize) -> bool {
 }
 
 /// 列参照ではない位置（関数名・型名・別名・`EXTRACT` のフィールド名）。
-fn is_non_column_position(tokens: &[Token], i: usize) -> bool {
+pub(crate) fn is_non_column_position(tokens: &[Token], i: usize) -> bool {
     if matches!(tokens.get(i.wrapping_add(1)), Some(Token::Punct('('))) {
         return true;
     }

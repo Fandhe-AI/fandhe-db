@@ -86,6 +86,7 @@ mod wire_sql50_update_delete_param;
 mod wire_sql53_dml_from_using;
 mod wire_sql53_dml_from_using_params;
 mod wire_sql53_dml_subquery_operation_id;
+mod wire_sql53_single_table_alias;
 mod wire_sql56_order_by_ordinal;
 mod wire_sql58_group_by_key_expressions;
 mod wire_sql58_group_key_expr_matching;
