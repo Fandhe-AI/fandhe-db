@@ -14,15 +14,32 @@ use super::super::{
     ForeignKeyDeferrability, ForeignKeyMatch, HnswOpClassFamily, IdentityKind, IndexDef, IndexKind,
     ReferentialAction, RowIdentity, TableSchema, TimeDefault, ViewCheckOption, ViewDef,
 };
-use super::quote::{ensure_no_internal_key, ident, literal, push_collation, push_ident};
+use super::quote::{ensure_no_internal_key, literal, push_collation, push_ident, Namer};
 use super::{unsupported, Ctx, SchemaDdlError};
 use std::collections::BTreeMap;
 
 /// 暗黙 SEQUENCE の索引（SEQUENCE の relation キー → 定義と所有者）。
 pub(super) type SequenceMap = BTreeMap<String, (SequenceDef, Option<SequenceOwner>)>;
 
-/// 列型を SQL の型名へ描画する。ENUM は型名を引用符付きで出す。
+/// 列型を SQL の型名へ描画する（SCHEMA 配下の ENUM 型を含まない文脈用。含む型は `Unsupported`）。
+/// ENUM は型名を引用符付きで出す。
 pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdlError<E>> {
+    render_column_type_in::<E>(&Namer::default(), ty)
+}
+
+/// ENUM 型の SQL 上の参照名。`public` の型は `"name"`、SCHEMA 配下の型は引用符なしの修飾名
+/// `schema.name`（`CREATE TYPE` の書き出しと同じ形。列型・キャストの型名位置はこの形を受理する。
+/// Issue #3289）。選択したテナントの SCHEMA に解決できない内部キー（他テナントのもの・破損）は書き出せない
+/// ものとして `Unsupported`（存在を示す情報は含めない。内部キーの `#` も出さない）。
+fn enum_type_ref<E>(namer: &Namer, key: &str) -> Result<String, SchemaDdlError<E>> {
+    namer.qualified_required::<E>(key)
+}
+
+/// [`render_column_type`] の、SCHEMA 配下の ENUM 型を `namer` で公開名へ戻す版。
+pub(super) fn render_column_type_in<E>(
+    namer: &Namer,
+    ty: &ColumnType,
+) -> Result<String, SchemaDdlError<E>> {
     Ok(match ty {
         ColumnType::Text => "TEXT".to_string(),
         ColumnType::Varchar(None) => "VARCHAR".to_string(),
@@ -49,10 +66,10 @@ pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdl
         ColumnType::Jsonb => "JSONB".to_string(),
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Numeric { precision, scale } => format!("NUMERIC({precision}, {scale})"),
-        ColumnType::Enum(def) => ident(def.name())?,
+        ColumnType::Enum(def) => enum_type_ref::<E>(namer, def.name())?,
         ColumnType::Array(a) => {
             let elem = match (a.elem(), a.enum_def()) {
-                (ArrayElemType::Enum, Some(def)) => ident::<E>(def.name())?,
+                (ArrayElemType::Enum, Some(def)) => enum_type_ref::<E>(namer, def.name())?,
                 (ArrayElemType::Enum, None) => {
                     return Err(unsupported("column type", "enum array without a type"));
                 }
@@ -227,7 +244,7 @@ fn render_column<E>(
                     not_null = false;
                 }
                 Some((_, None)) => {
-                    s.push_str(&render_column_type::<E>(&col.ty)?);
+                    s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?);
                     let arg = ctx.namer.sequence_arg::<E>(seq)?.ok_or_else(|| {
                         unsupported("sequence", "reference outside the dump scope")
                     })?;
@@ -268,18 +285,18 @@ fn render_column<E>(
                     "owned sequence with a non-default name",
                 ));
             }
-            s.push_str(&render_column_type::<E>(&col.ty)?);
+            s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?);
             tail.push(' ');
             tail.push_str(&render_identity(*kind, &def.params));
         }
         Some(d) => {
-            s.push_str(&render_column_type::<E>(&col.ty)?);
+            s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?);
             if let Some(expr) = render_plain_default::<E>(d)? {
                 tail.push_str(" DEFAULT ");
                 tail.push_str(&expr);
             }
         }
-        None => s.push_str(&render_column_type::<E>(&col.ty)?),
+        None => s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?),
     }
     if let Some(c) = col.collation {
         s.push_str(" COLLATE ");

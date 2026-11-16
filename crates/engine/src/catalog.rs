@@ -3896,6 +3896,38 @@ fn validate_catalog_param(param: &str) -> Result<()> {
     Ok(())
 }
 
+/// 型タグ別の `param` 文字集合検証（Issue #3289）。ENUM 型名の欄（`enum` タグの `param`、`array` タグの
+/// `enum,<名>,<max_len>[,d<N>]` の第 2 欄）に限り、裸の識別子に加えて解決器が作る内部キー
+/// `#<schema_id>.<name>`（SCHEMA 配下の型。[`namespace::RelationKey`]）を受理する。区切り文字（`:`・`,`・
+/// 改行）は内部キーの文法（正準 10 進・`.`・識別子）に含まれないため、注入経路は増えない。それ以外の
+/// タグ・欄は [`validate_catalog_param`] と同一（public の型の列は従来どおり裸の名前のままで、
+/// バイト列は不変）。
+fn validate_catalog_param_for_tag(tag: &str, param: &str) -> Result<()> {
+    match tag {
+        "enum" if param.starts_with('#') => validate_enum_type_ref(param),
+        "array" if param.starts_with("enum,#") => {
+            let mut fields = param.split(',');
+            let _tag = fields.next();
+            let Some(name) = fields.next() else {
+                return validate_catalog_param(param);
+            };
+            validate_enum_type_ref(name)?;
+            // 型名欄を無害な識別子へ置き換え、残りの欄を従来の文字集合で検証する。
+            let rest: Vec<&str> = fields.collect();
+            let masked = format!("enum,x,{}", rest.join(","));
+            validate_catalog_param(&masked)
+        }
+        _ => validate_catalog_param(param),
+    }
+}
+
+/// 列の ENUM 型参照（裸の名前または内部キー `#<schema_id>.<name>`）の検証（Issue #3289）。カタログに
+/// 保存された列定義の `param` と、解決器が書き換えた型名だけがこの形を取る（利用者の生入力は字句解析器が
+/// `#` を作らないため到達しない）。
+pub(crate) fn validate_enum_type_ref(name: &str) -> Result<()> {
+    namespace::RelationKey::parse(name).map(|_| ())
+}
+
 /// 列行 `param` 内の照合要素の接頭辞（TABLE-28・Issue #1609）。
 const COLLATION_PARAM_PREFIX: &str = "collate_";
 
@@ -5279,7 +5311,7 @@ impl ColumnType {
                 Ok(ColumnType::Jsonb)
             }
             "enum" => {
-                validate_identifier(param)?;
+                validate_enum_type_ref(param)?;
                 let def = resolve_enum(param)?;
                 Ok(ColumnType::Enum(def))
             }
@@ -7604,7 +7636,7 @@ fn parse_array_param(
             ArrayType::new(ArrayElemType::Numeric { precision, scale }, max_len)
         }
         ("enum", [_, name, _]) => {
-            validate_identifier(name)?;
+            validate_enum_type_ref(name)?;
             let def = resolve_enum(name)?;
             ArrayType::new_enum(def, max_len)
         }
@@ -7654,7 +7686,7 @@ fn array_param_enum_name(param: &str) -> Result<Option<&str>> {
     }
     match fields.as_slice() {
         [_, name, max_len] => {
-            validate_identifier(name).map_err(|_| corrupt())?;
+            validate_enum_type_ref(name).map_err(|_| corrupt())?;
             let canonical = max_len
                 .parse::<u32>()
                 .map(|n| n.to_string() == *max_len && (1..=MAX_ARRAY_ELEMENTS).contains(&n))
@@ -10877,7 +10909,7 @@ fn encode_column_line(
     param_field: &str,
     nullable: bool,
 ) -> Result<String> {
-    validate_catalog_param(param_field)?;
+    validate_catalog_param_for_tag(type_name, param_field)?;
     let nullable_field = nullable_field_for(type_name, nullable);
     Ok(format!(
         "{name}:{type_name}:{param_field}:{nullable_field}\n"
@@ -10893,7 +10925,7 @@ fn encode_column_line_v3(
     nullable: bool,
     state: char,
 ) -> Result<String> {
-    validate_catalog_param(param_field)?;
+    validate_catalog_param_for_tag(type_name, param_field)?;
     let nullable_field = nullable_field_for(type_name, nullable);
     Ok(format!(
         "{name}:{type_name}:{param_field}:{nullable_field}:{state}\n"
@@ -10911,7 +10943,7 @@ fn encode_column_line_v5(
     state: char,
     default: Option<&ColumnDefault>,
 ) -> Result<String> {
-    validate_catalog_param(param_field)?;
+    validate_catalog_param_for_tag(type_name, param_field)?;
     let nullable_field = nullable_field_for(type_name, nullable);
     let default_field = match default {
         None => "-".to_string(),
@@ -12376,7 +12408,7 @@ fn decode_schema_body(
         }
 
         validate_identifier(name)?;
-        validate_catalog_param(param_field)?;
+        validate_catalog_param_for_tag(type_name, param_field)?;
         // 未知の型タグ・型別の `param` 文法違反は、ここで `ColumnDef`（`name` の
         // 所有 `String` を確保する）を構築する前に拒否する（アロケーション前拒否。
         // Issue #880 D7）。
@@ -21878,6 +21910,86 @@ mod tests {
                     Err(CatalogError::Invalid(_))
                 ),
                 "must reject: {invalid_param:?}"
+            );
+        }
+    }
+
+    /// Issue #3289: ENUM 型名の欄（`enum` の `param`・`array` の `enum,<名>,<max_len>[,d<N>]` の第 2 欄）に
+    /// 限り、SCHEMA 配下の型の内部キー `#<id>.<name>` を受理する。非正準・区切り文字の混入・他のタグへの
+    /// 持ち込みは拒否し、public の型の行（裸の名前）はバイト列が変わらない。
+    #[test]
+    fn enum_param_accepts_internal_keys_only_in_enum_fields() {
+        // public の型の列は従来どおりのバイト列。
+        assert_eq!(
+            encode_column_line("m", "enum", "mood", true).expect("public"),
+            "m:enum:mood:1\n"
+        );
+        // 内部キーは enum 列・enum 配列の型名欄で受理され、往復する。
+        assert_eq!(
+            encode_column_line("m", "enum", "#12.mood", true).expect("key"),
+            "m:enum:#12.mood:1\n"
+        );
+        assert!(encode_column_line("m", "array", "enum,#12.mood,4", false).is_ok());
+        assert!(encode_column_line("m", "array", "enum,#12.mood,4,d2", false).is_ok());
+        let mut resolve =
+            |name: &str| -> Result<Arc<EnumTypeDef>> { Ok(EnumTypeDef::for_test(name, &["a"])) };
+        let decoded =
+            ColumnType::from_catalog_fields("enum", "#12.mood", &mut resolve).expect("decode key");
+        assert_eq!(decoded.catalog_fields(), ("enum", "#12.mood".to_string()));
+        let decoded = ColumnType::from_catalog_fields("array", "enum,#12.mood,4", &mut resolve)
+            .expect("decode array key");
+        assert_eq!(
+            decoded.catalog_fields(),
+            ("array", "enum,#12.mood,4".to_string())
+        );
+        assert_eq!(
+            array_param_enum_name("enum,#12.mood,4,d2").expect("ok"),
+            Some("#12.mood")
+        );
+        // 非正準・不正な形は encode・decode の両側で拒否する。
+        for bad in [
+            "#012.x",
+            "#0.x",
+            "#1.",
+            "#a.x",
+            "#1.1x",
+            "#1.x.y",
+            "#",
+            "#1",
+            "#1:x",
+            "#1,x",
+            "#99999999999999999999999.x",
+        ] {
+            assert!(
+                encode_column_line("m", "enum", bad, true).is_err(),
+                "encode must reject {bad:?}"
+            );
+            assert!(
+                ColumnType::from_catalog_fields("enum", bad, &mut resolve).is_err(),
+                "decode must reject {bad:?}"
+            );
+            let array = format!("enum,{bad},4");
+            assert!(
+                encode_column_line("m", "array", &array, false).is_err(),
+                "array encode must reject {bad:?}"
+            );
+            assert!(
+                ColumnType::from_catalog_fields("array", &array, &mut resolve).is_err(),
+                "array decode must reject {bad:?}"
+            );
+        }
+        // 他のタグ・欄へは内部キーの文字（`#`・`.`）を持ち込めない。
+        for (tag, param) in [
+            ("text", "#1.x"),
+            ("vector", "#1.3"),
+            ("numeric", "10.2"),
+            ("array", "text,#1.x,4"),
+            ("array", "enum,mood,#1.4"),
+            ("array", "numeric,10.2,4"),
+        ] {
+            assert!(
+                encode_column_line("m", tag, param, false).is_err(),
+                "{tag} {param:?}"
             );
         }
     }

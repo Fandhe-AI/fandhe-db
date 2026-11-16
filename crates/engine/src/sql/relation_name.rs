@@ -19,9 +19,9 @@
 //!   同じ応答）、あれば内部キー `#<schema_id>.<name>`（ADR D2。[`RelationKey`]）の
 //!   `Token::Ident` へ置き換える（Issue #1717。表・ビュー・索引・SEQUENCE の名前位置）。
 //!   MATERIALIZED VIEW の SCHEMA 配置は未対応で `0A000`
-//! - ENUM 型の名前（`CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の名前位置だけ。Issue #3288）も同じ規則
-//!   （`public.` は裸の名前、テナントの SCHEMA は内部キー）。関係位置（[`relation_positions`]）には足さず、列型・
-//!   キャスト・`ALTER TABLE .. TYPE` の修飾名は解決しない（従来どおり構文段で `42601`。Issue #3289）
+//! - ENUM 型の名前（`CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の名前位置。Issue #3288）と、列型・キャスト・
+//!   `ALTER TABLE` の型名位置（`sql::type_name_position`。Issue #3289）も同じ規則（`public.` は裸の名前、
+//!   テナントの SCHEMA は内部キー）。関係位置（[`relation_positions`]）には足さない
 //!
 //! 内部キーを作れるのはこの解決器だけである（字句解析器は `#` を含む識別子を作らない。
 //! 保存済みビュー本文だけは `lexer::tokenize_stored_view_body` が引用形で受理する）。
@@ -588,11 +588,24 @@ pub(crate) fn rewrite_relation_names_full(
         .collect();
     let mut public_drop_rewrites: Vec<(usize, String)> = Vec::new();
     let grant_function_range = grant_function_token_range(tokens);
+    // 列型・キャストの型名の位置（Issue #3289）。関係位置とは別の走査器で、K2 と同じ解決を共用する。
+    let type_walk = crate::sql::type_name_position::type_name_positions(tokens);
     for (i, t) in tokens.iter().enumerate() {
         let Token::QualifiedIdent { qualifier, .. } = t else {
             continue;
         };
         if walk.positions.iter().any(|p| p.index == i) {
+            continue;
+        }
+        if type_walk.iter().any(|p| p.index == i) {
+            targets.push(Target {
+                index: i,
+                create_name: false,
+                matview: false,
+                function_pos: false,
+                drop_name: false,
+                type_pos: true,
+            });
             continue;
         }
         // `DROP FUNCTION s.f`（#1920）は型の並びの括弧を省略できるため、先頭が `DROP FUNCTION` の文では
@@ -606,8 +619,8 @@ pub(crate) fn rewrite_relation_names_full(
                 .as_ref()
                 .is_some_and(|r| r.contains(&i));
         // 型名の位置（Issue #3288）。`CREATE TYPE <名>`（3 語目）・`DROP TYPE <名>`（3 語目）・
-        // `DROP TYPE IF EXISTS <名>`（5 語目）だけ。列型・キャスト・`ALTER TABLE .. TYPE` の修飾名はこの位置に
-        // 当たらず、従来どおり構文エラー（`42601`。SCHEMA 配下の型の解決は別 Issue #3289）のまま。
+        // `DROP TYPE IF EXISTS <名>`（5 語目）。列型・キャスト・`ALTER TABLE` の型名位置は上の
+        // `type_name_position` の走査結果で別に解決する（Issue #3289）。
         // `public.` は裸の名前、不在・他テナントの SCHEMA は `3F000`、組み込み SCHEMA・`pg_temp` は `0A000`
         // （[`resolve`] を関係名と共用する）。
         let create_type_name =
@@ -697,7 +710,8 @@ pub(crate) fn rewrite_relation_names_full(
             Ok(Resolved::Public) => {
                 // 同名の CTE があると、置換後の裸の名前が CTE に解決され永続表を指さなくなる。
                 // `public.` が永続側を指す契約を守れないため拒否する（fail-closed）。
-                if cte_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                // 型名の位置は relation と別の名前空間なので CTE 名とは衝突しない（検査しない）。
+                if !pos.type_pos && cte_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "public-qualified relation conflicts with a CTE name",
                     ));
@@ -1495,13 +1509,11 @@ mod tests {
         );
     }
 
-    /// Issue #3288: `CREATE TYPE`・`DROP TYPE [IF EXISTS]` の型名位置だけが解決される。`public.` は裸の名前、
-    /// テナントの SCHEMA は内部キー、不在は `3F000`、組み込み SCHEMA・`pg_temp` は `0A000`。列型・キャスト・
-    /// `ALTER TABLE .. TYPE` の修飾名は型名位置ではなく、書き換えない（従来どおり構文段で `42601`）。
-    // intentional: docs/design/schema-tenant-namespace.md
-    // tracked: #3289
+    /// Issue #3288・#3289: `CREATE TYPE`・`DROP TYPE [IF EXISTS]` の型名と、列型・キャスト・`ALTER TABLE` の型名位置が
+    /// 解決される。`public.` は裸の名前、テナントの SCHEMA は内部キー、不在は `3F000`、組み込み SCHEMA・
+    /// `pg_temp` は `0A000`。型名位置ではない修飾名（列修飾・関数名）は解決しない。
     #[test]
-    fn type_names_are_resolved_only_in_create_and_drop_type_positions() {
+    fn type_names_are_resolved_in_type_name_positions() {
         same(
             "CREATE TYPE public.mood AS ENUM ('a')",
             "CREATE TYPE mood AS ENUM ('a')",
@@ -1553,18 +1565,54 @@ mod tests {
                 .wire_code(),
             "3F000"
         );
-        // 型名位置ではない修飾名（列型・キャスト・ALTER の型）は書き換えない。
+        // 列型・キャスト・ALTER の型名位置（Issue #3289）。テナントの SCHEMA は内部キー、`public.` は裸の名前。
         for sql in [
             "CREATE TABLE t (m s.mood)",
+            "CREATE TABLE t (id BIGINT, m s.mood[])",
             "SELECT 'a'::s.mood",
+            "SELECT CAST('a' AS s.mood)",
+            "ALTER TABLE t ADD COLUMN c s.mood",
             "ALTER TABLE t ALTER COLUMN c TYPE s.mood",
         ] {
-            let t = rewrite_in_tenant(sql);
-            let still_qualified = match &t {
-                Ok(t) => t.iter().any(|x| matches!(x, Token::QualifiedIdent { .. })),
-                Err(_) => true,
-            };
-            assert!(still_qualified, "{sql}");
+            let t = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                t.iter()
+                    .any(|x| matches!(x, Token::Ident(k) if k == "#12.mood")),
+                "{sql}: {t:?}"
+            );
+            assert!(
+                !t.iter().any(|x| matches!(x, Token::QualifiedIdent { .. })),
+                "{sql}"
+            );
+        }
+        same("SELECT 1::public.integer", "SELECT 1::integer");
+        same("CREATE TABLE t (m public.mood)", "CREATE TABLE t (m mood)");
+        // 型名位置の不在・組み込み SCHEMA は固定のエラー。
+        for (sql, want) in [
+            ("CREATE TABLE t (m z.mood)", "3F000"),
+            ("SELECT 'a'::z.mood", "3F000"),
+            ("SELECT 'a'::pg_catalog.int4", "0A000"),
+            ("ALTER TABLE t ADD COLUMN c pg_temp.mood", "0A000"),
+        ] {
+            assert_eq!(
+                rewrite_in_tenant(sql).expect_err(sql).wire_code(),
+                want,
+                "{sql}"
+            );
+        }
+        // `public.` の型名は一時表との衝突検査用の名前（relation の名前空間）に含めない。
+        let mut t = tokenize("CREATE TABLE t (m public.mood)").expect("lex");
+        let info = rewrite_relation_names_full(&mut t, Some(&probe)).expect("ok");
+        assert!(info.names.is_empty());
+        assert!(!info.create_public);
+        // 型名位置ではない修飾名（列修飾・関数名）は解決しない（従来どおり構文段で扱う）。
+        for sql in ["SELECT x.id FROM s.t", "SELECT s.f(1)"] {
+            let t = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                !t.iter()
+                    .any(|x| matches!(x, Token::Ident(k) if k == "#12.id")),
+                "{sql}"
+            );
         }
     }
 
@@ -1717,6 +1765,11 @@ mod tests {
         ] {
             assert_eq!(rewrite(sql).expect_err(sql).wire_code(), "0A000", "{sql}");
         }
+        // 型名の位置（キャストの `public.<型>`）は CTE 名と衝突しない（別名前空間）。
+        same(
+            "WITH integer AS (SELECT 1 AS n) SELECT n::public.integer FROM integer",
+            "WITH integer AS (SELECT 1 AS n) SELECT n::integer FROM integer",
+        );
         // 別名の CTE とは衝突しない。
         same(
             "WITH c AS (SELECT id FROM public.t) SELECT id FROM c",
