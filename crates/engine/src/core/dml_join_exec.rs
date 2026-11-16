@@ -57,6 +57,16 @@ pub(crate) struct JoinedDmlOutcome {
 }
 
 impl EngineCore {
+    /// 結合形 DML の結合上限（起動時設定）。実行と `EXPLAIN`（Issue #3293）が同じ値で走査前検証を行う。
+    pub(super) fn joined_dml_limits(&self) -> JoinLimits {
+        JoinLimits {
+            max_input_rows: self.join_limits.max_input_rows(),
+            max_output_rows: self.join_limits.max_output_rows(),
+            max_relations: self.join_limits.max_relations(),
+            ..JoinLimits::default()
+        }
+    }
+
     /// 結合形 DML を実行する。起動時設定の上限（結合・走査・影響行数）を使う。`content_hash` は
     /// 構文段で算出した正規化文ハッシュ（台帳の照合・記録に使う）。
     #[allow(clippy::too_many_arguments)]
@@ -69,12 +79,7 @@ impl EngineCore {
         operation_id: Option<&OperationId>,
         content_hash: &ContentHash,
     ) -> Result<JoinedDmlOutcome, SqlSurfaceError> {
-        let limits = JoinLimits {
-            max_input_rows: self.join_limits.max_input_rows(),
-            max_output_rows: self.join_limits.max_output_rows(),
-            max_relations: self.join_limits.max_relations(),
-            ..JoinLimits::default()
-        };
+        let limits = self.joined_dml_limits();
         self.execute_joined_dml_with_limits(
             target,
             ctx,
