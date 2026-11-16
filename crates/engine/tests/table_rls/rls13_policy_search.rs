@@ -7,7 +7,8 @@
 //!    候補が足りる限り `LIMIT k` 件を返す（距離順・`HINT ORDER`・`WHERE` との合成）
 //! 2. 隠れた行にだけ評価エラーを起こす式が利用者の `WHERE` に混じっても、ポリシーが先に行を除く
 //! 3. ハイブリッドの疎側（BM25）の統計も隠れた行に依存しない（隠れた行を最初から入れていない兄弟表と一致）
-//! 4. HNSW（opt-in）でも `LIMIT k` 件を満たし、隠れた行は結果に出ない。ANN 経路を実際に通る（空振りでない）
+//! 4. HNSW（opt-in）でも `LIMIT k` 件を満たし、隠れた行は結果に出ない。ANN 経路を実際に通る（空振りでない）。
+//!    `vector_ip_ops` を宣言した `<#>` でも同じ（Issue #3305）
 //! 5. `row_security = off` は `42501`、他テナントの有効化・定義は効かない、DISABLE 後は従来の結果に戻る
 //! 6. `EXPLAIN` は適用表で `FullVisible` を報告しない
 
@@ -328,6 +329,17 @@ fn explain_lines(core: &EngineCore, tenant: &str, sql: &str) -> Vec<String> {
 }
 
 fn hnsw_core(label: &str, rows_n: u64, hide_upto: u64) -> (EngineCore, CleanupGuard) {
+    hnsw_core_with_canaries(label, rows_n, hide_upto, false)
+}
+
+/// [`hnsw_core`] に、`bob_canaries` が真のとき bob の Private 行（id 5001..=5005）を足す版。
+/// ベクトルは `[5,0]` 近傍で、クエリ `[1,0]` との内積が全行より大きい（alice へ漏れれば `<#>` の先頭に出る）。
+fn hnsw_core_with_canaries(
+    label: &str,
+    rows_n: u64,
+    hide_upto: u64,
+    bob_canaries: bool,
+) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path(label);
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -350,6 +362,25 @@ fn hnsw_core(label: &str, rows_n: u64, hide_upto: u64) -> (EngineCore, CleanupGu
             },
             0.0013,
         );
+    }
+    if bob_canaries {
+        for id in 5001..=5005u64 {
+            engine::tenant::insert_typed_row(
+                &storage,
+                "docs",
+                &ctx("bob"),
+                id,
+                Visibility::Private,
+                &[
+                    Value::Vector(vec![5.0 + (id - 5000) as f32 * 0.01, 0.0]),
+                    Value::Text("keep".to_string()),
+                    Value::Integer(id as i32),
+                    Value::Text("canary".to_string()),
+                ],
+                &OperationId::parse(&format!("seed-canary-{id}")).expect("op id"),
+            )
+            .expect("seed canary");
+        }
     }
     let validated = engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
         .expect("valid hnsw params");
@@ -442,5 +473,88 @@ fn hnsw_hybrid_refetch_loop_fills_limit_with_policy_passing_rows() {
     assert!(
         stats.hybrid_dense_searches >= 1,
         "ハイブリッド密側が ANN を通っていない: {stats:?}"
+    );
+}
+
+/// `vector_ip_ops` を宣言した適用表では、`<#>` の EXPLAIN が `full_visible` を報告しない（Issue #3305）。
+/// ポリシー前は `metric=ip` の `hnsw_full_visible`。
+#[test]
+fn explain_ip_ops_policy_table_is_not_full_visible() {
+    let (core, _g) = hnsw_core("rls13-search-ip-explain", 20, 5);
+    ok_as(
+        &core,
+        "alice",
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let sql = "EXPLAIN SELECT id FROM docs ORDER BY embedding <#> '[1,0]' LIMIT 5";
+    let before = explain_lines(&core, "alice", sql);
+    assert!(
+        before
+            .iter()
+            .any(|l| l.starts_with("ann_plan:") && l.contains("full_visible")),
+        "ポリシー前は FullVisible: {before:?}"
+    );
+    assert!(
+        before
+            .iter()
+            .any(|l| l.starts_with("hnsw_params:") && l.contains("metric=ip,")),
+        "{before:?}"
+    );
+    enable_keep_policy(&core, "docs");
+    let after = explain_lines(&core, "alice", sql);
+    assert!(
+        after
+            .iter()
+            .any(|l| l.starts_with("ann_plan:") && l.contains("subset")),
+        "適用表では Subset 系: {after:?}"
+    );
+    let hinted = format!("{sql} HINT ORDER(DISTANCE, SCALAR, RLS)");
+    let after_hinted = explain_lines(&core, "alice", &hinted);
+    assert!(
+        after_hinted.iter().all(|l| !l.contains("full_visible")),
+        "DISTANCE 先行でも FullVisible にならない: {after_hinted:?}"
+    );
+}
+
+/// `vector_ip_ops` 宣言の `<#>` でも、近傍の大半をポリシーで隠した表で HNSW 経路が `LIMIT k` 件を返し、
+/// 隠れた行（内積が最大の側）と他テナント（bob）のカナリア行は結果に出ない。ANN 経路を実際に通る。
+#[test]
+fn hnsw_ip_ops_returns_k_policy_passing_rows_through_the_ann_path() {
+    const N: u64 = 2_400;
+    const HIDE: u64 = 1_800;
+    const K: usize = 10;
+    let (core, _g) = hnsw_core_with_canaries("rls13-search-hnsw-ip", N, HIDE, true);
+    ok_as(
+        &core,
+        "alice",
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    enable_keep_policy(&core, "docs");
+    let sql = format!("SELECT id FROM docs ORDER BY embedding <#> '[1,0]' LIMIT {K}");
+    let expected: Vec<u64> = (HIDE + 1..=HIDE + K as u64).collect();
+    let mut last = Vec::new();
+    for _ in 0..3 {
+        last = ranked_ids(&core, "alice", &sql);
+        assert_eq!(last.len(), K, "候補が足りる限り LIMIT k 件を返す");
+        assert!(
+            last.iter().all(|id| *id > HIDE && *id < 5001),
+            "隠れた行・他テナントの行は出ない: {last:?}"
+        );
+    }
+    let overlap = last.iter().filter(|id| expected.contains(id)).count();
+    assert!(
+        overlap * 10 >= K * 8,
+        "厳密解との重なり {overlap}/{K}: {last:?}"
+    );
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.builds >= 1 && stats.subset_searches >= 1,
+        "ANN 経路を通っていない（空振り）: {stats:?}"
+    );
+    // bob からは自分のカナリア行が先頭に見える（検知が vacuous でないことの確認）。
+    let as_bob = ranked_ids(&core, "bob", &sql);
+    assert!(
+        as_bob.first().is_some_and(|id| (5001..=5005).contains(id)),
+        "{as_bob:?}"
     );
 }
