@@ -170,8 +170,10 @@ fn create_table_positions(tokens: &[Token], out: &mut Vec<TypePos>) {
         }
         if at_start && depth == 1 {
             at_start = false;
-            if matches!(t, Token::Ident(_))
-                && !is_constraint_word(Some(t))
+            if matches!(
+                t,
+                Token::Ident(_) | Token::QuotedNull(_) | Token::QuotedBoolWord(_)
+            ) && !is_constraint_word(Some(t))
                 && is_name(tokens.get(j + 1))
             {
                 out.push(TypePos {
@@ -311,6 +313,8 @@ mod tests {
             .collect();
         assert_eq!(col, ["BIGINT", "s.mood", "mood", "TEXT"]);
         assert!(got.contains(&("s.mood".to_string(), false)));
+        // 引用符付き "null" の列名（QuotedNull）の直後の型も位置になる。
+        assert_eq!(names("CREATE TABLE t (\"null\" s.mood)"), ["s.mood"]);
         assert!(names("CREATE TABLE t (LIKE u)").is_empty());
         // CTAS の列名リストは型名の位置ではない。
         assert!(names("CREATE TABLE t (a, b) AS SELECT 1, 2").is_empty());
