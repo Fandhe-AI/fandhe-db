@@ -478,6 +478,28 @@ fn references_to_temporary_tables_are_rejected() {
     );
 }
 
+// 作成中の表自身への自己 FK は、同名の一時表があっても新しい SCHEMA の表を指して受理される。
+// 作成中の表以外の未修飾参照は従来どおり一時表参照として 0A000。
+#[test]
+fn self_fk_is_accepted_even_when_a_temp_table_has_the_same_name() {
+    let f = fx("sch-el-temp-self");
+    let mut s = ddl_session();
+    f.ok(A, &mut s, "CREATE TEMP TABLE t (id BIGINT)");
+    f.ok(
+        A,
+        &mut s,
+        "CREATE SCHEMA s CREATE TABLE t (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES t (id))",
+    );
+    assert_eq!(
+        f.code(
+            A,
+            &mut s,
+            "CREATE SCHEMA s2 CREATE TABLE u (id BIGINT PRIMARY KEY, p BIGINT REFERENCES t (id))"
+        ),
+        "0A000"
+    );
+}
+
 #[test]
 fn quoted_create_identifiers_do_not_split_elements() {
     let f = fx("sch-el-quoted");

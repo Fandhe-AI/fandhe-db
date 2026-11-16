@@ -221,13 +221,14 @@ impl EngineCore {
         //     同じ文で先に作られる名前（表の自己参照を含む）は新しい SCHEMA を指す。
         let skip: Vec<usize> = new_positions.iter().map(|(i, _)| *i).collect();
         for (index, name) in crate::sql::search_path::element_relation_refs(&tokens, &skip) {
-            if session.temp_tables().contains(&name) {
+            let is_self_table =
+                element.kind == SchemaElementKind::Table && own_name.as_deref() == Some(&name);
+            // 作成中の表自身への参照は一時表との同名でも新しい SCHEMA の表を指すため、拒否の対象から外す。
+            if !is_self_table && session.temp_tables().contains(&name) {
                 return Err(SqlSurfaceError::feature_not_supported(
                     "CREATE SCHEMA elements cannot reference temporary tables",
                 ));
             }
-            let is_self_table =
-                element.kind == SchemaElementKind::Table && own_name.as_deref() == Some(&name);
             if is_self_table || known.contains(&name) {
                 new_positions.push((index, name));
             }
