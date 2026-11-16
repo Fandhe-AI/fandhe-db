@@ -120,4 +120,3 @@ SQL-53 (b)・SQL-75・SQL-76 のポインタ。`EXPLAIN [ANALYZE|VERBOSE|(オプ
 - **VERBOSE**: `RETURNING` の列を `output:` に出す（Describe と同じ列）。`FORMAT JSON` は既存の包みで通り、`ANALYZE` との併用は `0A000`
 - **権限**: 非 EXPLAIN と同じビット（対象表 `UPDATE|SELECT`／`DELETE|SELECT`、FROM／USING 側の SELECT）。EXPLAIN は抜け道にならない
 - **まだ拒否する形**: ビュー・一時表が関与する形（#3292）、FROM 内の JOIN ON・多方向結合（#3294。木の組み立ては source 1 個前提で、#3294 が計画を拡張するときに追随させる）、分割実行（`PARTITIONED`）、セッション無しの入口
-
