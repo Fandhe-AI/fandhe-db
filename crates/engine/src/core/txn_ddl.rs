@@ -17,6 +17,8 @@
 //! 暫定の規則（受け皿は #3314。V1・V5・V7）: DDL を積んだ後に同じ Tx で実行できる文は、結線を済ませた最小の
 //! 種類だけにする（[`check_post_ddl_statement`]）。`search_path` の解決・ビュー展開・権限ゲートが読む確定済み
 //! カタログと、write txn 上の内容が食い違う経路を作らないため、それ以外は `0A000` で拒否する（fail-closed）。
+//! ビュー経由の読みは `catalog.rs` の `TableLookup::view_definition` が重ね見の区間で `0A000` にする。
+//! 既存行の走査を伴う `CREATE INDEX`（一意・式・述語つき・GIN）・`SET NOT NULL` は、期限の結線まで対象表に行がある間 `0A000` にする。
 //! 確定済みカタログで行う解析の表スキーマの引き当ては、Tx が変更した表の write txn 上のスキーマを重ねて
 //! 見る（`sql::txn_overlay`）。
 
@@ -46,10 +48,35 @@ fn schema_scoped_ddl_unsupported() -> SqlSurfaceError {
     )
 }
 
+/// 既存行の走査を伴う DDL（`CREATE INDEX`・`SET NOT NULL`）は、走査ループに Tx の残り時間
+/// （`remaining_duration`）の期限が結線されていないため、対象表に行がある間は `0A000` にする
+/// （共有 writer を持続時間上限を越えて保持しない。fail-closed。受け皿は #3314）。
+fn reject_scan_ddl_on_nonempty_table(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+) -> Result<(), SqlSurfaceError> {
+    if crate::catalog::table_has_rows_in_txn(write_txn, table).map_err(|_| internal())? {
+        return Err(SqlSurfaceError::transaction_feature_not_supported(
+            "this DDL scans existing rows and is not supported on a non-empty table inside a transaction block yet",
+        ));
+    }
+    Ok(())
+}
+
+/// `ALTER TABLE` のアクションに既存行を走査する `SET NOT NULL` が含まれるか。
+fn alter_scans_rows(stmt: &crate::sql::allowlist::ValidatedAlterTable) -> bool {
+    use crate::sql::allowlist::ValidatedAlterTable as V;
+    match stmt {
+        V::AlterColumnSetNotNull(_) => true,
+        V::Multiple(m) => m.actions.iter().any(alter_scans_rows),
+        _ => false,
+    }
+}
+
 /// DDL を積んだ Tx に対し、`parsed` を実行してよいか判定する（暫定の許可リスト。受け皿は #3314。V1・V5・V7）。
 ///
 /// 許可するのは、本モジュールが受理する DDL・Tx 制御・セッション変数の `SET`/`SHOW`・結線を済ませた
-/// `INSERT`・読み取り（`USING PLAN`・`EXPLAIN`・ルーチン呼び出し・集合返却関数・ビュー展開を伴う形を除く）。
+/// `INSERT`・読み取り（`USING PLAN`・`EXPLAIN`・ルーチン呼び出し・集合返却関数・ビュー展開を伴う形は `view_definition` 側で拒否）。
 /// 表・索引を DROP した後は、確定済みカタログでの解析・ビュー展開が古い名前を見るため DDL 以外を拒否する。
 /// DDL を積んでいない Tx では何もしない。文言は文の種類だけで、対象の名前・存在を含めない。
 pub(super) fn check_post_ddl_statement(
@@ -61,6 +88,8 @@ pub(super) fn check_post_ddl_statement(
         return Ok(());
     }
     let removed = txn.ddl_removed();
+    // 一時カタログ・`search_path` の振り分けの包みは中身で判定する（包んだままだと許可対象の文も拒否される）。
+    let parsed = parsed.peel_session_route();
     let allowed = match parsed {
         ParsedSql::CreateTable(_)
         | ParsedSql::DropTable(_)
@@ -243,6 +272,9 @@ impl EngineCore {
                 txn.ensure_writer(ctx)?;
                 txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
+                if alter_scans_rows(stmt) {
+                    reject_scan_ddl_on_nonempty_table(write_txn, table_name)?;
+                }
                 let (outcome, evict) = crate::sql::ddl::execute_alter_table_in_txn(
                     &self.storage,
                     write_txn,
@@ -275,6 +307,14 @@ impl EngineCore {
                 txn.ensure_writer(ctx)?;
                 txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
+                // 既存行を走査する形（一意・式・述語つき・GIN）だけが対象。列の宣言だけの索引は走査しない。
+                if stmt.is_unique()
+                    || stmt.predicate().is_some()
+                    || stmt.gin_opclass().is_some()
+                    || stmt.expression_keys().iter().any(Option::is_some)
+                {
+                    reject_scan_ddl_on_nonempty_table(write_txn, stmt.table())?;
+                }
                 let outcome = crate::sql::ddl::execute_create_index_in_txn(write_txn, stmt)?;
                 txn.mark_ddl_done(false, Vec::new());
                 Ok(SqlOutcome::CreateIndex(outcome))

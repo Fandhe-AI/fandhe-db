@@ -17949,6 +17949,24 @@ impl Storage {
     }
 }
 
+/// 共有 write txn 上で `table_name` の行ストアに 1 行以上あるかを返す（Issue #3313。Tx 内 DDL の
+/// 走査を伴う形を、期限の結線までの間 `0A000` にするための判定。読み取り集合へは記録しない）。
+/// 行ストア未作成は 0 行。
+pub(crate) fn table_has_rows_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+) -> Result<bool> {
+    let row_table_name = user_rows_physical_name(table_name);
+    match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
+        Ok(t) => {
+            let mut it = t.iter().map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            Ok(it.next().is_some())
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(map_row_table_error(e)),
+    }
+}
+
 /// `sql::allowlist::validate_statement`（TASK-74・SQL-8 参照）から FROM テーブルの
 /// カタログ存在確認に使われる橋渡し実装。`get_table_schema` が返す `CatalogError`
 /// を SQL 表層のエラー契約へ分類し直し、識別子形式不正のみ拒否側（構文エラー）へ
@@ -17969,7 +17987,15 @@ impl TableLookup for Storage {
     /// 委譲し、`CatalogError` は [`table_lookup_error`] で SQL 表層の契約へ
     /// 写像する（TABLE-18・SQL-23・TASK-205、Issue #909）。
     fn view_definition(&self, name: &str) -> std::result::Result<Option<ViewDef>, SqlSurfaceError> {
-        Storage::view_definition(self, name).map_err(table_lookup_error)
+        let def = Storage::view_definition(self, name).map_err(table_lookup_error)?;
+        // SQL-80・Issue #3313: DDL を積んだ Tx の区間では、ビュー本体（確定済みカタログ）が Tx 内の表の形と
+        // 食い違いうるため、ビュー経由の読みは受け皿（#3314）まで `0A000`（fail-closed。文言に名前を含めない）。
+        if def.is_some() && crate::sql::txn_overlay::overlay_active(self) {
+            return Err(SqlSurfaceError::transaction_feature_not_supported(
+                "reading a view after DDL inside a transaction block is not supported yet",
+            ));
+        }
+        Ok(def)
     }
 
     /// `sql::allowlist` の WITH 事前検証（どこからも参照されない leaf CTE）が

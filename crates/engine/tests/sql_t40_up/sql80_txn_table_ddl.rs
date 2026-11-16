@@ -796,3 +796,64 @@ fn copy_after_ddl_is_rejected_with_0a000() {
     assert_eq!(txn.status(), TransactionStatus::Failed);
     tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
 }
+
+/// 走査を伴う DDL（一意索引・`SET NOT NULL`）は、期限の結線まで行のある表では `0A000`（Issue #3313 レビュー）。
+#[test]
+fn scanning_ddl_on_a_non_empty_table_is_rejected_until_deadline_wiring() {
+    let (core, _guard) = new_core("sql80-scan-ddl");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(1, "a"))
+        .expect("seed");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    assert_eq!(
+        tx_code(
+            &core,
+            &mut session,
+            &mut txn,
+            "CREATE UNIQUE INDEX t_body_u ON t (body)"
+        ),
+        "0A000"
+    );
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    assert_eq!(
+        tx_code(
+            &core,
+            &mut session,
+            &mut txn,
+            "ALTER TABLE t ALTER COLUMN body SET NOT NULL"
+        ),
+        "0A000"
+    );
+}
+
+/// DDL 後にビュー経由の読みは `0A000`（古いビュー本体を Tx 内の表の形へ束縛しない）。
+#[test]
+fn view_read_after_ddl_is_rejected() {
+    let (core, _guard) = new_core("sql80-view-after-ddl");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE VIEW v AS SELECT id FROM t",
+    )
+    .expect("view");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "ALTER TABLE t ADD COLUMN extra TEXT",
+    );
+    assert_eq!(
+        tx_code(&core, &mut session, &mut txn, "SELECT id FROM v"),
+        "0A000"
+    );
+}

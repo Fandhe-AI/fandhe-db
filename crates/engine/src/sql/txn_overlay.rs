@@ -94,6 +94,16 @@ pub(crate) fn overlay_schema(storage: &Storage, name: &str) -> Option<Option<Tab
     })
 }
 
+/// `storage` に対して重ね見が張られているか（DDL を積んだ Tx の文の区間か）。ビュー本体は確定済み
+/// カタログからしか読めず Tx 内の表の形と食い違いうるため、張られている間はビュー展開を拒否する判定に使う。
+pub(crate) fn overlay_active(storage: &Storage) -> bool {
+    OVERLAY.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .is_some_and(|o| o.storage_addr == addr_of(storage))
+    })
+}
+
 /// `name` の表スキーマを、重ね見があればそれ、無ければ確定済みカタログから引く
 /// （`impl TableLookup for Storage` と INSERT のスキーマ取得が共有する）。
 pub(crate) fn table_schema_overlaid(
