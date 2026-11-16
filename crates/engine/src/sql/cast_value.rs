@@ -145,6 +145,7 @@ pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
         ArrayElemType::Date => CastSrc::Date,
         ArrayElemType::Timestamp => CastSrc::Timestamp,
         ArrayElemType::Time => CastSrc::Time,
+        ArrayElemType::Interval => CastSrc::Interval,
         ArrayElemType::Uuid => CastSrc::Uuid,
         ArrayElemType::Numeric { .. } => CastSrc::Numeric,
         ArrayElemType::Bytea => CastSrc::Bytea,
@@ -170,6 +171,7 @@ pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
         ArrayElemType::Date => CastDst::Date,
         ArrayElemType::Timestamp => CastDst::Timestamp,
         ArrayElemType::Time => CastDst::Time,
+        ArrayElemType::Interval => CastDst::Interval,
         ArrayElemType::Uuid => CastDst::Uuid,
         ArrayElemType::Numeric { precision, scale } => CastDst::Numeric(Some((precision, scale))),
         ArrayElemType::Bytea => CastDst::Bytea,
@@ -1205,6 +1207,7 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Date(v) => map(v, |d| Ok(ExprValue::Date(*d))),
         ArrayValue::Timestamp(v) => map(v, |t| Ok(ExprValue::Timestamp(*t))),
         ArrayValue::Time(v) => map(v, |t| Ok(ExprValue::Time(*t))),
+        ArrayValue::Interval(v) => map(v, |x| Ok(ExprValue::Interval(*x))),
         ArrayValue::Uuid(v) => map(v, |u| Ok(ExprValue::Uuid(*u))),
         ArrayValue::Numeric(v) => map(v, |d| Ok(ExprValue::Numeric(*d))),
         ArrayValue::Bytea(v) => map(v, |b| Ok(ExprValue::Bytes(Cow::Owned(b.clone())))),
@@ -1282,6 +1285,12 @@ pub(crate) fn values_to_array(
             // 防御: 変換経路は範囲検査済みの値だけを渡すが、範囲外は格納せず拒否する（fail-closed）。
             ExprValue::Time(t) if crate::datetime::validate_time_micros(t) => Ok(t),
             ExprValue::Time(_) => Err(out_of_range("time out of range")),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Interval => ArrayValue::Interval(collect(values, |v| match v {
+            // 防御: 変換経路は検査済みの値だけを渡すが、番兵は格納せず拒否する（fail-closed）。
+            ExprValue::Interval(iv) if crate::datetime::validate_interval(&iv) => Ok(iv),
+            ExprValue::Interval(_) => Err(out_of_range("interval out of range")),
             _ => Err(bad()),
         })?),
         ArrayElemType::Uuid => ArrayValue::Uuid(collect(values, |v| match v {

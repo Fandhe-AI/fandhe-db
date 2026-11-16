@@ -618,6 +618,9 @@ wire_type_enum! {
         /// 要素の長さ `n` は typmod（`n`。VARHDRSZ を足さない。スカラー BIT と同じ）で公告する。
         /// テキスト表現のみ対応。
         BitArray,
+        /// `ColumnMeta::Scalar{ty: Array(<interval>)}`（`_interval`=1187。TABLE-14・TABLE-34・TABLE-35・
+        /// Issue #3234）。次元数は OID に影響しない（PostgreSQL と同じ）。テキスト表現のみ対応。
+        IntervalArray,
         /// `ColumnMeta::Record{array: false}`（`record`。再帰 CTE の `SEARCH BREADTH FIRST` 順序列。
         /// SQL-35・Issue #2213）。テキスト表現のみ対応（`record_out` 形式）。
         Record,
@@ -671,6 +674,7 @@ impl WireType {
             WireType::VarcharArray => 1015,
             WireType::BpcharArray => 1014,
             WireType::BitArray => 1561,
+            WireType::IntervalArray => 1187,
             WireType::Record => 2249,
             WireType::RecordArray => 2287,
         }
@@ -705,6 +709,7 @@ impl WireType {
             | WireType::VarcharArray
             | WireType::BpcharArray
             | WireType::BitArray
+            | WireType::IntervalArray
             | WireType::Record
             | WireType::RecordArray => -1,
             WireType::Int2 => 2,
@@ -761,6 +766,7 @@ impl WireType {
             WireType::VarcharArray => "_varchar",
             WireType::BpcharArray => "_bpchar",
             WireType::BitArray => "_bit",
+            WireType::IntervalArray => "_interval",
             WireType::Record => "record",
             WireType::RecordArray => "_record",
         }
@@ -823,6 +829,7 @@ impl WireType {
             | WireType::VarcharArray
             | WireType::BpcharArray
             | WireType::BitArray
+            | WireType::IntervalArray
             | WireType::Record
             | WireType::RecordArray => None,
         }
@@ -886,6 +893,7 @@ impl WireType {
             | WireType::VarcharArray
             | WireType::BpcharArray
             | WireType::BitArray
+            | WireType::IntervalArray
             // レコード・レコード配列のバイナリ形式（`record_send`）は対象外（SQL-35・Issue #2213）。
             | WireType::Record
             | WireType::RecordArray => false,
@@ -1013,6 +1021,7 @@ fn scalar_type_modifier(ty: &engine::catalog::ColumnType) -> Result<i32, EncodeE
                 | E::Jsonb
                 | E::SmallInt
                 | E::Time
+                | E::Interval
                 | E::Enum => Ok(-1),
             }
         }
@@ -1157,6 +1166,7 @@ fn array_wire_type(elem: engine::catalog::ArrayElemType) -> WireType {
         E::Varchar(_) => WireType::VarcharArray,
         E::Bpchar(_) => WireType::BpcharArray,
         E::Bit(_) => WireType::BitArray,
+        E::Interval => WireType::IntervalArray,
         E::Enum => WireType::Text,
     }
 }
@@ -2307,6 +2317,20 @@ mod tests {
             text_of(ArrayValue::Time(vec![Some(0), None, Some(86_400_000_000)])),
             "{00:00:00,NULL,24:00:00}"
         );
+        // INTERVAL[]（Issue #3234）: 空白を含むため引用される。
+        let iv = |months, days, micros| engine::datetime::Interval {
+            months,
+            days,
+            micros,
+        };
+        assert_eq!(
+            text_of(ArrayValue::Interval(vec![
+                Some(iv(0, 1, 0)),
+                None,
+                Some(iv(1, 0, 7_200_000_000))
+            ])),
+            r#"{"1 day",NULL,"1 mon 02:00:00"}"#
+        );
         let bit = |s: &str| engine::bit_string::BitString::parse_text(s, 4).expect("bit");
         assert_eq!(
             text_of(ArrayValue::Bit(vec![
@@ -2972,7 +2996,7 @@ mod tests {
     /// 保証はマクロが担う）。
     #[test]
     fn wire_type_all_is_exhaustive() {
-        assert_eq!(WireType::ALL.len(), 40);
+        assert_eq!(WireType::ALL.len(), 41);
     }
 
     /// Parse の宣言 OID 写像（Issue #2436・WIRE-24 ポインタ）: 全 variant が OID から
@@ -2998,7 +3022,7 @@ mod tests {
     /// そのものを外部オラクルで検証する（WIRE-13・TASK-200・Issue #895）。
     #[test]
     fn wire_type_table_matches_postgres_builtin_catalog() {
-        let expected: [(WireType, i32, i16, &str); 40] = [
+        let expected: [(WireType, i32, i16, &str); 41] = [
             (WireType::Numeric, 1700, -1, "numeric"),
             (WireType::Text, 25, -1, "text"),
             (WireType::Varchar, 1043, -1, "varchar"),
@@ -3037,6 +3061,7 @@ mod tests {
             (WireType::VarcharArray, 1015, -1, "_varchar"),
             (WireType::BpcharArray, 1014, -1, "_bpchar"),
             (WireType::BitArray, 1561, -1, "_bit"),
+            (WireType::IntervalArray, 1187, -1, "_interval"),
             (WireType::Record, 2249, -1, "record"),
             (WireType::RecordArray, 2287, -1, "_record"),
         ];
@@ -3118,6 +3143,7 @@ mod tests {
                 E::Varchar(_) => (1015, "_varchar"),
                 E::Bpchar(_) => (1014, "_bpchar"),
                 E::Bit(_) => (1561, "_bit"),
+                E::Interval => (1187, "_interval"),
                 // ENUM[] は語彙を公告できないため text として公告する。
                 E::Enum => (25, "text"),
             };
