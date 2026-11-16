@@ -27,7 +27,7 @@ DELETE FROM <表> [[AS] <別名>] USING <from_list> [WHERE <join_where>]
 
 `<from_list>` の JOIN 連鎖は Issue #3294 で受理した（下記「多方向結合」節）。
 
-- `WHERE` は JOIN の `WHERE` 文法（`JoinWhereExpr`）を再利用する。列同士の比較・`AND`／`OR`・括弧を受理し、数値リテラル・`IS NULL`・`NOT`・サブクエリは構造的に `42601`
+- `WHERE` は JOIN の `WHERE` 文法（`JoinWhereExpr`）を再利用する。列同士の比較・`AND`／`OR`・括弧を受理する。DML の WHERE だけが、数値リテラルとの比較（`= < <= > >=`）・数値 `IN`・`IS [NOT] NULL` の葉を加えて受理する（Issue #3295。SELECT の JOIN の WHERE／ON は同じ入力で `42601` のまま）。`NOT`・サブクエリ・`<>`・`IS TRUE` は構造的に `42601`
   になる。#1750 のサブクエリ形と FROM 形は当面同時に使えない
 - SET 左辺は非修飾の列名だけ（`SET t.a = ...` は `42601`）。行値の代入 `(a, b) = (...)`／`= ROW(...)` は Issue #3296 で受理（下記「SET の行値代入と FROM 側の式」節）
 - SET 右辺は 2 系統に分ける
@@ -44,8 +44,8 @@ DELETE FROM <表> [[AS] <別名>] USING <from_list> [WHERE <join_where>]
 - 入口（`EngineCore::parse_tokens_in`）が `looks_like_update_from`／`looks_like_delete_using` で先読みし、専用の解析器へ回す。既存の `parse_update`／`parse_delete` は変えない
 - `looks_like_update_from`: 括弧深さ 0 の `FROM`（`IS [NOT] DISTINCT FROM` を除く）がある `UPDATE` 文
 - `looks_like_delete_using`: 括弧深さ 0 の `USING` の直後が `OPERATION_ID` でない `DELETE FROM` 文。`DELETE FROM t USING OPERATION_ID '...'`（WHERE 省略形）は従来どおり既存の経路を通る。`operation_id` という名前の表を USING に書く形は operation_id 句として扱われ、既存の解析器が `42601` で拒否する（fail-closed）
-- 非セッション入口（`validate_update`・`validate_delete_statement` など）は FROM／USING 形を従来どおり `42601` で拒否する（`EXPLAIN` は Issue #3293 で受理。末尾「EXPLAIN（Issue #3293）」節）
-- 別名付きで FROM／USING が無い単一表 DML（`UPDATE t AS x SET ... WHERE ...`）は従来どおり `42601`（受理範囲を広げない）
+- 非セッション入口（`validate_update`・`validate_delete_statement` など）は FROM／USING 形を従来どおり `42601` で拒否する（`EXPLAIN` の FROM／USING 形は Issue #3293 で受理。末尾「EXPLAIN（Issue #3293）」節）
+- 別名付きで FROM／USING が無い単一表 DML（`UPDATE t AS x SET ... WHERE ...`）は Issue #3291 で受理に変わった。入口のトークン正規化で別名なしの同じ文へ書き換える（下記「別名つき単一表 DML」節）
 
 ## 新しい `ParsedSql` variant
 
@@ -77,9 +77,10 @@ WHERE は最上位の `AND` で conjunct に平坦化し、解決済みの relat
 | 別 relation の列同士の等値 | 結合キー（対象側・source 側へ向きを正規化。複合キー可） |
 | 対象側だけを参照（`OR` 可） | 対象側フィルタ（既存の述語形 DML と同じ束縛器） |
 | source 側だけを参照（`OR` 可） | 単一表 source は走査へ押し下げる述語。畳み込み source（Issue #3294）は合成 JOIN 文の `WHERE` |
-| 上記以外 | `0A000` |
+| 対象と source をまたぐ上記以外（非等値・`OR`・キー化できない型の等値） | 残余述語（Issue #3295。単一表 source のみ。畳み込み source は `0A000`。下記「非等値・OR をまたぐ述語」節） |
+| 上記以外（参照列が無い等） | `0A000` |
 
-`0A000` で拒否する形（設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: relation をまたぐ非等値・`OR`、対象側の列比較（単一表 source では source 側の列比較も）、キー化できない型（REAL／DOUBLE／NUMERIC 等）の結合キー、非バイト列順の照合つきキー列、embedding を参照する対象側述語、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列。キー列の型クラスが比較できない組は `42804`。等値結合キーが無い形（WHERE 省略・source だけの述語）と FROM／USING が 2 表以上の形は Issue #3294 で受理した（`MULTI_FROM`・`NO_EQUI_KEY` の拒否は廃止）。
+`0A000` で拒否する形（設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: 畳み込み source（FROM／USING が 2 表以上・JOIN 段あり）での対象と source をまたぐ非等値・`OR`・キー化できない型の等値、embedding を参照する対象側述語・残余、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列、残余での source 疑似列 `id`・VECTOR／配列列の参照。同じ relation 内の列比較は Issue #3295 で対象側／（単一表）source 側へ押し下げて受理する。キー列の型クラスが比較できない組は `42804`。等値結合キーが無い形（WHERE 省略・source だけの述語）と FROM／USING が 2 表以上の形は Issue #3294 で受理した。
 
 SET は、リテラルと対象表の列だけを使う式をそのまま運び、列参照（source 列を含む）と source 列を含む式（Issue #3296）を「対象列 ++ source の取り出し列」の合成スキーマ上の式として束縛する（合成名は利用者の識別子と衝突しない綴り）。Describe 経路で変換エラーを返すかどうかは #3202 の方針の範囲。
 
@@ -90,7 +91,7 @@ SET は、リテラルと対象表の列だけを使う式をそのまま運び�
 - **畳み込み**: source が 2 表以上、または JOIN の段を持つとき、source 側のリレーション列と結合段（カンマは `Cross` 段）から合成 JOIN 文（`FoldedSource`）を作り、既存の結合実行器（`sql::join::execute_with_limits`）で評価した出力 1 つを source 行源として扱う。対象表はその行源と結合キーで突き合わせる。第 2 の結合実行器は作らず、各リレーションは書き込むセッションの `PolicyContext` で独立に走査する（RLS-10 (b)）。走査は共有 write txn 上で行い、文の開始時点のスナップショットになる
 - **畳み込みスキーマ**: SET・結合キー・`RETURNING` が読む source 列だけを疑似列 `id` なしの採番方式スキーマとして並べる（疑似列 `id` は整数クラスの `BIGINT` 列）。`JoinedDmlSource` の添字系列（`columns`・`EquiKey::source_column`・セル位置）はその添字を指す。probe は単一表 source と共通
 - **単一表 source（JOIN の段なし）**: 従来の単一表走査のまま。結合キーが 0 本でもよい
-- **WHERE の振り分け**: 畳み込み source で source だけを参照する述語は、修飾した論理木のまま合成 JOIN 文の `WHERE` へ渡す（外部結合の意味論は結合計画器の pushdown・残余が守る）。複数の source にまたがる述語・列比較も可。対象表と source をまたぐ述語は列同士の等値だけを結合キーにし、それ以外は `0A000`（tracked: #3295）
+- **WHERE の振り分け**: 畳み込み source で source だけを参照する述語は、修飾した論理木のまま合成 JOIN 文の `WHERE` へ渡す（外部結合の意味論は結合計画器の pushdown・残余が守る）。複数の source にまたがる述語・列比較も可。対象表と source をまたぐ述語は列同士の等値だけを結合キーにし、それ以外は、単一表 source でなければ `0A000`（畳み込み source での残余は未対応。tracked: #3295 の後続）
 - **結合キーが 0 本**: 全 source 行を空キーの 1 バケットに入れ、対象行 1 件ごとに一致ペアへ source の行数を加算する。累計が出力行数上限を超えたら `54000`
 - **ON の束縛**: `ON` は FROM 側の表だけのスコープで解決する（段 k が参照できるのは先頭から k + 1 番目まで）。対象表への参照は PG と同じく拒否（修飾参照は `42P01`、対象表にしか無い非修飾列は `42703`）。判定順は「スコープ構築 → ON → WHERE → SET → RETURNING」。ON の型検証・結合キー／残余の分類は結合実行器が担い、変換の段階で合成 JOIN 文を束縛して Describe と Execute のコードをそろえる
 - **上限**（超過はすべて `54000`・副作用ゼロ）: リレーション数（対象表 + source の数）、各リレーションの入力行数、結合段の出力、NLJ の比較回数、畳み込み出力の行数（単一表 source と同じ可視行数上限）、累計バイト予算（結合実行器の上限を共有予算の残りに絞り、返った行を共有予算へ計上）、一致ペア
@@ -149,6 +150,19 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - **権限**: `classify_write` は従来どおり target のビットだけを課し、source のビュー名はトークン走査の読み取りゲートで判定される。準備済み文の陳腐化はトークン列に現れる名前の同一性検査が覆う
 - **一時表だけの形**: `is_routable` が `UpdateFrom`／`DeleteUsing` を受理し、`temp_dispatch` が一時コアの `execute_update_from_on`／`execute_delete_using_on` を呼ぶ。総バイト数の上限（`54000`）・明示 Tx・Describe は既存の一時表経路に乗る
 
+## 非等値・OR をまたぐ述語（Issue #3295）
+
+SQL-53 (b)・RLS-10・RECOVER-10/11・SQL-28 のポインタ。等値キーが取れない部分を、対象行 × source 行のネストループで評価する残余述語として受理する。
+
+- **振り分け**: 最上位の `AND` の conjunct のうち、キー化できる列等値だけが結合キー。対象と source をまたぐそれ以外（非等値・`OR`・`AND`／`OR` 混在・REAL／DOUBLE／NUMERIC 等の等値・非バイト列順の照合の等値）は残余。型クラスが比較できない等値は従来どおり `42804`。キーが 0 本でも残余があれば受理する（キーも残余も無い形は交差結合として受理する）
+- **束縛・評価**: 残余は「対象表のスキーマ ++ 残余が参照する source 列（合成名）」の合成スキーマ上の `WherePredicate` へ変換し、通常の単一表 WHERE と同じ `bind_where_predicates` で束縛する（`sql::join::dml_residual`）。実行は `where_tree::BoundConjunction::matches` で、ビューは「対象行の走査結果 ++ source 行のスカラー」。第 2 の評価器を作らないため、NULL の三値論理・型強制・照合・数値リテラル・`IS NULL` の真理値が通常の WHERE と一致する。source 列は照合を引き継ぐ。SELECT JOIN の `residual::eval_all` は使わない（NULL 補完行を偽にする前提が `IS NULL` と相性が悪い）
+- **実行**: 候補は等値キーのバケット（キー 0 本なら source の全行）。バケットを評価する前に `charge_comparisons` で比較回数を文全体の上限へ計上する（超過は `54000`）。走査位置の昇順に評価し、残余が真になった組だけを一致ペアに数える（`max_output_rows`。一意化の前の累計）。採る source 行は真になった中の最初（決定的）。DELETE も短絡せず全候補を評価し、UPDATE と `54000` の判定を同じにする。内側ループで協調的中断（`57014`）に応じる。残余が無い形は従来経路のまま
+- **列配置**: 残余が参照する source 列は走査投影の末尾（SET・キー・`RETURNING` の列の後ろ）へ追記し、SET ビューと `RETURNING` のセル位置を動かさない
+- **DML 専用の葉**: `JoinWherePredicate::NumericCompare`・`IsNull`。`IN (数値, ...)` は構文段で数値比較の `OR` へ脱糖する。葉数・`IN` の要素数は積む前に検査する（`54000`）。`IsNull` は非 strict（`is_null_rejecting` は偽）で、SELECT の JOIN の文法は生成しない。多重防御として SELECT の計画器（`build_plan`）は新 variant を含む木を `0A000` で拒否する
+- **fail-closed**: 残余での source 疑似列 `id`（u64 を式評価ビューへ載せない）・VECTOR／配列列の参照は固定文言の `0A000`。サブクエリ・`NOT`・`<>`・`IS TRUE` は従来どおり `42601`。RLS は変えない（対象側は所有∧可視の候補、source 側は `ctx` 走査結果だけが入力で、他テナントの Private 行はどちらにも現れない）。エラー文言は固定文言と入力された名前だけ
+- **対象外**: WHERE 省略・片側だけの述語による交差結合と 3 表以上（#3294）、SET 右辺の FROM 側修飾式・行値代入（#3296）、`EXPLAIN` への残余の表示（対応しない。`EXPLAIN` が壊れないことだけを結合テストで確認）、SELECT の JOIN の WHERE／ON への数値リテラル・`IS NULL`（対応しない。外部結合の strict 簡約の見直しが要る別の判断）
+- **テスト**: `sql53_dml_from_using_residual.rs`（sql_t40_up。非等値・キー＋残余・OR・三値論理・数値リテラル・決定性・自己結合・RLS・明示 Tx・台帳・上限・fail-closed・EXPLAIN）・`dml_join_exec_tests.rs`（バケット内の偽の行の飛ばし・比較回数／ペア数上限）・`dml_plan_tests.rs`・`allowlist.rs` の単体テスト・`wire_sql53_dml_from_using.rs`（末尾 `;` のタグ）
+
 ## テスト
 
 - Issue #3292 の追加テスト: `sql53_dml_from_using_view.rs`（sql_t40_up）・`table44_temp_table_dml_from.rs`（table_rls）
@@ -159,6 +173,17 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - `crates/engine/src/core/dml_join_exec_tests.rs`: 実行器の単体テスト（走査位置 `matches` の固定を含む）
 - `crates/wire-server/tests/wire_sql/wire_sql53_dml_from_using.rs`: 末尾 `;` 付き単独送信・タグ・op id
 - `allowlist.rs`・`relation_name.rs` の単体テスト
+
+## 別名つき単一表 DML（Issue #3291）
+
+`UPDATE t [AS] x SET ... WHERE x.a = 1 RETURNING x.*`・`DELETE FROM t [AS] x WHERE x.a = 1`（FROM／USING なし）を受理する（SQL-53・RLS-10・RECOVER-10/11 のポインタ）。
+
+- 方式: 構文解析より前に、別名なしの同じ文のトークン列へ書き換える（実体 `sql::dml_target_alias`。呼び出しは `EngineCore::normalize_row_count_clauses`。冪等）。別名トークンを除き、`<別名>.<列>` を `<列>` へ 1 対 1 で置換する。以降の経路（構文解析・名前解決・一時表の振り分け・`$n` の型推論・ビュー DML・台帳ハッシュ・RLS・分割実行）は既存の別名なし文と同一で、`parse_update`／`parse_delete` は変えない
+- 解析器を変えず入口で正規化する理由: `$n` の位置・search_path 再解決の位置・ビューの WHERE 末尾など、トークン列の索引に依存する構造が複数あり、生トークンと書き換え後トークンの索引がずれる経路を作らないため。別名つき文と別名なし文は同じ AST・同じ content_hash になり、台帳の再送冪等は別名の有無を問わず同じ操作として扱われる（別の文への再利用は従来どおり `22023`）
+- 照合規則は FROM／USING 形と同じ `TableRef::matches_qualifier`。別名を付けた表を本名・他表名で修飾すると `42P01`（カタログを引かないため存在のオラクルにならない）
+- 受理しない（従来どおり `42601`。副作用なし）: SET 左辺の修飾（`SET x.a = ...`・`SET (x.a, x.b) = ...`）、予約語の別名、別名の直後が想定外のトークン、`x.null`・構文語と衝突する名前・WHERE の述語葉以外の `x.true`、RETURNING の項目位置以外の `x.*`
+- 正規化しない経路（`42601` のまま）: `EXPLAIN`（分割実行 DML の別名形を含む。実行と `EXPLAIN ... PARTITIONED` でこの差が出る）、データ変更 CTE の本文、PL/pgSQL・埋め込み単位（`colref_sink` の記録区間では何もしない）、非セッション入口（`validate_update` 等）、サブクエリ括弧の中の外側の別名・本名への修飾相関（別名なし文の `t.c` と同じ fail-closed）
+- 別名なしの経路はバイト不変（別名なし文の本名修飾 `WHERE t.a = 1` は従来どおり `42601`）
 
 ## EXPLAIN（Issue #3293）
 

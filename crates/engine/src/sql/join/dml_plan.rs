@@ -42,9 +42,10 @@ use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
 
 use super::dml::{
     EquiKey, FoldedSource, JoinedCopyItem, JoinedDmlPlan, JoinedDmlSource, JoinedDmlTarget,
-    JoinedSetItem, JoinedUpdateSet,
+    JoinedResidual, JoinedSetItem, JoinedUpdateSet,
 };
-use super::plan::{collect_leaf_colrefs, flatten_conjuncts, slot_name, to_where_predicates};
+use super::dml_residual::{convert, plan_residual};
+use super::plan::{collect_leaf_colrefs, flatten_conjuncts, slot_name};
 use super::using::JoinScope;
 use super::values::{cell_scalar_supports, cmp_class, key_class};
 use super::JoinLimits;
@@ -67,6 +68,8 @@ struct Split {
     /// 畳み込み source の述語（修飾済みの論理木。合成 JOIN 文の `WHERE` へ渡す）。
     source_join: Vec<JoinWhereExpr>,
     keys: Vec<EquiKey>,
+    /// 対象と単一表 source をまたぐ残余（Issue #3295。畳み込み source では拒否する）。
+    residual: Option<JoinedResidual>,
 }
 
 /// source 側の列を、`JoinedDmlSource` の添字系列（`columns`・`EquiKey::source_column`）へ写像する。
@@ -129,14 +132,6 @@ impl SourceMap {
     }
 }
 
-/// 部分木に列同士の比較が含まれるか。
-fn contains_column_compare(expr: &JoinWhereExpr) -> bool {
-    match expr {
-        JoinWhereExpr::Leaf(p) => matches!(p, JoinWherePredicate::ColumnCompare { .. }),
-        JoinWhereExpr::And(ch) | JoinWhereExpr::Or(ch) => ch.iter().any(contains_column_compare),
-    }
-}
-
 /// 部分木が参照する relation（対象側を含むか・source 側を含むか）。
 fn relation_set(
     expr: &JoinWhereExpr,
@@ -167,7 +162,8 @@ fn check_key_side(schema: &TableSchema, slot: ColumnSlot) -> Result<(), SqlSurfa
 }
 
 /// 対象表と source の列の等値を [`EquiKey`] にする（向きは対象側 `target_column`・source 側
-/// `source_column` に正規化）。型クラスが比較できなければ `42804`、キー化できなければ `0A000`。
+/// `source_column` に正規化）。型クラスが比較できなければ `42804`。キー化できない型・非バイト列順の
+/// 照合は `None`（残余として通常の WHERE と同じ評価へ回す。Issue #3295）。
 /// `source_schemas` は FROM／USING 側の実表スキーマ（宣言順）。
 fn equi_key(
     lhs: &ResolvedColumn,
@@ -175,7 +171,7 @@ fn equi_key(
     target_schema: &TableSchema,
     source_schemas: &[&TableSchema],
     map: &mut SourceMap,
-) -> Result<EquiKey, SqlSurfaceError> {
+) -> Result<Option<EquiKey>, SqlSurfaceError> {
     let (t, s) = match (lhs.relation() == 0, rhs.relation() == 0) {
         (true, false) => (lhs, rhs),
         (false, true) => (rhs, lhs),
@@ -188,36 +184,33 @@ fn equi_key(
                 "JOIN key columns have incompatible types",
             ))
         }
-        _ => {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "this column type cannot be used as a JOIN key",
-            ))
-        }
+        _ => return Ok(None),
     }
-    let unkeyable =
-        |_| SqlSurfaceError::feature_not_supported("this column type cannot be used as a JOIN key");
-    let tc = key_class(t.column_type()).map_err(unkeyable)?;
-    let sc = key_class(s.column_type()).map_err(unkeyable)?;
+    let (Ok(tc), Ok(sc)) = (key_class(t.column_type()), key_class(s.column_type())) else {
+        return Ok(None);
+    };
     if tc != sc {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "this column type cannot be used as a JOIN key",
-        ));
+        return Ok(None);
     }
-    check_key_side(target_schema, t.slot())?;
+    if check_key_side(target_schema, t.slot()).is_err() {
+        return Ok(None);
+    }
     let source_schema = s
         .relation()
         .checked_sub(1)
         .and_then(|r| source_schemas.get(r))
         .ok_or_else(|| internal("source relation index out of range"))?;
-    check_key_side(source_schema, s.slot())?;
+    if check_key_side(source_schema, s.slot()).is_err() {
+        return Ok(None);
+    }
     let target_column = match t.slot() {
         ColumnSlot::Id => None,
         ColumnSlot::Column(i) => Some(i),
     };
-    Ok(EquiKey {
+    Ok(Some(EquiKey {
         target_column,
         source_column: map.column(s.relation(), s.slot())?,
-    })
+    }))
 }
 
 /// 解決済みの列参照を、公開名で修飾した列参照へ書き換える（畳み込み source の合成 JOIN 文は
@@ -294,6 +287,17 @@ fn qualify_expr(
                     rhs: q(rhs)?,
                 }
             }
+            JoinWherePredicate::NumericCompare { column, op, value } => {
+                JoinWherePredicate::NumericCompare {
+                    column: q(column)?,
+                    op: *op,
+                    value: value.clone(),
+                }
+            }
+            JoinWherePredicate::IsNull { column, negated } => JoinWherePredicate::IsNull {
+                column: q(column)?,
+                negated: *negated,
+            },
         }),
     })
 }
@@ -307,6 +311,7 @@ fn split_where(
     other_schemas: &[&TableSchema],
     map: &mut SourceMap,
     other_visible: &[Option<Vec<String>>],
+    udfs: &UdfRegistry,
 ) -> Result<Split, SqlSurfaceError> {
     let (Some(target_ref), others) = (relations.first(), relations.get(1..).unwrap_or(&[])) else {
         return Err(internal("DML join without a target relation"));
@@ -319,6 +324,7 @@ fn split_where(
         source: Vec::new(),
         source_join: Vec::new(),
         keys: Vec::new(),
+        residual: None,
     };
     let Some(where_clause) = where_clause else {
         return Ok(split);
@@ -337,45 +343,53 @@ fn split_where(
     schemas.push(target_schema);
     schemas.extend(other_schemas.iter().copied());
     let unsupported = || SqlSurfaceError::feature_not_supported(UNSUPPORTED_WHERE);
+    let mut residual: Vec<&JoinWhereExpr> = Vec::new();
+    // 単一 relation で完結する部分木の列名解決（解決済みの relation 添字で行う）。
+    let mut name_of = |r: &ColumnRef| -> Result<String, SqlSurfaceError> {
+        let resolved = scope.resolve(r)?;
+        let schema = schemas
+            .get(resolved.relation())
+            .ok_or_else(|| internal("relation index out of range in DML join WHERE"))?;
+        slot_name(resolved.slot(), schema)
+    };
     for c in conjuncts {
+        // 判定は解決済みの relation 添字だけで行い、全域にする（取りこぼしは書き込み範囲を広げる）。
         match relation_set(c, &scope)? {
-            (true, false) => {
-                if contains_column_compare(c) {
-                    return Err(unsupported());
-                }
-                split
-                    .target
-                    .extend(to_where_predicates(c, &scope, &schemas)?);
-            }
+            (true, false) => split.target.extend(convert(c, &mut name_of)?),
             (false, true) if map.is_folded() => {
                 split
                     .source_join
                     .push(qualify_expr(c, &scope, relations, &schemas)?);
             }
-            (false, true) => {
-                if contains_column_compare(c) {
-                    return Err(unsupported());
-                }
-                split
-                    .source
-                    .extend(to_where_predicates(c, &scope, &schemas)?);
-            }
+            (false, true) => split.source.extend(convert(c, &mut name_of)?),
             (true, true) => {
-                // 対象表と source をまたぐ述語は、列同士の等値（結合キー）だけを受理する。
-                let JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare { lhs, op, rhs }) = c
-                else {
-                    return Err(unsupported());
-                };
-                if *op != BinOp::Eq {
-                    return Err(unsupported());
+                // 列同士の等値は結合キー。キー化できない型・等値以外・`OR` などは残余（Issue #3295）。
+                if let JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare { lhs, op, rhs }) = c {
+                    if *op == BinOp::Eq {
+                        let (l, r) = (scope.resolve(lhs)?, scope.resolve(rhs)?);
+                        if let Some(k) = equi_key(&l, &r, target_schema, other_schemas, map)? {
+                            split.keys.push(k);
+                            continue;
+                        }
+                    }
                 }
-                let (l, r) = (scope.resolve(lhs)?, scope.resolve(rhs)?);
-                split
-                    .keys
-                    .push(equi_key(&l, &r, target_schema, other_schemas, map)?);
+                residual.push(c);
             }
             (false, false) => return Err(unsupported()),
         }
+    }
+    if !residual.is_empty() {
+        // 残余は単一表 source 専用（畳み込み source は対象行 × 畳み込み行の評価ビューを持たない）。
+        let ([source_schema], false) = (other_schemas, map.is_folded()) else {
+            return Err(unsupported());
+        };
+        split.residual = Some(plan_residual(
+            &residual,
+            &scope,
+            target_schema,
+            source_schema,
+            udfs,
+        )?);
     }
     Ok(split)
 }
@@ -781,6 +795,7 @@ fn plan_joined(
         other_schemas,
         &mut map,
         input.source_visible,
+        udfs,
     )?;
     let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
     let (update, columns) = match input.update {
@@ -840,6 +855,7 @@ fn plan_joined(
         target,
         source,
         keys: split.keys,
+        residual: split.residual,
         update,
         returning: None,
     };

@@ -57,6 +57,7 @@ mod aggregate;
 pub(crate) mod dml;
 // 束縛済み `UPDATE ... FROM`／`DELETE ... USING` から `JoinedDmlPlan` への変換（Issue #3201・SQL-53 (b)）。
 pub(crate) mod dml_plan;
+mod dml_residual;
 mod exec;
 mod explain;
 mod nlj;
@@ -1590,11 +1591,25 @@ mod tests {
             JoinWherePredicate::ColumnCompare {
                 lhs: column.clone(),
                 op: crate::sql::udf_call::BinOp::Lt,
-                rhs: column,
+                rhs: column.clone(),
+            },
+            // DML 専用の数値リテラル比較（Issue #3295）も strict。
+            JoinWherePredicate::NumericCompare {
+                column: column.clone(),
+                op: crate::sql::udf_call::BinOp::Gt,
+                value: "1".to_string(),
             },
         ];
         for pred in &preds {
             assert!(plan::is_null_rejecting(pred), "pred={pred:?}");
+        }
+        // `IS [NOT] NULL` は NULL（外部結合の補完行）に対して真になりうるため非 strict。
+        for negated in [false, true] {
+            let pred = JoinWherePredicate::IsNull {
+                column: column.clone(),
+                negated,
+            };
+            assert!(!plan::is_null_rejecting(&pred), "pred={pred:?}");
         }
     }
 

@@ -7324,7 +7324,10 @@ impl EngineCore {
     fn normalize_row_count_clauses(
         tokens: Vec<crate::sql::lexer::Token>,
     ) -> Result<Vec<crate::sql::lexer::Token>, crate::sql::allowlist::SqlSurfaceError> {
-        crate::sql::fetch_clause::normalize_statement_tokens(tokens)
+        let tokens = crate::sql::fetch_clause::normalize_statement_tokens(tokens)?;
+        // 別名つき単一表 `UPDATE`／`DELETE`（FROM／USING なし）を別名なしの同じ文へ書き換える
+        // （SQL-53・Issue #3291。実体は `sql::dml_target_alias`。冪等で、対象外の文は何も変えない）。
+        crate::sql::dml_target_alias::normalize(tokens)
     }
 
     /// [`Self::parse_tokens`] のテナント SCHEMA 解決つき版（`resolver` は ctx を持つ入口だけが渡す。

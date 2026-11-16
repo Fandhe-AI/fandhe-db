@@ -399,7 +399,10 @@ fn failed_statements_do_not_consume_the_operation_id() {
         code(run(
             &core,
             &alice,
-            &op("UPDATE t SET x = 1 FROM s WHERE t.x > s.v", "acc-b")
+            &op(
+                "UPDATE t SET x = 1 FROM s WHERE t.k = s.k AND t.x < s.embedding",
+                "acc-b"
+            )
         )),
         "0A000"
     );
@@ -675,13 +678,14 @@ fn unsupported_forms_fail_closed_without_side_effects() {
     let before_a = rows_t(&core, &alice);
     let before_b = rows_t(&core, &bob);
     for (sql, want) in [
-        ("UPDATE t SET x = 1 FROM s WHERE t.x > s.v", "0A000"),
+        // 非等値・OR をまたぐ述語は Issue #3295 で受理する（`sql53_dml_from_using_residual.rs`）。
+        // 残余が VECTOR 列を参照する形は引き続き fail-closed。
         (
-            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k OR t.x = s.v",
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k AND t.x < s.embedding",
             "0A000",
         ),
         (
-            "DELETE FROM t USING s WHERE t.k = s.k OR t.x = s.v",
+            "DELETE FROM t USING s WHERE t.k = s.k OR s.embedding = t.x",
             "0A000",
         ),
         (
