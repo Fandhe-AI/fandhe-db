@@ -148,6 +148,7 @@ fn split_where(
     where_clause: Option<&JoinWhereExpr>,
     target_schema: &TableSchema,
     other_schemas: &[&TableSchema],
+    other_visible: &[Option<Vec<String>>],
 ) -> Result<Split, SqlSurfaceError> {
     let (Some(target_ref), [source_ref]) = (relations.first(), relations.get(1..).unwrap_or(&[]))
     else {
@@ -164,6 +165,7 @@ fn split_where(
         target_schema,
         std::slice::from_ref(source_ref),
         &[*source_schema],
+        other_visible,
     )?);
 
     let mut conjuncts: Vec<&JoinWhereExpr> = Vec::new();
@@ -461,6 +463,7 @@ pub(crate) fn plan_update_from(
         bound.where_clause(),
         target_schema,
         from_schemas,
+        bound.source_visible(),
     )?;
     let ([target_ref, source_ref], [source_schema]) = (bound.relations(), from_schemas) else {
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));
@@ -501,6 +504,7 @@ pub(crate) fn plan_delete_using(
         bound.where_clause(),
         target_schema,
         using_schemas,
+        bound.source_visible(),
     )?;
     let ([target_ref, source_ref], [source_schema]) = (bound.relations(), using_schemas) else {
         return Err(SqlSurfaceError::feature_not_supported(MULTI_FROM));

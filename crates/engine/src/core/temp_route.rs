@@ -292,8 +292,10 @@ fn is_routable(parsed: &ParsedSql) -> bool {
         ParsedSql::ExplainVerbose(_) => false,
         // Issue #2055: 一時表への DML の ANALYZE は対象外（振り分けず永続側の拒否に倒す）。
         ParsedSql::ExplainAnalyzeDml(_) => false,
-        // SQL-53 (b)・Issue #1754: 一時表が関与する FROM／USING 形は一時コアの結合実行に未対応（`0A000`）。
-        ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => false,
+        // SQL-53 (b)・Issue #3292: 一時表だけの FROM／USING 形（target・source とも一時表）は一時コアが
+        // 自分の一時 DB の上で結合 DML を実行する。`operation_id` つきは冒頭の判定で `false`（台帳は一時表の
+        // 対象外のため黙って捨てず拒否する）。永続表・ビューと混在する形は混在判定で `0A000` のまま。
+        ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => true,
         _ => false,
     }
 }
@@ -1585,6 +1587,12 @@ impl EngineCore {
                         self.execute_predicate_update_form(target, ctx, session, stmt)?,
                     ))
                 }
+            }
+            // Issue #3292: 一時表だけの結合 DML。一時コアが自分の一時 DB で計画し、同じ gated txn で実行する
+            // （一時コアは台帳なし。総バイト数の上限は呼び出し元の `enforce_budget` が判定する）。
+            ParsedSql::UpdateFrom(stmt) => self.execute_update_from_on(target, ctx, session, stmt),
+            ParsedSql::DeleteUsing(stmt) => {
+                self.execute_delete_using_on(target, ctx, session, stmt)
             }
             ParsedSql::Truncate(stmt) => {
                 // SQL-40・Issue #1968: CASCADE の連鎖後の最終集合を write txn 内で再判定する。
