@@ -87,9 +87,34 @@ impl EngineCore {
                 }
             }
             ParsedSql::ExplainDml(explain) => {
+                // 結合形（Issue #3293）の `output:` は Describe と同じ列（束縛済み RETURNING の列メタデータ）。
+                if let Some(joined_plan) = match explain {
+                    ExplainDml::UpdateFrom(v) => {
+                        Some(self.plan_update_from_stmt(v, session.udfs()))
+                    }
+                    ExplainDml::DeleteUsing(v) => {
+                        Some(self.plan_delete_using_stmt(v, session.udfs()))
+                    }
+                    _ => None,
+                } {
+                    let plan = joined_plan?;
+                    if let Some(bound) = &plan.returning {
+                        let columns = crate::sql::dml_from_returning::column_meta(bound);
+                        let names: Vec<&str> = columns
+                            .iter()
+                            .map(crate::sql::view_buffered::column_name)
+                            .collect();
+                        lines.extend(output_line(names)?);
+                    }
+                    return Ok(lines);
+                }
                 let (table, returning) = match explain {
                     ExplainDml::Delete(v) => (v.table_name(), v.returning()),
                     ExplainDml::Update(v) => (v.table_name(), v.returning()),
+                    // 上で処理済み（到達しない）。
+                    ExplainDml::UpdateFrom(_) | ExplainDml::DeleteUsing(_) => {
+                        return Err(internal())
+                    }
                 };
                 let schema = self.load_table_schema_for_dml(table)?;
                 if let Some(projection) = crate::sql::parser::bind_returning_with_udfs(
