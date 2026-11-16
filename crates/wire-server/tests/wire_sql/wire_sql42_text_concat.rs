@@ -101,6 +101,39 @@ fn limit_and_unsupported_pairs_fail_closed_and_keep_connection() {
     expect_one_text(&mut s, "SELECT 'a' || 'b';", "ab");
 }
 
+/// 拒否の SQLSTATE は被演算子の形・FROM の有無によらず型の組で決まる（Issue #3277）。
+#[test]
+fn rejected_pairs_use_consistent_sqlstates_and_keep_connection() {
+    let (mut s, _g) = connect();
+    for (sql, state) in [
+        ("SELECT 1 || 2;", "42883"),
+        ("SELECT n || n FROM t;", "42883"),
+    ] {
+        send_simple_query(&mut s, sql);
+        expect_error_response_with_sqlstate(&mut s, state);
+        read_ready_for_query(&mut s);
+    }
+    expect_one_text(&mut s, "SELECT 'a' || 'b';", "ab");
+}
+
+#[test]
+fn aggregate_list_may_start_with_a_string_literal_concat() {
+    let (mut s, _g) = connect();
+    send_simple_query(&mut s, "SELECT 'x' || lang, count(*) FROM t GROUP BY lang;");
+    let _ = read_row_description_with_types(&mut s);
+    let mut rows = vec![read_data_row(&mut s), read_data_row(&mut s)];
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![None, Some("1".to_string())],
+            vec![Some("xja".to_string()), Some("1".to_string())]
+        ]
+    );
+    assert_eq!(read_command_complete(&mut s), "SELECT 2");
+    assert_eq!(read_ready_for_query_status(&mut s), b'I');
+}
+
 #[test]
 fn extended_describe_advertises_text_result_type() {
     let (mut s, _g) = connect();
@@ -144,6 +177,28 @@ fn non_text_operand_concat_over_simple_query() {
     expect_error_response_with_sqlstate(&mut s, "0A000");
     read_ready_for_query(&mut s);
     expect_one_text(&mut s, "SELECT 'n=' || 5;", "n=5");
+}
+
+/// INSERT VALUES のリテラル直後の `||`（Issue #3278 の PR 指摘）。
+#[test]
+fn non_text_operand_concat_in_insert_values() {
+    let (mut s, _g) = connect();
+    send_simple_query(
+        &mut s,
+        "INSERT INTO t (id, embedding, lang, n) VALUES (7, '[0.1,0.1]', 'n=' || 5, 1) \
+         USING OPERATION_ID 'ins-3278-a'",
+    );
+    read_command_complete(&mut s);
+    read_ready_for_query(&mut s);
+    send_simple_query(
+        &mut s,
+        "INSERT INTO t (id, embedding, lang, n) VALUES (8, '[0.1,0.1]', 5 || 'x', 1) \
+         USING OPERATION_ID 'ins-3278-b'",
+    );
+    read_command_complete(&mut s);
+    read_ready_for_query(&mut s);
+    expect_one_text(&mut s, "SELECT lang || '' FROM t WHERE id = 7;", "n=5");
+    expect_one_text(&mut s, "SELECT lang || '' FROM t WHERE id = 8;", "5x");
 }
 
 #[test]

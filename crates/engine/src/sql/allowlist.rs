@@ -9138,14 +9138,17 @@ impl<'a> Parser<'a> {
     /// 現在位置が、集計 SELECT リストで式項目として読み始めてよい形かを返す（Issue #1811・
     /// SQL-42 ポインタ）。トリガー集合は通常投影の [`Self::parse_select_item`] に合わせる
     /// （数値・`(`〔スカラーサブクエリを除く〕・`-`・`CASE WHEN`・`ARRAY[`/`ARRAY(`・括弧なし値関数・
-    /// `ident (`・識別子の直後の演算子・文字列リテラルの直後の `::`）。集計呼び出しを含むかは
+    /// `ident (`・識別子の直後の演算子・文字列リテラルの直後の `::`／`||`〔Issue #3277〕）。集計呼び出しを含むかは
     /// 呼び出し側が [`select_range_contains_aggregate_call`] で別に確認する。
     fn aggregate_item_starts_expr(&self) -> bool {
         match self.peek() {
             Some(Token::Number(_)) | Some(Token::Punct('-')) => true,
             Some(Token::Punct('(')) => !self.peek_is_scalar_subquery_start(),
             Some(Token::StringLiteral(_)) => {
-                matches!(self.tokens.get(self.pos + 1), Some(Token::TypeCast))
+                matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::TypeCast | Token::Concat)
+                )
             }
             Some(Token::Ident(name)) => {
                 let next = self.tokens.get(self.pos + 1);
@@ -14575,9 +14578,10 @@ impl<'a> Parser<'a> {
         if !is_expr_start {
             let start = self.pos;
             let lit = self.expect_literal()?;
+            // `VALUES ('n=' || 5)` のようにリテラルへ `||` が続く形も式として読み直す（Issue #3278）。
             if !matches!(
                 self.peek(),
-                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast)
+                Some(Token::Punct('+' | '-' | '*' | '/' | '%') | Token::TypeCast | Token::Concat)
             ) && !self.peek_at_time_zone()
             {
                 return Ok(lit);

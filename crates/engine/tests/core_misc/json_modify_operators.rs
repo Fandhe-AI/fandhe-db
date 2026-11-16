@@ -367,6 +367,12 @@ fn type_errors_use_fixed_sqlstates() {
     assert_eq!(select_code(&core, &alice, "docb || lang"), "0A000");
     // jsonb と数値は演算子なし。リテラル同士も 42883。
     assert_eq!(select_code(&core, &alice, "docb || n"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || n"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || doc"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || docb"), "42883");
+    assert_eq!(select_code(&core, &alice, "docb || doc"), "42883");
+    // 反対側の束縛エラーが先に出る。
+    assert_eq!(select_code(&core, &alice, "doc || nope_col"), "42703");
     assert_eq!(
         code(
             &core,

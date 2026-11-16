@@ -118,6 +118,23 @@ fn setup() -> (EngineCore, PolicyContext, CleanupGuard) {
                     ),
                     true,
                 ),
+                ColumnDef::new("doc", ColumnType::Json, true),
+                ColumnDef::new(
+                    "ai",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Integer, engine::catalog::MAX_ARRAY_ELEMENTS)
+                            .expect("array type"),
+                    ),
+                    true,
+                ),
+                ColumnDef::new(
+                    "bv",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Bit(4), engine::catalog::MAX_ARRAY_ELEMENTS)
+                            .expect("bit array type"),
+                    ),
+                    true,
+                ),
             ],
         ))
         .expect("create table");
@@ -233,19 +250,15 @@ fn result_length_limit_rejected_with_54000() {
     assert_eq!(one(&r).map(|v| v.len()), Some(4_194_304));
 }
 
+/// 構文・名前解決の拒否（型の組の分類とは別段）。
 // intentional: docs/design/json-expr-type-mapping.md
-// tracked: #3277
 #[test]
-fn unsupported_pairs_stay_fail_closed() {
+fn syntax_and_name_errors_keep_their_codes() {
     let (core, ctx, _g) = setup();
     // jsonb と型付き text の組・自前の `||` を持つ型との組は曖昧なため拒否のまま（Issue #3278）。
     for sql in [
         "SELECT docb || lang FROM t",
         "SELECT lang || docb FROM t",
-        "SELECT bt || 'x' FROM t",
-        "SELECT 'x' || bt FROM t",
-        "SELECT arr || 'x' FROM t",
-        "SELECT lang || arr FROM t",
         "SELECT embedding || 'x' FROM t",
         // 種別を静的に決められない数値は CAST と同じく拒否。
         "SELECT 'x' || id FROM t",
@@ -253,12 +266,16 @@ fn unsupported_pairs_stay_fail_closed() {
     ] {
         assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
     }
-    // 非 text 同士の組は現行コードのまま（統一は #3277）。
-    assert_eq!(code(&core, &ctx, "SELECT n || n FROM t"), "0A000");
+    // PG に演算子が無い組は 42883（#3277）。
+    assert_eq!(code(&core, &ctx, "SELECT n || n FROM t"), "42883");
     assert_eq!(code(&core, &ctx, "SELECT lang || FROM t"), "42601");
     assert_eq!(code(&core, &ctx, "SELECT lang || nope_col FROM t"), "42703");
     // CAST が拒否する形と一致する。
     assert_eq!(code(&core, &ctx, "SELECT CAST(id AS text) FROM t"), "0A000");
+    // 反対側の束縛エラーは型の組の判定より先に出る（json 列が左でも `42703`）。
+    assert_eq!(code(&core, &ctx, "SELECT doc || nope_col FROM t"), "42703");
+    assert_eq!(code(&core, &ctx, "SELECT docb || nope_col FROM t"), "42703");
+    assert_eq!(code(&core, &ctx, "SELECT docb || '{' FROM t"), "22P02");
 }
 
 #[test]
@@ -361,6 +378,23 @@ fn non_text_concat_in_where_update_and_limit() {
 }
 
 #[test]
+fn non_text_concat_in_insert_values() {
+    let (core, ctx, _g) = setup();
+    // リテラルの直後の `||` も INSERT VALUES では式として読む（Issue #3278）。
+    run_opt(
+        &core,
+        &ctx,
+        "INSERT INTO t (id, embedding, lang, body, vc, ch, n, docb) VALUES \
+         (7, '[0.7,0.1]', 'n=' || 5, 5 || 'x', 'v7', 'c', 1, '{}') USING OPERATION_ID 'ins-3278'",
+    )
+    .unwrap_or_else(|e| panic!("insert should succeed: {e:?}"));
+    let r = run(&core, &ctx, "SELECT lang FROM t WHERE id = 7");
+    assert_eq!(texts(&r), vec![s("n=5")]);
+    let r = run(&core, &ctx, "SELECT body FROM t WHERE id = 7");
+    assert_eq!(texts(&r), vec![s("5x")]);
+}
+
+#[test]
 fn non_text_concat_respects_tenant_boundary() {
     let (core, ctx, _g) = setup();
     let r = run(&core, &ctx, "SELECT lang || n FROM t");
@@ -370,6 +404,201 @@ fn non_text_concat_respects_tenant_boundary() {
     }
     let r = run(&core, &ctx_for("t2"), "SELECT lang || n FROM t");
     assert_eq!(texts(&r), vec![s("secret1")]);
+}
+
+/// PG に演算子が無い組は、被演算子の形（リテラル・列・CAST・json 列の左右）・句の位置
+/// （FROM なし・通常投影・集計リスト・WHERE の式）によらず `42883` に揃う（Issue #3277）。
+#[test]
+fn pairs_without_an_operator_are_42883_in_every_shape() {
+    let (core, ctx, _g) = setup();
+    let wrap = |expr: &str| {
+        [
+            format!("SELECT {expr}"),
+            format!("SELECT {expr} FROM t"),
+            format!("SELECT {expr}, count(*) FROM t GROUP BY lang"),
+            format!("SELECT lang FROM t WHERE ({expr}) IS NOT NULL"),
+        ]
+    };
+    for expr in [
+        "1 || 2",
+        "CAST(1 AS int) || CAST(2 AS int)",
+        "CAST('{}' AS json) || CAST(1 AS int)",
+        "CAST('{}' AS jsonb) || CAST(1 AS int)",
+        "CAST('{}' AS jsonb) || CAST('{}' AS json)",
+        "CAST('{}' AS json) || CAST('{}' AS json)",
+    ] {
+        for sql in wrap(expr) {
+            assert_eq!(code(&core, &ctx, &sql), "42883", "{sql}");
+        }
+    }
+    for sql in [
+        "SELECT n || n FROM t",
+        "SELECT docb || n FROM t",
+        "SELECT docb || doc FROM t",
+        "SELECT doc || docb FROM t",
+        "SELECT doc || doc FROM t",
+        "SELECT doc || n FROM t",
+        "SELECT n || CAST('a' AS bytea) FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+}
+
+/// text と jsonb の組（曖昧な組）は、被演算子の形によらず `0A000`。text と変換できる非 text の組は
+/// 連結になる（Issue #3278）。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3278 での変更」の拒否する組の項を参照。
+#[test]
+fn text_with_jsonb_is_0a000_in_every_shape() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT docb || lang FROM t",
+        "SELECT lang || docb FROM t",
+        "SELECT docb || CAST('a' AS text) FROM t",
+        "SELECT lang FROM t WHERE (docb || lang) IS NOT NULL",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+}
+
+/// 配列・vector の `||` は PG／pgvector にあるが未実装のため `0A000`（fail-closed）。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列・bytea・vector・bit の行）を参照。
+#[test]
+fn array_and_vector_concat_stay_0a000() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT ARRAY[1] || '{2}'",
+        "SELECT ARRAY[1] || ARRAY[2]",
+        "SELECT 'x' || ARRAY[1]",
+        "SELECT ARRAY[1] || n FROM t",
+        "SELECT ARRAY['a'] || lang FROM t",
+        "SELECT embedding || embedding FROM t",
+        "SELECT embedding || lang FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+}
+
+/// 要素型が互換しない配列の `||` は PG に演算子が無く `42883`（解決できる組だけ `0A000`）。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列を含む組の行）を参照。
+#[test]
+fn incompatible_array_concat_is_42883() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT ARRAY[1] || ARRAY[CAST(1 AS boolean)]",
+        "SELECT ARRAY[CAST(1 AS boolean)] || ARRAY[1]",
+        "SELECT ARRAY[1] || CAST(1 AS boolean)",
+        "SELECT lang || ARRAY[1] FROM t",
+        "SELECT ARRAY[1] || lang FROM t",
+        "SELECT doc || ARRAY[1] FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+}
+
+/// 同じ要素型の json／jsonb／bytea 配列とスカラー、timestamp と timestamptz の配列連結は
+/// PG で成立するため `0A000`（未実装）。要素型が違う組は `42883`。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列を含む組の行）を参照。
+#[test]
+fn compatible_array_concat_of_special_scalars_is_0a000() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT ARRAY[CAST('{}' AS jsonb)] || CAST('{}' AS jsonb)",
+        "SELECT CAST('{}' AS jsonb) || ARRAY[CAST('{}' AS jsonb)]",
+        "SELECT ARRAY[CAST('a' AS bytea)] || CAST('a' AS bytea)",
+        "SELECT ARRAY[CAST('2024-01-01 00:00:00' AS timestamp)] || CAST('2024-01-01 00:00:00+00' AS timestamptz)",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+    for sql in [
+        "SELECT ARRAY[CAST('a' AS bytea)] || CAST('{}' AS jsonb)",
+        "SELECT ARRAY[1] || CAST('a' AS bytea)",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+}
+
+/// BIT スカラーと配列の `||` は、BIT 配列を要素型つきで区別して判定する（Issue #3277 の PR 指摘）。
+/// BIT 配列の値そのものは式の中で未解禁（`ARRAY[bit]` の構築・配列列の裸参照は fail-closed）のため、
+/// 現状で到達できる組（BIT スカラーと非 BIT 配列は `42883`）と、未解禁の BIT 配列の構築が `0A000` の
+/// ままであることを固定する。BIT 配列どうしの互換判定は `concat_array_pair_compatible` が担う。
+// intentional: docs/design/json-expr-type-mapping.md
+// 節「Issue #3277 での変更」の分類表（配列を含む組の行）を参照。
+#[test]
+fn bit_scalar_with_array_concat_sqlstate_is_consistent_across_operand_order() {
+    let (core, ctx, _g) = setup();
+    for sql in [
+        "SELECT bv[1] || ARRAY[1] FROM t",
+        "SELECT ARRAY[1] || bv[1] FROM t",
+        "SELECT bv[1] || ARRAY['a'] FROM t",
+        "SELECT ARRAY['a'] || bv[1] FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "42883", "{sql}");
+    }
+    for sql in [
+        "SELECT ARRAY[bv[1]] || ARRAY[1] FROM t",
+        "SELECT bv[1] || ARRAY[bv[1]] FROM t",
+        "SELECT ARRAY[bv[1]] || bv[1] FROM t",
+    ] {
+        assert_eq!(code(&core, &ctx, sql), "0A000", "{sql}");
+    }
+}
+
+/// 拒否の SQLSTATE と文言は静的な型だけで決まり、他テナントの行の有無で変わらない。
+#[test]
+fn rejection_does_not_depend_on_other_tenants_rows() {
+    let (core, ctx, _g) = setup();
+    let err = |ctx: &PolicyContext, sql: &str| match run_opt(&core, ctx, sql) {
+        Ok(o) => panic!("{sql:?} should be rejected, got {o:?}"),
+        Err(e) => (e.wire_code().to_string(), format!("{e:?}")),
+    };
+    // t3 は行を持たない（空の表）。t1・t2 は行を持つ。
+    for sql in [
+        "SELECT lang || docb FROM t",
+        "SELECT n || n FROM t",
+        "SELECT doc || n FROM t",
+    ] {
+        let base = err(&ctx, sql);
+        assert_eq!(err(&ctx_for("t2"), sql), base, "{sql}");
+        assert_eq!(err(&ctx_for("t3"), sql), base, "{sql}");
+        assert!(!base.1.contains("secret"), "{sql}: {}", base.1);
+    }
+}
+
+/// 集計 SELECT リストで文字列リテラルから始まる `||` も式として読める（Issue #3277）。
+#[test]
+fn aggregate_list_item_may_start_with_a_string_literal_concat() {
+    let (core, ctx, _g) = setup();
+    let r = run(
+        &core,
+        &ctx,
+        "SELECT 'x' || lang, count(*) FROM t GROUP BY lang",
+    );
+    let mut got: Vec<Option<String>> = r
+        .rows
+        .iter()
+        .map(|row| match &row.cells[0] {
+            Cell::Text(s) => Some(s.clone()),
+            Cell::Null => None,
+            other => panic!("unexpected cell {other:?}"),
+        })
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![None, s("xen"), s("xja")]);
+    // 他テナントの値は出ない。
+    assert!(!got.iter().flatten().any(|v| v.contains("secret")));
+    // GROUP BY に無い列を使う形は従来どおり拒否される。
+    assert_eq!(
+        code(
+            &core,
+            &ctx,
+            "SELECT 'x' || body, count(*) FROM t GROUP BY lang"
+        ),
+        "42803"
+    );
 }
 
 #[test]
