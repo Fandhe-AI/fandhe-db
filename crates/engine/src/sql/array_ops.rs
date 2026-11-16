@@ -160,6 +160,7 @@ pub(crate) fn array_keys(a: &ArrayValue) -> Result<Vec<Option<Key<'_>>>, SqlSurf
         ArrayValue::Integer(v) => map(v, |i| Key::Int(i64::from(*i))),
         ArrayValue::SmallInt(v) => map(v, |i| Key::Int(i64::from(*i))),
         ArrayValue::Time(v) => map(v, |t| Key::Int(*t)),
+        ArrayValue::TimestampTz(v) => map(v, |t| Key::Int(*t)),
         ArrayValue::BigInt(v) => map(v, |i| Key::Int(*i)),
         ArrayValue::Real(v) => map(v, |x| Key::Float(f64::from(*x))),
         ArrayValue::Double(v) => map(v, |x| Key::Float(*x)),
@@ -275,6 +276,7 @@ fn comparable_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Timestamp
         | ArrayElemType::Time
         | ArrayElemType::Interval
+        | ArrayElemType::TimestampTz
         | ArrayElemType::Uuid
         | ArrayElemType::Bytea
         | ArrayElemType::Jsonb => true,
@@ -298,6 +300,7 @@ fn is_float_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::Timestamp
         | ArrayElemType::Time
         | ArrayElemType::Interval
+        | ArrayElemType::TimestampTz
         | ArrayElemType::Uuid
         | ArrayElemType::Numeric { .. }
         | ArrayElemType::Bytea
@@ -327,6 +330,7 @@ fn lhs_kinds_for(elem: ArrayElemType) -> &'static [CastKind] {
         ArrayElemType::Timestamp => &[K::Timestamp],
         ArrayElemType::Time => &[K::Time],
         ArrayElemType::Interval => &[K::Interval],
+        ArrayElemType::TimestampTz => &[K::TimestampTz],
         ArrayElemType::Uuid => &[K::Uuid],
         ArrayElemType::Bytea => &[K::Bytea],
         ArrayElemType::Jsonb => &[K::Jsonb],
@@ -608,6 +612,7 @@ fn lhs_elem_cast_type(kind: CastKind) -> Result<CastType, SqlSurfaceError> {
         CastKind::Timestamp => CastType::Timestamp,
         CastKind::Time => CastType::Time,
         CastKind::Interval => CastType::Interval,
+        CastKind::TimestampTz => CastType::TimestampTz,
         CastKind::Uuid => CastType::Uuid,
         CastKind::Bytea => CastType::Bytea,
         CastKind::Jsonb => CastType::Jsonb,
@@ -720,6 +725,7 @@ fn bind_quantified_like(
             | ArrayElemType::Timestamp
             | ArrayElemType::Time
             | ArrayElemType::Interval
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Uuid
             | ArrayElemType::Numeric { .. }
             | ArrayElemType::Bytea
@@ -887,6 +893,7 @@ fn value_key<'v>(v: &'v ExprValue<'_>) -> Result<Option<Key<'v>>, SqlSurfaceErro
         ExprValue::Timestamp(t) => Key::Int(*t),
         ExprValue::Time(t) => Key::Int(*t),
         ExprValue::Interval(v) => Key::Interval(crate::datetime::interval_cmp_key(v)),
+        ExprValue::TimestampTz(t) => Key::Int(*t),
         ExprValue::Uuid(u) => Key::Uuid(*u),
         ExprValue::Bytes(b) => Key::Bytes(b.as_ref()),
         ExprValue::Json(s) => json_key(s.as_ref())?,
@@ -1175,6 +1182,7 @@ mod tests {
                 E::Timestamp => &[K::Timestamp],
                 E::Time => &[K::Time],
                 E::Interval => &[K::Interval],
+                E::TimestampTz => &[K::TimestampTz],
                 E::Uuid => &[K::Uuid],
                 E::Bytea => &[K::Bytea],
                 E::Jsonb => &[K::Jsonb],

@@ -105,6 +105,7 @@ fn array_elem_label(elem: &ArrayElemType) -> &'static str {
         ArrayElemType::Time => "time",
         ArrayElemType::Bit(_) => "bit",
         ArrayElemType::Interval => "interval",
+        ArrayElemType::TimestampTz => "timestamptz",
     }
 }
 
@@ -322,6 +323,7 @@ fn all_column_type_variants_are_covered_by_case_table() {
         ArrayElemType::Enum,
         ArrayElemType::SmallInt,
         ArrayElemType::Time,
+        ArrayElemType::TimestampTz,
     ]
     .iter()
     .map(array_elem_label)
@@ -344,7 +346,8 @@ fn all_column_type_variants_are_covered_by_case_table() {
             "jsonb",
             "enum",
             "smallint",
-            "time"
+            "time",
+            "timestamptz"
         ])
     );
 }
@@ -1586,6 +1589,10 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ]),
         ),
         (
+            ArrayElemType::TimestampTz,
+            ArrayValue::TimestampTz(vec![Some(0), None, Some(1_700_000_000_000_000), Some(-1)]),
+        ),
+        (
             ArrayElemType::BigInt,
             ArrayValue::BigInt(vec![None, Some(i64::MIN), Some(i64::MAX)]),
         ),
@@ -1638,6 +1645,7 @@ fn array_new_elem_types_roundtrip_with_and_without_null_elements() {
             ArrayValue::Time(_) => ArrayValue::Time(vec![]),
             ArrayValue::Bit(_) => ArrayValue::Bit(vec![]),
             ArrayValue::Interval(_) => ArrayValue::Interval(vec![]),
+            ArrayValue::TimestampTz(_) => ArrayValue::TimestampTz(vec![]),
             ArrayValue::BigInt(_) => ArrayValue::BigInt(vec![]),
             ArrayValue::Real(_) => ArrayValue::Real(vec![]),
             ArrayValue::Double(_) => ArrayValue::Double(vec![]),

@@ -2359,7 +2359,7 @@ pub(crate) fn canonical_numeric_parts(d: crate::numeric::Decimal) -> (i128, u8) 
 /// 配列要素型の一意キー用固定タグ。[`crate::catalog::ArrayElemType`] のカタログ
 /// 表現とは独立に採番してよいが、Issue #1070 以降この値は `user_uniq` 索引の
 /// キーの一部として**永続化される**ため、既存タグの意味は変えず、新しい要素型には
-/// 未使用の値を新規に採番する（Issue #1357 で 9〜13、Issue #3230 で 14、Issue #3232 で 15、Issue #3235 で 18 を追加）。値は
+/// 未使用の値を新規に採番する（Issue #1357 で 9〜13、Issue #3230 で 14、Issue #3232 で 15、Issue #3233 で 16、Issue #3235 で 18 を追加）。値は
 /// [`ARRAY_KEY_NULL_MARK`]（0x80）未満に保つ（NULL 要素マーカーとの衝突防止）。
 fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
     match elem {
@@ -2387,6 +2387,7 @@ fn array_elem_tag(elem: crate::catalog::ArrayElemType) -> u8 {
         crate::catalog::ArrayElemType::Bit(_) => 18,
         // Issue #3234 の新規採番（INTERVAL）。
         crate::catalog::ArrayElemType::Interval => 17,
+        crate::catalog::ArrayElemType::TimestampTz => 16,
     }
 }
 
@@ -5166,6 +5167,8 @@ mod tests {
             (E::Bit(4), 18),
             // Issue #3234 の新規採番（既存値は振り直さない）。
             (E::Interval, 17),
+            // Issue #3233 の新規採番（既存値は振り直さない）。
+            (E::TimestampTz, 16),
         ];
         // 全要素型を網羅していること（要素型の追加時に永続タグの決定を強制する。Issue #3229）。
         assert_eq!(elems.len(), E::ALL_KINDS.len());

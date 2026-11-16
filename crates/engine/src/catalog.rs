@@ -7236,6 +7236,9 @@ pub enum ArrayElemType {
     /// のフィールド順）。OID は別（`_interval` = 1187）なので他型へは丸めない。等価・比較は
     /// スカラー INTERVAL と同じ正規化キー（1 か月 = 30 日）で行うが、行バイトは生の三要素を保つ。
     Interval,
+    /// `TIMESTAMPTZ`（Issue #3233）。行内表現は UTC 起点のマイクロ秒 8 バイト LE（`Timestamp`・
+    /// `Time` と同形）。OID は別（`_timestamptz` = 1185）なので他の要素型へは丸めない。
+    TimestampTz,
 }
 
 impl ArrayElemType {
@@ -7243,7 +7246,7 @@ impl ArrayElemType {
     /// 往復・凍結テスト（engine／wire-server）が全種別を走査する唯一の入口。
     /// 要素型を足すときは [`ArrayElemType::kind_ordinal`] の網羅 match（コンパイルエラーで
     /// 気づける）と本定数の両方へ追加する。`Numeric` の代表値は検証を通る精度・位取り。
-    pub const ALL_KINDS: [ArrayElemType; 20] = [
+    pub const ALL_KINDS: [ArrayElemType; 21] = [
         ArrayElemType::Text,
         ArrayElemType::Bool,
         ArrayElemType::Integer,
@@ -7267,6 +7270,7 @@ impl ArrayElemType {
         ArrayElemType::Time,
         ArrayElemType::Bit(4),
         ArrayElemType::Interval,
+        ArrayElemType::TimestampTz,
     ];
 
     /// 種別の序数（[`ArrayElemType::ALL_KINDS`] の添字）。ワイルドカード無しの網羅 match の
@@ -7295,6 +7299,7 @@ impl ArrayElemType {
             ArrayElemType::Time => 17,
             ArrayElemType::Bit(_) => 18,
             ArrayElemType::Interval => 19,
+            ArrayElemType::TimestampTz => 20,
         }
     }
 
@@ -7325,6 +7330,7 @@ impl ArrayElemType {
             ArrayElemType::SmallInt => "smallint",
             ArrayElemType::Time => "time",
             ArrayElemType::Interval => "interval",
+            ArrayElemType::TimestampTz => "timestamptz",
         }
     }
 
@@ -7340,6 +7346,7 @@ impl ArrayElemType {
             "smallint" => Ok(ArrayElemType::SmallInt),
             "time" => Ok(ArrayElemType::Time),
             "interval" => Ok(ArrayElemType::Interval),
+            "timestamptz" => Ok(ArrayElemType::TimestampTz),
             "real" => Ok(ArrayElemType::Real),
             "double" => Ok(ArrayElemType::Double),
             "date" => Ok(ArrayElemType::Date),
@@ -7422,7 +7429,8 @@ impl ArrayType {
             | ArrayElemType::Jsonb
             | ArrayElemType::SmallInt
             | ArrayElemType::Time
-            | ArrayElemType::Interval => {}
+            | ArrayElemType::Interval
+            | ArrayElemType::TimestampTz => {}
         }
         Ok(Self {
             elem,
@@ -7528,7 +7536,8 @@ impl ArrayType {
                 | ArrayElemType::Varchar(None)
                 | ArrayElemType::SmallInt
                 | ArrayElemType::Time
-                | ArrayElemType::Interval,
+                | ArrayElemType::Interval
+                | ArrayElemType::TimestampTz,
                 _,
             ) => format!("{},{}", self.elem.catalog_tag(), self.max_len),
         };
@@ -8246,6 +8255,7 @@ fn is_text_framed_array_elem(elem: ArrayElemType) -> bool {
         | ArrayElemType::SmallInt
         | ArrayElemType::Time
         | ArrayElemType::Interval
+        | ArrayElemType::TimestampTz
         | ArrayElemType::Bit(_) => false,
     }
 }
@@ -21046,6 +21056,7 @@ mod tests {
             (ArrayElemType::SmallInt, "smallint"),
             (ArrayElemType::Time, "time"),
             (ArrayElemType::Interval, "interval"),
+            (ArrayElemType::TimestampTz, "timestamptz"),
             (ArrayElemType::Real, "real"),
             (ArrayElemType::Double, "double"),
             (ArrayElemType::Date, "date"),
@@ -21324,6 +21335,36 @@ mod tests {
         assert_eq!(array_param_enum_name("bit,4,8").ok(), Some(None));
         assert!(ArrayType::new(ArrayElemType::Bit(0), 8).is_err());
         assert!(ArrayType::new(ArrayElemType::Bit(beyond), 8).is_err());
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` の param は `timestamptz,<max_len>`（2 次元は末尾 `d2`）で
+    /// 往復し、既存の `timestamp` の param を変えない。
+    #[test]
+    fn timestamptz_array_param_roundtrips_and_leaves_timestamp_param_unchanged() {
+        let one =
+            ColumnType::Array(ArrayType::new(ArrayElemType::TimestampTz, 4).expect("array ty"));
+        assert_eq!(one.catalog_fields(), ("array", "timestamptz,4".to_string()));
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4", &mut array_resolver)
+                .expect("decode"),
+            one
+        );
+        let two = ColumnType::Array(
+            ArrayType::new(ArrayElemType::TimestampTz, 4)
+                .and_then(|a| a.with_ndims(2))
+                .expect("array ty"),
+        );
+        assert_eq!(
+            two.catalog_fields(),
+            ("array", "timestamptz,4,d2".to_string())
+        );
+        assert_eq!(
+            ColumnType::from_catalog_fields("array", "timestamptz,4,d2", &mut array_resolver)
+                .expect("decode 2d"),
+            two
+        );
+        let ts = ColumnType::Array(ArrayType::new(ArrayElemType::Timestamp, 4).expect("array ty"));
+        assert_eq!(ts.catalog_fields(), ("array", "timestamp,4".to_string()));
     }
 
     /// Issue #1605: 2 次元以上の宣言は param 末尾の `d<N>` で往復し、1 次元の param は従来の

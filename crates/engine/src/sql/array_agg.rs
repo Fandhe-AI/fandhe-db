@@ -96,6 +96,8 @@ enum Elem {
     Time(i64),
     /// `INTERVAL`（Issue #3234）。生の三要素を保ち、`DISTINCT` の鍵だけ正規化キーにする。
     Interval(crate::datetime::Interval),
+    /// `TIMESTAMPTZ`（Issue #3233）。UTC 起点のマイクロ秒。
+    TimestampTz(i64),
     Uuid(Uuid),
     Numeric(Decimal),
     Bytea(Vec<u8>),
@@ -134,7 +136,7 @@ impl Elem {
             Elem::Bool(b) => out.push(u8::from(*b)),
             Elem::Integer(v) | Elem::Date(v) => out.extend_from_slice(&v.to_be_bytes()),
             Elem::SmallInt(v) => out.extend_from_slice(&v.to_be_bytes()),
-            Elem::BigInt(v) | Elem::Timestamp(v) | Elem::Time(v) => {
+            Elem::BigInt(v) | Elem::Timestamp(v) | Elem::Time(v) | Elem::TimestampTz(v) => {
                 out.extend_from_slice(&v.to_be_bytes())
             }
             // スカラー INTERVAL と同じ正規化キー（`1 mon` と `30 days` は同じ鍵）。
@@ -431,6 +433,10 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
             Elem::Interval(v) => Some(v),
             _ => None,
         })?),
+        ArrayElemType::TimestampTz => ArrayValue::TimestampTz(collect(elems, |e| match e {
+            Elem::TimestampTz(v) => Some(v),
+            _ => None,
+        })?),
         ArrayElemType::Timestamp => ArrayValue::Timestamp(collect(elems, |e| match e {
             Elem::Timestamp(v) => Some(v),
             _ => None,
@@ -543,6 +549,7 @@ fn elem_from_scalar(
         (ArrayElemType::Timestamp, S::Timestamp(x)) => Elem::Timestamp(*x),
         (ArrayElemType::Time, S::Time(x)) => Elem::Time(*x),
         (ArrayElemType::Interval, S::Interval(x)) => Elem::Interval(*x),
+        (ArrayElemType::TimestampTz, S::TimestampTz(x)) => Elem::TimestampTz(*x),
         (ArrayElemType::Uuid, S::Uuid(u)) => Elem::Uuid(*u),
         (ArrayElemType::Numeric { .. }, S::Numeric(d)) => Elem::Numeric(*d),
         (ArrayElemType::Bytea, S::Bytes(b)) => Elem::Bytea(try_clone_bytes(b)?),
@@ -570,6 +577,7 @@ fn elem_from_scalar(
             | ArrayElemType::Time
             | ArrayElemType::Interval
             | ArrayElemType::Bit(_)
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),
@@ -612,6 +620,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
         (ArrayElemType::Timestamp, ExprValue::Timestamp(t)) => Elem::Timestamp(t),
         (ArrayElemType::Time, ExprValue::Time(t)) => Elem::Time(t),
         (ArrayElemType::Interval, ExprValue::Interval(v)) => Elem::Interval(v),
+        (ArrayElemType::TimestampTz, ExprValue::TimestampTz(t)) => Elem::TimestampTz(t),
         (ArrayElemType::Uuid, ExprValue::Uuid(u)) => Elem::Uuid(u),
         (ArrayElemType::Numeric { .. }, ExprValue::Numeric(d)) => Elem::Numeric(d),
         (ArrayElemType::Bytea, ExprValue::Bytes(b)) => Elem::Bytea(try_clone_bytes(&b)?),
@@ -638,6 +647,7 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
             | ArrayElemType::Time
             | ArrayElemType::Interval
             | ArrayElemType::Bit(_)
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Enum,
             _,
         ) => return Err(mismatch()),

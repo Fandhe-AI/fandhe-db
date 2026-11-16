@@ -606,6 +606,45 @@ TABLE-35 の配列関数 8 種（`array_length`・`cardinality`・`array_append`
 - **据え置いた面（対象外）**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14）、`INTERVAL(p)[]`・フィールド制限付き配列、
   集合演算（スカラー INTERVAL の解禁に合わせる）。
 
+## Issue #3233 追記（`TIMESTAMPTZ[]` の受理）
+
+親 #3228・TABLE-14・TABLE-35・TABLE-33 のポインタ。#3232 と同じ手順で、`TIMESTAMPTZ[]`／`TIMESTAMPTZ[n]`／
+`TIMESTAMP WITH TIME ZONE[]` を専用の要素型 `ArrayElemType::TimestampTz` として受理した（別 OID の
+`_timestamptz`=1185 を公告するため `Timestamp` へは丸めない）。Issue #1574 で拒否していた形の反転。
+`TIME[]` との本質的な違いは、**テキスト出力がセッション TimeZone に依存する**こと。
+
+- **値表現**: `ArrayValue::TimestampTz(Vec<Option<i64>>)`。UTC 起点のマイクロ秒で、スカラー `Value::TimestampTz` と
+  同じ。範囲は `validate_timestamptz_micros` に従い、変換点（配列リテラル・CAST・`ARRAY[...]`・`array_agg`・NoSQL の
+  JSON 束縛）の範囲外は `22008`、書式不正は `22007`、未知の TZ 名は `22023`（スカラー `TIMESTAMPTZ` と同じ契約）。
+- **行内表現**: 固定幅 8 バイト LE（`Timestamp`・`Time` と同形）。encode・decode の両方で範囲を検証し、範囲外は
+  Invalid で fail-closed。
+- **凍結値（新規採番。既存値は振り直さない）**: カタログ param のタグ `timestamptz`、`constraint::array_elem_tag` と
+  `canonical_parts` の序数と content hash の要素型タグはいずれも 16（0x40 の次元マーカー未満）。
+- **入力の TZ 解釈**: 配列リテラルの各要素はスカラー列と同じ `bind_datetime_literal` を通り、offset 無しの要素は
+  セッション TimeZone で解釈する。UTC 起点で保存するため、行内表現・一意キー・content hash は TimeZone に依存しない。
+- **出力の TZ**: engine に `ArrayValue::to_pg_text_in_tz`・`to_pg_text_bounded_in_tz` を追加した。既存の
+  `to_pg_text`・`to_pg_text_bounded` は UTC で委譲するため、他の要素型の出力はバイト単位で不変。
+
+  | 出力面 | 使う TimeZone |
+  | ------ | ------------- |
+  | wire の DataRow（簡易・拡張）・COPY TO | 接続のセッション TimeZone（スカラー `timestamptz` と同じ） |
+  | `CAST(<timestamptz[]> AS text)`・`array_to_string` | 評価時のセッション TimeZone |
+  | 定数畳み込み（再 parse で往復）・論理ダンプ | UTC 固定（offset 付きで出すため、どの TimeZone でも同じ瞬間へ往復する） |
+  | NoSQL（HTTP）応答 | UTC 固定（TABLE-33 (5)。HTTP 面はセッション TimeZone を持たない） |
+
+- **wire**: `WireType::TimestampTzArray`（OID 1185・typlen -1・`_timestamptz`）。テキスト形式のみで、バイナリは
+  従来の配列と同じく `0A000`。Parse で 1185 を宣言した場合は従来どおり `0A000`。NoSQL の
+  `element_type: "timestamptz"` も受理し、要素は JSON 文字列のみ（それ以外は `42601`）、応答の型名は `timestamptz[]`。
+- **副次的に受理した面**: 要素がすべて timestamptz の `ARRAY[...]`（timestamp との混在は `42804`）、timestamptz 列の
+  `array_agg`、`CAST(... AS timestamptz[])`（text 配列からは要素ごとの io 変換、整数配列からは規則表どおり `42846`）、
+  添字（結果型 timestamptz）・スライス、timestamptz 左辺の量化比較、`TIMESTAMPTZ[] UNIQUE`（キーは UTC マイクロ秒の
+  ため、異なる offset で書いた同じ瞬間は `23505`）。
+- **据え置いた面**: `TIMESTAMPTZ(p)[]` はスカラー `TIMESTAMPTZ(p)` が未対応のため `0A000` のまま。`ALTER COLUMN TYPE`
+  の配列要素型変更は既存の配列どうしの判定に従い拡張しない（fail-closed）。スカラー `TIMESTAMPTZ` の UNIQUE／PRIMARY
+  KEY／FK は変更なし。
+- **対象外**: 配列のバイナリ形式（TABLE-35 (4)・WIRE-14。対応しない）。VARCHAR・INTERVAL・BIT の各要素型は #3231・
+  #3234・#3235。
+
 ## Issue #3258 追記（LIKE の量化形）
 
 `<式> [NOT] LIKE|ILIKE ANY|SOME|ALL (<配列式>)` と `~~` 系演算子（TABLE-35・SQL-9 のポインタ）は

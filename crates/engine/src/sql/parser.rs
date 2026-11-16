@@ -1785,6 +1785,17 @@ fn convert_array_elements(
             })
             .map(ArrayValue::Bit)
         }
+        // timestamptz は列束縛と同じ検査（offset 無しはセッション TimeZone で解釈・範囲外 22008・
+        // 書式不正 22007・未知の TZ 名 22023）を経てから格納する（Issue #3233）。
+        E::TimestampTz => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::TimestampTz, raw)? {
+                Value::TimestampTz(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "timestamptz array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::TimestampTz),
         E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
             Value::Uuid(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
@@ -9246,8 +9257,8 @@ fn bind_array_agg_value(
             ColumnType::SmallInt => ArrayElemType::SmallInt,
             ColumnType::Time => ArrayElemType::Time,
             ColumnType::Interval => ArrayElemType::Interval,
+            ColumnType::TimestampTz => ArrayElemType::TimestampTz,
             ColumnType::Bpchar(_)
-            | ColumnType::TimestampTz
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
@@ -9321,6 +9332,15 @@ fn resolve_array_agg_input(
         node_budget,
         item.func.default_alias(),
     )?;
+    // TIMESTAMPTZ の JSON 化は未対応。確定時の XX000 ではなく束縛時に 0A000 で拒否する（Issue #3233）。
+    if !matches!(output, ArrayAggOutput::Array) && elem == ArrayElemType::TimestampTz {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "{} over timestamptz is not supported yet",
+                item.func.default_alias()
+            ),
+        });
+    }
     let orders_by_value = item.distinct || item.order_by.iter().any(|k| k.expr == *value_expr);
     if orders_by_value {
         match elem {
@@ -9365,6 +9385,7 @@ fn resolve_array_agg_input(
             | ArrayElemType::Date
             | ArrayElemType::Timestamp
             | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
             | ArrayElemType::Uuid
             | ArrayElemType::Numeric { .. }
             | ArrayElemType::Jsonb

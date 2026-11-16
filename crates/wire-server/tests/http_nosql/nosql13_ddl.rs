@@ -942,6 +942,37 @@ fn create_table_timestamptz_column_binds() {
     assert_eq!(add.status, 200, "got: {add:?}");
 }
 
+/// Issue #3233（TABLE-14・TABLE-33）: 配列要素型としての `"timestamptz"` が受理され、文字列要素が
+/// 束縛できる。範囲外は 22008、数値要素は 42601 で拒否される（副作用なし）。
+#[test]
+fn create_table_timestamptz_array_element_binds() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let resp = query(
+        &session,
+        br#"{"op":"create_table","table":"tza","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"timestamptz","max_len":4}
+    ]}"#,
+    );
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"tza","rows":[{"id":1,"embedding":[0.1,0.2],"a":["2026-01-01T00:00:00+09:00",null]}],"operation_id":"tza-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let oor = query(
+        &session,
+        br#"{"op":"insert","table":"tza","rows":[{"id":2,"embedding":[0.1,0.2],"a":["2026-13-01 00:00:00Z"]}],"operation_id":"tza-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&oor), "22008", "got: {oor:?}");
+    let ty = query(
+        &session,
+        br#"{"op":"insert","table":"tza","rows":[{"id":3,"embedding":[0.1,0.2],"a":[1]}],"operation_id":"tza-3"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&ty), "42601", "got: {ty:?}");
+}
+
 /// Issue #1583（TABLE-34・NOSQL-13）: `create_table`／`add_column` の型名 `"interval"` が
 /// 受理され、文字列が束縛でき、書式不正は 22007・数値は 42601 で拒否される。
 #[test]

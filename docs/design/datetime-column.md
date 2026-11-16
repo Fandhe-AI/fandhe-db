@@ -192,10 +192,10 @@ TABLE-32・親 #1568 のポインタ（第 2 段）。#1569 で fail-closed に�
 - **DST の解決**: 名前付き TZ の gap（存在しない時刻）は直前の offset、fold（重複する時刻）は後の offset で解決する（PG の `DetermineTimeZoneOffset` の既定と同じ見込み。例: NY の `2026-03-08 02:30` は `-05` として `07:30Z`、`2026-11-01 01:30` は `-05` として `06:30Z`）。jiff の既定に任せず自前で選んでいる。PG 17 の実測との照合は #1576 で完了し確定した（[timestamptz-conversion.md](timestamptz-conversion.md)）。
 - **SQLSTATE**: 書式違反 `22007`、範囲外（UTC へ直して範囲外、offset の範囲外を含む）`22008`、解決できない TZ 名 `22023`（detail は静的文字列で入力を反射しない）。
 - **整形**: `format_timestamptz(utc_micros, &SessionTimeZone)` は `YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]]`（分・秒が 0 でなければ付ける）。局所年が 0 以下になる場合は PG に合わせ年を `1 - year` とし offset の後ろに「 BC」（先頭に空白を伴う）を付ける。局所年 10000 は 5 桁のまま出す。LMT のような秒を含む offset も整形できる。現状の呼び出し元（投影・COPY TO・HTTP JSON）はすべて UTC 固定（`+00`）。
-- **型名**: `TIMESTAMPTZ`・`TIMESTAMP WITH TIME ZONE` を受理（`TIMESTAMPTZ` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する）。`TIMESTAMPTZ(p)`・`timestamptz[]` は構文段で `0A000`。`timestamptz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した。
+- **型名**: `TIMESTAMPTZ`・`TIMESTAMP WITH TIME ZONE` を受理（`TIMESTAMPTZ` は綴りを保持する別名として返し、同名 ENUM との衝突を実行段が検出する）。`TIMESTAMPTZ(p)` は構文段で `0A000`（`timestamptz[]` は Issue #3233 で受理済み。[array-column-type.md](array-column-type.md) 参照）。`timestamptz` は `CREATE_ONLY_RESERVED_TYPE_NAMES` へ追加した。
 - **PostgreSQL との乖離**: (1) 日付だけ・秒なし・小数 7 桁以上・1 桁の時の offset は受理しない。(2) 範囲は UTC で 0001〜9999 年。(3) offset の範囲外は PG では `22009` だが、Issue の写像に従い `22008`。(4) TZ 略称（`JST` 等）と POSIX 形式は #1575 まで `22023`。
 - **暫定挙動（fail-closed）**: 述語・ORDER BY・GROUP BY・集計・window・集合演算・式・二次索引・EXTRACT／date_trunc は #1576 で解禁済み（[timestamptz-conversion.md](timestamptz-conversion.md)）。UDF 引数は引き続き拒否する。PK／UNIQUE／FK・JOIN キー・`ALTER COLUMN TYPE` は担当 Issue 未定。wire は暫定で text（OID 25）を公告してバイナリは非対応、NoSQL は型束縛・filter とも `TypeMismatch` で拒否する（OID 1184 とバイナリ・NoSQL は #1577）。JSON 応答の型名は `"timestamptz"`。
-- **対象外**: セッション TimeZone（`SET TIME ZONE`／StartupMessage／`SHOW`）・POSIX 形式は #1575 で実装済み（[session-timezone.md](session-timezone.md)。TZ 略称は PG と同じく `SET` で `22023`）。`AT TIME ZONE`・他型との変換・述語・集計・索引・EXTRACT・DST 解決の PG 17 照合は #1576 で実装済み（[timestamptz-conversion.md](timestamptz-conversion.md)）。`now()`／`CURRENT_TIMESTAMP` の戻り値型の切り替え、`TIMESTAMPTZ(p)`、`timestamptz[]`（OID 1185）、特殊値 `infinity`・`epoch`・`now` は担当 Issue 未定。
+- **対象外**: セッション TimeZone（`SET TIME ZONE`／StartupMessage／`SHOW`）・POSIX 形式は #1575 で実装済み（[session-timezone.md](session-timezone.md)。TZ 略称は PG と同じく `SET` で `22023`）。`AT TIME ZONE`・他型との変換・述語・集計・索引・EXTRACT・DST 解決の PG 17 照合は #1576 で実装済み（[timestamptz-conversion.md](timestamptz-conversion.md)）。`now()`／`CURRENT_TIMESTAMP` の戻り値型の切り替え、`TIMESTAMPTZ(p)`、特殊値 `infinity`・`epoch`・`now` は担当 Issue 未定（`timestamptz[]`（OID 1185）は Issue #3233 で受理済み）。
 
 ## Issue #1577 追記: TIMESTAMPTZ の wire OID とバイナリ入出力
 
@@ -203,7 +203,7 @@ TABLE-33・WIRE-13・WIRE-14・NOSQL-13・NOSQL-17 のポインタ。#1574 の�
 
 - **wire**: OID 1184・typlen 8 で公告し、バイナリ結果・バイナリ param に対応（詳細は [wire-binary-format.md](wire-binary-format.md)）。テキスト出力はセッション TimeZone で整形する（#1575）。
 - **NoSQL**: insert／update は JSON 文字列を束縛し（数値・真偽値は `42601`）、書式・範囲・TZ 名の検査は engine の `parse_timestamptz`（`22007`／`22008`／`22023`）に委ねる。`create_table`／`add_column` の型名 `"timestamptz"` を受理する。
-- **対象外**: NoSQL filter・述語（#1576 の後）、`timestamptz[]`（OID 1185）、COPY バイナリ、特殊値 `infinity`。
+- **対象外**: NoSQL filter・述語（#1576 の後）、COPY バイナリ、特殊値 `infinity`。`timestamptz[]`（OID 1185）は Issue #3233 で受理済み。
 
 ## Issue #1579 追記: INTERVAL 列型
 

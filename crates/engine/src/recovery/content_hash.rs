@@ -557,6 +557,19 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                         }
                     }
                 }
+                // Issue #3233 の新規採番（既存タグのバイト列は不変）。
+                crate::row_codec::ArrayValue::TimestampTz(items) => {
+                    b.push_u8(16 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(*item as u64);
+                        }
+                    }
+                }
                 crate::row_codec::ArrayValue::BigInt(items) => {
                     b.push_u8(3 | mark);
                     b.push_u64(items.len() as u64);
@@ -1989,6 +2002,19 @@ fn update_where_with_tag(
     Ok(b.finish())
 }
 
+/// CAST の変換先が `TIMESTAMPTZ` を要素に含む配列型（入れ子配列を含む）か。
+/// `push_dml_expr` の `Expr::Cast` 腕が TZ 依存の印を付ける判定に使う。
+fn cast_target_is_timestamptz_array(ty: &crate::sql::cast::CastType) -> bool {
+    use crate::sql::cast::CastType;
+    match ty {
+        CastType::Array(inner) => {
+            matches!(inner.as_ref(), CastType::TimestampTz)
+                || cast_target_is_timestamptz_array(inner)
+        }
+        _ => false,
+    }
+}
+
 /// 分割実行（再開で別接続から同一 operation_id が再送される）の内容照合へ、セッション TimeZone を
 /// 含める。再開時に別の TimeZone で残りの行へ別の条件・値を適用しないための fail-closed
 /// （Issue #1575・#1576 レビュー指摘）。含めるのは TZ に依存しうる文だけ: 表が `TIMESTAMPTZ` 列を持つ、
@@ -2000,10 +2026,14 @@ fn push_partitioned_time_zone(
     schema: &crate::catalog::TableSchema,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
     let depends = b.is_tz_dependent()
-        || schema
-            .columns
-            .iter()
-            .any(|c| matches!(c.ty, crate::catalog::ColumnType::TimestampTz));
+        || schema.columns.iter().any(|c| match &c.ty {
+            crate::catalog::ColumnType::TimestampTz => true,
+            // `TIMESTAMPTZ[]` の offset なしリテラルも既定 TZ で解釈される（Issue #3233）。
+            crate::catalog::ColumnType::Array(a) => {
+                a.elem() == crate::catalog::ArrayElemType::TimestampTz
+            }
+            _ => false,
+        });
     if depends {
         let tz = crate::datetime::current_session_time_zone();
         if tz.display() != "UTC" {
@@ -3282,6 +3312,11 @@ fn push_dml_expr(
             b.push_u8(16);
             b.push_bytes(ty.to_sql().as_bytes())
                 .map_err(|_| dml_hash_field_too_large())?;
+            // `CAST(... AS timestamptz[])` は offset なしの要素をセッション TimeZone で解釈するため、
+            // 対象表の列型に依らず TZ 依存と印を付ける（Issue #3233 レビュー指摘）。
+            if cast_target_is_timestamptz_array(ty) {
+                b.mark_tz_dependent();
+            }
             push_dml_expr(b, expr, params)?;
         }
         // タグ 17・18（対象ビヘイビア: TABLE-35。Issue #1602。変更禁止）。17 は
@@ -6691,6 +6726,42 @@ mod tests {
             vec![ColumnDef::new("ts", ColumnType::Text, true)],
         );
         assert_eq!(hash_in("Asia/Tokyo", &without), hash_in("UTC", &without));
+    }
+
+    /// TIMESTAMPTZ 列を持たない表でも、`CAST(... AS timestamptz[])` を含む分割実行 UPDATE の
+    /// SET 式はセッション TimeZone が違えば別ハッシュ（Issue #3233 レビュー指摘）。
+    #[test]
+    fn partitioned_update_hash_includes_time_zone_for_timestamptz_array_cast() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::datetime::{SessionTimeZone, SessionTimeZoneScope};
+        use crate::sql::allowlist::SetValue;
+        use crate::sql::cast::CastType;
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+        let registry = UdfRegistry::default();
+        let predicates = partitioned_test_predicates();
+        let schema = TableSchema::new(
+            "t".to_string(),
+            vec![ColumnDef::new("note", ColumnType::Text, true)],
+        );
+        let cast = |ty: CastType| {
+            SetValue::Expr(Expr::Cast {
+                expr: Box::new(Expr::Cast {
+                    expr: Box::new(Expr::String("{2026-01-01 09:00:00}".to_string())),
+                    ty: CastType::Array(Box::new(ty)),
+                }),
+                ty: CastType::Text,
+            })
+        };
+        let tz_arr = cast(CastType::TimestampTz);
+        let int_arr = cast(CastType::Int4);
+        let hash_in = |tz: &str, v: &SetValue| {
+            let _scope =
+                SessionTimeZoneScope::enter(SessionTimeZone::parse_setting(tz).expect("tz"));
+            for_update_where_partitioned("t", &[("note", v)], &predicates, &registry, &schema)
+                .expect("hash")
+        };
+        assert_ne!(hash_in("Asia/Tokyo", &tz_arr), hash_in("UTC", &tz_arr));
+        assert_eq!(hash_in("Asia/Tokyo", &int_arr), hash_in("UTC", &int_arr));
     }
 
     /// TIMESTAMP 列のみの表でも、3 引数 `date_trunc` を含む分割実行 UPDATE は
