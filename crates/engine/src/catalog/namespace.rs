@@ -393,7 +393,9 @@ pub(crate) struct SchemaObjects {
     pub(crate) indexes: Vec<String>,
     /// SEQUENCE（`#<id>.<name>`）。
     pub(crate) sequences: Vec<String>,
-    /// 現状 SCHEMA 配下には置けない種別（matview・ENUM 型）が 1 件でもあるか。あれば
+    /// ENUM 型（`#<id>.<name>`。Issue #3288）。`CASCADE` が表の後・SCHEMA 行の前に落とす。
+    pub(crate) enum_types: Vec<String>,
+    /// 現状 SCHEMA 配下には置けない種別（matview）が 1 件でもあるか。あれば
     /// `DROP SCHEMA ... CASCADE` は不整合として拒否する（fail-closed）。
     pub(crate) unsupported_kinds: bool,
 }
@@ -436,6 +438,7 @@ pub(crate) fn enumerate_schema_objects_in_txn<R: ReadSource>(
         tables: str_keys_in_range(src, CATALOG_TABLE, &start, &end)?,
         views: str_keys_in_range(src, VIEWS_TABLE, &start, &end)?,
         indexes: str_keys_in_range(src, INDEX_CATALOG_TABLE, &start, &end)?,
+        enum_types: str_keys_in_range(src, ENUM_TYPES_TABLE, &start, &end)?,
         ..SchemaObjects::default()
     };
     objects.unsupported_kinds = str_key_range_nonempty(
@@ -443,7 +446,7 @@ pub(crate) fn enumerate_schema_objects_in_txn<R: ReadSource>(
         super::materialized::MATERIALIZED_VIEWS_TABLE,
         &start,
         &end,
-    )? || str_key_range_nonempty(src, ENUM_TYPES_TABLE, &start, &end)?;
+    )?;
     let seq_key = sequence_schema_key(schema_id);
     match src.open_table(super::sequence::SEQUENCES_TABLE) {
         Ok(seqs) => {
@@ -670,7 +673,8 @@ impl Storage {
     /// (1) SCHEMA 配下の表・ビューを根として外部の依存（別 SCHEMA のビュー・外部キー。public からの
     /// 依存は D7 で存在しない）を既存の依存列挙で求めて先に削除 → (2) 配下のビュー（キー昇順）→
     /// (3) 配下の表（既存の `DROP TABLE ... CASCADE` 本体。索引宣言・行ストア・世代・台帳・キャッシュ
-    /// 世代・所有 SEQUENCE を継承）→ (4) 残りの SEQUENCE（キー昇順）→ (5) SCHEMA 行の順に消す。
+    /// 世代・所有 SEQUENCE を継承）→ (4) 残りの SEQUENCE（キー昇順）→ (4b) 配下の ENUM 型（キー昇順。型を使う列が
+    /// SCHEMA の外に残っていれば何も消さず `DependentObjectsStillExist`。Issue #3288）→ (5) SCHEMA 行の順に消す。
     /// 依存を正確に判定できない場合・外部の表が配下の SEQUENCE を `DEFAULT nextval` で参照している
     /// 場合は `DependentObjectsStillExist`（不可逆な連鎖削除をしない。fail-closed）。ID カウンタは
     /// 巻き戻さない。`sql::ddl::execute_drop_schema` から呼ばれる（権限ゲート通過後）。
@@ -714,6 +718,7 @@ impl Storage {
             && (!objects.tables.is_empty()
                 || !objects.views.is_empty()
                 || !objects.sequences.is_empty()
+                || !objects.enum_types.is_empty()
                 || objects.unsupported_kinds)
         {
             return Err(CatalogError::NotObjectOwner);
@@ -760,6 +765,12 @@ impl Storage {
             if super::sequence::sequence_exists_in_txn(&write_txn, seq)? {
                 dropped_sequence_ids.push(super::sequence::drop_sequence_in_txn(&write_txn, seq)?);
             }
+        }
+        // (4b) 配下の ENUM 型（Issue #3288）。配下の表を落とした後の `CATALOG_TABLE` を 1 回だけ走査し、
+        // 配下の型を参照する列（配列要素を含む）が SCHEMA の外に残っていれば、型を消さず txn ごと破棄する
+        // （fail-closed。列の型が宙に浮くため）。残っていなければ型を内部キーの昇順で消す。
+        if !objects.enum_types.is_empty() {
+            super::drop_schema_enum_types_in_txn(&write_txn, &objects.enum_types)?;
         }
         // 配下に残った索引宣言（表を失った孤児。通常は無い）も消す。
         let prefix = RelationKey::schema_prefix(id);
@@ -1490,5 +1501,79 @@ mod tests {
         assert!(reopened.schema_id("alice", "s1").expect("id").is_some());
         assert!(reopened.schema_id("bob", "s1").expect("id").is_some());
         assert!(reopened.schema_id("alice", "s2").expect("id").is_none());
+    }
+
+    /// ENUM 型の `DROP SCHEMA ... CASCADE`（Issue #3288）: 配下の型を落とし、同名の public の型・隣接 ID の型は
+    /// 巻き込まない。型を使う列が SCHEMA の外に残る場合は何も消さず `DependentObjectsStillExist`。
+    #[test]
+    fn cascade_drops_schema_types_and_refuses_while_a_column_still_uses_one() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        let labels = |l: &[&str]| l.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (s, _g) = tmp_storage("ns-enum-cascade");
+        s.create_schema("alice", "s", false).expect("schema");
+        let id = s.schema_id("alice", "s").expect("id").expect("some");
+        let key = format!("#{id}.mood");
+        s.create_enum_type("mood", labels(&["p"])).expect("public");
+        s.create_enum_type(&key, labels(&["a", "b"]))
+            .expect("in schema");
+        // 隣接 ID（10 倍・桁違い）の型は SCHEMA `s` の持ち物ではない。ID が `id * 10 + 1` の SCHEMA が
+        // できるまで他テナントの SCHEMA を作る（`s` の ID は 1。ID は 1 始まりで再利用されない）。
+        assert_eq!(id, 1);
+        for n in 0..10 {
+            s.create_schema("bob", &format!("x{n}"), false)
+                .expect("filler");
+        }
+        assert_eq!(s.schema_id("bob", "x9").expect("id"), Some(id * 10 + 1));
+        let neighbour = format!("#{}.mood", id * 10 + 1);
+        s.create_enum_type(&neighbour, labels(&["n"]))
+            .expect("neighbour");
+        // 往復と独立性。
+        assert_eq!(s.get_enum_type(&key).expect("get").labels(), ["a", "b"]);
+        assert_eq!(s.get_enum_type("mood").expect("get").labels(), ["p"]);
+        // `#<id>.int4` 等の予約名は名前部で拒否される。
+        for bad in ["int4", "text", "INT4"] {
+            assert!(
+                matches!(
+                    s.create_enum_type(&format!("#{id}.{bad}"), labels(&["a"])),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "{bad}"
+            );
+        }
+        // SQL・Storage API のどちらでも、列は SCHEMA 配下の型（内部キー）を参照できない（列の型名は厳格な
+        // 識別子検証）。CASCADE の依存走査は、その前提が将来崩れても型を孤児にしないための多層防御なので、
+        // 走査関数を直接呼んで検証する: 型を使う列が残っていれば何も消さず `DependentObjectsStillExist`。
+        let public_def = s.get_enum_type("mood").expect("public def");
+        s.create_table(&TableSchema::new(
+            "t",
+            vec![ColumnDef::new("m", ColumnType::Enum(public_def), false)],
+        ))
+        .expect("table using the public type");
+        let before = dump_non_schema_state(&s);
+        {
+            let txn = s.begin_write_txn().expect("txn");
+            let r = super::super::drop_schema_enum_types_in_txn(&txn, &["mood".to_string()]);
+            assert!(matches!(
+                r,
+                Err(CatalogError::DependentObjectsStillExist(_))
+            ));
+            // commit せず破棄する（呼び出し元の `drop_schema_cascade_gated` と同じ）。
+            drop(txn);
+        }
+        assert_eq!(before, dump_non_schema_state(&s));
+        // 配下の型（内部キー）を参照する列は無いので、CASCADE は通る。
+        s.drop_table("t").expect("drop table");
+        // CASCADE は型を落とし、public の型と隣接 ID の型は残る。
+        assert_eq!(
+            s.drop_schema_cascade("alice", "s", false).expect("cascade"),
+            DropSchemaResult::Dropped
+        );
+        assert!(matches!(
+            s.get_enum_type(&key),
+            Err(CatalogError::TypeNotFound(_))
+        ));
+        assert!(s.get_enum_type("mood").is_ok());
+        assert!(s.get_enum_type(&neighbour).is_ok());
+        assert!(s.schema_id("alice", "s").expect("id").is_none());
     }
 }
