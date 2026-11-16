@@ -27,6 +27,7 @@ mod sql26_datetime_functions;
 mod sql26_extract;
 mod sql26_order_by_having_expressions;
 mod sql26_scalar_functions;
+mod sql26_simple_case;
 mod sql27_explain_targets;
 mod sql28_inner_join;
 mod sql28_multi_way_join;

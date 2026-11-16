@@ -133,7 +133,7 @@ pub(crate) fn check_view_body(owner: &str, body_sql: &str) -> Result<(), SqlSurf
     forbid(
         owner,
         tokens.iter().filter_map(|t| match t {
-            Token::Ident(s) => Some(s.as_str()),
+            Token::Ident(s) | Token::QuotedNull(s) => Some(s.as_str()),
             _ => None,
         }),
     )
