@@ -1718,7 +1718,7 @@ pub(crate) fn search_prepared_resumable(
         }
     };
 
-    if overlay.arena_len != arena.len() {
+    if overlay.arena_len != arena.len() || query_ties_every_row(query) {
         *resume = None;
         access.cache.record_fallback();
         return full_scan_with_arena(provider, arena, query, k);
@@ -2414,6 +2414,10 @@ fn search_with_overlay(
         access.cache.record_fallback();
         return full_scan_with_arena(provider, arena, query, k);
     }
+    if query_ties_every_row(query) {
+        access.cache.record_fallback();
+        return full_scan_with_arena(provider, arena, query, k);
+    }
 
     // 可視カーディナリティ切替（Issue #409・`ValidatedHnswParams::full_scan_ratio`。
     // Issue #501 で `TraversalRegime` へ一般化）: `overlay.regime` が
@@ -2636,6 +2640,15 @@ fn finish_indexed_search(
             fell_back.set(true);
             return full_scan_with_arena(provider, arena, query, k);
         };
+        if !score.is_finite() {
+            // f16／SQ8 常駐では探索時の近似 score が有限でも f32 の再採点がオーバーフローしうる。
+            // 厳密走査（provider.search）は非有限 score の行を除外する規約のため、ここで黙って
+            // 結果へ流さず（`provider_result_is_valid_with` が XX000 で落とす）全走査へ縮退して
+            // 厳密側の除外規約に揃える（Issue #3304）。
+            access.cache.record_fallback();
+            fell_back.set(true);
+            return full_scan_with_arena(provider, arena, query, k);
+        }
         mapped.push(CandidateHit {
             id: slot as u64,
             score,
@@ -2693,6 +2706,16 @@ fn finish_indexed_search(
             .fetch_add(acorn_descent_bridges, Ordering::Relaxed);
     }
     Ok(mapped)
+}
+
+/// 全成分が 0 のクエリか（`-0.0` も 0 とみなす）。
+///
+/// 内積グラフでは全ノードの score が 0 の同点になり、厳密走査は同点規則（スロット昇順）の
+/// 先頭 k 件を返すが、グラフ探索はビームが辿った任意の k ノードを返すため集合が食い違う。
+/// ANN では決定的な同点順を再現できず索引の利点もないため、`search_with_overlay`／
+/// `search_prepared_resumable` は全走査へ縮退する（Issue #3304。ビヘイビア INDEX-7・SQL-33）。
+fn query_ties_every_row(query: &[f32]) -> bool {
+    query.iter().all(|v| *v == 0.0)
 }
 
 fn full_scan_with_arena(
@@ -2868,6 +2891,9 @@ pub(crate) fn ann_plan_for_direction(
 /// 縮退する。fail-closed）。`Cosine` へ `score_f32` をそのまま使うと正規化していない生
 /// ベクトルの内積になって誤るため、Cosine を写像へ足すときは delta・全走査も含めて
 /// コサインの score 定義に揃えること。
+///
+/// 返す score が非有限の場合、呼び出し元（`finish_indexed_search`）は全走査へ縮退する
+/// （厳密走査は非有限 score の行を除外するため。Issue #3304）。
 fn rescore_indexed_hit(metric: HnswMetric, row: &[f32], query: &[f32]) -> Option<f32> {
     match metric {
         HnswMetric::InnerProduct => Some(metric.score_f32(row, query)),
@@ -3956,6 +3982,96 @@ mod tests {
             stats.hits, 0,
             "縮退した呼び出しは hits に計上されない（旧実装は 1 になっていた）"
         );
+    }
+
+    #[test]
+    fn query_ties_every_row_detects_only_all_zero_queries() {
+        assert!(query_ties_every_row(&[0.0, -0.0, 0.0]));
+        assert!(!query_ties_every_row(&[0.0, 1e-30, 0.0]));
+        assert!(!query_ties_every_row(&[f32::NAN, 0.0]));
+    }
+
+    #[test]
+    fn search_with_overlay_zero_query_falls_back_to_exact_slot_order() {
+        // Issue #3304: 全成分 0 のクエリは内積グラフで全行が同点になるため、グラフ探索せず
+        // 全走査へ縮退し、provider.search と同じ（スロット昇順の先頭 k 件）結果を返す。
+        let path = unique_db_path("hnsw-cache-zero-query");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        for id in 1..=6u64 {
+            seed_row(
+                &storage,
+                "docs",
+                id,
+                "tenant-a",
+                &[id as f32, 1.0, 0.0, 0.0],
+            );
+        }
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let base = Arc::new(
+            IndexedBase::build(
+                &arena,
+                crate::hnsw::HnswParams::default(),
+                crate::hnsw::ResidentPrecision::F32,
+                HnswMetric::InnerProduct,
+                c.clone(),
+                gen,
+            )
+            .expect("build")
+            .0,
+        );
+        let (visible_mask, visible_in_index) = identity_mask_and_visible(&base);
+        let overlay = Arc::new(Overlay {
+            generation: gen,
+            arena_len: arena.len(),
+            slot_of_node: (0..base.index.len() as u32).collect(),
+            stale_nodes: 0,
+            delta_slots: Vec::new(),
+            delta_vectors: Vec::new(),
+            visible_mask,
+            visible_in_index,
+            mask_splits_graph: false,
+            regime: TraversalRegime::OneHop,
+        });
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
+        };
+        let provider = crate::kernel::CpuScalarProvider;
+        let query = [0.0f32; 4];
+        let got = search_with_overlay(
+            &access,
+            base,
+            overlay,
+            &provider,
+            &arena,
+            &query,
+            3,
+            OverlaySuccessStat::Hits,
+        )
+        .expect("zero query search");
+        let want = full_scan_with_arena(&provider, &arena, &query, 3).expect("exact");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.id, w.id);
+            assert_eq!(g.score.to_bits(), w.score.to_bits());
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.fallbacks, 1);
+        assert_eq!(stats.hits, 0);
     }
 
     #[test]
@@ -5048,6 +5164,78 @@ mod tests {
         assert!(
             stats.hybrid_resumed_rounds >= 1,
             "at least the 2nd/3rd rounds should reuse the previous graph scan"
+        );
+    }
+
+    /// Issue #3304: 全成分 0 のクエリは再開型でも全走査へ縮退し、再開状態を破棄して
+    /// fallback を計上する。
+    #[test]
+    fn search_prepared_resumable_zero_query_resets_state_and_falls_back() {
+        let path = unique_db_path("hnsw-cache-resumable-zero-query");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        for i in 0..2_000u64 {
+            let v = i as f32;
+            seed_row(
+                &storage,
+                "docs",
+                i,
+                "tenant-a",
+                &[v, v + 1.0, v + 2.0, v + 3.0],
+            );
+        }
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
+        };
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let prepared = prepare_full_visible(&access, &read_txn, "docs", &c, &arena);
+        let provider = crate::kernel::CpuScalarProvider;
+        let mut resume: Option<HnswResumeState> = None;
+
+        // 非ゼロクエリで再開状態を作る。
+        search_prepared_resumable(
+            &access,
+            &prepared,
+            &provider,
+            &arena,
+            &slot_ids,
+            &[0.0f32, 1.0, 2.0, 3.0],
+            10,
+            &mut resume,
+        )
+        .expect("non-zero query succeeds");
+        let fallbacks_before = cache.stats().fallbacks;
+
+        let zero = [0.0f32; 4];
+        let hits = search_prepared_resumable(
+            &access,
+            &prepared,
+            &provider,
+            &arena,
+            &slot_ids,
+            &zero,
+            10,
+            &mut resume,
+        )
+        .expect("zero query succeeds");
+        assert!(resume.is_none(), "ゼロクエリは再開状態を破棄する");
+        assert_eq!(cache.stats().fallbacks, fallbacks_before + 1);
+        let expected = full_scan_with_arena(&provider, &arena, &zero, 10).expect("full scan");
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            expected.iter().map(|h| h.id).collect::<Vec<_>>()
         );
     }
 

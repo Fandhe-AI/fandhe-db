@@ -292,7 +292,7 @@ pub(super) fn row_literals(
 /// 各要素をここで検証する）を `table`／`operation_id` と合わせて
 /// `Vec<BoundInsert>` へ束縛する。件数（`rows.len()`）は呼び出し元
 /// （[`execute`]）が `EngineCore::execute_bound_insert_in_session` の row_count
-/// 引数として先に渡し、①（件数上限）判定を通過した後にのみ本関数が呼ばれる。
+/// 引数として先に渡し、`--max-insert-rows`（指定時）と ④ の件数判定を通過した後にのみ本関数が呼ばれる。
 pub fn bind_rows(
     items: &[JsonValue],
     table: &str,

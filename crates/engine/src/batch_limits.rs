@@ -10,9 +10,11 @@
 //! 上限であり、複数ファイル合計に対する上限を持たない。本モジュールは
 //! [`BatchLimits`] の各フィールドとして、バッチ全体に対する処理量ガードを追加する。
 //!
-//! ①はファイル形の一括投入と `COPY FROM`（Issue #3309 まで）にだけ掛かり、複数行
-//! `VALUES`・UPSERT・NoSQL `rows[]` には掛からない（Issue #3308。行の形の行数上限は
-//! `--max-insert-rows` 指定時のみ）。
+//! ①はファイル形の一括投入にだけ掛かり、複数行 `VALUES`・UPSERT・NoSQL `rows[]`・
+//! `COPY FROM` には掛からない（Issue #3308・#3309）。行の形の行数の実効上限は
+//! `--max-insert-rows`（指定時）と ④（`max_batch_chunks`。1 行 = 1 チャンク）の小さい方で、
+//! SQL 文長・トークン数・1 メッセージの上限も別に効く（Issue #3310）。COPY の ③ は
+//! デコード前の CopyData 累計で数える。
 //!
 //! 各上限の判定タイミングは [`validate_batch_shape`]・[`validate_chunk_total`]・
 //! [`validate_raw_sql_len`] の各関数ドキュメント、および呼び出し元
@@ -445,23 +447,9 @@ pub(crate) fn validate_raw_sql_len(
     Ok(new_total)
 }
 
-/// ①（バッチあたり最大ファイル数。COPY では「行数」と読み替える）を、CopyDone
-/// を待たず 1 行ずつ逐次判定する（Issue #939・WIRE-17。[`validate_batch_shape`]
-/// が一括判定するのに対し、COPY はストリーミングであるため超過を CopyData
-/// 受信中に検出する必要がある。判定内容自体は同一）。
-pub(crate) fn check_row_count(count: usize, limits: &BatchLimits) -> Result<(), BatchLimitsError> {
-    if count > limits.max_files_per_batch {
-        return Err(BatchLimitsError::TooManyFiles {
-            count,
-            max: limits.max_files_per_batch,
-        });
-    }
-    Ok(())
-}
-
 /// ②（1 ファイルあたり最大本文サイズ。COPY では「1 行あたりのデコード後
 /// バイト量」と読み替える）を、CopyDone を待たず 1 行ずつ逐次判定する
-/// （[`check_row_count`] と同じ理由）。
+/// （CopyData 受信中に超過を検出する必要があるため。判定内容は一括判定と同一）。
 pub(crate) fn check_row_body_len(
     index: usize,
     len: usize,
@@ -478,7 +466,7 @@ pub(crate) fn check_row_body_len(
 }
 
 /// ③（バッチ合計最大サイズ）を、CopyDone を待たず CopyData 受信ごとに逐次
-/// 判定する（[`check_row_count`] と同じ理由。COPY の場合は生 CopyData
+/// 判定する（COPY の場合は生 CopyData
 /// バイト量そのものを累算する——[`validate_batch_shape`] のようにデコード後の
 /// `path.len() + body.len()` ではなく、デコード前のバイト量を上限判定の対象と
 /// することで、レコード分割・エスケープ解決・`Vec<BoundInsert>` への確保より

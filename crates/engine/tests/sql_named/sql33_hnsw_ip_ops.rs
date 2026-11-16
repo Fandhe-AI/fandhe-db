@@ -8,6 +8,13 @@
 //! - 宣言なし（`All` の暗黙コサインのみ・`Declared` で cosine だけ）の `<#>` は従来どおり厳密全走査
 //! - DESC・LIMIT 省略・`precision` 併用・`<->`／`<+>` は HNSW より前に縮退または拒否される
 //! - テナント境界を保つ（他テナントの行は結果にも `EXPLAIN` にも現れない）
+//!
+//! Issue #3305 で追加する内容:
+//!
+//! - コサインの SQL 表層試験（`core_misc/hnsw_cache.rs`）と同じ手順・閾値の Recall@10 下限（常駐精度別）
+//! - 内積が最大になるカナリア行を他テナントへ置いた越境試験（ctx ごとにキャッシュが別になることも含む）
+//! - 再起動（`Storage` の再オープン）後に宣言 opclass からゲート・写像・キャッシュキーが復元され、
+//!   `<#>` が HNSW を使うこと。fail-closed の形は再起動後も保たれる
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -19,6 +26,7 @@ use engine::sql::exec::{Cell, QueryResult};
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
 use engine::storage::{RowInput, Storage, Visibility};
+use std::path::{Path, PathBuf};
 
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
@@ -27,6 +35,8 @@ const DIM: u32 = 8;
 // `sql::hnsw_cache::MIN_INDEXED_ROWS`（1,024）超。
 const HNSW_ROWS: usize = 1_100;
 const TENANT_B_ID_BASE: u64 = 1_000_000;
+// tenant-a のカナリア行（tenant-b のクエリの定数倍のベクトル）の id 起点。
+const CANARY_ID_BASE: u64 = 500_000;
 
 fn gen_vectors(seed: u64, rows: usize) -> Vec<Vec<f32>> {
     let mut state = seed;
@@ -43,10 +53,14 @@ fn gen_vectors(seed: u64, rows: usize) -> Vec<Vec<f32>> {
 }
 
 fn schema() -> TableSchema {
+    schema_dim(DIM)
+}
+
+fn schema_dim(dim: u32) -> TableSchema {
     TableSchema::new(
         "docs",
         vec![
-            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("embedding", ColumnType::Vector(dim), false),
             ColumnDef::new("lang", ColumnType::Text, false),
         ],
     )
@@ -58,7 +72,20 @@ fn ctx(tenant: &str) -> PolicyContext {
 }
 
 fn seed(storage: &Storage, tenant: &str, id_base: u64, vis: Visibility, vectors: &[Vec<f32>]) {
-    let schema = schema();
+    seed_with(storage, tenant, id_base, vis, vectors, DIM, tenant);
+}
+
+/// 次元と操作 ID の接尾辞を指定できる `seed`（Recall 用コーパス・カナリア行の追加で使う）。
+fn seed_with(
+    storage: &Storage,
+    tenant: &str,
+    id_base: u64,
+    vis: Visibility,
+    vectors: &[Vec<f32>],
+    dim: u32,
+    op_label: &str,
+) {
+    let schema = schema_dim(dim);
     let metadata: Vec<Vec<u8>> = (0..vectors.len())
         .map(|i| {
             let lang = if i % 3 == 0 { "ja" } else { "en" };
@@ -84,7 +111,7 @@ fn seed(storage: &Storage, tenant: &str, id_base: u64, vis: Visibility, vectors:
             )
         })
         .collect();
-    let op_id = OperationId::parse(&format!("seed-{tenant}")).expect("valid operation id");
+    let op_id = OperationId::parse(&format!("seed-{op_label}")).expect("valid operation id");
     engine::tenant::insert_rows(storage, "docs", &ctx(tenant), &rows, &op_id).expect("seed rows");
 }
 
@@ -98,6 +125,17 @@ fn core_with_two_tenants(
     label: &str,
     scope: HnswScope,
 ) -> (EngineCore, CleanupGuard, Vec<Vec<f32>>) {
+    let (core, guard, _path, vectors_b) = core_with_two_tenants_at(label, scope, &[]);
+    (core, guard, vectors_b)
+}
+
+/// [`core_with_two_tenants`] に DB パスと、tenant-a の追加カナリア行（Private・id は `CANARY_ID_BASE` 起点）を足した版。
+/// 再起動試験が同じパスを開き直すために `path` を返す。
+fn core_with_two_tenants_at(
+    label: &str,
+    scope: HnswScope,
+    canaries_a: &[Vec<f32>],
+) -> (EngineCore, CleanupGuard, PathBuf, Vec<Vec<f32>>) {
     let path = unique_db_path(label);
     let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -105,6 +143,17 @@ fn core_with_two_tenants(
     let vectors_a = gen_vectors(3, HNSW_ROWS);
     let vectors_b = gen_vectors(5, HNSW_ROWS);
     seed(&storage, "tenant-a", 0, Visibility::Private, &vectors_a);
+    if !canaries_a.is_empty() {
+        seed_with(
+            &storage,
+            "tenant-a",
+            CANARY_ID_BASE,
+            Visibility::Private,
+            canaries_a,
+            DIM,
+            "canary-a",
+        );
+    }
     seed(
         &storage,
         "tenant-b",
@@ -112,10 +161,19 @@ fn core_with_two_tenants(
         Visibility::Private,
         &vectors_b,
     );
+    let core = core_from_storage(storage, scope);
+    (core, guard, path, vectors_b)
+}
+
+fn core_from_storage(storage: Storage, scope: HnswScope) -> EngineCore {
     let kind =
         search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
-    let core = EngineCore::from_storage_with_engine(storage, kind).with_hnsw_scope(scope);
-    (core, guard, vectors_b)
+    EngineCore::from_storage_with_engine(storage, kind).with_hnsw_scope(scope)
+}
+
+/// 再起動の模擬: 既存パスの `Storage` を開き直して新しい `EngineCore`（ゲートキャッシュ・HNSW キャッシュは空）を作る。
+fn reopen(path: &Path, scope: HnswScope) -> EngineCore {
+    core_from_storage(Storage::open(path).expect("reopen storage"), scope)
 }
 
 fn ddl(core: &EngineCore, sql: &str) {
@@ -389,4 +447,516 @@ fn ip_hnsw_path_keeps_tenant_boundary() {
         assert!(!l.contains("tenant"), "{l}");
         assert!(!l.contains(&HNSW_ROWS.to_string()), "{l}");
     }
+}
+
+/// 一致契約（Issue #3304）: HNSW 結果に含まれる行の距離値は厳密全走査とビット一致し、
+/// 並びは距離昇順・同点は id 昇順になる。
+#[test]
+fn hnsw_distances_are_bit_identical_to_exact_scan() {
+    let (baseline, _g0, _) = core_with_two_tenants("sql33-ip-bit-base", HnswScope::Declared);
+    let (core, _g, vb) = core_with_two_tenants("sql33-ip-bit", HnswScope::Declared);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    for qi in 0..5 {
+        let sql = format!(
+            "SELECT id FROM docs ORDER BY embedding <#> '{}' LIMIT 20",
+            vec_literal(&vb[qi * 13])
+        );
+        let (exact, _) = run(&baseline, "tenant-b", &sql);
+        let (got, consulted) = run(&core, "tenant-b", &sql);
+        assert!(consulted > 0);
+        let exact_score: std::collections::BTreeMap<u64, u64> = exact
+            .rows
+            .iter()
+            .map(|r| (r.id, r.score.to_bits()))
+            .collect();
+        for r in &got.rows {
+            if let Some(bits) = exact_score.get(&r.id) {
+                assert_eq!(r.score.to_bits(), *bits, "id {}", r.id);
+            }
+        }
+        assert!(got
+            .rows
+            .windows(2)
+            .all(|w| w[0].score < w[1].score || (w[0].score == w[1].score && w[0].id < w[1].id)));
+    }
+}
+
+/// 全成分 0 のクエリは全行が同点のため全走査へ縮退し、宣言なしの厳密結果（id 昇順の先頭 k 件）と完全一致する。
+#[test]
+fn zero_query_matches_exact_scan() {
+    let (baseline, _g0, _) = core_with_two_tenants("sql33-ip-zero-base", HnswScope::Declared);
+    let (core, _g, _) = core_with_two_tenants("sql33-ip-zero", HnswScope::Declared);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let sql = knn_ip_sql(&[0.0; DIM as usize]);
+    let (exact, _) = run(&baseline, "tenant-b", &sql);
+    let (got, consulted) = run(&core, "tenant-b", &sql);
+    assert!(consulted > 0);
+    assert_eq!(got, exact);
+    assert!(core.hnsw_index_cache_stats().fallbacks > 0);
+}
+
+/// 内積がオーバーフローするクエリでも、宣言あり・なしで結果（またはエラーの SQLSTATE）が一致する。
+#[test]
+fn overflowing_query_matches_exact_scan() {
+    let (baseline, _g0, _) = core_with_two_tenants("sql33-ip-ovf-base", HnswScope::Declared);
+    let (core, _g, _) = core_with_two_tenants("sql33-ip-ovf", HnswScope::Declared);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let sql = knn_ip_sql(&[3.0e38; DIM as usize]);
+    let want = baseline.execute_sql(&ctx("tenant-b"), &sql);
+    let got = core.execute_sql(&ctx("tenant-b"), &sql);
+    match (want, got) {
+        (Ok(w), Ok(g)) => assert_eq!(g, w),
+        (Err(w), Err(g)) => assert_eq!(g.wire_code(), w.wire_code()),
+        (w, g) => panic!("diverged: exact={w:?} hnsw={g:?}"),
+    }
+}
+
+/// cosine と ip の両方を宣言した表: `index=` は宣言名の列挙（現行規則）、`<#>` は `metric=ip`、`<=>` は `metric=cosine`。
+#[test]
+fn explain_with_both_declarations_reports_query_metric() {
+    let (core, _g, vb) = core_with_two_tenants("sql33-ip-both", HnswScope::Declared);
+    ddl(&core, "CREATE INDEX idx_cos ON docs USING hnsw (embedding)");
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let lines = explain_lines(&core, "tenant-b", &knn_ip_sql(&vb[0]));
+    assert_eq!(
+        line(&lines, "ann_plan: "),
+        "ann_plan: hnsw_full_visible index=idx_cos,idx_ip"
+    );
+    assert!(
+        line(&lines, "hnsw_params: ").contains("metric=ip,"),
+        "{lines:?}"
+    );
+    let cos = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 5",
+        vec_literal(&vb[0])
+    );
+    let lines = explain_lines(&core, "tenant-b", &cos);
+    assert!(
+        line(&lines, "hnsw_params: ").contains("metric=cosine,"),
+        "{lines:?}"
+    );
+}
+// ---------------------------------------------------------------------
+// Issue #3305: Recall 下限・越境（カナリア）・再起動後の復元
+// ---------------------------------------------------------------------
+
+type Precision = engine::hnsw::ResidentPrecision;
+
+const RECALL_DIM: u32 = 16;
+// `MIN_INDEXED_ROWS` 超かつ並列構築の閾値（2,048）未満（構築が決定的）。`core_misc/hnsw_cache.rs` と同じ根拠。
+const RECALL_ROWS: usize = 1_200;
+const RECALL_K: usize = 10;
+const RECALL_QUERIES: usize = 20;
+/// クエリ抽出の間隔。コーパスは `i % 12` でクラスタ割当のため、12 と互いに素な値にして 12 クラスタすべてを網羅する
+/// （`RECALL_QUERIES * RECALL_QUERY_STRIDE <= RECALL_ROWS` を満たす）。
+const RECALL_QUERY_STRIDE: usize = 61;
+
+/// 長さを正規化しない決定的なクラスタ付きコーパス。正規化済みだと内積とコサインの順位が一致し、
+/// `<#>` 固有の検証にならないため、行ごとに長さを [0.25, 4] で変える。
+fn gen_clustered_unnormalized(
+    seed: u64,
+    dim: usize,
+    rows: usize,
+    clusters: usize,
+) -> Vec<Vec<f32>> {
+    let rng = |state: &mut u64| -> f32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        let bits = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as u32;
+        (bits as f32) / (1u32 << 24) as f32 * 2.0 - 1.0
+    };
+    let mut cs = seed ^ 0xC1C1_C1C1_C1C1_C1C1;
+    let centers: Vec<Vec<f32>> = (0..clusters.max(1))
+        .map(|_| (0..dim).map(|_| rng(&mut cs)).collect())
+        .collect();
+    let mut st = seed;
+    (0..rows)
+        .map(|i| {
+            let center = &centers[i % centers.len()];
+            let scale = 0.25 + (rng(&mut st) + 1.0) * 1.875;
+            center
+                .iter()
+                .map(|c| (c + rng(&mut st) * 0.2) * scale)
+                .collect()
+        })
+        .collect()
+}
+
+/// `core_misc/hnsw_cache.rs::recall_at_k` の複製。
+fn recall_at_k(got: &[u64], want: &[u64]) -> f64 {
+    if want.is_empty() {
+        return 1.0;
+    }
+    let want_set: std::collections::HashSet<u64> = want.iter().copied().collect();
+    got.iter().filter(|id| want_set.contains(id)).count() as f64 / want.len() as f64
+}
+
+/// `core_misc/hnsw_cache.rs::min_recall_for` と同じ回帰基準（本リポの実装既定値で、spec 由来ではない）。
+fn min_recall_for(precision: Precision) -> f64 {
+    match precision {
+        Precision::I8 => 0.8,
+        Precision::F32 | Precision::F16 => 0.9,
+    }
+}
+
+fn hnsw_kind_with(precision: Precision) -> search_engine::SearchEngineKind {
+    match search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params")
+    {
+        search_engine::SearchEngineKind::Hnsw(v) => {
+            search_engine::SearchEngineKind::Hnsw(v.with_resident_precision(precision))
+        }
+        other => panic!("hnsw_kind must return Hnsw, got {other:?}"),
+    }
+}
+
+fn recall_core(
+    label: &str,
+    corpus: &[Vec<f32>],
+    precision: Precision,
+    declare_ip: bool,
+) -> (EngineCore, CleanupGuard) {
+    let path = unique_db_path(label);
+    let guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&schema_dim(RECALL_DIM))
+        .expect("create docs");
+    seed_with(
+        &storage,
+        "tenant-a",
+        0,
+        Visibility::Public,
+        corpus,
+        RECALL_DIM,
+        "recall",
+    );
+    let core = EngineCore::from_storage_with_engine(storage, hnsw_kind_with(precision))
+        .with_hnsw_scope(HnswScope::Declared);
+    if declare_ip {
+        ddl(
+            &core,
+            "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+        );
+    }
+    (core, guard)
+}
+
+/// コサインと同じ手順（宣言なしの厳密側を対照にした Recall@10 の平均。クエリはコーパスから 12 と互いに素な間隔 61 で 20 点。全クラスタを対象にする）で、
+/// `<#>` の HNSW の Recall が常駐精度別の下限（F32／F16 は 0.9、I8 は 0.8）以上であることを固定する。
+/// 返る行の距離値は厳密側の同 id とビット一致する（一致契約）。
+#[test]
+fn ip_recall_at_10_meets_cosine_regression_floor_per_precision() {
+    let corpus = gen_clustered_unnormalized(0x1B_3305, RECALL_DIM as usize, RECALL_ROWS, 12);
+    for precision in [Precision::F32, Precision::F16, Precision::I8] {
+        let (exact_core, _g0) = recall_core("sql33-ip-recall-exact", &corpus, precision, false);
+        let (core, _g1) = recall_core("sql33-ip-recall-hnsw", &corpus, precision, true);
+        let mut sum = 0.0f64;
+        for qi in 0..RECALL_QUERIES {
+            let q = &corpus[qi * RECALL_QUERY_STRIDE];
+            let sql = format!(
+                "SELECT id FROM docs ORDER BY embedding <#> '{}' LIMIT {RECALL_K}",
+                vec_literal(q)
+            );
+            let (exact, consulted) = run(&exact_core, "tenant-a", &sql);
+            assert_eq!(consulted, 0, "対照側は HNSW を照会しない");
+            let (got, consulted) = run(&core, "tenant-a", &sql);
+            assert!(consulted > 0, "{precision:?}: ip 宣言は HNSW へ届く");
+            let exact_bits: std::collections::BTreeMap<u64, u64> = exact
+                .rows
+                .iter()
+                .map(|r| (r.id, r.score.to_bits()))
+                .collect();
+            for r in &got.rows {
+                if let Some(bits) = exact_bits.get(&r.id) {
+                    assert_eq!(r.score.to_bits(), *bits, "{precision:?} id {}", r.id);
+                }
+            }
+            let got_ids: Vec<u64> = got.rows.iter().map(|r| r.id).collect();
+            let want_ids: Vec<u64> = exact.rows.iter().map(|r| r.id).collect();
+            sum += recall_at_k(&got_ids, &want_ids);
+        }
+        let mean = sum / RECALL_QUERIES as f64;
+        eprintln!("ip recall@{RECALL_K} {precision:?}: {mean:.4}");
+        assert!(
+            mean >= min_recall_for(precision),
+            "{precision:?}: mean recall {mean} < {}",
+            min_recall_for(precision)
+        );
+        let stats = core.hnsw_index_cache_stats();
+        assert_eq!(stats.builds, 1, "{precision:?}: {stats:?}");
+        assert!(stats.hits >= 1, "{precision:?}: {stats:?}");
+        let kind = core
+            .search_engine_kind()
+            .map(|k| k.to_string())
+            .unwrap_or_default();
+        let want_suffix = match precision {
+            Precision::F32 => "resident=f32",
+            Precision::F16 => "resident=f16",
+            Precision::I8 => "resident=i8",
+        };
+        assert!(kind.contains(want_suffix), "{kind}");
+        assert_eq!(stats.f16_residency_fallbacks, 0, "{precision:?}");
+        assert_eq!(stats.i8_residency_fallbacks, 0, "{precision:?}");
+    }
+}
+
+/// 越境（カナリア）: tenant-a の Private 行に tenant-b のクエリの定数倍（内積が最大）のベクトルを置いても、
+/// tenant-b の `<#>` の HNSW 結果には現れない。tenant-a で問い合わせると先頭に来る（検知が vacuous でない）。
+/// キャッシュは ctx ごとに別エントリ（`(table, ctx, InnerProduct)`）になる。
+#[test]
+fn ip_hnsw_never_returns_other_tenant_canary_rows() {
+    let q_b = gen_vectors(5, HNSW_ROWS)[0].clone();
+    let canaries: Vec<Vec<f32>> = (0..30)
+        .map(|i| q_b.iter().map(|x| x * (10.0 + i as f32 * 0.01)).collect())
+        .collect();
+    let (core, _g, _path, _vb) =
+        core_with_two_tenants_at("sql33-ip-canary", HnswScope::Declared, &canaries);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <#> '{}' LIMIT 10",
+        vec_literal(&q_b)
+    );
+    let is_canary = |id: u64| (CANARY_ID_BASE..CANARY_ID_BASE + 30).contains(&id);
+
+    // tenant-a 側: カナリアが先頭に来る。
+    let (as_a, consulted) = run(&core, "tenant-a", &sql);
+    assert!(consulted > 0);
+    assert!(is_canary(as_a.rows[0].id), "{:?}", as_a.rows);
+    assert_eq!(core.hnsw_index_cache_stats().builds, 1);
+
+    // tenant-b 側: HNSW を照会し、k 件満たし、全行が tenant-b の行。エントリは ctx ごとに別。
+    let (as_b, consulted) = run(&core, "tenant-b", &sql);
+    assert!(consulted > 0);
+    assert_eq!(as_b.rows.len(), 10);
+    assert!(
+        as_b.rows.iter().all(|r| r.id >= TENANT_B_ID_BASE),
+        "{:?}",
+        as_b.rows
+    );
+    assert_eq!(core.hnsw_index_cache_stats().builds, 2);
+
+    // 末尾 `;` の単独送信でも同じ。
+    let mut session = SessionState::default();
+    match core
+        .execute_sql_in_session(&ctx("tenant-b"), &mut session, &format!("{sql};"))
+        .expect("session query")
+    {
+        SqlOutcome::Query(r) => assert_eq!(r, as_b),
+        other => panic!("expected query outcome, got {other:?}"),
+    }
+    let lines = explain_lines(&core, "tenant-b", &sql);
+    for l in &lines {
+        assert!(!l.contains("tenant"), "{l}");
+        assert!(!l.contains(&HNSW_ROWS.to_string()), "{l}");
+    }
+}
+
+/// 再起動後の `<#>` の共通検査: HNSW を照会し、k 件返り、距離値は `-dot`。
+fn assert_ip_hnsw_result(core: &EngineCore, vb: &[Vec<f32>], q: &[f32], k: usize) -> QueryResult {
+    let sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <#> '{}' LIMIT {k}",
+        vec_literal(q)
+    );
+    let (got, consulted) = run(core, "tenant-b", &sql);
+    assert!(consulted > 0, "restart must restore the ip route");
+    assert_eq!(got.rows.len(), k);
+    for r in &got.rows {
+        assert!(r.id >= TENANT_B_ID_BASE);
+        let v = &vb[(r.id - TENANT_B_ID_BASE) as usize];
+        assert!((r.score + dot(q, v)).abs() < 1e-4, "score must be -dot");
+    }
+    got
+}
+
+/// 再起動（`Storage` の再オープン）後も、永続カタログの宣言 opclass からゲート・写像・キャッシュキーが
+/// 復元され、`<#>` は HNSW を使う。fail-closed の形も保たれる。
+#[test]
+fn restart_restores_ip_declaration_and_hnsw_route() {
+    let (core, _g, path, vb) =
+        core_with_two_tenants_at("sql33-ip-restart", HnswScope::Declared, &[]);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    let q = vb[17].clone();
+    let before = assert_ip_hnsw_result(&core, &vb, &q, 10);
+    drop(core);
+
+    let core = reopen(&path, HnswScope::Declared);
+    let sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <#> '{}' LIMIT 10",
+        vec_literal(&q)
+    );
+    let lines = explain_lines(&core, "tenant-b", &sql);
+    assert_eq!(
+        line(&lines, "ann_plan: "),
+        "ann_plan: hnsw_full_visible index=idx_ip"
+    );
+    assert!(
+        line(&lines, "hnsw_params: ").contains("metric=ip,"),
+        "{lines:?}"
+    );
+    let after = assert_ip_hnsw_result(&core, &vb, &q, 10);
+    assert_eq!(after, before, "構築は決定的で再起動前後の結果は一致する");
+    let stats = core.hnsw_index_cache_stats();
+    assert_eq!(
+        stats.builds, 1,
+        "キャッシュはメモリ上のみ: 再起動後は作り直し"
+    );
+    let hits_before = stats.hits;
+    assert_ip_hnsw_result(&core, &vb, &q, 10);
+    assert!(core.hnsw_index_cache_stats().hits > hits_before);
+
+    // 末尾 `;` の単独送信。
+    let mut session = SessionState::default();
+    match core
+        .execute_sql_in_session(&ctx("tenant-b"), &mut session, &format!("{sql};"))
+        .expect("session query")
+    {
+        SqlOutcome::Query(r) => assert_eq!(r, before),
+        other => panic!("expected query outcome, got {other:?}"),
+    }
+
+    // ip だけの宣言なので `<=>` は厳密（HNSW 非照会）。
+    let cos = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 5",
+        vec_literal(&q)
+    );
+    let (_, consulted) = run(&core, "tenant-b", &cos);
+    assert_eq!(consulted, 0);
+    let lines = explain_lines(&core, "tenant-b", &cos);
+    assert_eq!(
+        line(&lines, "ann_plan: "),
+        "ann_plan: plain_scan_opclass_mismatch"
+    );
+
+    // fail-closed の維持。
+    let ql = vec_literal(&q);
+    assert_eq!(
+        err_code(
+            &core,
+            "tenant-b",
+            &format!(
+                "SELECT id FROM docs ORDER BY embedding <#> '{ql}' LIMIT 5 USING MODE 'precision'"
+            )
+        ),
+        "0A000"
+    );
+    for op in ["<->", "<+>"] {
+        assert_eq!(
+            err_code(
+                &core,
+                "tenant-b",
+                &format!("SELECT id FROM docs ORDER BY embedding {op} '{ql}' LIMIT 5")
+            ),
+            "0A000",
+            "{op}"
+        );
+    }
+    let desc = format!("SELECT id FROM docs ORDER BY embedding <#> '{ql}' DESC LIMIT 5");
+    let lines = explain_lines(&core, "tenant-b", &desc);
+    assert_eq!(
+        line(&lines, "ann_plan: "),
+        "ann_plan: plain_scan_descending"
+    );
+}
+
+/// cosine と ip の両宣言を再起動しても、`<#>` と `<=>` は物理グラフ（`(table, ctx, InnerProduct)`）を共有する。
+#[test]
+fn restart_with_cos_and_ip_shares_inner_product_cache_key() {
+    let (core, _g, path, vb) =
+        core_with_two_tenants_at("sql33-ip-restart-both", HnswScope::Declared, &[]);
+    ddl(&core, "CREATE INDEX idx_cos ON docs USING hnsw (embedding)");
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    drop(core);
+
+    let core = reopen(&path, HnswScope::Declared);
+    let q = vb[5].clone();
+    assert_ip_hnsw_result(&core, &vb, &q, 10);
+    let s1 = core.hnsw_index_cache_stats();
+    assert_eq!(s1.builds, 1);
+    let cos = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 10",
+        vec_literal(&q)
+    );
+    let (got, consulted) = run(&core, "tenant-b", &cos);
+    assert!(consulted > 0);
+    assert_eq!(got.rows.len(), 10);
+    assert!(got.rows.iter().all(|r| r.id >= TENANT_B_ID_BASE));
+    let s2 = core.hnsw_index_cache_stats();
+    assert_eq!(s2.builds, 1, "物理グラフは共有され再構築しない: {s2:?}");
+    assert!(s2.hits > s1.hits, "{s1:?} -> {s2:?}");
+    let lines = explain_lines(&core, "tenant-b", &knn_ip_sql(&q));
+    assert_eq!(
+        line(&lines, "ann_plan: "),
+        "ann_plan: hnsw_full_visible index=idx_cos,idx_ip"
+    );
+    assert!(line(&lines, "hnsw_params: ").contains("metric=ip,"));
+    let lines = explain_lines(&core, "tenant-b", &cos);
+    assert!(line(&lines, "hnsw_params: ").contains("metric=cosine,"));
+}
+
+/// ip 宣言を DROP してから再起動すると、宣言が 0 件なので `<#>` は厳密全走査（`plain_scan_engine`）で宣言なしと同じ結果になる。
+#[test]
+fn restart_after_drop_index_keeps_exact_scan() {
+    let (baseline, _g0, _p0, _) =
+        core_with_two_tenants_at("sql33-ip-restart-drop-base", HnswScope::Declared, &[]);
+    let (core, _g, path, vb) =
+        core_with_two_tenants_at("sql33-ip-restart-drop", HnswScope::Declared, &[]);
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    ddl(&core, "DROP INDEX idx_ip");
+    drop(core);
+
+    let core = reopen(&path, HnswScope::Declared);
+    let sql = knn_ip_sql(&vb[2]);
+    let (got, consulted) = run(&core, "tenant-b", &sql);
+    assert_eq!(consulted, 0);
+    let lines = explain_lines(&core, "tenant-b", &sql);
+    assert_eq!(line(&lines, "ann_plan: "), "ann_plan: plain_scan_engine");
+    let (exact, _) = run(&baseline, "tenant-b", &sql);
+    assert_eq!(got, exact);
+}
+
+/// `HnswScope::All` でも再起動後に ip 宣言があれば `<#>` は HNSW を照会し、宣言なしなら厳密のまま。
+#[test]
+fn restart_scope_all_with_ip_declaration_routes_hnsw() {
+    let (core, _g, path, vb) =
+        core_with_two_tenants_at("sql33-ip-restart-all", HnswScope::All, &[]);
+    let (_, consulted) = run(&core, "tenant-b", &knn_ip_sql(&vb[1]));
+    assert_eq!(consulted, 0, "宣言なしの All は <#> を HNSW へ送らない");
+    ddl(
+        &core,
+        "CREATE INDEX idx_ip ON docs USING hnsw (embedding vector_ip_ops)",
+    );
+    drop(core);
+
+    let core = reopen(&path, HnswScope::All);
+    assert_ip_hnsw_result(&core, &vb, &vb[1], 10);
+    let lines = explain_lines(&core, "tenant-b", &knn_ip_sql(&vb[1]));
+    assert!(
+        line(&lines, "hnsw_params: ").contains("metric=ip,"),
+        "{lines:?}"
+    );
 }

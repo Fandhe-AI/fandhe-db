@@ -215,13 +215,13 @@ _EXPLAIN_REASON = (
 )
 
 # `ingest_bulk`: NoSQL（HTTP）表層には COPY FROM STDIN 相当のストリーミング一括投入
-# op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当で、1 要求あたり既定
-# 64 行（INDEX-4 ①）・要求ごとに commit する。SQL 表層（`self_db`）の COPY 計測
-# （64 行ずつの複数 COPY）と同形の計測は本アダプタでは未実装のため unsupported とする。
+# op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当で、要求ごとに commit する
+# （INDEX-4 ① は Issue #3308 以降 rows には掛からない）。SQL 表層（`self_db`）の COPY 計測
+# （過去の計測と比較できるよう 64 行ずつの複数 COPY）と同形の計測は本アダプタでは未実装のため unsupported とする。
 _INGEST_BULK_REASON = (
     "NoSQL 表層に COPY 相当のストリーミング一括投入 op が無い。op: insert の rows 配列は"
-    "複数行 INSERT 相当（1 要求あたり既定上限 64 行〔INDEX-4 ①。FANDHE_DB_BATCH_MAX_FILES "
-    "で上書き可〕・要求ごとに commit）で、SQL 表層の COPY 計測と同形の rows 分割投入は"
+    "複数行 INSERT 相当（INDEX-4 ① は掛からない〔Issue #3308〕・要求ごとに commit）"
+    "で、SQL 表層の COPY 計測と同形の rows 分割投入は"
     "本アダプタでは未実装（crates/wire-server/docs/nosql-api.md「insert」節）"
 )
 
