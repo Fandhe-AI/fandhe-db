@@ -102,20 +102,18 @@ fn assert_row_count(stream: &mut std::net::TcpStream, expected: usize) {
     read_ready_for_query(stream);
 }
 
+/// Issue #3308: `--batch-max-files` の解決値（①）は行の形の複数行 `VALUES` には効かない。
+/// ①が 3 でも 4 行が成功する（ファイル形の一括投入には引き続き効く。engine 側
+/// `core_misc/batch_limits.rs` が固定。wire 経路にファイル形の入口は無い）。
 #[test]
-fn sql_multi_row_values_respects_cli_resolved_limit() {
+fn sql_multi_row_values_ignores_cli_resolved_file_limit() {
     let (core, _guard) = new_core(limits_from_cli("3"));
     let mut stream = spawn_with_alice(core);
 
     send_simple_query(&mut stream, &multi_row_insert_sql(4, "parity-sql-over"));
-    expect_error_response_with_sqlstate(&mut stream, "54000");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 4");
     read_ready_for_query(&mut stream);
-    assert_row_count(&mut stream, 0);
-
-    send_simple_query(&mut stream, &multi_row_insert_sql(3, "parity-sql-at"));
-    assert_eq!(read_command_complete(&mut stream), "INSERT 0 3");
-    read_ready_for_query(&mut stream);
-    assert_row_count(&mut stream, 3);
+    assert_row_count(&mut stream, 4);
 }
 
 #[test]

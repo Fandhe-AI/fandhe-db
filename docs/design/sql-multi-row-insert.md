@@ -30,9 +30,9 @@ SQL テキスト
                        │
                        ▼（RowBatch のみ）
        core::EngineCore::execute_insert_form の RowBatch 分岐
-         1. ①行数上限: bounds.len() > self.batch_limits.max_files_per_batch → 54000
+         1. （Issue #3308 以降）①は掛けない。行数上限は --max-insert-rows 指定時のみ
          2. ②③④: EngineCore::validate_insert_batch_byte_and_chunk_limits
-            （batch_limits::validate_batch_shape・validate_chunk_total）→ 54000
+            （batch_limits::validate_row_batch_shape・validate_chunk_total）→ 54000
          3. sql::exec::execute_insert_batch_with_schema（単一 write トランザク
             ション・単一台帳エントリ・operation_id 必須化ガード込み）
 ```
@@ -111,3 +111,19 @@ limits`）が想定外に大きい `Vec<BoundInsert>` を受け取ることは�
 採番する。内容照合ハッシュは `id` を材料にしない別タグ（`InsertIdentityBatch`・
 `InsertIdentityBatchExpr`）で、全行が明示 `id` のバッチは従来のタグ・バイト列のまま。
 詳細は [migrated-id-identity.md](migrated-id-identity.md) の D8。
+
+## Issue #3308 追記: 行の形から INDEX-4 ① を外す
+
+- INDEX-4 ①（`max_files_per_batch`。既定 64）はファイル形の一括投入向けの値であり、行の形
+  （複数行 `VALUES`・UPSERT・`RETURNING` 付き・INSERT…SELECT・NoSQL `rows[]`）の行数には
+  掛けない。65 行以上の複数行 `VALUES` は既定構成で成功する。上の判定順・上限表の ① の記述は
+  本追記が優先する。
+- 行数の上限は `--max-insert-rows`（`dml_limits.max_insert_rows_per_statement`）の指定時だけ。
+  未指定時の実効上限は ④（1 行 = 1 チャンクで `max_batch_chunks`。既定 4096・
+  `FANDHE_DB_BATCH_MAX_CHUNKS` で上書き可）になる。②③④と SQL 文長の上限は従来どおりで、
+  超過は `54000`・副作用ゼロ。
+- ④は束縛前（`row_count` だけで判定できる時点）にも判定し、`--max-insert-rows` 未指定でも
+  束縛の作業量を有界に保つ（`EngineCore::validate_row_count_chunk_limit`）。
+- ファイル形の一括投入（`execute_insert_sql_batch`・`incremental::index_file_batch`）の ① と
+  `COPY FROM` の逐次判定は変更しない（COPY は Issue #3309）。警告・README の整合は Issue #3310。
+- 関連 ID: SQL-16・INDEX-4・NOSQL-6（ポインタのみ）。

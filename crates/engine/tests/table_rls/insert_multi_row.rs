@@ -533,33 +533,90 @@ fn multi_row_insert_rejects_row_with_mismatched_literal_count() {
 // NoSQL 表層 `rows[]`（`execute_bound_insert_in_session`）と同一上限を共有する。
 // ---------------------------------------------------------------------
 
+/// Issue #3308: ①（`max_files_per_batch`）は行の形の複数行 `VALUES` には掛からない。
+/// 上限 2 でも 3 行・100 行が成功する（ファイル形の一括投入の ① は別テストで維持）。
 #[test]
-fn multi_row_insert_over_batch_limits_row_count_is_rejected_with_54000() {
-    // `sql::parser::MAX_INSERT_ROWS_PER_STATEMENT`（実装既定値 1,000）を超えない
-    // 行数（3 行）でも、運用者が絞った `self.batch_limits.max_files_per_batch`
-    // （ここでは 2）を超えれば NoSQL 表層と同じ `54000` で拒否される
-    // （`sql_insert_batch_public_api.rs::execute_bound_insert_in_session_row_count_limit_precedes_bind`
-    // と同型の上限。SQL 表層の複数行 VALUES が `batch_limits` を迂回しないことを固定）。
+fn multi_row_insert_ignores_batch_file_limit() {
     let (core, path) = open_engine_with_limits(
-        "insert-multi-row-batch-limits-row-count",
+        "insert-multi-row-ignores-file-limit",
         engine::batch_limits::BatchLimits {
             max_files_per_batch: 2,
+            max_batch_chunks: 10_000,
             ..engine::batch_limits::BatchLimits::default()
         },
     );
     let _guard = CleanupGuard(path);
     let policy = ctx("tenant-a");
 
-    let sql = multi_row_sql(TABLE, &[1, 2, 3], "op-batch-limit-rows");
+    let ids: Vec<u64> = (1..=100).collect();
+    let sql = multi_row_sql(TABLE, &ids, "op-ignores-file-limit");
+    let outcome = core
+        .execute_insert_sql(&policy, &sql)
+        .expect("100-row multi-row VALUES must succeed without the file count limit");
+    assert_eq!(outcome.rows_affected, 100);
+    assert_eq!(read_back_ids(&core, "tenant-a").len(), 100);
+}
+
+/// Issue #3308: 行の形でも④（1 行 = 1 チャンク）は働き、超過は `54000`・副作用ゼロ。
+#[test]
+fn multi_row_insert_over_chunk_limit_is_rejected_with_54000_and_no_side_effects() {
+    let (core, path) = open_engine_with_limits(
+        "insert-multi-row-chunk-limit-rows",
+        engine::batch_limits::BatchLimits {
+            max_files_per_batch: 2,
+            max_batch_chunks: 2,
+            ..engine::batch_limits::BatchLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let sql = multi_row_sql(TABLE, &[1, 2, 3], "op-chunk-limit-rows");
     let err = core
         .execute_insert_sql(&policy, &sql)
-        .expect_err("row count over batch_limits.max_files_per_batch must be rejected");
+        .expect_err("row count over max_batch_chunks must be rejected");
     assert_eq!(err.wire_code(), "54000");
+    assert!(read_back_ids(&core, "tenant-a").is_empty());
+}
+
+/// Issue #3308: `--max-insert-rows` 指定時だけ行数上限が掛かる（70 行は成功・71 行は `54000`）。
+#[test]
+fn multi_row_insert_over_default_64_rows_honors_only_max_insert_rows() {
+    let path = unique_db_path("insert-multi-row-70-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&row_schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_dml_limits(engine::sql::parser::DmlLimits {
+            max_insert_rows_per_statement: Some(
+                std::num::NonZeroUsize::new(70).expect("70 is nonzero"),
+            ),
+            ..engine::sql::parser::DmlLimits::default()
+        })
+        .with_batch_limits(engine::batch_limits::BatchLimits {
+            max_files_per_batch: 64,
+            max_batch_chunks: 10_000,
+            ..engine::batch_limits::BatchLimits::default()
+        });
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let over: Vec<u64> = (1..=71).collect();
+    let err = core
+        .execute_insert_sql(&policy, &multi_row_sql(TABLE, &over, "op-70-over"))
+        .expect_err("71 rows over --max-insert-rows=70 must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    assert!(read_back_ids(&core, "tenant-a").is_empty());
+
+    let ok: Vec<u64> = (1..=70).collect();
+    let outcome = core
+        .execute_insert_sql(&policy, &multi_row_sql(TABLE, &ok, "op-70-ok"))
+        .expect("70 rows at the limit must succeed");
+    assert_eq!(outcome.rows_affected, 70);
 }
 
 #[test]
 fn multi_row_insert_within_batch_limits_row_count_succeeds() {
-    // 上限ちょうど（2 行）は成功する（境界値確認）。
+    // ①は行の形に掛からないため、上限 2 と同数（2 行）は当然成功する（Issue #3308。回帰確認）。
     let (core, path) = open_engine_with_limits(
         "insert-multi-row-batch-limits-row-count-ok",
         engine::batch_limits::BatchLimits {
