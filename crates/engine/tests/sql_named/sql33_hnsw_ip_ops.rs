@@ -390,6 +390,7 @@ fn ip_hnsw_path_keeps_tenant_boundary() {
         assert!(!l.contains(&HNSW_ROWS.to_string()), "{l}");
     }
 }
+
 /// 一致契約（Issue #3304）: HNSW 結果に含まれる行の距離値は厳密全走査とビット一致し、
 /// 並びは距離昇順・同点は id 昇順になる。
 #[test]

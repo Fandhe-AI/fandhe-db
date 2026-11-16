@@ -5167,6 +5167,78 @@ mod tests {
         );
     }
 
+    /// Issue #3304: 全成分 0 のクエリは再開型でも全走査へ縮退し、再開状態を破棄して
+    /// fallback を計上する。
+    #[test]
+    fn search_prepared_resumable_zero_query_resets_state_and_falls_back() {
+        let path = unique_db_path("hnsw-cache-resumable-zero-query");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        for i in 0..2_000u64 {
+            let v = i as f32;
+            seed_row(
+                &storage,
+                "docs",
+                i,
+                "tenant-a",
+                &[v, v + 1.0, v + 2.0, v + 3.0],
+            );
+        }
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+        let gate_cache = crate::catalog::IndexCatalogGateCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+            index_gate_cache: &gate_cache,
+            hnsw_scope: crate::search_engine::HnswScope::All,
+            graph_metric: Some(HnswMetric::InnerProduct),
+            build_options: None,
+        };
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+        let prepared = prepare_full_visible(&access, &read_txn, "docs", &c, &arena);
+        let provider = crate::kernel::CpuScalarProvider;
+        let mut resume: Option<HnswResumeState> = None;
+
+        // 非ゼロクエリで再開状態を作る。
+        search_prepared_resumable(
+            &access,
+            &prepared,
+            &provider,
+            &arena,
+            &slot_ids,
+            &[0.0f32, 1.0, 2.0, 3.0],
+            10,
+            &mut resume,
+        )
+        .expect("non-zero query succeeds");
+        let fallbacks_before = cache.stats().fallbacks;
+
+        let zero = [0.0f32; 4];
+        let hits = search_prepared_resumable(
+            &access,
+            &prepared,
+            &provider,
+            &arena,
+            &slot_ids,
+            &zero,
+            10,
+            &mut resume,
+        )
+        .expect("zero query succeeds");
+        assert!(resume.is_none(), "ゼロクエリは再開状態を破棄する");
+        assert_eq!(cache.stats().fallbacks, fallbacks_before + 1);
+        let expected = full_scan_with_arena(&provider, &arena, &zero, 10).expect("full scan");
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            expected.iter().map(|h| h.id).collect::<Vec<_>>()
+        );
+    }
+
     /// Issue #505: `k > MAX_EF` のラウンドは再開型探索を試みず状態を破棄する
     /// （`search_prepared` の既存 `ef_cap_fallbacks` 縮退契約と同じ挙動）。
     #[test]
