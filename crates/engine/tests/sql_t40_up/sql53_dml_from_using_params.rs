@@ -3,7 +3,7 @@
 //!
 //! 契約: Parse（位置規則・型推論・Describe 用ダミー値）→ Bind（置換後の再解析）→ 実行の経路が、
 //! 同じ値をリテラルで書いた簡易クエリと同じ結果・同じ `wire_code` になる。結合 WHERE が受理しない
-//! 数値位置は `42601` で fail-closed。結合 DML の公開名重複は PG と同じ `42712`。
+//! 位置は `42601` で fail-closed。結合 DML の公開名重複は PG と同じ `42712`。
 //! ポインタ: `docs/design/update-from-delete-using.md`。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -326,6 +326,30 @@ fn describe_with_date_set_param() {
         "UPDATE docs SET d = 'not-a-date' FROM langs WHERE docs.lang = langs.lang"
     )
     .is_err());
+}
+
+/// 括弧付きの SET `($n)`（何重でも）も素の `$n` と同じ経路で Parse／Describe／Bind できる。
+/// DATE 列の `($n)` は式内 `$n` の型推論が非対応（`0A000`）で、結合なしの UPDATE と同じコードになる
+/// （Describe のダミー値の判定を括弧付きへ広げても、この fail-closed を緩めない）。
+#[test]
+fn parenthesized_set_param_follows_plain_param() {
+    let (core, path) = new_core("p3297-describe-set-paren");
+    let _g = CleanupGuard(path);
+    seed(&core);
+    for sql in [
+        "UPDATE docs SET lang = ($1) FROM langs WHERE docs.lang = langs.lang",
+        "UPDATE docs SET lang = (($1)) FROM langs WHERE docs.lang = langs.lang",
+    ] {
+        let prepared = core.parse_sql_prepared(sql).expect(sql);
+        core.describe_prepared_in_session(&SessionState::default(), &prepared)
+            .expect("describe");
+        exec_bound(&core, sql, &["zz"]).expect(sql);
+    }
+    let joined = code(
+        core.parse_sql_prepared("UPDATE docs SET d = ($1) FROM langs WHERE docs.lang = langs.lang"),
+    );
+    let plain = code(core.parse_sql_prepared("UPDATE docs SET d = ($1) WHERE lang = 'ja'"));
+    assert_eq!(joined, plain);
 }
 
 /// JOIN 連鎖の後続表の列型も `$n` の型推論に使う（`b.flag` は BOOLEAN）。畳み込み source

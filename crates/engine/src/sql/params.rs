@@ -320,13 +320,20 @@ pub(crate) fn joined_dml_dummy_flags(tokens: &[Token], kinds: &[ParamLiteralKind
                     }
                     return;
                 }
+                // 右辺は素の `$n` に加え、括弧で包んだ `($n)`（何重でも）も単独の `$n` とみなす。
+                let mut rhs = seg.get(2..).unwrap_or(&[]);
+                while let Some(inner) = rhs
+                    .strip_prefix(&[Token::Punct('(')])
+                    .and_then(|r| r.strip_suffix(&[Token::Punct(')')]))
+                {
+                    rhs = inner;
+                }
                 flags.push(matches!(
-                    seg,
-                    [
-                        Token::Ident(_) | Token::QuotedNull(_),
-                        Token::Punct('='),
-                        Token::Param(n),
-                    ] if kind_of(kinds, *n) == ParamLiteralKind::String
+                    (seg.get(..2), rhs),
+                    (
+                        Some([Token::Ident(_) | Token::QuotedNull(_), Token::Punct('=')]),
+                        [Token::Param(n)],
+                    ) if kind_of(kinds, *n) == ParamLiteralKind::String
                 ));
             };
             for (i, t) in region.iter().enumerate() {

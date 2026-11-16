@@ -515,4 +515,4 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
 
 ### 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`）の `$n`（Issue #3297）
 
-SET 右辺・WHERE の `<列|公開名.列> = $n`（`AND` 区切りの連言）・`USING OPERATION_ID $n` を受理する。型は修飾子が指す表の列から推論し、整数・浮動小数列の WHERE は `42601`。詳細は [update-from-delete-using.md](update-from-delete-using.md) の「`$n` と公開名重複」節。
+SET 右辺・WHERE の `<列|公開名.列> = $n`（`AND` 区切りの連言）・`USING OPERATION_ID $n` を受理する。型は修飾子が指す表の列から推論し。整数・浮動小数列の WHERE の等価比較も受理する。詳細は [update-from-delete-using.md](update-from-delete-using.md) の「`$n` と公開名重複」節。
