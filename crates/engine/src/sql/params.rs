@@ -261,12 +261,14 @@ pub(crate) fn joined_dml_dummy_flags(tokens: &[Token], kinds: &[ParamLiteralKind
                 if matches!(seg.first(), Some(Token::Punct('('))) {
                     let mut d: usize = 0;
                     let mut cols: usize = 1;
-                    for t in seg {
+                    let mut close = None;
+                    for (i, t) in seg.iter().enumerate() {
                         match t {
                             Token::Punct('(') => d = d.saturating_add(1),
                             Token::Punct(')') => {
                                 d = d.saturating_sub(1);
                                 if d == 0 {
+                                    close = Some(i);
                                     break;
                                 }
                             }
@@ -274,7 +276,40 @@ pub(crate) fn joined_dml_dummy_flags(tokens: &[Token], kinds: &[ParamLiteralKind
                             _ => {}
                         }
                     }
-                    flags.extend(std::iter::repeat_n(false, cols));
+                    // 右辺が `( <式>, ... )` で要素数が左辺の列数と一致するとき、要素ごとに
+                    // 「単独の `$n`（置換種別が String）か」を積む。それ以外は全て検証側（偽）。
+                    let elems: Option<Vec<bool>> = close.and_then(|c| {
+                        let rest = seg.get(c.saturating_add(1)..)?;
+                        let (Token::Punct('='), Token::Punct('('), inner) =
+                            (rest.first()?, rest.get(1)?, rest.get(2..)?)
+                        else {
+                            return None;
+                        };
+                        let inner = inner.strip_suffix(&[Token::Punct(')')])?;
+                        let mut out = Vec::new();
+                        let mut dd: usize = 0;
+                        let mut st = 0usize;
+                        let one = |e: &[Token]| {
+                            matches!(e, [Token::Param(n)] if kind_of(kinds, *n) == ParamLiteralKind::String)
+                        };
+                        for (i, t) in inner.iter().enumerate() {
+                            match t {
+                                Token::Punct('(') | Token::Punct('[') => dd = dd.saturating_add(1),
+                                Token::Punct(')') | Token::Punct(']') => dd = dd.saturating_sub(1),
+                                Token::Punct(',') if dd == 0 => {
+                                    out.push(one(inner.get(st..i)?));
+                                    st = i.saturating_add(1);
+                                }
+                                _ => {}
+                            }
+                        }
+                        out.push(one(inner.get(st..)?));
+                        (out.len() == cols).then_some(out)
+                    });
+                    match elems {
+                        Some(v) => flags.extend(v),
+                        None => flags.extend(std::iter::repeat_n(false, cols)),
+                    }
                     return;
                 }
                 flags.push(matches!(
@@ -317,7 +352,11 @@ pub(crate) fn joined_where_conjunct_flags(
     let Some((start, end)) = where_region(tokens) else {
         return Vec::new();
     };
-    let region = tokens.get(start.saturating_add(1)..end).unwrap_or(&[]);
+    let mut region = tokens.get(start.saturating_add(1)..end).unwrap_or(&[]);
+    // `where_region` は末尾の `;` を領域に含めるため、最後の連言分の形判定の前に除く。
+    while let Some(rest) = region.strip_suffix(&[Token::Punct(';')]) {
+        region = rest;
+    }
     let mut flags = Vec::new();
     let mut depth: usize = 0;
     let mut seg_start = 0usize;

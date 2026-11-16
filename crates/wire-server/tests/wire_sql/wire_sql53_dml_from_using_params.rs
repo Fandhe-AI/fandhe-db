@@ -28,6 +28,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("embedding", ColumnType::Vector(2), false),
                 ColumnDef::new("lang", ColumnType::Text, false),
                 ColumnDef::new("n", ColumnType::Integer, true),
+                ColumnDef::new("d", ColumnType::Date, true),
             ],
         ))
         .expect("create docs");
@@ -38,6 +39,7 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
                 ColumnDef::new("lang", ColumnType::Text, false),
                 ColumnDef::new("label", ColumnType::Text, true),
                 ColumnDef::new("n", ColumnType::BigInt, true),
+                ColumnDef::new("d", ColumnType::Date, true),
             ],
         ))
         .expect("create langs");
@@ -219,4 +221,56 @@ fn set_expr_param_type_follows_from_side_qualified_column() {
         }
     }
     assert_eq!(oids, vec![20]); // int8（BIGINT）
+}
+
+/// Parse → Describe(S) → Bind → Execute → Sync が全段で成功することを確かめる（DATE 列へ `$n` を
+/// 渡す形。Describe 用ダミー値が実値として検証され `22007` になる回帰の再現。PR #3472 指摘）。
+fn assert_extended_ok(sql: &str, values: &[&str], expect_tag: &str) {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+    let (_oids, tag) = extended(&mut stream, sql, values);
+    assert_eq!(tag, expect_tag, "{sql}");
+}
+
+#[test]
+fn describe_date_param_with_trailing_semicolon() {
+    assert_extended_ok(
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND langs.d = $1;",
+        &["2024-01-02"],
+        "DELETE 0",
+    );
+}
+
+#[test]
+fn describe_date_param_through_view_source() {
+    let (core, _g) = new_core();
+    {
+        let mut session = engine::sql::mode::SessionState::default();
+        session.allow_ddl();
+        let ctx = engine::policy::PolicyContext::new("tenant-a").expect("valid tenant id");
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "CREATE VIEW v AS SELECT id, lang, d FROM langs WHERE label = 'Japanese'",
+        )
+        .expect("create view");
+    }
+    let mut stream = connect(core);
+    seed(&mut stream);
+    let (_oids, tag) = extended(
+        &mut stream,
+        "DELETE FROM docs USING v WHERE docs.lang = v.lang AND v.d = $1",
+        &["2024-01-02"],
+    );
+    assert_eq!(tag, "DELETE 0");
+}
+
+#[test]
+fn describe_date_param_in_row_value_assignment() {
+    assert_extended_ok(
+        "UPDATE docs SET (d, lang) = ($1, $2) FROM langs WHERE docs.lang = langs.lang",
+        &["2024-01-02", "ja"],
+        "UPDATE 1",
+    );
 }

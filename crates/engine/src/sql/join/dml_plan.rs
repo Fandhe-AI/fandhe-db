@@ -814,7 +814,7 @@ fn plan_joined(
     other_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
     conjunct_dummy: &[bool],
-) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+) -> Result<(JoinedDmlPlan, Vec<bool>), SqlSurfaceError> {
     let (Some(target_ref), others) = (
         input.relations.first(),
         input.relations.get(1..).unwrap_or(&[]),
@@ -870,6 +870,8 @@ fn plan_joined(
             returning_columns.push(i);
         }
     }
+    // ビュー述語の畳み込み（`core::dml_from_exec`）が再束縛で引き継ぐ、source 側のダミーフラグ。
+    let source_dummy = split.source_dummy.clone();
     let source = match &map {
         SourceMap::Single => {
             let (Some(source_ref), Some(source_schema)) = (others.first(), other_schemas.first())
@@ -904,7 +906,25 @@ fn plan_joined(
         returning: None,
     };
     resolve_returning(&mut plan, &map, input.returning.cloned())?;
-    finish(plan, udfs)
+    Ok((finish(plan, udfs)?, source_dummy))
+}
+
+/// ビュー述語を source 述語の先頭へ畳み込んだ後の再束縛用ダミーフラグ（Issue #3297）。
+/// ビュー定義の述語は実リテラルなので、その葉の数だけ偽を先頭に置き、続けて source 側のフラグを引き継ぐ。
+pub(crate) fn view_prefixed_dummy(
+    view_preds: &[WherePredicate],
+    source_dummy: &[bool],
+) -> Vec<bool> {
+    if source_dummy.is_empty() {
+        return Vec::new();
+    }
+    let n = view_preds
+        .iter()
+        .map(ordinal_leaf_count)
+        .fold(0usize, usize::saturating_add);
+    let mut out = vec![false; n];
+    out.extend_from_slice(source_dummy);
+    out
 }
 
 /// 束縛済みの `UPDATE ... FROM` を [`JoinedDmlPlan`] へ変換する。呼び出し元は
@@ -915,7 +935,7 @@ pub(crate) fn plan_update_from(
     from_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
-    plan_update_from_describe(bound, target_schema, from_schemas, udfs, &[])
+    plan_update_from_describe(bound, target_schema, from_schemas, udfs, &[]).map(|(p, _)| p)
 }
 
 /// [`plan_update_from`] の Describe 用版（Issue #3297）。`conjunct_dummy` は WHERE の連言分ごとの
@@ -927,7 +947,7 @@ pub(crate) fn plan_update_from_describe(
     from_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
     conjunct_dummy: &[bool],
-) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+) -> Result<(JoinedDmlPlan, Vec<bool>), SqlSurfaceError> {
     plan_joined(
         PlanInput {
             relations: bound.relations(),
@@ -951,7 +971,7 @@ pub(crate) fn plan_delete_using(
     using_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
-    plan_delete_using_describe(bound, target_schema, using_schemas, udfs, &[])
+    plan_delete_using_describe(bound, target_schema, using_schemas, udfs, &[]).map(|(p, _)| p)
 }
 
 /// [`plan_delete_using`] の Describe 用版（Issue #3297。[`plan_update_from_describe`] と同じ契約）。
@@ -961,7 +981,7 @@ pub(crate) fn plan_delete_using_describe(
     using_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
     conjunct_dummy: &[bool],
-) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+) -> Result<(JoinedDmlPlan, Vec<bool>), SqlSurfaceError> {
     plan_joined(
         PlanInput {
             relations: bound.relations(),
