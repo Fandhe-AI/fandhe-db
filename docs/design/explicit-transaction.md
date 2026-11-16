@@ -735,13 +735,16 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   （単一行・複数行・`ON CONFLICT`・`RETURNING`）・`SELECT`/集計/スキャン/JOIN/集合演算/定数 SELECT
   （`USING PLAN`・ルーチン呼び出し・ビュー展開を除く）。表・索引を DROP した後は DDL 以外を `0A000` にする。
   それ以外（`UPDATE`・`DELETE`・`TRUNCATE`・`EXPLAIN`・`COPY`・カーソル・`LOCK`・`DO`・`SET ROLE` など）は `0A000`。
-  拡張クエリの Execute も同じ入口を通るため同じ。同じ Tx で作った表への SELECT・INSERT を Parse 時点で
-  解決できない拡張クエリは `42P01` になる（V7。受け皿は #3314）
+  拡張クエリの Execute（Parse・Bind 済みの文）は、確定済みカタログで束縛した文を実行しないため、DDL・Tx 制御・
+  `SET`/`SHOW` 以外を `0A000` にする（`execute_parsed_in_txn_unscrubbed`。V7。受け皿は #3314）。`COPY` は
+  `begin_copy_in_txn` が同じく `0A000`。同じ Tx で作った表への SELECT・INSERT を Parse 時点で解決できない
+  拡張クエリは `42P01` になる
 - 確定済みカタログを読む解析の表スキーマの引き当て（`impl TableLookup for Storage`・INSERT の
   `InsertSchemaLookup`）は、Tx が変更した表（dirty）の write txn 上のスキーマを文の区間だけ重ねて見る
   （`sql::txn_overlay`。スレッドローカルの RAII。重ねるのは張った `Storage` だけで、一時表用の別 `Storage`
   には効かない）。実行本体は write txn を直接読む。確定済みカタログ側の権限（ACL）は重ねないため、
-  束縛ロールのセッションが同じ Tx で作った表へ触れる経路は `42501`（fail-closed。受け皿は #3314）
+  束縛ロールのセッションが同じ Tx で作った表へ触れる経路は `42501` になる想定（fail-closed。**未検証**。
+  結線は #3314 の V2）
 - 世代を鍵にするキャッシュ（V4）: write txn から読んだ内容をキャッシュへ載せない。DDL を積んだ Tx の読み取りは
   常に writer から読み、ROLLBACK 後の世代の再利用でも別セッションの検索へ漏れないことをテスト
   （`sql80_txn_table_ddl.rs`）で固定した
@@ -751,7 +754,8 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   行セキュリティ、`CREATE TABLE ... AS`、SERIAL/IDENTITY 列（暗黙 SEQUENCE の採番状態が ROLLBACK で戻らず、再利用される
   内部 ID と食い違うため）、SCHEMA 配下の表・索引、一時表の DDL、既存行を処理する DDL の期限の検査点
   （`CREATE INDEX` の構築ループなどは文の期限だけ。Tx の残り時間との小さい方は #3314）
-- 変更ログのオラクル試験（`make change-log-oracle`）は DDL と DML が混ざる commit を含めて緑
+- 変更ログのオラクル試験: `FANDHE_CHANGE_LOG_ORACLE=1`（`--all-features`）で `sql_t40_up`・`sql_named`・`table_rls`・
+  `sql_t01_39` を流して緑（DDL と DML が混ざる commit を含む）。`make change-log-oracle` の全体（2 段）は未検証
 
 ### 子 Issue への割り当て（申し送り）
 
