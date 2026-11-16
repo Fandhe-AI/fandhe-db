@@ -287,3 +287,42 @@ fn wire_row_compare_extended_query_errors_keep_the_connection() {
         &["1"],
     );
 }
+
+/// 行値の `IN`／`NOT IN`（Issue #3299）が末尾 `;` 付きの単独送信で行を返す。NULL 成分の行は UNKNOWN で出ない。
+#[test]
+fn wire_row_in_with_trailing_semicolon() {
+    let (core, _guard) = new_core();
+    let users_path = write_user_store_file(&[("alice", "tenant-alice", "pw-alice")]);
+    let addrs = [spawn_server_with_engine(&users_path, core)];
+    let mut stream = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+    insert(&mut stream, 1, "1", "1");
+    insert(&mut stream, 2, "3", "5");
+    insert(&mut stream, 3, "3", "NULL");
+
+    expect_ids(
+        &mut stream,
+        "SELECT id FROM docs WHERE (a, b) IN ((1, 1), (3, 5)) ORDER BY id LIMIT 10;",
+        &["1", "2"],
+    );
+    expect_ids(
+        &mut stream,
+        "SELECT id FROM docs WHERE (a, b) NOT IN ((1, 1)) ORDER BY id LIMIT 10;",
+        &["2", "3"],
+    );
+}
+
+/// 行値の `IN` の要素の成分数不一致は `42601` の ErrorResponse の後に ReadyForQuery が返り、接続は継続する。
+#[test]
+fn wire_row_in_malformed_carries_sqlstate() {
+    let (core, _guard) = new_core();
+    let users_path = write_user_store_file(&[("alice", "tenant-alice", "pw-alice")]);
+    let addrs = [spawn_server_with_engine(&users_path, core)];
+    let mut stream = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM docs WHERE (a, b) IN ((1, 2, 3)) LIMIT 5;",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}

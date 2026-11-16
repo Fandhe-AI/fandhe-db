@@ -256,7 +256,7 @@ impl JoinedDmlPlan {
     }
 
     /// 結合キーごとの型クラス。両辺のクラスが異なれば `42804`、許可されない型は `42601`。
-    fn key_classes(&self) -> Result<Vec<JoinKeyClass>, SqlSurfaceError> {
+    pub(crate) fn key_classes(&self) -> Result<Vec<JoinKeyClass>, SqlSurfaceError> {
         fn class_of(
             schema: &TableSchema,
             column: Option<usize>,
@@ -297,17 +297,16 @@ fn to_u32(v: usize) -> Result<u32, SqlSurfaceError> {
     u32::try_from(v).map_err(|_| SqlSurfaceError::payload_too_large("JOIN row count exceeds limit"))
 }
 
-/// FROM／USING 側を `ctx`（RLS 暗黙適用）で走査してハッシュ表にする。`read_txn` は呼び出し元の
-/// 共有 write txn（自トランザクションの未 commit の変更が見え、文の開始時点のスナップショットになる）。
-fn build_source_index(
-    read_txn: &impl crate::storage::read_source::ReadSource,
-    ctx: &PolicyContext,
+/// FROM／USING 側の走査入力（[`BoundScan`](crate::sql::parser::BoundScan)）を作る。実行器
+/// （[`build_source_index`]）と `EXPLAIN UPDATE ... FROM`／`EXPLAIN DELETE ... USING`
+/// （`core/explain_dml.rs`。Issue #3293）が同じ関数を共有し、`EXPLAIN` の走査分類が実経路と
+/// 矛盾しないようにする（D5）。行・ストレージには触れない（スキーマと述語の束縛だけ）。
+/// 側スキャンの `LIMIT` は内部値（入力行数上限 + 1）に差し替える（JOIN の側スキャンと同じ）。
+pub(crate) fn source_bound_scan(
     plan: &JoinedDmlPlan,
-    classes: &[JoinKeyClass],
     udfs: &UdfRegistry,
     limits: &JoinLimits,
-    budget: &mut JoinBudget,
-) -> Result<SourceIndex, SqlSurfaceError> {
+) -> Result<crate::sql::parser::BoundScan, SqlSurfaceError> {
     let schema = &plan.source.schema;
     let columns = plan.scan_columns();
     let id_needed = plan.source_id_in_cells();
@@ -339,7 +338,6 @@ fn build_source_index(
         with_ties: false,
         distinct_on: None,
     };
-    // 側スキャンの `LIMIT` は内部値（入力行数上限 + 1）に差し替える（JOIN の側スキャンと同じ）。
     let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
         &scan,
         schema,
@@ -348,6 +346,24 @@ fn build_source_index(
         &crate::result_limits::ResultLimits::default(),
     )?;
     bound.limit = limits.max_input_rows.saturating_add(1);
+    Ok(bound)
+}
+
+/// FROM／USING 側を `ctx`（RLS 暗黙適用）で走査してハッシュ表にする。`read_txn` は呼び出し元の
+/// 共有 write txn（自トランザクションの未 commit の変更が見え、文の開始時点のスナップショットになる）。
+fn build_source_index(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    plan: &JoinedDmlPlan,
+    classes: &[JoinKeyClass],
+    udfs: &UdfRegistry,
+    limits: &JoinLimits,
+    budget: &mut JoinBudget,
+) -> Result<SourceIndex, SqlSurfaceError> {
+    let schema = &plan.source.schema;
+    let columns = plan.scan_columns();
+    let id_offset = usize::from(plan.source_id_in_cells());
+    let bound = source_bound_scan(plan, udfs, limits)?;
     let result = crate::sql::scan::execute_scan_with_budget(
         read_txn,
         ctx,

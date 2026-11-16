@@ -8797,8 +8797,27 @@ impl EngineCore {
         }
         // SQL-53 (b)・Issue #1754: `UPDATE ... FROM`／`DELETE ... USING` の `$n` は位置規則の対象外のため、
         // Parse 段で `42601` として拒否する（fail-closed。`#1750` の WHERE 内サブクエリと同じ扱い）。
-        if (crate::sql::allowlist::looks_like_update_from(&tokens)
-            || crate::sql::allowlist::looks_like_delete_using(&tokens))
+        // Issue #3293: `EXPLAIN [ANALYZE|VERBOSE|(オプション)]` の前置があっても同じ拒否を維持する
+        // （前置を外した本文で判定する。外せない形は生のトークン列のまま判定し、後続の構文段が拒否する）。
+        // `$n` を受理しないまま EXPLAIN 経由でダミー値の文が計画・実行される経路を作らない（fail-closed）。
+        let joined_dml_body: Vec<crate::sql::lexer::Token> = if matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN")
+        ) {
+            match crate::sql::explain_options::extract(tokens.clone()) {
+                Ok((t, _)) => t.get(1..).unwrap_or(&[]).to_vec(),
+                Err(_) => tokens.get(1..).unwrap_or(&[]).to_vec(),
+            }
+        } else {
+            Vec::new()
+        };
+        let joined_dml_probe: &[crate::sql::lexer::Token] = if joined_dml_body.is_empty() {
+            &tokens
+        } else {
+            &joined_dml_body
+        };
+        if (crate::sql::allowlist::looks_like_update_from(joined_dml_probe)
+            || crate::sql::allowlist::looks_like_delete_using(joined_dml_probe))
             && tokens
                 .iter()
                 .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
@@ -9610,6 +9629,7 @@ impl EngineCore {
         // SQL-53 (b)・Issue #3202: `UPDATE ... FROM`／`DELETE ... USING` も同じ暗黙トランザクションで実行する。
         if Self::is_subquery_predicate_dml(parsed)
             || dml_from_exec::is_joined_dml(parsed)
+            || dml_from_exec::is_joined_explain_analyze(parsed)
             || matches!(parsed, ParsedSql::DataModifyingCte(_) | ParsedSql::Do(_))
             || Self::calls_session_routine(session, parsed)
         {

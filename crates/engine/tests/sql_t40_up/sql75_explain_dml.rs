@@ -3,7 +3,7 @@
 //!
 //! 文を実行せず、段の木（`delete`／`update` と全走査の `scan`）を返す。行・台帳（operation_id）・
 //! トランザクション状態に触れず、束縛エラーは実行したときと同じ `wire_code`、テナントによって
-//! 出力が変わらない。未対応の形（単一行形・UPDATE FROM／DELETE USING・ビュー・部分クエリ・
+//! 出力が変わらない。未対応の形（単一行形・ビュー・部分クエリ・
 //! 一時表・セッション無し）は固定の `42601`／`0A000`。
 
 use engine::core::EngineCore;
@@ -245,11 +245,13 @@ fn unsupported_forms_are_rejected_without_effects() {
     exec_as(&core, "tenant-a", "CREATE VIEW va AS SELECT k, v FROM a");
     let before = snapshot(&core, "a");
     for (sql, expected) in [
+        // UPDATE ... FROM／DELETE ... USING は Issue #3293 で受理する（`sql53_explain_dml_from_using.rs`）。
+        // 結合形のうち拒否のままの形（FROM に 2 表以上・ON 付き結合）はここで固定する。
+        // tracked: #3294
         (
-            "EXPLAIN UPDATE a SET v = 'z' FROM pt WHERE a.k = pt.k",
-            "42601",
+            "EXPLAIN UPDATE a SET v = 'z' FROM pt, nn WHERE a.k = pt.k AND pt.k = nn.k",
+            "0A000",
         ),
-        ("EXPLAIN DELETE FROM a USING pt WHERE a.k = pt.k", "42601"),
         ("EXPLAIN DELETE FROM va WHERE k = 1", "42601"),
         (
             "EXPLAIN DELETE FROM a WHERE k IN (SELECT k FROM pt)",
