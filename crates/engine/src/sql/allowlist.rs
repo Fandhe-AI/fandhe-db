@@ -1564,6 +1564,10 @@ impl SqlSurfaceError {
             Self::AmbiguousColumn { name } => Self::AmbiguousColumn { name: f(&name) },
             Self::InvalidForeignKey { detail } => Self::InvalidForeignKey { detail: f(&detail) },
             Self::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail: f(&detail) },
+            // ENUM 列のラベル違反の文言は型名を含む。SCHEMA 配下の型の内部キーを公開名へ戻す（Issue #3289）。
+            Self::InvalidTextRepresentation { detail } => {
+                Self::InvalidTextRepresentation { detail: f(&detail) }
+            }
             Self::UndefinedFunction { detail } => Self::UndefinedFunction { detail: f(&detail) },
             Self::DuplicateFunction { detail } => Self::DuplicateFunction { detail: f(&detail) },
             Self::InvalidFunctionDefinition { detail } => {
