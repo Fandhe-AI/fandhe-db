@@ -19,6 +19,9 @@
 //!   同じ応答）、あれば内部キー `#<schema_id>.<name>`（ADR D2。[`RelationKey`]）の
 //!   `Token::Ident` へ置き換える（Issue #1717。表・ビュー・索引・SEQUENCE の名前位置）。
 //!   MATERIALIZED VIEW の SCHEMA 配置は未対応で `0A000`
+//! - ENUM 型の名前（`CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の名前位置だけ。Issue #3288）も同じ規則
+//!   （`public.` は裸の名前、テナントの SCHEMA は内部キー）。関係位置（[`relation_positions`]）には足さず、列型・
+//!   キャスト・`ALTER TABLE .. TYPE` の修飾名は解決しない（従来どおり構文段で `42601`。Issue #3289）
 //!
 //! 内部キーを作れるのはこの解決器だけである（字句解析器は `#` を含む識別子を作らない。
 //! 保存済みビュー本文だけは `lexer::tokenize_stored_view_body` が引用形で受理する）。
@@ -508,7 +511,7 @@ pub(crate) struct RewriteInfo {
     /// 準備済み文が未修飾名の `search_path` ゲートから除外するために使う（置換は 1 対 1 なので位置は
     /// 保たれる。TABLE-27・Issue #1715）。
     pub positions: Vec<usize>,
-    /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか。
+    /// 作成対象名（`CREATE TABLE`・`VIEW`・`SEQUENCE`・`TYPE`）が `public.` で明示修飾されていたか。
     pub create_public: bool,
 }
 
@@ -567,6 +570,9 @@ pub(crate) fn rewrite_relation_names_full(
         function_pos: bool,
         /// `DROP FUNCTION s.f` の関数名位置（存在しない SCHEMA は `3F000` で fail-closed にする）。
         drop_name: bool,
+        /// `CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の型名位置（Issue #3288）。型は relation と別の
+        /// 名前空間なので、`public.` の修飾は一時表との衝突検査（[`RewriteInfo::names`]）に含めない。
+        type_pos: bool,
     }
     let mut targets: Vec<Target> = walk
         .positions
@@ -577,6 +583,7 @@ pub(crate) fn rewrite_relation_names_full(
             matview: p.matview,
             function_pos: false,
             drop_name: false,
+            type_pos: false,
         })
         .collect();
     let mut public_drop_rewrites: Vec<(usize, String)> = Vec::new();
@@ -598,6 +605,28 @@ pub(crate) fn rewrite_relation_names_full(
             || grant_function_range
                 .as_ref()
                 .is_some_and(|r| r.contains(&i));
+        // 型名の位置（Issue #3288）。`CREATE TYPE <名>`（3 語目）・`DROP TYPE <名>`（3 語目）・
+        // `DROP TYPE IF EXISTS <名>`（5 語目）だけ。列型・キャスト・`ALTER TABLE .. TYPE` の修飾名はこの位置に
+        // 当たらず、従来どおり構文エラー（`42601`。SCHEMA 配下の型の解決は別 Issue #3289）のまま。
+        // `public.` は裸の名前、不在・他テナントの SCHEMA は `3F000`、組み込み SCHEMA・`pg_temp` は `0A000`
+        // （[`resolve`] を関係名と共用する）。
+        let create_type_name =
+            i == 2 && ident_is(tokens.first(), "CREATE") && ident_is(tokens.get(1), "TYPE");
+        let drop_type_name = ident_is(tokens.first(), "DROP")
+            && ident_is(tokens.get(1), "TYPE")
+            && (i == 2
+                || (i == 4 && ident_is(tokens.get(2), "IF") && ident_is(tokens.get(3), "EXISTS")));
+        if create_type_name || drop_type_name {
+            targets.push(Target {
+                index: i,
+                create_name: create_type_name,
+                matview: false,
+                function_pos: false,
+                drop_name: false,
+                type_pos: true,
+            });
+            continue;
+        }
         // `DROP FUNCTION public.f` は `DROP TABLE public.t` と同様に裸の名前へ正規化する
         // （DROP は UDF カタログの削除だけで、組み込み関数へ化ける経路にならない）。
         if drop_function_name && qualifier.eq_ignore_ascii_case("public") {
@@ -633,6 +662,7 @@ pub(crate) fn rewrite_relation_names_full(
                 matview: false,
                 function_pos: true,
                 drop_name: strict_function_name,
+                type_pos: false,
             });
         } else {
             residual_column_qualifier = true;
@@ -677,7 +707,9 @@ pub(crate) fn rewrite_relation_names_full(
                         "qualified relation name collides with a syntax word",
                     ));
                 }
-                info.names.push(name.clone());
+                if !pos.type_pos {
+                    info.names.push(name.clone());
+                }
                 info.positions.push(i);
                 info.create_public |= pos.create_name;
                 if let Some(slot) = tokens.get_mut(i) {
@@ -1441,6 +1473,79 @@ mod tests {
                 .wire_code(),
             "3F000"
         );
+    }
+
+    /// Issue #3288: `CREATE TYPE`・`DROP TYPE [IF EXISTS]` の型名位置だけが解決される。`public.` は裸の名前、
+    /// テナントの SCHEMA は内部キー、不在は `3F000`、組み込み SCHEMA・`pg_temp` は `0A000`。列型・キャスト・
+    /// `ALTER TABLE .. TYPE` の修飾名は型名位置ではなく、書き換えない（従来どおり構文段で `42601`）。
+    // intentional: docs/design/schema-tenant-namespace.md
+    // tracked: #3289
+    #[test]
+    fn type_names_are_resolved_only_in_create_and_drop_type_positions() {
+        same(
+            "CREATE TYPE public.mood AS ENUM ('a')",
+            "CREATE TYPE mood AS ENUM ('a')",
+        );
+        same("DROP TYPE PUBLIC.mood", "DROP TYPE mood");
+        same(
+            "DROP TYPE IF EXISTS public.mood",
+            "DROP TYPE IF EXISTS mood",
+        );
+        for (sql, idx) in [
+            ("CREATE TYPE s.mood AS ENUM ('a')", 2),
+            ("DROP TYPE s.mood", 2),
+            ("DROP TYPE IF EXISTS s.mood", 4),
+        ] {
+            let t = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                matches!(t.get(idx), Some(Token::Ident(k)) if k == "#12.mood"),
+                "{sql}: {t:?}"
+            );
+        }
+        // `public.` の作成名は明示修飾として報告され、一時表との衝突検査用の名前には含めない。
+        let mut t = tokenize("CREATE TYPE public.mood AS ENUM ('a')").expect("lex");
+        let info = rewrite_relation_names_full(&mut t, Some(&probe)).expect("ok");
+        assert!(info.create_public);
+        assert!(info.names.is_empty());
+        assert_eq!(info.positions, vec![2]);
+        let mut t = tokenize("CREATE TYPE s.mood AS ENUM ('a')").expect("lex");
+        let info = rewrite_relation_names_full(&mut t, Some(&probe)).expect("ok");
+        assert!(!info.create_public);
+        for (sql, want) in [
+            ("CREATE TYPE z.mood AS ENUM ('a')", "3F000"),
+            ("DROP TYPE z.mood", "3F000"),
+            ("DROP TYPE IF EXISTS z.mood", "3F000"),
+            ("CREATE TYPE pg_catalog.x AS ENUM ('a')", "0A000"),
+            ("DROP TYPE pg_temp.x", "0A000"),
+            ("DROP TYPE information_schema.x", "0A000"),
+        ] {
+            assert_eq!(
+                rewrite_in_tenant(sql).expect_err(sql).wire_code(),
+                want,
+                "{sql}"
+            );
+        }
+        // テナントが分からない入口は `3F000`。
+        let mut t = tokenize("DROP TYPE s.mood").expect("lex");
+        assert_eq!(
+            rewrite_relation_names(&mut t, None)
+                .expect_err("no tenant")
+                .wire_code(),
+            "3F000"
+        );
+        // 型名位置ではない修飾名（列型・キャスト・ALTER の型）は書き換えない。
+        for sql in [
+            "CREATE TABLE t (m s.mood)",
+            "SELECT 'a'::s.mood",
+            "ALTER TABLE t ALTER COLUMN c TYPE s.mood",
+        ] {
+            let t = rewrite_in_tenant(sql);
+            let still_qualified = match &t {
+                Ok(t) => t.iter().any(|x| matches!(x, Token::QualifiedIdent { .. })),
+                Err(_) => true,
+            };
+            assert!(still_qualified, "{sql}");
+        }
     }
 
     /// CREATE INDEX の索引名の修飾は PG と同じく構文エラー（索引は対象表の SCHEMA に置かれる）。

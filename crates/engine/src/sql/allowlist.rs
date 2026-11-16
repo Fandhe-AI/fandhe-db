@@ -21316,6 +21316,9 @@ pub fn validate_drop_index_tokens(tokens: &[Token]) -> Result<ValidatedDropIndex
 pub struct ValidatedCreateType {
     pub(crate) name: String,
     pub(crate) labels: Vec<String>,
+    /// 型名が `public.` で明示修飾されていたか（Issue #3288。`search_path` の先頭が SCHEMA でも `public` へ作る。
+    /// 解決器が設定し、`core::attach_public_qualified` が準備済み文の再 parse 後に戻す）。
+    pub(crate) public_qualified: bool,
 }
 
 impl ValidatedCreateType {
@@ -21366,7 +21369,7 @@ pub(crate) fn is_drop_type_statement(tokens: &[Token]) -> bool {
 
 /// [`ValidatedCreateType`] の構造検証本体（Issue #1194）。型名は識別子形状のみ
 /// ここで検証し（違反は `42601`）、ラベル数は push 前に `MAX_ENUM_LABELS` で
-/// 打ち切る（`54000`）。`IF NOT EXISTS`・スキーマ修飾名・`AS (...)`・空リスト・
+/// 打ち切る（`54000`）。`IF NOT EXISTS`・`AS (...)`・空リスト・
 /// 非文字列リテラルのラベル・`$n` はいずれも期待トークン列と一致せず `42601` へ落ちる。
 pub(crate) fn validate_create_type_tokens(
     tokens: &[Token],
@@ -21381,7 +21384,9 @@ pub(crate) fn validate_create_type_tokens(
         ));
     }
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    // 型名は裸の識別子（public）か、解決器が作る内部キー（SCHEMA 配下。Issue #3288）。利用者が内部キーを
+    // 直接書く経路は無い（字句解析器は `#` を含む識別子を作らない）。予約名の判定はカタログ側が行う。
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in CREATE TYPE"))?;
     p.expect_ident_matching("AS")?;
     p.expect_ident_matching("ENUM")?;
@@ -21396,7 +21401,11 @@ pub(crate) fn validate_create_type_tokens(
     }
     p.expect_punct(')')?;
     p.expect_end_of_statement()?;
-    Ok(ValidatedCreateType { name, labels })
+    Ok(ValidatedCreateType {
+        name,
+        labels,
+        public_qualified: false,
+    })
 }
 
 /// [`ValidatedDropType`] の構造検証本体（Issue #1194）。`RESTRICT`（既定と同義）は受理し、
@@ -21410,7 +21419,7 @@ pub(crate) fn validate_drop_type_tokens(
     p.expect_ident_matching("TYPE")?;
     let if_exists = p.consume_if_exists();
     let name = p.expect_ident()?;
-    crate::catalog::validate_identifier(&name)
+    crate::catalog::validate_relation_key(&name)
         .map_err(|_| SqlSurfaceError::unsupported("invalid type name in DROP TYPE"))?;
     if p.parse_optional_drop_behavior() == DropBehavior::Cascade {
         return Err(SqlSurfaceError::unsupported(
