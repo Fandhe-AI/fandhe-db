@@ -525,6 +525,66 @@ fn schema_type_is_usable_as_column_type_with_public_parity() {
     assert!(!msg.contains('#'), "{msg}");
 }
 
+/// 型を使う列を持つ表の移動・複製が D7 を迂回しない: public ⇄ SCHEMA の `SET SCHEMA` は両向き `42501`、
+/// SCHEMA 間の移動は許可される。ラベル違反などのエラー文言にも内部キー（`#`）は出ない。
+#[test]
+fn schema_enum_columns_do_not_bypass_the_dependency_rule() {
+    let (core, _g) = new_core("t27-enum-move");
+    let mut s = ddl_session();
+    ok(&core, &mut s, "CREATE SCHEMA s");
+    ok(&core, &mut s, "CREATE SCHEMA s2");
+    ok(&core, &mut s, "CREATE TYPE s.mood AS ENUM ('a')");
+    ok(&core, &mut s, "CREATE TYPE mood AS ENUM ('a')");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE s.t (id BIGINT PRIMARY KEY, m s.mood, ms s.mood[])",
+    );
+    ok(
+        &core,
+        &mut s,
+        "CREATE TABLE pt (id BIGINT PRIMARY KEY, m mood)",
+    );
+    assert_eq!(
+        code(&core, &mut s, "ALTER TABLE s.t SET SCHEMA public"),
+        "42501"
+    );
+    assert_eq!(code(&core, &mut s, "ALTER TABLE pt SET SCHEMA s"), "42501");
+    // SCHEMA 間の移動は許可され、列は型を保つ（移動後も `DROP TYPE` は `2BP01`）。
+    ok(&core, &mut s, "ALTER TABLE s.t SET SCHEMA s2");
+    ok(&core, &mut s, "INSERT INTO s2.t (id, m) VALUES (1, 'a')");
+    assert_eq!(code(&core, &mut s, "DROP TYPE s.mood"), "2BP01");
+    // 複製（`LIKE`）は、受理される場合も所属の異なる依存を作らない。
+    for sql in [
+        "CREATE TABLE pt2 (LIKE s2.t)",
+        "CREATE TABLE s.t3 (LIKE pt)",
+    ] {
+        match core.execute_sql_in_session(&ctx(TENANT), &mut s, sql) {
+            Ok(_) => panic!("{sql} must not create a cross-boundary dependency"),
+            Err(e) => assert!(
+                ["42501", "42601", "0A000"].contains(&e.wire_code()),
+                "{sql}: {}",
+                e.wire_code()
+            ),
+        }
+    }
+    // エラー文言に内部キーを出さない（ラベル違反・配列要素のラベル違反・型の不一致）。
+    let mut seen_errors = 0;
+    for sql in [
+        "INSERT INTO s2.t (id, m) VALUES (2, 'zzz')",
+        "INSERT INTO s2.t (id, ms) VALUES (2, ARRAY['zzz'])",
+        "UPDATE s2.t SET m = 'zzz' WHERE id = 1",
+        "SELECT id FROM s2.t WHERE m = 'zzz'",
+        "ALTER TABLE s2.t ALTER COLUMN id TYPE s.mood",
+    ] {
+        if let Err(e) = core.execute_sql_in_session(&ctx(TENANT), &mut s, sql) {
+            seen_errors += 1;
+            assert!(!e.to_string().contains('#'), "{sql}: {e}");
+        }
+    }
+    assert!(seen_errors >= 3, "expected most statements to be rejected");
+}
+
 /// 同名の型が public と SCHEMA にあるとき、未修飾の列型名は `search_path` の順で解決される。
 #[test]
 fn unqualified_column_type_follows_the_search_path() {
