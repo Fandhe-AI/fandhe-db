@@ -1267,6 +1267,26 @@ mod tests {
         assert_eq!(relation_positions(&t).positions.len(), 1);
     }
 
+    /// Issue #3294: FROM／USING 内の `JOIN` の直後の表と、`ON` 式の後のカンマの直後の表も表参照位置になる
+    /// （`search_path` ゲートの素通りを防ぐ）。
+    #[test]
+    fn join_and_comma_after_on_in_dml_from_lists_are_relation_positions() {
+        same(
+            "DELETE FROM public.a USING public.b JOIN public.c ON b.id = c.id WHERE a.id = b.id",
+            "DELETE FROM a USING b JOIN c ON b.id = c.id WHERE a.id = b.id",
+        );
+        same(
+            "UPDATE public.a SET x = b.x FROM public.b LEFT JOIN public.c ON b.id = c.id, public.d \
+             WHERE a.id = b.id",
+            "UPDATE a SET x = b.x FROM b LEFT JOIN c ON b.id = c.id, d WHERE a.id = b.id",
+        );
+        let t = tokenize(
+            "DELETE FROM a USING b JOIN c ON b.id = c.id CROSS JOIN d USING OPERATION_ID 'x'",
+        )
+        .expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 4);
+    }
+
     #[test]
     fn quoted_keyword_column_in_expression_is_not_a_relation_position() {
         let t = tokenize("SELECT id FROM public.t WHERE \"update\" IS NULL LIMIT 5").expect("lex");
