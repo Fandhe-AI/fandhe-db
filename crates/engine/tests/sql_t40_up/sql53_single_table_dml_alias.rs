@@ -200,6 +200,10 @@ fn unsupported_shapes_fail_closed_without_side_effects() {
         "UPDATE t tt SET x = tt.default WHERE tt.k = 'a'",
         "UPDATE t tt SET x = 1 WHERE tt.k = 'a' RETURNING tt.* + 1",
         "DELETE FROM t tt WHERE tt.*",
+        // DML 固有の句開始語への修飾列名の書き換え（RETURNING／PARTITIONED の偽装）
+        "DELETE FROM t tt WHERE tt.k = 'a' tt.returning k",
+        "DELETE FROM t tt WHERE tt.k = 'a' tt.partitioned BY 1",
+        "UPDATE t tt SET x = 1 WHERE tt.k = 'a' tt.returning k",
         // 対象外の経路（従来どおり）
         "EXPLAIN DELETE FROM t tt WHERE tt.k = 'a' USING OPERATION_ID 'p' PARTITIONED CHUNK 1",
         "WITH d AS (DELETE FROM t tt WHERE tt.k = 'a' RETURNING tt.k) SELECT k FROM d",

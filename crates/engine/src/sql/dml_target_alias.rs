@@ -245,7 +245,10 @@ pub(crate) fn normalize(tokens: Vec<Token>) -> Result<Vec<Token>, SqlSurfaceErro
                         "qualified default column reference is not supported",
                     ));
                 }
-                if is_syntax_word(name) || is_contextual_syntax_use(&tokens, i, name) {
+                if is_syntax_word(name)
+                    || is_dml_syntax_word(name)
+                    || is_contextual_syntax_use(&tokens, i, name)
+                {
                     return Err(SqlSurfaceError::unsupported(
                         "qualified column reference named like a SQL keyword is not supported",
                     ));
@@ -269,6 +272,25 @@ pub(crate) fn normalize(tokens: Vec<Token>) -> Result<Vec<Token>, SqlSurfaceErro
     Ok(out)
 }
 
+/// UPDATE／DELETE 固有の構文語か（`is_syntax_word` は SELECT 向けで含まない語）。
+/// 修飾が外れた後に句の開始語（`RETURNING`・`PARTITIONED` 等）へ誤読されるのを防ぐ。
+fn is_dml_syntax_word(name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "returning",
+        "partitioned",
+        "set",
+        "where",
+        "from",
+        "limit",
+        "order",
+        "by",
+        "values",
+        "only",
+        "into",
+    ];
+    WORDS.iter().any(|w| name.eq_ignore_ascii_case(w))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +306,16 @@ mod tests {
 
     fn code(sql: &str) -> &'static str {
         norm(sql).expect_err("must be rejected").wire_code()
+    }
+
+    #[test]
+    fn qualified_dml_clause_words_are_rejected() {
+        for sql in [
+            "DELETE FROM t x WHERE id = 1 x.returning id",
+            "DELETE FROM t x WHERE id = 1 x.partitioned BY 10",
+        ] {
+            assert_eq!(code(sql), "42601", "{sql}");
+        }
     }
 
     #[test]
