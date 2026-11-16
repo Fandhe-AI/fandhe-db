@@ -376,7 +376,7 @@ PG に演算子が無い組は PG 準拠の `42883`、PG では通るが本実�
 | 配列を含む組（配列の要素型と反対側の型が互換するもの。型なしリテラル、同じ要素型の json／jsonb／bytea／bit、date／timestamp／timestamptz 間の暗黙変換を含む） | `0A000`（PG の配列連結。未実装） |
 | 配列を含む組（要素型が互換しないもの。`integer[]` × `boolean[]`、text × `integer[]`、要素型が異なる jsonb／bytea／bit × 配列、vector × 配列 等） | `42883`（PG に演算子が無い） |
 | text × 変換できる非 text（数値・boolean・日時・interval・uuid・json）とその逆 | text 連結（#3278。`CAST(.. AS text)` と同じ変換） |
-| text × jsonb・bytea・vector・bit とその逆 | `0A000`（曖昧な組・自前の `||` を持つ型。text × 配列は上の配列の行） |
+| text × jsonb・bytea・vector・bit とその逆 | `0A000`（曖昧な組・自前の連結演算子を持つ型。text × 配列は上の配列の行） |
 | bytea × bytea、vector × vector、bit × bit | `0A000`（PG／pgvector にある連結演算子。未実装） |
 | 上記以外（数値 × 数値、jsonb × json、json × json、json × 数値、bytea × 数値 等） | `42883`（PG に演算子が無い） |
 
