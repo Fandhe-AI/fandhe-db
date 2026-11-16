@@ -556,12 +556,13 @@ fn rejected_forms_fail_closed_with_expected_codes() {
              WHERE docs.lang = langs.lang",
             "42601",
         ),
-        // 別名付きで FROM／USING 無し
+        // 別名付きで FROM／USING 無しは Issue #3291 で受理に変わった（`sql53_single_table_dml_alias.rs`）。
+        // 別名を付けた表を本名で修飾する形は `42P01`（intentional: docs/design/update-from-delete-using.md）
         (
-            "UPDATE docs AS d SET lang = 'x' WHERE d.lang = 'en'",
-            "42601",
+            "UPDATE docs AS d SET lang = 'x' WHERE docs.lang = 'en'",
+            "42P01",
         ),
-        ("DELETE FROM docs d WHERE d.lang = 'en'", "42601"),
+        ("DELETE FROM docs d WHERE docs.lang = 'en'", "42P01"),
         // USING に operation_id という名前の表
         ("DELETE FROM docs USING operation_id", "42601"),
         // 参照数の超過（対象表 + 8 個）
