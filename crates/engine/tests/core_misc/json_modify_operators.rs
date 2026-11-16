@@ -346,6 +346,7 @@ fn delete_path_follows_postgres_rules() {
     assert_eq!(select_code_for(&core, &alice, "docb #- lang", 1), "0A000");
 }
 
+// intentional: docs/design/json-expr-type-mapping.md
 #[test]
 fn type_errors_use_fixed_sqlstates() {
     let (core, path) = new_core();
@@ -357,11 +358,13 @@ fn type_errors_use_fixed_sqlstates() {
         cell(&core, &alice, "lang || 'x'", 1),
         Cell::Text("kx".to_string())
     );
-    // 非 text オペランドの連結は未実装のまま拒否する。
-    // tracked: #3278
+    // json（原文保存）は PostgreSQL でも自前の `||` を持たず text 連結になる（Issue #3278）。
+    assert_eq!(
+        cell(&core, &alice, "doc || '{}'", 1),
+        Cell::Text("{}{}".to_string())
+    );
+    // jsonb と型付き text の組は意図的に拒否のまま。
     assert_eq!(select_code(&core, &alice, "docb || lang"), "0A000");
-    // tracked: #3278
-    assert_eq!(select_code(&core, &alice, "doc || '{}'"), "0A000");
     // jsonb と数値は演算子なし。リテラル同士も 42883。
     assert_eq!(select_code(&core, &alice, "docb || n"), "42883");
     assert_eq!(

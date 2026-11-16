@@ -101,7 +101,7 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （[multi-row-dml-operation-id.md](multi-row-dml-operation-id.md)。`jsonb - x` は `Binary Sub` で区別）。
 - 対象外: `jsonb - text[]` の SQL 表層（text[] を書く手段のキャスト・`ARRAY[...]` 待ち。評価関数
   `json::jsonb_delete_keys` は用意済み）、`#-` のパスの NULL 要素（`22004` の分類が未実装のため
-  `0A000`）、`UPDATE ... SET` への jsonb 式の代入、json の `||`・非 text の暗黙連結（text 同士は #3276 で実装済み。残りは #3278）、ORDER BY の式キー、
+  `0A000`）、`UPDATE ... SET` への jsonb 式の代入、json の `||`・非 text の暗黙連結（text 同士は #3276、非 text の暗黙連結は #3278 で実装済み）、ORDER BY の式キー、
   `$n` の型推論、NoSQL の filter。
 
 ## Issue #1599 での変更（スカラー関数）
@@ -338,6 +338,30 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 - 対象外: GIN 相当の索引（#2204）、NoSQL filter、`jsonpath` 型の式・列・CAST、`@@` の全文検索版、
   ORDER BY・VIEW 本文での利用（既存の jsonb 述語演算子と同じ受理範囲）。
   期待値は PostgreSQL 17 の挙動に合わせたが、実機との突き合わせは未実施。
+
+## Issue #3278 での変更（`||` の非 text オペランドの暗黙連結）
+
+- 対象ビヘイビア: SQL-42（ポインタ）。片側が text（型なし文字列リテラル・裸の NULL を含む）で、
+  他方が `CAST(.. AS text)` で変換できる型のとき、他方を `CAST` と同じ変換で text へ変えて
+  strict な text 連結（`BuiltinFn::TextConcat`）に束縛する。PostgreSQL 17 の
+  `text || anynonarray`・`anynonarray || text` に当たる。変換規則は `sql::cast` を再利用するため
+  値の表記・セッションのタイムゾーンの扱いは `CAST` と一致する。
+- 受理する相手の型: 整数・浮動小数・numeric（数値リテラルは正確な numeric 定数）・boolean・
+  date・time・timestamp・timestamptz・interval・uuid・json（原文保存）。json は PostgreSQL でも
+  自前の `||` を持たず text 連結になる（結果は原文＋相手の text）。
+- 意図的に拒否する組（`0A000`・fail-closed）:
+  - jsonb と型付き text（`docb || lang`）。型なしリテラルとの組は jsonb 連結になるため、型付き text との
+    組を text 連結にすると意味が割れる曖昧な組として拒否する。
+  - 配列・bytea・vector・bit。PostgreSQL では自前の `||`（配列の連結・追加、bytea 連結ほか）を持つため、
+    text 連結として黙って評価しない。
+  - 種別を静的に決められない数値（`id` 疑似列・関数の結果・型の決まらない算術）。`CAST(.. AS text)`
+    が同じ制約で `0A000` のため、それに合わせる。CHECK 本体での変換も `CAST` と同じく `0A000`。
+- 非 text 同士の組と jsonb を含む組の SQLSTATE は変えない（42883 への統一は #3277）。
+- 束縛は葉でないオペランドを 1 回だけ束縛する（左結合の連鎖で束縛時間が線形に収まる）。
+  `UPDATE ... SET c = '<文字列>' || n` を式として読むため、SET 右辺の文字列リテラルの直後の `||` を
+  式の開始として扱う。
+- 対象外: `$n` の型推論、CHECK・UDF・DEFAULT 本体での `||`、ORDER BY の式キー、
+  配列・bytea 等の自前の `||` の実装。
 
 ## 設計判断の所在
 

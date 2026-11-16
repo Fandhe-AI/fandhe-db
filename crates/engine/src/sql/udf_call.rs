@@ -8108,8 +8108,8 @@ fn bind_json_access(
     ))
 }
 
-/// `||` の jsonb オペランドを束縛する。`json` 列は PostgreSQL では text 連結になるが
-/// 本実装に文字列連結は無いため `0A000`（fail-closed）。それ以外は通常の式として束縛する。
+/// `||` の jsonb 経路のオペランドを束縛する（text 連結は [`try_bind_text_concat`] が先に処理する。
+/// Issue #3278）。`json` 列・json 値は jsonb 経路へは持ち込めないため `0A000`（fail-closed）。
 fn bind_json_concat_operand(
     expr: &Expr,
     env: &mut BindEnv<'_>,
@@ -8138,7 +8138,7 @@ fn bind_json_concat_operand(
 
 fn concat_not_supported() -> SqlSurfaceError {
     SqlSurfaceError::FeatureNotSupported {
-        detail: "the || operator is only supported on jsonb operands".to_string(),
+        detail: "the || operator is not supported for these operand types".to_string(),
     }
 }
 
@@ -8146,50 +8146,159 @@ fn concat_not_supported() -> SqlSurfaceError {
 enum TextConcatBind {
     /// text 連結として束縛済み。
     Done((BoundExpr, ExprType)),
-    /// text 連結ではない。リテラル（`Expr::String`／`Expr::Null`）以外の束縛済みオペランドを
-    /// 従来の jsonb 経路へ引き渡す（再束縛しない）。リテラルは `None`。
+    /// text 連結ではない。葉（リテラル・識別子・数値リテラル）以外の束縛済みオペランドを
+    /// 従来の jsonb 経路へ引き渡す（再束縛しない）。葉は `None`（従来経路が束縛し直す。葉なので
+    /// 束縛時間は増えない）。
     Fallback {
         lhs: Option<(BoundExpr, ExprType)>,
         rhs: Option<(BoundExpr, ExprType)>,
     },
 }
 
-/// `||` の text 連結束縛（Issue #3276・SQL-42）。両オペランドの型が text（型なしリテラル・
-/// 裸の NULL を含む）に揃うときだけ [`BuiltinFn::TextConcat`] に束縛して返す。jsonb・非 text が
-/// 絡むときは束縛済みオペランドを [`TextConcatBind::Fallback`] で返し、呼び出し元の従来経路
-/// （jsonb 連結／拒否）がそれを再利用する。リテラル以外のオペランドは必ず 1 回だけ束縛する
-/// （左結合の `||` 連鎖で部分木を二重に束縛すると束縛時間が段数に対して指数的になるため。
-/// PR #3453 指摘）。リテラルは葉であり、text 判明後にだけ束縛する。
+/// `||` のオペランドの束縛結果（[`try_bind_text_concat`] の内部表現）。
+enum ConcatOperand {
+    /// 型なし文字列リテラル・裸の NULL（束縛は text 判明後）。
+    Literal,
+    /// 数値リテラル（葉。`bind_cast` で正確な numeric 定数として text へ変換する）。
+    Number,
+    /// 束縛済みの式。`leaf` は識別子（従来経路へ戻すとき再束縛する）。
+    Bound {
+        bound: BoundExpr,
+        ty: ExprType,
+        leaf: bool,
+    },
+}
+
+/// `||` のオペランドを 1 回だけ束縛して [`ConcatOperand`] にする。
+fn classify_concat_operand(
+    e: &Expr,
+    env: &mut BindEnv<'_>,
+    budget: &mut usize,
+) -> Result<ConcatOperand, SqlSurfaceError> {
+    match e {
+        Expr::String(_) | Expr::Null => Ok(ConcatOperand::Literal),
+        Expr::Number(_) => Ok(ConcatOperand::Number),
+        Expr::Ident(name) => {
+            if let Some((bound, ty)) = crate::sql::cast::bind_cast_operand_column(name, env) {
+                crate::sql::cast::charge_node(budget)?;
+                return Ok(ConcatOperand::Bound {
+                    bound,
+                    ty,
+                    leaf: true,
+                });
+            }
+            let (bound, ty) = bind_expr_any(e, env, budget)?;
+            Ok(ConcatOperand::Bound {
+                bound,
+                ty,
+                leaf: true,
+            })
+        }
+        _ => {
+            let (bound, ty) = bind_expr_any(e, env, budget)?;
+            Ok(ConcatOperand::Bound {
+                bound,
+                ty,
+                leaf: false,
+            })
+        }
+    }
+}
+
+/// `||` の text 連結束縛（Issue #3276・#3278・SQL-42）。片側が text（型なしリテラル・裸の NULL を
+/// 含む）で、他方が text か `CAST(.. AS text)` で変換できる型（数値・boolean・日時・interval・uuid・
+/// json）のときだけ [`BuiltinFn::TextConcat`] に束縛して返す。変換は `sql::cast` の規則に従い、
+/// 種別を静的に決められない数値と CHECK 本体は `CAST` と同じく `0A000`。jsonb が絡む組は
+/// 従来経路（[`TextConcatBind::Fallback`]）、text と配列・bytea・vector・bit の組は PostgreSQL で
+/// 自前の `||` と曖昧になるため `0A000`（fail-closed）。葉でないオペランドは必ず 1 回だけ束縛する
+/// （左結合の `||` 連鎖で部分木を二重に束縛すると束縛時間が指数的になるため。PR #3453 指摘）。
 fn try_bind_text_concat(
     lhs: &Expr,
     rhs: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<TextConcatBind, SqlSurfaceError> {
-    let is_lit = |e: &Expr| matches!(e, Expr::String(_) | Expr::Null);
-    let l = if is_lit(lhs) {
-        None
-    } else {
-        Some(bind_json_concat_operand(lhs, env, node_budget)?)
+    let l = classify_concat_operand(lhs, env, node_budget)?;
+    let r = classify_concat_operand(rhs, env, node_budget)?;
+    let is_text = |o: &ConcatOperand| match o {
+        ConcatOperand::Literal => true,
+        ConcatOperand::Bound { ty, .. } => *ty == ExprType::Text,
+        ConcatOperand::Number => false,
     };
-    let r = if is_lit(rhs) {
-        None
-    } else {
-        Some(bind_json_concat_operand(rhs, env, node_budget)?)
+    // 0: text 相当 / 1: text へ変換できる / 2: jsonb / 3: 自前の `||` を持つ型（拒否）。
+    let kind_of = |o: &ConcatOperand| match o {
+        ConcatOperand::Literal => 0u8,
+        ConcatOperand::Number => 1,
+        ConcatOperand::Bound { ty, .. } => match ty {
+            ExprType::Text => 0,
+            ExprType::Json => 2,
+            ExprType::Array | ExprType::Bytea | ExprType::Vector | ExprType::Bit => 3,
+            _ => 1,
+        },
     };
-    let text_like =
-        |t: &Option<(BoundExpr, ExprType)>| t.as_ref().is_none_or(|(_, ty)| *ty == ExprType::Text);
-    if !(text_like(&l) && text_like(&r)) {
-        return Ok(TextConcatBind::Fallback { lhs: l, rhs: r });
+    let (lk, rk) = (kind_of(&l), kind_of(&r));
+    let text_pair = lk == 0 && rk == 0;
+    let convert_pair = (is_text(&l) && rk == 1) || (is_text(&r) && lk == 1);
+    let reject_pair = (is_text(&l) && rk == 3) || (is_text(&r) && lk == 3);
+    if reject_pair {
+        let other = if is_text(&l) { &r } else { &l };
+        let label = match other {
+            ConcatOperand::Bound { ty, .. } => match ty {
+                ExprType::Array => "array",
+                ExprType::Bytea => "bytea",
+                ExprType::Vector => "vector",
+                _ => "bit",
+            },
+            _ => "unknown",
+        };
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("the || operator between text and {label} operands is not supported"),
+        });
     }
-    let finish = |pre: Option<(BoundExpr, ExprType)>,
+    if !(text_pair || convert_pair) {
+        // json 原文型の式は従来どおり `0A000`（`doc -> 'a' || docb` 等のコードを変えない）。
+        for o in [&l, &r] {
+            if matches!(
+                o,
+                ConcatOperand::Bound {
+                    ty: ExprType::JsonText,
+                    leaf: false,
+                    ..
+                }
+            ) {
+                return Err(concat_not_supported());
+            }
+        }
+        let into_fallback = |o: ConcatOperand| match o {
+            ConcatOperand::Bound {
+                bound,
+                ty,
+                leaf: false,
+            } => Some((bound, ty)),
+            _ => None,
+        };
+        return Ok(TextConcatBind::Fallback {
+            lhs: into_fallback(l),
+            rhs: into_fallback(r),
+        });
+    }
+    let finish = |o: ConcatOperand,
                   expr: &Expr,
                   env: &mut BindEnv<'_>,
                   budget: &mut usize|
      -> Result<BoundExpr, SqlSurfaceError> {
-        match pre {
-            Some((b, _)) => Ok(b),
-            None => Ok(bind_null_aware(expr, env, budget)?.0),
+        let text = crate::sql::cast::CastType::Text;
+        match o {
+            ConcatOperand::Literal => Ok(bind_null_aware(expr, env, budget)?.0),
+            ConcatOperand::Number => Ok(crate::sql::cast::bind_cast(expr, &text, env, budget)?.0),
+            ConcatOperand::Bound {
+                bound,
+                ty: ExprType::Text,
+                ..
+            } => Ok(bound),
+            ConcatOperand::Bound { bound, ty, .. } => {
+                Ok(crate::sql::cast::cast_bound(expr, bound, ty, &text, env, budget)?.0)
+            }
         }
     };
     let lb = finish(l, lhs, env, node_budget)?;
@@ -8205,7 +8314,6 @@ fn try_bind_text_concat(
         ExprType::Text,
     )))
 }
-
 /// jsonb の連結・パス削除演算子（`||` `#-`。Issue #2181・TABLE-25）の束縛。
 /// `||` は両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として解釈）のみ受理し、
 /// 文字列連結に当たる組は `0A000`、型の合わない組は `42883`。`#-` は左辺 jsonb（`json` 列は
@@ -8281,7 +8389,7 @@ fn bind_json_modify(
         return Err(operator_missing());
     }
     // 型なしリテラルの反対側の型を確定させる。jsonb ならリテラルを jsonb として解釈、
-    // text なら文字列連結（未実装）、それ以外は演算子なし。束縛済みのオペランドは再束縛しない。
+    // text なら文字列連結は束縛済みのためここへ来ない（`0A000`）、それ以外は演算子なし。束縛済みのオペランドは再束縛しない。
     let (l_bound, r_bound) = if lhs_is_literal || rhs_is_literal {
         let (other_expr, other_pre, literal_expr) = if lhs_is_literal {
             (rhs, pre_r, lhs)

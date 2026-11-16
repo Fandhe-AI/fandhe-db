@@ -130,3 +130,39 @@ fn extended_describe_advertises_text_result_type() {
     assert_eq!(k, b'Z');
     assert_eq!(body, [b'I']);
 }
+
+/// 非 text オペランドの暗黙連結（Issue #3278）。末尾 `;` 付き単独送信で値が返り、
+/// 種別を決められない数値との組は 0A000 で拒否されても接続が使えること。
+#[test]
+fn non_text_operand_concat_over_simple_query() {
+    let (mut s, _g) = connect();
+    expect_one_text(&mut s, "SELECT 'n=' || 5;", "n=5");
+    expect_one_text(&mut s, "SELECT 5 || 'x';", "5x");
+    expect_one_text(&mut s, "SELECT lang || n FROM t WHERE id = 1;", "ja1");
+
+    send_simple_query(&mut s, "SELECT 'x' || id FROM t;");
+    expect_error_response_with_sqlstate(&mut s, "0A000");
+    read_ready_for_query(&mut s);
+    expect_one_text(&mut s, "SELECT 'n=' || 5;", "n=5");
+}
+
+#[test]
+fn extended_describe_advertises_text_for_non_text_concat() {
+    let (mut s, _g) = connect();
+    send_length_prefixed_message(&mut s, b'P', &parse_body("s1", "SELECT 'n=' || 5", 0));
+    let mut describe = vec![b'S'];
+    describe.extend_from_slice(b"s1");
+    describe.push(0);
+    send_length_prefixed_message(&mut s, b'D', &describe);
+    send_length_prefixed_message(&mut s, b'S', b"");
+    let (k, _) = read_message(&mut s);
+    assert_eq!(k, b'1', "ParseComplete");
+    let (k, _) = read_message(&mut s);
+    assert_eq!(k, b't', "ParameterDescription");
+    let (k, body) = read_message(&mut s);
+    assert_eq!(k, b'T', "RowDescription");
+    let name_end = body[2..].iter().position(|b| *b == 0).expect("nul") + 2;
+    let pos = name_end + 1;
+    let oid = i32::from_be_bytes(body[pos + 6..pos + 10].try_into().expect("oid"));
+    assert_eq!(oid, 25);
+}
