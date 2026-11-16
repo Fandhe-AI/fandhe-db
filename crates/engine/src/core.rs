@@ -345,9 +345,12 @@ fn row_compare_relation_names(tokens: &[crate::sql::lexer::Token]) -> Vec<String
             k += 1;
             if word(tokens.get(k), "AS") {
                 k += 1;
-                if matches!(tokens.get(k), Some(Token::Ident(_))) {
+                if matches!(tokens.get(k), Some(Token::Ident(_) | Token::QuotedNull(_))) {
                     k += 1;
                 }
+            } else if matches!(tokens.get(k), Some(Token::QuotedNull(_))) {
+                // 引用付きの暗黙別名（`FROM u "U"`）も読み飛ばす。
+                k += 1;
             } else if let Some(Token::Ident(a)) = tokens.get(k) {
                 const NOT_ALIAS: [&str; 11] = [
                     "JOIN",
@@ -377,59 +380,8 @@ fn row_compare_relation_names(tokens: &[crate::sql::lexer::Token]) -> Vec<String
 }
 
 #[cfg(test)]
-mod row_compare_relation_names_tests {
-    use super::row_compare_relation_names;
-    use crate::sql::lexer::tokenize;
-
-    fn names(sql: &str) -> Vec<String> {
-        row_compare_relation_names(&tokenize(sql).expect("lex"))
-    }
-
-    #[test]
-    fn extract_from_is_not_a_relation() {
-        assert_eq!(
-            names("SELECT EXTRACT(year FROM ts) FROM t WHERE (id, a) > (1, 2) LIMIT 10"),
-            vec!["t"]
-        );
-    }
-
-    #[test]
-    fn is_distinct_from_is_not_a_relation() {
-        assert_eq!(
-            names("SELECT a FROM t WHERE a IS DISTINCT FROM b"),
-            vec!["t"]
-        );
-    }
-
-    #[test]
-    fn using_operation_id_is_not_a_relation() {
-        assert_eq!(
-            names("DELETE FROM t WHERE (id, a) > (1, 2) USING OPERATION_ID 'x'"),
-            vec!["t"]
-        );
-    }
-
-    #[test]
-    fn qualified_and_comma_separated_relations() {
-        assert_eq!(names("SELECT a FROM public.u"), vec!["u"]);
-        assert_eq!(
-            names("SELECT a FROM a, b x, c AS y WHERE a.k = b.k"),
-            vec!["a", "b", "c"]
-        );
-        assert_eq!(
-            names("DELETE FROM t USING u, public.v WHERE t.k = u.k"),
-            vec!["t", "u", "v"]
-        );
-    }
-
-    #[test]
-    fn join_relations() {
-        assert_eq!(
-            names("SELECT a FROM t JOIN u ON t.k = u.k LEFT JOIN v ON u.k = v.k"),
-            vec!["t", "u", "v"]
-        );
-    }
-}
+#[path = "core/row_compare_relation_names_tests.rs"]
+mod row_compare_relation_names_tests;
 
 /// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
 /// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
@@ -9257,6 +9209,8 @@ impl EngineCore {
         let where_table: Option<String> = match tokens.first() {
             Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
                 Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                // スキーマ修飾の対象表（`UPDATE public.t`）は表名部分を引く（row_compare_relation_names と同じ扱い）。
+                Some(Token::QualifiedIdent { name, .. }) => Some(name.clone()),
                 _ => None,
             },
             // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
@@ -9499,7 +9453,19 @@ impl EngineCore {
         // Issue #3257・パターン 12: 行値比較の成分の `$n` に使う、相手列の型の Describe 用ダミー候補
         // （トークン添字・番号・ダミー）。種別が `String` のものだけが後段で採用される。
         let mut row_dummies: Vec<(usize, u16, Token)> = Vec::new();
-        for (i, col) in crate::sql::params::row_compare_column_slots(tokens) {
+        let row_slots = crate::sql::params::row_compare_column_slots(tokens);
+        // 参照表一覧と候補はスロットごとに作り直さず 1 回だけ構築して使い回す。
+        let rels = if row_slots.is_empty() {
+            Vec::new()
+        } else {
+            row_compare_relation_names(tokens)
+        };
+        let candidates: Vec<&str> = where_table
+            .as_deref()
+            .into_iter()
+            .chain(rels.iter().map(String::as_str))
+            .collect();
+        for (i, col) in row_slots {
             let Some(Token::Param(n)) = tokens.get(i) else {
                 continue;
             };
@@ -9509,14 +9475,9 @@ impl EngineCore {
             // 一時表は一時コア（`temp_route`）がこの関数を呼ぶので、`column_type` が一時表も引ける。
             // 候補は主表を先頭に、実際に表として参照される名前だけ（`row_compare_relation_names`）。
             // 疑似 `id`（`ColumnMeta::Id`）が解決した時点で探索を終える（後続の無関係な表の物理 `id` へ進まない）。
-            let rels = row_compare_relation_names(tokens);
-            let candidates: Vec<&str> = where_table
-                .as_deref()
-                .into_iter()
-                .chain(rels.iter().map(String::as_str))
-                .collect();
             let resolved_ty = candidates
-                .into_iter()
+                .iter()
+                .copied()
                 .find_map(|t| match column_type(t, &col) {
                     Some(PreparedParamType::Column(ColumnMeta::Id)) => Some(None),
                     Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })) => {

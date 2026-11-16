@@ -567,3 +567,18 @@ fn row_compare_params_on_temp_table_date_and_uuid_columns_parse_and_describe() {
     core.describe_prepared_in_session(&session, &prepared)
         .unwrap_or_else(|e| panic!("{sql}: describe {}", e.wire_code()));
 }
+
+/// スキーマ修飾の UPDATE 対象表（`UPDATE public.t`）の DATE／UUID 列も、型付きダミーで
+/// Parse／Describe が通る（対象表の取りこぼしで既定ダミー `'0'` が実リテラルとして検証され
+/// 失敗する退行を固定する。引用付き別名の走査は `core/row_compare_relation_names_tests.rs`）。
+#[test]
+fn row_compare_params_on_schema_qualified_update_parse_and_describe() {
+    let (_p, _g, core) = setup("prep-row-cmp-qual");
+    let session = SessionState::default();
+    let sql = "UPDATE public.t SET s = 'x' WHERE (d, u) > ($1, $2) USING OPERATION_ID $3";
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&session, sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: parse {}", e.wire_code()));
+    core.describe_prepared_in_session(&session, &prepared)
+        .unwrap_or_else(|e| panic!("{sql}: describe {}", e.wire_code()));
+}
