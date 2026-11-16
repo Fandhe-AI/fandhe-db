@@ -2,7 +2,7 @@
 //! 実 `Storage`＋`CpuScalarProvider` を `EngineCore::execute_sql_in_session` 経由で使い、
 //! FROM なし SELECT・列投影・集計投影の値と結果型（PostgreSQL 17 準拠）、0 除算（22012）・
 //! float 型被演算子／非対応型（42883）・構文不完全形（42601）の fail-closed、テナント境界を固定する。
-//! WHERE 等の各文脈の網羅は兄弟 Issue #3274 の担当で、ここでは WHERE のスモークだけを置く。
+//! WHERE 等の各文脈の網羅は `sql42_remainder_contexts.rs`（Issue #3274）が担い、ここでは WHERE のスモークだけを置く。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
