@@ -3166,8 +3166,8 @@ struct PreparedPathInput<'a> {
 
 /// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
 /// 表名を戻す（TABLE-27・Issue #1714）。実行時の粗いゲートが同名の一時表との衝突を拒否する。
-/// `CREATE TABLE`・`CREATE [MATERIALIZED] VIEW`・`CREATE SEQUENCE` には作成対象名の `public.` 修飾の
-/// 有無を戻す（Issue #1715）。
+/// `CREATE TABLE`・`CREATE [MATERIALIZED] VIEW`・`CREATE SEQUENCE`・`CREATE TYPE` には作成対象名の
+/// `public.` 修飾の有無を戻す（Issue #1715・#3288）。
 fn attach_public_qualified(
     parsed: &mut ParsedSql,
     public_qualified: &[String],
@@ -3180,6 +3180,7 @@ fn attach_public_qualified(
         ParsedSql::CreateView(stmt) => stmt.public_qualified = create_public,
         ParsedSql::CreateMaterializedView(stmt) => stmt.public_qualified = create_public,
         ParsedSql::CreateSequence(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateType(stmt) => stmt.public_qualified = create_public,
         _ => {}
     }
 }
@@ -6296,7 +6297,7 @@ impl EngineCore {
         }
         // 作成先の判定では、path 上の USAGE の無い SCHEMA を飛ばさず `42501` にする（受入基準。K4）。
         // ここへ裸の名前のまま届いて作成先が自テナントの SCHEMA になるのは、解析時の書き換えを通らない経路
-        // （構文語と衝突する名前・`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・解析と実行の間の SCHEMA 作成の
+        // （構文語と衝突する名前・`CREATE MATERIALIZED VIEW`・解析と実行の間の SCHEMA 作成の
         // 競合）。`public` へ黙って作らないよう、固定文言の `0A000` にする（fail-closed）。
         let probe = |schema: &str| self.schema_id_requiring_usage(ctx, session, schema);
         match crate::sql::search_path::creation_target(session, &probe)? {
@@ -6623,6 +6624,7 @@ impl EngineCore {
                 NameKind::Relation => crate::catalog::relation_or_sequence_exists_in(src, key),
                 NameKind::Index => crate::catalog::index_exists_in_source(src, key),
                 NameKind::Sequence => crate::catalog::sequence::sequence_exists_in(src, key),
+                NameKind::Type => crate::catalog::enum_type_exists_in(src, key),
             };
             if let Some(snap) = read_snap {
                 return probe(snap).map_err(crate::catalog::table_lookup_error);
@@ -8129,7 +8131,8 @@ impl EngineCore {
             return Ok(ParsedSql::CreateSequence(stmt));
         }
         if crate::sql::allowlist::is_create_type_statement(&tokens) {
-            let stmt = crate::sql::allowlist::validate_create_type_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_create_type_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateType(stmt));
         }
         if crate::sql::allowlist::is_create_index_statement(&tokens) {
@@ -10222,14 +10225,16 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::DropIndex(outcome))
             }
             // TABLE-14・SQL-23・TASK-198（Issue #1194）: 他の DDL と同じ判定順序
-            // （DDL 実行権限ゲート → 実行本体）。ENUM 型は全テナント共有カタログで
-            // `ctx` は取らない。権限の無い主体には型の有無を問わず常に `42501`。
+            // （DDL 実行権限ゲート → 実行本体）。ENUM 型は public（全テナント共有）と自テナントの
+            // SCHEMA 配下（内部キー。Issue #3288）に置け、作成先の権限は `require_creation_target` が検査する。
+            // 型のカタログ API は `ctx` を取らない（解決器が自テナントの内部 ID だけを渡す）。権限の無い主体には
+            // 型の有無を問わず常に `42501`。
             ParsedSql::CreateType(stmt) => {
                 crate::sql::privilege_gate::require_ddl(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateType,
                 )?;
-                self.require_creation_target(ctx, session, false, stmt.name())?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 let outcome =
                     crate::sql::ddl::execute_create_type(&self.storage, stmt, &self.schema_limits)?;
                 Ok(crate::sql::SqlOutcome::CreateType(outcome))
