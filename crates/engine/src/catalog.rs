@@ -2070,10 +2070,11 @@ pub(crate) enum HnswGate {
     MetricMismatch { index_metric: VectorOpClass },
 }
 
-/// 物理 HNSW グラフが対応する距離種別か。現状のグラフはコサインだけ。
-/// opclass 別カーネル（Issue #1996・#1999）が入った時点でここを広げる。
+/// 物理 HNSW グラフが対応する距離種別か。物理グラフは内積で構築され、コサインは内積候補を
+/// 厳密コサインで再採点し、内積（Issue #3303）は再採点なしでそのまま答えにする。
+/// L2・L1 は未対応（厳密全走査）。`sql::hnsw_cache::hnsw_graph_metric_for` と `is_some()` が一致する。
 pub(crate) fn hnsw_supported_metric(metric: VectorOpClass) -> bool {
-    matches!(metric, VectorOpClass::Cosine)
+    matches!(metric, VectorOpClass::Cosine | VectorOpClass::Ip)
 }
 
 /// 宣言された opclass 集合から表示用の索引 metric を決める（Issue #1978 の決定規則）。
@@ -28537,6 +28538,49 @@ mod tests {
             .expect("create cosine index");
         assert_eq!(gate(HnswScope::Declared, true, cos), targeted);
         assert_eq!(gate(HnswScope::Declared, true, l2), mismatch(cos));
+
+        // 内積（Issue #3303）: 宣言がなければ `<#>` は不一致のまま（Cosine と L2 だけの宣言でも同じ）。
+        let ip = VectorOpClass::Ip;
+        assert_eq!(gate(HnswScope::All, true, ip), mismatch(cos));
+        assert_eq!(gate(HnswScope::Declared, true, ip), mismatch(cos));
+        // ip を宣言すると `<#>` は Targeted、`<=>` も従来どおり Targeted。
+        let mut def = hnsw_def("idx_ip", "docs");
+        def.kind = IndexKind::Hnsw(ip);
+        storage.create_index(&def).expect("create ip index");
+        let targeted_ip = HnswGate::Targeted {
+            metric: ip,
+            options: None,
+        };
+        assert_eq!(gate(HnswScope::Declared, true, ip), targeted_ip);
+        assert_eq!(gate(HnswScope::All, true, ip), targeted_ip);
+        assert_eq!(gate(HnswScope::Declared, true, cos), targeted);
+        // 物理グラフ未対応の L2 は ip 宣言があっても不一致。
+        assert_eq!(gate(HnswScope::Declared, true, l2), mismatch(cos));
+    }
+
+    /// Ip だけを宣言した表では `<=>` は不一致、`<#>` は Targeted（Issue #3303）。
+    #[test]
+    fn hnsw_gate_ip_only_declaration() {
+        let (storage, _guard) = index_fixture_storage("index-hnsw-gate-ip-only");
+        let gate_cache = IndexCatalogGateCache::new();
+        let mut def = hnsw_def("idx_ip", "docs");
+        def.kind = IndexKind::Hnsw(VectorOpClass::Ip);
+        storage.create_index(&def).expect("create ip index");
+        let txn = storage.db().begin_read().expect("begin read");
+        let g = |scope, q| hnsw_gate_in_txn(&txn, &gate_cache, "docs", scope, true, q);
+        assert_eq!(
+            g(HnswScope::Declared, VectorOpClass::Cosine),
+            HnswGate::MetricMismatch {
+                index_metric: VectorOpClass::Ip
+            }
+        );
+        assert_eq!(
+            g(HnswScope::Declared, VectorOpClass::Ip),
+            HnswGate::Targeted {
+                metric: VectorOpClass::Ip,
+                options: None
+            }
+        );
     }
 
     /// 構築パラメータの伝搬（SQL-33 (5)、Issue #2029）: ゲートは問い合わせ metric の宣言の `WITH` を

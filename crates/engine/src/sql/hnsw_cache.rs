@@ -2878,8 +2878,10 @@ fn rescore_indexed_hit(metric: HnswMetric, row: &[f32], query: &[f32]) -> Option
 /// 問い合わせ側 opclass が引く物理 HNSW グラフの metric（世代整合キャッシュのキー。
 /// Issue #2000・親 #1996。ビヘイビア INDEX-7・SQL-33・SQL-75 のポインタ）。
 ///
-/// 写像は暫定値: `<=>` はコサイン距離で実行されるが、HNSW は内積グラフの候補を後段で
-/// 厳密なコサインへ再採点する方式のため `Cosine -> InnerProduct`。`Ip`・`L2`・`L1` は SQL 実行側が未接続のため `None`
+/// 写像: `<=>` はコサイン距離で実行されるが、HNSW は内積グラフの候補を後段で
+/// 厳密なコサインへ再採点する方式のため `Cosine -> InnerProduct`。`<#>` は内積グラフの探索結果が
+/// そのまま答え（再採点不要）のため `Ip -> InnerProduct`（Issue #3303）。キー
+/// `(table, ctx, InnerProduct)` で両者は同じ索引済みベースを共有する。`L2`・`L1` は `None`
 /// （ゲートは `MetricMismatch` となり厳密全走査）。`catalog::hnsw_supported_metric` と
 /// `is_some()` が一致することを単体テストで固定する（catalog は sql に依存しない）。
 /// Cosine を `HnswMetric::Cosine` へ切り替えるのは #2241（ゼロノルム行の除外）と
@@ -2887,8 +2889,8 @@ fn rescore_indexed_hit(metric: HnswMetric, row: &[f32], query: &[f32]) -> Option
 pub(crate) fn hnsw_graph_metric_for(query: crate::catalog::VectorOpClass) -> Option<HnswMetric> {
     use crate::catalog::VectorOpClass;
     match query {
-        VectorOpClass::Cosine => Some(HnswMetric::InnerProduct),
-        VectorOpClass::Ip | VectorOpClass::L2 | VectorOpClass::L1 => None,
+        VectorOpClass::Cosine | VectorOpClass::Ip => Some(HnswMetric::InnerProduct),
+        VectorOpClass::L2 | VectorOpClass::L1 => None,
     }
 }
 
@@ -5461,6 +5463,12 @@ mod tests {
             hnsw_graph_metric_for(VectorOpClass::Cosine),
             Some(HnswMetric::InnerProduct)
         );
+        assert_eq!(
+            hnsw_graph_metric_for(VectorOpClass::Ip),
+            Some(HnswMetric::InnerProduct)
+        );
+        assert_eq!(hnsw_graph_metric_for(VectorOpClass::L2), None);
+        assert_eq!(hnsw_graph_metric_for(VectorOpClass::L1), None);
     }
 
     #[test]
