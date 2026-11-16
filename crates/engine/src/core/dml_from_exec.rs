@@ -31,7 +31,7 @@ use crate::sql::udf_call::UdfRegistry;
 use crate::sql::SqlOutcome;
 use crate::tenant::WriteTarget;
 
-/// 暗黙トランザクションを通らない経路（`EXPLAIN` 等のネスト）への固定文言（`0A000`）。
+/// 暗黙トランザクションを通らない経路（ネストした実行等）への固定文言（`0A000`）。
 pub(super) const JOINED_DML_UNSUPPORTED_HERE: &str =
     "UPDATE ... FROM / DELETE ... USING is not supported for this statement";
 
@@ -43,13 +43,32 @@ pub(super) fn is_joined_dml(parsed: &super::ParsedSql) -> bool {
     )
 }
 
+/// 結合形 DML の `EXPLAIN ANALYZE`（実際に書き込む）かどうか（Issue #3293）。autocommit では
+/// 内側の実行が共有 write txn を要するため、[`is_joined_dml`] と同じく暗黙トランザクションへ振り分ける。
+/// 静的な `EXPLAIN`（`ParsedSql::ExplainDml`）は書き込まないので対象外。
+pub(super) fn is_joined_explain_analyze(parsed: &super::ParsedSql) -> bool {
+    use crate::sql::explain_analyze::ExplainAnalyzeDmlTarget;
+    use crate::sql::explain_dml::ExplainDml;
+    matches!(
+        parsed,
+        super::ParsedSql::ExplainAnalyzeDml(ea)
+            if matches!(
+                &ea.target,
+                ExplainAnalyzeDmlTarget::Dml(
+                    ExplainDml::UpdateFrom(_) | ExplainDml::DeleteUsing(_)
+                )
+            )
+    )
+}
+
 impl EngineCore {
-    /// 対象表と FROM／USING 側の表のスキーマを同一スナップショットから取得する。
+    /// 対象表と FROM／USING 側の表のスキーマを同一スナップショットから取得する。使った読み取り
+    /// トランザクションも返す（`EXPLAIN` が索引宣言を同じスナップショットで読むため。Issue #3293）。
     fn dml_from_schemas(
         &self,
         target: &str,
         others: &[crate::sql::relation::TableRef],
-    ) -> Result<(TableSchema, Vec<TableSchema>), SqlSurfaceError> {
+    ) -> Result<(redb::ReadTransaction, TableSchema, Vec<TableSchema>), SqlSurfaceError> {
         let mut names: Vec<String> = Vec::with_capacity(
             others
                 .len()
@@ -58,7 +77,7 @@ impl EngineCore {
         );
         names.push(target.to_string());
         names.extend(others.iter().map(|r| r.table().to_string()));
-        let (_read_txn, schemas) = self.read_txn_with_schemas(&names)?;
+        let (read_txn, schemas) = self.read_txn_with_schemas(&names)?;
         let internal = || SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         };
@@ -68,7 +87,7 @@ impl EngineCore {
         for r in others {
             other_schemas.push(schemas.get(r.table()).cloned().ok_or_else(internal)?);
         }
-        Ok((target_schema, other_schemas))
+        Ok((read_txn, target_schema, other_schemas))
     }
 
     /// `UPDATE ... FROM` を束縛し、結合 DML の実行入力へ変換する（Issue #3201）。
@@ -79,10 +98,22 @@ impl EngineCore {
         stmt: &ValidatedUpdateFrom,
         udfs: &UdfRegistry,
     ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
-        let (target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.from)?;
+        self.plan_update_from_stmt_with_txn(stmt, udfs)
+            .map(|(plan, _read_txn)| plan)
+    }
+
+    /// [`Self::plan_update_from_stmt`] が使った読み取りトランザクションも返す版
+    /// （`EXPLAIN UPDATE ... FROM` が GIN 宣言を同じスナップショットで読む。Issue #3293）。
+    pub(super) fn plan_update_from_stmt_with_txn(
+        &self,
+        stmt: &ValidatedUpdateFrom,
+        udfs: &UdfRegistry,
+    ) -> Result<(JoinedDmlPlan, redb::ReadTransaction), SqlSurfaceError> {
+        let (read_txn, target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.from)?;
         let refs: Vec<&TableSchema> = others.iter().collect();
         let bound = crate::sql::dml_from::bind_update_from_with_udfs(stmt, &target, &refs, udfs)?;
-        crate::sql::join::dml_plan::plan_update_from(&bound, &target, &refs, udfs)
+        let plan = crate::sql::join::dml_plan::plan_update_from(&bound, &target, &refs, udfs)?;
+        Ok((plan, read_txn))
     }
 
     /// `DELETE ... USING` を束縛し、結合 DML の実行入力へ変換する（Issue #3201）。
@@ -91,10 +122,21 @@ impl EngineCore {
         stmt: &ValidatedDeleteUsing,
         udfs: &UdfRegistry,
     ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
-        let (target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.using)?;
+        self.plan_delete_using_stmt_with_txn(stmt, udfs)
+            .map(|(plan, _read_txn)| plan)
+    }
+
+    /// [`Self::plan_delete_using_stmt`] が使った読み取りトランザクションも返す版（Issue #3293）。
+    pub(super) fn plan_delete_using_stmt_with_txn(
+        &self,
+        stmt: &ValidatedDeleteUsing,
+        udfs: &UdfRegistry,
+    ) -> Result<(JoinedDmlPlan, redb::ReadTransaction), SqlSurfaceError> {
+        let (read_txn, target, others) = self.dml_from_schemas(stmt.target_table(), &stmt.using)?;
         let refs: Vec<&TableSchema> = others.iter().collect();
         let bound = crate::sql::dml_from::bind_delete_using_with_udfs(stmt, &target, &refs, udfs)?;
-        crate::sql::join::dml_plan::plan_delete_using(&bound, &target, &refs, udfs)
+        let plan = crate::sql::join::dml_plan::plan_delete_using(&bound, &target, &refs, udfs)?;
+        Ok((plan, read_txn))
     }
 
     /// `UPDATE ... FROM` を共有 write txn 上で実行する（autocommit は暗黙 Tx 経由で同じ腕に入る）。

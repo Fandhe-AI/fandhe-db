@@ -40,7 +40,7 @@ DELETE FROM <表> [[AS] <別名>] USING <rel>[, <rel>]* [WHERE <join_where>]
 - 入口（`EngineCore::parse_tokens_in`）が `looks_like_update_from`／`looks_like_delete_using` で先読みし、専用の解析器へ回す。既存の `parse_update`／`parse_delete` は変えない
 - `looks_like_update_from`: 括弧深さ 0 の `FROM`（`IS [NOT] DISTINCT FROM` を除く）がある `UPDATE` 文
 - `looks_like_delete_using`: 括弧深さ 0 の `USING` の直後が `OPERATION_ID` でない `DELETE FROM` 文。`DELETE FROM t USING OPERATION_ID '...'`（WHERE 省略形）は従来どおり既存の経路を通る。`operation_id` という名前の表を USING に書く形は operation_id 句として扱われ、既存の解析器が `42601` で拒否する（fail-closed）
-- 非セッション入口（`validate_update`・`validate_delete_statement` など）と `EXPLAIN` は FROM／USING 形を従来どおり `42601` で拒否する
+- 非セッション入口（`validate_update`・`validate_delete_statement` など）は FROM／USING 形を従来どおり `42601` で拒否する（`EXPLAIN` は Issue #3293 で受理。末尾「EXPLAIN（Issue #3293）」節）
 - 別名付きで FROM／USING が無い単一表 DML（`UPDATE t AS x SET ... WHERE ...`）は従来どおり `42601`（受理範囲を広げない）
 
 ## 新しい `ParsedSql` variant
@@ -92,12 +92,12 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 
 - **autocommit**: `execute_parsed_in_session_inner` が `is_joined_dml` を見て、サブクエリ付き述語 DML と同じ文単位の暗黙 Tx（`execute_subquery_dml_autocommit`）へ振り分ける。実行本体は明示 Tx と共通
 - **明示 Tx**: 共有 write txn 上で実行し、対象表とトリガが書いた表へ `mark_written` する（漏れると COMMIT が write txn を破棄し、遅延 FK の検査も取りこぼす）。コマンドタグは autocommit と同じ `UPDATE n`／`DELETE n`
-- **暗黙 Tx を通らない経路**（`EXPLAIN` 等のネスト）: `execute_parsed_statement` の腕は固定文言の `0A000`（fail-closed）
+- **暗黙 Tx を通らない経路**（ネストした実行等。`EXPLAIN ANALYZE` の autocommit は暗黙 Tx へ振り分ける）: `execute_parsed_statement` の腕は固定文言の `0A000`（fail-closed）
 - **Describe**: Execute と同じ準備段（束縛・変換）を通す。実行できる形は結果列なし、変換器が拒否する形は `0A000`（op id 付きも通常の Describe と同じ）、束縛エラーは従来のコード。これで Describe と Execute のコードがそろう
 - **`USING OPERATION_ID` 付き**（Issue #3203・RECOVER-10/11）: 台帳へ結線済み。構文段で検証した `operation_id` と content_hash を実行器へ渡し、FROM／USING 側の走査より前の事前照合で再送は `23505`、別文への再利用は `22023`、確定記録は書き込み本体と同じ txn で行う。束縛・変換・実行のエラーは txn が commit されないため台帳を消費しない。`parsed_operation_id` は実値を返し、同一 Tx 内の再利用は既存 DML と同じく拒否される（Tx は `Failed`）。`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体は op id 付きを拒否側に倒す。`--require-operation-id` 構成でも使える（省略は `23502`）
 - **`PARTITIONED`**: 構文段が `42601` で拒否する。`ValidatedUpdateFrom`／`ValidatedDeleteUsing` は `partitioned` を持たず、`run_partitioned_*` は述語形だけを受け取るため、結合形が分割実行器へ入る経路は構造上存在しない（autocommit・明示 Tx の両方を結合テストで固定）
 - **多重一致**: 実行器の規約どおり、対象行ごとに 1 回だけ更新・削除し、UPDATE の値は走査順で最初の source 行を採る
-- **まだ拒否する形**: 変換器の対象外（上記の変換器節。`0A000`）、ビュー・一時表が関与する形、データ変更 CTE の本文と `EXPLAIN`。いずれも第 1 弾の設計上の対象外で、fail-closed の安全弁
+- **まだ拒否する形**: 変換器の対象外（上記の変換器節。`0A000`）、ビュー・一時表が関与する形、データ変更 CTE の本文。いずれも第 1 弾の設計上の対象外で、fail-closed の安全弁
 
 ## テスト
 
@@ -107,3 +107,17 @@ SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。�
 - `crates/engine/src/core/dml_join_exec_tests.rs`: 実行器の単体テスト（走査位置 `matches` の固定を含む）
 - `crates/wire-server/tests/wire_sql/wire_sql53_dml_from_using.rs`: 末尾 `;` 付き単独送信・タグ・op id
 - `allowlist.rs`・`relation_name.rs` の単体テスト
+
+## EXPLAIN（Issue #3293）
+
+SQL-53 (b)・SQL-75・SQL-76 のポインタ。`EXPLAIN [ANALYZE|VERBOSE|(オプション)] UPDATE ... FROM`／`DELETE ... USING` を受理する。
+
+- **構文段**: 先頭の `EXPLAIN` を外した文を既存の結合 DML 解析器へ再帰で通し、返った検証済みの値を `ExplainDml::UpdateFrom`／`DeleteUsing` に包む（第 2 の解析器を持たない）。`$n` は前置があっても Parse 段で `42601`（受理は #3297）
+- **静的な EXPLAIN の出力**（閉じた語彙）: 根 `update`／`delete`（`assignments`・`filter`・`returning`・`operation_id`）の下に `join`（`join_method: hash`・`join_type: inner`・`join_keys: n`・`join_filter: none`）、その下に対象表（`relation: 1`・全走査）と FROM／USING 側（`relation: 2`）の `scan`。source 側の分類は実行器と同じ `source_bound_scan` を共有分類（PK → GIN → 全走査）へ渡して作り、実経路と矛盾しない
+- **見積もりは出さない**: 行数・見積もり・表名・別名・値は載せない（SQL-75 (5)・RLS-10。既存の JOIN の `EXPLAIN` と同じ契約。テナントの存在情報を漏らさないため）
+- **副作用ゼロ**: 読むのはスキーマと GIN 宣言だけ。台帳・writer・世代・行には触れず、`READ ONLY` Tx でも実行できる。束縛・変換・走査前検証の順序と `wire_code` は実行と一致する
+- **ANALYZE**: 既存の DML ANALYZE（#2055）と同じ契約で実際に実行する。autocommit は暗黙 Tx で実行して commit、明示 Tx は同じ Tx 上で実行（`ROLLBACK` で戻る）、`USING OPERATION_ID` は台帳に記録される。`actual_rows` は `RETURNING` の可視行数（無ければ 0）。`READ ONLY` Tx は `25006`
+- **VERBOSE**: `RETURNING` の列を `output:` に出す（Describe と同じ列）。`FORMAT JSON` は既存の包みで通り、`ANALYZE` との併用は `0A000`
+- **権限**: 非 EXPLAIN と同じビット（対象表 `UPDATE|SELECT`／`DELETE|SELECT`、FROM／USING 側の SELECT）。EXPLAIN は抜け道にならない
+- **まだ拒否する形**: ビュー・一時表が関与する形（#3292）、FROM 内の JOIN ON・多方向結合（#3294。木の組み立ては source 1 個前提で、#3294 が計画を拡張するときに追随させる）、分割実行（`PARTITIONED`）、セッション無しの入口
+
