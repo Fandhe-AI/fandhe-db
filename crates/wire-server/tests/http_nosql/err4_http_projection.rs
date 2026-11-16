@@ -136,7 +136,8 @@ fn new_core_overflow() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-/// `insert` の件数上限（INDEX-4）を小さく固定したスローアウェイ `EngineCore`
+/// `insert` のチャンク総量上限（INDEX-4 ④。行の形は 1 行 = 1 チャンク。Issue #3308 で
+/// ①ではなく④が行の形の上限になった）を小さく固定したスローアウェイ `EngineCore`
 /// （環境変数の実値に依存せず非 vacuous に誘発するため）。
 fn new_core_with_small_batch_limit(max_files: usize) -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("err4-http-projection-batch-limit");
@@ -145,7 +146,7 @@ fn new_core_with_small_batch_limit(max_files: usize) -> (Arc<EngineCore>, temp_d
     storage.create_table(&schema()).expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_batch_limits(
         BatchLimits {
-            max_files_per_batch: max_files,
+            max_batch_chunks: max_files,
             ..Default::default()
         },
     );
