@@ -18,7 +18,8 @@
 //!   場合）は `(tenant, schema)` の 1 回の照会で、無ければ `3F000`（他テナントの SCHEMA も
 //!   同じ応答）、あれば内部キー `#<schema_id>.<name>`（ADR D2。[`RelationKey`]）の
 //!   `Token::Ident` へ置き換える（Issue #1717。表・ビュー・索引・SEQUENCE の名前位置）。
-//!   MATERIALIZED VIEW の SCHEMA 配置は未対応で `0A000`
+//!   MATERIALIZED VIEW の名前位置も同じ（Issue #3287。作成・更新・削除・参照）。
+//!   `ALTER MATERIALIZED VIEW .. SET SCHEMA` だけは対象外で、実行腕が `0A000` で拒否する
 //! - ENUM 型の名前（`CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の名前位置。Issue #3288）と、列型・キャスト・
 //!   `ALTER TABLE` の型名位置（`sql::type_name_position`。Issue #3289）も同じ規則（`public.` は裸の名前、
 //!   テナントの SCHEMA は内部キー）。関係位置（[`relation_positions`]）には足さない
@@ -39,15 +40,6 @@ use crate::sql::lexer::{Keyword, Token};
 /// の ctx を持つ入口だけが `Storage::schema_id` を包んで渡す（テナントは ctx から。SQL 文からは
 /// 変えられない）。
 pub(crate) type SchemaResolver<'a> = &'a dyn Fn(&str) -> Result<Option<u64>, SqlSurfaceError>;
-
-/// 名前位置の対象オブジェクト種別（置き換え後の可否判定に使う）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ObjKind {
-    /// 表・ビュー・索引・SEQUENCE（SCHEMA 配下に置ける）。
-    Plain,
-    /// MATERIALIZED VIEW（SCHEMA 配下への配置は未対応。`0A000`）。
-    Matview,
-}
 
 /// [`rewrite_relation_names`] の結果。
 #[derive(Debug, Default)]
@@ -102,8 +94,6 @@ pub(crate) struct RelPos {
     pub index: usize,
     /// 作成対象名（`CREATE TABLE`／`CREATE [OR REPLACE] VIEW`／`CREATE SEQUENCE` の名前）の位置か。
     pub create_name: bool,
-    /// MATERIALIZED VIEW の名前位置か（SCHEMA 配下への配置は未対応で `0A000`。Issue #1717）。
-    pub matview: bool,
 }
 
 /// `tokens[i]` が `DELETE FROM <表> [[AS] <別名>] USING <表の並び>` の `USING`（表参照リストを導く語）か。
@@ -150,14 +140,13 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
     let head_drop = ident_is(tokens.first(), "DROP");
     // 文頭付近（先頭 6 トークン）に現れる最初のオブジェクト種別語（`CREATE UNIQUE INDEX`・
     // `CREATE OR REPLACE VIEW`・`DROP SEQUENCE` 等）。`MATERIALIZED VIEW` は種別が VIEW になるため
-    // `head_matview` で区別する。
+    // 名前位置の判定では区別しない（MATERIALIZED VIEW も表・ビューと同じ内部キーへ置換する）。
     let head6 = tokens.get(..6).unwrap_or(tokens);
     let ddl_obj: Option<&'static str> = head6.iter().find_map(|t| {
         ["TABLE", "VIEW", "INDEX", "SEQUENCE"]
             .into_iter()
             .find(|k| ident_is(Some(t), k))
     });
-    let head_matview = head6.iter().any(|t| ident_is(Some(t), "MATERIALIZED"));
     let obj_ddl_head = ["CREATE", "DROP", "ALTER", "REFRESH"]
         .iter()
         .any(|k| ident_is(tokens.first(), k));
@@ -213,7 +202,6 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
         }
         let mut relation_pos = false;
         let mut is_create_name = false;
-        let mut kind = ObjKind::Plain;
         match cur {
             Token::Punct('(') => {
                 if let Some(l) = levels.last_mut() {
@@ -356,9 +344,6 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                     } else if is("VIEW") {
                         // `CREATE [OR REPLACE] VIEW`・`DROP VIEW`・`ALTER VIEW`・
                         // `{CREATE|DROP|ALTER|REFRESH} MATERIALIZED VIEW` の名前位置。
-                        if head_matview {
-                            kind = ObjKind::Matview;
-                        }
                         is_create_name = head_create;
                         obj_ddl_head && ddl_obj == Some("VIEW") && i <= 5
                     } else if is("SEQUENCE") {
@@ -369,12 +354,14 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                         // 構文エラー。索引は対象表の SCHEMA に置かれる）。
                         head_drop && ddl_obj == Some("INDEX") && i <= 2
                     } else if is("CONCURRENTLY") {
-                        head_drop && ddl_obj == Some("INDEX") && i <= 3
+                        // `DROP INDEX CONCURRENTLY <名>` と `REFRESH MATERIALIZED VIEW CONCURRENTLY <名>`
+                        // （Issue #3287）の名前位置。
+                        (head_drop && ddl_obj == Some("INDEX") && i <= 3)
+                            || (ident_is(tokens.first(), "REFRESH")
+                                && ddl_obj == Some("VIEW")
+                                && i <= 4)
                     } else if is("EXISTS") {
                         let if_prefixed = ident_is(prev2, "IF") || ident_is(prev2, "NOT");
-                        if if_prefixed && head_matview && ddl_obj == Some("VIEW") {
-                            kind = ObjKind::Matview;
-                        }
                         let ok = if_prefixed
                             && match ddl_obj {
                                 Some("TABLE") => table_head,
@@ -494,7 +481,6 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 out.positions.push(RelPos {
                     index: i,
                     create_name: is_create_name,
-                    matview: kind == ObjKind::Matview,
                 });
             }
             _ => {}
@@ -566,7 +552,6 @@ pub(crate) fn rewrite_relation_names_full(
     struct Target {
         index: usize,
         create_name: bool,
-        matview: bool,
         function_pos: bool,
         /// `DROP FUNCTION s.f` の関数名位置（存在しない SCHEMA は `3F000` で fail-closed にする）。
         drop_name: bool,
@@ -580,7 +565,6 @@ pub(crate) fn rewrite_relation_names_full(
         .map(|p| Target {
             index: p.index,
             create_name: p.create_name,
-            matview: p.matview,
             function_pos: false,
             drop_name: false,
             type_pos: false,
@@ -601,7 +585,6 @@ pub(crate) fn rewrite_relation_names_full(
             targets.push(Target {
                 index: i,
                 create_name: false,
-                matview: false,
                 function_pos: false,
                 drop_name: false,
                 type_pos: true,
@@ -633,7 +616,6 @@ pub(crate) fn rewrite_relation_names_full(
             targets.push(Target {
                 index: i,
                 create_name: create_type_name,
-                matview: false,
                 function_pos: false,
                 drop_name: false,
                 type_pos: true,
@@ -672,7 +654,6 @@ pub(crate) fn rewrite_relation_names_full(
             targets.push(Target {
                 index: i,
                 create_name: false,
-                matview: false,
                 function_pos: true,
                 drop_name: strict_function_name,
                 type_pos: false,
@@ -694,17 +675,11 @@ pub(crate) fn rewrite_relation_names_full(
             continue;
         };
         let (qualifier, name) = (qualifier.clone(), name.clone());
-        let kind = if pos.matview {
-            ObjKind::Matview
-        } else {
-            ObjKind::Plain
-        };
         match resolve(
             &qualifier,
             &name,
             // 一時表の作成対象名だけが対象（`REFERENCES public.u` 等の参照側は許可する）。
             create_temp_table && pos.create_name,
-            kind,
             resolver,
         ) {
             Ok(Resolved::Public) => {
@@ -1120,7 +1095,6 @@ fn resolve(
     qualifier: &str,
     name: &str,
     create_temp: bool,
-    kind: ObjKind,
     resolver: Option<SchemaResolver<'_>>,
 ) -> Result<Resolved, SqlSurfaceError> {
     if qualifier.eq_ignore_ascii_case("public") {
@@ -1149,11 +1123,6 @@ fn resolve(
     let Some(schema_id) = schema_id else {
         return Err(SqlSurfaceError::invalid_schema_name(qualifier));
     };
-    if kind == ObjKind::Matview {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "materialized views inside a schema are not supported",
-        ));
-    }
     Ok(Resolved::InSchema(
         RelationKey::InSchema {
             schema_id,
@@ -1739,15 +1708,31 @@ mod tests {
         assert_eq!(relation_positions(&t).positions.len(), 1);
     }
 
-    /// MATERIALIZED VIEW の SCHEMA 配置は未対応（`0A000`）。存在しない SCHEMA は `3F000`。
+    /// MATERIALIZED VIEW の名前位置も内部キーへ置換される（Issue #3287）。存在しない SCHEMA は `3F000`。
     #[test]
-    fn matview_in_tenant_schema_is_unsupported() {
-        assert_eq!(
-            rewrite_in_tenant("CREATE MATERIALIZED VIEW s.m AS SELECT id FROM t")
-                .expect_err("matview")
-                .wire_code(),
-            "0A000"
-        );
+    fn matview_in_tenant_schema_is_rewritten() {
+        for sql in [
+            "CREATE MATERIALIZED VIEW s.m AS SELECT id FROM t",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS s.m AS SELECT id FROM t",
+            "REFRESH MATERIALIZED VIEW s.m",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY s.m",
+            "DROP MATERIALIZED VIEW s.m",
+            "DROP MATERIALIZED VIEW IF EXISTS s.m",
+        ] {
+            let toks = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                toks.iter().any(
+                    |t| matches!(t, Token::Ident(n) if n.starts_with('#') && n.ends_with(".m"))
+                ),
+                "{sql}"
+            );
+            assert!(
+                !toks
+                    .iter()
+                    .any(|t| matches!(t, Token::QualifiedIdent { .. })),
+                "{sql}"
+            );
+        }
         assert_eq!(
             rewrite_in_tenant("CREATE MATERIALIZED VIEW z.m AS SELECT id FROM t")
                 .expect_err("matview")
