@@ -9360,8 +9360,33 @@ impl EngineCore {
             let Some(Token::Param(n)) = tokens.get(i) else {
                 continue;
             };
-            if let Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })) =
-                where_table.as_deref().and_then(|t| column_type(t, &col))
+            // 相手列は主表だけでなく、文中の `FROM`／`JOIN`／`USING` 直後の表名（結合・`UPDATE ... FROM`・
+            // `DELETE ... USING` の相手表）からも引く。主表で引けない列を既定ダミー `'0'` のまま
+            // 検証に回すと DATE／UUID／ENUM 列で Parse／Describe が誤って失敗するため。
+            // 一時表は一時コア（`temp_route`）がこの関数を呼ぶので、`column_type` が一時表も引ける。
+            let mut candidates: Vec<&str> = where_table.as_deref().into_iter().collect();
+            for (k, tok) in tokens.iter().enumerate() {
+                let is_rel_head = match tok {
+                    Token::Keyword(crate::sql::lexer::Keyword::From) => true,
+                    Token::Ident(w) => {
+                        w.eq_ignore_ascii_case("JOIN") || w.eq_ignore_ascii_case("USING")
+                    }
+                    _ => false,
+                };
+                if is_rel_head {
+                    if let Some(Token::Ident(name) | Token::QuotedNull(name)) = tokens.get(k + 1) {
+                        candidates.push(name.as_str());
+                    }
+                }
+            }
+            if let Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })) = candidates
+                .into_iter()
+                .find_map(|t| match column_type(t, &col) {
+                    Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, name })) => {
+                        Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, name }))
+                    }
+                    _ => None,
+                })
             {
                 if let Some(tok) = crate::sql::params::row_compare_dummy_token(&ty)? {
                     row_dummies.push((i, *n, tok));

@@ -545,3 +545,25 @@ fn row_compare_params_work_in_knn_and_aggregate_statements() {
         .expect("literal parse");
     assert_eq!(bound, literal);
 }
+
+/// 一時表の DATE／UUID 列の行値比較 `$n` も、型付きダミーで Parse／Describe が通る
+/// （一時表は一時コアで解決される。永続カタログだけを引いて既定ダミー `'0'` が実リテラルとして
+/// 検証され失敗する退行を固定する）。
+#[test]
+fn row_compare_params_on_temp_table_date_and_uuid_columns_parse_and_describe() {
+    let (_p, _g, core) = setup("prep-row-cmp-temp");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TEMP TABLE tt (k INTEGER, d2 DATE, u2 UUID)",
+    )
+    .expect("create temp table");
+    let sql = "SELECT k FROM tt WHERE (d2, u2) > ($1, $2) LIMIT 10";
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(&session, sql, &[])
+        .unwrap_or_else(|e| panic!("{sql}: parse {}", e.wire_code()));
+    core.describe_prepared_in_session(&session, &prepared)
+        .unwrap_or_else(|e| panic!("{sql}: describe {}", e.wire_code()));
+}
