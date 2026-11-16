@@ -108,24 +108,48 @@ const EXECUTABLE: &[(&str, u64)] = &[
     ("DELETE FROM docs USING langs WHERE docs.lang = langs.lang", 1),
     ("DELETE FROM docs d USING langs AS l WHERE d.lang = l.lang", 1),
     ("DELETE FROM docs USING docs AS d2 WHERE docs.id = d2.id", 2),
+    // 非等値・OR をまたぐ述語・DML 専用の葉（Issue #3295。seed: docs = ja/en・n は NULL、langs = ja）
+    ("DELETE FROM docs USING langs WHERE docs.lang < langs.lang", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang >= langs.lang", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang OR docs.n = 1", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang AND langs.label IS NOT NULL", 1),
+    ("UPDATE docs SET n = 5 FROM langs WHERE docs.lang = langs.lang AND docs.n IS NULL", 1),
+    ("DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n IN (1, 2)", 0),
+    ("DELETE FROM docs USING langs WHERE docs.lang < langs.lang OR langs.label IS NULL;", 1),
+    // FROM／USING 内の JOIN ... ON と多方向結合（Issue #3294）
+    (
+        "UPDATE docs SET lang = 'x' FROM langs JOIN langs b ON langs.lang = b.lang \
+         WHERE docs.lang = langs.lang",
+        1,
+    ),
+    (
+        "UPDATE docs SET lang = 'x' FROM langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
+        1,
+    ),
+    (
+        "DELETE FROM docs USING langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
+        1,
+    ),
+    (
+        "DELETE FROM docs d USING langs a LEFT JOIN langs b ON a.lang = b.lang WHERE d.lang = a.lang;",
+        1,
+    ),
+    // 等値結合キーなし・WHERE 省略（純粋な交差結合。op id の有無によらず実行される。Issue #3294）
+    ("UPDATE docs SET lang = 'x' FROM langs", 2),
+    ("UPDATE docs SET lang = 'x' FROM langs USING OPERATION_ID NULL", 2),
+    ("DELETE FROM docs USING langs", 2),
+    ("DELETE FROM docs USING langs USING OPERATION_ID 'op-d2'", 2),
+    // 裸の bool 列 WHERE の後ろに DML の後続句が続く形（source だけの述語。flag は NULL のため 0 件）
+    ("UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag USING OPERATION_ID 'op-u3'", 0),
+    ("UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag;", 0),
+    ("DELETE FROM docs USING langs WHERE langs.flag USING OPERATION_ID 'op-d3'", 0),
+    ("DELETE FROM docs USING langs WHERE langs.flag;", 0),
 ];
 
 /// 束縛は通るが、変換器が `0A000` で拒否する形（第 1 弾の対象外。設計記録の変換器節）。
 const CONVERTER_REJECTED: &[&str] = &[
-    // relation をまたぐ OR
+    // 残余（Issue #3295）が FROM 側の疑似列 id を参照する形（固定文言の 0A000）
     "UPDATE docs SET lang = 'x', n = 1 FROM langs WHERE docs.lang = langs.lang OR (docs.id = langs.id)",
-    // FROM／USING が 2 表以上
-    "UPDATE docs SET lang = 'x' FROM langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
-    "DELETE FROM docs USING langs a, langs b WHERE docs.lang = a.lang AND a.lang = b.lang",
-    // 等値結合キーなし・WHERE 省略（op id の有無によらず変換器が先に拒否する）
-    "UPDATE docs SET lang = 'x' FROM langs USING OPERATION_ID NULL",
-    "DELETE FROM docs USING langs USING OPERATION_ID 'op-d2'",
-    "DELETE FROM docs USING langs",
-    // 裸の bool 列 WHERE の後ろに DML の後続句が続く形（同上）
-    "UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag USING OPERATION_ID 'op-u3'",
-    "UPDATE docs SET lang = 'x' FROM langs WHERE langs.flag;",
-    "DELETE FROM docs USING langs WHERE langs.flag USING OPERATION_ID 'op-d3'",
-    "DELETE FROM docs USING langs WHERE langs.flag;",
 ];
 
 /// 実行できる形に `USING OPERATION_ID` が付いた形（Issue #3203 で台帳結線済み。初回は `UPDATE n`／`DELETE n`）。
@@ -193,6 +217,7 @@ fn executable_forms_run_with_exact_tags_and_rows() {
 
 /// 変換器が拒否する形は `0A000` で、行も台帳も変えない。
 // intentional: docs/design/update-from-delete-using.md
+// tracked: #3295
 #[test]
 fn converter_rejected_forms_fail_closed_without_side_effects() {
     let (core, path) = new_core("sql53-from-conv-reject", false);
@@ -202,14 +227,6 @@ fn converter_rejected_forms_fail_closed_without_side_effects() {
     for sql in CONVERTER_REJECTED {
         assert_eq!(code(run(&core, sql)), "0A000", "{sql}");
         assert_eq!(before, doc_rows(&core), "rows changed by {sql}");
-    }
-    // 拒否された文の operation_id は台帳に残らない（別の文が同じ ID で通常どおり実行できる）。
-    for id in ["op-d2", "op-u3", "op-d3"] {
-        run(
-            &core,
-            &format!("UPDATE docs SET n = 7 WHERE lang = 'en' USING OPERATION_ID '{id}'"),
-        )
-        .unwrap_or_else(|e| panic!("operation_id {id} should be unused: {e:?}"));
     }
 }
 
@@ -302,6 +319,7 @@ fn operation_id_reuse_for_a_different_statement_is_22023() {
 }
 
 /// 束縛エラー・変換器拒否の文は台帳を消費せず、同じ ID を別の文が通常どおり使える。
+// tracked: #3295
 #[test]
 fn bind_and_converter_errors_do_not_consume_the_ledger() {
     let (core, path) = new_core("sql53-from-opid-unused", false);
@@ -311,7 +329,12 @@ fn bind_and_converter_errors_do_not_consume_the_ledger() {
     for (sql, want) in [
         ("UPDATE docs SET lang = 'x' FROM langs WHERE lang = 'ja' USING OPERATION_ID 'op-e'", "42702"),
         ("UPDATE docs SET lang = 'x' FROM nope WHERE docs.lang = nope.lang USING OPERATION_ID 'op-e'", "42P01"),
-        ("DELETE FROM docs USING langs USING OPERATION_ID 'op-e'", "0A000"),
+        // 変換器の拒否（relation をまたぐ OR。tracked: #3295）
+        (
+            "DELETE FROM docs USING langs WHERE docs.lang = langs.lang OR docs.id = langs.id \
+             USING OPERATION_ID 'op-e'",
+            "0A000",
+        ),
     ] {
         assert_eq!(code(run(&core, sql)), want, "{sql}");
         assert_eq!(before, doc_rows(&core));
@@ -515,46 +538,69 @@ fn rejected_forms_fail_closed_with_expected_codes() {
              USING OPERATION_ID 'p2' PARTITIONED",
             "42601",
         ),
-        // WHERE の対象外構文（サブクエリ・IS NULL・数値リテラル・NOT）
+        // WHERE の対象外構文（サブクエリ・NOT・IS TRUE）
         (
             "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang IN (SELECT lang FROM langs LIMIT 1)",
             "42601",
         ),
         (
-            "UPDATE docs SET lang = 'x' FROM langs WHERE langs.label IS NULL",
-            "42601",
-        ),
-        (
-            "DELETE FROM docs USING langs WHERE docs.n = 1",
+            "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND langs.flag IS TRUE",
             "42601",
         ),
         (
             "DELETE FROM docs USING langs WHERE NOT docs.lang = langs.lang",
             "42601",
         ),
-        // SET 左辺の修飾・行値代入
+        // SET 左辺の修飾
         (
             "UPDATE docs SET docs.lang = 'x' FROM langs WHERE docs.lang = langs.lang",
             "42601",
         ),
+        // 行値代入の形の誤り（Issue #3296。受理される形は sql53_dml_from_set_row_expr.rs）
         (
-            "UPDATE docs SET (lang, n) = ('x', 1) FROM langs WHERE docs.lang = langs.lang",
-            "0A000",
-        ),
-        // FROM 表の列を使う式
-        (
-            "UPDATE docs SET lang = upper(langs.lang) FROM langs WHERE docs.lang = langs.lang",
-            "0A000",
-        ),
-        (
-            "UPDATE docs SET lang = upper(label) FROM langs WHERE docs.lang = langs.lang",
-            "0A000",
-        ),
-        // FROM 内の JOIN ... ON
-        (
-            "UPDATE docs SET lang = 'x' FROM langs JOIN langs b ON langs.lang = b.lang \
-             WHERE docs.lang = langs.lang",
+            "UPDATE docs SET (lang, n) = ('x') FROM langs WHERE docs.lang = langs.lang",
             "42601",
+        ),
+        (
+            "UPDATE docs SET (lang) = (langs.label) FROM langs WHERE docs.lang = langs.lang",
+            "42601",
+        ),
+        (
+            "UPDATE docs SET (lang, n) = (SELECT 'x', 1) FROM langs WHERE docs.lang = langs.lang",
+            "0A000",
+        ),
+        // FROM 表の列を使う式の誤り（未知列・未知の修飾子・両表共通の非修飾名）
+        (
+            "UPDATE docs SET lang = upper(langs.nope) FROM langs WHERE docs.lang = langs.lang",
+            "42703",
+        ),
+        (
+            "UPDATE docs SET lang = upper(zz.lang) FROM langs WHERE docs.lang = langs.lang",
+            "42P01",
+        ),
+        // FROM 内の JOIN ... USING・NATURAL JOIN・カンマの後の明示 JOIN は意図的な拒否（0A000）
+        (
+            "UPDATE docs SET lang = 'x' FROM langs JOIN langs b USING (lang) \
+             WHERE docs.lang = langs.lang",
+            "0A000",
+        ),
+        (
+            "DELETE FROM docs USING langs NATURAL JOIN langs b WHERE docs.lang = langs.lang",
+            "0A000",
+        ),
+        (
+            "DELETE FROM docs USING langs a, langs b JOIN langs c ON b.lang = c.lang",
+            "0A000",
+        ),
+        // 派生表・関数呼び出し
+        (
+            "DELETE FROM docs USING langs a JOIN (SELECT lang FROM langs) b ON a.lang = b.lang",
+            "42601",
+        ),
+        // ON が対象表を参照する
+        (
+            "DELETE FROM docs USING langs a JOIN langs b ON docs.lang = b.lang WHERE docs.lang = a.lang",
+            "42P01",
         ),
         // 別名付きで FROM／USING 無し
         (
@@ -851,9 +897,12 @@ fn require_where_for_dml_applies_to_from_and_using_forms() {
         .expect("with WHERE");
 }
 
-/// ビューが関与する FROM／USING 形は `0A000`。
+/// FROM／USING 側の単純形ビューは受理され（Issue #3292）、書き込み先（target）がビューの形は
+/// `0A000` のまま。
+/// 更新可能ビューを target にする形は別の穴として意図的に拒否する。
+/// intentional: docs/design/update-from-delete-using.md
 #[test]
-fn view_relations_are_rejected_with_0a000() {
+fn view_as_source_is_accepted_and_view_as_target_is_rejected() {
     let (core, path) = new_core("sql53-from-view", false);
     let _g = CleanupGuard(path);
     let mut session = SessionState::default();
@@ -867,10 +916,17 @@ fn view_relations_are_rejected_with_0a000() {
     for sql in [
         "UPDATE docs SET lang = 'x' FROM v WHERE docs.id = v.id",
         "DELETE FROM docs USING v WHERE docs.id = v.id",
-        "DELETE FROM v USING langs WHERE v.id = langs.id",
     ] {
-        assert_eq!(code(core.parse_sql(sql)), "0A000", "{sql}");
+        let parsed = core.parse_sql(sql).expect(sql);
+        assert!(
+            matches!(parsed, ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_)),
+            "{sql}: {parsed:?}"
+        );
     }
+    assert_eq!(
+        code(core.parse_sql("DELETE FROM v USING langs WHERE v.id = langs.id")),
+        "0A000"
+    );
 }
 
 /// SET 右辺が列名 `distinct`（引用形）でも FROM 形（`UpdateFrom`）として解析される

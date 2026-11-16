@@ -205,7 +205,14 @@ fn reject_non_constant_with(expr: &Expr, allow_placeholders: bool) -> Result<(),
             reject_non_constant_with(lhs, allow_placeholders)?;
             reject_non_constant_with(rhs, allow_placeholders)
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                reject_non_constant_with(o, allow_placeholders)?;
+            }
             for (cond, result) in whens {
                 reject_non_constant_with(cond, allow_placeholders)?;
                 reject_non_constant_with(result, allow_placeholders)?;
@@ -271,10 +278,15 @@ fn expr_uses_schema_fn(expr: &Expr) -> bool {
         | Expr::VectorDistance { lhs, rhs, .. } => {
             expr_uses_schema_fn(lhs) || expr_uses_schema_fn(rhs)
         }
-        Expr::Case { whens, else_result } => {
-            whens
-                .iter()
-                .any(|(c, r)| expr_uses_schema_fn(c) || expr_uses_schema_fn(r))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_uses_schema_fn)
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_uses_schema_fn(c) || expr_uses_schema_fn(r))
                 || else_result.as_deref().is_some_and(expr_uses_schema_fn)
         }
         Expr::Coalesce(args) => args.iter().any(expr_uses_schema_fn),

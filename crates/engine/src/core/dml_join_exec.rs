@@ -57,6 +57,16 @@ pub(crate) struct JoinedDmlOutcome {
 }
 
 impl EngineCore {
+    /// 結合形 DML の結合上限（起動時設定）。実行と `EXPLAIN`（Issue #3293）が同じ値で走査前検証を行う。
+    pub(super) fn joined_dml_limits(&self) -> JoinLimits {
+        JoinLimits {
+            max_input_rows: self.join_limits.max_input_rows(),
+            max_output_rows: self.join_limits.max_output_rows(),
+            max_relations: self.join_limits.max_relations(),
+            ..JoinLimits::default()
+        }
+    }
+
     /// 結合形 DML を実行する。起動時設定の上限（結合・走査・影響行数）を使う。`content_hash` は
     /// 構文段で算出した正規化文ハッシュ（台帳の照合・記録に使う）。
     #[allow(clippy::too_many_arguments)]
@@ -69,12 +79,7 @@ impl EngineCore {
         operation_id: Option<&OperationId>,
         content_hash: &ContentHash,
     ) -> Result<JoinedDmlOutcome, SqlSurfaceError> {
-        let limits = JoinLimits {
-            max_input_rows: self.join_limits.max_input_rows(),
-            max_output_rows: self.join_limits.max_output_rows(),
-            max_relations: self.join_limits.max_relations(),
-            ..JoinLimits::default()
-        };
+        let limits = self.joined_dml_limits();
         self.execute_joined_dml_with_limits(
             target,
             ctx,
@@ -131,21 +136,33 @@ impl EngineCore {
             crate::sql::exec::map_write_error(crate::tenant::TenantWriteError::from(e), op)
         })?;
 
-        // source のスキーマが束縛後に変わっていないこと（対象表は書き込み側が照合する）。
-        let live_source =
-            crate::catalog::require_table_schema_write_any_identity(write_txn, &plan.source.table)
-                .map_err(|e| match e {
-                    crate::catalog::CatalogError::TableNotFound(name) => {
-                        SqlSurfaceError::UndefinedTable { name }
-                    }
-                    _ => SqlSurfaceError::Internal {
-                        detail: "failed to load table schema".to_string(),
-                    },
-                })?;
-        if live_source != plan.source.schema {
-            return Err(SqlSurfaceError::invalid_input(
-                "table schema changed after the statement was bound",
-            ));
+        // source のスキーマが束縛後に変わっていないこと（対象表は書き込み側が照合する）。畳み込み
+        // source（Issue #3294）は JOIN の全実表を照合する。畳み込みスキーマは合成で実表ではない。
+        let single_source;
+        let source_tables: &[(String, crate::catalog::TableSchema)] = match &plan.source.fold {
+            Some(fold) => &fold.real,
+            None => {
+                single_source = [(plan.source.table.clone(), plan.source.schema.clone())];
+                &single_source
+            }
+        };
+        for (table, bound_schema) in source_tables {
+            let live_source = crate::catalog::require_table_schema_write_any_identity(
+                write_txn, table,
+            )
+            .map_err(|e| match e {
+                crate::catalog::CatalogError::TableNotFound(name) => {
+                    SqlSurfaceError::UndefinedTable { name }
+                }
+                _ => SqlSurfaceError::Internal {
+                    detail: "failed to load table schema".to_string(),
+                },
+            })?;
+            if &live_source != bound_schema {
+                return Err(SqlSurfaceError::invalid_input(
+                    "table schema changed after the statement was bound",
+                ));
+            }
         }
 
         // FROM／USING 側を `ctx`（RLS 暗黙適用）で走査してハッシュ表にする。以降の書き込み側の
@@ -163,10 +180,13 @@ impl EngineCore {
         let index_handle = probe.index_handle();
         let matches_handle = probe.matches_handle();
         let index_ref: &crate::sql::join::dml::SourceIndex = &index_handle;
+        // 畳み込み source の行は 1 本のセル列で、FROM／USING 側の各 relation が同じセル位置の
+        // 規則（畳み込みスキーマの走査投影）で読む。relation ごとに同じ行を指す参照を並べる。
+        let source_relations = plan.source_relation_count();
         let lookup = |id: u64| -> Option<Vec<FromRowRef<'_>>> {
             let pos = *matches_handle.try_borrow().ok()?.get(&id)?;
             let row = index_ref.rows.get(usize::try_from(pos).ok()?)?;
-            Some(vec![FromRowRef { cells: &row.cells }])
+            Some(vec![FromRowRef { cells: &row.cells }; source_relations])
         };
         let mut returning_rows: Vec<ResultRow> = Vec::new();
         let mut returning_budget = 0usize;

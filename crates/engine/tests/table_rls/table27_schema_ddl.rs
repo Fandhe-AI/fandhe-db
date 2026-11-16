@@ -216,6 +216,8 @@ fn ddl_permission_gate_applies_regardless_of_existence() {
     ok_as(&core, "alice", &mut allowed, "DROP SCHEMA exists1");
 }
 
+/// 未対応の形は `0A000`、構文違反は `42601`（要素つき `CREATE SCHEMA` の未対応の要素を含む）。
+// intentional: docs/design/schema-tenant-namespace.md
 #[test]
 fn syntax_table() {
     let (_p, _g, core) = open_fixture("sch-syntax");
@@ -224,7 +226,13 @@ fn syntax_table() {
         // `AUTHORIZATION <ロール>` は Issue #2236 で対応した（`sql40_object_owner.rs`。ロール不在は `42704`）。
         // 名前を省略して `CURRENT_USER` 等を指定する形は名前を決められないため `0A000`。
         "CREATE SCHEMA AUTHORIZATION CURRENT_USER",
-        "CREATE SCHEMA s CREATE TABLE x (a INT)",
+        // スキーマ要素のうち `CREATE TABLE`／`VIEW`／`SEQUENCE` は Issue #3286 で対応した
+        // （`table27_schema_elements.rs`）。それ以外の要素・要素側の `IF NOT EXISTS`・`IF NOT EXISTS` との併用は
+        // 黙って無視せず `0A000`（fail-closed。設計記録の Issue #3286 実装記録 D2・D3）。
+        "CREATE SCHEMA s CREATE INDEX i ON x (a)",
+        "CREATE SCHEMA s CREATE TABLE x (a INT) GRANT SELECT ON x TO r",
+        "CREATE SCHEMA s CREATE TABLE IF NOT EXISTS x (a INT)",
+        "CREATE SCHEMA IF NOT EXISTS s CREATE TABLE x (a INT)",
         // `DROP SCHEMA ... CASCADE` は Issue #1717 で対応した（`table27_schema_objects.rs`）。
         "DROP SCHEMA a, b",
     ] {
@@ -235,6 +243,8 @@ fn syntax_table() {
         "CREATE SCHEMA a.b",
         "CREATE SCHEMA 1x",
         "CREATE SCHEMA s extra",
+        "CREATE SCHEMA s CREATE",
+        "CREATE SCHEMA s CREATE TABLE",
         "DROP SCHEMA",
         "DROP SCHEMA a.b",
         "DROP SCHEMA 1x",
@@ -247,12 +257,18 @@ fn syntax_table() {
     ok_as(&core, "alice", &mut s, "DROP SCHEMA s RESTRICT");
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
 #[test]
 fn schema_ddl_inside_explicit_transaction_is_rejected() {
     let (p, _g, core) = open_fixture("sch-txn");
     let mut s = allowed_session();
     ok_as(&core, "alice", &mut s, "CREATE SCHEMA existing");
-    for sql in ["CREATE SCHEMA s9", "DROP SCHEMA existing"] {
+    for sql in [
+        "CREATE SCHEMA s9",
+        // 要素つきも同じく拒否し、何も作らない（Issue #3286）。
+        "CREATE SCHEMA s9 CREATE TABLE x (a INT)",
+        "DROP SCHEMA existing",
+    ] {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
             .expect("begin");

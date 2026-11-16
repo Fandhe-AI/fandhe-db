@@ -93,15 +93,14 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
   （存在しないパスは変化なし）。スカラーからの削除・オブジェクトへの添字削除・スカラー根への `#-`・
   配列の段の非整数パス要素は `22023`。
 - 型規則: `||` は両辺 jsonb（型なし文字列リテラルは反対側が jsonb のとき jsonb として解釈）。
-  文字列連結に当たる組（text 同士・`json` 列・jsonb と text）は `0A000`、jsonb と数値などは
-  `42883`。`-`・`#-` の左辺は jsonb のみで、`json` 列は `42883`。`- integer` は int4 式のみ。
+  拒否する組の SQLSTATE は「Issue #3277 での変更」の分類表に従う。`-`・`#-` の左辺は jsonb のみで、`json` 列は `42883`。`- integer` は int4 式のみ。
   `#-` の右辺は text[] リテラルのみ（それ以外は `0A000`）。
 - 結果は正規化して上限（長さ・深さ・要素数）を再検証し、超過は `54000`。
 - DML の content hash はタグ 12 の下位種別 10（`||`）・11（`#-`）を追加した
   （[multi-row-dml-operation-id.md](multi-row-dml-operation-id.md)。`jsonb - x` は `Binary Sub` で区別）。
 - 対象外: `jsonb - text[]` の SQL 表層（text[] を書く手段のキャスト・`ARRAY[...]` 待ち。評価関数
   `json::jsonb_delete_keys` は用意済み）、`#-` のパスの NULL 要素（`22004` の分類が未実装のため
-  `0A000`）、`UPDATE ... SET` への jsonb 式の代入、text／json の `||`、ORDER BY の式キー、
+  `0A000`）、`UPDATE ... SET` への jsonb 式の代入、json の `||`・非 text の暗黙連結（text 同士は #3276、非 text の暗黙連結は #3278 で実装済み）、ORDER BY の式キー、
   `$n` の型推論、NoSQL の filter。
 
 ## Issue #1599 での変更（スカラー関数）
@@ -338,6 +337,59 @@ jsonpath 系（#2182 配下の #2183〜#2187）は、JSON 値が式評価器の�
 - 対象外: GIN 相当の索引（#2204）、NoSQL filter、`jsonpath` 型の式・列・CAST、`@@` の全文検索版、
   ORDER BY・VIEW 本文での利用（既存の jsonb 述語演算子と同じ受理範囲）。
   期待値は PostgreSQL 17 の挙動に合わせたが、実機との突き合わせは未実施。
+
+## Issue #3278 での変更（`||` の非 text オペランドの暗黙連結）
+
+- 対象ビヘイビア: SQL-42（ポインタ）。片側が text（型なし文字列リテラル・裸の NULL を含む）で、
+  他方が `CAST(.. AS text)` で変換できる型のとき、他方を `CAST` と同じ変換で text へ変えて
+  strict な text 連結（`BuiltinFn::TextConcat`）に束縛する。PostgreSQL 17 の
+  `text || anynonarray`・`anynonarray || text` に当たる。変換規則は `sql::cast` を再利用するため
+  値の表記・セッションのタイムゾーンの扱いは `CAST` と一致する。
+- 受理する相手の型: 整数・浮動小数・numeric（数値リテラルは正確な numeric 定数）・boolean・
+  date・time・timestamp・timestamptz・interval・uuid・json（原文保存）。json は PostgreSQL でも
+  自前の `||` を持たず text 連結になる（結果は原文＋相手の text）。
+- 意図的に拒否する組（`0A000`・fail-closed）:
+  - jsonb と型付き text（`docb || lang`）。型なしリテラルとの組は jsonb 連結になるため、型付き text との
+    組を text 連結にすると意味が割れる曖昧な組として拒否する。
+  - 配列・bytea・vector・bit。PostgreSQL では自前の `||`（配列の連結・追加、bytea 連結ほか）を持つため、
+    text 連結として黙って評価しない（SQLSTATE は #3277 の表に従う）。
+  - 種別を静的に決められない数値（`id` 疑似列・関数の結果・型の決まらない算術）。`CAST(.. AS text)`
+    が同じ制約で `0A000` のため、それに合わせる。CHECK 本体での変換も `CAST` と同じく `0A000`。
+- 非 text 同士の組と jsonb を含む組の SQLSTATE は #3277 の表に従う。
+- 束縛は葉でないオペランドを 1 回だけ束縛する（左結合の連鎖で束縛時間が線形に収まる）。
+  `UPDATE ... SET c = '<文字列>' || n` を式として読むため、SET 右辺の文字列リテラルの直後の `||` を
+  式の開始として扱う。
+- 対象外: `$n` の型推論、CHECK・UDF・DEFAULT 本体での `||`、ORDER BY の式キー、
+  配列・bytea 等の自前の `||` の実装。
+
+## Issue #3277 での変更（`||` の拒否 SQLSTATE の統一）
+
+`||` の型の組が連結に束縛できないときの SQLSTATE を、被演算子の形（リテラル・列・CAST・json 列の左右）と
+句の位置（FROM なし・通常投影・集計リスト・WHERE の式）によらず 1 箇所（`udf_call::reject_concat_pair`）で決める
+（SQL-42 ポインタ）。判定は束縛時の静的な型だけで行い、行の値・他テナントの行の有無で結果を変えない。
+PG に演算子が無い組は PG 準拠の `42883`、PG では通るが本実装が未実装の組は fail-closed の `0A000`。
+
+| 被演算子の組 | 結果 |
+| ------------ | ---- |
+| text × text（型なしリテラル・裸の NULL を含む） | text 連結（#3276） |
+| jsonb × jsonb、jsonb × 型なしリテラル | jsonb 連結（不変） |
+| 配列を含む組（配列の要素型と反対側の型が互換するもの。型なしリテラル、同じ要素型の json／jsonb／bytea／bit、date／timestamp／timestamptz 間の暗黙変換を含む） | `0A000`（PG の配列連結。未実装） |
+| 配列を含む組（要素型が互換しないもの。`integer[]` × `boolean[]`、text × `integer[]`、要素型が異なる jsonb／bytea／bit × 配列、vector × 配列 等） | `42883`（PG に演算子が無い） |
+| text × 変換できる非 text（数値・boolean・日時・interval・uuid・json）とその逆 | text 連結（#3278。`CAST(.. AS text)` と同じ変換） |
+| text × jsonb・bytea・vector・bit とその逆 | `0A000`（曖昧な組・自前の連結演算子を持つ型。text × 配列は上の配列の行） |
+| bytea × bytea、vector × vector、bit × bit | `0A000`（PG／pgvector にある連結演算子。未実装） |
+| 上記以外（数値 × 数値、jsonb × json、json × json、json × 数値、bytea × 数値 等） | `42883`（PG に演算子が無い） |
+
+- エラーの優先順位は「左の被演算子の束縛エラー → 右の被演算子の束縛エラー → 型の組の分類」。
+  json 列を左に置いても、右の未知の列は `42703`
+- 配列・bytea・vector・bit の `0A000` は設計上の対象外（fail-closed）で、実装は別の対応になる。
+  テストの `intentional:` 注記はこの節を根拠にする
+- 構文段の補正: 集計 SELECT リストで文字列リテラルから始まる `'x' || col` を式として読む
+  （従来は直後が `::` のときだけで、`42601` になっていた）
+- 文言: `42883` は `operator does not exist: the operand types do not match the || operator`、
+  `0A000` は `the || operator is not supported for these operand types`。値・列の中身は含めない
+- 対象外: WHERE の構造葉・`UPDATE SET`・`INSERT VALUES`・LIKE／正規表現のパターン位置などリテラル始まりの
+  `||` が構文段で拒否される文脈、配列列の式内参照（`22000`）。いずれも本 Issue では変えない
 
 ## 設計判断の所在
 

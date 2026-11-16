@@ -218,11 +218,26 @@ fn expand_relation(
         .relations()
         .get(relation)
         .ok_or_else(|| bug("relation index out of range"))?;
-    if schema.has_pseudo_id() {
-        push_column(out, relation, ColumnSlot::Id, None, scope)?;
-    }
-    for index in 0..schema.columns.len() {
-        push_column(out, relation, ColumnSlot::Column(index), None, scope)?;
+    match scope.visible_columns(relation) {
+        // ビューを source にした relation（Issue #3292）は公開列だけを公開順に並べる。
+        // 疑似列 `id` は一覧に含まれ、基底表が持つときだけ展開する。
+        Some(visible) => {
+            for name in visible {
+                if name == "id" && schema.has_pseudo_id() {
+                    push_column(out, relation, ColumnSlot::Id, None, scope)?;
+                } else if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
+                    push_column(out, relation, ColumnSlot::Column(index), None, scope)?;
+                }
+            }
+        }
+        None => {
+            if schema.has_pseudo_id() {
+                push_column(out, relation, ColumnSlot::Id, None, scope)?;
+            }
+            for index in 0..schema.columns.len() {
+                push_column(out, relation, ColumnSlot::Column(index), None, scope)?;
+            }
+        }
     }
     Ok(())
 }

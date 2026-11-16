@@ -166,8 +166,10 @@ fn plan(keys: Vec<EquiKey>, update: Option<JoinedUpdateSet>) -> JoinedDmlPlan {
             columns: vec![1, 2],
             returning_columns: Vec::new(),
             include_pseudo_id: false,
+            fold: None,
         },
         keys,
+        residual: None,
         update,
         returning: None,
     }
@@ -1086,11 +1088,13 @@ fn update_from_assigns_time_timestamptz_interval_bpchar_and_array_source_columns
             columns: vec![2, 3, 4, 5, 6],
             returning_columns: Vec::new(),
             include_pseudo_id: false,
+            fold: None,
         },
         keys: vec![EquiKey {
             target_column: Some(1),
             source_column: Some(1),
         }],
+        residual: None,
         update: Some(JoinedUpdateSet {
             copies: Vec::new(),
             literal_assignments: Vec::new(),
@@ -1195,4 +1199,77 @@ fn converted_plan_ignores_other_tenants_private_source_rows() {
     let out = exec(&core, &alice, &plan).expect("update");
     assert_eq!(out.rows_affected, 2);
     assert_eq!(xs(&core, &alice), vec![(1, 100), (2, 300), (3, 30)]);
+}
+
+/// 残余述語（Issue #3295）: キー無しの非等値は source の全行をネストループで評価し、
+/// 採る source 行は残余が真になった走査位置の最初。
+#[test]
+fn keyless_residual_takes_the_first_true_source_row() {
+    let (core, _g, alice) = setup();
+    let plan = plan_from_sql(
+        &core,
+        "UPDATE t SET x = s.v FROM s WHERE t.x < s.v AND s.v < 300",
+    );
+    assert!(plan.keys.is_empty() && plan.residual.is_some());
+    let out = exec(&core, &alice, &plan).expect("update");
+    assert_eq!(out.rows_affected, 3);
+    // source は (a,100)・(a,200)。どの対象行も先頭の 100 が真になる。
+    assert_eq!(xs(&core, &alice), vec![(1, 100), (2, 100), (3, 100)]);
+    assert_eq!(out.matches, vec![(1, 0), (2, 0), (3, 0)]);
+}
+
+/// 等値キーのバケット内で残余が偽の行を飛ばし、最初の真を採る。
+#[test]
+fn residual_skips_false_rows_in_the_key_bucket() {
+    let (core, _g, alice) = setup();
+    seed_t(&core, &alice, 4, 150, Some("a"));
+    let plan = plan_from_sql(
+        &core,
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k AND t.x < s.v",
+    );
+    let out = exec(&core, &alice, &plan).expect("update");
+    // t1(10)・t4(150) は k = a のバケット {100, 200} が対象。t1 は 100、t4 は 100 が偽で 200 が真。
+    // t2(20) は b のバケット {300} が真。t3(c) は不一致。
+    assert_eq!(out.rows_affected, 3);
+    assert_eq!(
+        xs(&core, &alice),
+        vec![(1, 100), (2, 300), (3, 30), (4, 200)]
+    );
+    assert_eq!(out.matches, vec![(1, 0), (2, 2), (4, 1)]);
+}
+
+/// 比較回数・一致ペア数の上限超過は `54000` で副作用ゼロ。比較回数は評価の前に計上される。
+#[test]
+fn residual_comparison_and_pair_limits_reject_without_side_effects() {
+    let sql = "UPDATE t SET x = s.v FROM s WHERE t.x < s.v AND s.v < 300";
+    // 対象 3 行 × source 2 行 = 6 比較。上限 5 は超過・6 は成功。
+    let (core, _g, alice) = setup();
+    let plan = plan_from_sql(&core, sql);
+    let tight = JoinLimits {
+        max_comparisons: 5,
+        ..JoinLimits::default()
+    };
+    let err = exec_with(&core, &alice, &plan, &tight, None, 1_000_000)
+        .err()
+        .expect("reject");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(xs(&core, &alice), vec![(1, 10), (2, 20), (3, 30)]);
+    let at_limit = JoinLimits {
+        max_comparisons: 6,
+        ..JoinLimits::default()
+    };
+    exec_with(&core, &alice, &plan, &at_limit, None, 1_000_000).expect("at the limit");
+
+    // 一致ペアは真になった 6 組。上限 5 は超過。
+    let (core, _g, alice) = setup();
+    let plan = plan_from_sql(&core, sql);
+    let pairs = JoinLimits {
+        max_output_rows: 5,
+        ..JoinLimits::default()
+    };
+    let err = exec_with(&core, &alice, &plan, &pairs, None, 1_000_000)
+        .err()
+        .expect("reject");
+    assert_eq!(err.wire_code(), "54000");
+    assert_eq!(xs(&core, &alice), vec![(1, 10), (2, 20), (3, 30)]);
 }

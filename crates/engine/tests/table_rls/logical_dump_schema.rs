@@ -421,6 +421,85 @@ fn other_tenants_schema_scoped_sequences_do_not_affect_the_dump() {
     assert!(!b.iter().any(|(_, s)| s.contains("app.q")));
 }
 
+/// SCHEMA 配下の ENUM 型（`CREATE TYPE s.mood`。Issue #3288）が、同名の public の型と並んで往復で一致し、
+/// SCHEMA 修飾の `CREATE TYPE` として書き出される（共有の型が先）。他テナントの同名 SCHEMA・型は自テナントの
+/// ダンプの成否にも内容にも影響しない。
+#[test]
+fn schema_scoped_enum_types_round_trip_and_other_tenants_do_not_leak() {
+    let p1 = unique_db_path("dump-scoped-enum-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-scoped-enum-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TYPE mood AS ENUM ('p')",
+        "CREATE TYPE app.zeta AS ENUM ('a', 'it''s')",
+        "CREATE TYPE app.mood AS ENUM ('s')",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let before = dump(&src, &scope).expect("dump");
+    // 他テナントの同名 SCHEMA・型は自テナントのダンプを変えない。
+    ok(&src, "tenant-b", "CREATE SCHEMA app");
+    ok(&src, "tenant-b", "CREATE TYPE app.secret AS ENUM ('b')");
+    let after = dump(&src, &scope).expect("dump with other tenant state");
+    assert_eq!(before, after);
+    let types: Vec<&str> = after
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .filter(|s| s.starts_with("CREATE TYPE "))
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "CREATE TYPE \"mood\" AS ENUM ('p')",
+            "CREATE TYPE app.mood AS ENUM ('s')",
+            "CREATE TYPE app.zeta AS ENUM ('a', 'it''s')",
+        ]
+    );
+    assert!(!after.iter().any(|(_, s)| s.contains("secret")));
+    // 空の DB へ復元して再書き出しが一致する。
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &before);
+    assert_eq!(dump(&dst, &scope).expect("dump again"), before);
+    // tenant-b 自身のダンプには自分の型が出る。
+    let b = dump(&src, &SchemaDdlScope::shared_and_tenant("tenant-b")).expect("dump b");
+    assert!(b
+        .iter()
+        .any(|(_, s)| s == "CREATE TYPE app.secret AS ENUM ('b')"));
+}
+
+/// SCHEMA 配下の ENUM 型を使う列（スカラー・配列。Issue #3289）が、公開名（`schema.name`。内部キーの `#` を
+/// 含まない）で書き出され、往復で同一のダンプになる。SCHEMA の改名後は改名後の名前で書き出される。
+#[test]
+fn schema_scoped_enum_columns_round_trip_with_public_names() {
+    let setup = [
+        "CREATE SCHEMA app",
+        "CREATE TYPE app.mood AS ENUM ('a', 'b')",
+        "CREATE TABLE app.t (id BIGINT PRIMARY KEY, m app.mood, ms app.mood[4])",
+        "INSERT INTO app.t (id, m) VALUES (1, 'a')",
+    ];
+    let first = assert_round_trip("scoped-enum-col", "tenant-a", &setup);
+    let table = first
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .find(|s| s.starts_with("CREATE TABLE app.t"))
+        .expect("table ddl");
+    assert!(table.contains("app.mood"), "{table}");
+    assert!(!first.iter().any(|(_, s)| s.contains('#')), "{first:?}");
+    // 改名後の公開名で書き出され、再往復も一致する。
+    let mut renamed: Vec<&str> = setup.to_vec();
+    renamed.push("ALTER SCHEMA app RENAME TO app2");
+    let after = assert_round_trip("scoped-enum-col-renamed", "tenant-a", &renamed);
+    assert!(
+        after.iter().any(|(_, s)| s.contains("app2.mood")),
+        "{after:?}"
+    );
+    assert!(!after.iter().any(|(_, s)| s.contains("app.mood")));
+}
+
 fn user(line: usize, name: &str, tenant: &str, ddl: bool) -> BootstrapUser {
     BootstrapUser {
         line,

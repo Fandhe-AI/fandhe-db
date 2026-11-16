@@ -1135,6 +1135,8 @@ fn array_elem_lacks_equality(elem: crate::catalog::ArrayElemType) -> bool {
         | E::Date
         | E::Timestamp
         | E::Time
+        | E::Interval
+        | E::TimestampTz
         | E::Uuid
         | E::Numeric { .. }
         | E::Bytea

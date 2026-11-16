@@ -176,7 +176,10 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
         // `Expr::ValueFunction` に化けないよう二重引用符付きで出す（SQL-37・Issue #1586）。
         // 予約語以外は従来どおり引用なし（既存の保存形式との互換維持）。
         Expr::Ident(name) => {
-            if ValueFunctionKind::from_keyword(name).is_some() {
+            // 列名 `null` も裸で出すと再解析で `Expr::Null` に化ける（単純 CASE の被演算子・
+            // 比較値は NULL リテラルを許す文脈。Issue #3279）ため引用して出す。
+            if ValueFunctionKind::from_keyword(name).is_some() || name.eq_ignore_ascii_case("null")
+            {
                 format!("\"{name}\"")
             } else {
                 name.clone()
@@ -312,14 +315,25 @@ pub(crate) fn render_expr(expr: &Expr) -> String {
         // 再パースされるため、`parse(render(x)) == x` の往復を単体テストで
         // 固定する。
         Expr::Null => "NULL".to_string(),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
             let mut s = String::from("(CASE");
+            // 単純形（Issue #3279）は被演算子を 1 回だけ描画し、WHEN には比較値を描画する。
+            if let Some(operand) = operand {
+                // 括弧付きで出す: 符号付き数値（`-1`）は単純 CASE の被演算子の開始判定
+                // （構文段の先読み）を通らないため、往復を保つ（括弧は AST に残らない）。
+                s.push_str(&format!(" ({})", render_expr(operand)));
+            }
             for (cond, result) in whens {
-                s.push_str(&format!(
-                    " WHEN {} THEN {}",
-                    render_condition(cond),
-                    render_expr(result)
-                ));
+                let rendered = if operand.is_some() {
+                    render_expr(cond)
+                } else {
+                    render_condition(cond)
+                };
+                s.push_str(&format!(" WHEN {rendered} THEN {}", render_expr(result)));
             }
             if let Some(else_result) = else_result {
                 s.push_str(&format!(" ELSE {}", render_expr(else_result)));
@@ -431,7 +445,14 @@ fn normalize_session_local_expr(expr: &mut Expr) {
             normalize_session_local_expr(lhs);
             normalize_session_local_expr(rhs);
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                normalize_session_local_expr(o);
+            }
             for (cond, result) in whens.iter_mut() {
                 normalize_session_local_expr(cond);
                 normalize_session_local_expr(result);
@@ -846,7 +867,14 @@ fn referenced_column_names(
                     }
                 }
             }
-            Expr::Case { whens, else_result } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    collect_idents(o, acc);
+                }
                 for (cond, result) in whens {
                     collect_idents(cond, acc);
                     collect_idents(result, acc);
@@ -1291,7 +1319,12 @@ pub(crate) fn map_expr_idents(expr: &Expr, f: &dyn Fn(&str) -> String) -> Expr {
             lhs: Box::new(rec(lhs)),
             rhs: Box::new(rec(rhs)),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_deref().map(|o| Box::new(rec(o))),
             whens: whens.iter().map(|(c, r)| (rec(c), rec(r))).collect(),
             else_result: else_result.as_deref().map(|e| Box::new(rec(e))),
         },
@@ -2320,6 +2353,7 @@ mod tests {
 
         let cases: Vec<Expr> = vec![
             Expr::Case {
+                operand: None,
                 whens: vec![(
                     Expr::Binary {
                         op: BinOp::Gt,
@@ -2334,6 +2368,7 @@ mod tests {
                 else_result: Some(Box::new(Expr::Number("0".to_string()))),
             },
             Expr::Case {
+                operand: None,
                 whens: vec![(
                     Expr::Binary {
                         op: BinOp::Gt,
@@ -2362,6 +2397,77 @@ mod tests {
                 rhs: Box::new(Expr::Number("1".to_string())),
             };
             let rendered = render_expression_predicate(&top);
+            let reparsed = parse_check_predicate_text(&rendered)
+                .unwrap_or_else(|e| panic!("reparse of {rendered:?} failed: {e:?}"));
+            assert_eq!(
+                reparsed,
+                vec![WherePredicate::Expression(top)],
+                "round trip mismatch for rendered text {rendered:?}"
+            );
+        }
+    }
+
+    /// 単純 CASE（Issue #3279）の描画は `(CASE <operand> WHEN <v> THEN <r> ... END)` で、
+    /// 保存テキストの再パースが元の AST（被演算子を 1 回だけ保持）へ往復する。
+    #[test]
+    fn render_expr_round_trips_simple_case_through_reparse() {
+        use crate::sql::allowlist::{parse_check_predicate_text, WherePredicate};
+        use crate::sql::udf_call::{BinOp, Expr};
+
+        let cases: Vec<Expr> = vec![
+            Expr::Case {
+                operand: Some(Box::new(Expr::Ident("id".to_string()))),
+                whens: vec![
+                    (
+                        Expr::Number("1".to_string()),
+                        Expr::Number("10".to_string()),
+                    ),
+                    (
+                        Expr::Number("2".to_string()),
+                        Expr::Number("20".to_string()),
+                    ),
+                ],
+                else_result: Some(Box::new(Expr::Number("0".to_string()))),
+            },
+            Expr::Case {
+                operand: Some(Box::new(Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("id".to_string())),
+                    rhs: Box::new(Expr::Number("1".to_string())),
+                })),
+                whens: vec![(Expr::Number("2".to_string()), Expr::Number("1".to_string()))],
+                else_result: None,
+            },
+            Expr::Case {
+                operand: Some(Box::new(Expr::Null)),
+                whens: vec![(Expr::Null, Expr::Number("1".to_string()))],
+                else_result: Some(Box::new(Expr::Number("2".to_string()))),
+            },
+            Expr::Case {
+                operand: Some(Box::new(Expr::Number("-1".to_string()))),
+                whens: vec![(
+                    Expr::Number("-1".to_string()),
+                    Expr::Number("1".to_string()),
+                )],
+                else_result: Some(Box::new(Expr::Number("0".to_string()))),
+            },
+            Expr::Case {
+                operand: Some(Box::new(Expr::Ident("null".to_string()))),
+                whens: vec![(
+                    Expr::Ident("NULL".to_string()),
+                    Expr::Number("1".to_string()),
+                )],
+                else_result: Some(Box::new(Expr::Number("0".to_string()))),
+            },
+        ];
+        for expr in cases {
+            let top = Expr::Binary {
+                op: BinOp::Eq,
+                lhs: Box::new(expr.clone()),
+                rhs: Box::new(Expr::Number("1".to_string())),
+            };
+            let rendered = render_expression_predicate(&top);
+            assert!(rendered.contains("(CASE "), "{rendered}");
             let reparsed = parse_check_predicate_text(&rendered)
                 .unwrap_or_else(|e| panic!("reparse of {rendered:?} failed: {e:?}"));
             assert_eq!(

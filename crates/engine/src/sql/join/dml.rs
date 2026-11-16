@@ -40,12 +40,16 @@ use crate::catalog::{ColumnType, TableSchema};
 use crate::declarative_filter::MetadataFilter;
 use crate::policy::PolicyContext;
 use crate::row_codec::{ScalarRef, Value};
-use crate::sql::allowlist::{Projection, SqlSurfaceError, ValidatedScan, WherePredicate};
+use crate::sql::allowlist::{
+    JoinProjection, Projection, SqlSurfaceError, ValidatedJoin, ValidatedScan, WherePredicate,
+};
 use crate::sql::dml_from_returning::BoundFromReturning;
 use crate::sql::exec::{Cell, ResultRow};
+use crate::sql::expr_program::StackValue;
 use crate::sql::relation::ColumnSlot;
 use crate::sql::set_expr::BoundSetExpr;
 use crate::sql::udf_call::{BoundExpr, UdfRegistry};
+use crate::sql::where_tree::BoundConjunction;
 use crate::tenant::DmlCandidate;
 
 use super::values::{
@@ -84,6 +88,106 @@ pub(crate) struct JoinedDmlSource {
     /// `RETURNING` が source の疑似列 `id` を参照するため、結合キーが使わなくても走査で `id` を
     /// 取り出すか（Issue #3204）。
     pub(crate) include_pseudo_id: bool,
+    /// FROM／USING が 2 表以上、または JOIN の段を持つとき、source 側を結合実行器の出力 1 つへ
+    /// 畳み込むための入力（Issue #3294）。`Some` のとき [`Self::table`] は空、[`Self::schema`] は
+    /// 畳み込み列から合成したスキーマ（疑似列 `id` を持たない採番方式）で、`columns`・
+    /// `returning_columns`・[`EquiKey::source_column`] はその添字系列を指す。
+    pub(crate) fold: Option<Box<FoldedSource>>,
+}
+
+/// source 側の畳み込み入力（Issue #3294）。結合実行器（`sql::join`。SQL-28 の契約・RLS-10 の独立適用）へ
+/// 渡す合成 JOIN 文と、畳み込み列の出自を持つ。第 2 の結合実行器は作らず、各リレーションを
+/// 書き込むセッションの `PolicyContext` で独立に走査する。呼び出し元は `core::dml_join_exec`
+/// （スキーマ照合に [`Self::real`] を使う）と、[`JoinedProbe`]（[`build_source_index`] が走査に使う）。
+#[derive(Debug, Clone)]
+pub(crate) struct FoldedSource {
+    /// 合成した JOIN 文（FROM／USING 側の表だけ。射影は実行時に [`JoinedDmlPlan::scan_columns`] から
+    /// 差し替えるためプレースホルダ）。
+    pub(crate) join: ValidatedJoin,
+    /// 畳み込み列の出自。畳み込みスキーマの列 i が、`join.relations[relation]`（0 起点）の
+    /// `slot` 列であることを表す。
+    pub(crate) cols: Vec<(usize, ColumnSlot)>,
+    /// `join.relations` と同じ並びの実表名とスキーマ（束縛時。実行時の照合と結合実行器の入力に使う）。
+    pub(crate) real: Vec<(String, TableSchema)>,
+}
+
+impl FoldedSource {
+    /// 畳み込み列 `columns`（畳み込みスキーマの添字。走査投影の並び）を射影にした JOIN 文を返す。
+    pub(crate) fn projected_join(
+        &self,
+        columns: &[usize],
+    ) -> Result<ValidatedJoin, SqlSurfaceError> {
+        let mut refs: Vec<crate::sql::relation::ColumnRef> = Vec::with_capacity(columns.len());
+        for &c in columns {
+            let (rel, slot) = self
+                .cols
+                .get(c)
+                .ok_or_else(|| internal("folded source column out of range"))?;
+            let table_ref = self
+                .join
+                .relations
+                .get(*rel)
+                .ok_or_else(|| internal("folded source relation out of range"))?;
+            let (_, real_schema) = self
+                .real
+                .get(*rel)
+                .ok_or_else(|| internal("folded source schema out of range"))?;
+            let name = match slot {
+                ColumnSlot::Id => "id".to_string(),
+                ColumnSlot::Column(i) => real_schema
+                    .columns
+                    .get(*i)
+                    .map(|col| col.name.clone())
+                    .ok_or_else(|| internal("folded source real column out of range"))?,
+            };
+            refs.push(crate::sql::relation::ColumnRef::qualified(
+                table_ref.exposed_name(),
+                name,
+            ));
+        }
+        let mut join = self.join.clone();
+        join.projection = JoinProjection::Columns(refs);
+        Ok(join)
+    }
+
+    /// 結合実行器へ渡す、表名 → 実表スキーマの対応。
+    pub(crate) fn schema_map(&self) -> HashMap<String, TableSchema> {
+        self.real.iter().cloned().collect()
+    }
+
+    /// 行を読まずに合成 JOIN 文を束縛する（`ON` の列・型・リレーション数の検証。変換の段階で
+    /// Describe と Execute の拒否コードをそろえるために呼ぶ）。
+    pub(crate) fn prepare(
+        &self,
+        columns: &[usize],
+        udfs: &UdfRegistry,
+    ) -> Result<(), SqlSurfaceError> {
+        let join = self.projected_join(columns)?;
+        let schemas = self.schema_map();
+        super::prepare_join(
+            &schemas,
+            &super::CteIdColumns::new(),
+            &join,
+            udfs,
+            &JoinLimits::default(),
+        )
+        .map(|_| ())
+    }
+}
+
+/// 対象と source をまたぐ残余述語（Issue #3295。非等値・`OR`・キー化できない型の等値・
+/// 数値リテラル・`IS [NOT] NULL` を含む部分木）。「対象表のスキーマ ++ [`Self::source_columns`]
+/// （合成名の列）」の合成スキーマ上で、通常の WHERE と同じ束縛器により束縛済み
+/// （[`super::dml_residual::plan_residual`]）。評価は対象行 × source 行の組ごとに
+/// [`JoinedProbe`] が行い、結合ビューは「対象行の走査結果 ++ 残余が参照する source 列」。
+#[derive(Debug, Clone)]
+pub(crate) struct JoinedResidual {
+    /// 残余が参照する source の列（`source.schema.columns` の添字。初出順・重複なし）。
+    /// ビュー上の位置は対象列数 + 並び位置。
+    pub(crate) source_columns: Vec<usize>,
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
+    pub(crate) expr_filters: Vec<BoundExpr>,
+    pub(crate) or_filters: Vec<crate::sql::where_tree::BoundOrGroup>,
 }
 
 /// 等値結合キー 1 本。`None` は疑似列 `id`（`has_pseudo_id` の表のみ）。
@@ -134,8 +238,11 @@ pub(crate) struct JoinedUpdateSet {
 pub(crate) struct JoinedDmlPlan {
     pub(crate) target: JoinedDmlTarget,
     pub(crate) source: JoinedDmlSource,
-    /// 等値結合キー（1 本以上。複数なら複合キー）。
+    /// 等値結合キー（複数なら複合キー）。0 本のときは [`Self::residual`] が必須（キー無しの
+    /// ネストループ。Issue #3295）。
     pub(crate) keys: Vec<EquiKey>,
+    /// 対象と source をまたぐ残余述語（Issue #3295）。`None` なら従来の等値結合だけ。
+    pub(crate) residual: Option<JoinedResidual>,
     /// `Some` なら `UPDATE`、`None` なら `DELETE`。
     pub(crate) update: Option<JoinedUpdateSet>,
     /// 束縛済みの `RETURNING`（Issue #3204）。source 側の列は計画段で
@@ -150,6 +257,12 @@ fn internal(detail: &str) -> SqlSurfaceError {
 }
 
 impl JoinedDmlPlan {
+    /// FROM／USING 側の表の数（畳み込みなしは 1）。`RETURNING` の収集が relation ごとの行参照を
+    /// 並べる数と、[`Self::validate`] のリレーション数上限の判定に使う。
+    pub(crate) fn source_relation_count(&self) -> usize {
+        self.source.fold.as_ref().map_or(1, |f| f.real.len().max(1))
+    }
+
     /// source 側で実際に取り出す列。[`JoinedDmlSource::columns`] に、結合キーの列で未含のものを
     /// 末尾へ追加したもの（結合ビューの添字系列は先頭から不変）。
     pub(crate) fn source_columns(&self) -> Vec<usize> {
@@ -172,6 +285,14 @@ impl JoinedDmlPlan {
         for &c in &self.source.returning_columns {
             if !cols.contains(&c) {
                 cols.push(c);
+            }
+        }
+        // 残余が参照する列は最後尾へ追記する（SET ビュー・`RETURNING` の添字を動かさない）。
+        if let Some(r) = &self.residual {
+            for &c in &r.source_columns {
+                if !cols.contains(&c) {
+                    cols.push(c);
+                }
             }
         }
         cols
@@ -201,15 +322,13 @@ impl JoinedDmlPlan {
 
     /// データに依存しない形の検証。走査より前に呼ぶ（fail-closed）。
     pub(crate) fn validate(&self, limits: &JoinLimits) -> Result<(), SqlSurfaceError> {
-        // 対象表＋ FROM／USING の 1 relation。
-        if 2 > limits.max_relations {
+        // 対象表＋ FROM／USING 側の全 relation（畳み込みでは結合する表の数）。
+        let relation_count = 1usize.saturating_add(self.source_relation_count());
+        if relation_count > limits.max_relations {
             return Err(SqlSurfaceError::payload_too_large(format!(
-                "too many tables in JOIN: 2 exceeds limit {}",
+                "too many tables in JOIN: {relation_count} exceeds limit {}",
                 limits.max_relations
             )));
-        }
-        if self.keys.is_empty() {
-            return Err(internal("joined DML without a join key"));
         }
         let (t_len, s_len) = (
             self.target.schema.columns.len(),
@@ -236,6 +355,7 @@ impl JoinedDmlPlan {
             .columns
             .iter()
             .chain(&self.source.returning_columns)
+            .chain(self.residual.iter().flat_map(|r| r.source_columns.iter()))
             .any(|&c| c >= s_len)
         {
             return Err(internal("source column out of range"));
@@ -256,7 +376,7 @@ impl JoinedDmlPlan {
     }
 
     /// 結合キーごとの型クラス。両辺のクラスが異なれば `42804`、許可されない型は `42601`。
-    fn key_classes(&self) -> Result<Vec<JoinKeyClass>, SqlSurfaceError> {
+    pub(crate) fn key_classes(&self) -> Result<Vec<JoinKeyClass>, SqlSurfaceError> {
         fn class_of(
             schema: &TableSchema,
             column: Option<usize>,
@@ -297,17 +417,16 @@ fn to_u32(v: usize) -> Result<u32, SqlSurfaceError> {
     u32::try_from(v).map_err(|_| SqlSurfaceError::payload_too_large("JOIN row count exceeds limit"))
 }
 
-/// FROM／USING 側を `ctx`（RLS 暗黙適用）で走査してハッシュ表にする。`read_txn` は呼び出し元の
-/// 共有 write txn（自トランザクションの未 commit の変更が見え、文の開始時点のスナップショットになる）。
-fn build_source_index(
-    read_txn: &impl crate::storage::read_source::ReadSource,
-    ctx: &PolicyContext,
+/// FROM／USING 側の走査入力（[`BoundScan`](crate::sql::parser::BoundScan)）を作る。実行器
+/// （[`build_source_index`]）と `EXPLAIN UPDATE ... FROM`／`EXPLAIN DELETE ... USING`
+/// （`core/explain_dml.rs`。Issue #3293）が同じ関数を共有し、`EXPLAIN` の走査分類が実経路と
+/// 矛盾しないようにする（D5）。行・ストレージには触れない（スキーマと述語の束縛だけ）。
+/// 側スキャンの `LIMIT` は内部値（入力行数上限 + 1）に差し替える（JOIN の側スキャンと同じ）。
+pub(crate) fn source_bound_scan(
     plan: &JoinedDmlPlan,
-    classes: &[JoinKeyClass],
     udfs: &UdfRegistry,
     limits: &JoinLimits,
-    budget: &mut JoinBudget,
-) -> Result<SourceIndex, SqlSurfaceError> {
+) -> Result<crate::sql::parser::BoundScan, SqlSurfaceError> {
     let schema = &plan.source.schema;
     let columns = plan.scan_columns();
     let id_needed = plan.source_id_in_cells();
@@ -339,7 +458,6 @@ fn build_source_index(
         with_ties: false,
         distinct_on: None,
     };
-    // 側スキャンの `LIMIT` は内部値（入力行数上限 + 1）に差し替える（JOIN の側スキャンと同じ）。
     let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
         &scan,
         schema,
@@ -348,13 +466,69 @@ fn build_source_index(
         &crate::result_limits::ResultLimits::default(),
     )?;
     bound.limit = limits.max_input_rows.saturating_add(1);
-    let result = crate::sql::scan::execute_scan_with_budget(
+    Ok(bound)
+}
+
+/// source が 1 表で JOIN の段を持たない形の走査（従来方式）。JOIN の側スキャンと同じ経路
+/// （`sql::scan::execute_scan_with_budget`）を、書き込む側の `ctx`（RLS 暗黙適用）・同じ write txn で
+/// 実行する。走査入力は EXPLAIN と共有する [`source_bound_scan`] で作る。
+fn scan_single_source(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    plan: &JoinedDmlPlan,
+    udfs: &UdfRegistry,
+    limits: &JoinLimits,
+    budget: &JoinBudget,
+) -> Result<crate::sql::exec::QueryResult, SqlSurfaceError> {
+    let bound = source_bound_scan(plan, udfs, limits)?;
+    crate::sql::scan::execute_scan_with_budget(
         read_txn,
         ctx,
-        schema,
+        &plan.source.schema,
         &bound,
         budget.remaining(),
-    )?;
+    )
+}
+
+/// source が 2 表以上または JOIN の段を持つ形の走査（Issue #3294）。合成した JOIN 文を結合実行器
+/// （`sql::join::execute_with_limits`）で評価する。各リレーションは `ctx`（RLS 暗黙適用）で独立に
+/// 走査され、結合の方式・入力行数・出力行数・NLJ の比較回数の上限と超過時の `54000` は SELECT の
+/// JOIN と同じ契約に従う。畳み込んだ出力の行数は単一表 source と同じ可視行数上限（`max_input_rows`）に
+/// そろえ、結合実行器の予算の上限は共有予算の残りに絞る。
+fn scan_folded_source(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    fold: &FoldedSource,
+    columns: &[usize],
+    udfs: &UdfRegistry,
+    limits: &JoinLimits,
+    budget: &JoinBudget,
+) -> Result<crate::sql::exec::QueryResult, SqlSurfaceError> {
+    let join = fold.projected_join(columns)?;
+    let schemas = fold.schema_map();
+    let join_limits = limits
+        .with_budget_cap(budget.remaining())
+        .with_max_result_rows(limits.max_input_rows);
+    super::execute_with_limits(read_txn, ctx, &schemas, &join, udfs, &join_limits)
+}
+
+/// FROM／USING 側を `ctx`（RLS 暗黙適用）で走査してハッシュ表にする。`read_txn` は呼び出し元の
+/// 共有 write txn（自トランザクションの未 commit の変更が見え、文の開始時点のスナップショットになる）。
+fn build_source_index(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    plan: &JoinedDmlPlan,
+    classes: &[JoinKeyClass],
+    udfs: &UdfRegistry,
+    limits: &JoinLimits,
+    budget: &mut JoinBudget,
+) -> Result<SourceIndex, SqlSurfaceError> {
+    let columns = plan.scan_columns();
+    let id_offset = usize::from(plan.source_id_in_cells());
+    let result = match &plan.source.fold {
+        Some(fold) => scan_folded_source(read_txn, ctx, fold, &columns, udfs, limits, budget)?,
+        None => scan_single_source(read_txn, ctx, plan, udfs, limits, budget)?,
+    };
     if result.rows.len() > limits.max_input_rows {
         return Err(SqlSurfaceError::payload_too_large(
             "JOIN input exceeds the visible row limit",
@@ -424,12 +598,24 @@ pub(crate) struct JoinedProbe<'a> {
     cell_offset: usize,
     budget: JoinBudget,
     max_output_rows: usize,
+    /// 残余の比較回数上限（[`JoinLimits::max_comparisons`]。文全体で共有）。
+    max_comparisons: usize,
+    /// 残余述語の評価器（Issue #3295）。`None` なら従来の等値結合だけ。
+    residual: Option<ResidualEval>,
     /// 一意化の前の一致ペアの累計（`max_output_rows` の判定対象）。
     pairs: usize,
     /// 一致した対象行 id と採った source の走査位置（`RETURNING` の収集側と共有する。Issue #3204）。
     /// 述語クロージャ（書き込み）と収集クロージャ（読み取り）が同じ文内で別々に借用するため
     /// `RefCell` に置く。借用の重なりは起きない設計だが、起きても panic せず `XX000` にする。
     matches: Rc<RefCell<HashMap<u64, u32>>>,
+}
+
+/// 残余述語の実行時の評価器。
+struct ResidualEval {
+    conj: BoundConjunction,
+    /// 残余が参照する source 列の（走査結果のセル位置, 列型）。ビューへの追記順。
+    cells: Vec<(usize, ColumnType)>,
+    scratch: Vec<StackValue>,
 }
 
 impl<'a> JoinedProbe<'a> {
@@ -448,6 +634,33 @@ impl<'a> JoinedProbe<'a> {
         let index = build_source_index(read_txn, ctx, plan, &classes, udfs, limits, &mut budget)?;
         let source_columns = plan.source_columns();
         let cell_offset = usize::from(plan.source_id_in_cells());
+        let residual = match &plan.residual {
+            None => None,
+            Some(r) => {
+                let mut cells = Vec::with_capacity(r.source_columns.len());
+                for &c in &r.source_columns {
+                    let pos = plan.source_cell_position(ColumnSlot::Column(c))?;
+                    let ty = plan
+                        .source
+                        .schema
+                        .columns
+                        .get(c)
+                        .ok_or_else(|| internal("source column out of range"))?
+                        .ty
+                        .clone();
+                    cells.push((pos, ty));
+                }
+                Some(ResidualEval {
+                    conj: BoundConjunction::new(
+                        r.metadata_filters.clone(),
+                        r.expr_filters.clone(),
+                        r.or_filters.clone(),
+                    ),
+                    cells,
+                    scratch: Vec::new(),
+                })
+            }
+        };
         Ok(Self {
             plan,
             classes,
@@ -456,6 +669,8 @@ impl<'a> JoinedProbe<'a> {
             cell_offset,
             budget,
             max_output_rows: limits.max_output_rows,
+            max_comparisons: limits.max_comparisons,
+            residual,
             pairs: 0,
             matches: Rc::new(RefCell::new(HashMap::new())),
         })
@@ -512,17 +727,66 @@ impl<'a> JoinedProbe<'a> {
             };
             encode_key_component(&cell, class, &mut key)?;
         }
-        let Some(matched) = self.index.table.get(&key) else {
+        // 走査結果を所有する `Rc` を手元へ複製し、`self` の他フィールドの可変借用と衝突させない。
+        let index = Rc::clone(&self.index);
+        let Some(matched) = index.table.get(&key) else {
             return Ok(None);
         };
-        // 一意化の前に一致ペアを数え、上限超過は何も確保せずに拒否する。
-        self.pairs = self.pairs.saturating_add(matched.len());
-        if self.pairs > self.max_output_rows {
-            return Err(SqlSurfaceError::payload_too_large(
-                "JOIN result exceeds the row limit",
-            ));
-        }
-        let first = matched.first().copied();
+        let first = match self.residual.as_mut() {
+            None => {
+                // 一意化の前に一致ペアを数え、上限超過は何も確保せずに拒否する。
+                self.pairs = self.pairs.saturating_add(matched.len());
+                if self.pairs > self.max_output_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "JOIN result exceeds the row limit",
+                    ));
+                }
+                matched.first().copied()
+            }
+            Some(res) => {
+                // 残余の評価は候補（等値キーの一致バケット。キー無しなら source の全行）ごとの
+                // ネストループ。比較回数を評価の前に文全体の上限へ計上する（超過は `54000`）。
+                // DELETE も短絡せず全候補を評価する（UPDATE と `54000` の判定を同じにするため。
+                // コストは比較回数上限で抑える）。
+                self.budget
+                    .charge_comparisons(matched.len(), self.max_comparisons)?;
+                let base = scanned.len();
+                let mut view: Vec<Option<ScalarRef<'_>>> =
+                    Vec::with_capacity(base.saturating_add(res.cells.len()));
+                view.extend(scanned.iter().copied());
+                let mut first: Option<u32> = None;
+                for (n, &pos) in matched.iter().enumerate() {
+                    if n % 1024 == 0 {
+                        crate::interrupt::check()?;
+                    }
+                    let row = index
+                        .rows
+                        .get(pos as usize)
+                        .ok_or_else(|| internal("matched source row out of range"))?;
+                    view.truncate(base);
+                    for (cell_pos, ty) in &res.cells {
+                        let cell = row
+                            .cells
+                            .get(*cell_pos)
+                            .ok_or_else(|| internal("source cell out of range"))?;
+                        view.push(source_scalar(cell, ty, None)?);
+                    }
+                    if res.conj.matches(&view, c.id, &[], 0, &mut res.scratch)? {
+                        // 一致ペアは残余が真になった組だけを数える（一意化の前の累計）。
+                        self.pairs = self.pairs.saturating_add(1);
+                        if self.pairs > self.max_output_rows {
+                            return Err(SqlSurfaceError::payload_too_large(
+                                "JOIN result exceeds the row limit",
+                            ));
+                        }
+                        if first.is_none() {
+                            first = Some(pos);
+                        }
+                    }
+                }
+                first
+            }
+        };
         if let Some(pos) = first {
             self.budget.charge(std::mem::size_of::<(u64, u32)>())?;
             let mut log = self
@@ -662,7 +926,7 @@ fn copy_cell_to_value(cell: Cell, ty: &ColumnType) -> Result<Value, SqlSurfaceEr
 /// （`bind_set_expr` が受理する列型と一致させる。対象表側は行 codec の走査結果をそのまま使う）。
 /// 配列は呼び出し側が `write_array_elements_payload` で作った `array_payload` を借用する。
 /// 想定外の型・セルの組は `cell_scalar` と同じく `Internal`（fail-closed）。
-fn source_scalar<'a>(
+pub(super) fn source_scalar<'a>(
     cell: &'a Cell,
     ty: &ColumnType,
     array_payload: Option<&'a [u8]>,
@@ -673,6 +937,10 @@ fn source_scalar<'a>(
         (ColumnType::TimestampTz, Cell::TimestampTz(t)) => Some(ScalarRef::TimestampTz(*t)),
         (ColumnType::Interval, Cell::Interval(i)) => Some(ScalarRef::Interval(*i)),
         (ColumnType::Bpchar(_), Cell::Text(s)) => Some(ScalarRef::Text(s)),
+        // 畳み込み source の疑似列 `id`（Issue #3294）は射影結果で符号なしの `Cell::Integer` のまま運ばれ、
+        // 結合キー専用に走査列へ載る。SET 右辺は疑似列 `id` を拒否するため式から読まれることはなく、
+        // ビューの位置合わせのためだけに写す。`i64` に収まらない値は NULL 扱い（読まれないため安全）。
+        (ColumnType::BigInt, Cell::Integer(v)) => i64::try_from(*v).ok().map(ScalarRef::BigInt),
         // JSONB は JSON と値表現を共有するため、既存の式評価と同じ Json 借用形へ写す。
         (ColumnType::Jsonb, Cell::Json(s)) => Some(ScalarRef::Json(s)),
         (ColumnType::Array(_), Cell::Array(a)) => {

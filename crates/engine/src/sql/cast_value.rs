@@ -145,6 +145,8 @@ pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
         ArrayElemType::Date => CastSrc::Date,
         ArrayElemType::Timestamp => CastSrc::Timestamp,
         ArrayElemType::Time => CastSrc::Time,
+        ArrayElemType::Interval => CastSrc::Interval,
+        ArrayElemType::TimestampTz => CastSrc::TimestampTz,
         ArrayElemType::Uuid => CastSrc::Uuid,
         ArrayElemType::Numeric { .. } => CastSrc::Numeric,
         ArrayElemType::Bytea => CastSrc::Bytea,
@@ -170,6 +172,8 @@ pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
         ArrayElemType::Date => CastDst::Date,
         ArrayElemType::Timestamp => CastDst::Timestamp,
         ArrayElemType::Time => CastDst::Time,
+        ArrayElemType::Interval => CastDst::Interval,
+        ArrayElemType::TimestampTz => CastDst::TimestampTz,
         ArrayElemType::Uuid => CastDst::Uuid,
         ArrayElemType::Numeric { precision, scale } => CastDst::Numeric(Some((precision, scale))),
         ArrayElemType::Bytea => CastDst::Bytea,
@@ -924,14 +928,19 @@ fn render_to_text<'a>(from: CastSrc, v: ExprValue<'a>) -> Result<Cow<'a, str>, S
             }
             Ok(Cow::Owned(crate::bytea::format_hex_text(&b)))
         }
-        (CastSrc::Array(_), ExprValue::Array(a)) => a
-            .to_pg_text_bounded(max_text)
-            .map(Cow::Owned)
-            .ok_or_else(|| {
-                SqlSurfaceError::payload_too_large(
-                    "array text exceeds the maximum TEXT field length",
-                )
-            }),
+        // TIMESTAMPTZ 要素だけはセッション TimeZone で描画する（PostgreSQL と同じ。Issue #3233）。
+        // 他の要素型では TimeZone を読まない（式の再 parse 判定の `SESSION_TZ_READ` を立てない）。
+        (CastSrc::Array(_), ExprValue::Array(a)) => (if a.elem() == ArrayElemType::TimestampTz {
+            crate::datetime::with_current_session_time_zone(|tz| {
+                a.to_pg_text_bounded_in_tz(max_text, tz)
+            })
+        } else {
+            a.to_pg_text_bounded(max_text)
+        })
+        .map(Cow::Owned)
+        .ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("array text exceeds the maximum TEXT field length")
+        }),
         _ => Err(mismatch()),
     }
 }
@@ -1205,6 +1214,8 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Date(v) => map(v, |d| Ok(ExprValue::Date(*d))),
         ArrayValue::Timestamp(v) => map(v, |t| Ok(ExprValue::Timestamp(*t))),
         ArrayValue::Time(v) => map(v, |t| Ok(ExprValue::Time(*t))),
+        ArrayValue::Interval(v) => map(v, |x| Ok(ExprValue::Interval(*x))),
+        ArrayValue::TimestampTz(v) => map(v, |t| Ok(ExprValue::TimestampTz(*t))),
         ArrayValue::Uuid(v) => map(v, |u| Ok(ExprValue::Uuid(*u))),
         ArrayValue::Numeric(v) => map(v, |d| Ok(ExprValue::Numeric(*d))),
         ArrayValue::Bytea(v) => map(v, |b| Ok(ExprValue::Bytes(Cow::Owned(b.clone())))),
@@ -1282,6 +1293,18 @@ pub(crate) fn values_to_array(
             // 防御: 変換経路は範囲検査済みの値だけを渡すが、範囲外は格納せず拒否する（fail-closed）。
             ExprValue::Time(t) if crate::datetime::validate_time_micros(t) => Ok(t),
             ExprValue::Time(_) => Err(out_of_range("time out of range")),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Interval => ArrayValue::Interval(collect(values, |v| match v {
+            // 防御: 変換経路は検査済みの値だけを渡すが、番兵は格納せず拒否する（fail-closed）。
+            ExprValue::Interval(iv) if crate::datetime::validate_interval(&iv) => Ok(iv),
+            ExprValue::Interval(_) => Err(out_of_range("interval out of range")),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::TimestampTz => ArrayValue::TimestampTz(collect(values, |v| match v {
+            // 防御: 変換経路は範囲検査済みの値だけを渡すが、範囲外は格納せず拒否する（fail-closed）。
+            ExprValue::TimestampTz(t) if crate::datetime::validate_timestamptz_micros(t) => Ok(t),
+            ExprValue::TimestampTz(_) => Err(out_of_range("timestamptz out of range")),
             _ => Err(bad()),
         })?),
         ArrayElemType::Uuid => ArrayValue::Uuid(collect(values, |v| match v {

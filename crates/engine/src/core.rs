@@ -71,8 +71,10 @@ mod temp_route;
 pub use temp_route::{PreparedRelationIdentity, SessionRoutedSql};
 
 mod ctas_exec;
+// 要素つき `CREATE SCHEMA` の実行本体（TABLE-27・Issue #3286）。
 mod matview_exec;
 mod row_lock_exec;
+mod schema_elements;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
@@ -3148,8 +3150,8 @@ struct PreparedPathInput<'a> {
 
 /// 解決済みトークンから再 parse した `DROP TABLE` に、Parse 時に外した `public.` 修飾の
 /// 表名を戻す（TABLE-27・Issue #1714）。実行時の粗いゲートが同名の一時表との衝突を拒否する。
-/// `CREATE TABLE`・`CREATE [MATERIALIZED] VIEW`・`CREATE SEQUENCE` には作成対象名の `public.` 修飾の
-/// 有無を戻す（Issue #1715）。
+/// `CREATE TABLE`・`CREATE [MATERIALIZED] VIEW`・`CREATE SEQUENCE`・`CREATE TYPE` には作成対象名の
+/// `public.` 修飾の有無を戻す（Issue #1715・#3288）。
 fn attach_public_qualified(
     parsed: &mut ParsedSql,
     public_qualified: &[String],
@@ -3162,6 +3164,7 @@ fn attach_public_qualified(
         ParsedSql::CreateView(stmt) => stmt.public_qualified = create_public,
         ParsedSql::CreateMaterializedView(stmt) => stmt.public_qualified = create_public,
         ParsedSql::CreateSequence(stmt) => stmt.public_qualified = create_public,
+        ParsedSql::CreateType(stmt) => stmt.public_qualified = create_public,
         _ => {}
     }
 }
@@ -6278,7 +6281,7 @@ impl EngineCore {
         }
         // 作成先の判定では、path 上の USAGE の無い SCHEMA を飛ばさず `42501` にする（受入基準。K4）。
         // ここへ裸の名前のまま届いて作成先が自テナントの SCHEMA になるのは、解析時の書き換えを通らない経路
-        // （構文語と衝突する名前・`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・解析と実行の間の SCHEMA 作成の
+        // （構文語と衝突する名前・`CREATE MATERIALIZED VIEW`・解析と実行の間の SCHEMA 作成の
         // 競合）。`public` へ黙って作らないよう、固定文言の `0A000` にする（fail-closed）。
         let probe = |schema: &str| self.schema_id_requiring_usage(ctx, session, schema);
         match crate::sql::search_path::creation_target(session, &probe)? {
@@ -6605,6 +6608,7 @@ impl EngineCore {
                 NameKind::Relation => crate::catalog::relation_or_sequence_exists_in(src, key),
                 NameKind::Index => crate::catalog::index_exists_in_source(src, key),
                 NameKind::Sequence => crate::catalog::sequence::sequence_exists_in(src, key),
+                NameKind::Type => crate::catalog::enum_type_exists_in(src, key),
             };
             if let Some(snap) = read_snap {
                 return probe(snap).map_err(crate::catalog::table_lookup_error);
@@ -8111,7 +8115,8 @@ impl EngineCore {
             return Ok(ParsedSql::CreateSequence(stmt));
         }
         if crate::sql::allowlist::is_create_type_statement(&tokens) {
-            let stmt = crate::sql::allowlist::validate_create_type_tokens(&tokens)?;
+            let mut stmt = crate::sql::allowlist::validate_create_type_tokens(&tokens)?;
+            stmt.public_qualified = create_public;
             return Ok(ParsedSql::CreateType(stmt));
         }
         if crate::sql::allowlist::is_create_index_statement(&tokens) {
@@ -8776,8 +8781,27 @@ impl EngineCore {
         }
         // SQL-53 (b)・Issue #1754: `UPDATE ... FROM`／`DELETE ... USING` の `$n` は位置規則の対象外のため、
         // Parse 段で `42601` として拒否する（fail-closed。`#1750` の WHERE 内サブクエリと同じ扱い）。
-        if (crate::sql::allowlist::looks_like_update_from(&tokens)
-            || crate::sql::allowlist::looks_like_delete_using(&tokens))
+        // Issue #3293: `EXPLAIN [ANALYZE|VERBOSE|(オプション)]` の前置があっても同じ拒否を維持する
+        // （前置を外した本文で判定する。外せない形は生のトークン列のまま判定し、後続の構文段が拒否する）。
+        // `$n` を受理しないまま EXPLAIN 経由でダミー値の文が計画・実行される経路を作らない（fail-closed）。
+        let joined_dml_body: Vec<crate::sql::lexer::Token> = if matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN")
+        ) {
+            match crate::sql::explain_options::extract(tokens.clone()) {
+                Ok((t, _)) => t.get(1..).unwrap_or(&[]).to_vec(),
+                Err(_) => tokens.get(1..).unwrap_or(&[]).to_vec(),
+            }
+        } else {
+            Vec::new()
+        };
+        let joined_dml_probe: &[crate::sql::lexer::Token] = if joined_dml_body.is_empty() {
+            &tokens
+        } else {
+            &joined_dml_body
+        };
+        if (crate::sql::allowlist::looks_like_update_from(joined_dml_probe)
+            || crate::sql::allowlist::looks_like_delete_using(joined_dml_probe))
             && tokens
                 .iter()
                 .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
@@ -9563,6 +9587,7 @@ impl EngineCore {
         // SQL-53 (b)・Issue #3202: `UPDATE ... FROM`／`DELETE ... USING` も同じ暗黙トランザクションで実行する。
         if Self::is_subquery_predicate_dml(parsed)
             || dml_from_exec::is_joined_dml(parsed)
+            || dml_from_exec::is_joined_explain_analyze(parsed)
             || matches!(parsed, ParsedSql::DataModifyingCte(_) | ParsedSql::Do(_))
             || Self::calls_session_routine(session, parsed)
         {
@@ -10178,14 +10203,16 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::DropIndex(outcome))
             }
             // TABLE-14・SQL-23・TASK-198（Issue #1194）: 他の DDL と同じ判定順序
-            // （DDL 実行権限ゲート → 実行本体）。ENUM 型は全テナント共有カタログで
-            // `ctx` は取らない。権限の無い主体には型の有無を問わず常に `42501`。
+            // （DDL 実行権限ゲート → 実行本体）。ENUM 型は public（全テナント共有）と自テナントの
+            // SCHEMA 配下（内部キー。Issue #3288）に置け、作成先の権限は `require_creation_target` が検査する。
+            // 型のカタログ API は `ctx` を取らない（解決器が自テナントの内部 ID だけを渡す）。権限の無い主体には
+            // 型の有無を問わず常に `42501`。
             ParsedSql::CreateType(stmt) => {
                 crate::sql::privilege_gate::require_ddl(
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateType,
                 )?;
-                self.require_creation_target(ctx, session, false, stmt.name())?;
+                self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 let outcome =
                     crate::sql::ddl::execute_create_type(&self.storage, stmt, &self.schema_limits)?;
                 Ok(crate::sql::SqlOutcome::CreateType(outcome))
@@ -10407,20 +10434,25 @@ impl EngineCore {
                     session,
                     crate::sql::privilege_gate::DdlStatementKind::CreateSchema,
                 )?;
-                // 所有者（`AUTHORIZATION` の指定、省略時は作成者＝束縛中の現在ロール）を同じ write txn で
-                // 記録する（Issue #2236。未束縛で指定も無ければ記録せず、運用者権限でしか扱えない）。
-                let owner = crate::sql::owner_ddl::resolve_schema_owner(
-                    &self.storage,
-                    ctx.tenant_id(),
-                    session,
-                    stmt.authorization.as_ref(),
-                )?;
-                let outcome = crate::sql::ddl::execute_create_schema(
-                    &self.storage,
-                    ctx.tenant_id(),
-                    stmt,
-                    owner,
-                )?;
+                // スキーマ要素つき（Issue #3286）は SCHEMA と全要素を 1 つの write txn で作る専用の実行器へ。
+                let outcome = if !stmt.elements.is_empty() {
+                    self.execute_create_schema_with_elements(ctx, session, stmt)?
+                } else {
+                    // 所有者（`AUTHORIZATION` の指定、省略時は作成者＝束縛中の現在ロール）を同じ write txn で
+                    // 記録する（Issue #2236。未束縛で指定も無ければ記録せず、運用者権限でしか扱えない）。
+                    let owner = crate::sql::owner_ddl::resolve_schema_owner(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        session,
+                        stmt.authorization.as_ref(),
+                    )?;
+                    crate::sql::ddl::execute_create_schema(
+                        &self.storage,
+                        ctx.tenant_id(),
+                        stmt,
+                        owner,
+                    )?
+                };
                 Ok(crate::sql::SqlOutcome::CreateSchema(outcome))
             }
             // Issue #2236: 運用者権限、またはテナント内の所有者（書き込み txn 内で検査）。
@@ -17638,12 +17670,10 @@ impl EngineCore {
     /// 2. `row_count == 0` → [`crate::sql::allowlist::SqlSurfaceError::invalid_input`]
     ///    （`22000`。`EngineCore::execute_insert_sql_batch` の「空バッチ拒否」と同じ
     ///    契約）。
-    /// 3. ①（バッチあたり最大ファイル数を「1 要求あたり最大行数」に読み替える。
-    ///    `batch_limits.rs` INDEX-4 ドキュメント参照）: `row_count` が
-    ///    `self.batch_limits.max_files_per_batch` を超えるなら
-    ///    [`crate::sql::allowlist::SqlSurfaceError::payload_too_large`]（`54000`）。
-    ///    カタログ参照・束縛より前に判定する（`row_count` だけで判定できるため。
-    ///    coding-rust.md「不安全な設計 / DoS」対応）。
+    /// 3. `--max-insert-rows`（指定時のみ）と④の早期判定（1 行 = 1 チャンク。
+    ///    `row_count > max_batch_chunks`）→ `54000`。①（`max_files_per_batch`）は
+    ///    行の形には掛けない（Issue #3308）。カタログ参照・束縛より前に判定する
+    ///    （`row_count` だけで判定できるため。coding-rust.md「不安全な設計 / DoS」対応）。
     /// 4. [`Self::read_txn_with_schema`] で `table` のスキーマを取得（`bind` はまだ
     ///    呼ばない）。テーブル不存在は `UndefinedTable`（`42P01`）。
     /// 5. `bind(&schema)` で束縛済み `Vec<BoundInsert>` を得る（`read_txn` が開いて
@@ -17657,7 +17687,7 @@ impl EngineCore {
     ///    経路を閉じる）。
     /// 6. ②③④（`batch_limits.rs`）: 各行のバイト量
     ///    `Σ Text.len() + Vector.len() × size_of::<f32>()`（`checked_add`。`Null` は
-    ///    0）を `(0, row_bytes)` として `batch_limits::validate_batch_shape` へ渡し
+    ///    0）を `(0, row_bytes)` として `batch_limits::validate_row_batch_shape`（②③のみ）へ渡し
     ///    （行形には「パス」が無いため `path_len` は常に 0）、
     ///    `batch_limits::validate_chunk_total(row_count, ..)`（1 行 = 1 チャンクと
     ///    みなす。INDEX-4 の「生成チャンク数」上限をここでは「行数」上限に読み替える）
@@ -17870,16 +17900,17 @@ impl EngineCore {
             ));
         }
 
-        // 判定 3（①）: 件数上限。カタログ参照・束縛より前。
-        if row_count > self.batch_limits.max_files_per_batch {
-            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
-                crate::batch_limits::BatchLimitsError::TooManyFiles {
-                    count: row_count,
-                    max: self.batch_limits.max_files_per_batch,
-                }
-                .to_string(),
-            ));
+        // 判定 3（`--max-insert-rows`）: NoSQL 表層の入口（`privilege` が `Some`）だけが掛ける。
+        // COPY の commit 経路（`privilege` が `None`）の行数（`--max-insert-rows`・④）は
+        // `RecordSink::push_record` が CopyData 受信中に逐次判定済みで、ここで二重に拒否しない。
+        // ①（max_files_per_batch）は行の形には掛けない（Issue #3308・#3309）。
+        if privilege.is_some() {
+            self.check_insert_row_count_limit(row_count)?;
         }
+        // 判定 3'（④の早期判定）: 1 行 = 1 チャンクとして `row_count` だけで判定し、
+        // カタログ参照・束縛より前に束縛の作業量を `max_batch_chunks` で頭打ちにする
+        // （coding-rust.md「不安全な設計 / DoS」対応）。
+        self.validate_row_count_chunk_limit(row_count)?;
 
         // 判定 4・5: スキーマ取得 → 束縛（同一 read_txn 下）。
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
@@ -17951,7 +17982,7 @@ impl EngineCore {
     ///
     /// 1. `operation_id` 必須化ガード（`23502`。RECOVER-1）
     /// 2. `row_count == 0` → `22000`
-    /// 3. 1 文あたり行数上限・`max_files_per_batch` → `54000`（カタログ参照より前）
+    /// 3. 1 文あたり行数上限（`--max-insert-rows`）・④の早期判定 → `54000`（カタログ参照より前。①は掛けない。Issue #3308）
     /// 4. スキーマ取得（`42P01`）
     /// 5. `bind(&schema)`（`DEFAULT` 時刻・sparsevec 上限のスコープ内。台帳 v3 の評価時刻は書き込み区間へ引き継ぐ）
     /// 6. 束縛結果の `table`・行数・`operation_id` が引数と一致することの検証（不一致は `22000`）
@@ -17989,15 +18020,8 @@ impl EngineCore {
             ));
         }
         self.check_insert_row_count_limit(row_count)?;
-        if row_count > self.batch_limits.max_files_per_batch {
-            return Err(SqlSurfaceError::payload_too_large(
-                crate::batch_limits::BatchLimitsError::TooManyFiles {
-                    count: row_count,
-                    max: self.batch_limits.max_files_per_batch,
-                }
-                .to_string(),
-            ));
-        }
+        // Issue #3308: ① は掛けず、④を束縛前に早期判定する。
+        self.validate_row_count_chunk_limit(row_count)?;
         let (read_txn, schema) = self.read_txn_with_schema(table)?;
         let (bound, bound_evaluated_at) = {
             let now = crate::sql::time_fn::now_micros()?;
@@ -18256,6 +18280,7 @@ impl EngineCore {
                         clock,
                         session.time_zone().clone(),
                         defer_not_null,
+                        self.dml_limits.max_insert_rows_per_statement,
                     )?
                     .with_row_security(session.row_security())
                     .with_privilege_recheck(
@@ -19573,27 +19598,29 @@ impl EngineCore {
         Ok(())
     }
 
-    /// SQL 表層の複数行 `VALUES`（①行数上限＋②③④バイト量・チャンク総量）
-    /// 上限検証本体。`execute_insert_form`・`execute_insert_returning_form`
-    /// （`RETURNING` 付き。Issue #873・SQL-21）の `RowBatch` 分岐がいずれも
-    /// 束縛済み `bounds` に対して同一の判定（①は `self.batch_limits.
-    /// max_files_per_batch` との比較、②③④は [`Self::
-    /// validate_insert_batch_byte_and_chunk_limits`] への委譲）を行っていた
-    /// 重複を解消する（codex-review Low 指摘・PR #873）。判定内容・エラー写像は
-    /// 集約前と完全に同一。
+    /// ④（バッチあたり最大チャンク数）を行数だけで早期判定する（Issue #3308）。行の形は
+    /// 1 行 = 1 チャンクで数えるため、束縛・カタログ参照より前に `row_count` で判定でき、
+    /// `--max-insert-rows` 未指定でも束縛の作業量を `max_batch_chunks` で頭打ちにする。
+    /// 超過は `54000`（副作用ゼロ）。
+    fn validate_row_count_chunk_limit(
+        &self,
+        row_count: usize,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::batch_limits::validate_chunk_total(row_count, &self.batch_limits)
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()))
+    }
+
+    /// SQL 表層の複数行 `VALUES`（②③④バイト量・チャンク総量）上限検証本体。
+    /// `execute_insert_form`・`execute_insert_returning_form`（`RETURNING` 付き。
+    /// Issue #873・SQL-21）の `RowBatch` 分岐がいずれも束縛済み `bounds` に対して
+    /// 同一の判定（[`Self::validate_insert_batch_byte_and_chunk_limits`] への委譲）を
+    /// 行う重複を解消する（codex-review Low 指摘・PR #873）。①（`max_files_per_batch`）
+    /// は行の形には掛けない（Issue #3308）。
     fn validate_insert_row_batch_limits(
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        if bounds.len() > self.batch_limits.max_files_per_batch {
-            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
-                crate::batch_limits::BatchLimitsError::TooManyFiles {
-                    count: bounds.len(),
-                    max: self.batch_limits.max_files_per_batch,
-                }
-                .to_string(),
-            ));
-        }
+        // Issue #3308: ①（max_files_per_batch）は行の形には掛けない。
         self.validate_insert_batch_byte_and_chunk_limits(bounds)
     }
 
@@ -19605,10 +19632,8 @@ impl EngineCore {
     /// TASK-178・判定6）と [`Self::validate_insert_row_batch_limits`]（SQL 表層の
     /// 複数行 VALUES・SQL-16・TASK-190・`RETURNING` 付き経路を含む）が同一の
     /// 判定本体を共有し、表層間で上限を迂回できないようにする（Issue #860
-    /// SQL/NoSQL 機能パリティ）。①（行数上限。`self.batch_limits.
-    /// max_files_per_batch`）は各呼び出し元が個別に行う（NoSQL 表層は
-    /// スキーマ取得・束縛より前に判定する契約のため、束縛済み `bounds` だけを
-    /// 受け取る本関数には含められない）。
+    /// SQL/NoSQL 機能パリティ）。①（`max_files_per_batch`）は行の形には掛けない
+    /// （Issue #3308。行数上限は `--max-insert-rows` 指定時のみ。④が実効上限になる）。
     fn validate_insert_batch_byte_and_chunk_limits(
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
@@ -19721,9 +19746,9 @@ impl EngineCore {
             }
             shapes.push((0, row_bytes));
         }
-        crate::batch_limits::validate_batch_shape(&shapes, &self.batch_limits).map_err(|e| {
-            crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
-        })?;
+        crate::batch_limits::validate_row_batch_shape(&shapes, &self.batch_limits).map_err(
+            |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
+        )?;
         crate::batch_limits::validate_chunk_total(bounds.len(), &self.batch_limits).map_err(
             |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
         )?;
@@ -20665,6 +20690,8 @@ impl EngineCore {
         lookup: &InsertSchemaLookup<'_>,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
         self.check_insert_row_count_limit(stmt.rows.len())?;
+        // Issue #3308: ① は掛けず、④を束縛前に早期判定する。
+        self.validate_row_count_chunk_limit(stmt.rows.len())?;
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self
@@ -20706,8 +20733,7 @@ impl EngineCore {
             //
             // INDEX-4 上限も NoSQL 表層と揃える（Issue #860 SQL/NoSQL 機能
             // パリティ。SQL 表層の複数行 VALUES が `self.batch_limits` を迂回して
-            // NoSQL 表層より緩い上限で受理されないようにする）。①（行数上限）・
-            // ②③④（バイト量・チャンク総量）はいずれも [`Self::
+            // NoSQL 表層より緩い上限で受理されないようにする）。②③④（バイト量・チャンク総量）はいずれも [`Self::
             // validate_insert_row_batch_limits`]（`execute_insert_returning_form`
             // の `RowBatch` 分岐と共有）へ委譲する。
             // `sql::parser::MAX_INSERT_ROWS_PER_STATEMENT`（構文解析段階の
@@ -20740,8 +20766,8 @@ impl EngineCore {
             }
             // `ON CONFLICT (id) DO NOTHING | DO UPDATE SET ...`（SQL-20・
             // TASK-193、Issue #872）。複数行 `VALUES` を伴う UPSERT にも
-            // `RowBatch` 分岐と同じ INDEX-4 上限（①行数・②③④バイト量・
-            // チャンク総量）を適用する（SQL/NoSQL 機能パリティの方針を UPSERT
+            // `RowBatch` 分岐と同じ INDEX-4 上限（②③④バイト量・
+            // チャンク総量。①は掛けない）を適用する（SQL/NoSQL 機能パリティの方針を UPSERT
             // にも揃える）。
             crate::sql::parser::BoundInsertForm::Upsert(bound) => {
                 self.validate_upsert_batch_limits(&bound.rows)?;
@@ -20776,6 +20802,8 @@ impl EngineCore {
         udfs: &crate::sql::udf_call::UdfRegistry,
     ) -> Result<crate::sql::exec::ReturningOutcome, crate::sql::allowlist::SqlSurfaceError> {
         self.check_insert_row_count_limit(stmt.rows.len())?;
+        // Issue #3308: ① は掛けず、④を束縛前に早期判定する。
+        self.validate_row_count_chunk_limit(stmt.rows.len())?;
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self
@@ -20852,22 +20880,14 @@ impl EngineCore {
     }
 
     /// UPSERT（`INSERT ... ON CONFLICT`）の INDEX-4 バッチ上限検査
-    /// （①行数・②③④バイト量・チャンク総量。`RowBatch` と同じ SQL/NoSQL パリティ
+    /// （②③④バイト量・チャンク総量。①は掛けない。`RowBatch` と同じ SQL/NoSQL パリティ
     /// 方針）。[`Self::execute_insert_form`] と
     /// [`Self::execute_insert_returning_form`] の `Upsert` 腕が共有する。
     fn validate_upsert_batch_limits(
         &self,
         rows: &[crate::sql::parser::BoundInsert],
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
-        if rows.len() > self.batch_limits.max_files_per_batch {
-            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
-                crate::batch_limits::BatchLimitsError::TooManyFiles {
-                    count: rows.len(),
-                    max: self.batch_limits.max_files_per_batch,
-                }
-                .to_string(),
-            ));
-        }
+        // Issue #3308: ①（max_files_per_batch）は行の形には掛けない。
         self.validate_insert_batch_byte_and_chunk_limits(rows)
     }
 

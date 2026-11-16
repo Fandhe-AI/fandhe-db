@@ -155,6 +155,9 @@ pub(super) struct SingleFilter {
     /// 述語が参照するスキーマ列（添字・側スキャン結果内の位置・列型）。
     pub(super) cols: Vec<(usize, usize, ColumnType)>,
     pub(super) schema_len: usize,
+    /// NULL 補完された relation でも全列 NULL の行として評価するか。DML 専用の非 strict な葉
+    /// （`IS [NOT] NULL`。Issue #3295）を含む部分木だけが真で、それ以外は補完行を偽として扱う。
+    pub(super) eval_padded: bool,
 }
 
 pub(super) struct ColCompare {
@@ -473,7 +476,9 @@ pub(super) fn leaf_colrefs(pred: &JoinWherePredicate) -> Vec<&ColumnRef> {
         | JoinWherePredicate::Compare { column, .. }
         | JoinWherePredicate::BoolEquality { column, .. }
         | JoinWherePredicate::BoolColumn { column }
-        | JoinWherePredicate::InList { column, .. } => vec![column],
+        | JoinWherePredicate::InList { column, .. }
+        | JoinWherePredicate::NumericCompare { column, .. }
+        | JoinWherePredicate::IsNull { column, .. } => vec![column],
         JoinWherePredicate::ColumnCompare { lhs, rhs, .. } => vec![lhs, rhs],
     }
 }
@@ -491,7 +496,11 @@ pub(super) fn is_null_rejecting(pred: &JoinWherePredicate) -> bool {
         | JoinWherePredicate::BoolEquality { .. }
         | JoinWherePredicate::BoolColumn { .. }
         | JoinWherePredicate::InList { .. }
-        | JoinWherePredicate::ColumnCompare { .. } => true,
+        | JoinWherePredicate::ColumnCompare { .. }
+        // 数値リテラルとの比較も strict（DML 専用の葉。SELECT 計画器は入口で拒否する）。
+        | JoinWherePredicate::NumericCompare { .. } => true,
+        // `IS [NOT] NULL` は NULL（外部結合の補完行）に対して真になりうる。
+        JoinWherePredicate::IsNull { .. } => false,
     }
 }
 
@@ -564,6 +573,18 @@ fn has_compare(expr: &JoinWhereExpr) -> bool {
     }
 }
 
+/// 部分木に DML 専用の葉（[`JoinWherePredicate::NumericCompare`]・[`JoinWherePredicate::IsNull`]）が
+/// 含まれるか。
+pub(super) fn contains_dml_only_leaf(expr: &JoinWhereExpr) -> bool {
+    match expr {
+        JoinWhereExpr::Leaf(p) => matches!(
+            p,
+            JoinWherePredicate::NumericCompare { .. } | JoinWherePredicate::IsNull { .. }
+        ),
+        JoinWhereExpr::And(ch) | JoinWhereExpr::Or(ch) => ch.iter().any(contains_dml_only_leaf),
+    }
+}
+
 /// 最上位の `AND` を平坦化して conjunct を集める。
 pub(super) fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e JoinWhereExpr>) {
     match expr {
@@ -576,7 +597,7 @@ pub(super) fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e J
     }
 }
 
-fn leaf_to_where(
+pub(super) fn leaf_to_where(
     pred: &JoinWherePredicate,
     name: String,
 ) -> Result<WherePredicate, SqlSurfaceError> {
@@ -604,6 +625,18 @@ fn leaf_to_where(
         JoinWherePredicate::InList { values, .. } => WherePredicate::InList {
             column: name,
             values: values.clone(),
+        },
+        JoinWherePredicate::NumericCompare { op, value, .. } => {
+            // 通常の WHERE の数値比較（`numeric_comparison`）と同じ式形にする。
+            WherePredicate::Expression(crate::sql::udf_call::Expr::Binary {
+                op: *op,
+                lhs: Box::new(crate::sql::udf_call::Expr::Ident(name)),
+                rhs: Box::new(crate::sql::udf_call::Expr::Number(value.clone())),
+            })
+        }
+        JoinWherePredicate::IsNull { negated, .. } => WherePredicate::IsNull {
+            column: name,
+            negated: *negated,
         },
         JoinWherePredicate::ColumnCompare { .. } => {
             return Err(SqlSurfaceError::Internal {
@@ -718,6 +751,7 @@ fn build_residual(
                 "JOIN WHERE predicate cannot reference a VECTOR column",
             ));
         }
+        let eval_padded = contains_dml_only_leaf(expr);
         let mut refs = Vec::new();
         collect_leaf_colrefs(expr, &mut refs);
         let mut cols: Vec<(usize, usize, ColumnType)> = Vec::new();
@@ -731,9 +765,30 @@ fn build_residual(
                 c.ty
             };
             if let (Some(idx), Some(ty)) = (c.schema_idx, ty) {
+                // 評価は `cell_scalar` と `source_scalar` の和集合（TIME・TIMESTAMPTZ・INTERVAL・JSONB を
+                // 加える。単一表の述語と同じ受理集合）を通るため、写像できない型（配列・BIT 等）は
+                // 実行時の XX000 にせず束縛段階で 0A000 にする。
+                if !super::values::cell_scalar_supports(&ty)
+                    && !matches!(
+                        ty,
+                        ColumnType::Time
+                            | ColumnType::TimestampTz
+                            | ColumnType::Interval
+                            | ColumnType::Jsonb
+                    )
+                {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "this column type cannot be used in a JOIN WHERE predicate",
+                    ));
+                }
                 if !cols.iter().any(|(i, _, _)| *i == idx) {
                     cols.push((idx, c.pos, ty));
                 }
+            } else if eval_padded {
+                // 補完行の行 `id` は NULL を表せないため、補完行を評価する部分木では参照を拒否する。
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "row id cannot be referenced together with IS NULL in this JOIN predicate",
+                ));
             }
         }
         return Ok(ResNode::Single(SingleFilter {
@@ -741,6 +796,7 @@ fn build_residual(
             group,
             cols,
             schema_len: schema.columns.len(),
+            eval_padded,
         }));
     }
     match expr {
@@ -844,6 +900,17 @@ pub(super) fn build_plan<'a>(
         return Err(SqlSurfaceError::Internal {
             detail: "JOIN relation/step count is inconsistent".to_string(),
         });
+    }
+    // 多重防御: DML 専用の葉（数値リテラル比較・`IS [NOT] NULL`。Issue #3295）は SELECT の JOIN
+    // の文法が生成しない。WHERE には畳み込み source の source 側述語（`dml_plan`）として現れうるため
+    // 受理し（非 strict な葉は下の振り分けで必ず残余へ回す）、ON 条件にはどの経路でも現れないため拒否する。
+    if validated.steps.iter().any(|st| match &st.condition {
+        crate::sql::allowlist::JoinCondition::On(e) => contains_dml_only_leaf(e),
+        _ => false,
+    }) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "numeric literal comparison and IS NULL are not supported in JOIN conditions",
+        ));
     }
     let mut rel_schemas: Vec<&'a TableSchema> = Vec::with_capacity(relations.len());
     for r in relations {
@@ -1077,7 +1144,9 @@ pub(super) fn build_plan<'a>(
                 }
             }
             let mask = refs_mask(c, &b.scope)?;
-            if mask.count_ones() == 1 && !has_compare(c) {
+            // 非 strict な式（`IS NULL` を含む `OR` 等）は補完行で真になりうるため、走査へ押し下げず
+            // 結合後の残余で評価する。
+            if mask.count_ones() == 1 && !has_compare(c) && strict & mask == mask {
                 let rel = usize::try_from(mask.trailing_zeros()).map_err(|_| {
                     SqlSurfaceError::Internal {
                         detail: "JOIN relation mask overflow".to_string(),
