@@ -347,7 +347,7 @@ impl JoinedDmlPlan {
     }
 
     /// 結合キーごとの型クラス。両辺のクラスが異なれば `42804`、許可されない型は `42601`。
-    fn key_classes(&self) -> Result<Vec<JoinKeyClass>, SqlSurfaceError> {
+    pub(crate) fn key_classes(&self) -> Result<Vec<JoinKeyClass>, SqlSurfaceError> {
         fn class_of(
             schema: &TableSchema,
             column: Option<usize>,
@@ -388,26 +388,25 @@ fn to_u32(v: usize) -> Result<u32, SqlSurfaceError> {
     u32::try_from(v).map_err(|_| SqlSurfaceError::payload_too_large("JOIN row count exceeds limit"))
 }
 
-/// source が 1 表で JOIN の段を持たない形の走査（従来方式）。JOIN の側スキャンと同じ経路
-/// （`sql::scan::execute_scan_with_budget`）を、書き込む側の `ctx`（RLS 暗黙適用）・同じ write txn で
-/// 実行する。
-#[allow(clippy::too_many_arguments)]
-fn scan_single_source(
-    read_txn: &impl crate::storage::read_source::ReadSource,
-    ctx: &PolicyContext,
+/// FROM／USING 側の走査入力（[`BoundScan`](crate::sql::parser::BoundScan)）を作る。実行器
+/// （[`build_source_index`]）と `EXPLAIN UPDATE ... FROM`／`EXPLAIN DELETE ... USING`
+/// （`core/explain_dml.rs`。Issue #3293）が同じ関数を共有し、`EXPLAIN` の走査分類が実経路と
+/// 矛盾しないようにする（D5）。行・ストレージには触れない（スキーマと述語の束縛だけ）。
+/// 側スキャンの `LIMIT` は内部値（入力行数上限 + 1）に差し替える（JOIN の側スキャンと同じ）。
+pub(crate) fn source_bound_scan(
     plan: &JoinedDmlPlan,
-    columns: &[usize],
-    id_needed: bool,
     udfs: &UdfRegistry,
     limits: &JoinLimits,
-    budget: &JoinBudget,
-) -> Result<crate::sql::exec::QueryResult, SqlSurfaceError> {
+) -> Result<crate::sql::parser::BoundScan, SqlSurfaceError> {
     let schema = &plan.source.schema;
-    let mut names: Vec<String> = Vec::with_capacity(columns.len().saturating_add(1));
+    let columns = plan.scan_columns();
+    let id_needed = plan.source_id_in_cells();
+    let id_offset = usize::from(id_needed);
+    let mut names: Vec<String> = Vec::with_capacity(columns.len().saturating_add(id_offset));
     if id_needed {
         names.push("id".to_string());
     }
-    for &c in columns {
+    for &c in &columns {
         let col = schema
             .columns
             .get(c)
@@ -430,7 +429,6 @@ fn scan_single_source(
         with_ties: false,
         distinct_on: None,
     };
-    // 側スキャンの `LIMIT` は内部値（入力行数上限 + 1）に差し替える（JOIN の側スキャンと同じ）。
     let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
         &scan,
         schema,
@@ -439,7 +437,28 @@ fn scan_single_source(
         &crate::result_limits::ResultLimits::default(),
     )?;
     bound.limit = limits.max_input_rows.saturating_add(1);
-    crate::sql::scan::execute_scan_with_budget(read_txn, ctx, schema, &bound, budget.remaining())
+    Ok(bound)
+}
+
+/// source が 1 表で JOIN の段を持たない形の走査（従来方式）。JOIN の側スキャンと同じ経路
+/// （`sql::scan::execute_scan_with_budget`）を、書き込む側の `ctx`（RLS 暗黙適用）・同じ write txn で
+/// 実行する。走査入力は EXPLAIN と共有する [`source_bound_scan`] で作る。
+fn scan_single_source(
+    read_txn: &impl crate::storage::read_source::ReadSource,
+    ctx: &PolicyContext,
+    plan: &JoinedDmlPlan,
+    udfs: &UdfRegistry,
+    limits: &JoinLimits,
+    budget: &JoinBudget,
+) -> Result<crate::sql::exec::QueryResult, SqlSurfaceError> {
+    let bound = source_bound_scan(plan, udfs, limits)?;
+    crate::sql::scan::execute_scan_with_budget(
+        read_txn,
+        ctx,
+        &plan.source.schema,
+        &bound,
+        budget.remaining(),
+    )
 }
 
 /// source が 2 表以上または JOIN の段を持つ形の走査（Issue #3294）。合成した JOIN 文を結合実行器
@@ -476,13 +495,10 @@ fn build_source_index(
     budget: &mut JoinBudget,
 ) -> Result<SourceIndex, SqlSurfaceError> {
     let columns = plan.scan_columns();
-    let id_needed = plan.source_id_in_cells();
-    let id_offset = usize::from(id_needed);
+    let id_offset = usize::from(plan.source_id_in_cells());
     let result = match &plan.source.fold {
         Some(fold) => scan_folded_source(read_txn, ctx, fold, &columns, udfs, limits, budget)?,
-        None => scan_single_source(
-            read_txn, ctx, plan, &columns, id_needed, udfs, limits, budget,
-        )?,
+        None => scan_single_source(read_txn, ctx, plan, udfs, limits, budget)?,
     };
     if result.rows.len() > limits.max_input_rows {
         return Err(SqlSurfaceError::payload_too_large(

@@ -211,6 +211,65 @@ fn join_on_and_three_table_forms_report_exact_tags() {
     assert_eq!(count(&mut stream, ALL), 2);
 }
 
+/// `EXPLAIN ...` の応答（`QUERY PLAN` 単一列・行・`EXPLAIN` タグ）を読み、行本文を連結して返す。
+fn expect_explain(stream: &mut std::net::TcpStream, sql: &str, status: u8) -> String {
+    send_simple_query(stream, sql);
+    assert_eq!(
+        read_row_description(stream),
+        vec!["QUERY PLAN".to_string()],
+        "{sql}"
+    );
+    let mut body = String::new();
+    loop {
+        let (kind, payload) = read_message(stream);
+        match kind {
+            b'D' => body.push_str(&String::from_utf8_lossy(&payload)),
+            b'C' => {
+                assert!(
+                    String::from_utf8_lossy(&payload).starts_with("EXPLAIN"),
+                    "{sql}"
+                );
+                break;
+            }
+            other => panic!("unexpected message {other}: {sql}"),
+        }
+    }
+    assert_eq!(read_ready_for_query_status(stream), status, "{sql}");
+    body
+}
+
+/// 静的な `EXPLAIN`（Issue #3293）は末尾 `;` 付きの単独送信でも結合計画を返し、行を変えない。
+#[test]
+fn static_explain_returns_the_join_plan_without_writing() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    for sql in [format!("EXPLAIN {UPD}"), format!("EXPLAIN {DEL}")] {
+        let body = expect_explain(&mut stream, &sql, b'I');
+        assert!(body.contains("join_method: hash"), "{sql}: {body}");
+    }
+    assert_eq!(count(&mut stream, UPDATED), 0);
+    assert_eq!(count(&mut stream, ALL), 3);
+}
+
+/// `EXPLAIN ANALYZE`（Issue #3293）は autocommit では書き込みが残り、明示 Tx では `ROLLBACK` で戻る。
+#[test]
+fn explain_analyze_writes_and_follows_transaction_state() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    let body = expect_explain(&mut stream, &format!("EXPLAIN ANALYZE {DEL}"), b'T');
+    assert!(body.contains("actual_rows"), "{body}");
+    expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
+    assert_eq!(count(&mut stream, ALL), 3);
+
+    expect_explain(&mut stream, &format!("EXPLAIN ANALYZE {UPD}"), b'I');
+    assert_eq!(count(&mut stream, UPDATED), 2);
+}
+
 /// 管理用セッションで DDL を 1 文実行する（wire 経由の DDL 権限とは独立）。
 fn admin_ddl(core: &EngineCore, sql: &str) {
     let mut session = engine::sql::mode::SessionState::default();

@@ -147,5 +147,6 @@ mod sql_visible_cache;
 mod sql_where_or;
 mod sql_where_or_in_rewrite;
 mod sql_where_row_compare;
+mod sql_where_row_in;
 mod table26_nullable_vector_search;
 mod table26_nullable_vector_storage;
