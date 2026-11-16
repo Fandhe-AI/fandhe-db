@@ -926,7 +926,7 @@ fn copy_cell_to_value(cell: Cell, ty: &ColumnType) -> Result<Value, SqlSurfaceEr
 /// （`bind_set_expr` が受理する列型と一致させる。対象表側は行 codec の走査結果をそのまま使う）。
 /// 配列は呼び出し側が `write_array_elements_payload` で作った `array_payload` を借用する。
 /// 想定外の型・セルの組は `cell_scalar` と同じく `Internal`（fail-closed）。
-fn source_scalar<'a>(
+pub(super) fn source_scalar<'a>(
     cell: &'a Cell,
     ty: &ColumnType,
     array_payload: Option<&'a [u8]>,

@@ -40,6 +40,20 @@ fn build(label: &str, tune: impl FnOnce(EngineCore) -> EngineCore) -> (EngineCor
             ))
             .expect("create table");
     }
+    // 畳み込み source の `IS [NOT] NULL` を `cell_scalar` 非対応型で確かめる表（Issue #3295）。
+    storage
+        .create_table(&TableSchema::new(
+            "m",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("k", ColumnType::Text, false),
+                ColumnDef::new("tm", ColumnType::Time, true),
+                ColumnDef::new("tz", ColumnType::TimestampTz, true),
+                ColumnDef::new("iv", ColumnType::Interval, true),
+                ColumnDef::new("j", ColumnType::Jsonb, true),
+            ],
+        ))
+        .expect("create table m");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     (tune(core), CleanupGuard(path))
 }
@@ -316,6 +330,40 @@ fn folded_source_accepts_numeric_and_is_null_leaves() {
     let sql = "DELETE FROM t USING s JOIN u ON s.k = u.k AND u.w > 7 WHERE t.k = s.k";
     assert_eq!(code(run(&core, &alice, sql)), "42601");
     assert_eq!(before, xs(&core, &alice));
+}
+
+/// 畳み込み source の `IS [NOT] NULL` は NULL 性だけで評価し、`cell_scalar` が写せない列型
+/// （TIME・TIMESTAMPTZ・INTERVAL・JSONB）でも `0A000` にならない。DML（UPDATE FROM・DELETE USING）で、
+/// 単一表 source と同じ行集合になる（Issue #3295 のレビュー指摘。`IS NULL` は DML 専用の葉）。
+#[test]
+fn folded_source_is_null_accepts_time_family_and_jsonb_columns() {
+    let alice = ctx("alice");
+    for col in ["tm", "tz", "iv", "j"] {
+        for (pred, want) in [("IS NULL", 1u64), ("IS NOT NULL", 1u64)] {
+            for kind in ["DEL", "UPD"] {
+                let (core, _g) = new_core("sql53-mj-nulltypes");
+                seed(&core, &alice);
+                // m1（k = a）は列が全て非 NULL、m2（k = b）は全て NULL。
+                for ins in [
+                    "INSERT INTO m (id, embedding, k, tm, tz, iv, j) VALUES (1, '[0.1,0.2]', 'a', '01:02:03', \
+                     '2026-01-02 00:00:00Z', '1 day', '{\"a\": 1}')",
+                    "INSERT INTO m (id, embedding, k, tm, tz, iv, j) VALUES (2, '[0.1,0.2]', 'b', NULL, NULL, NULL, NULL)",
+                ] {
+                    run(&core, &alice, ins).unwrap_or_else(|e| panic!("{ins}: {e:?}"));
+                }
+                let sql = match kind {
+                    "DEL" => format!(
+                        "DELETE FROM t USING m, u WHERE t.k = m.k AND m.k = u.k AND m.{col} {pred}"
+                    ),
+                    _ => format!(
+                        "UPDATE t SET x = 0 FROM m, u WHERE t.k = m.k AND m.k = u.k AND m.{col} {pred}"
+                    ),
+                };
+                let out = run(&core, &alice, &sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+                assert_eq!(out, tag(kind, want), "{sql}");
+            }
+        }
+    }
 }
 
 /// 疑似列 `id` を結合キーに使う畳み込み source（符号なしの `Cell::Integer` を運ぶ）でも、SET が他の

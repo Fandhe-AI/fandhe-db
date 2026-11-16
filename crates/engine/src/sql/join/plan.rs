@@ -765,9 +765,18 @@ fn build_residual(
                 c.ty
             };
             if let (Some(idx), Some(ty)) = (c.schema_idx, ty) {
-                // 評価は `cell_scalar` を通るため、写像できない型（TIME・TIMESTAMPTZ・INTERVAL・JSONB・
-                // 配列・BIT 等）は実行時の XX000 にせず束縛段階で 0A000 にする（`IS [NOT] NULL` も同様）。
-                if !super::values::cell_scalar_supports(&ty) {
+                // 評価は `cell_scalar` と `source_scalar` の和集合（TIME・TIMESTAMPTZ・INTERVAL・JSONB を
+                // 加える。単一表の述語と同じ受理集合）を通るため、写像できない型（配列・BIT 等）は
+                // 実行時の XX000 にせず束縛段階で 0A000 にする。
+                if !super::values::cell_scalar_supports(&ty)
+                    && !matches!(
+                        ty,
+                        ColumnType::Time
+                            | ColumnType::TimestampTz
+                            | ColumnType::Interval
+                            | ColumnType::Jsonb
+                    )
+                {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "this column type cannot be used in a JOIN WHERE predicate",
                     ));
