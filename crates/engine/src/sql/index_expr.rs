@@ -763,7 +763,9 @@ fn array_source_elem(
         // 分岐式は各枝の要素型を再帰評価し、`TIMESTAMPTZ` が 1 つでもあればそれを採る（fail-closed。Issue #3233）。
         Expr::Coalesce(items) => merge_branch_elems(items.iter(), schema),
         Expr::NullIf(a, b) => merge_branch_elems([a.as_ref(), b.as_ref()].into_iter(), schema),
-        Expr::Case { whens, else_result } => merge_branch_elems(
+        Expr::Case {
+            whens, else_result, ..
+        } => merge_branch_elems(
             whens.iter().map(|(_, r)| r).chain(else_result.as_deref()),
             schema,
         ),

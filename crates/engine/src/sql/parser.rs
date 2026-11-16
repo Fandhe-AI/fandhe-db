@@ -3642,6 +3642,12 @@ fn bind_where_predicates_recursive(
             rewrite_total,
             allow_text_range_rewrite,
         )?;
+        // 展開葉は別呼び出しで束縛するため `bind_all_for_describe` の件数検査は各呼び出し単位になる。
+        // 合算が `MAX_METADATA_FILTERS` を超えるなら結合前に `54000` で拒否する（無制限 `Vec` 成長の
+        // DoS 防止・fail-closed）。
+        declarative_filter::check_filter_count(
+            metadata_filters.len().saturating_add(gen_meta.len()),
+        )?;
         metadata_filters.extend(gen_meta);
         expr_filters.extend(gen_expr);
         or_filters.extend(gen_or);
@@ -14804,6 +14810,47 @@ mod tests {
             &crate::sql::udf_call::UdfRegistry::default(),
         )
         .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// 元の等値条件 `plain` 件＋行値比較 `(lang, body) = (..)`（等価 2 葉へ展開）の述語削除を束縛する
+    /// （Issue #3256。展開葉は別呼び出しで束縛されるため、合算の件数上限を検査する）。
+    fn bind_delete_with_row_compare(plain: usize) -> Result<BoundPredicateDelete, SqlSurfaceError> {
+        use crate::sql::udf_call::Expr;
+        let mut where_predicates: Vec<WherePredicate> = (0..plain)
+            .map(|i| WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: format!("v{i}"),
+            })
+            .collect();
+        where_predicates.push(WherePredicate::RowCompare {
+            lhs: vec![
+                Expr::Ident("lang".to_string()),
+                Expr::Ident("body".to_string()),
+            ],
+            op: crate::sql::udf_call::ArrayCmpOp::Eq,
+            rhs: vec![Expr::String("a".to_string()), Expr::String("b".to_string())],
+        });
+        let stmt = ValidatedPredicateDelete {
+            table_name: "documents".to_string(),
+            where_predicates,
+            operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
+            partitioned: None,
+        };
+        bind_predicate_delete(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn row_compare_expansion_counts_toward_metadata_filter_limit() {
+        let max = crate::declarative_filter::MAX_METADATA_FILTERS;
+        // 元 254 件＋展開 2 件 = 上限ちょうど（受理）、元 255 件＋展開 2 件 = 257（拒否）。
+        assert!(bind_delete_with_row_compare(max - 2).is_ok());
+        let err = bind_delete_with_row_compare(max - 1).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 
