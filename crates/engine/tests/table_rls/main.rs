@@ -127,6 +127,7 @@ mod table43_view_update_delete;
 mod table43_view_write_rls_ledger;
 mod table44_temp_table_ddl;
 mod table44_temp_table_dml;
+mod table44_temp_table_dml_from;
 mod table44_temp_table_isolation;
 mod table45_trigger_copy_from;
 mod table45_trigger_ddl;
