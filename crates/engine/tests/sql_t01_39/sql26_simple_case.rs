@@ -413,6 +413,53 @@ fn clock_timestamp_via_declarative_udf_operand_is_rejected() {
     );
 }
 
+/// 束縛済みの UDF 引数に含まれる `clock_timestamp()` が本体の単純 CASE 被演算子（パラメータ参照）
+/// として複製される場合も、複数 WHEN では拒否する（レビュー指摘。入れ子の UDF も同様）。
+#[test]
+fn clock_timestamp_via_udf_argument_is_rejected() {
+    let (core, mut s, _g) = setup("sql26_simple_case_clock_arg");
+    run(
+        &core,
+        &mut s,
+        "CREATE FUNCTION classify(x) AS CASE x WHEN '2000-01-01 00:00:00'::timestamp THEN 1 \
+         WHEN '2001-01-01 00:00:00'::timestamp THEN 2 ELSE 0 END",
+    );
+    run(&core, &mut s, "CREATE FUNCTION outer_c(y) AS classify(y)");
+    for sql in [
+        "SELECT classify(clock_timestamp())",
+        "SELECT outer_c(clock_timestamp())",
+    ] {
+        assert_eq!(code(&core, &mut s, sql), "0A000", "{sql}");
+    }
+    // 壁時計を含まない引数は従来どおり受理する。
+    assert_eq!(
+        one(
+            &core,
+            &mut s,
+            "SELECT classify('2001-01-01 00:00:00'::timestamp)"
+        ),
+        Cell::Float(2.0)
+    );
+}
+
+/// 検索形 CASE の結果式にある列名 `case` と演算子（外側の WHEN を単純形の開始と誤判定しない）。
+#[test]
+fn column_named_case_inside_searched_case_result_keeps_working() {
+    let (core, mut s, _g) = setup("sql26_simple_case_colname2");
+    run(
+        &core,
+        &mut s,
+        "CREATE TABLE k2 (id INTEGER, \"case\" INTEGER)",
+    );
+    run(&core, &mut s, "INSERT INTO k2 VALUES (1, 10)");
+    let got = first_column(rows(
+        &core,
+        &mut s,
+        "SELECT CASE WHEN id = 1 THEN case + 1 WHEN id = 2 THEN 0 ELSE 0 END FROM k2",
+    ));
+    assert_eq!(got, vec![Cell::SignedInteger(11)]);
+}
+
 /// NULL を含む分岐でも被演算子の実行時評価は保たれる（検索形と同じく 22012）。
 #[test]
 fn null_branch_still_evaluates_the_operand() {

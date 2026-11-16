@@ -7569,6 +7569,22 @@ impl<'a> Parser<'a> {
         if self.quoted_null.contains(&pos) {
             return false;
         }
+        // 直後が被演算子の開始（識別子・数値・文字列・`(`）でなければ列名 `case` の参照
+        // （`THEN case + 1 WHEN ...` の `case` を、外側の `WHEN` まで先読みして単純形と
+        // 取り違えない。検索形 CASE 内の列名 `case` の後方互換。`-x` 等の符号付き被演算子は
+        // 従来 `42601` で、列参照側へ倒す fail-closed）。中置の語（`AND`・`IS` 等）も同様。
+        let operand_start = match self.tokens.get(first) {
+            Some(Token::Number(_) | Token::StringLiteral(_) | Token::Punct('(')) => true,
+            Some(Token::Ident(_)) => ![
+                "AND", "OR", "IS", "IN", "LIKE", "ILIKE", "BETWEEN", "THEN", "ELSE", "END", "AS",
+            ]
+            .iter()
+            .any(|w| word_at(first, w)),
+            _ => false,
+        };
+        if !operand_start {
+            return false;
+        }
         // 括弧の深さと入れ子の `CASE ... END` の深さは別カウンタで数える（列名 `case`・`end` が
         // 括弧内に現れても、入れ子の CASE と取り違えて括弧の対応を崩さないため）。
         let mut parens: usize = 0;
@@ -44699,6 +44715,23 @@ mod tests {
                 SelectItem::Expr { expr: Expr::Ident(name), .. } if name == "case"
             )
         );
+    }
+
+    /// 検索形 CASE の結果式にある列名 `case` の直後に演算子があっても、外側の `WHEN` まで
+    /// 先読みして単純形と取り違えない（Issue #3279 のレビュー指摘。従来どおり受理）。
+    #[test]
+    fn searched_case_result_may_use_column_named_case_with_operator() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "SELECT CASE WHEN id = 1 THEN case + 1 WHEN id = 2 THEN 0 ELSE 0 END \
+                   FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 10";
+        let stmt = validate_statement(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(matches!(
+            &select_expr_items(&stmt)[0],
+            SelectItem::Expr {
+                expr: Expr::Case { operand: None, .. },
+                ..
+            }
+        ));
     }
 
     /// 括弧内の列名 `case` は入れ子の CASE と取り違えない（Issue #3279 のレビュー指摘）。

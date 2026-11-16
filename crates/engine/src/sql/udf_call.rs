@@ -6416,6 +6416,12 @@ thread_local! {
     /// `clock_timestamp()` を束縛した累計回数（Issue #3279）。単純 CASE の被演算子が（宣言的 UDF の
     /// 本体経由を含め）壁時計を読むかを、束縛の前後の差で判定する。束縛は同期・同一スレッド内で完結する。
     static CLOCK_TIMESTAMP_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 展開中の UDF 本体で、`clock_timestamp()` を含む実引数に束縛されたパラメータ名（小文字。
+    /// Issue #3279 のレビュー指摘）。束縛済み実引数は本体のパラメータ参照で複製されるだけで
+    /// `clock_timestamp()` の束縛を通らないため、参照時に [`CLOCK_TIMESTAMP_BINDS`] を加算して
+    /// 単純 CASE の被演算子判定へ伝える。UDF 呼び出しごとに差し替え・復元する（字句スコープ）。
+    static CLOCK_PARAMS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// 単純 CASE の一致しない分岐の片側を束縛する（裸の `NULL` は [`BoundExpr::Null`]。1 ノード課金）。
@@ -7103,6 +7109,10 @@ pub(super) fn bind_expr_any(
             // （`validate_closed_expr` の参照検証と一貫させる。外側コンテキストでは
             // `env.params` が常に空のため、列名の大文字小文字扱いには影響しない）。
             if let Some((bound, ty)) = env.params.get(name.to_ascii_lowercase().as_str()) {
+                // 壁時計を含む実引数のパラメータ参照は、複製のたびに束縛カウンタを進める。
+                if CLOCK_PARAMS.with(|c| c.borrow().contains(name.to_ascii_lowercase().as_str())) {
+                    CLOCK_TIMESTAMP_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
+                }
                 // パラメータ参照の展開は、構文上は 1 ノードでも実際には既に展開済みの
                 // `BoundExpr` 部分木をまるごとクローンする（UDF 連鎖・多重参照時に
                 // 展開結果が指数的に膨張しうる経路）。構文ノード数（直前の
@@ -10342,14 +10352,24 @@ fn bind_call(
         // 型注釈つきパラメータ（SQL-66 (1)）は実引数を宣言型へ暗黙変換する。型なしは従来どおり。
         // `param_types.len() == params.len()` は `define_function_with_types` が確立する不変条件。
         let mut bound_args = Vec::with_capacity(args.len());
+        let mut clock_flags = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
+            let before = CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get);
             match def.param_types.get(i).and_then(Option::as_ref) {
                 Some(declared) => {
                     bound_args.push(bind_typed_udf_arg(name, a, declared, env, node_budget)?)
                 }
                 None => bound_args.push(bind_expr_in(a, env, node_budget)?),
             }
+            clock_flags.push(CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get) != before);
         }
+        let inner_clock_params: std::collections::HashSet<String> = def
+            .params
+            .iter()
+            .zip(&clock_flags)
+            .filter(|(_, f)| **f)
+            .map(|(p, _)| p.to_ascii_lowercase())
+            .collect();
         let mut inner_params = std::collections::HashMap::new();
         let mut inner_decl = std::collections::HashMap::new();
         for (i, (pname, bound)) in def.params.iter().zip(bound_args).enumerate() {
@@ -10380,10 +10400,13 @@ fn bind_call(
             exact_int: false,
         };
         // RETURNS 付きは本体の結果を戻り値型へ変換して返す（定義時に型検査済み。Issue #1916）。
-        return match &def.return_type {
+        let saved_clock_params = CLOCK_PARAMS.with(|c| c.replace(inner_clock_params));
+        let result = match &def.return_type {
             Some(ret) => bind_udf_return(&def.body, ret, &mut inner_env, node_budget),
             None => bind_expr_in(&def.body, &mut inner_env, node_budget),
         };
+        CLOCK_PARAMS.with(|c| c.replace(saved_clock_params));
+        return result;
     }
 
     if let Some(backend) = env.registry.get_wasm(name).cloned() {
