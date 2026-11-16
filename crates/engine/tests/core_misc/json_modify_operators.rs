@@ -346,6 +346,7 @@ fn delete_path_follows_postgres_rules() {
     assert_eq!(select_code_for(&core, &alice, "docb #- lang", 1), "0A000");
 }
 
+// tracked: #3278
 #[test]
 fn type_errors_use_fixed_sqlstates() {
     let (core, path) = new_core();
@@ -358,12 +359,16 @@ fn type_errors_use_fixed_sqlstates() {
         Cell::Text("kx".to_string())
     );
     // 非 text オペランドの連結は未実装のまま拒否する。
-    // tracked: #3278
     assert_eq!(select_code(&core, &alice, "docb || lang"), "0A000");
-    // tracked: #3278
     assert_eq!(select_code(&core, &alice, "doc || '{}'"), "0A000");
-    // jsonb と数値は演算子なし。リテラル同士も 42883。
+    // PG に演算子が無い組は 42883（Issue #3277）。json 列は text 連結にも jsonb 連結にも入らない。
     assert_eq!(select_code(&core, &alice, "docb || n"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || n"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || doc"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || docb"), "42883");
+    assert_eq!(select_code(&core, &alice, "docb || doc"), "42883");
+    // 反対側の束縛エラーが先に出る。
+    assert_eq!(select_code(&core, &alice, "doc || nope_col"), "42703");
     assert_eq!(
         code(
             &core,
