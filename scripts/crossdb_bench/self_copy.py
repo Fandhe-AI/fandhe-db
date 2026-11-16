@@ -11,10 +11,9 @@
   `CREATE TABLE`（要 DDL 権限。呼び出し元が `--ddl-allowed-users` を付けて起動する）で
   作る。`docs` へ入れると fixture の既存 id と衝突し、後続フェーズの可視行数も変わる。
   `CREATE TABLE`／`DROP TABLE` は計測区間の外（pgvector の `_setup_schema` と同じ扱い）。
-- **1 COPY あたりの行数は既定 64 行**: COPY の行数は INDEX-4 ①
-  （`engine::batch_limits::DEFAULT_MAX_FILES_PER_BATCH`＝64。サーバー側で
-  `FANDHE_DB_BATCH_MAX_FILES` により上書き可）に数えられ、超過は `54000` で拒否される。
-  そのため fixture 全件を 64 行ずつの複数 COPY に分け、COPY ごとに別の
+- **1 COPY あたりの行数は 64 行（過去の計測との比較可能性のため）**: INDEX-4 ① は Issue #3309 以降
+  COPY の行数に掛からない（上限は `--max-insert-rows` 指定時のみ・既定の実効上限は ④）。
+  計測条件を変えないため fixture 全件を 64 行ずつの複数 COPY に分け、COPY ごとに別の
   `USING OPERATION_ID` を付ける。commit は COPY ごと（pgvector は単一 COPY・単一
   トランザクション）であり、この差は結果 JSON の `commit_granularity` に記録する。
 - **tenant／visibility は書き込み接続のテナントに固定**: COPY は `ctx.tenant_id()` と
@@ -44,7 +43,7 @@ from common import vec_literal
 # 連結しない。
 TABLE = "docs_bulk"
 
-# サーバー側 `engine::batch_limits::DEFAULT_MAX_FILES_PER_BATCH` と同値（INDEX-4 ①）。
+# 過去の計測と同じ分割幅（旧 INDEX-4 ① の既定値。Issue #3309 以降は COPY に掛からない）。
 DEFAULT_COPY_ROWS = 64
 # サーバー側 `MAX_BATCH_MAX_FILES`（`MAX_DML_ROW_LIMIT`）と同値。
 MAX_COPY_ROWS = 1_000_000
@@ -191,7 +190,7 @@ def ingest_bulk(conn, docs: list[dict], dim: int, copy_rows: int | None = None) 
         "table": TABLE,
         "commit_granularity": "per_copy",
         "note": (
-            f"{n_copies} 回の COPY FROM STDIN（CSV・各 {size} 行以下。INDEX-4 ① の既定上限に"
+            f"{n_copies} 回の COPY FROM STDIN（CSV・各 {size} 行以下。過去の計測の分割幅に"
             "合わせて分割）。commit は COPY ごと（pgvector は単一 COPY）。投入先は専用テーブル"
             f" {TABLE}（fixture の docs は不変）で tenant／visibility は接続テナントの"
             " tenant-a／private に固定（fixture 値は投入しない）。計測区間は CSV 化＋COPY のみで、"

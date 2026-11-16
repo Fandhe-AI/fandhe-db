@@ -7,9 +7,10 @@
 //! （ただし `base` に `BatchLimits::default()` を使うので `max_batch_chunks` 等は
 //! 既定に従う）。
 //!
-//! - SQL 複数行 `VALUES`: 上限ちょうどは成功・上限 + 1 は `54000`・副作用ゼロ
-//! - COPY FROM STDIN: 同じ値を共有し、上限 + 1 行目で `54000`・副作用ゼロ
-//! - 引き上げ方向: 既定 64 より大きい値なら 65 行以上でも成功する
+//! - SQL 複数行 `VALUES`・COPY FROM STDIN: `max_files_per_batch`（①）は行の形に効かない
+//!   （Issue #3308・#3309）ため、CLI で解決した値を小さくしても行数で `54000` にならない
+//!   （効く上限は ④ `max_batch_chunks`・`--max-insert-rows`）。本ファイルはその不変を固定する
+//! - 引き上げ方向: 既定 64 より大きい値でも 65 行以上は成功する
 //!
 //! NoSQL `op=insert rows[]` の上限超過（`54000`）は `nosql6_insert.rs`、ファイル形
 //! バッチ（engine ローカル API・wire 経路なし）は `crates/engine/tests/
@@ -128,7 +129,8 @@ fn sql_multi_row_values_can_exceed_default_when_raised() {
 }
 
 #[test]
-fn copy_from_stdin_respects_cli_resolved_limit() {
+fn copy_from_stdin_ignores_cli_resolved_file_limit() {
+    // Issue #3309: ① は COPY の行数にも掛からない。
     let (core, _guard) = new_core(limits_from_cli("3"));
     let mut stream = spawn_with_alice(core);
 
@@ -142,7 +144,7 @@ fn copy_from_stdin_respects_cli_resolved_limit() {
         b"1\t[1.0,0.0]\tja\n2\t[1.0,0.0]\tja\n3\t[1.0,0.0]\tja\n4\t[1.0,0.0]\tja\n",
     );
     send_copy_done(&mut stream);
-    expect_error_response_with_sqlstate(&mut stream, "54000");
+    assert_eq!(read_command_complete(&mut stream), "COPY 4");
     read_ready_for_query(&mut stream);
-    assert_row_count(&mut stream, 0);
+    assert_row_count(&mut stream, 4);
 }
