@@ -63,6 +63,47 @@ fn reject_scan_ddl_on_nonempty_table(
     Ok(())
 }
 
+/// `ALTER TABLE` が実際に既存行を走査しうるか。`SET NOT NULL` のうち、対象列が現在すでに NOT NULL で、
+/// かつ同じ文の他アクション（`DROP NOT NULL`・`DROP/ADD COLUMN`）が同列を変えないものは no-op のため走査しない。
+/// 表・列が見つからない場合は実行側がエラーで返す（走査前）ので、ここでは走査なし扱いにする。
+fn alter_needs_row_scan(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    stmt: &crate::sql::allowlist::ValidatedAlterTable,
+) -> bool {
+    use crate::sql::allowlist::ValidatedAlterTable as V;
+    if !alter_scans_rows(stmt) {
+        return false;
+    }
+    let Ok(schema) = crate::catalog::get_table_schema_in_txn_impl(write_txn, table, false) else {
+        return false;
+    };
+    let actions: Vec<&V> = match stmt {
+        V::Multiple(m) => m.actions.iter().collect(),
+        other => vec![other],
+    };
+    actions.iter().any(|a| {
+        let V::AlterColumnSetNotNull(s) = a else {
+            return false;
+        };
+        let Some(col) = schema.columns.iter().find(|c| c.name == s.column_name) else {
+            // 現スキーマに無い列は、同じ文の ADD COLUMN で現れうるため走査ありとして扱う。
+            return actions
+                .iter()
+                .any(|o| matches!(o, V::AddColumn(x) if x.column_name == s.column_name));
+        };
+        if col.nullable {
+            return true;
+        }
+        actions.iter().any(|o| match o {
+            V::AlterColumnDropNotNull(x) => x.column_name == s.column_name,
+            V::DropColumn(x) => x.column_name == s.column_name,
+            V::AddColumn(x) => x.column_name == s.column_name,
+            _ => false,
+        })
+    })
+}
+
 /// `ALTER TABLE` のアクションに既存行を走査する `SET NOT NULL` が含まれるか。
 fn alter_scans_rows(stmt: &crate::sql::allowlist::ValidatedAlterTable) -> bool {
     use crate::sql::allowlist::ValidatedAlterTable as V;
@@ -272,7 +313,8 @@ impl EngineCore {
                 txn.ensure_writer(ctx)?;
                 txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                if alter_scans_rows(stmt) {
+                // 既に NOT NULL の列への `SET NOT NULL` は走査しない no-op のため、ゲートの対象外にする。
+                if alter_needs_row_scan(write_txn, table_name, stmt) {
                     reject_scan_ddl_on_nonempty_table(write_txn, table_name)?;
                 }
                 let (outcome, evict) = crate::sql::ddl::execute_alter_table_in_txn(
@@ -308,10 +350,19 @@ impl EngineCore {
                 txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 // 既存行を走査する形（一意・式・述語つき・GIN）だけが対象。列の宣言だけの索引は走査しない。
-                if stmt.is_unique()
-                    || stmt.predicate().is_some()
-                    || stmt.gin_opclass().is_some()
-                    || stmt.expression_keys().iter().any(Option::is_some)
+                // 同名の relation が既にある場合は構築（走査）に入る前に結果が決まる（`IF NOT EXISTS` の
+                // no-op 成功・名前衝突のエラー）ため、ゲートの対象外にする。
+                let name_taken = crate::catalog::namespace::sibling_key(stmt.table(), stmt.name())
+                    .ok()
+                    .and_then(|key| {
+                        crate::catalog::relation_name_exists_in_txn(write_txn, &key).ok()
+                    })
+                    .unwrap_or(false);
+                if !name_taken
+                    && (stmt.is_unique()
+                        || stmt.predicate().is_some()
+                        || stmt.gin_opclass().is_some()
+                        || stmt.expression_keys().iter().any(Option::is_some))
                 {
                     reject_scan_ddl_on_nonempty_table(write_txn, stmt.table())?;
                 }

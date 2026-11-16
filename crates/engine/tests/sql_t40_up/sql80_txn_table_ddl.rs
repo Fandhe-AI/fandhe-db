@@ -831,6 +831,39 @@ fn scanning_ddl_on_a_non_empty_table_is_rejected_until_deadline_wiring() {
     );
 }
 
+/// 走査しない no-op（名前衝突の `IF NOT EXISTS`・既に NOT NULL の列への `SET NOT NULL`）は、行のある表でも成功する。
+#[test]
+fn scan_free_noops_on_a_non_empty_table_still_succeed() {
+    let (core, _guard) = new_core("sql80-scan-noop");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, body TEXT NOT NULL)",
+    )
+    .expect("create");
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(1, "a"))
+        .expect("seed");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE INDEX t_body_i ON t (body)",
+    );
+    for sql in [
+        "CREATE UNIQUE INDEX IF NOT EXISTS t_body_i ON t (body)",
+        "CREATE INDEX IF NOT EXISTS t_body_i ON t USING gin (body)",
+        "CREATE INDEX IF NOT EXISTS t_body_i ON t (lower(body))",
+        "CREATE INDEX IF NOT EXISTS t_body_i ON t (body) WHERE id > 0",
+        "ALTER TABLE t ALTER COLUMN body SET NOT NULL",
+    ] {
+        tx_ok(&core, &mut session, &mut txn, sql);
+    }
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+}
+
 /// DDL 後にビュー経由の読みは `0A000`（古いビュー本体を Tx 内の表の形へ束縛しない）。
 #[test]
 fn view_read_after_ddl_is_rejected() {
