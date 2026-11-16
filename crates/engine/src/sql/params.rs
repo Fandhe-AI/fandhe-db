@@ -701,25 +701,27 @@ fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option
     }
 }
 
-/// `tokens[open]`（`(`）に対応する `)` の添字を `end` 未満の範囲で線形に探す（深さ追跡のみ。
-/// 呼び出し側は比較演算子が続く場合に限って呼ぶため、文全体での走査量は有界）。
-fn matching_close(tokens: &[Token], open: usize, end: usize) -> Option<usize> {
-    let mut depth: usize = 0;
-    let mut j = open;
-    while j < end {
-        match tokens.get(j)? {
-            Token::Punct('(') => depth = depth.checked_add(1)?,
-            Token::Punct(')') => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(j);
+/// `[start, end)` 内の `(` ごとに対応する `)` の添字を、スタック 1 回の走査で求める
+/// （戻り値は `tokens` 添字で引く表。対応が無い `(` は `None`）。左境界を満たす `(` ごとに
+/// 再走査しないため、入れ子が深くても全体で線形時間になる。
+fn matching_closes(tokens: &[Token], start: usize, end: usize) -> Vec<Option<usize>> {
+    let end = end.min(tokens.len());
+    let mut closes: Vec<Option<usize>> = vec![None; end];
+    let mut stack: Vec<usize> = Vec::new();
+    for j in start..end {
+        match tokens.get(j) {
+            Some(Token::Punct('(')) => stack.push(j),
+            Some(Token::Punct(')')) => {
+                if let Some(open) = stack.pop() {
+                    if let Some(slot) = closes.get_mut(open) {
+                        *slot = Some(j);
+                    }
                 }
             }
             _ => {}
         }
-        j += 1;
     }
-    None
+    closes
 }
 
 /// 行の 1 辺 `( e1 , ... , en )`（`open` が `(`、`close` が対応する `)`）を、括弧深さ 1・角括弧深さ 0 の
@@ -771,13 +773,14 @@ fn row_compare_param_slots(
     end: usize,
 ) -> HashMap<usize, WhereParamShape> {
     let mut out = HashMap::new();
+    let closes = matching_closes(tokens, start, end);
     let mut i = start + 1;
     while i < end {
         if !matches!(tokens.get(i), Some(Token::Punct('('))) || !is_noneq_left_boundary(tokens, i) {
             i += 1;
             continue;
         }
-        let Some(close) = matching_close(tokens, i, end) else {
+        let Some(close) = closes.get(i).copied().flatten() else {
             i += 1;
             continue;
         };
@@ -795,7 +798,7 @@ fn row_compare_param_slots(
             i += 1;
             continue;
         }
-        let Some(r_close) = matching_close(tokens, r_open, end) else {
+        let Some(r_close) = closes.get(r_open).copied().flatten() else {
             i += 1;
             continue;
         };
