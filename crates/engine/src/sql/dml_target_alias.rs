@@ -234,6 +234,12 @@ pub(crate) fn normalize(tokens: Vec<Token>) -> Result<Vec<Token>, SqlSurfaceErro
                         "qualified null column reference is not supported",
                     ));
                 }
+                if name.eq_ignore_ascii_case("default") {
+                    // bare な `default` は SET 右辺で DEFAULT キーワード化し列参照にならないため拒否する（fail-closed）。
+                    return Err(SqlSurfaceError::unsupported(
+                        "qualified default column reference is not supported",
+                    ));
+                }
                 if is_syntax_word(name) || is_contextual_syntax_use(&tokens, i, name) {
                     return Err(SqlSurfaceError::unsupported(
                         "qualified column reference named like a SQL keyword is not supported",

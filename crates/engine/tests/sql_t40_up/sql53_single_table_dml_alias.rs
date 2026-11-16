@@ -197,6 +197,7 @@ fn unsupported_shapes_fail_closed_without_side_effects() {
         "DELETE FROM t AS where",
         // 修飾の誤用
         "UPDATE t tt SET x = tt.null WHERE tt.k = 'a'",
+        "UPDATE t tt SET x = tt.default WHERE tt.k = 'a'",
         "UPDATE t tt SET x = 1 WHERE tt.k = 'a' RETURNING tt.* + 1",
         "DELETE FROM t tt WHERE tt.*",
         // 対象外の経路（従来どおり）
