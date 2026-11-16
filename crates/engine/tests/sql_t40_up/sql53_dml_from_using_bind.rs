@@ -852,9 +852,12 @@ fn require_where_for_dml_applies_to_from_and_using_forms() {
         .expect("with WHERE");
 }
 
-/// ビューが関与する FROM／USING 形は `0A000`。
+/// FROM／USING 側の単純形ビューは受理され（Issue #3292）、書き込み先（target）がビューの形は
+/// `0A000` のまま。
+/// 更新可能ビューを target にする形は別の穴として意図的に拒否する。
+/// intentional: docs/design/update-from-delete-using.md
 #[test]
-fn view_relations_are_rejected_with_0a000() {
+fn view_as_source_is_accepted_and_view_as_target_is_rejected() {
     let (core, path) = new_core("sql53-from-view", false);
     let _g = CleanupGuard(path);
     let mut session = SessionState::default();
@@ -868,10 +871,17 @@ fn view_relations_are_rejected_with_0a000() {
     for sql in [
         "UPDATE docs SET lang = 'x' FROM v WHERE docs.id = v.id",
         "DELETE FROM docs USING v WHERE docs.id = v.id",
-        "DELETE FROM v USING langs WHERE v.id = langs.id",
     ] {
-        assert_eq!(code(core.parse_sql(sql)), "0A000", "{sql}");
+        let parsed = core.parse_sql(sql).expect(sql);
+        assert!(
+            matches!(parsed, ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_)),
+            "{sql}: {parsed:?}"
+        );
     }
+    assert_eq!(
+        code(core.parse_sql("DELETE FROM v USING langs WHERE v.id = langs.id")),
+        "0A000"
+    );
 }
 
 /// SET 右辺が列名 `distinct`（引用形）でも FROM 形（`UpdateFrom`）として解析される

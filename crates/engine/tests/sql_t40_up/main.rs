@@ -60,6 +60,7 @@ mod sql52_ctas_exec;
 mod sql53_dml_from_using_acceptance;
 mod sql53_dml_from_using_bind;
 mod sql53_dml_from_using_exec;
+mod sql53_dml_from_using_view;
 mod sql53_dml_where_subquery;
 mod sql53_single_table_dml_alias;
 mod sql54_ilike;
