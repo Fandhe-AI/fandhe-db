@@ -85,6 +85,14 @@ fn residual_type_supported(ty: &ColumnType) -> bool {
         )
 }
 
+/// 合成スキーマの列が VECTOR 系（走査で値を復号しない）か。範囲外は拒否側（true）に倒す。
+fn is_vector_slot(schema: &TableSchema, idx: usize) -> bool {
+    schema
+        .columns
+        .get(idx)
+        .is_none_or(|c| c.ty.is_vector_family())
+}
+
 /// 残余の合成名（source 列の並び位置）。
 fn synthetic_name(position: usize) -> String {
     format!("\u{0}res{position}")
@@ -155,6 +163,20 @@ pub(super) fn plan_residual(
         .any(crate::sql::udf_call::references_embedding)
         || or_filters.iter().any(|g| g.references_embedding())
     {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "UPDATE ... FROM / DELETE ... USING WHERE cannot reference a VECTOR column",
+        ));
+    }
+    // `IS [NOT] NULL` はメタデータフィルタとして束縛され `references_embedding` に現れない。
+    // 評価は埋め込みを復号せず VECTOR 列が常に NULL に見えるため、OR 群の内側も含めて拒否する
+    // （通すと `IS NULL` が全行で真になり、更新・削除対象が過大になる fail-open）。
+    let mut vector_ref = metadata_filters
+        .iter()
+        .any(|f| is_vector_slot(&combined, f.column_index()));
+    for g in &or_filters {
+        g.visit_column_indices(&mut |i| vector_ref |= is_vector_slot(&combined, i));
+    }
+    if vector_ref {
         return Err(SqlSurfaceError::feature_not_supported(
             "UPDATE ... FROM / DELETE ... USING WHERE cannot reference a VECTOR column",
         ));

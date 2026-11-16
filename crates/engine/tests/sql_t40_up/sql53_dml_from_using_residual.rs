@@ -429,6 +429,20 @@ fn unsupported_residual_forms_fail_closed() {
         ("UPDATE t SET x = 1 FROM s WHERE t.x < s.embedding", "0A000"),
         ("DELETE FROM t USING s WHERE t.x < s.id", "0A000"),
         ("DELETE FROM t USING s WHERE t.k = s.k OR s.id = 1", "0A000"),
+        // VECTOR 列の `IS [NOT] NULL` は束縛段階で拒否される（評価では常に NULL に見えて OR が全行真に
+        // なり得るため）。残余側にも同じ参照の fail-closed 検査があり、どちらでも更新・削除は起きない。
+        (
+            "DELETE FROM t USING s WHERE t.x < s.v OR t.embedding IS NULL",
+            "22000",
+        ),
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.x < s.v OR t.embedding IS NULL",
+            "22000",
+        ),
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.x < s.v AND t.embedding IS NOT NULL",
+            "22000",
+        ),
         (
             "DELETE FROM t USING s WHERE t.x < s.v AND NOT t.k = s.k",
             "42601",
