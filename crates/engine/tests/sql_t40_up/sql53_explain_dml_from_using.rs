@@ -476,18 +476,20 @@ fn unsupported_forms_stay_fail_closed() {
     assert_eq!(snapshot(&core, "a"), before);
 }
 
-/// ビュー・一時表が関与する形は拒否する（受理は別 Issue）。
+/// target がビューの形と一時表が関与する形は拒否する。FROM／USING 側の単純形ビューは
+/// #3292 で受理済みのため、EXPLAIN も同じ計画を返す。
 #[test]
 fn views_and_temp_tables_are_rejected() {
     let (core, _g) = seeded("x3293-view-temp");
     exec_as(&core, "tenant-a", "CREATE VIEW va AS SELECT k, v FROM a");
-    for sql in [
-        "EXPLAIN UPDATE va SET v = 'z' FROM pt WHERE va.k = pt.k",
+    let sql = "EXPLAIN UPDATE va SET v = 'z' FROM pt WHERE va.k = pt.k";
+    let c = code(&core, sql);
+    assert!(c == "0A000" || c == "42601", "{sql}: {c}");
+    exec_as(
+        &core,
+        "tenant-a",
         "EXPLAIN DELETE FROM a USING va WHERE a.k = va.k",
-    ] {
-        let c = code(&core, sql);
-        assert!(c == "0A000" || c == "42601", "{sql}: {c}");
-    }
+    );
     let c = ctx("tenant-a");
     let mut session = SessionState::default();
     session.allow_ddl();
