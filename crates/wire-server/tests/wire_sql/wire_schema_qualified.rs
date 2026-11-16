@@ -293,3 +293,69 @@ fn wire_extended_query_tenant_schema_names() {
     send_length_prefixed_message(&mut bob, b'S', &[]);
     assert_eq!(read_message(&mut bob).0, b'Z');
 }
+/// MATERIALIZED VIEW の SCHEMA 配置（Issue #3287）。psql 形（1 メッセージ 1 文・末尾 `;`）の修飾名で
+/// CREATE・SELECT・REFRESH・DROP が通り、別テナントの接続からは不在と同じ `3F000`（`#` を含まない）。
+/// 拒否の後も接続を使い続けられる。
+#[test]
+fn wire_simple_query_matview_in_tenant_schema_with_trailing_semicolon() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    assert_eq!(simple_ok(&mut alice, "CREATE SCHEMA s;"), "CREATE SCHEMA");
+    simple_ok(&mut alice, "CREATE TABLE s.t (id BIGINT PRIMARY KEY);");
+    simple_ok(&mut alice, "INSERT INTO s.t (id) VALUES (1);");
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t;"
+        ),
+        "SELECT 1"
+    );
+    send_simple_query(&mut alice, "SELECT id FROM s.mv;");
+    let _ = read_message(&mut alice); // RowDescription
+    let row = read_data_row(&mut alice);
+    assert_eq!(row.first().cloned().flatten().as_deref(), Some("1"));
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+    simple_ok(&mut alice, "INSERT INTO s.t (id) VALUES (2);");
+    assert_eq!(
+        simple_ok(&mut alice, "REFRESH MATERIALIZED VIEW s.mv;"),
+        "REFRESH MATERIALIZED VIEW"
+    );
+    send_simple_query(&mut alice, "SELECT id FROM s.mv;");
+    let _ = read_message(&mut alice);
+    let _ = read_data_row(&mut alice);
+    let _ = read_data_row(&mut alice);
+    assert_eq!(read_command_complete(&mut alice), "SELECT 2");
+    read_ready_for_query(&mut alice);
+
+    // bob からは alice の SCHEMA は存在しない（`3F000`）。`#` を含まず、拒否後も接続は使える。
+    for sql in [
+        "SELECT id FROM s.mv;",
+        "REFRESH MATERIALIZED VIEW s.mv;",
+        "DROP MATERIALIZED VIEW s.mv;",
+        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t;",
+    ] {
+        send_simple_query(&mut bob, sql);
+        expect_error_without_internal_keys(&mut bob, "3F000");
+        read_ready_for_query(&mut bob);
+    }
+    assert_eq!(simple_ok(&mut bob, "CREATE SCHEMA s;"), "CREATE SCHEMA");
+
+    assert_eq!(
+        simple_ok(&mut alice, "DROP MATERIALIZED VIEW s.mv;"),
+        "DROP MATERIALIZED VIEW"
+    );
+    send_simple_query(&mut alice, "SELECT id FROM s.mv;");
+    expect_error_without_internal_keys(&mut alice, "42P01");
+    read_ready_for_query(&mut alice);
+}

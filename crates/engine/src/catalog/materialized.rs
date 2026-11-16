@@ -37,10 +37,10 @@ use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefiniti
 use super::{
     bump_table_generation_in_txn, decode_index_def, decode_schema_with_resolver, encode_schema,
     is_declarable_scalar_index_type, retain_index_defs_in_txn, validate_identifier,
-    validate_index_columns, CascadedObject, CatalogError, ColumnDef, ColumnType, DropBehavior,
-    IndexDef, IndexKind, Result, Storage, TableSchema, INDEX_CATALOG_TABLE, MAX_COLUMN_COUNT,
-    MAX_IDENTIFIER_LEN, MAX_INDEX_COUNT, MAX_LIST_TABLES, MAX_UNIQUE_CONSTRAINTS,
-    MAX_VIEW_BODY_BYTES,
+    validate_index_columns, validate_relation_key, CascadedObject, CatalogError, ColumnDef,
+    ColumnType, DropBehavior, IndexDef, IndexKind, Result, Storage, TableSchema,
+    INDEX_CATALOG_TABLE, MAX_COLUMN_COUNT, MAX_IDENTIFIER_LEN, MAX_INDEX_COUNT, MAX_LIST_TABLES,
+    MAX_UNIQUE_CONSTRAINTS, MAX_VIEW_BODY_BYTES,
 };
 use crate::policy::PolicyContext;
 use crate::result_limits::MAX_RESULT_ROWS_HARD_CAP;
@@ -79,8 +79,15 @@ const CONTEXT_KEY_VERSION: u8 = 1;
 /// 埋め込むスキーマ blob のバイト数上限（カタログ値の上限と同じ 2 MiB）。
 const MAX_SCHEMA_BLOB_BYTES: usize = 2 * 1024 * 1024;
 
-/// 実体の行表名を組み立てる唯一の点。`validate_identifier` は `/` を拒否するため、
-/// `user_rows/*` やユーザー表の名前と衝突しない。
+/// 内部キー `#<schema_id>.<name>`（[`RelationKey`](super::namespace::RelationKey)）を収める
+/// relation 名の長さの上限（`#` + `u64` の 10 進最大 20 桁 + `.` + 名前部の上限。Issue #3287）。
+/// 定義の decode が基表名を読む際の上限で、超過は破損（`CorruptSchema`）として扱う。
+const MAX_RELATION_KEY_LEN: usize = 1 + 20 + 1 + MAX_IDENTIFIER_LEN;
+
+/// 実体の行表名を組み立てる唯一の点。名前は `validate_relation_key` を通った relation キー
+/// （裸の識別子か内部キー）だけで、どちらも `/` を含まないため `user_rows/*` やユーザー表の名前と
+/// 衝突しない。SCHEMA 配下の matview は `user_rows/{内部キー}` と同じ流儀で内部キーをそのまま使い、
+/// `#`・`.` は識別子に現れないので `public` の同名とも衝突しない（Issue #3287）。
 fn matview_rows_table_name(name: &str) -> String {
     // 明示トランザクションの読み取り集合（SQL-38・Issue #2404）。実体の行テーブルに触れる経路は
     // ここで名前を作る（区間が無ければ何もしない）。
@@ -363,7 +370,7 @@ impl<'a> Reader<'a> {
 
 /// 作成前の形状検証（名前・件数・長さ・列型）。write txn に入る前に呼ぶ。
 fn validate_def_shape(def: &MaterializedViewDef) -> Result<()> {
-    validate_identifier(&def.name)?;
+    validate_relation_key(&def.name)?;
     if def.body_sql.len() > MAX_VIEW_BODY_BYTES {
         return Err(CatalogError::ViewLimitExceeded(
             "materialized view body too large".to_string(),
@@ -375,7 +382,7 @@ fn validate_def_shape(def: &MaterializedViewDef) -> Result<()> {
         ));
     }
     for (i, rel) in def.base_relations.iter().enumerate() {
-        validate_identifier(rel)?;
+        validate_relation_key(rel)?;
         if def.base_relations.iter().take(i).any(|r| r == rel) {
             return Err(CatalogError::Invalid(
                 "duplicate materialized view base relation".to_string(),
@@ -455,8 +462,8 @@ pub(crate) fn decode_materialized_view_def(
         .try_reserve_exact(base_count)
         .map_err(|_| corrupt("materialized view allocation failed"))?;
     for _ in 0..base_count {
-        let rel = r.string(MAX_IDENTIFIER_LEN)?;
-        validate_identifier(&rel).map_err(|_| corrupt("invalid base relation identifier"))?;
+        let rel = r.string(MAX_RELATION_KEY_LEN)?;
+        validate_relation_key(&rel).map_err(|_| corrupt("invalid base relation identifier"))?;
         base_relations.push(rel);
     }
     let alias_count = r.count(MAX_COLUMN_COUNT)?;
@@ -991,6 +998,8 @@ pub(crate) fn begin_streamed_create_in_txn(
     def: &MaterializedViewDef,
 ) -> Result<()> {
     let encoded = encode_materialized_view_def(def)?;
+    // 解析と書き込みの間に SCHEMA が消えた場合の孤児を防ぐ（内部キーの作成先。Issue #3287）。
+    super::namespace::ensure_key_schema_alive_in_txn(write_txn, &def.name)?;
     insert_def_in_txn(write_txn, def, &encoded)?;
     if def.populated {
         delete_all_meta_in_txn(write_txn, &def.name)?;
@@ -1008,7 +1017,7 @@ pub(crate) fn begin_streamed_refresh_in_txn(
     write_txn: &redb::WriteTransaction,
     name: &str,
 ) -> Result<MaterializedViewDef> {
-    validate_identifier(name)?;
+    validate_relation_key(name)?;
     let def = load_def_in_txn(write_txn, name)?
         .ok_or_else(|| CatalogError::ViewNotFound(name.to_string()))?;
     delete_all_meta_in_txn(write_txn, name)?;
@@ -1135,11 +1144,7 @@ pub(crate) fn read_materialized_view_in<R: ReadSource>(
     name: &str,
     ctx: &PolicyContext,
 ) -> Result<Option<MaterializedViewEntity>> {
-    if name.starts_with('#') {
-        // 内部キーは利用者が直接指せない。定義が無い扱い（`Ok(None)` は「未 populate」の意味）。
-        return Err(CatalogError::ViewNotFound(name.to_string()));
-    }
-    validate_identifier(name)?;
+    validate_relation_key(name)?;
     let def = {
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
             Ok(t) => t,
@@ -1229,10 +1234,7 @@ impl Storage {
         &self,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>> {
-        if name.starts_with('#') {
-            return Ok(None);
-        }
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
             Ok(t) => t,
@@ -1251,11 +1253,7 @@ impl Storage {
         read_txn: &impl crate::storage::read_source::ReadSource,
         name: &str,
     ) -> Result<Option<MaterializedViewDef>> {
-        if name.starts_with('#') {
-            // matview は public にしか置けない（内部キーの名前は存在しない。Issue #1717）。
-            return Ok(None);
-        }
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let table = match read_txn.open_table(MATERIALIZED_VIEWS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1278,7 +1276,7 @@ impl Storage {
         entities: &[(PolicyContext, Vec<Vec<Value>>)],
         max_rows_per_context: usize,
     ) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let keys = check_entities(entities, max_rows_per_context)?;
         let write_txn = self
             .begin_write_txn()
@@ -1296,7 +1294,7 @@ impl Storage {
 
     /// 全文脈の実体を破棄して `populated = false` に戻す（`WITH NO DATA` 用）。
     pub(crate) fn clear_materialized_view_entities(&self, name: &str) -> Result<()> {
-        validate_identifier(name)?;
+        validate_relation_key(name)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
@@ -1351,7 +1349,7 @@ impl Storage {
     ) -> Result<DropMaterializedViewsReport> {
         let mut targets: Vec<&str> = Vec::new();
         for name in names {
-            validate_identifier(name)?;
+            validate_relation_key(name)?;
             if !targets.contains(&name.as_str()) {
                 targets.push(name.as_str());
             }
