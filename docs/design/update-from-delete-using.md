@@ -44,8 +44,8 @@ DELETE FROM <表> [[AS] <別名>] USING <from_list> [WHERE <join_where>]
 - 入口（`EngineCore::parse_tokens_in`）が `looks_like_update_from`／`looks_like_delete_using` で先読みし、専用の解析器へ回す。既存の `parse_update`／`parse_delete` は変えない
 - `looks_like_update_from`: 括弧深さ 0 の `FROM`（`IS [NOT] DISTINCT FROM` を除く）がある `UPDATE` 文
 - `looks_like_delete_using`: 括弧深さ 0 の `USING` の直後が `OPERATION_ID` でない `DELETE FROM` 文。`DELETE FROM t USING OPERATION_ID '...'`（WHERE 省略形）は従来どおり既存の経路を通る。`operation_id` という名前の表を USING に書く形は operation_id 句として扱われ、既存の解析器が `42601` で拒否する（fail-closed）
-- 非セッション入口（`validate_update`・`validate_delete_statement` など）は FROM／USING 形を従来どおり `42601` で拒否する（`EXPLAIN` は Issue #3293 で受理。末尾「EXPLAIN（Issue #3293）」節）
-- 別名付きで FROM／USING が無い単一表 DML（`UPDATE t AS x SET ... WHERE ...`）は従来どおり `42601`（受理範囲を広げない）
+- 非セッション入口（`validate_update`・`validate_delete_statement` など）は FROM／USING 形を従来どおり `42601` で拒否する（`EXPLAIN` の FROM／USING 形は Issue #3293 で受理。末尾「EXPLAIN（Issue #3293）」節）
+- 別名付きで FROM／USING が無い単一表 DML（`UPDATE t AS x SET ... WHERE ...`）は Issue #3291 で受理に変わった。入口のトークン正規化で別名なしの同じ文へ書き換える（下記「別名つき単一表 DML」節）
 
 ## 新しい `ParsedSql` variant
 
@@ -173,6 +173,17 @@ SQL-53 (b)・RLS-10・RECOVER-10/11・SQL-28 のポインタ。等値キーが�
 - `crates/engine/src/core/dml_join_exec_tests.rs`: 実行器の単体テスト（走査位置 `matches` の固定を含む）
 - `crates/wire-server/tests/wire_sql/wire_sql53_dml_from_using.rs`: 末尾 `;` 付き単独送信・タグ・op id
 - `allowlist.rs`・`relation_name.rs` の単体テスト
+
+## 別名つき単一表 DML（Issue #3291）
+
+`UPDATE t [AS] x SET ... WHERE x.a = 1 RETURNING x.*`・`DELETE FROM t [AS] x WHERE x.a = 1`（FROM／USING なし）を受理する（SQL-53・RLS-10・RECOVER-10/11 のポインタ）。
+
+- 方式: 構文解析より前に、別名なしの同じ文のトークン列へ書き換える（実体 `sql::dml_target_alias`。呼び出しは `EngineCore::normalize_row_count_clauses`。冪等）。別名トークンを除き、`<別名>.<列>` を `<列>` へ 1 対 1 で置換する。以降の経路（構文解析・名前解決・一時表の振り分け・`$n` の型推論・ビュー DML・台帳ハッシュ・RLS・分割実行）は既存の別名なし文と同一で、`parse_update`／`parse_delete` は変えない
+- 解析器を変えず入口で正規化する理由: `$n` の位置・search_path 再解決の位置・ビューの WHERE 末尾など、トークン列の索引に依存する構造が複数あり、生トークンと書き換え後トークンの索引がずれる経路を作らないため。別名つき文と別名なし文は同じ AST・同じ content_hash になり、台帳の再送冪等は別名の有無を問わず同じ操作として扱われる（別の文への再利用は従来どおり `22023`）
+- 照合規則は FROM／USING 形と同じ `TableRef::matches_qualifier`。別名を付けた表を本名・他表名で修飾すると `42P01`（カタログを引かないため存在のオラクルにならない）
+- 受理しない（従来どおり `42601`。副作用なし）: SET 左辺の修飾（`SET x.a = ...`・`SET (x.a, x.b) = ...`）、予約語の別名、別名の直後が想定外のトークン、`x.null`・構文語と衝突する名前・WHERE の述語葉以外の `x.true`、RETURNING の項目位置以外の `x.*`
+- 正規化しない経路（`42601` のまま）: `EXPLAIN`（分割実行 DML の別名形を含む。実行と `EXPLAIN ... PARTITIONED` でこの差が出る）、データ変更 CTE の本文、PL/pgSQL・埋め込み単位（`colref_sink` の記録区間では何もしない）、非セッション入口（`validate_update` 等）、サブクエリ括弧の中の外側の別名・本名への修飾相関（別名なし文の `t.c` と同じ fail-closed）
+- 別名なしの経路はバイト不変（別名なし文の本名修飾 `WHERE t.a = 1` は従来どおり `42601`）
 
 ## EXPLAIN（Issue #3293）
 
