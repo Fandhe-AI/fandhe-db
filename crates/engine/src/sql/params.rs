@@ -280,8 +280,16 @@ pub(crate) fn joined_dml_dummy_flags(tokens: &[Token], kinds: &[ParamLiteralKind
                     // 「単独の `$n`（置換種別が String）か」を積む。それ以外は全て検証側（偽）。
                     let elems: Option<Vec<bool>> = close.and_then(|c| {
                         let rest = seg.get(c.saturating_add(1)..)?;
-                        let (Token::Punct('='), Token::Punct('('), inner) =
-                            (rest.first()?, rest.get(1)?, rest.get(2..)?)
+                        // 右辺は `( ... )` か `ROW( ... )`（`set_row_value_slots` と同じく ROW は任意）。
+                        let (Token::Punct('='), after_eq) = (rest.first()?, rest.get(1..)?) else {
+                            return None;
+                        };
+                        let after_row = if ident_eq_ignore_case(after_eq.first(), "ROW") {
+                            after_eq.get(1..)?
+                        } else {
+                            after_eq
+                        };
+                        let (Token::Punct('('), inner) = (after_row.first()?, after_row.get(1..)?)
                         else {
                             return None;
                         };

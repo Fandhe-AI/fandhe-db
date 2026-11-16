@@ -274,3 +274,13 @@ fn describe_date_param_in_row_value_assignment() {
         "UPDATE 1",
     );
 }
+
+/// `= ROW($n, ...)` 形式でも要素ごとのダミーフラグが立ち、Describe が 22007 にならない。
+#[test]
+fn describe_date_param_in_row_keyword_value_assignment() {
+    assert_extended_ok(
+        "UPDATE docs SET (d, lang) = ROW($1, $2) FROM langs WHERE docs.lang = langs.lang",
+        &["2024-01-02", "ja"],
+        "UPDATE 1",
+    );
+}
