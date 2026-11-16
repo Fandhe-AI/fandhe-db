@@ -19609,14 +19609,12 @@ impl EngineCore {
             .map_err(|e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()))
     }
 
-    /// SQL 表層の複数行 `VALUES`（①行数上限＋②③④バイト量・チャンク総量）
-    /// 上限検証本体。`execute_insert_form`・`execute_insert_returning_form`
-    /// （`RETURNING` 付き。Issue #873・SQL-21）の `RowBatch` 分岐がいずれも
-    /// 束縛済み `bounds` に対して同一の判定（①は `self.batch_limits.
-    /// max_files_per_batch` との比較、②③④は [`Self::
-    /// validate_insert_batch_byte_and_chunk_limits`] への委譲）を行っていた
-    /// 重複を解消する（codex-review Low 指摘・PR #873）。判定内容・エラー写像は
-    /// 集約前と完全に同一。
+    /// SQL 表層の複数行 `VALUES`（②③④バイト量・チャンク総量）上限検証本体。
+    /// `execute_insert_form`・`execute_insert_returning_form`（`RETURNING` 付き。
+    /// Issue #873・SQL-21）の `RowBatch` 分岐がいずれも束縛済み `bounds` に対して
+    /// 同一の判定（[`Self::validate_insert_batch_byte_and_chunk_limits`] への委譲）を
+    /// 行う重複を解消する（codex-review Low 指摘・PR #873）。①（`max_files_per_batch`）
+    /// は行の形には掛けない（Issue #3308）。
     fn validate_insert_row_batch_limits(
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
