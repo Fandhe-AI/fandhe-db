@@ -87,10 +87,14 @@ fn eval_single(
     tuple: &[Option<u32>],
     scratch: &mut Vec<StackValue>,
 ) -> Result<bool, SqlSurfaceError> {
-    let row = match row_at(sides, tuple, f.rel)? {
-        Some(r) => r,
-        // NULL 補完された relation を参照する部分木は偽（不定）。
-        None => return Ok(false),
+    let Some(row) = row_at(sides, tuple, f.rel)? else {
+        // NULL 補完された relation を参照する部分木は偽（不定）。ただし非 strict な葉（`IS NULL`）を
+        // 含む部分木は全列 NULL の行として評価する（行 `id` の参照は束縛時に拒否済み）。
+        if !f.eval_padded {
+            return Ok(false);
+        }
+        let scanned: Vec<Option<crate::row_codec::ScalarRef<'_>>> = vec![None; f.schema_len];
+        return f.group.matches(&scanned, 0, &[], 0, scratch);
     };
     let mut scanned: Vec<Option<crate::row_codec::ScalarRef<'_>>> = vec![None; f.schema_len];
     for (schema_idx, pos, ty) in &f.cols {

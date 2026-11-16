@@ -277,6 +277,47 @@ fn three_way_comma_and_cross_joins() {
     );
 }
 
+/// 畳み込み source（2 表以上）でも、source だけを参照する数値比較・数値 `IN`・`IS [NOT] NULL` を受理し、
+/// 単一表 source と同じ行集合になる（Issue #3295）。外部結合の補完行は非 strict な述語で残余評価される。
+#[test]
+fn folded_source_accepts_numeric_and_is_null_leaves() {
+    let alice = ctx("alice");
+    for (where_tail, want) in [
+        ("s.v > 150", 1),
+        ("s.v IN (100, 300)", 1),
+        ("u.w IS NOT NULL", 2),
+        ("u.w IS NULL", 0),
+        ("(u.w IS NULL OR u.w > 7)", 1),
+    ] {
+        let (core, _g) = new_core("sql53-mj-dmlleaf");
+        seed(&core, &alice);
+        let sql =
+            format!("DELETE FROM t USING s, u WHERE t.k = s.k AND s.k = u.k AND {where_tail}");
+        assert_eq!(
+            run(&core, &alice, &sql).expect(&sql),
+            tag("DEL", want),
+            "{sql}"
+        );
+    }
+    // LEFT JOIN の補完行（u.w が NULL）だけが `IS NULL` に一致する。
+    let (core, _g) = new_core("sql53-mj-dmlleaf-left");
+    seed(&core, &alice);
+    let sql = "UPDATE t SET x = 0 FROM s LEFT JOIN u ON s.k = u.k AND u.k = 'a' \
+               WHERE t.k = s.k AND u.w IS NULL";
+    assert_eq!(run(&core, &alice, sql).expect("update"), tag("UPD", 1));
+    assert_eq!(
+        xs(&core, &alice),
+        vec![(1, Some(10)), (2, Some(0)), (3, Some(30))]
+    );
+    // ON 条件への数値リテラル比較は受理せず、行を変えない。
+    let (core, _g) = new_core("sql53-mj-dmlleaf-on");
+    seed(&core, &alice);
+    let before = xs(&core, &alice);
+    let sql = "DELETE FROM t USING s JOIN u ON s.k = u.k AND u.w > 7 WHERE t.k = s.k";
+    assert_eq!(code(run(&core, &alice, sql)), "42601");
+    assert_eq!(before, xs(&core, &alice));
+}
+
 /// 疑似列 `id` を結合キーに使う畳み込み source（符号なしの `Cell::Integer` を運ぶ）でも、SET が他の
 /// source 列を読む正常な文が `XX000` にならず、一致した行だけが更新される。
 #[test]

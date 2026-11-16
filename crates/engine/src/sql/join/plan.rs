@@ -155,6 +155,9 @@ pub(super) struct SingleFilter {
     /// 述語が参照するスキーマ列（添字・側スキャン結果内の位置・列型）。
     pub(super) cols: Vec<(usize, usize, ColumnType)>,
     pub(super) schema_len: usize,
+    /// NULL 補完された relation でも全列 NULL の行として評価するか。DML 専用の非 strict な葉
+    /// （`IS [NOT] NULL`。Issue #3295）を含む部分木だけが真で、それ以外は補完行を偽として扱う。
+    pub(super) eval_padded: bool,
 }
 
 pub(super) struct ColCompare {
@@ -748,6 +751,7 @@ fn build_residual(
                 "JOIN WHERE predicate cannot reference a VECTOR column",
             ));
         }
+        let eval_padded = contains_dml_only_leaf(expr);
         let mut refs = Vec::new();
         collect_leaf_colrefs(expr, &mut refs);
         let mut cols: Vec<(usize, usize, ColumnType)> = Vec::new();
@@ -764,6 +768,11 @@ fn build_residual(
                 if !cols.iter().any(|(i, _, _)| *i == idx) {
                     cols.push((idx, c.pos, ty));
                 }
+            } else if eval_padded {
+                // 補完行の行 `id` は NULL を表せないため、補完行を評価する部分木では参照を拒否する。
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "row id cannot be referenced together with IS NULL in this JOIN predicate",
+                ));
             }
         }
         return Ok(ResNode::Single(SingleFilter {
@@ -771,6 +780,7 @@ fn build_residual(
             group,
             cols,
             schema_len: schema.columns.len(),
+            eval_padded,
         }));
     }
     match expr {
@@ -876,14 +886,12 @@ pub(super) fn build_plan<'a>(
         });
     }
     // 多重防御: DML 専用の葉（数値リテラル比較・`IS [NOT] NULL`。Issue #3295）は SELECT の JOIN
-    // の文法が生成しないが、非 strict な葉が外部結合の簡約規則へ入らないよう入口で拒否する。
-    let dml_only = |e: &JoinWhereExpr| contains_dml_only_leaf(e);
-    if validated.where_clause.as_deref().is_some_and(dml_only)
-        || validated.steps.iter().any(|st| match &st.condition {
-            crate::sql::allowlist::JoinCondition::On(e) => dml_only(e),
-            _ => false,
-        })
-    {
+    // の文法が生成しない。WHERE には畳み込み source の source 側述語（`dml_plan`）として現れうるため
+    // 受理し（非 strict な葉は下の振り分けで必ず残余へ回す）、ON 条件にはどの経路でも現れないため拒否する。
+    if validated.steps.iter().any(|st| match &st.condition {
+        crate::sql::allowlist::JoinCondition::On(e) => contains_dml_only_leaf(e),
+        _ => false,
+    }) {
         return Err(SqlSurfaceError::feature_not_supported(
             "numeric literal comparison and IS NULL are not supported in JOIN conditions",
         ));
@@ -1120,7 +1128,9 @@ pub(super) fn build_plan<'a>(
                 }
             }
             let mask = refs_mask(c, &b.scope)?;
-            if mask.count_ones() == 1 && !has_compare(c) {
+            // 非 strict な式（`IS NULL` を含む `OR` 等）は補完行で真になりうるため、走査へ押し下げず
+            // 結合後の残余で評価する。
+            if mask.count_ones() == 1 && !has_compare(c) && strict & mask == mask {
                 let rel = usize::try_from(mask.trailing_zeros()).map_err(|_| {
                     SqlSurfaceError::Internal {
                         detail: "JOIN relation mask overflow".to_string(),
