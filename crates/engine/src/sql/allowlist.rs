@@ -1379,6 +1379,9 @@ pub enum SqlSurfaceError {
     /// PL/pgSQL の未代入のレコード変数のフィールドを参照した（`55000`。Issue #2225・SQL-68）。
     /// 固定文言のみ（変数名・フィールド名を含めない）。
     RecordNotAssigned,
+    /// `ALTER COLUMN ... DROP EXPRESSION`（`IF EXISTS` なし）の対象が生成列でない（`55000`。
+    /// TABLE-50 (3)・Issue #3331）。固定文言のみ（列名・テナント・値を含めない）。
+    ColumnNotGenerated,
     /// PL/pgSQL の `INTO STRICT` が 0 行（`P0002`。Issue #2225・SQL-68）。固定文言のみ。
     NoDataFound,
     /// PL/pgSQL の `INTO STRICT`／DML の `RETURNING INTO` が 2 行以上（`P0003`。Issue #2225・
@@ -2141,6 +2144,7 @@ impl ClassifiedError for SqlSurfaceError {
             | SqlSurfaceError::SequenceNotYetDefined
             | SqlSurfaceError::LastvalNotYetDefined
             | SqlSurfaceError::RecordNotAssigned
+            | SqlSurfaceError::ColumnNotGenerated
             | SqlSurfaceError::ViewNotAutoUpdatable { .. } => {
                 ErrorClass::ObjectNotInPrerequisiteState
             }
@@ -2596,6 +2600,10 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             // PostgreSQL と同じ固定文言（変数名・値・行の内容は含めない。Issue #2225）。
             SqlSurfaceError::RecordNotAssigned => write!(f, "record is not assigned yet"),
+            // 固定文言（列名・値を含めない。Issue #3331）。
+            SqlSurfaceError::ColumnNotGenerated => {
+                write!(f, "column is not a stored generated column")
+            }
             SqlSurfaceError::NoDataFound => write!(f, "query returned no rows"),
             SqlSurfaceError::TooManyRows => write!(f, "query returned more than one row"),
             SqlSurfaceError::CaseNotFound => write!(f, "case not found"),
@@ -6924,6 +6932,24 @@ pub struct ValidatedAlterTableAddForeignKey {
 pub struct ValidatedAlterTableDropColumn {
     pub table_name: String,
     pub column_name: String,
+    /// `CASCADE`／`RESTRICT` 句（無指定は `Restrict`。TABLE-50 (3)・Issue #3331）。`Cascade` は
+    /// 列を式が参照する生成列を連鎖削除する（それ以外の依存は `2BP01`）。
+    ///
+    /// **BREAKING CHANGE**（Issue #3331）: フィールド追加。構造体リテラルで構築するクレート外の
+    /// コードは追随が必要。
+    pub behavior: crate::catalog::DropBehavior,
+}
+
+/// 許可形状の構造判定を通過した `ALTER TABLE <table> ALTER COLUMN <column> DROP EXPRESSION
+/// [IF EXISTS]` 文（TABLE-50 (3)・Issue #3331）。予約列名は構造検証段で `42601` に落とし済み。
+/// 表・列の存在確認と生成列かの判定は実行段（`sql::ddl::execute_alter_table_drop_expression`）が
+/// DDL 権限ゲートの後で担う（権限の無い主体への存在オラクル化を防ぐ）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedAlterTableAlterColumnDropExpression {
+    pub table_name: String,
+    pub column_name: String,
+    /// `IF EXISTS` 指定。生成列でない列に対して何もせず成功する。
+    pub if_exists: bool,
 }
 
 /// 許可形状の構造判定を通過した `ALTER TABLE <table> RENAME [COLUMN] <old> TO <new>`
@@ -7085,6 +7111,8 @@ pub enum ValidatedAlterTable {
     AlterColumnSetDefault(ValidatedAlterTableAlterColumnSetDefault),
     AlterColumnDropDefault(ValidatedAlterTableAlterColumnDropDefault),
     AlterColumnDropNotNull(ValidatedAlterTableAlterColumnDropNotNull),
+    /// 生成列の式の除去（TABLE-50 (3)・Issue #3331）。**BREAKING CHANGE**: variant 追加。
+    AlterColumnDropExpression(ValidatedAlterTableAlterColumnDropExpression),
     RenameColumn(ValidatedAlterTableRenameColumn),
     /// 表の改名（Issue #1623）。**BREAKING CHANGE**: variant 追加。
     RenameTable(ValidatedAlterTableRenameTable),
@@ -16813,15 +16841,18 @@ impl<'a> Parser<'a> {
         }
         if self.peek_contextual_keyword("DROP") {
             self.advance();
-            // `DROP COLUMN <col>`（TABLE-19、Issue #1167）。`COLUMN` 省略形・
-            // `IF EXISTS`・`CASCADE`／`RESTRICT` は余剰トークンとして `42601`。
+            // `DROP COLUMN <col> [CASCADE | RESTRICT]`（TABLE-19、Issue #1167。`CASCADE`／`RESTRICT` は
+            // TABLE-50 (3)・Issue #3331）。`COLUMN` 省略形・`IF EXISTS` は余剰トークンとして `42601`。
+            // 両句の併記も余剰トークンとして呼び出し元の文末検査が `42601` にする。
             if self.peek_contextual_keyword("COLUMN") {
                 self.advance();
                 let column_name = self.expect_ident()?;
                 reject_reserved_alter_column_name(&column_name)?;
+                let behavior = self.parse_optional_drop_behavior();
                 return Ok(ParsedAlterTableShape::DropColumn {
                     table_name,
                     column_name,
+                    behavior,
                 });
             }
             // `DROP CONSTRAINT <name>` を受理する（`DROP CONSTRAINT IF EXISTS`／
@@ -16863,6 +16894,14 @@ impl<'a> Parser<'a> {
                 self.advance();
             } else if self.peek_contextual_keyword("SET") {
                 self.advance();
+                // `SET EXPRESSION AS (...)` は未対応（PostgreSQL は全行を再計算して許すが、再計算の
+                // 計算点が無い間は受理しない。TABLE-50 (3)・Issue #3331）。カタログを見ない固定文言の
+                // `0A000`（存在オラクルにならない）。
+                if self.peek_ident_matches("EXPRESSION") {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "ALTER COLUMN ... SET EXPRESSION is not supported",
+                    ));
+                }
                 if self.peek_ident_matches("DEFAULT") {
                     self.advance();
                     // 式の許可範囲は `CREATE TABLE` の列 DEFAULT と同じ（時刻値関数を先に試し、
@@ -16916,6 +16955,24 @@ impl<'a> Parser<'a> {
                     return Ok(ParsedAlterTableShape::AlterColumnDropNotNull {
                         table_name,
                         column_name,
+                    });
+                }
+                // `DROP EXPRESSION [IF EXISTS]`（TABLE-50 (3)・Issue #3331）。
+                if self.peek_ident_matches("EXPRESSION") {
+                    self.advance();
+                    let if_exists = if self.peek_ident_matches("IF")
+                        && self.peek_ident_matches_at(1, "EXISTS")
+                    {
+                        self.advance();
+                        self.advance();
+                        true
+                    } else {
+                        false
+                    };
+                    return Ok(ParsedAlterTableShape::AlterColumnDropExpression {
+                        table_name,
+                        column_name,
+                        if_exists,
                     });
                 }
                 self.expect_contextual_keyword("DEFAULT")?;
@@ -23143,6 +23200,12 @@ enum ParsedAlterTableShape {
     DropColumn {
         table_name: String,
         column_name: String,
+        behavior: crate::catalog::DropBehavior,
+    },
+    AlterColumnDropExpression {
+        table_name: String,
+        column_name: String,
+        if_exists: bool,
     },
     AlterColumnType {
         table_name: String,
@@ -32409,10 +32472,23 @@ fn into_validated_alter_table(
         ParsedAlterTableShape::DropColumn {
             table_name,
             column_name,
+            behavior,
         } => ValidatedAlterTable::DropColumn(ValidatedAlterTableDropColumn {
             table_name,
             column_name,
+            behavior,
         }),
+        ParsedAlterTableShape::AlterColumnDropExpression {
+            table_name,
+            column_name,
+            if_exists,
+        } => ValidatedAlterTable::AlterColumnDropExpression(
+            ValidatedAlterTableAlterColumnDropExpression {
+                table_name,
+                column_name,
+                if_exists,
+            },
+        ),
         ParsedAlterTableShape::AddPrimaryKey {
             table_name,
             constraint_name,
@@ -34560,6 +34636,64 @@ mod tests {
                 assert_eq!(d.column_name, "a");
             }
             other => panic!("unexpected: {other:?}"),
+        }
+        // TABLE-50 (3)・Issue #3331: `DROP COLUMN` の `CASCADE`／`RESTRICT` と `DROP EXPRESSION`。
+        for (sql, expected) in [
+            (
+                "ALTER TABLE docs DROP COLUMN a;",
+                crate::catalog::DropBehavior::Restrict,
+            ),
+            (
+                "ALTER TABLE docs DROP COLUMN a RESTRICT;",
+                crate::catalog::DropBehavior::Restrict,
+            ),
+            (
+                "ALTER TABLE docs DROP COLUMN a CASCADE;",
+                crate::catalog::DropBehavior::Cascade,
+            ),
+        ] {
+            match validate_alter_table(sql) {
+                Ok(ValidatedAlterTable::DropColumn(d)) => assert_eq!(d.behavior, expected, "{sql}"),
+                other => panic!("unexpected for {sql}: {other:?}"),
+            }
+        }
+        for (sql, if_exists) in [
+            ("ALTER TABLE docs ALTER COLUMN a DROP EXPRESSION;", false),
+            (
+                "ALTER TABLE docs ALTER COLUMN a DROP EXPRESSION IF EXISTS;",
+                true,
+            ),
+        ] {
+            match validate_alter_table(sql) {
+                Ok(ValidatedAlterTable::AlterColumnDropExpression(d)) => {
+                    assert_eq!(
+                        (d.table_name.as_str(), d.column_name.as_str()),
+                        ("docs", "a")
+                    );
+                    assert_eq!(d.if_exists, if_exists, "{sql}");
+                }
+                other => panic!("unexpected for {sql}: {other:?}"),
+            }
+        }
+        for (sql, code) in [
+            ("ALTER TABLE docs DROP COLUMN a CASCADE RESTRICT", "42601"),
+            ("ALTER TABLE docs DROP COLUMN IF EXISTS a CASCADE", "42601"),
+            (
+                "ALTER TABLE docs ALTER COLUMN a DROP EXPRESSION IF",
+                "42601",
+            ),
+            (
+                "ALTER TABLE docs ALTER COLUMN a DROP EXPRESSION extra",
+                "42601",
+            ),
+            ("ALTER TABLE docs ALTER COLUMN id DROP EXPRESSION", "42601"),
+            (
+                "ALTER TABLE docs ALTER COLUMN a SET EXPRESSION AS (b)",
+                "0A000",
+            ),
+        ] {
+            let e = validate_alter_table(sql).expect_err(sql);
+            assert_eq!(e.wire_code(), code, "{sql}");
         }
         match validate_alter_table("ALTER TABLE docs ALTER COLUMN a DROP NOT NULL;") {
             Ok(ValidatedAlterTable::AlterColumnDropNotNull(d)) => {

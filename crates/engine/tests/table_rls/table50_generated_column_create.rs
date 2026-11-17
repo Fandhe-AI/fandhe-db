@@ -583,10 +583,11 @@ fn writes_to_generated_tables_are_rejected_until_wired() {
     );
 }
 
-/// 参照列の DROP・RENAME は拒否され、参照しない列の変更・生成列自身の改名・表の改名の後も生成式が残る。
+/// 参照列の DROP（無指定）・型変更は拒否され、参照しない列の変更・生成列自身の改名・表の改名の後も
+/// 生成式が残る（参照列の RENAME の追随と CASCADE・DROP EXPRESSION は `table50_generated_column_alter.rs`）。
 #[test]
-// ALTER の暫定ガード（最終形は #3331）。
-// tracked: #3331
+// 拒否は最終形（TABLE-50 (3)・参照列と生成列自身の型変更の `0A000`、SET DEFAULT の `42601`）。
+// intentional: docs/design/generated-column.md
 fn alter_guards_and_surviving_alters_keep_the_expression() {
     let (_p, _g, core) = fixture("gen-alter");
     ok(
@@ -594,11 +595,11 @@ fn alter_guards_and_surviving_alters_keep_the_expression() {
         TENANT,
         "CREATE TABLE g (a INTEGER, other TEXT, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
     );
-    // 参照列: DROP は 2BP01、RENAME・型変更は 0A000。
+    // 参照列: DROP は 2BP01、型変更は 0A000。
     assert_eq!(code(&core, TENANT, "ALTER TABLE g DROP COLUMN a"), "2BP01");
     assert_eq!(
-        code(&core, TENANT, "ALTER TABLE g RENAME COLUMN a TO a2"),
-        "0A000"
+        code(&core, TENANT, "ALTER TABLE g DROP COLUMN a RESTRICT"),
+        "2BP01"
     );
     assert_eq!(
         code(&core, TENANT, "ALTER TABLE g ALTER COLUMN a TYPE BIGINT"),

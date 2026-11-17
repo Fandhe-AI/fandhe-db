@@ -14278,14 +14278,36 @@ impl Storage {
     /// 失効契約は他の DDL（`alter_table_add_column` 等）と同じくテーブル単位
     /// 世代カウンタへ一本化する（`bump_table_generation_in_txn`）。
     pub fn alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
+        self.alter_table_drop_column_with_behavior(table_name, column_name, DropBehavior::Restrict)
+            .map(|_| ())
+    }
+
+    /// [`Self::alter_table_drop_column`] の `CASCADE`／`RESTRICT` 指定版（TABLE-50 (3)・TABLE-37、
+    /// Issue #3331）。`Cascade` は、削除対象列を式が参照する生成列（深さは 1。生成列は生成列を参照
+    /// できない）を先に削除してから対象列を削除する。連鎖先・対象列に生成列以外の依存（PK・UNIQUE・
+    /// CHECK・FK・ビュー等）があれば `DependentObjectsStillExist`（`2BP01`）で全体を拒否する
+    /// （部分削除なし。txn を commit しない）。`sql::ddl::execute_alter_table_drop_column` から呼ばれる。
+    /// 戻り値は連鎖削除した生成列名（宣言順）。
+    pub(crate) fn alter_table_drop_column_with_behavior(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        behavior: DropBehavior,
+    ) -> Result<Vec<String>> {
         validate_relation_key(table_name)?;
         validate_identifier(column_name)?;
         if column_name == "id" || column_name == "tenant_id" || column_name == "visibility" {
             return Err(CatalogError::ProtectedColumn(column_name.to_string()));
         }
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        let dropped_sequence_ids =
-            Self::alter_table_drop_column_in_txn(&write_txn, table_name, column_name, false)?;
+        let (dropped_sequence_ids, cascaded) = Self::alter_table_drop_column_with_behavior_in_txn(
+            &write_txn,
+            table_name,
+            column_name,
+            behavior,
+            false,
+            true,
+        )?;
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
         crate::storage::commit_log::note_ddl(&write_txn, table_name);
         bump_table_generation_in_txn(&write_txn, table_name)?;
@@ -14297,8 +14319,67 @@ impl Storage {
             }
             crate::recovery::commit_boundary::PostCommitResult::Ok
         })
-        .map(|_| ())
-        .map_err(convert_storage_error)
+        .map_err(convert_storage_error)?;
+        Ok(cascaded)
+    }
+
+    /// [`Self::alter_table_drop_column_with_behavior`] の write txn 内本体（begin・世代 bump・commit を
+    /// 含まない。Issue #3331）。`Restrict` は [`Self::alter_table_drop_column_core_in_txn`] そのもの。
+    /// `Cascade` は `column_name` を参照する生成列を宣言順に core（RESTRICT 判定）で削除し、最後に対象列を
+    /// 削除する。`defer_live_check = true` は複数アクション経路専用で、削除後の生存列 0 本を中間状態として
+    /// 許す（この場合、呼び出し側が全アクション適用後に [`Self::ensure_table_has_live_column_in_txn`] を
+    /// 必ず呼ぶ。`false` は最後の対象列の削除で即時拒否）。
+    /// 返す `Vec<String>` は連鎖削除した生成列名（呼び出し側は所有 SEQUENCE の一括処理へ積む。生成列は
+    /// SEQUENCE を所有できないため、ここで返す SEQUENCE ID は対象列の分だけ）。
+    pub(crate) fn alter_table_drop_column_with_behavior_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+        behavior: DropBehavior,
+        defer_live_check: bool,
+        drop_owned_sequences: bool,
+    ) -> Result<(Vec<u64>, Vec<String>)> {
+        let mut cascaded: Vec<String> = Vec::new();
+        if behavior == DropBehavior::Cascade {
+            let dependents: Vec<String> = {
+                let table = write_txn.open_table_logged(CATALOG_TABLE)?;
+                let existing: Vec<u8> = {
+                    let guard = table
+                        .get(table_name)?
+                        .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+                    guard.value().to_vec()
+                };
+                let mut resolve = |name: &str| get_enum_type_in_write_txn(write_txn, name);
+                let schema =
+                    decode_schema_with_resolver_impl(table_name, &existing, &mut resolve, false)?;
+                schema
+                    .columns
+                    .iter()
+                    .filter(|c| {
+                        c.generated
+                            .as_ref()
+                            .is_some_and(|g| g.referenced_columns.iter().any(|r| r == column_name))
+                    })
+                    .map(|c| c.name.clone())
+                    .collect()
+            };
+            for dependent in dependents {
+                // 連鎖先の生成列自身の依存（PK・UNIQUE・CHECK・ビュー等）は core が `2BP01` で拒否する。
+                // 生成列は SEQUENCE を所有できないため所有 SEQUENCE の処理は行わない。
+                Self::alter_table_drop_column_core_in_txn(
+                    write_txn, table_name, &dependent, true, false,
+                )?;
+                cascaded.push(dependent);
+            }
+        }
+        let sequences = Self::alter_table_drop_column_core_in_txn(
+            write_txn,
+            table_name,
+            column_name,
+            defer_live_check,
+            drop_owned_sequences,
+        )?;
+        Ok((sequences, cascaded))
     }
 
     /// 複数アクション `ALTER TABLE` で削除した列（`columns`）が所有する SEQUENCE を、全アクション適用後の
@@ -14337,29 +14418,7 @@ impl Storage {
         validate_schema(&schema)
     }
 
-    /// [`Self::alter_table_drop_column`] の write txn 内本体（begin・世代 bump・commit を含まない。
-    /// Issue #1633）。単独 wrapper と複数アクション経路が共有する。識別子・保護列名の検査は
-    /// 呼び出し側（wrapper／`sql::ddl`）の責務。
-    ///
-    /// `defer_live_check = true` は複数アクション経路専用で、削除後の生存列 0 本を中間状態として
-    /// 許す（後続の `ADD COLUMN` で埋まる場合のため）。この場合、呼び出し側は全アクション適用後に
-    /// [`Self::ensure_table_has_live_column_in_txn`] を必ず呼ぶ。`false` は従来どおり即時拒否。
-    pub(crate) fn alter_table_drop_column_in_txn(
-        write_txn: &redb::WriteTransaction,
-        table_name: &str,
-        column_name: &str,
-        defer_live_check: bool,
-    ) -> Result<Vec<u64>> {
-        Self::alter_table_drop_column_core_in_txn(
-            write_txn,
-            table_name,
-            column_name,
-            defer_live_check,
-            true,
-        )
-    }
-
-    /// [`Self::alter_table_drop_column_in_txn`] の実体。`drop_owned_sequences = false` は複数アクション
+    /// [`Self::alter_table_drop_column_with_behavior_in_txn`] の下請けの実体。`drop_owned_sequences = false` は複数アクション
     /// 経路専用で、所有 SEQUENCE の削除と依存検査を行わない（空の ID 列を返す）。同じ文の後続アクション
     /// （別列の `DROP COLUMN`・`DROP DEFAULT` 等）が依存を除去しうるため、呼び出し側が全アクション適用後に
     /// [`Self::drop_owned_sequences_of_columns_in_txn`] で一括して検査・削除する（Issue #1694）。
@@ -14443,8 +14502,9 @@ impl Storage {
                     .iter()
                     .any(|u| u.columns().iter().any(|c| c == column_name))
                 || schema_check_references_column(&schema, column_name)
-                // 生成列の式が参照する列も同様に拒否する（TABLE-50・Issue #3327。`2BP01`。
-                // CASCADE による連鎖削除は #3331）。
+                // 生成列の式が参照する列も同様に拒否する（TABLE-50・Issue #3327。`2BP01`）。`CASCADE` の
+                // 連鎖削除は呼び出し側（[`Self::alter_table_drop_column_with_behavior_in_txn`]）が
+                // 依存する生成列を先に削除するため、ここへ届く時点で残るのは連鎖できない参照だけ。
                 || schema.column_referenced_by_generated(column_name)
                 // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照元列も同様に
                 // 拒否する（`DROP CONSTRAINT` を持たないため、制約を黙って消す
@@ -14617,14 +14677,6 @@ impl Storage {
         if schema.columns.iter().any(|c| c.name == new_name) {
             return Err(CatalogError::ColumnAlreadyExists(new_name.to_string()).into());
         }
-        // 生成列の式が参照する列の改名は、式の追随（正規描画の書き換えと往復一致の再検証）が入るまで
-        // 拒否する（TABLE-50・Issue #3327 の暫定ガード。式を黙って壊さない fail-closed）。
-        // tracked: #3331
-        if schema.column_referenced_by_generated(old_name) {
-            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
-                detail: "renaming a column used by a generated column is not supported".to_string(),
-            }));
-        }
         // ビュー定義の追随（TABLE-38、Issue #1621）。拒否・計画失敗時は何も書かない。
         // CATALOG_TABLE のハンドルは解放済み。`schema` は改名前のもの。
         rewrite_views_for_renamed_column_in_txn(
@@ -14659,6 +14711,35 @@ impl Storage {
             }
         }
         schema = bare_schema.with_checks(new_checks);
+        // 生成列の式も同じく AST 経由で追随させる（TABLE-38・TABLE-50 (3)、Issue #3331）。再解析・識別子写像・
+        // 再束縛・往復一致・参照列集合の一致のどれかが失敗したら `0A000`（固定文言）で全体を破棄する
+        // （旧名の参照を残す fail-open を作らない。応答に式・列名以外を載せない）。
+        let refuse_generated = || {
+            AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail:
+                    "renaming a column referenced by a generated column expression is not supported"
+                        .to_string(),
+            })
+        };
+        let mut rewritten_generated: Vec<(usize, GeneratedColumnDef)> = Vec::new();
+        for (index, column) in schema.columns.iter().enumerate() {
+            let Some(def) = column.generated.as_ref() else {
+                continue;
+            };
+            if !def.referenced_columns.iter().any(|r| r == old_name) {
+                continue;
+            }
+            let rebuilt = crate::sql::generated_column::rename_column_in_generated(
+                &schema, column, def, old_name, new_name,
+            )
+            .map_err(|_| refuse_generated())?;
+            rewritten_generated.push((index, rebuilt));
+        }
+        for (index, rebuilt) in rewritten_generated {
+            if let Some(column) = schema.columns.get_mut(index) {
+                column.generated = Some(rebuilt);
+            }
+        }
         // 親側 FK: `table` を参照する他テーブル（自己参照は自表の書き換えで済む）の
         // `parent_columns` を追随させる。CATALOG_TABLE のハンドルを解放した状態で呼ぶ
         // （`referencing_foreign_keys_in_txn` の契約）。
@@ -15434,6 +15515,77 @@ impl Storage {
         Ok(AlterApply::Applied)
     }
 
+    /// `ALTER TABLE ... ALTER COLUMN <column> DROP EXPRESSION [IF EXISTS]`（TABLE-50 (3)、
+    /// Issue #3331）。`sql::ddl::execute_alter_table_drop_expression` が呼ぶ唯一の実装で、生成列を
+    /// 通常の列へ変える。行は書き換えない（値・NOT NULL・照合・索引・制約は保つ）。最後の生成列が
+    /// 消えた表は encoder が自動でカタログ v15 のバイト列へ戻す。単一 write txn で判定から書き込みまで
+    /// 行い、世代を bump する。`if_exists` で生成列でない列は冪等な no-op（commit・世代 bump なし）。
+    ///
+    /// 判定順序（fail-closed。拒否はすべて commit 前に return し副作用ゼロ）:
+    /// (1) 識別子・保護列名 (2) 表の取得（`TableNotFound`） (3) 列の取得（`ColumnNotFound`）
+    /// (4) 生成列でなければ `if_exists` で no-op、そうでなければ `55000`（固定文言）。
+    pub(crate) fn alter_table_drop_expression(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        if_exists: bool,
+    ) -> std::result::Result<AlterApply, AlterCheckError> {
+        Self::validate_alter_column_target(table_name, column_name)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let apply = Self::alter_table_drop_expression_in_txn(
+            &write_txn,
+            table_name,
+            column_name,
+            if_exists,
+        )?;
+        if apply == AlterApply::Unchanged {
+            // 冪等な no-op。txn を commit せず破棄する（世代も進めない）。
+            return Ok(apply);
+        }
+        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+        crate::storage::commit_log::note_ddl(&write_txn, table_name);
+        bump_table_generation_in_txn(&write_txn, table_name)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(apply)
+    }
+
+    /// [`Self::alter_table_drop_expression`] の write txn 内本体（begin・世代 bump・commit を含まない）。
+    /// 識別子・保護列名の検査は呼び出し側の責務。複数アクション経路と共有する。
+    pub(crate) fn alter_table_drop_expression_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column_name: &str,
+        if_exists: bool,
+    ) -> std::result::Result<AlterApply, AlterCheckError> {
+        let schema = require_table_schema_write_any_identity(write_txn, table_name)?;
+        let column = schema
+            .columns
+            .iter()
+            .find(|c| c.name == column_name)
+            .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+        if column.generated.is_none() {
+            if if_exists {
+                return Ok(AlterApply::Unchanged);
+            }
+            return Err(AlterCheckError::Sql(SqlSurfaceError::ColumnNotGenerated));
+        }
+        let mut updated = schema.clone();
+        for c in updated.columns.iter_mut() {
+            if c.name == column_name {
+                c.generated = None;
+            }
+        }
+        // `validate_schema`（`encode_schema` 内で呼ばれる）が不変条件を再検証する。
+        let encoded = encode_schema(&updated)?;
+        let mut catalog_table = write_txn
+            .open_table_logged(CATALOG_TABLE)
+            .map_err(CatalogError::from)?;
+        catalog_table
+            .insert(table_name, encoded.as_slice())
+            .map_err(CatalogError::from)?;
+        Ok(AlterApply::Applied)
+    }
+
     /// `ALTER TABLE ... ALTER COLUMN <column> SET／DROP DEFAULT`（TABLE-39 (1)(2)(6) のポインタ、
     /// Issue #1628）。SQL 表層 `sql::ddl::execute_alter_table_alter_column_set_default`／
     /// `execute_alter_table_alter_column_drop_default` から呼ばれる唯一の実装で、`default_expr`
@@ -15508,9 +15660,9 @@ impl Storage {
                     "column {column_name:?} type changed concurrently; retry the statement"
                 )));
             }
-            // 生成列の DEFAULT の付け替え・削除は未対応（TABLE-50・Issue #3327。生成列は `DEFAULT` を
-            // 併記できない。PG17 との同等化は #3331）。冪等な no-op 判定より前に拒否する。
-            // tracked: #3331
+            // 生成列の DEFAULT の付け替え・削除は拒否する（TABLE-50・Issue #3327。生成列は `DEFAULT` を
+            // 併記できない。固定文言の `42601`）。冪等な no-op 判定より前に拒否する。PG17 との突き合わせは
+            // #3332 で扱う。
             if column.generated.is_some() {
                 return Err(CatalogError::Invalid(
                     "cannot change the DEFAULT of a generated column".to_string(),
@@ -16378,9 +16530,11 @@ impl Storage {
                 .columns
                 .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
-            // 生成列の式が参照する列の型変更は拒否する（式の再束縛を伴うため。TABLE-50・Issue #3327。
-            // ビューのゲートと同じ固定文言）。生成列自身の型変更は PG17 との同等化まで未対応。
-            // tracked: #3331
+            // 生成列の式が参照する列の型変更は `0A000` で拒否する（TABLE-50 (3)・設計記録 G9。
+            // 最終形。ビューのゲートと同じ固定文言）。式の再検証に通れば許す案は G9 が却下している。
+            // 生成列自身の型変更も `0A000`（PG17 は全行を再計算して許すが、再計算の計算点と全行の
+            // 書き直しが無い間は受理しない）。
+            // intentional: docs/design/generated-column.md
             if old_schema.column_referenced_by_generated(column_name) {
                 return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
                     detail: "cannot alter type of a column used by a generated column".to_string(),

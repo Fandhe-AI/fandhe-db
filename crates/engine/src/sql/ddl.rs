@@ -50,9 +50,10 @@ use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterSchema, ValidatedAlterSequence,
     ValidatedAlterTable, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnDropDefault,
-    ValidatedAlterTableAlterColumnDropNotNull, ValidatedAlterTableAlterColumnSetDefault,
-    ValidatedAlterTableAlterColumnSetNotNull, ValidatedAlterTableAlterColumnType,
-    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
+    ValidatedAlterTableAlterColumnDropExpression, ValidatedAlterTableAlterColumnDropNotNull,
+    ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
+    ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
+    ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedAlterTableSetSchema,
     ValidatedCreateIndex, ValidatedCreateSchema, ValidatedCreateSequence, ValidatedCreateTable,
     ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
@@ -770,6 +771,9 @@ pub enum AlterTableAction {
     AlterColumnSetNotNull { column_name: String },
     /// `ALTER COLUMN <col> DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。**BREAKING CHANGE**: variant 追加。
     AlterColumnDropNotNull { column_name: String },
+    /// `ALTER COLUMN <col> DROP EXPRESSION [IF EXISTS]`（TABLE-50 (3)、Issue #3331）。
+    /// **BREAKING CHANGE**: variant 追加。
+    AlterColumnDropExpression { column_name: String },
     /// `ALTER COLUMN <col> SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
     AlterColumnSetDefault { column_name: String },
     /// `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
@@ -1090,6 +1094,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropNotNull(stmt) => {
             execute_alter_table_alter_column_drop_not_null(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropExpression(stmt) => {
+            execute_alter_table_alter_column_drop_expression(storage, stmt)
+        }
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetDefault(stmt) => {
             execute_alter_table_alter_column_set_default(storage, stmt)
         }
@@ -1199,7 +1206,8 @@ const ALTER_PASS_ATTRIBUTES: u8 = 2;
 /// 複数アクションに含められない種別は構文段で拒否済みのため最後尾（到達しない）に置く。
 fn alter_action_pass(action: &ValidatedAlterTable) -> u8 {
     match action {
-        ValidatedAlterTable::DropColumn(_) => 0,
+        // `DROP EXPRESSION` も PostgreSQL の `AT_PASS_DROP` と同じ pass（同じ pass 内は記述順）。
+        ValidatedAlterTable::DropColumn(_) | ValidatedAlterTable::AlterColumnDropExpression(_) => 0,
         ValidatedAlterTable::AddColumn(_) => 1,
         // 列属性変更（SET／DROP NOT NULL・SET／DROP DEFAULT）は ADD COLUMN の後に記述順で適用する
         // （同一 pass 内は安定ソートで記述順を保つ）。
@@ -1269,20 +1277,46 @@ fn apply_alter_action_in_txn(
             Storage::validate_alter_column_target(table_name, &stmt.column_name)
                 .map_err(|e| alter_in_txn_error(e, map))?;
             // 所有 SEQUENCE は削除せず、列名だけ記録する（全アクション適用後に呼び出し元が一括処理）。
-            Storage::alter_table_drop_column_core_in_txn(
+            // `CASCADE` で連鎖削除した生成列も記録する（Issue #3331）。
+            let (_, cascaded) = Storage::alter_table_drop_column_with_behavior_in_txn(
                 txn,
                 table_name,
                 &stmt.column_name,
+                stmt.behavior,
                 true,
                 false,
             )
             .map_err(|e| alter_in_txn_error(e, map))?;
+            dropped_columns.extend(cascaded);
             dropped_columns.push(stmt.column_name.clone());
             Ok((
                 AlterTableAction::DropColumn {
                     column_name: stmt.column_name.clone(),
                 },
                 AlterApply::Applied,
+            ))
+        }
+        ValidatedAlterTable::AlterColumnDropExpression(stmt) => {
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            let apply = Storage::alter_table_drop_expression_in_txn(
+                txn,
+                table_name,
+                &stmt.column_name,
+                stmt.if_exists,
+            )
+            .map_err(|e| match e {
+                // `TableNotFound` は txn 破棄後に `42P01`／`42809` を判別するため未変換で返す。
+                AlterCheckError::Catalog(c @ CatalogError::TableNotFound(_)) => {
+                    AlterCheckError::Catalog(c)
+                }
+                other => AlterCheckError::Sql(map_drop_expression_error(other)),
+            })?;
+            Ok((
+                AlterTableAction::AlterColumnDropExpression {
+                    column_name: stmt.column_name.clone(),
+                },
+                apply,
             ))
         }
         ValidatedAlterTable::AlterColumnSetNotNull(stmt) => {
@@ -1560,7 +1594,7 @@ pub(crate) fn execute_alter_table_drop_column(
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
     storage
-        .alter_table_drop_column(&stmt.table_name, &stmt.column_name)
+        .alter_table_drop_column_with_behavior(&stmt.table_name, &stmt.column_name, stmt.behavior)
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
             other => map_drop_alter_column_error(other),
@@ -1904,6 +1938,41 @@ fn execute_alter_table_alter_column_drop_not_null(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> DROP EXPRESSION [IF EXISTS]` の実行本体
+/// （TABLE-50 (3)、Issue #3331）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
+/// [`require_ddl_permission`] を先に通す）。判定順序: テーブル存在確認 →
+/// `catalog::Storage::alter_table_drop_expression`（列の存在 `42703` → 生成列でなければ
+/// `55000`〔`IF EXISTS` は no-op〕。行は書き換えない）。
+fn execute_alter_table_alter_column_drop_expression(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnDropExpression,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_drop_expression(&stmt.table_name, &stmt.column_name, stmt.if_exists)
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            other => map_drop_expression_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnDropExpression {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `DROP EXPRESSION` のカタログ層エラーを SQL 表層へ写す（`Sql` は透過、`Catalog` は
+/// [`map_drop_alter_column_error`] の契約）。
+fn map_drop_expression_error(e: AlterCheckError) -> SqlSurfaceError {
+    match e {
+        AlterCheckError::Sql(sql_err) => sql_err,
+        AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+    }
 }
 
 /// `SET DEFAULT` の検証済み列定義（`default_expr` のみ差し替え済み）を作る。列の取得
