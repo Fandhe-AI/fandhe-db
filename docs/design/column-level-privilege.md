@@ -128,7 +128,8 @@
 ## 6. 対象外・未決事項
 
 - ビュー・matview への列 `GRANT`（J10 の `0A000` を維持）
-- DDL での `REFERENCES` 列権限の検査・MERGE・`GRANTED BY`
+- DDL での `REFERENCES` 列権限の検査・`GRANTED BY`
+- MERGE の列単位の権限（表単位で全列を要求する。[sql-merge.md](sql-merge.md) の D10）
 - 列のマスキング・除去、行の値に応じた列の可視性
 - 列集合の件数の上限値（#2083 で決める）
 - 親 ADR（role-privilege-model.md）は Proposed のままである。#1960 は close 済みで、Phase 6 の後続は D9 を前提に進んだ。
