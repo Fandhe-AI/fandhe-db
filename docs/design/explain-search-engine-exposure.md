@@ -402,9 +402,10 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
   （結合 → WHERE 残余 → 集計／並べ替え → OFFSET／LIMIT）の逆。`join` は left-deep で、段 k の子は
   [段 k-1 の `join`（k = 0 なら relation 1 の `scan`）, relation k+2 の `scan`] の順。
 - **語彙（閉じている・安定契約）**:
-  - `join`: `join_method: hash|nested_loop|cross`（実行器と同じ判定 `StepPlan::method` を共有）、
+  - `join`: `join_method: hash|nested_loop|cross|lateral`（実行器と同じ判定 `StepPlan::method` を共有）、
     `join_type: inner|left|right|full`（外部結合の簡約後の実効値）、`join_keys: <n>`、
-    `join_filter: present|none`（ON 残余の有無）。
+    `join_filter: present|none`（ON 残余の有無）。`join_method: lateral` の段（外側参照のある LATERAL。Issue #3324）だけに
+    `reevaluation: per_outer_row`（外側行ごとの右側の再評価。値・行数は出さない）を足す。
   - `scan`: `relation: <n>`（FROM での 1 始まりの序数）に続けて、単一表の広域取得と同一の
     `scalar_plan:`／`access_path:`（PK 点検索 → GIN → 全走査。`scan_explain_lines` を共有）。
   - `filter`: `residual_predicates: <n>`。`aggregate`: `group_keys`・`aggregates`・`having: present|none`。
@@ -760,3 +761,9 @@ EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた�
 ## 追記（Issue #3293）
 
 `EXPLAIN [ANALYZE] UPDATE ... FROM`／`DELETE ... USING` を受理した。静的な `EXPLAIN` は結合計画の木（`join` と 2 つの `scan`）を返し、行数・見積もりは出さない（JOIN の `EXPLAIN` と同じ SQL-75 (5) の契約）。`ANALYZE` は DML ANALYZE（#2055）と同じ契約。詳細は [update-from-delete-using.md](update-from-delete-using.md) の「EXPLAIN（Issue #3293）」節。
+
+## Issue #3324 追記: LATERAL 派生表の EXPLAIN（SQL-62 (7)・SQL-75 のポインタ）
+
+- 受理: INNER／CROSS／コンマ／LEFT の LATERAL（相関あり・なし）。`ANALYZE`・`VERBOSE`・`COSTS OFF`・`FORMAT JSON`（`FORMAT JSON` と `ANALYZE`／`VERBOSE` の併用は従来どおり `0A000`）も非 LATERAL の派生表 JOIN と同じ範囲で受理する。非 EXPLAIN と同じ検証本体を通す（第 2 の実装を持たない）
+- 語彙: 外側参照のある段だけ `join_method: lateral` に `reevaluation: per_outer_row` を足す。外側参照の無い LATERAL は通常の派生表の段（`cross` 等）で、この行は出ない。LATERAL の側の `cte` 節の下に基底の `cte_source: with` が 1 段入る（基底 slot の内部名。値は出ない）。表名・別名・列名・予約内部名・行数・LIMIT 値は出さず、全テナントで同一（`sql62_lateral_explain.rs`・`rls10_lateral_paths.rs`）
+- 未知の列は EXPLAIN でも束縛段で実行と同じ `42703`。`EXPLAIN` と `$n` の併用は従来どおり `42601`

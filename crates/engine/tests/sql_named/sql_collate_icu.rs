@@ -48,9 +48,10 @@ const JA_ORDER: [&str; 31] = [
 ];
 
 fn schema() -> TableSchema {
-    let col = |name: &str, ty: ColumnType, c: Option<Collation>| ColumnDef {
-        collation: c,
-        ..ColumnDef::new(name, ty, true)
+    let col = |name: &str, ty: ColumnType, c: Option<Collation>| {
+        let mut def = ColumnDef::new(name, ty, true);
+        def.collation = c;
+        def
     };
     TableSchema::new(
         TABLE,

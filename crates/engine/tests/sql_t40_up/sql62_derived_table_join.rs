@@ -392,14 +392,23 @@ fn inherited_join_input_restrictions_stay_fail_closed() {
             "0A000",
         ),
         ("SELECT * FROM docs d, (SELECT lang FROM docs)", "0A000"),
-        // LATERAL は対象外。
-        (
-            "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs) t ON true",
-            "0A000",
-        ),
     ] {
         assert_eq!(code(&core, "alice", sql), expected, "{sql}");
     }
+}
+
+/// 左側を参照しない `LEFT JOIN LATERAL ... ON <条件>` は LATERAL 語を除いた通常の派生表の LEFT JOIN と
+/// 同じ結果になる（#3323。L6）。
+#[test]
+fn uncorrelated_left_lateral_with_on_matches_the_plain_derived_table() {
+    let (core, _g) = open_seeded();
+    let lateral = "SELECT d.id, t.lang FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs) t ON d.lang = t.lang";
+    let plain =
+        "SELECT d.id, t.lang FROM docs d LEFT JOIN (SELECT lang FROM docs) t ON d.lang = t.lang";
+    let l = query(&core, "alice", lateral).expect("lateral");
+    let p = query(&core, "alice", plain).expect("plain");
+    assert!(!l.rows.is_empty());
+    assert_eq!(render(&l), render(&p));
 }
 
 #[test]

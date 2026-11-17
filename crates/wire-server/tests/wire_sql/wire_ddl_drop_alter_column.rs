@@ -132,7 +132,10 @@ fn wire_error_sqlstates_and_ready_for_query_recovery() {
         // 同一型への変更は 42804（NUMERIC の精度縮小は代入変換のある一般変換として受理される。
         // TABLE-40・Issue #1636）。
         ("ALTER TABLE docs ALTER COLUMN qty TYPE INTEGER", "42804"),
-        ("ALTER TABLE docs DROP COLUMN note CASCADE", "42601"),
+        (
+            "ALTER TABLE docs DROP COLUMN note CASCADE RESTRICT",
+            "42601",
+        ),
         ("ALTER TABLE docs DROP COLUMN IF EXISTS note", "42601"),
         // USING の式が未定義列を参照する束縛エラー。
         (

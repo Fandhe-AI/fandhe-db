@@ -305,6 +305,9 @@ impl EngineCore {
             });
         }
 
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間（`INSERT ... SELECT`）。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(req.table_name);
         // `ON CONFLICT` 付きは同じ結果行を UPSERT 経路へ流す（第 2 の書き込み経路を作らない）。
         // 文内重複の扱い（`DO UPDATE` は `21000`、`DO NOTHING` は先勝ち）は束縛側で書き込み前に決まり、
         // 台帳は上で張ったスコープの文ハッシュ（`ON CONFLICT` 句を含む）で照合・記録される。

@@ -15,7 +15,7 @@
 明示トランザクション（Issue #942）の中で次の 3 文を受理できるようにする。
 
 - `DECLARE <name> [SCROLL | NO SCROLL | INSENSITIVE | ASENSITIVE]... CURSOR [WITHOUT HOLD] FOR <SELECT>`（修飾語は Issue #3334）
-- `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`
+- `FETCH [ <direction> ] { FROM | IN } <name>`（向きは §4。Issue #3335）
 - `CLOSE <name>`
 
 ## 設計の要点（判断記録）
@@ -129,8 +129,8 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   判定順は 修飾語・hold の構文（`42601`）→ 内側 SELECT の構造検証 → `WITH HOLD`／`BINARY` の `0A000`
   （構文が壊れた文は常に構文エラー）。`0A000` は構文解析段で返るため、Tx 内では `Failed` になる。
   **意図した PG17 との差**: (1) 指定なしは `NO SCROLL` と同じで、PG が計画により許す逆方向を許さない。
-  (2) 矛盾指定は PG17 では `42P11`（invalid_cursor_definition）だが、ErrorClass を新設せず `42601` で拒否する
-  （突き合わせは #3337）。
+  (2) 矛盾指定は PG17 17.11 の実測で `42P11`（invalid_cursor_definition）だが、ErrorClass を新設せず
+  `42601` で拒否する（Issue #3337 で実測。一覧は後述「PG17 との意図した差」）。
 - **末尾の `;`（Issue #3171）**: `FETCH`・`CLOSE` は末尾の単一 `;` を受理する（`sql::lexer::strip_one_trailing_semicolon`）。`;;` は `42601`。`DECLARE` は内側 SELECT の検証が末尾 `;` を 1 個受理する。判断は [explicit-transaction.md](explicit-transaction.md) の「末尾 `;` の扱い」節。
 - **`DECLARE` のカタログ照合の遅延とビュー**: 構文解析段（`core.rs::parse_tokens`）
   は内側 `SELECT` の構造検証のみを行い、カタログを参照しない（トランザクション
@@ -156,12 +156,19 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   実行し、カーソルの残容量を生成中の累計バイト予算の上限にする。いずれも枝・中間行・CTE 本文の
   評価を計上するため、通常の SELECT より早く `54000` に達しうる（安全側の差）。
   SELECT 権限は全枝・CTE 本文の基底表・JOIN の相手表を `DECLARE` の時点で検査する。
-- **`FETCH`**（Issue #3173・#3174）: 受理するのは `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`。
-  `NEXT` は 1 件、`ALL` は残り全行（払い出し後は末尾で、続く `ALL` は 0 行。内部では `FetchCount::All`）、
-  `IN` は `FROM` の別名、`FORWARD` の後ろは件数か `ALL` が必須。件数は `NEXT`
-  を含め `sql::parser::validate_search_limit_with`（`1..=MAX_SEARCH_K`）を通す。
-  `BACKWARD`／`PRIOR`／`FIRST`／`LAST`／`ABSOLUTE`／`RELATIVE`・件数なしの
-  `FORWARD`・`FROM`／`IN` の省略は前方向へ読み替えず `42601` で拒否する（fail-closed）。
+- **`FETCH`**（Issue #3173・#3174・#3335・WIRE-27 (1)(2)）: 受理するのは
+  `FETCH [ <direction> ] { FROM | IN } <name>`。`<direction>` は `NEXT`・`PRIOR`・`FIRST`・`LAST`・
+  `ABSOLUTE <n>`・`RELATIVE <n>`・`<n>`・`ALL`・`FORWARD [<n> | ALL]`・`BACKWARD [<n> | ALL]`
+  （`<n>` は `+`／`-` 付きの整数）。向きの省略は `NEXT`、件数なしの `FORWARD` は `NEXT`、件数なしの
+  `BACKWARD` は `PRIOR` と同じ。`IN` は `FROM` の別名。負の件数は向きを反転する（`FETCH -2` は
+  `BACKWARD 2`、`BACKWARD -2` は `FORWARD 2`）。件数 0（`FETCH 0`・`FORWARD 0`・`BACKWARD 0`・
+  `RELATIVE 0`）は位置を動かさず現在の行を返す（従来の `22000` から受理へ変更。行の上でなければ 0 行）。
+  構文解析は `sql::cursor::FetchDirection`（`Forward`／`Backward`／`Current`／`Absolute`／`Relative`）を作り、
+  行数として扱う件数（`<n>`・`FORWARD <n>`・`BACKWARD <n>`。絶対値）は `validate_search_limit_with`
+  （`1..=max_result_rows`）を通す。`ABSOLUTE`／`RELATIVE` の数値は位置で返す行は高々 1 行のため行数上限は
+  適用せず、`u32` に収まらない値だけ `42601`（O(1) の clamp で処理し、走査も確保もしない）。
+  `FROM`／`IN` の省略（`FETCH c`・`FETCH NEXT c`）・余剰な件数（`PRIOR 1`）・符号の重複は前方向へ
+  読み替えず `42601` で拒否する（fail-closed。`FROM`／`IN` の省略は受け皿 #3333）。
 - **`CLOSE`**: 受理するのは `CLOSE <name>` のみ。`CLOSE ALL` は明示的に
   拒否する（`ALL` 自体は識別子として妥当な形のため、拒否しないと「たまたま
   `ALL` という名前のカーソルが存在する場合にだけ動く曖昧な構文」になって
@@ -178,13 +185,21 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   位置だけで判定するため、先頭語を見て弾かないと `DECLARE ... FOR SELECT
   ... WHERE col = $1` のような形が誤って受理されてしまう）。
 
+- **`MOVE`**（Issue #3336・WIRE-27）: `MOVE [<向き>] { FROM | IN } <name>`。向き・件数の文法、
+  上限検証（`22000`）、`42601` の拒否集合は `FETCH` と完全に同一で、`sql::cursor` の共通関数
+  （`parse_motion_tokens`）を `validate_fetch_tokens`／`validate_move_tokens` が呼ぶ。違いは
+  エラー文言の文名だけ。`FROM`／`IN` の省略（`MOVE c`）は `FETCH` と同じく `42601`。
+  PG は任意の大きさの件数を受理するが、本実装は `FETCH` と同じく `u32` と `max_result_rows` で
+  制限する（意図した差。行集合は `DECLARE` 時点で cap 済みなので、上限超の件数は `ALL` で代替でき機能は失われない）。
+
 ### 5. 上限とエラー分類（実装既定値）
 
 | 事象 | `wire_code` | 備考 |
 | ---- | ---- | ---- |
 | トランザクション外の `DECLARE` | `25P01` | `sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction` を再利用 |
 | 不在のカーソル名に対する `FETCH`／`CLOSE`（トランザクション外も含む） | `34000` | 新設 `ErrorClass::InvalidCursorName` |
-| `n` の範囲外 | `22000` | `validate_search_limit` を再利用 |
+| `n` の範囲外（行数として扱う件数の絶対値） | `22000` | `validate_search_limit` を再利用。件数 0 は受理（現在の行） |
+| NO SCROLL（指定なしを含む）への後ろへ戻る取得（§9 の表） | `55000` | 文言 `cursor can only scan forward`。位置は変えない。Issue #3335 |
 | `DECLARE` 内側 SELECT の結果行数上限超過（`LIMIT` 省略・`ALL` の受理後） | `54000` | `DECLARE` を拒否しカーソルは登録しない。設計は [limit-omitted-result-cap.md](limit-omitted-result-cap.md) |
 | `FETCH ALL` の残り行数が結果行数上限を超える場合 | `54000` | 部分払い出しをせず位置も進めない多層防御（`DECLARE` で cap 済みのため SQL 経路からは通常到達しない） |
 | 同時カーソル数の上限超過（`MAX_CURSORS_PER_SESSION`＝16 本目の次） | `54000` | 内側の `SELECT` を実行する**前**に判定する |
@@ -214,7 +229,8 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 （`None`）。それ以外の `ParsedSql` は `describe_parsed_in_session` と完全に
 同一の判定へ委譲する。`wire-server::extended_query::handle_describe`／
 `handle_bind` が接続単位の `SessionTransaction` を渡してこの API を呼ぶ
-よう結線した。
+よう結線した。`MOVE` は行を返さないため Describe（Statement／Portal）は `DECLARE`／`CLOSE` と同じく
+NoData、Execute は Command 応答（`MOVE n`）で portal の中断（`Suspended`）は起きない。
 
 `FETCH` の portal を `max_rows` で分割送出する処理は、既存の `Suspended`
 の仕組みにそのまま乗る。カーソル位置は Execute 1 回につき 1 度だけ進み、
@@ -227,8 +243,9 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   `RowDescription`／`DataRow` を伴う（検索 SELECT・`EXPLAIN` と同じエンコード
   を再利用する）。
 - `CLOSE` → `CLOSE CURSOR`（固定タグ）
+- `MOVE` → `MOVE <n>`（行なし。`RowDescription` を送らない）。n は同じ向きの `FETCH` が返す行数。
 
-`sql::statement_splitter::classify_statement` は `DECLARE`／`FETCH`／`CLOSE`
+`sql::statement_splitter::classify_statement` は `DECLARE`／`FETCH`／`MOVE`／`CLOSE`
 を `StatementEffect::ReadOnly` に分類する（redb の commit を伴わないため）。
 
 ### 8. wire-server 拡張クエリの portal 束縛（PR #1049 レビュー指摘対応）
@@ -286,14 +303,91 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
   （N+1 からは N 行目から）。p が 0／1 なら 0 行。
 - `55000`（非 SCROLL への逆方向）・`54000`（`ALL` の行数上限超過）では位置を変えない。
 - メモリ課金は SCROLL／NO SCROLL で同じ（`estimate_result_bytes`）で、16 MiB・16 本の上限に数える。
-- 逆方向の取得口 `CursorRegistry::fetch_backward` は engine 内に置くが、SQL の方向構文（`PRIOR`・`BACKWARD` 等）の
-  結線は #3335、`MOVE` は #3336 が担う。それまで SQL 経由の逆方向は従来どおり `42601`。
+- 取得口は `CursorRegistry::fetch(name, FetchDirection, max_rows)` の 1 本（Issue #3335 で前方向・全件・逆方向を
+  統合し、`#[allow(dead_code)]` を外した）。`MOVE`（#3336）は `CursorPosition::plan`／`apply` を行の切り出しなしで再利用する（後述）。
+
+#### FETCH の向きの意味（Issue #3335・WIRE-27 (1)(2)）
+
+N を行数、p を現在位置とし、「行 t を返す」は 1 ≦ t ≦ N のときだけ 1 行を返すこと。位置の更新は
+`CursorPosition::plan`（状態を変えない純粋関数）で計算し、`apply` で確定する。
+
+| 向き | 新位置 | 返す行 |
+| ---- | ------ | ------ |
+| `Forward(n)`／`Forward(ALL)`・`Backward(n)`／`Backward(ALL)` | 上記の `forward`／`forward_all`／`backward` | 既存どおり（逆方向は降順） |
+| `ABSOLUTE k`（k>0。`FIRST` は 1） | min(k, N+1) | 行 t |
+| `ABSOLUTE k`（k<0。`LAST` は -1） | \|k\| ≦ N なら N+1-\|k\|、それ以外は 0 | 行 t |
+| `ABSOLUTE 0` | 0 | 0 行 |
+| `RELATIVE k`（k>0） | min(p+k, N+1) | 行 t（途中の行は返さない） |
+| `RELATIVE k`（k<0） | p.saturating_sub(\|k\|) | 行 t |
+| 件数 0 | p のまま | 1 ≦ p ≦ N なら行 p、それ以外は 0 行 |
+
+NO SCROLL のカーソルで `55000`（位置は変えない）にする条件は次のとおり。PostgreSQL 17.11 の実測
+（`crates/engine/tests/data/cursor_directions_pg17.tsv` の 700 ケース）と全件一致を確認済み（Issue #3337）。
+
+| 向き | NO SCROLL での扱い |
+| ---- | ------------------ |
+| `PRIOR`・`BACKWARD`（件数なし・n・0・ALL）・`FORWARD -n`・`FETCH -n`・`RELATIVE -n`・`ABSOLUTE -n`（`LAST` を含む） | 常に `55000` |
+| `FETCH 0`・`FORWARD 0`・`RELATIVE 0`（`FETCH` のみ。`MOVE` は後述） | 1 ≦ p ≦ N（行の上）なら `55000`、それ以外は 0 行で受理 |
+| `ABSOLUTE k`（k>0。`FIRST` を含む） | k > p なら受理、k ≦ p なら `55000`（末尾の後 p = N+1 では k ≦ N+1 が `55000`、k ≧ N+2 は 0 行で受理） |
+| `ABSOLUTE 0` | p == 0 なら受理（0 行）、それ以外は `55000` |
+| `NEXT`・`n`・`FORWARD n`・`ALL`・`RELATIVE k`（k>0）・`BACKWARD -n` | 常に受理 |
+
+判定順は 構文と件数（`42601`／`22000`。構文解析段）→ カーソルの不在（`34000`）→ NO SCROLL（`55000`）→
+`ALL` の行数上限（`54000`）→ 位置の更新と行の切り出し。いずれの拒否でも位置は変えない。
+
+- **PG17 実測で是正した境界（Issue #3337）**: 当初は PG17 のソースからの導出で拒否側に倒していた次の 2 点を、
+  実測に合わせて受理へ変えた。(1) 末尾の後からの `ABSOLUTE k`（k ≧ N+2）は 0 行で受理（`FETCH`・`MOVE` 共通）。
+  (2) `MOVE` の件数 0 と先頭の前の `MOVE BACKWARD ALL` は NO SCROLL でも受理（後述）。`FETCH` の
+  件数 0（行の上）・`FETCH BACKWARD ALL`（先頭の前を含む）は PG17 でも `55000` のまま。
+- **Issue の方針の行との差**: Issue 本文の方針は NO SCROLL の 6 つの向きを一律に `55000` と読めるが、仕様
+  （WIRE-27 (2)）と PG17 は「後ろへ戻る取得」だけを拒否する。前方向の `RELATIVE k`（k>0）や先の位置への
+  `ABSOLUTE` は NO SCROLL でも受理する。
+
+#### MOVE（Issue #3336・WIRE-27）
+
+`CursorRegistry::move_cursor(name, FetchDirection) -> u64` が `fetch` と同じ前段（不在 `34000`→
+NO SCROLL の後退走査 `55000`。共通の private 関数）と同じ `plan`／`apply` で位置だけを動かす。
+行は複製しないので `ALL` の行数上限（`54000`）は適用しない（結果メモリが増えない）。いずれの拒否でも位置は変えない。
+NO SCROLL の境界は `FETCH` と同じ判定だが、PG17 17.11 の実測に合わせて次の `MOVE` だけ例外にする
+（Issue #3337）: 件数 0 の向き（`MOVE 0`・`FORWARD 0`・`RELATIVE 0`・`BACKWARD 0`）は走査せず位置を変えないため
+NO SCROLL でも受理し、タグは行の上なら `MOVE 1`・それ以外は `MOVE 0`。先頭の前の `MOVE BACKWARD ALL` も
+受理（`MOVE 0`）。不在 `34000` の検査は先に行う。
+
+タグの n は「同じ向きの `FETCH` が返す行数」（PG17 17.11 の実測と一致）。N=5・位置 0 からの例:
+
+| 文 | タグ |
+| -- | ---- |
+| `MOVE FORWARD 2` | `MOVE 2` |
+| `MOVE FORWARD 10` | `MOVE 5` |
+| `MOVE ABSOLUTE 0` | `MOVE 0` |
+| `MOVE ABSOLUTE 3` | `MOVE 1` |
+| `MOVE ABSOLUTE 10` | `MOVE 0` |
+| 位置 2 から `MOVE BACKWARD 1` | `MOVE 1` |
+| 末尾の後から `MOVE BACKWARD ALL` | `MOVE 5` |
+| 行の上で `MOVE RELATIVE 0`（SCROLL） | `MOVE 1` |
+
+- 上のタグ件数と NO SCROLL の境界は PG17 17.11 の実測と一致を確認済み（照合は
+  `crates/engine/tests/sql_named/sql_cursor_pg17_parity.rs`）。
+
+#### PG17 との意図した差（Issue #3337）
+
+| 形 | PG17 17.11 の実測 | 本実装 | 理由・受け皿 |
+| -- | ----------------- | ------ | ------------ |
+| 指定なしのカーソルの逆方向 | 計画次第で許す | NO SCROLL と同じ（`55000`） | 計画に依存しない決定的な挙動にする |
+| `SCROLL` と `NO SCROLL`・`INSENSITIVE` と `ASENSITIVE` の併記 | `42P11` | `42601` | ErrorClass を新設しない |
+| 同名カーソルの再 `DECLARE` | `42P03` | `22000` | 既存の契約 |
+| `WITH HOLD` | 受理 | `0A000` | 受け皿 #3340 |
+| `BINARY` | 受理 | `0A000` | 意図した拒否（上記） |
+| `FROM`／`IN` の省略（`FETCH c`・`MOVE c`） | 受理（`NEXT`） | `42601` | 受け皿 #3333 |
+| カーソル自身の実行が `55000` で失敗した後の `ROLLBACK TO` | そのカーソルは使えなくなる（以降 `55000`） | 位置を保って使い続けられる | 既存の契約（SQL-69 (5)・WIRE-27 (2) のポインタ先）を維持。PG17 に合わせるかは spec 側の判断事項 |
+
+- 他の形（SCROLL・NO SCROLL × 向き × 位置 × `FETCH`／`MOVE`）に差は無い。
+- 別の文のエラー後の `ROLLBACK TO`、SCROLL カーソルの位置が `ROLLBACK TO` で戻らないことは PG17 と一致する。
 
 ## 対象外・申し送り
 
-- `WITH HOLD`（#3339・#3340）／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／
-  `ABSOLUTE`／`RELATIVE`（#3335）／件数なし `FORWARD`／`FROM`・`IN` 省略の `FETCH`／`CLOSE ALL`／
-  `MOVE`（#3336）、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
+- `WITH HOLD`（#3339・#3340）／`FROM`・`IN` 省略の `FETCH`（#3333）／`CLOSE ALL`／
+  PL/pgSQL 本体内の `MOVE`（範囲外語として `0A000` のまま）、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。
 - 主クエリが tail CTE（本文に `ORDER BY`／`LIMIT`／`OFFSET`）を直接読む単一表の `DECLARE`・

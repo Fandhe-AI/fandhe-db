@@ -121,6 +121,14 @@ pub(super) fn apply_with_triggers(
     let _row_loop = (!plan.before.is_empty()).then(|| RowLoopScope::enter(&child_schema.name));
     let cascade_delete = is_delete && matches!(action, ReferentialAction::Cascade);
     let fk_indices = child_fk_indices(child_schema, fk)?;
+    // 子表の生成列（TABLE-50・Issue #3329）。BEFORE が無ければ参照列の書き換えに依存するものだけ、
+    // BEFORE があれば BEFORE の後に全生成列を再計算する。束縛は 1 回（行ループの外）。
+    let generated =
+        crate::sql::generated_column::CompiledGeneratedColumns::compile_any(child_schema)?;
+    let generated_changed: Vec<usize> = generated
+        .as_ref()
+        .map(|g| g.affected(&fk_indices))
+        .unwrap_or_default();
     let mut pre_images = UpdatedKeyPreImages::new();
     let mut deleted_ids: Vec<RowId> = Vec::new();
 
@@ -215,6 +223,19 @@ pub(super) fn apply_with_triggers(
             let (embedding, metadata) =
                 crate::tenant::merge_row_for_update(child_schema, existing, &assignments)
                     .map_err(TenantWriteError::Catalog)?;
+            let metadata = match &generated {
+                Some(g) if !generated_changed.is_empty() => {
+                    crate::tenant::recompute_generated_metadata(
+                        g,
+                        child_schema,
+                        id.legacy_id(),
+                        &embedding,
+                        &metadata,
+                        &generated_changed,
+                    )?
+                }
+                _ => metadata,
+            };
             let new_row = crate::tenant::captured_values_from_parts(
                 child_schema,
                 embedding.clone(),
@@ -239,9 +260,16 @@ pub(super) fn apply_with_triggers(
                 candidate,
             )
             .map_err(TenantWriteError::TriggerFailed)?;
-            let Some(final_row) = fired else {
+            let Some(mut final_row) = fired else {
                 continue;
             };
+            crate::tenant::trigger_dml::apply_generated_columns(
+                generated.as_ref(),
+                child_schema,
+                id.legacy_id(),
+                &mut final_row,
+                None,
+            )?;
             let (embedding, metadata) =
                 crate::tenant::trigger_dml::encode_final_row(child_schema, &final_row)?;
             (embedding, metadata, final_row)
@@ -305,7 +333,12 @@ pub(super) fn apply_with_triggers(
     // BEFORE ROW が主キー・UNIQUE 列を書き換えうるため、BEFORE のある子表は孫段へ全列を更新済みとして
     // 渡す（fail-closed。`trigger_dml.rs` と同じ）。
     let changed = if plan.before.is_empty() {
-        fk_indices
+        let mut cols = fk_indices;
+        // 再計算した生成列も孫段へ変更列として渡す（Issue #3329）。
+        cols.extend(generated_changed);
+        cols.sort_unstable();
+        cols.dedup();
+        cols
     } else {
         (0..child_schema.columns.len()).collect()
     };

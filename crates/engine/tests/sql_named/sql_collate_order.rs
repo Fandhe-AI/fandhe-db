@@ -32,9 +32,10 @@ const POOL: [&str; 8] = ["B", "a", "ab", "", "é", "あ", "A", "b"];
 const COLUMNS: [&str; 4] = ["t0", "tc", "vp", "bc"];
 
 fn schema() -> TableSchema {
-    let col = |name: &str, ty: ColumnType, c: Option<Collation>| ColumnDef {
-        collation: c,
-        ..ColumnDef::new(name, ty, true)
+    let col = |name: &str, ty: ColumnType, c: Option<Collation>| {
+        let mut def = ColumnDef::new(name, ty, true);
+        def.collation = c;
+        def
     };
     TableSchema::new(
         TABLE,

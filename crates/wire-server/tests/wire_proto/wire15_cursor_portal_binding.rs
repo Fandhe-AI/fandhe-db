@@ -722,3 +722,275 @@ fn extended_declare_after_writer_fetch_portal_reads_acquire_time_snapshot() {
     assert_eq!(read_command_complete(&mut stream), "COMMIT");
     read_ready_for_query(&mut stream);
 }
+/// 拡張クエリの `MOVE`（Issue #3336・WIRE-27）: Describe(Portal) は NoData、Execute は行なしの
+/// `CommandComplete`（`MOVE n`）で、その後の `FETCH` が移動先の次の行から始まる。
+#[test]
+fn move_over_extended_query_describes_no_data_and_moves_position() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM documents LIMIT 100",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    read_ready_for_query(&mut stream);
+
+    parse_and_bind(&mut stream, "sm", "pm", "MOVE FORWARD 2 IN c");
+    send_length_prefixed_message(&mut stream, b'D', b"Ppm\0");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'n', "MOVE must describe as NoData");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pm", 0));
+    let (kind, tag) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "MOVE must complete without rows");
+    assert_eq!(tag, b"MOVE 2\0");
+
+    parse_and_bind(&mut stream, "sf", "pf", "FETCH NEXT FROM c");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pf", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'D', "expected DataRow for the row after the move");
+    let (kind, tag) = read_message(&mut stream);
+    assert_eq!(kind, b'C');
+    assert_eq!(tag, b"FETCH 1\0");
+    send_sync(&mut stream);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+}
+// --- SCROLL／MOVE の拡張クエリ（Issue #3337・WIRE-27・WIRE-15） ------------------------
+
+/// `DataRow` 本体（列数 i16 → 各列 長さ i32 ＋値）の第 1 列の文字列。
+fn data_row_first_column(body: &[u8]) -> String {
+    let len_bytes: [u8; 4] = body
+        .get(2..6)
+        .and_then(|s| s.try_into().ok())
+        .expect("DataRow has a first column length");
+    let len = usize::try_from(i32::from_be_bytes(len_bytes)).expect("non-null column");
+    let value = body.get(6..6 + len).expect("DataRow first column bytes");
+    String::from_utf8(value.to_vec()).expect("utf8 id")
+}
+
+/// `BEGIN` → `DECLARE c {head} CURSOR`（5 行）まで進める。
+fn begin_and_declare_c(stream: &mut std::net::TcpStream, head: &str) {
+    simple_ok(stream, "BEGIN", "BEGIN");
+    simple_ok(
+        stream,
+        &format!("DECLARE c {head} CURSOR FOR SELECT id FROM documents LIMIT 100"),
+        "DECLARE CURSOR",
+    );
+}
+
+/// Parse（末尾 `;` 付き可）→ Bind → Describe(Portal) → Execute(max_rows=0) を流し、
+/// `(RowDescription の有無, DataRow の id 列, CommandComplete のタグ)` を返す（Sync は呼び側）。
+fn run_extended(
+    stream: &mut std::net::TcpStream,
+    sql: &str,
+    max_rows: i32,
+) -> (bool, Vec<String>, String) {
+    static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (stmt, portal) = (format!("sx{id}"), format!("px{id}"));
+    parse_and_bind(stream, &stmt, &portal, sql);
+    send_length_prefixed_message(stream, b'D', format!("P{portal}\0").as_bytes());
+    let (kind, _) = read_message(stream);
+    let described_rows = match kind {
+        b'T' => true,
+        b'n' => false,
+        other => panic!("unexpected Describe response {other}"),
+    };
+    send_length_prefixed_message(stream, b'E', &execute_body(&portal, max_rows));
+    let mut ids = Vec::new();
+    loop {
+        let (kind, body) = read_message(stream);
+        match kind {
+            b'D' => ids.push(data_row_first_column(&body)),
+            b'C' => {
+                let tag = String::from_utf8_lossy(&body)
+                    .trim_end_matches('\0')
+                    .to_string();
+                return (described_rows, ids, tag);
+            }
+            other => panic!("{sql}: unexpected message {other}"),
+        }
+    }
+}
+
+fn sync_and_expect_status(stream: &mut std::net::TcpStream, status: u8) {
+    send_sync(stream);
+    let (kind, body) = read_message(stream);
+    assert_eq!(kind, b'Z', "expected ReadyForQuery after Sync");
+    assert_eq!(body.last().copied(), Some(status));
+}
+
+/// SCROLL カーソルの各向きが拡張クエリ（Parse の末尾 `;` 付き）でも PG と同じ行・タグで返る。
+#[test]
+fn scroll_directions_over_extended_query_match_simple_query() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    begin_and_declare_c(&mut stream, "SCROLL");
+
+    let script: &[(&str, &[&str], &str)] = &[
+        ("FETCH ABSOLUTE -1 FROM c;", &["5"], "FETCH 1"),
+        ("FETCH PRIOR FROM c", &["4"], "FETCH 1"),
+        ("FETCH RELATIVE -2 FROM c;", &["2"], "FETCH 1"),
+        ("FETCH BACKWARD 2 FROM c", &["1"], "FETCH 1"),
+        ("FETCH FIRST FROM c;", &["1"], "FETCH 1"),
+        ("FETCH FORWARD 2 FROM c", &["2", "3"], "FETCH 2"),
+    ];
+    for (sql, ids, tag) in script {
+        let (described, got, got_tag) = run_extended(&mut stream, sql, 0);
+        assert!(described, "{sql}: FETCH describes its row shape");
+        let want: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        assert_eq!((got, got_tag.as_str()), (want, *tag), "{sql}");
+    }
+    sync_and_expect_status(&mut stream, b'T');
+    simple_ok(&mut stream, "ROLLBACK", "ROLLBACK");
+}
+
+/// `FETCH ALL` で末尾の後へ進めてから `FETCH BACKWARD ALL` を `max_rows=2` で Execute すると、
+/// 中断 portal の再 Execute を挟んでも降順の行が漏れなく重複なく届く。
+#[test]
+fn backward_all_portal_suspends_and_resumes_in_descending_order() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    begin_and_declare_c(&mut stream, "SCROLL");
+    simple_ok(&mut stream, "MOVE FORWARD ALL IN c", "MOVE 5");
+
+    parse_and_bind(&mut stream, "sb", "pb", "FETCH BACKWARD ALL FROM c");
+    let mut ids: Vec<String> = Vec::new();
+    let mut suspensions = 0;
+    loop {
+        send_length_prefixed_message(&mut stream, b'E', &execute_body("pb", 2));
+        let mut finished = false;
+        loop {
+            let (kind, body) = read_message(&mut stream);
+            match kind {
+                b'D' => ids.push(data_row_first_column(&body)),
+                b's' => {
+                    suspensions += 1;
+                    break;
+                }
+                b'C' => {
+                    finished = true;
+                    break;
+                }
+                other => panic!("unexpected message {other}"),
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    assert_eq!(ids, ["5", "4", "3", "2", "1"]);
+    assert_eq!(suspensions, 2, "5 rows at max_rows=2 suspend twice");
+    sync_and_expect_status(&mut stream, b'T');
+    simple_ok(&mut stream, "ROLLBACK", "ROLLBACK");
+}
+
+/// NO SCROLL の逆方向は ErrorResponse `55000`（Sync 後の ReadyForQuery は `E`）。
+/// 行の上の `MOVE 0` は Describe が NoData で、実行は `MOVE 1`。
+#[test]
+fn no_scroll_backward_is_55000_and_move_zero_is_accepted_over_extended_query() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    begin_and_declare_c(&mut stream, "NO SCROLL");
+
+    let (_, ids, tag) = run_extended(&mut stream, "FETCH 2 FROM c", 0);
+    assert_eq!(
+        (ids, tag.as_str()),
+        (vec!["1".into(), "2".into()], "FETCH 2")
+    );
+    let (described, ids, tag) = run_extended(&mut stream, "MOVE 0 IN c;", 0);
+    assert!(!described, "MOVE describes as NoData");
+    assert_eq!((ids.len(), tag.as_str()), (0, "MOVE 1"));
+    let (_, ids, tag) = run_extended(&mut stream, "FETCH NEXT FROM c", 0);
+    assert_eq!((ids, tag.as_str()), (vec!["3".to_string()], "FETCH 1"));
+
+    parse_and_bind(&mut stream, "sp", "pp", "FETCH PRIOR FROM c");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pp", 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'E', "NO SCROLL backward must be rejected");
+    assert!(String::from_utf8_lossy(&body).contains("55000"));
+    send_sync(&mut stream);
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+    assert_eq!(body.last().copied(), Some(b'E'));
+    simple_ok(&mut stream, "ROLLBACK", "ROLLBACK");
+}
+
+/// savepoint より前に宣言した SCROLL カーソルの逆方向の中断 portal は `ROLLBACK TO` の後も
+/// 続きの行を出せる（older cursor の逆方向版）。後に宣言したカーソルの中断 portal は `34000`。
+#[test]
+fn backward_suspended_portal_follows_rollback_to_contract() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    begin_and_declare_c(&mut stream, "SCROLL");
+    simple_ok(&mut stream, "MOVE FORWARD ALL IN c", "MOVE 5");
+    simple_ok(&mut stream, "SAVEPOINT a", "SAVEPOINT");
+    simple_ok(
+        &mut stream,
+        "DECLARE d SCROLL CURSOR FOR SELECT id FROM documents LIMIT 100",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "MOVE FORWARD ALL IN d", "MOVE 5");
+
+    // c（older）と d（newer）の逆方向 portal をそれぞれ 1 行で中断させる。
+    for (stmt, portal, cursor) in [("sc", "pc", "c"), ("sd", "pd", "d")] {
+        parse_and_bind(
+            &mut stream,
+            stmt,
+            portal,
+            &format!("FETCH BACKWARD ALL FROM {cursor}"),
+        );
+        send_length_prefixed_message(&mut stream, b'E', &execute_body(portal, 1));
+        let (kind, body) = read_message(&mut stream);
+        assert_eq!(kind, b'D');
+        assert_eq!(data_row_first_column(&body), "5");
+        let (kind, _) = read_message(&mut stream);
+        assert_eq!(kind, b's', "expected PortalSuspended");
+    }
+    simple_ok(&mut stream, "ROLLBACK TO a", "ROLLBACK");
+
+    // older: 続きの 4 行が降順で出る。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pc", 0));
+    let mut ids = Vec::new();
+    loop {
+        let (kind, body) = read_message(&mut stream);
+        match kind {
+            b'D' => ids.push(data_row_first_column(&body)),
+            b'C' => break,
+            other => panic!("unexpected message {other}"),
+        }
+    }
+    assert_eq!(ids, ["4", "3", "2", "1"]);
+    // newer: 閉じたカーソルへの束縛は 34000 で、行を送出しない。
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pd", 0));
+    let (kind, body) = read_message(&mut stream);
+    assert_eq!(kind, b'E', "closed cursor portal must not resume");
+    assert!(String::from_utf8_lossy(&body).contains("34000"));
+    send_sync(&mut stream);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+    simple_ok(&mut stream, "ROLLBACK", "ROLLBACK");
+}

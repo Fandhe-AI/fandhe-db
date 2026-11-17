@@ -293,6 +293,98 @@ fn insert_table_name_only(tokens: &[crate::sql::lexer::Token]) -> Option<String>
     }
 }
 
+/// 行値比較の `$n` のダミー型照会用に、文中で実際に表として参照される名前（出現順）を集める
+/// （Issue #3257）。`FROM`／`JOIN`／`DELETE ... USING` 直後の関係名（スキーマ修飾は表名部分、
+/// カンマ区切りの後続の表を含む）だけを拾い、表参照ではない `FROM`（`EXTRACT(f FROM x)`・
+/// `SUBSTRING`／`TRIM`／`OVERLAY`／`POSITION` の括弧内と `IS DISTINCT FROM`）と
+/// `USING OPERATION_ID` は拾わない。`infer_param_types` から呼ばれる。
+fn row_compare_relation_names(tokens: &[crate::sql::lexer::Token]) -> Vec<String> {
+    use crate::sql::lexer::{Keyword, Token};
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    let is_delete = word(tokens.first(), "DELETE");
+    let mut out: Vec<String> = Vec::new();
+    // 括弧ごとの「関数構文の括弧（内側の FROM は表参照ではない）」フラグ。
+    let mut stack: Vec<bool> = Vec::new();
+    let mut k = 0usize;
+    while let Some(tok) = tokens.get(k) {
+        match tok {
+            Token::Punct('(') => {
+                let func = matches!(
+                    k.checked_sub(1).and_then(|p| tokens.get(p)),
+                    Some(Token::Ident(w)) if ["EXTRACT", "SUBSTRING", "TRIM", "OVERLAY", "POSITION"]
+                        .iter()
+                        .any(|f| w.eq_ignore_ascii_case(f))
+                );
+                stack.push(func);
+            }
+            Token::Punct(')') => {
+                stack.pop();
+            }
+            _ => {}
+        }
+        let in_func = stack.last().copied().unwrap_or(false);
+        let prev = k.checked_sub(1).and_then(|p| tokens.get(p));
+        let is_head = !in_func
+            && match tok {
+                Token::Keyword(Keyword::From) => !word(prev, "DISTINCT"),
+                Token::Ident(w) if w.eq_ignore_ascii_case("JOIN") => true,
+                Token::Ident(w) if w.eq_ignore_ascii_case("USING") => {
+                    is_delete && !word(tokens.get(k + 1), "OPERATION_ID")
+                }
+                _ => false,
+            };
+        k += 1;
+        if !is_head {
+            continue;
+        }
+        // 関係名 [別名] {, 関係名 [別名]}
+        loop {
+            match tokens.get(k) {
+                Some(Token::Ident(n) | Token::QuotedNull(n)) => out.push(n.clone()),
+                Some(Token::QualifiedIdent { name, .. }) => out.push(name.clone()),
+                _ => break,
+            }
+            k += 1;
+            if word(tokens.get(k), "AS") {
+                k += 1;
+                if matches!(tokens.get(k), Some(Token::Ident(_) | Token::QuotedNull(_))) {
+                    k += 1;
+                }
+            } else if matches!(tokens.get(k), Some(Token::QuotedNull(_))) {
+                // 引用付きの暗黙別名（`FROM u "U"`）も読み飛ばす。
+                k += 1;
+            } else if let Some(Token::Ident(a)) = tokens.get(k) {
+                const NOT_ALIAS: [&str; 11] = [
+                    "JOIN",
+                    "INNER",
+                    "LEFT",
+                    "RIGHT",
+                    "FULL",
+                    "CROSS",
+                    "ON",
+                    "USING",
+                    "SET",
+                    "RETURNING",
+                    "OFFSET",
+                ];
+                if !NOT_ALIAS.iter().any(|w| a.eq_ignore_ascii_case(w)) {
+                    k += 1;
+                }
+            }
+            if matches!(tokens.get(k), Some(Token::Punct(','))) {
+                k += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[path = "core/row_compare_relation_names_tests.rs"]
+mod row_compare_relation_names_tests;
+
 /// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
 /// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
 /// prepared statement のパラメータ型推論（`EngineCore::prepare_*`）が呼ぶ。
@@ -2065,6 +2157,12 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1754）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
+    /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析までを
+    /// 担い、Execute・Describe・明示 Tx の各腕は固定文言の `0A000`（[`MERGE_NOT_SUPPORTED_YET`]）で
+    /// 副作用なしに止める。束縛は #3352、実行は #3353・#3354、台帳・`OpTag`・`EXPLAIN` は #3357、
+    /// `RETURNING` は #3356 が結線する。既存 variant にフィールドを足さず別 variant にしているのは、
+    /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
+    Merge(Box<crate::sql::allowlist::ValidatedMerge>),
     /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
     /// 契約は [`Self::UpdateFrom`] と同じ。
     ///
@@ -2518,6 +2616,10 @@ fn row_lock_not_supported() -> crate::sql::allowlist::SqlSurfaceError {
     )
 }
 
+/// `MERGE` の実行・Describe が返す固定文言（SQL-79・Issue #3351。構文解析のみで、実行は #3353・#3354）。
+/// 入力断片・件数・他テナントの情報を含めない。
+const MERGE_NOT_SUPPORTED_YET: &str = "MERGE is not supported yet";
+
 fn statement_clock_scope(
     parsed: &ParsedSql,
     txn_start_micros: Option<i64>,
@@ -2542,6 +2644,9 @@ fn statement_clock_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
+        // SQL-79・Issue #3351: MERGE の SET・INSERT 値も文の開始時刻を共有する想定（実行は #3354 で結線。
+        // 現状は `0A000` のため影響しない）。
+        | ParsedSql::Merge(_)
         // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 等の評価に文の開始時刻を要する。
         | ParsedSql::ExplainInsert(_)
         // Issue #2050: `EXPLAIN UPDATE|DELETE` も非 EXPLAIN の DML と同じく束縛段が時刻を読む。
@@ -2639,6 +2744,8 @@ fn insert_sequence_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
+        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
+        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -2732,6 +2839,8 @@ fn insert_default_clock_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
+        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
+        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -2840,7 +2949,18 @@ fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<S
         Statement::Select(v) => out.push(v.table_name().to_string()),
         Statement::Aggregate(v) => out.push(v.table_name().to_string()),
         Statement::Scan(v) => out.push(v.table_name().to_string()),
-        Statement::Join(v) => out.extend(crate::sql::join::collect_join_tables(v)),
+        Statement::Join(v) => {
+            out.extend(crate::sql::join::collect_join_tables(v));
+            // Issue #3324: LATERAL 派生表を本文に持つビューの CTE 入力（slot）が読む表も含める
+            // （照合の検査が内側の表を取りこぼさない）。
+            if let Some(inputs) = v.cte_inputs.as_deref() {
+                for slot in &inputs.slots {
+                    if let crate::sql::allowlist::CteSlotSource::Scan(scan) = &slot.source {
+                        out.push(scan.table_name().to_string());
+                    }
+                }
+            }
+        }
         Statement::SetOperation(v) => crate::sql::set_op::collect_branch_tables(&v.tree, out),
         Statement::BufferedView(v) => buffered_body_tables(&v.body, out),
         Statement::RecursiveCte(v) => recursive_cte_tables(v, out),
@@ -2940,6 +3060,9 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         // （`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体の各ゲートも operation_id 付きを拒否側に倒す）。
         ParsedSql::UpdateFrom(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::DeleteUsing(stmt) => stmt.operation_id().map(|id| id.as_str()),
+        // SQL-79・Issue #3351: 台帳・Tx 内の再利用判定には参加させない（`None`）。実行は `0A000` で、台帳との
+        // 結線は #3357。`USING OPERATION_ID` 付きでも `23505` 等が `0A000` より先に出る経路を作らない。
+        ParsedSql::Merge(_) => None,
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
         ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => None,
@@ -3043,6 +3166,18 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
     }
 }
 
+/// 行値比較の成分の `$n`（パターン 12。Issue #3257）の Describe 用ダミー候補
+/// （トークン添字・パラメータ番号・ダミー）。種別が `String` の番号のものだけが採用される。
+type RowDummyCandidate = (usize, u16, crate::sql::lexer::Token);
+
+/// [`EngineCore::infer_param_types`] の結果（`$n` ごとの型公告・宣言型の変換可否判定の入力・行値比較の
+/// Describe 用ダミー候補）。
+type InferredParams = (
+    Vec<crate::sql::params::PreparedParamType>,
+    Vec<crate::sql::param_coerce::ParamCheck>,
+    Vec<RowDummyCandidate>,
+);
+
 /// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
 /// 拡張クエリプロトコルの Parse が `$n` を含む SQL テキストを値未確定のまま
 /// 構造検証した「束縛前テンプレート」を運ぶ。行・台帳・世代のいずれにも触れて
@@ -3087,6 +3222,10 @@ pub struct PreparedSql {
     /// （PR #1012 Cursor Bugbot 指摘対応: `$n` を含まない等価述語では `false`
     /// のままとなり、実リテラルは通常の Describe と同じく必ず検証される）。
     where_equality_dummy_flags: Vec<bool>,
+    /// 行値比較の成分の `$n`（パターン 12。Issue #3257）に使った、相手列の型の Describe 用ダミー
+    /// （トークン添字 → ダミー）。`BEGIN` 時点のスナップショットでの再 parse
+    /// （[`EngineCore::reparse_dummy_with_snapshot`]）が `dummy_parsed` と同じ置換を再現するために保持する。
+    dummy_overrides: Vec<(usize, crate::sql::lexer::Token)>,
     /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
     /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
     param_types: Vec<crate::sql::params::PreparedParamType>,
@@ -5525,7 +5664,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -5603,7 +5743,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -5678,7 +5819,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -5760,7 +5902,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as SetOperation"
                                 .to_string(),
@@ -5861,7 +6004,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Join"
                                 .to_string(),
@@ -7461,7 +7605,7 @@ impl EngineCore {
         let literal_sensitive_head = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name))
-                if ["INSERT", "UPDATE", "CREATE", "ALTER", "WITH"]
+                if ["INSERT", "UPDATE", "CREATE", "ALTER", "WITH", "MERGE"]
                     .iter()
                     .any(|kw| name.eq_ignore_ascii_case(kw))
         ) || matches!(
@@ -7689,6 +7833,20 @@ impl EngineCore {
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Truncate(stmt));
+        }
+
+        // SQL-79・Issue #3351: `MERGE` は専用の構文解析器へ回す（既存の単一表 DML の解析器へ落とさない）。
+        // 解析を通った文の実行は固定文言の `0A000`（実行系の結線は #3353・#3354）。対象・元の存在確認は
+        // 他の書き込みと同じく書き込み先ビュー・索引の写像（`reclassify_write_to_view_error`）を通す。
+        if crate::sql::allowlist::looks_like_merge(&tokens) {
+            let stmt = crate::sql::allowlist::validate_merge_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.nesting_limits,
+                &storage_lookup,
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            return Ok(ParsedSql::Merge(Box::new(stmt)));
         }
 
         // SQL-53 (b)・Issue #1754: `DELETE ... USING <表の並び>`／`UPDATE ... FROM <表の並び>` は既存の
@@ -7960,6 +8118,15 @@ impl EngineCore {
         );
         if is_fetch_statement {
             let stmt = crate::sql::cursor::validate_fetch_tokens(&tokens, &self.result_limits)?;
+            return Ok(ParsedSql::Cursor(stmt));
+        }
+
+        let is_move_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("MOVE")
+        );
+        if is_move_statement {
+            let stmt = crate::sql::cursor::validate_move_tokens(&tokens, &self.result_limits)?;
             return Ok(ParsedSql::Cursor(stmt));
         }
 
@@ -8876,6 +9043,7 @@ impl EngineCore {
                 )),
                 literal_skip: crate::sql::parser::LiteralSkip::NONE,
                 where_equality_dummy_flags: Vec::new(),
+                dummy_overrides: Vec::new(),
                 param_types: Vec::new(),
                 declared: Vec::new(),
                 typed_positions: crate::sql::params::TypedPositions::default(),
@@ -8930,7 +9098,7 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let (param_types, param_checks) = match self.infer_param_types(
+        let (param_types, param_checks, row_dummies) = match self.infer_param_types(
             &tokens,
             param_count,
             declared,
@@ -8958,14 +9126,33 @@ impl EngineCore {
         // `WherePredicate::Equality` にならず序数に数えない）。
         // 結合 DML（Issue #3297）は連言分ごとのフラグ（`sql::join::dml_plan` が対象側・source 側へ
         // 振り分ける）。それ以外は従来どおり等価述語の序数ごと。
-        let where_equality_dummy_flags = if crate::sql::params::is_joined_dml(&tokens) {
-            crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
-        } else {
-            crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
-        };
+        // Issue #3324: LATERAL 本文の `$n` は TEXT 系の列に限るためダミー値の語彙照合の省略が要らない。
+        // 序数フラグは本文の外の実リテラルへ誤適用されうるので、渡さない（空＝すべて検証する）。
+        let where_equality_dummy_flags =
+            if param_count > 0 && crate::sql::params::lateral_param_layout(&tokens).is_some() {
+                Vec::new()
+            } else if crate::sql::params::is_joined_dml(&tokens) {
+                crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
+            } else {
+                crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
+            };
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
-        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
+        let dummy_overrides: Vec<(usize, crate::sql::lexer::Token)> = row_dummies
+            .into_iter()
+            .filter(|(_, n, _)| {
+                usize::from(*n)
+                    .checked_sub(1)
+                    .and_then(|k| kinds.get(k))
+                    .is_some_and(|k| *k == crate::sql::params::ParamLiteralKind::String)
+            })
+            .map(|(i, _, tok)| (i, tok))
+            .collect();
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed_with(
+            &tokens,
+            &kinds,
+            &dummy_overrides.iter().cloned().collect(),
+        );
         let parse_hits = crate::sql::temp_catalog::RelationHits::default();
         let dummy_parsed = {
             let positions: Vec<usize> = tokens
@@ -9033,6 +9220,7 @@ impl EngineCore {
             dummy_parsed,
             literal_skip,
             where_equality_dummy_flags,
+            dummy_overrides,
             param_types,
             declared: (0..usize::from(param_count))
                 .map(|i| declared.get(i).copied().flatten())
@@ -9073,13 +9261,7 @@ impl EngineCore {
         param_count: u16,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
         read_snap: Option<&redb::ReadTransaction>,
-    ) -> Result<
-        (
-            Vec<crate::sql::params::PreparedParamType>,
-            Vec<crate::sql::param_coerce::ParamCheck>,
-        ),
-        crate::sql::allowlist::SqlSurfaceError,
-    > {
+    ) -> Result<InferredParams, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::exec::ColumnMeta;
         use crate::sql::lexer::Token;
@@ -9103,15 +9285,27 @@ impl EngineCore {
             match tokens.first() {
                 Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
                     Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                    // スキーマ修飾の対象表（`UPDATE public.t`）は表名部分を引く（row_compare_relation_names と同じ扱い）。
+                    Some(Token::QualifiedIdent { name, .. }) => Some(name.clone()),
                     _ => None,
                 },
                 // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
                 // 引く `FROM` は括弧深さ 0 の最初のものに限る。
                 _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
                     Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                    // スキーマ修飾の参照表（`SELECT ... FROM public.t`・`DELETE FROM public.t`）も表名部分を引く。
+                    Some(Token::QualifiedIdent { name, .. }) => Some(name.clone()),
                     _ => None,
                 }),
             }
+        };
+        // Issue #3257: 行値比較の成分の `$n` が当たる列と、相手列を引く関係名の一覧。
+        // 主表で引けない列は `FROM`／`JOIN`／`USING` の関係から引く（下の `WhereColumn` と後段で共有）。
+        let row_slots = crate::sql::params::row_compare_column_slots(tokens);
+        let rels = if row_slots.is_empty() {
+            Vec::new()
+        } else {
+            row_compare_relation_names(tokens)
         };
         // 表スキーマの引き先。再 Parse は `BEGIN` 時点のスナップショット、通常の Parse は最新カタログ。
         let schema_of = |table: &str| -> Option<crate::catalog::TableSchema> {
@@ -9288,6 +9482,15 @@ impl EngineCore {
                                 }
                                 None => where_table.as_deref().and_then(|t| column_type(t, col)),
                             };
+                            // 行値比較の相手列は主表以外（結合・`FROM`・`USING` の相手表）にもありうる。
+                            // 行値比較の列に限り、追加関係から型を引く（整数・真偽値でも Text に落とさない）。
+                            let ty = ty.or_else(|| {
+                                if row_slots.values().any(|c| c == col) {
+                                    rels.iter().find_map(|t| column_type(t, col))
+                                } else {
+                                    None
+                                }
+                            });
                             (ty, Some(ParamContextKind::Operator))
                         }
                         // Issue #3297: 結合 DML の `<公開名>.<列> = $n`。修飾子が指す表の列で引く
@@ -9301,6 +9504,27 @@ impl EngineCore {
                                 .and_then(|(_, t)| column_type(t, column)),
                             Some(ParamContextKind::Operator),
                         ),
+                        // Issue #3324: LATERAL 本文の WHERE の `$n`。型は本文の FROM の表の列から引く。
+                        // 受理するのは TEXT 系の列（引けない場合は従来どおり `Text`）だけ。派生表の本文は
+                        // 数値比較・`BETWEEN` を持てず、ENUM・日付等の列は Describe 用ダミー値が型検証に
+                        // 当たる（等価述語の序数フラグが LATERAL 本文の内側では保証できない）ため、
+                        // 列が引けて TEXT 系でない場合は固定 `42601`（fail-closed）で拒否する。
+                        ParamPosition::LateralColumn { table, column } => {
+                            let ty = column_type(table, column);
+                            if let Some(t) = &ty {
+                                let text_like = matches!(
+                                    t,
+                                    PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })
+                                        if ty.is_text_like()
+                                );
+                                if !text_like {
+                                    return Err(SqlSurfaceError::unsupported(
+                                        "parameter placeholders in LATERAL derived tables are supported only for text columns",
+                                    ));
+                                }
+                            }
+                            (ty, Some(ParamContextKind::Operator))
+                        }
                         ParamPosition::SetColumn(col) => (
                             where_table.as_deref().and_then(|t| column_type(t, col)),
                             Some(ParamContextKind::Assignment),
@@ -9409,7 +9633,46 @@ impl EngineCore {
                 }
             });
         }
-        Ok((out, checks))
+        // Issue #3257・パターン 12: 行値比較の成分の `$n` に使う、相手列の型の Describe 用ダミー候補
+        // （トークン添字・番号・ダミー）。種別が `String` のものだけが後段で採用される。
+        let mut row_dummies: Vec<(usize, u16, Token)> = Vec::new();
+        // 参照表一覧と候補はスロットごとに作り直さず 1 回だけ構築して使い回す（上で構築済み）。
+        let candidates: Vec<&str> = where_table
+            .as_deref()
+            .into_iter()
+            .chain(rels.iter().map(String::as_str))
+            .collect();
+        for (i, col) in row_slots {
+            let Some(Token::Param(n)) = tokens.get(i) else {
+                continue;
+            };
+            // 相手列は主表だけでなく、文中の `FROM`／`JOIN`／`USING` 直後の表名（結合・`UPDATE ... FROM`・
+            // `DELETE ... USING` の相手表）からも引く。主表で引けない列を既定ダミー `'0'` のまま
+            // 検証に回すと DATE／UUID／ENUM 列で Parse／Describe が誤って失敗するため。
+            // 一時表は一時コア（`temp_route`）がこの関数を呼ぶので、`column_type` が一時表も引ける。
+            // 候補は主表を先頭に、実際に表として参照される名前だけ（`row_compare_relation_names`）。
+            // 疑似 `id`（`ColumnMeta::Id`）が解決した時点で探索を終える（後続の無関係な表の物理 `id` へ進まない）。
+            let resolved_ty = candidates
+                .iter()
+                .copied()
+                .find_map(|t| match column_type(t, &col) {
+                    Some(PreparedParamType::Column(ColumnMeta::Id)) => Some(None),
+                    Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })) => {
+                        Some(Some(ty))
+                    }
+                    _ => None,
+                });
+            {
+                let Some(Some(ty)) = resolved_ty else {
+                    continue;
+                };
+                if let Some(tok) = crate::sql::params::row_compare_dummy_token(&ty)? {
+                    row_dummies.push((i, *n, tok));
+                }
+            }
+        }
+        row_dummies.sort_by_key(|(i, _, _)| *i);
+        Ok((out, checks, row_dummies))
     }
 
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
@@ -9917,6 +10180,13 @@ impl EngineCore {
             ParsedSql::UpdateFrom(_) | ParsedSql::DeleteUsing(_) => Err(
                 crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                     dml_from_exec::JOINED_DML_UNSUPPORTED_HERE,
+                ),
+            ),
+            // SQL-79・Issue #3351: 構文解析のみ。writer の取得・暗黙 Tx の開始・台帳の照合より前に固定文言の
+            // `0A000` で返し、行・台帳・世代へ一切触れない（実行は #3353・#3354）。
+            ParsedSql::Merge(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    MERGE_NOT_SUPPORTED_YET,
                 ),
             ),
             ParsedSql::Update(stmt) => {
@@ -10639,6 +10909,7 @@ impl EngineCore {
                     Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction)
                 }
                 crate::sql::cursor::CursorStatement::Fetch { .. }
+                | crate::sql::cursor::CursorStatement::Move { .. }
                 | crate::sql::cursor::CursorStatement::Close { .. } => {
                     Err(crate::sql::allowlist::SqlSurfaceError::invalid_cursor_name())
                 }
@@ -11617,6 +11888,13 @@ impl EngineCore {
             // SQL-53 (b)・Issue #3202: 共有 write txn 上で結合実行器へ dispatch し、`mark_written` する。
             // 失敗時は呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
             ParsedSql::UpdateFrom(stmt) => self.execute_update_from_in_txn(ctx, session, txn, stmt),
+            // SQL-79・Issue #3351: 明示 Tx 内の MERGE も固定文言の `0A000`。`mark_written` は呼ばず、共有 write txn
+            // へ何も書かない（失敗文としての Tx 状態遷移は呼び出し元の既存規約）。
+            ParsedSql::Merge(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    MERGE_NOT_SUPPORTED_YET,
+                ),
+            ),
             ParsedSql::DeleteUsing(stmt) => {
                 self.execute_delete_using_in_txn(ctx, session, txn, stmt)
             }
@@ -11933,18 +12211,21 @@ impl EngineCore {
                     .declare(name.clone(), result, *scroll)?;
                 Ok(crate::sql::SqlOutcome::DeclareCursor)
             }
-            CursorStatement::Fetch { name, count } => {
+            CursorStatement::Fetch { name, direction } => {
                 let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
                     detail: "internal error".to_string(),
                 })?;
-                // `ALL` は残り全行。上限は結果行数 cap と同じ値で多層防御として判定する（Issue #3174）。
-                let result = match count {
-                    crate::sql::cursor::FetchCount::Rows(n) => registry.fetch(name, *n)?,
-                    crate::sql::cursor::FetchCount::All => {
-                        registry.fetch_all(name, self.result_limits.max_result_rows())?
-                    }
-                };
+                // `ALL` の上限は結果行数 cap と同じ値で多層防御として判定する（Issue #3174・#3335）。
+                let result =
+                    registry.fetch(name, *direction, self.result_limits.max_result_rows())?;
                 Ok(crate::sql::SqlOutcome::Fetch(result))
+            }
+            CursorStatement::Move { name, direction } => {
+                let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let moved = registry.move_cursor(name, *direction)?;
+                Ok(crate::sql::SqlOutcome::Move(moved))
             }
             CursorStatement::Close { name } => {
                 txn.cursors_mut()
@@ -12145,6 +12426,7 @@ impl EngineCore {
         if let Some(stmt) = cursor {
             return match stmt {
                 crate::sql::cursor::CursorStatement::Declare { .. }
+                | crate::sql::cursor::CursorStatement::Move { .. }
                 | crate::sql::cursor::CursorStatement::Close { .. } => Ok(None),
                 crate::sql::cursor::CursorStatement::Fetch { name, .. } => {
                     // `Failed` 中はカーソルが既に破棄されているが、Execute と同じく
@@ -12198,7 +12480,11 @@ impl EngineCore {
             .iter()
             .map(|t| t.literal_kind())
             .collect();
-        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&prepared.tokens, &kinds);
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed_with(
+            &prepared.tokens,
+            &kinds,
+            &prepared.dummy_overrides.iter().cloned().collect(),
+        );
         let positions: Vec<usize> = prepared
             .tokens
             .iter()
@@ -13055,6 +13341,12 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
+            // SQL-79・Issue #3351: Describe も Execute と同じ SQLSTATE（固定文言の `0A000`）。
+            ParsedSql::Merge(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    MERGE_NOT_SUPPORTED_YET,
+                ),
+            ),
             // SQL-53 (b)・Issue #3202・#3204: Execute と同じ準備段（束縛・変換）を通し、
             // エラーコードを揃える。`RETURNING` つきなら Execute の `QueryResult.columns` と同じ列を返す。
             ParsedSql::UpdateFrom(stmt) => {
@@ -13213,8 +13505,25 @@ impl EngineCore {
                 // SQL-62・Issue #1861: CTE 入力は本文を実行せず、結果列だけを導出して Execute と同じ
                 // 関数で合成スキーマにする（Describe は本体を実行しない契約）。
                 if let Some(cte) = validated.cte_inputs.as_deref() {
-                    for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
+                    for (rel_idx, (rel, slot)) in validated
+                        .relations
+                        .iter()
+                        .zip(cte.relation_slot.iter())
+                        .enumerate()
+                    {
                         let Some(k) = slot else { continue };
+                        // `LATERAL unnest(...)`（Issue #3360）は Execute と同じ導出（足場の slot は使わない）。
+                        if let Some(Some(lat)) = cte.lateral.get(rel_idx) {
+                            if lat.unnest.is_some() {
+                                let cols =
+                                    crate::sql::join::unnest_columns_for(validated, &schemas, lat)?;
+                                let (schema, id_columns) =
+                                    crate::sql::join::cte_schema(rel.table(), &cols)?;
+                                schemas.insert(rel.table().to_string(), schema);
+                                cte_ids.insert(rel.table().to_string(), id_columns);
+                                continue;
+                            }
+                        }
                         let cols = self.describe_cte_slot(
                             session,
                             cte,
@@ -14740,6 +15049,7 @@ impl EngineCore {
             &cte_ids,
             inputs,
             budget,
+            self.correlated_limits,
         )
     }
 
@@ -14777,19 +15087,121 @@ impl EngineCore {
         let mut cache: Vec<Option<crate::sql::exec::QueryResult>> = vec![None; cte.slots.len()];
         let mut inputs = Vec::with_capacity(validated.relations.len());
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
-        for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
+        for (rel_idx, (rel, slot)) in validated
+            .relations
+            .iter()
+            .zip(cte.relation_slot.iter())
+            .enumerate()
+        {
             let Some(k) = slot else {
                 inputs.push(None);
                 continue;
             };
-            let result = self
-                .evaluate_cte_slot(ctx, session, read_txn, cte, *k, limits, &mut cache, budget)?;
+            // 外側の行ごとに再評価する LATERAL（Issue #3322）は、後処理の slot を評価せず、基底（親 slot）だけを
+            // 文内で 1 回評価して JOIN へ渡す。後処理は外側タプルごとに `sql::join::lateral` が適用する。
+            // 結合のスキーマ・列メタは後処理後の列（Describe の `describe_cte_slot` と同じ導出）で作る。
+            if let Some(Some(lat)) = cte.lateral.get(rel_idx) {
+                // `LATERAL unnest(...)`（Issue #3360）は slot の足場を評価せず（記憶域を読まず）、左側 relation の
+                // スキーマから出力列を導く（Describe と同じ `unnest_columns_for`）。行は JOIN の段が作る。
+                if lat.unnest.is_some() {
+                    let cols = crate::sql::join::unnest_columns_for(validated, schemas, lat)?;
+                    let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &cols)?;
+                    schemas.insert(rel.table().to_string(), schema);
+                    cte_ids.insert(rel.table().to_string(), id_columns);
+                    inputs.push(None);
+                    continue;
+                }
+                let (base, post_columns) = self.evaluate_lateral_base(
+                    ctx, session, read_txn, cte, *k, limits, &mut cache, budget,
+                )?;
+                let (schema, id_columns) =
+                    crate::sql::join::cte_schema(rel.table(), &post_columns)?;
+                schemas.insert(rel.table().to_string(), schema);
+                cte_ids.insert(rel.table().to_string(), id_columns);
+                inputs.push(Some(base));
+                continue;
+            }
+            let result = self.evaluate_cte_slot(
+                ctx, session, read_txn, cte, *k, limits, &mut cache, budget, None,
+            )?;
             let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &result.columns)?;
             schemas.insert(rel.table().to_string(), schema);
             cte_ids.insert(rel.table().to_string(), id_columns);
             inputs.push(Some(result));
         }
         Ok((inputs, cte_ids))
+    }
+
+    /// 外側の行ごとに再評価する LATERAL の slot `k`（後処理）について、基底（`from` の親 slot）の評価済みの
+    /// 行と、後処理後の結果列（列名リスト適用後）を返す（Issue #3322。設計記録 L1・L15）。基底は参照者
+    /// 自身の `ctx`・呼び出し元と同一の `read_txn` で文内に 1 回だけ評価し、保持分は `budget` へ計上される。
+    /// 基底が実表を読む `Scan` のときの暗黙 `LIMIT`（結果行数上限）は、後処理が外側タプルごとに絞るため
+    /// ハード上限まで緩め、入力行数の上限は呼び出し先の JOIN が判定する（利用者の CTE を読む基底は設定値の
+    /// まま）。明示 `LIMIT` は設定値の範囲を検査する。
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_lateral_base<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        read_txn: &R,
+        cte: &crate::sql::allowlist::JoinCteInputs,
+        k: usize,
+        limits: crate::result_limits::ResultLimits,
+        cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
+        budget: &mut crate::sql::join::JoinBudget,
+    ) -> Result<
+        (
+            crate::sql::exec::QueryResult,
+            Vec<crate::sql::exec::ColumnMeta>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
+        let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "CTE slot out of range".to_string(),
+        })?;
+        let CteSlotSource::Derived { from, layer } = &slot.source else {
+            return Err(SqlSurfaceError::Internal {
+                detail: "LATERAL slot is not a derived layer".to_string(),
+            });
+        };
+        if layer.limit_explicit {
+            crate::sql::parser::validate_search_limit_with(layer.limit, &limits)?;
+        }
+        // 基底が実表を読む `Scan` のときだけ暗黙上限を緩める。基底が利用者の CTE を読む `Derived` のときは、
+        // 緩めた上限が（共有されうる）親 slot の評価・キャッシュへ伝わらないよう、設定値のまま渡す。
+        let base_is_scan = matches!(
+            cte.slots.get(*from).map(|b| &b.source),
+            Some(CteSlotSource::Scan(_))
+        );
+        let base_limits = if base_is_scan {
+            crate::result_limits::ResultLimits::new(crate::result_limits::MAX_RESULT_ROWS_HARD_CAP)
+        } else {
+            limits
+        };
+        let base = self.evaluate_cte_slot(
+            ctx,
+            session,
+            read_txn,
+            cte,
+            *from,
+            base_limits,
+            cache,
+            budget,
+            base_is_scan.then(|| self.join_limits.max_input_rows()),
+        )?;
+        let plan = crate::sql::view_buffered::plan_rows_layer(
+            &base.columns,
+            &slot.name,
+            layer,
+            session.udfs(),
+        )?;
+        let mut columns = plan.columns().to_vec();
+        if !slot.column_aliases.is_empty() {
+            columns =
+                crate::sql::view_buffered::rename_cte_columns(&columns, &slot.column_aliases)?;
+        }
+        Ok((base, columns))
     }
 
     /// CTE slot `k` の評価済みの行（列名リスト適用後）を返す（[`Self::evaluate_join_cte_inputs`]
@@ -14808,6 +15220,7 @@ impl EngineCore {
         limits: crate::result_limits::ResultLimits,
         cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
         budget: &mut crate::sql::join::JoinBudget,
+        scan_input_cap: Option<usize>,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
         let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
@@ -14823,13 +15236,18 @@ impl EngineCore {
             CteSlotSource::Scan(scan) => {
                 self.count_materialized_cte_eval();
                 let schema = table_schema_in(read_txn, scan.table_name())?;
-                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     scan,
                     &schema,
                     session.udfs(),
                     &[],
                     &limits,
                 )?;
+                // 入力上限つきの基底（LATERAL。Issue #3322 設計記録 L11）は、上限＋1 件で取得を止めて
+                // 超過を検出する（上限を超える行を読み込み・確保しない）。
+                if let Some(cap) = scan_input_cap {
+                    bound.limit = cap.saturating_add(1);
+                }
                 let result = crate::sql::scan::execute_scan_with_budget(
                     read_txn,
                     ctx,
@@ -14837,6 +15255,13 @@ impl EngineCore {
                     &bound,
                     budget.remaining(),
                 )?;
+                if let Some(cap) = scan_input_cap {
+                    if result.rows.len() > cap {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "JOIN input exceeds the visible row limit",
+                        ));
+                    }
+                }
                 budget.charge_result(&result)?;
                 result
             }
@@ -14866,6 +15291,7 @@ impl EngineCore {
                     parent_limits,
                     cache,
                     budget,
+                    None,
                 )?;
                 // tail CTE（Issue #1862）の明示 `LIMIT` は設定値の範囲で検査する（構文段は
                 // 設定値を持たない。Scan 側の `bind_scan_with_dummy_flags` と同じ契約）。
@@ -17175,6 +17601,13 @@ impl EngineCore {
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
         let cte_inputs = validated.cte_inputs.as_deref();
         if let Some(cte) = cte_inputs {
+            // LATERAL（本文つき・`unnest`）の EXPLAIN は #3324 の範囲で、入口（`contains_lateral`）が固定 `0A000` で
+            // 拒否する。ここへ来た場合の多重防御（足場の slot を実行計画として写さない）。
+            if cte.lateral.iter().flatten().any(|l| l.unnest.is_some()) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN of a LATERAL subquery is not supported yet",
+                ));
+            }
             for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
                 let Some(k) = slot else { continue };
                 let cols = self.describe_cte_slot(
@@ -18002,6 +18435,8 @@ impl EngineCore {
             &crate::catalog::TableSchema,
         ) -> Result<T, crate::sql::allowlist::SqlSurfaceError>,
     {
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -18124,6 +18559,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         use crate::sql::allowlist::SqlSurfaceError;
         self.ledger_mode
             .resolve(operation_id)
@@ -18954,6 +19391,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // Issue #3282: 発火元の主体の写しを書き込み区間へ張る（SQL 表層と同じ実行器・同じ発火計画）。
         let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
@@ -19160,6 +19599,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // Issue #3282: 発火元の主体の写しを書き込み区間へ張る。
         let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
@@ -19298,6 +19739,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -19406,6 +19849,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -19553,6 +19998,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
         crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -20836,6 +21283,10 @@ impl EngineCore {
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
         let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。ファイル形は結線しない
+        // （Issue #3329）ため張らず、生成列を持つ表への書き込みは `0A000` のまま。
+        let _generated_scope = (!matches!(bound, crate::sql::parser::BoundInsertForm::File(_)))
+            .then(|| crate::sql::generated_column::GeneratedComputeScope::enter(&stmt.table_name));
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
                 crate::sql::exec::execute_insert_with_schema_in(
@@ -20948,6 +21399,9 @@ impl EngineCore {
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
         let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
+        // 生成列の計算点が結線された SQL 表層の書き込み区間（Issue #3328）。
+        let _generated_scope = (!matches!(bound, crate::sql::parser::BoundInsertForm::File(_)))
+            .then(|| crate::sql::generated_column::GeneratedComputeScope::enter(&stmt.table_name));
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
                 crate::sql::exec::execute_insert_returning_in(
@@ -21318,6 +21772,9 @@ impl EngineCore {
         let limits =
             crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(stmt.table_name());
         // SQL-40・Issue #1968: 各チャンクの write txn 内で権限を再判定する（束縛済みの主体だけ）。
         let recheck = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
             session,
@@ -21907,6 +22364,9 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedUpdate,
         lookup: &InsertSchemaLookup<'_>,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(&stmt.table_name);
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self
@@ -21977,6 +22437,9 @@ impl EngineCore {
             ValidatedUpdateForm::Single(v) => v.table_name.as_str(),
             ValidatedUpdateForm::Predicate(v) => v.table_name(),
         };
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(table_name);
         let schema = self
             .storage
             .get_table_schema(table_name)
@@ -22147,6 +22610,9 @@ impl EngineCore {
             ValidatedUpdateForm::Predicate(v) => (v.table_name(), v.returning()),
         };
         let schema = self.load_table_schema_for_dml(table_name)?;
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(table_name);
         let returning =
             crate::sql::parser::bind_returning_with_udfs(projection, &schema, returning_udfs)?
                 .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {

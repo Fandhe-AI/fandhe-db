@@ -149,6 +149,33 @@ pub(crate) fn bind_set_default(
     })
 }
 
+/// 式の代入を受理する列型か（[`bind_set_expr`] の許可リスト。`UPDATE ... SET` の右辺式と、生成列
+/// `GENERATED ALWAYS AS (<式>) STORED` の式〔TABLE-50・Issue #3327。`sql::generated_column`〕が
+/// 共有する唯一の判定）。NUMERIC・JSON・UUID・BYTEA・ENUM・ベクトル系は対象外。
+pub(crate) fn column_type_accepts_expression(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::SmallInt
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Text
+            | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
+            | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Interval
+            | ColumnType::Time
+            // 配列列（TABLE-35・Issue #1602）。右辺は配列式（コンストラクタ・スライス・CAST・配列列）。
+            | ColumnType::Array(_)
+            // BIT 列（TABLE-48 (3)・Issue #2023）。右辺は `binary_quantize(<VECTOR 列>)` だけが生成する bit 式。
+            | ColumnType::Bit(_)
+    )
+}
+
 /// `expr` を対象列 `column` への代入として束縛する。スキーマだけを参照し、行には触れない。
 /// 呼び出し元は `sql::parser::bind_set_assignments`。
 pub(crate) fn bind_set_expr(
@@ -168,30 +195,10 @@ pub(crate) fn bind_set_expr(
         ));
     }
     // 式を受理しない列型。リテラル経路（`bind_set_assignments` の既存分岐）は無変更。
-    match &column.ty {
-        ColumnType::SmallInt
-        | ColumnType::Integer
-        | ColumnType::BigInt
-        | ColumnType::Real
-        | ColumnType::Double
-        | ColumnType::Text
-        | ColumnType::Varchar(_)
-        | ColumnType::Bpchar(_)
-        | ColumnType::Boolean
-        | ColumnType::Date
-        | ColumnType::Timestamp
-        | ColumnType::TimestampTz
-        | ColumnType::Interval
-        | ColumnType::Time
-        // 配列列（TABLE-35・Issue #1602）。右辺は配列式（コンストラクタ・スライス・CAST・配列列）。
-        | ColumnType::Array(_)
-        // BIT 列（TABLE-48 (3)・Issue #2023）。右辺は `binary_quantize(<VECTOR 列>)` だけが生成する bit 式。
-        | ColumnType::Bit(_) => {}
-        _ => {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: format!("column {name:?} does not support an expression in SET"),
-            })
-        }
+    if !column_type_accepts_expression(&column.ty) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("column {name:?} does not support an expression in SET"),
+        });
     }
 
     let registry = UdfRegistry::default();

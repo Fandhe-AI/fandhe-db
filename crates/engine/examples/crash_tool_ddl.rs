@@ -11,7 +11,9 @@
 //!
 //! 文の列（ラウンド r ごとに表 `dd_<r>`。決定的。適用済みの段数 n から期待状態が一意に決まる）:
 //! 0 `CREATE TABLE` / 1 `INSERT`（SEED 行）/ 2 `ALTER TABLE ADD COLUMN c DEFAULT <r>` /
-//! 3 `CREATE INDEX`（スカラー）/ 4 `CREATE UNIQUE INDEX` / 5 `DROP TABLE dd_<r-1>`（r >= 1 のみ）。
+//! 3 `CREATE INDEX`（スカラー）/ 4 `CREATE UNIQUE INDEX` /
+//! 5 `ALTER TABLE ADD COLUMN g ... GENERATED ALWAYS AS (k * 2 + c) STORED`（Issue #3330。TABLE-50。全行を 1 つの
+//! write txn で計算して書き直す。fast default 列 c の補完値から計算する）/ 6 `DROP TABLE dd_<r-1>`（r >= 1 のみ）。
 //!
 //! サブコマンド:
 //! - `write <db_path>`: 現在の n を推定して（一致する n がちょうど 1 つでなければ開始を拒否する）
@@ -29,6 +31,9 @@
 //! Issue #2418（SQL-23 を併せて参照）: `write` は各文の `exec` 直前に `STMT step=<s> stage=<g>` を出す。
 //! kill 位置の分類（最後の進行行が STMT なら文の実行中）と、実行中なら n が ack 済み n か +1、文の間なら
 //! 完全一致の検査、DDL 段の実行中の中断を 1 度も観測しない実行の失敗は `scripts/crash_test_ddl.sh` が行う。
+//!
+//! 生成列の段（stage 5）は、カタログだけが変わった状態・一部の行だけが計算済みの状態・生成式を持たない通常の列 g を
+//! self-check の負の対照で拒否し、生存時は全行が `g == k * 2 + r` を満たすことを確かめる。
 //!
 //! 対象外（兄弟 Issue）: DDL の途中のエラーで何も残らないことと writer 待機の `55P03` は #2419 が担当する。
 //! 文の内部（commit 直前・直後）で決定的に止める同期点は設けない（確率的な kill 位置の分類に留める）。
@@ -60,8 +65,8 @@ const TENANT_B: &str = "crash-ddl-b";
 const SEED: i64 = 8;
 /// 自走するラウンド数の上限（安全弁。通常は SIGKILL で止まる。DoS 対策で表・行の増加も抑える）。
 const MAX_ROUNDS: u64 = 30_000;
-/// ステップ総数の上限（ラウンド 0 は 5 段、以降は 6 段）。
-const MAX_STEPS: u64 = 5 + 6 * (MAX_ROUNDS - 1);
+/// ステップ総数の上限（ラウンド 0 は 6 段、以降は 7 段）。
+const MAX_STEPS: u64 = 6 + 7 * (MAX_ROUNDS - 1);
 /// `SELECT … LIMIT` の上限。達したら全件を見られないので fail-closed。
 const SCAN_LIMIT: u64 = 10_000;
 /// 文と文の間の待機（マイクロ秒）。1 文の実行は 0.1ms 前後と短く、待機が長いと kill の大半が文と文の
@@ -96,6 +101,7 @@ fn main() {
 struct Tbl {
     rows: bool,
     col_c: bool,
+    col_g: bool,
     sidx: bool,
     uidx: bool,
 }
@@ -103,13 +109,13 @@ struct Tbl {
 /// ラウンド番号 → 表の状態（生きている表だけ）。
 type State = BTreeMap<u64, Tbl>;
 
-/// ステップ番号（0 起点）→（ラウンド, 段）。ラウンド 0 は 5 段、以降は 6 段。
+/// ステップ番号（0 起点）→（ラウンド, 段）。ラウンド 0 は 6 段、以降は 7 段。
 fn locate(step: u64) -> (u64, u64) {
-    if step < 5 {
+    if step < 6 {
         (0, step)
     } else {
-        let t = step - 5;
-        (1 + t / 6, t % 6)
+        let t = step - 6;
+        (1 + t / 7, t % 7)
     }
 }
 
@@ -121,7 +127,7 @@ fn apply(state: &mut State, created: &mut BTreeSet<u64>, step: u64) {
             state.insert(r, Tbl::default());
             created.insert(r);
         }
-        5 => {
+        6 => {
             state.remove(&r.saturating_sub(1));
         }
         s => {
@@ -130,7 +136,8 @@ fn apply(state: &mut State, created: &mut BTreeSet<u64>, step: u64) {
                     1 => t.rows = true,
                     2 => t.col_c = true,
                     3 => t.sidx = true,
-                    _ => t.uidx = true,
+                    4 => t.uidx = true,
+                    _ => t.col_g = true,
                 }
             }
         }
@@ -159,6 +166,9 @@ fn step_sql(step: u64) -> String {
         2 => format!("ALTER TABLE dd_{r} ADD COLUMN c BIGINT DEFAULT {r}"),
         3 => format!("CREATE INDEX dd_{r}_v ON dd_{r} (v)"),
         4 => format!("CREATE UNIQUE INDEX dd_{r}_k ON dd_{r} (k)"),
+        5 => {
+            format!("ALTER TABLE dd_{r} ADD COLUMN g BIGINT GENERATED ALWAYS AS (k * 2 + c) STORED")
+        }
         _ => format!("DROP TABLE dd_{}", r.saturating_sub(1)),
     }
 }
@@ -304,6 +314,8 @@ struct Catalog {
     /// 追加列 `c` の列型・INSERT 用 DEFAULT・読み出し補完値（表名 → 定義）。列名だけでは
     /// `ALTER COLUMN DROP DEFAULT` 等による DEFAULT の欠落を見逃すため別に保持する。
     col_c_def: BTreeMap<String, ColumnDef>,
+    /// 追加列 `g` の定義（表名 → 定義）。生成式の欠落（通常の列 g）を見逃さないため。
+    col_g_def: BTreeMap<String, ColumnDef>,
     indexes: Vec<IdxInfo>,
     /// raw redb の物理表名（一意索引の物理構造 `user_uniq/<表>` の有無の判定に使う）。
     physical: BTreeSet<String>,
@@ -317,6 +329,7 @@ impl Catalog {
             .map_err(|e| format!("list tables failed: {e}"))?;
         let mut columns = BTreeMap::new();
         let mut col_c_def = BTreeMap::new();
+        let mut col_g_def = BTreeMap::new();
         for t in &tables {
             let schema = storage
                 .get_table_schema(t)
@@ -327,6 +340,9 @@ impl Catalog {
             );
             if let Some(c) = schema.columns.iter().find(|c| c.name == "c") {
                 col_c_def.insert(t.clone(), c.clone());
+            }
+            if let Some(c) = schema.columns.iter().find(|c| c.name == "g") {
+                col_g_def.insert(t.clone(), c.clone());
             }
         }
         let indexes = storage
@@ -348,6 +364,7 @@ impl Catalog {
             tables,
             columns,
             col_c_def,
+            col_g_def,
             indexes,
             physical,
         })
@@ -360,9 +377,10 @@ fn observe(core: &EngineCore, cat: &Catalog) -> Res<State> {
     for name in &cat.tables {
         let r = parse_round(name).ok_or_else(|| format!("unexpected table in catalog: {name}"))?;
         let cols = cat.columns.get(name).map(Vec::as_slice).unwrap_or(&[]);
-        let col_c = match cols {
-            [k, v] if k == "k" && v == "v" => false,
-            [k, v, c] if k == "k" && v == "v" && c == "c" => true,
+        let (col_c, col_g) = match cols {
+            [k, v] if k == "k" && v == "v" => (false, false),
+            [k, v, c] if k == "k" && v == "v" && c == "c" => (true, false),
+            [k, v, c, g] if k == "k" && v == "v" && c == "c" && g == "g" => (true, true),
             _ => {
                 return Err(format!(
                     "unexpected columns: table={name} count={}",
@@ -380,7 +398,21 @@ fn observe(core: &EngineCore, cat: &Catalog) -> Res<State> {
                 return Err(format!("column c definition mismatch: table={name}"));
             }
         }
-        let proj = if col_c { "k, v, c" } else { "k, v" };
+        if col_g {
+            // 生成列 g は BIGINT で、生成式を持つ（式を持たない通常の列は拒否する）。
+            let ok = cat
+                .col_g_def
+                .get(name)
+                .is_some_and(|d| d.ty == ColumnType::BigInt && d.generation_expression().is_some());
+            if !ok {
+                return Err(format!("column g definition mismatch: table={name}"));
+            }
+        }
+        let proj = match (col_c, col_g) {
+            (_, true) => "k, v, c, g",
+            (true, false) => "k, v, c",
+            _ => "k, v",
+        };
         let rows = select(
             core,
             TENANT_A,
@@ -396,7 +428,14 @@ fn observe(core: &EngineCore, cat: &Catalog) -> Res<State> {
                     let ok_c = !col_c
                         || cells.get(2).and_then(int_of)
                             == Some(i64::try_from(r).map_err(|_| "round overflow".to_string())?);
-                    if !(ok_k && ok_v && ok_c) {
+                    // 生成列は全行が `k * 2 + r`（c の補完値 r から計算済み）。
+                    let ok_g = !col_g
+                        || cells.get(3).and_then(int_of)
+                            == Some(
+                                k * 2
+                                    + i64::try_from(r).map_err(|_| "round overflow".to_string())?,
+                            );
+                    if !(ok_k && ok_v && ok_c && ok_g) {
                         return Err(format!("row content mismatch: table={name} k={k}"));
                     }
                 }
@@ -404,6 +443,15 @@ fn observe(core: &EngineCore, cat: &Catalog) -> Res<State> {
             }
             n => return Err(format!("unexpected row count: table={name} count={n}")),
         };
+        if !col_g {
+            expect_code(
+                core,
+                TENANT_A,
+                &format!("SELECT g FROM {name} LIMIT 1"),
+                "42703",
+                &format!("column g probe on {name}"),
+            )?;
+        }
         if !col_c {
             expect_code(
                 core,
@@ -418,6 +466,7 @@ fn observe(core: &EngineCore, cat: &Catalog) -> Res<State> {
             Tbl {
                 rows: has_rows,
                 col_c,
+                col_g,
                 sidx: false,
                 uidx: false,
             },
@@ -647,6 +696,45 @@ fn raw_create(path: &str, name: &str) -> Res<()> {
     w.commit().map_err(|_| "raw commit failed".to_string())
 }
 
+/// 行ストア `user_rows/dd_0` の raw 内容（キー・値）。
+fn raw_snapshot(path: &str) -> Res<Vec<(String, u64, Vec<u8>)>> {
+    use redb::ReadableTable as _;
+    let db = redb::Database::open(path).map_err(|_| "raw open failed".to_string())?;
+    let r = db.begin_read().map_err(|_| "raw read failed".to_string())?;
+    let def: redb::TableDefinition<(&str, u64), &[u8]> =
+        redb::TableDefinition::new("user_rows/dd_0");
+    let t = r
+        .open_table(def)
+        .map_err(|_| "raw open table failed".to_string())?;
+    let mut out = Vec::new();
+    for e in t.iter().map_err(|_| "raw iter failed".to_string())? {
+        let (k, v) = e.map_err(|_| "raw entry failed".to_string())?;
+        let (tenant, id) = k.value();
+        out.push((tenant.to_string(), id, v.value().to_vec()));
+    }
+    Ok(out)
+}
+
+/// 先頭 `count` 行を snapshot のバイト列へ戻す（生成列の計算前の行を再現する負の対照）。
+fn raw_restore(path: &str, rows: &[(String, u64, Vec<u8>)], count: usize) -> Res<()> {
+    let db = redb::Database::open(path).map_err(|_| "raw open failed".to_string())?;
+    let w = db
+        .begin_write()
+        .map_err(|_| "raw write failed".to_string())?;
+    {
+        let def: redb::TableDefinition<(&str, u64), &[u8]> =
+            redb::TableDefinition::new("user_rows/dd_0");
+        let mut t = w
+            .open_table(def)
+            .map_err(|_| "raw open table failed".to_string())?;
+        for (tenant, id, bytes) in rows.iter().take(count) {
+            t.insert((tenant.as_str(), *id), bytes.as_slice())
+                .map_err(|_| "raw insert failed".to_string())?;
+        }
+    }
+    w.commit().map_err(|_| "raw commit failed".to_string())
+}
+
 fn steps(range: std::ops::Range<u64>) -> Vec<String> {
     range.map(step_sql).collect()
 }
@@ -654,7 +742,7 @@ fn steps(range: std::ops::Range<u64>) -> Vec<String> {
 fn self_check(dir: &str) -> Res<()> {
     // 正例: 到達しうる全状態（3 ラウンド分）を 1 段ずつ進め、各段の直後にちょうどその n で通る。
     let pos = format!("{dir}/positive.redb");
-    let total = 5 + 6 + 6;
+    let total = 6 + 7 + 7;
     for s in 0..total {
         run_sqls(&pos, &[step_sql(s)])?;
         let (n, _) = verify(&pos).map_err(|e| format!("positive step {s} rejected: {e}"))?;
@@ -707,7 +795,7 @@ fn self_check(dir: &str) -> Res<()> {
         run_sqls(p, &v)
     })?;
     neg("drop-residue", &|p| {
-        run_sqls(p, &steps(0..11))?;
+        run_sqls(p, &steps(0..13))?;
         raw_create(p, "user_rows/dd_0")
     })?;
     neg("unregistered-table-residue", &|p| {
@@ -715,7 +803,7 @@ fn self_check(dir: &str) -> Res<()> {
         raw_create(p, "user_rows/dd_1")
     })?;
     neg("missing-drop", &|p| {
-        let mut v = steps(0..10);
+        let mut v = steps(0..12);
         v.push("CREATE TABLE dd_2 (k BIGINT, v TEXT)".to_string());
         run_sqls(p, &v)
     })?;
@@ -732,6 +820,24 @@ fn self_check(dir: &str) -> Res<()> {
     neg("extra-index", &|p| {
         let mut v = steps(0..5);
         v.push("CREATE INDEX dd_0_x ON dd_0 (v)".to_string());
+        run_sqls(p, &v)
+    })?;
+    // 生成列の追加（stage 5）の部分状態: カタログだけが変わり行が元のまま／一部の行だけ計算済み／生成式なし。
+    neg("generated-catalog-only", &|p| {
+        run_sqls(p, &steps(0..5))?;
+        let before = raw_snapshot(p)?;
+        run_sqls(p, &[step_sql(5)])?;
+        raw_restore(p, &before, usize::MAX)
+    })?;
+    neg("generated-partial-rows", &|p| {
+        run_sqls(p, &steps(0..5))?;
+        let before = raw_snapshot(p)?;
+        run_sqls(p, &[step_sql(5)])?;
+        raw_restore(p, &before, 1)
+    })?;
+    neg("generated-plain-column", &|p| {
+        let mut v = steps(0..5);
+        v.push("ALTER TABLE dd_0 ADD COLUMN g BIGINT".to_string());
         run_sqls(p, &v)
     })?;
     neg("empty-db", &|p| {

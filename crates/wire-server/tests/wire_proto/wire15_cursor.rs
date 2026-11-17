@@ -262,8 +262,8 @@ fn wire15_declare_rejects_vector_ranking_select_and_fails_transaction() {
 }
 
 /// `FETCH NEXT`・`FETCH n IN`・`FETCH FORWARD n`（末尾 `;` 付きの単独送信）が
-/// 単純問い合わせで受理され、行が重複・欠落なく進むこと。未対応の方向（`PRIOR`）は
-/// `42601` で Tx が `Failed`（`'E'`）になる（Issue #3173・WIRE-15）。
+/// 単純問い合わせで受理され、行が重複・欠落なく進むこと。指定なし（NO SCROLL）のカーソルへの
+/// `PRIOR` は `55000` で Tx が `Failed`（`'E'`）になる（Issue #3173・#3335・WIRE-15・WIRE-27）。
 #[test]
 fn wire15_fetch_next_in_and_forward_over_simple_query() {
     let (core, _guard) = new_core_with_rows();
@@ -297,7 +297,7 @@ fn wire15_fetch_next_in_and_forward_over_simple_query() {
     assert_eq!(ids.len(), 5);
 
     send_simple_query(&mut stream, "FETCH PRIOR FROM c;");
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+    expect_error_response_with_sqlstate(&mut stream, "55000");
     assert_eq!(read_ready_for_query_status(&mut stream), b'E');
 
     send_simple_query(&mut stream, "ROLLBACK");
@@ -307,8 +307,8 @@ fn wire15_fetch_next_in_and_forward_over_simple_query() {
 
 /// `FETCH ALL`／`FETCH FORWARD ALL`（末尾 `;` 付きの単独送信）が単純問い合わせで受理され、
 /// 残り全行がタグ `FETCH n`（実際の行数）で返り、続く `FETCH ALL` は `FETCH 0`
-/// （Issue #3174・WIRE-15）。`BACKWARD ALL` は `42601` で Tx が `Failed`（`'E'`）になる。
-// tracked: #3172
+/// （Issue #3174・WIRE-15）。指定なし（NO SCROLL）のカーソルへの `BACKWARD ALL` は `55000` で
+/// Tx が `Failed`（`'E'`）になる（Issue #3335・WIRE-27）。
 #[test]
 fn wire15_fetch_all_over_simple_query() {
     let (core, _guard) = new_core_with_rows();
@@ -341,7 +341,7 @@ fn wire15_fetch_all_over_simple_query() {
     assert_eq!(ids.len(), 5);
 
     send_simple_query(&mut stream, "FETCH BACKWARD ALL FROM c;");
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+    expect_error_response_with_sqlstate(&mut stream, "55000");
     assert_eq!(read_ready_for_query_status(&mut stream), b'E');
 
     send_simple_query(&mut stream, "ROLLBACK");
@@ -925,6 +925,358 @@ fn wire15_declare_scroll_cursor_with_trailing_semicolon_over_simple_query() {
         "DECLARE h CURSOR WITH HOLD FOR SELECT id FROM docs LIMIT 100;",
     );
     expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
+
+// --- FETCH の向き（Issue #3335・WIRE-27） ----------------------------------------------
+
+/// psql と同じく末尾 `;` 付きで単独送信した SCROLL カーソルの各向きが、PG と同じ行・
+/// CommandComplete タグ（`FETCH n`。n は返した行数）で返る。
+#[test]
+fn wire27_fetch_directions_over_simple_query_on_scroll_cursor() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    // (文, 期待する id, 期待するタグ)。位置は先頭の前から始まる。
+    let script: &[(&str, &[&str], &str)] = &[
+        ("FETCH FIRST FROM c;", &["1"], "FETCH 1"),
+        ("FETCH LAST FROM c;", &["5"], "FETCH 1"),
+        ("FETCH PRIOR FROM c;", &["4"], "FETCH 1"),
+        ("FETCH ABSOLUTE 2 FROM c;", &["2"], "FETCH 1"),
+        ("FETCH RELATIVE 2 FROM c;", &["4"], "FETCH 1"),
+        ("FETCH RELATIVE -3 FROM c;", &["1"], "FETCH 1"),
+        ("FETCH 0 FROM c;", &["1"], "FETCH 1"),
+        ("FETCH ABSOLUTE -2 FROM c;", &["4"], "FETCH 1"),
+        ("FETCH BACKWARD 3 FROM c;", &["3", "2", "1"], "FETCH 3"),
+        ("FETCH PRIOR FROM c;", &[], "FETCH 0"),
+        ("FETCH NEXT FROM c;", &["1"], "FETCH 1"),
+        ("FETCH BACKWARD ALL FROM c;", &[], "FETCH 0"),
+        (
+            "FETCH FORWARD ALL FROM c;",
+            &["1", "2", "3", "4", "5"],
+            "FETCH 5",
+        ),
+        (
+            "FETCH BACKWARD ALL FROM c;",
+            &["5", "4", "3", "2", "1"],
+            "FETCH 5",
+        ),
+        ("FETCH ABSOLUTE 9 FROM c;", &[], "FETCH 0"),
+        ("FETCH PRIOR FROM c;", &["5"], "FETCH 1"),
+    ];
+    for (sql, expect_ids, expect_tag) in script {
+        send_simple_query(&mut stream, sql);
+        let (page, tag) = read_fetch_page(&mut stream);
+        assert_eq!(&tag, expect_tag, "{sql}");
+        let want: Vec<String> = expect_ids.iter().map(|s| s.to_string()).collect();
+        assert_eq!(page, want, "{sql}");
+    }
+    simple_ok(&mut stream, "CLOSE c;", "CLOSE CURSOR");
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
+
+/// NO SCROLL の逆方向は `55000`（Tx は `Failed`）、不在名は `34000`。
+#[test]
+fn wire27_fetch_backward_on_no_scroll_is_55000_and_unknown_name_is_34000() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    send_simple_query(&mut stream, "FETCH 2 FROM c;");
+    let (_, tag) = read_fetch_page(&mut stream);
+    assert_eq!(tag, "FETCH 2");
+    send_simple_query(&mut stream, "FETCH PRIOR FROM c;");
+    expect_error_response_with_sqlstate(&mut stream, "55000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    send_simple_query(&mut stream, "FETCH LAST FROM missing_cursor;");
+    expect_error_response_with_sqlstate(&mut stream, "34000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
+// --- MOVE（Issue #3336・WIRE-27） ----------------------------------------------------
+
+/// psql と同じ末尾 `;` 付きの単独送信で、`MOVE` は行なしの CommandComplete `MOVE n` だけを返し
+/// （`simple_ok` が RowDescription の不在も確かめる）、後続 `FETCH` が移動先の次から始まる。
+/// 複数文メッセージ内でも `0A000` にならない（ReadOnly 分類の回帰）。
+#[test]
+fn wire27_move_over_simple_query_returns_tag_only_and_moves_position() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "MOVE FORWARD 2 IN c;", "MOVE 2");
+    send_simple_query(&mut stream, "FETCH NEXT FROM c;");
+    let (page, tag) = read_fetch_page(&mut stream);
+    assert_eq!((page, tag), (vec!["3".to_string()], "FETCH 1".to_string()));
+    simple_ok(&mut stream, "MOVE BACKWARD 1 FROM c;", "MOVE 1");
+    send_simple_query(&mut stream, "FETCH NEXT FROM c;");
+    let (page, _) = read_fetch_page(&mut stream);
+    assert_eq!(page, vec!["3".to_string()]);
+    simple_ok(&mut stream, "MOVE ABSOLUTE 0 IN c;", "MOVE 0");
+    send_simple_query(&mut stream, "FETCH NEXT FROM c;");
+    let (page, _) = read_fetch_page(&mut stream);
+    assert_eq!(page, vec!["1".to_string()]);
+
+    // 複数文メッセージ（MOVE の後に MOVE）。2 つの CommandComplete が続く。
+    send_simple_query(&mut stream, "MOVE ABSOLUTE 0 IN c; MOVE FORWARD 1 IN c;");
+    assert_eq!(read_command_complete(&mut stream), "MOVE 0");
+    assert_eq!(read_command_complete(&mut stream), "MOVE 1");
+    read_ready_for_query(&mut stream);
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
+
+/// NO SCROLL の逆方向は `55000`（Tx は `Failed`）、不在名は `34000`。
+#[test]
+fn wire27_move_backward_on_no_scroll_is_55000_and_unknown_name_is_34000() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "MOVE 2 FROM c;", "MOVE 2");
+    send_simple_query(&mut stream, "MOVE BACKWARD 1 FROM c;");
+    expect_error_response_with_sqlstate(&mut stream, "55000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    send_simple_query(&mut stream, "MOVE NEXT FROM missing_cursor;");
+    expect_error_response_with_sqlstate(&mut stream, "34000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
+// --- 3 テナントの越境・NO SCROLL の境界・savepoint（Issue #3337・WIRE-27・WIRE-15） --------
+
+/// 3 テナントの行（id の範囲・`lang` の印・行数を分ける）。他テナントへ見えない可視性で入れる。
+const THREE_TENANTS: [(&str, &[u64], &str); 3] = [
+    ("tenant-a", &[1, 2, 3], "ta"),
+    ("tenant-b", &[101, 102, 103, 104, 105], "tb"),
+    ("tenant-c", &[201, 202, 203, 204, 205, 206, 207], "tc"),
+];
+
+fn new_core_with_three_tenants() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire15-cursor-3tenants");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    for (tenant, ids, mark) in THREE_TENANTS {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        for id in ids {
+            let op_id =
+                engine::recovery::required_op_id::OperationId::parse(&format!("seed-{mark}-{id}"))
+                    .expect("valid operation_id");
+            engine::tenant::insert_typed_row(
+                &storage,
+                TABLE,
+                &ctx,
+                *id,
+                Visibility::Private,
+                &[
+                    Value::Vector(vec![1.0, 0.0, 0.0]),
+                    Value::Text(mark.to_string()),
+                ],
+                &op_id,
+            )
+            .expect("insert row");
+        }
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// `(id, lang)` の 2 列を読む `FETCH` の 1 ページ（`RowDescription` から `ReadyForQuery` まで）。
+fn read_id_lang_page(stream: &mut std::net::TcpStream) -> (Vec<(String, String)>, String) {
+    let _ = read_row_description(stream);
+    let mut rows = Vec::new();
+    while peek_message_type(stream) == b'D' {
+        let row = read_data_row(stream);
+        rows.push((
+            row[0].clone().expect("id is not null"),
+            row[1].clone().expect("lang is not null"),
+        ));
+    }
+    let tag = read_command_complete(stream);
+    assert_eq!(read_ready_for_query_status(stream), b'T');
+    (rows, tag)
+}
+
+/// 3 テナントが同名 `c` の SCROLL カーソルを同時に持ち、psql と同じ末尾 `;` 付きの単独送信で
+/// 逆方向・`MOVE` を流しても、行・件数は自テナントの行だけで決まる（越境 0 件）。別接続は不在名と同じ `34000`。
+#[test]
+fn wire27_three_tenants_scroll_and_move_stay_inside_their_own_rows() {
+    let (core, _guard) = new_core_with_three_tenants();
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-a", "correct-horse"),
+        ("bob", "tenant-b", "battery-staple"),
+        ("carol", "tenant-c", "purple-monkey"),
+    ]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let creds = [
+        ("alice", "correct-horse"),
+        ("bob", "battery-staple"),
+        ("carol", "purple-monkey"),
+    ];
+    let mut streams: Vec<std::net::TcpStream> = creds
+        .iter()
+        .map(|(u, p)| authenticate_to_ready_for_query(addr, u, p))
+        .collect();
+    for stream in &mut streams {
+        simple_ok(stream, "BEGIN;", "BEGIN");
+        simple_ok(
+            stream,
+            "DECLARE c SCROLL CURSOR FOR SELECT id, lang FROM docs LIMIT 100;",
+            "DECLARE CURSOR",
+        );
+    }
+    // 3 接続を交互に進める。
+    for (i, (_, ids, mark)) in THREE_TENANTS.iter().enumerate() {
+        let n = ids.len();
+        let last = ids[n - 1].to_string();
+        let stream = &mut streams[i];
+        send_simple_query(stream, "FETCH LAST FROM c;");
+        let (rows, tag) = read_id_lang_page(stream);
+        assert_eq!(rows, vec![(last, mark.to_string())], "tenant {i}");
+        assert_eq!(tag, "FETCH 1");
+        simple_ok(
+            stream,
+            "MOVE BACKWARD ALL IN c;",
+            &format!("MOVE {}", n - 1),
+        );
+        send_simple_query(stream, "FETCH FORWARD ALL FROM c;");
+        let (rows, tag) = read_id_lang_page(stream);
+        assert_eq!(tag, format!("FETCH {n}"), "tenant {i}");
+        let got: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+        let want: Vec<String> = ids.iter().map(u64::to_string).collect();
+        assert_eq!(got, want, "tenant {i}");
+        assert!(
+            rows.iter().all(|r| r.1 == *mark),
+            "tenant {i} saw a foreign mark"
+        );
+    }
+    // カーソルを持たない別接続（alice の 2 本目）は不在名と同じ 34000（存在情報を漏らさない）。
+    let mut other = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    simple_ok(&mut other, "BEGIN;", "BEGIN");
+    send_simple_query(&mut other, "FETCH LAST FROM c;");
+    expect_error_response_with_sqlstate(&mut other, "34000");
+    assert_eq!(read_ready_for_query_status(&mut other), b'E');
+    simple_ok(&mut other, "ROLLBACK;", "ROLLBACK");
+    for stream in &mut streams {
+        simple_ok(stream, "ROLLBACK;", "ROLLBACK");
+    }
+}
+
+/// PG17 実測に合わせて新たに受理される NO SCROLL の形（psql の末尾 `;` 付き単独送信）。
+/// 行の上の `MOVE 0`／`MOVE BACKWARD 0` は `MOVE 1` で位置は不変、末尾の後からの `ABSOLUTE N+2` 以上は
+/// 0 行で受理され Tx は `T` のまま。`ABSOLUTE N+1` 以下は `55000`（`E`）。
+#[test]
+fn wire27_no_scroll_boundary_forms_follow_pg17_over_simple_query() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    send_simple_query(&mut stream, "FETCH 2 FROM c;");
+    let (_, tag) = read_fetch_page(&mut stream);
+    assert_eq!(tag, "FETCH 2");
+    simple_ok(&mut stream, "MOVE 0 IN c;", "MOVE 1");
+    simple_ok(&mut stream, "MOVE BACKWARD 0 IN c;", "MOVE 1");
+    send_simple_query(&mut stream, "FETCH NEXT FROM c;");
+    let (page, _) = read_fetch_page(&mut stream);
+    assert_eq!(page, vec!["3".to_string()]);
+
+    send_simple_query(&mut stream, "FETCH ALL FROM c;");
+    let (_, tag) = read_fetch_page(&mut stream);
+    assert_eq!(tag, "FETCH 2");
+    send_simple_query(&mut stream, "FETCH ABSOLUTE 7 FROM c;");
+    let (page, tag) = read_fetch_page(&mut stream);
+    assert_eq!((page.len(), tag.as_str()), (0, "FETCH 0"));
+    simple_ok(&mut stream, "MOVE ABSOLUTE 7 IN c;", "MOVE 0");
+
+    send_simple_query(&mut stream, "FETCH ABSOLUTE 6 FROM c;");
+    expect_error_response_with_sqlstate(&mut stream, "55000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
+
+/// savepoint の整合（SQL-69 (5)・WIRE-27 (3) のポインタ）。前に宣言したカーソルの位置は `ROLLBACK TO` で
+/// 戻らず、後に宣言したカーソルは閉じて `MOVE` が `34000`。
+#[test]
+fn wire27_rollback_to_keeps_older_scroll_cursor_and_closes_newer_one() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "MOVE FORWARD 2 IN c;", "MOVE 2");
+    simple_ok(&mut stream, "SAVEPOINT s;", "SAVEPOINT");
+    send_simple_query(&mut stream, "FETCH LAST FROM c;");
+    let (page, _) = read_fetch_page(&mut stream);
+    assert_eq!(page, vec!["5".to_string()]);
+    simple_ok(
+        &mut stream,
+        "DECLARE d SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "ROLLBACK TO s;", "ROLLBACK");
+    send_simple_query(&mut stream, "FETCH PRIOR FROM c;");
+    let (page, _) = read_fetch_page(&mut stream);
+    assert_eq!(page, vec!["4".to_string()]);
+    send_simple_query(&mut stream, "MOVE FORWARD 1 IN d;");
+    expect_error_response_with_sqlstate(&mut stream, "34000");
     assert_eq!(read_ready_for_query_status(&mut stream), b'E');
     simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
 }

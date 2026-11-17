@@ -306,6 +306,13 @@ fn render_column<E>(
         s.push_str(" NOT NULL");
     }
     s.push_str(&tail);
+    // 生成列（TABLE-50・Issue #3327）。正規描画の式を `GENERATED ALWAYS AS (<式>) STORED` で出す
+    // （DEFAULT は出さない。復元時に構文段・束縛段が同じ正規描画へ戻す往復を保つ）。
+    if let Some(generated) = &col.generated {
+        s.push_str(" GENERATED ALWAYS AS (");
+        s.push_str(&generated.expression);
+        s.push_str(") STORED");
+    }
     Ok(s)
 }
 

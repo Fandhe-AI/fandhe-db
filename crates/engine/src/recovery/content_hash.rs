@@ -2221,9 +2221,24 @@ fn push_dml_assignments(
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
     use crate::sql::allowlist::{InsertLiteral, SetValue};
 
+    // 生成列への `SET g = DEFAULT`（TABLE-50・Issue #3328）は何も代入しない受理だけの項で、束縛段が
+    // 捨てる（`bind_set_assignments`）。`id` 指定形 UPDATE は束縛後の SET 列でハッシュするため、
+    // 述語形・結合形も同じ材料（生成列の DEFAULT 項を除く）でハッシュして 2 形の同値判定を揃える
+    // （INSERT が生成列を材料から除くのと同じ方針。RECOVER-11 のポインタ）。
+    let is_generated_default = |name: &str, value: &SetValue| {
+        matches!(value, SetValue::Default)
+            && schema
+                .columns
+                .iter()
+                .any(|c| c.name == name && c.generated.is_some())
+    };
+    let assignments: Vec<&(&str, &SetValue)> = assignments
+        .iter()
+        .filter(|(name, value)| !is_generated_default(name, value))
+        .collect();
     let count = u32::try_from(assignments.len()).map_err(|_| dml_hash_field_too_large())?;
     b.push_raw(&count.to_le_bytes());
-    for (name, value) in assignments {
+    for (name, value) in assignments.into_iter().map(|&(n, v)| (n, v)) {
         b.push_bytes(name.as_bytes())
             .map_err(|_| dml_hash_field_too_large())?;
         // 式（Issue #1544・SQL-45 のポインタ）はタグ 6 ＋ 構文木の直列化
@@ -2251,7 +2266,7 @@ fn push_dml_assignments(
             InsertLiteral::String(s) => {
                 let vector_dim = if repr == DmlVectorRepr::Canonical {
                     schema.columns.iter().find_map(|c| {
-                        if &c.name == name {
+                        if c.name == name {
                             match c.ty {
                                 crate::catalog::ColumnType::Vector(dim) => Some(dim),
                                 _ => None,

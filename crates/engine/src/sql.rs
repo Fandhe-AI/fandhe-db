@@ -191,6 +191,9 @@ pub(crate) mod describe;
 pub mod dml_from;
 pub(crate) mod embedded_unit;
 pub(crate) mod function_scan;
+pub(crate) mod generated_column;
+#[cfg(test)]
+mod generated_column_tests;
 #[cfg(test)]
 mod identity_column_tests;
 pub mod insert_explain;
@@ -198,6 +201,7 @@ pub(crate) mod insert_select;
 pub(crate) mod int8vec_knn;
 pub(crate) mod interval_arith;
 pub(crate) mod json_agg;
+pub(crate) mod lateral_bind;
 pub(crate) mod matview;
 pub mod record_text;
 pub(crate) mod recursive_cte;
@@ -665,6 +669,10 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query` は `CommandComplete` タグ `CLOSE CURSOR`
     /// （件数を持たない固定タグ）を返す。
     CloseCursor,
+    /// `MOVE [<向き>] { FROM | IN } <name>`（Issue #3336・WIRE-27）が成功したことを示す応答。
+    /// 値は同じ向きの `FETCH` が返す行数。行は返さず、`wire-server::simple_query` は
+    /// `CommandComplete` タグ `MOVE <n>` のみを送出する。BREAKING CHANGE: 公開 enum への variant 追加。
+    Move(u64),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（TASK-202・SQL-23。
     /// Issue #900）がセッション経由の実行経路で成功したことを示す応答。DDL
     /// 権限ゲート（`sql::ddl::require_ddl_permission`）・実行本体

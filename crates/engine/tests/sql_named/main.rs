@@ -67,6 +67,7 @@ mod sql_create_table_composite_types;
 mod sql_create_table_named_primary_key;
 mod sql_create_table_named_unique_references;
 mod sql_cursor;
+mod sql_cursor_pg17_parity;
 mod sql_ddl_add_column;
 mod sql_ddl_drop_alter_column;
 mod sql_ddl_rename_column;

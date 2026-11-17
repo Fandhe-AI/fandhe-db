@@ -50,6 +50,9 @@ pub(crate) enum IndexExprSite {
     Key,
     /// 部分索引の `WHERE` 述語。
     Predicate,
+    /// 生成列 `GENERATED ALWAYS AS (<式>) STORED` の式（TABLE-50・Issue #3327）。決定性検査と先読みを
+    /// 共有し文言だけ切り替える。SQLSTATE は呼び出し側（`sql::generated_column`）が `42P17` へ揃える。
+    Generated,
 }
 
 impl IndexExprSite {
@@ -57,36 +60,77 @@ impl IndexExprSite {
         match self {
             Self::Key => MSG_SUBQUERY,
             Self::Predicate => "cannot use subquery in index predicate",
+            Self::Generated => "cannot use subquery in generated column expression",
         }
     }
     fn aggregate(self) -> &'static str {
         match self {
             Self::Key => MSG_AGGREGATE,
             Self::Predicate => "aggregate functions are not allowed in index predicates",
+            Self::Generated => {
+                "aggregate functions are not allowed in generated column expressions"
+            }
         }
     }
     fn window(self) -> &'static str {
         match self {
             Self::Key => MSG_WINDOW,
             Self::Predicate => "window functions are not allowed in index predicates",
+            Self::Generated => "window functions are not allowed in generated column expressions",
         }
     }
     fn srf(self) -> &'static str {
         match self {
             Self::Key => MSG_SRF,
             Self::Predicate => "set-returning functions are not allowed in index predicates",
+            Self::Generated => {
+                "set-returning functions are not allowed in generated column expressions"
+            }
         }
     }
     fn not_immutable(self) -> &'static str {
         match self {
             Self::Key => MSG_NOT_IMMUTABLE,
             Self::Predicate => "functions in index predicate must be marked IMMUTABLE",
+            Self::Generated => "generation expression is not immutable",
+        }
+    }
+    /// 部分クエリ・集計・ウィンドウ・SRF の拒否の SQLSTATE を文脈で切り替える。生成列
+    /// （TABLE-50 (1)・Issue #3327）は常に `42P17`（`InvalidObjectDefinition`）、索引の文脈は
+    /// 従来の `default`（PostgreSQL と同じ分類）。
+    fn rejection(self, detail: &'static str, default: SqlSurfaceError) -> SqlSurfaceError {
+        match self {
+            Self::Generated => SqlSurfaceError::InvalidObjectDefinition { detail },
+            Self::Key | Self::Predicate => default,
+        }
+    }
+    fn distinct_from(self) -> &'static str {
+        match self {
+            Self::Key | Self::Predicate => {
+                "IS [NOT] DISTINCT FROM is not supported in an index expression or predicate"
+            }
+            Self::Generated => {
+                "IS [NOT] DISTINCT FROM is not supported in a generated column expression"
+            }
+        }
+    }
+    fn regex(self) -> &'static str {
+        match self {
+            Self::Key | Self::Predicate => {
+                "regular expression operators are not supported in an index expression or predicate"
+            }
+            Self::Generated => {
+                "regular expression operators are not supported in a generated column expression"
+            }
         }
     }
     fn udf(self) -> &'static str {
         match self {
             Self::Key => MSG_UDF,
             Self::Predicate => "user-defined functions in index predicates are not supported",
+            Self::Generated => {
+                "user-defined functions in generated column expressions are not supported"
+            }
         }
     }
 }
@@ -98,13 +142,15 @@ pub(crate) fn element_end(tokens: &[Token], start: usize) -> usize {
     let mut i = start;
     while let Some(tok) = tokens.get(i) {
         match tok {
-            Token::Punct('(') => depth = depth.saturating_add(1),
+            // `ARRAY[a, b]` 内のカンマで要素を切らないよう、角括弧も丸括弧と同じ深さで数える。
+            Token::Punct('(' | '[') => depth = depth.saturating_add(1),
             Token::Punct(')') => {
                 if depth == 0 {
                     return i;
                 }
                 depth -= 1;
             }
+            Token::Punct(']') => depth = depth.saturating_sub(1),
             Token::Punct(',') if depth == 0 => return i,
             _ => {}
         }
@@ -166,9 +212,12 @@ pub(crate) fn precheck_index_tokens(
                     Some(Token::Keyword(Keyword::Select))
                 ) =>
             {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: site.subquery().to_string(),
-                });
+                return Err(site.rejection(
+                    site.subquery(),
+                    SqlSurfaceError::FeatureNotSupported {
+                        detail: site.subquery().to_string(),
+                    },
+                ));
             }
             Token::Ident(name)
                 if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) =>
@@ -186,18 +235,24 @@ pub(crate) fn precheck_index_tokens(
                 let is_window = WindowFunc::from_name(name).is_some();
                 if has_over {
                     if is_agg || is_window {
-                        return Err(SqlSurfaceError::WindowingError {
-                            detail: site.window(),
-                        });
+                        return Err(site.rejection(
+                            site.window(),
+                            SqlSurfaceError::WindowingError {
+                                detail: site.window(),
+                            },
+                        ));
                     }
                     return Err(SqlSurfaceError::unsupported(
                         "OVER is not allowed for a non-window function",
                     ));
                 }
                 if is_agg {
-                    return Err(SqlSurfaceError::GroupingError {
-                        detail: site.aggregate(),
-                    });
+                    return Err(site.rejection(
+                        site.aggregate(),
+                        SqlSurfaceError::GroupingError {
+                            detail: site.aggregate(),
+                        },
+                    ));
                 }
                 if is_window {
                     return Err(SqlSurfaceError::unsupported(
@@ -205,9 +260,12 @@ pub(crate) fn precheck_index_tokens(
                     ));
                 }
                 if is_set_returning_name(&name.to_ascii_lowercase()) {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: site.srf().to_string(),
-                    });
+                    return Err(site.rejection(
+                        site.srf(),
+                        SqlSurfaceError::FeatureNotSupported {
+                            detail: site.srf().to_string(),
+                        },
+                    ));
                 }
             }
             _ => {}
@@ -348,6 +406,17 @@ fn defer_udf(
     }
 }
 
+/// 生成列の式（[`IndexExprSite::Generated`]）の構文段の決定性検査（TABLE-50・Issue #3327）。
+/// [`check_expr_with`] を共有し、組み込み以外の関数（セッション UDF・WASM UDF・カタログ関数）は
+/// 保留せずその場で `42P17` にする（本体の実行が未実装で、書き込みごとの再束縛で評価できず
+/// fail-open になるため。IMMUTABLE な UDF も拒否する。PG との既知の差）。カタログを引かない。
+pub(crate) fn check_generated_expression_determinism(expr: &Expr) -> Result<(), SqlSurfaceError> {
+    let site = IndexExprSite::Generated;
+    check_expr_with(expr, site, &|_, _| {
+        Err(SqlSurfaceError::InvalidObjectDefinition { detail: site.udf() })
+    })
+}
+
 /// 組み込み以外の関数に達したときに呼ばれるフック（`Err` で走査を打ち切る）。
 type UdfHook<'a> = dyn Fn(&str, usize) -> Result<(), SqlSurfaceError> + 'a;
 
@@ -410,14 +479,11 @@ fn check_expr_with(
         }
         // `IS [NOT] DISTINCT FROM` は索引の式・述語では対象外（fail-closed。設計文書の対象外節）。
         Expr::IsDistinctFrom { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "IS [NOT] DISTINCT FROM is not supported in an index expression or predicate"
-                .to_string(),
+            detail: site.distinct_from().to_string(),
         }),
         // 正規表現マッチも同様（SQL-55・Issue #1787。fail-closed）。
         Expr::RegexMatch { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail:
-                "regular expression operators are not supported in an index expression or predicate"
-                    .to_string(),
+            detail: site.regex().to_string(),
         }),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => check_expr_with(expr, site, udf),
         Expr::SqlJsonQuery(q) => q
@@ -717,6 +783,92 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
     })
 }
 
+/// 代入先の列型 `target` と式 `expr` の静的な結果型の組が、代入キャストでセッション TZ 依存の変換
+/// （`TIMESTAMP`／`DATE` ⇔ `TIMESTAMPTZ`）を挿入するか。生成列は式を不変に限るため、この組は
+/// 呼び出し側（`generated_column::bind_generated_column`）が `42P17` で拒否する。
+pub(crate) fn assignment_cast_is_session_dependent(
+    expr: &Expr,
+    target: &crate::catalog::ColumnType,
+    schema: &crate::catalog::TableSchema,
+) -> bool {
+    use crate::catalog::ColumnType;
+    use crate::sql::udf_call::ExprType;
+    // 配列列への代入は要素ごとの変換になる（`bind_array_assignment`）。変換元・先の要素型の組が
+    // [`elem_assignment_is_session_dependent`] に該当すれば TZ・書式依存として扱う（fail-closed）。
+    if let ColumnType::Array(at) = target {
+        let dst = at.elem();
+        if let Expr::ArrayConstructor(items) = expr {
+            return items.iter().any(|i| {
+                static_type_of(i, schema)
+                    .and_then(expr_type_elem)
+                    .is_some_and(|src| elem_assignment_is_session_dependent(src, dst))
+            });
+        }
+        return array_source_elem(expr, schema)
+            .is_some_and(|src| elem_assignment_is_session_dependent(src, dst));
+    }
+    // スカラー列も配列要素と同じ判定を共有する（`TIMESTAMPTZ` → `TIME`・文字列、日時 → 文字列を含む）。
+    // 文字列 → `TIMESTAMPTZ` は定数リテラルの取り込みと区別できないため、スカラーでは対象外とする。
+    match (column_type_elem(target), static_type_of(expr, schema)) {
+        (Some(dst), Some(src_ty)) => {
+            src_ty != ExprType::Text
+                && expr_type_elem(src_ty)
+                    .is_some_and(|src| elem_assignment_is_session_dependent(src, dst))
+        }
+        _ => false,
+    }
+}
+
+/// 代入キャストの変換元・先の要素型の組が、セッション設定（`TimeZone`・`DateStyle`・`IntervalStyle`）に
+/// 依存して結果が変わる変換か。`TIMESTAMPTZ` と他の日時・文字列との間、および日時・間隔と文字列の間が該当する。
+fn elem_assignment_is_session_dependent(
+    src: crate::catalog::ArrayElemType,
+    dst: crate::catalog::ArrayElemType,
+) -> bool {
+    use crate::catalog::ArrayElemType as E;
+    let is_stringy = |e: E| matches!(e, E::Text | E::Varchar(_) | E::Bpchar(_));
+    let is_datetime = |e: E| matches!(e, E::Date | E::Time | E::Timestamp | E::Interval);
+    if src == dst {
+        return false;
+    }
+    (dst == E::TimestampTz && (matches!(src, E::Timestamp | E::Date) || is_stringy(src)))
+        || (src == E::TimestampTz
+            && (matches!(dst, E::Timestamp | E::Date | E::Time) || is_stringy(dst)))
+        || (is_datetime(src) && is_stringy(dst))
+        || (is_stringy(src) && is_datetime(dst))
+}
+
+/// 式の静的な結果型に対応する要素型（文字列・日時・間隔のみ。他は `None`）。
+fn expr_type_elem(ty: crate::sql::udf_call::ExprType) -> Option<crate::catalog::ArrayElemType> {
+    use crate::catalog::ArrayElemType as E;
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Text => Some(E::Text),
+        ExprType::Date => Some(E::Date),
+        ExprType::Timestamp => Some(E::Timestamp),
+        ExprType::Time => Some(E::Time),
+        ExprType::TimestampTz => Some(E::TimestampTz),
+        ExprType::Interval => Some(E::Interval),
+        _ => None,
+    }
+}
+
+/// スカラー列型に対応する要素型（文字列・日時・間隔のみ。他は `None`）。
+fn column_type_elem(ty: &crate::catalog::ColumnType) -> Option<crate::catalog::ArrayElemType> {
+    use crate::catalog::{ArrayElemType as E, ColumnType};
+    match ty {
+        ColumnType::Text => Some(E::Text),
+        ColumnType::Varchar(n) => Some(E::Varchar(*n)),
+        ColumnType::Bpchar(n) => Some(E::Bpchar(*n)),
+        ColumnType::Date => Some(E::Date),
+        ColumnType::Timestamp => Some(E::Timestamp),
+        ColumnType::Time => Some(E::Time),
+        ColumnType::TimestampTz => Some(E::TimestampTz),
+        ColumnType::Interval => Some(E::Interval),
+        _ => None,
+    }
+}
+
 /// 部分式 `sub` の静的な結果型。束縛できない（文脈依存の型なし `NULL` 等）場合は `None`。
 fn static_type_of(
     sub: &Expr,
@@ -770,10 +922,18 @@ fn array_source_elem(
             whens.iter().map(|(_, r)| r).chain(else_result.as_deref()),
             schema,
         ),
-        Expr::ArrayConstructor(items) => items
-            .iter()
-            .any(|i| static_type_of(i, schema) == Some(crate::sql::udf_call::ExprType::TimestampTz))
-            .then_some(ArrayElemType::TimestampTz),
+        // 要素の静的型から要素型を決める。`TIMESTAMPTZ` を含めばそれ、無ければ最初に判明した型。
+        Expr::ArrayConstructor(items) => {
+            let mut found = None;
+            for i in items {
+                match static_type_of(i, schema).and_then(expr_type_elem) {
+                    Some(ArrayElemType::TimestampTz) => return Some(ArrayElemType::TimestampTz),
+                    Some(t) if found.is_none() => found = Some(t),
+                    _ => {}
+                }
+            }
+            found
+        }
         // スライス・配列関数（`array_cat` 等）は束縛結果が保持する要素型で判定する（Issue #3233）。
         _ => {
             use crate::sql::array_fn::ArrayFnKind;
@@ -1188,6 +1348,11 @@ mod tests {
         // 閉じ括弧が無ければ終端は末尾。
         let t = toks("lower(a");
         assert_eq!(element_end(&t, 0), t.len());
+        // `ARRAY[...]` 内のカンマでは切らない。
+        let t = toks("ARRAY[a, b], c)");
+        let end = element_end(&t, 0);
+        assert!(matches!(t.get(end), Some(Token::Punct(','))));
+        assert_eq!(end, 6);
     }
     // --- 束縛段（Issue #1648） -------------------------------------------------------
 

@@ -489,6 +489,42 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   明示トランザクション）、`crates/wire-server/tests/wire_sql50_update_delete_param.rs`
   （text／binary の Bind・型不一致・テナント境界）、`sql::params` の単体テスト（行値の位置判定）。
 
+## 行値比較の成分の `$n`（パターン 12。Issue #3257。SQL-9・SQL-75・WIRE-12・RLS-10 のポインタ）
+
+`SELECT`／`UPDATE`／`DELETE` の `WHERE` 内の行値比較 `(c1, ..., ck) op (d1, ..., dk)` の成分のうち、成分全体が `$n` 単独の位置を受理する（親 #3254・評価は #3256）。
+
+- **受理形と判定**: パターン 9 と同じ文種・`WHERE` 領域・左右の境界規則。判定は `sql::params::row_compare_param_slots` に集約し、受理（`validate_param_positions`）・型推論（`infer_param_positions`）・Describe 用ダミー置換が同じ表を参照する。括弧の対応は `row_compare_ahead` と同じ規則（括弧深さ 1・角括弧深さ 0 の `,` で区切る）で、成分数は `MAX_ROW_COMPARE_COMPONENTS` 以下・左右同数。
+- **型**: 同じ位置の相手成分が裸の列ならその列の型（左右どちらの辺の `$n` も可）。相手も `$n` なら型を決められず、宣言型が無ければ `42P18`（パターン 9 と同じ）。
+- **序数**: 展開で生成される比較葉は等価述語のダミーフラグの序数に数えられない（束縛段が別カウンタ・空フラグで束縛する）。行値の `$n` は序数に数えず、既存の序数機構には触れない。
+- **Describe・構造検証用の型付きダミー**: 生成葉は実リテラルとして検証されるため、String 種別の `$n` の既定ダミー `'0'` では DATE・UUID・ENUM 等の列が `22007`／`22P02` になる。そこで相手列の型で有効な値（DATE `'2000-01-01'`、TIMESTAMP、TIMESTAMPTZ は明示オフセット付き、TIME、INTERVAL、UUID、BYTEA、ENUM は先頭ラベル。TEXT・NUMERIC 等は `'0'` のまま）を `core.rs` が上書き表として作り、`substitute_dummy_typed_with` へ渡す。ダミーは固定の定数かカタログのラベルだけで、利用者入力を含まない。Parse の構造検証と Describe にだけ使い、Bind は常に実値で再置換して再 parse する。`BEGIN` 時点のスナップショットでの再 parse のため `PreparedSql` が上書き表を保持する。
+- **意図的な拒否（`intentional:`。いずれも fail-closed）**:
+  - 相手成分がリテラル・式・修飾列の位置の `$n`、`$n` が式の内側（`$1 + 1`）・型キャスト付きの形は `42601`（安全に型を決められないため登録しない）。
+  - `EXPLAIN` 前置・`WITH`・集合演算・JOIN・派生表は先頭語・既存の一律拒否のまま `42601`（フラグの序数が検証できないため。パターン 9 と同じ）。
+  - 型付きダミーを持たない列型（JSON 系・配列・ビット列・ベクトル系）の相手は Parse で固定文言の `0A000`。
+  - NULL のバインドはリテラル `NULL` 成分と同じ SQLSTATE（現状は裸の識別子として解決され `42703`）。行値の NULL 成分の評価は本 Issue の対象外で、スカラー比較と同じ規則を維持する。
+- **EXPLAIN**: 出力は閉じた語彙で値・述語テキストを含まず、展開後の束縛結果から導かれる。等価な展開形を手で書いた文の EXPLAIN と完全に一致し、テナントによらず同一（述語の描画器は新設しない。SQL-75・SQL-27 のポインタ）。
+- **RLS**: 展開は既存の述語木だけを生成し、テナント境界・ポリシー・`visible()` の合成点には手を入れない。生成葉の束縛結果の `visible()` の有無を取りこぼさないよう伝播する。ポリシー式（`CREATE/ALTER POLICY`）での行値比較は従来どおり `0A000`（親 #3254）。
+- **検証**: `tests/table_rls/prepared_row_compare.rs`（リテラル形とのパリティ・型付きダミー・序数）・`tests/table_rls/rls10_row_compare_paths.rs`（T2／T3 の越境）・`tests/sql_named/sql_where_row_compare.rs`（EXPLAIN）・`crates/wire-server/tests/wire_sql/wire_row_compare.rs`（wire）。
+
+## 行値の IN の要素の成分の `$n`（パターン 13。Issue #3300。SQL-9・SQL-75・WIRE-12・RLS-10 のポインタ）
+
+`SELECT`／`UPDATE`／`DELETE` の `WHERE` 内の `(c1, ..., ck) [NOT] IN ((d1, ..., dk) [, ...])` の要素の成分のうち、成分全体が `$n` 単独で、同じ位置の左辺成分が裸の列の位置を受理する（親 #3298・脱糖は #3299）。
+
+- **受理形と判定**: パターン 12 と同じ文種・`WHERE` 領域・境界規則。判定は `sql::params::row_in_param_slots` に集約し、`row_compare_param_slots` が呼ぶ。そのため受理（`validate_param_positions`）・型推論（`infer_param_positions`）・Describe 用の型付きダミー（`row_compare_column_slots`）が同じ表を参照する。リストの中身は `( 要素 ) , ( 要素 )` の並びだけで、要素数は `MAX_IN_LIST_ITEMS` 以下・成分数は左辺と同数かつ `MAX_ROW_COMPARE_COMPONENTS` 以下。括弧の対応は `matching_closes` の表を共有し、走査は線形時間。
+- **型**: 同じ位置の左辺成分の列の型。`NOT IN` と前置 `NOT` も同じ。
+- **序数**: 脱糖と展開で生成される葉は束縛段が別カウンタ・空フラグで束縛するため、等価述語のダミーフラグの序数に数えない（兄弟の `col = $n` の序数はずれない）。
+- **意図的な拒否（`intentional:`。いずれも fail-closed）**:
+  - 左辺成分の `$n`（`($1, $2) IN ((a, b))`）は `42601`。1 個の `$n` が複数の要素の成分と対になり、型を一意に決められないため。
+  - 左辺成分がリテラル・式・修飾列の位置の `$n`、`$n` が式の内側・型キャスト付きの形、要素が行でない形・サブクエリ形・空リストは `42601`（構文段の `0A000` を含む）。
+  - スカラー `n IN ($1, $2)` は従来どおり `42601`。
+  - `EXPLAIN` 前置・`WITH`・集合演算・JOIN・`HAVING` は先頭語・既存の一律拒否のまま `42601`。
+  - 型付きダミーを持たない列型の相手は Parse で固定文言の `0A000`。NULL のバインドはリテラル `NULL` 成分と同じ SQLSTATE（パターン 12 と同じ規則）。
+  - 定義文脈（POLICY・VIEW・部分索引・CHECK）は従来どおり拒否（受け皿は #3254）。
+- **EXPLAIN**: 値も述語テキストも出さない閉じた語彙のまま、脱糖後の束縛結果から導かれる。手で展開した形（`IN` は `(a = 1 AND b = 1) OR (a = 3 AND b = 5)`、`NOT IN` は `(a <> 1 OR b <> 1) AND (a <> 3 OR b <> 5)`）の EXPLAIN と完全に一致し、テナントによらず同一。DML では `filter: present` が出る。述語の描画器は新設しない（SQL-75・SQL-27 のポインタ）。`EXPLAIN` と `$n` の組み合わせは `42601` のまま。
+- **RLS**: 脱糖は既存の述語木だけを生成し、テナント境界・ポリシー・`visible()` の合成点には手を入れない。`Or` 分岐の中の `RowCompare` でも `visible()` の有無を落とさないことを越境試験で固定する。
+- **索引**: 本 Issue の対象外。全走査で正しい結果を返す（複合索引の範囲化・IN の索引化は未対応）。
+- **検証**: `tests/table_rls/prepared_row_in.rs`（リテラル形とのパリティ・型付きダミー・序数・DML）・`tests/table_rls/rls10_row_in_paths.rs`（T2／T3 の越境・EXPLAIN）・`tests/sql_named/sql_where_row_in.rs`（評価・EXPLAIN の展開形一致）・`crates/wire-server/tests/wire_sql/wire_row_compare.rs`（wire）・`sql::params` の単体テスト。
+
 ## スコープ外・申し送り
 
 - wire 側（Parse の宣言型受理・`ParameterDescription`・Bind の値保持・
@@ -516,3 +552,11 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
 ### 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`）の `$n`（Issue #3297）
 
 SET 右辺・WHERE の `<列|公開名.列> = $n`（`AND` 区切りの連言）・`USING OPERATION_ID $n` を受理する。型は修飾子が指す表の列から推論し。整数・浮動小数列の WHERE の等価比較も受理する。詳細は [update-from-delete-using.md](update-from-delete-using.md) の「`$n` と公開名重複」節。
+
+## Issue #3324 追記: LATERAL 本文の WHERE の `$n`（SQL-62 (7)・WIRE-12 のポインタ）
+
+- 受理位置: LATERAL 派生表の本文（FROM が単一の表）の WHERE の最上位の連言に置いた `<内側列> (= | < | > | <= | >=) $n`。内側の別名／表名で修飾してよく、外側参照の連言と併用できる（`sql::params::lateral_param_layout` が受理位置の単一情報源。`validate_param_positions` と型の引き当て `infer_param_positions` が共有する）
+- 型: 内側の表の列から引く。**TEXT 系の列に限る**（列が引けて TEXT 系でなければ Parse で固定 `42601`。引けなければ従来どおり `Text`。応答コードで表・列の存在を観測させない）。派生表の本文は整数の比較・`BETWEEN`・`<>` をリテラルでも持てないため、これらの `$n` も同じ `42601`
+- 拒否（`42601`）: 外側の WHERE・投影・ON・LIMIT・`OR`・括弧・`::` 付き・`$n = <列>`・外側参照の列との比較・LATERAL を 2 つ持つ文・非 LATERAL の派生表・`EXPLAIN` 前置・本文の部分クエリ内側の `$n`
+- Describe 用の等価述語の序数フラグは LATERAL 文では渡さない（空＝すべての実リテラルを検証する）。TEXT 系に限るためダミー値の語彙照合の省略は要らず、本文の外の実リテラルへフラグが誤適用される経路を作らない
+- Bind は検証済みのリテラルへ置換して再解析するため、実行結果は簡易クエリと同一（`sql62_lateral_params.rs`・`rls10_lateral_paths.rs`・wire の `wire_lateral.rs` で固定）。設計は [lateral-derived-table.md](lateral-derived-table.md)
