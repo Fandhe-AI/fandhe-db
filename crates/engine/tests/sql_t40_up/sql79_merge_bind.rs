@@ -336,6 +336,35 @@ fn explicit_transaction_and_describe_report_the_same_binding_error() {
     );
 }
 
+/// 明示 Tx（writer 取得前）の Execute は `BEGIN` 時点のスナップショットで束縛し、Describe と一致する。
+#[test]
+fn explicit_transaction_binds_against_the_begin_snapshot() {
+    let (core, _g) = new_core("sql79b-snap");
+    seed(&core);
+    let merge = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET x = 1";
+
+    let mut session = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    // BEGIN 後に別セッションが参照列を削除する。
+    ddl(&core, "ALTER TABLE t DROP COLUMN x");
+
+    let parsed = core.parse_sql(merge).expect("parse");
+    let described = core.describe_parsed_in_txn(&session, &txn, &parsed);
+    assert_eq!(described.expect("describe in txn"), None);
+    let err = core
+        .execute_sql_in_txn(&ctx(), &mut session, &mut txn, merge)
+        .expect_err("merge in txn");
+    assert_eq!(err.wire_code(), "0A000", "{}", err.client_message());
+    core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+
+    // Tx の外（最新カタログ）では列が無いので 42703。
+    let (code, msg) = run(&core, merge).expect_err("merge outside txn");
+    assert_eq!(code, "42703", "{msg}");
+}
+
 #[test]
 fn the_privilege_gate_runs_before_binding() {
     let (core, _g) = new_core("sql79b-priv");

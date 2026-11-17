@@ -11700,7 +11700,10 @@ impl EngineCore {
             // 読み取りスナップショットだけを使い、`mark_written` は呼ばず共有 write txn へ何も書かない
             // （失敗文としての Tx 状態遷移は呼び出し元の既存規約）。
             ParsedSql::Merge(stmt) => {
-                self.bind_merge_stmt(session, stmt, session.udfs(), &[], None)?;
+                // writer 取得前は `BEGIN` 時点のスナップショットで束縛し、Describe（`describe_snapshot`）と
+                // 読み取り源をそろえる（並行 DDL 後も SQLSTATE が食い違わない）。
+                let snap = Self::describe_snapshot(txn)?;
+                self.bind_merge_stmt(session, stmt, session.udfs(), &[], snap)?;
                 Err(
                     crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                         MERGE_NOT_SUPPORTED_YET,

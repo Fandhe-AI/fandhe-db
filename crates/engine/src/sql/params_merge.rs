@@ -50,6 +50,27 @@ fn depth_zero_positions(tokens: &[Token], from: usize, to: usize) -> Vec<usize> 
     out
 }
 
+/// `i` の直前のトークンが式の終端として妥当か（識別子・リテラル・`)`／`]`）。`THEN end`・`ELSE end`・
+/// `a.end` のように直前が式を終えていない／ドット修飾の `end` は列名であり、`CASE` の `END` ではない。
+fn prev_ends_expression(tokens: &[Token], i: usize) -> bool {
+    let Some(prev_idx) = i.checked_sub(1) else {
+        return false;
+    };
+    match tokens.get(prev_idx) {
+        Some(Token::Ident(w)) => !["THEN", "ELSE", "WHEN", "CASE", "AND", "OR", "NOT"]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k)),
+        Some(
+            Token::Number(_)
+            | Token::StringLiteral(_)
+            | Token::QuotedBoolWord(_)
+            | Token::Param(_)
+            | Token::Punct(')' | ']'),
+        ) => true,
+        _ => false,
+    }
+}
+
 /// [`depth_zero_positions`] から、`CASE ... END`（入れ子可）の内側の位置も除いたもの。`CASE` 内の `WHEN`・
 /// `THEN` を MERGE の句境界と取り違えない（`CASE WHEN matched = 1 THEN ...` の `WHEN matched` 等）。
 /// `CASE` 自身は外側の位置として返し、対応する `END` までの内側を落とす。
@@ -62,7 +83,10 @@ fn clause_level_positions(tokens: &[Token], from: usize, to: usize) -> Vec<usize
                 out.push(i);
             }
             case_depth = case_depth.saturating_add(1);
-        } else if ident_is(tokens.get(i), "END") && case_depth > 0 {
+        } else if ident_is(tokens.get(i), "END")
+            && case_depth > 0
+            && prev_ends_expression(tokens, i)
+        {
             case_depth = case_depth.saturating_sub(1);
         } else if case_depth == 0 {
             out.push(i);
@@ -407,6 +431,21 @@ mod tests {
             ),
         ] {
             assert_eq!(check(&sql), Ok(1), "{sql}");
+        }
+    }
+
+    #[test]
+    fn end_named_column_after_then_does_not_close_case() {
+        // THEN の後の列名 `end` を CASE の END と取り違えず、後続の WHEN 節境界を保つ。
+        for sql in [
+            format!(
+                "{HEAD} WHEN MATCHED THEN UPDATE SET x = CASE WHEN matched = 1 THEN end ELSE 2 END, k = $1 WHEN NOT MATCHED THEN INSERT (k, x) VALUES ($2, $3)"
+            ),
+            format!(
+                "{HEAD} WHEN MATCHED THEN UPDATE SET x = CASE WHEN matched = 1 THEN 1 ELSE end END, k = $1 WHEN NOT MATCHED THEN INSERT (k, x) VALUES ($2, $3)"
+            ),
+        ] {
+            assert_eq!(check(&sql), Ok(3), "{sql}");
         }
     }
 
