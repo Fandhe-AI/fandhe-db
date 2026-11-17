@@ -377,6 +377,34 @@ fn ddl_without_ddl_permission_is_42501_and_leaks_no_existence() {
 
 #[test]
 // tracked: #3314
+fn insert_select_after_ddl_is_rejected_with_0a000() {
+    // 挿入先スキーマを確定済みカタログから取る INSERT ... SELECT は、同じ Tx の CREATE TABLE・ADD COLUMN を
+    // 解決できないため、結線までは 0A000 で拒否する（Tx は失敗状態。部分実行しない）。
+    let (core, _guard) = new_core("sql80-insert-select-gate");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    for ddl in [
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, body TEXT)",
+        "ALTER TABLE t ADD COLUMN extra TEXT",
+    ] {
+        let mut txn = core.new_session_transaction();
+        begin(&core, &mut session, &mut txn);
+        tx_ok(&core, &mut session, &mut txn, ddl);
+        let target = if ddl.starts_with("CREATE") { "u" } else { "t" };
+        let sql = format!("INSERT INTO {target} (id, body) SELECT id, body FROM t");
+        assert_eq!(
+            tx_code(&core, &mut session, &mut txn, &sql),
+            "0A000",
+            "{sql}"
+        );
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+    }
+}
+
+#[test]
+// tracked: #3314
 fn statements_not_yet_wired_after_ddl_are_rejected_with_0a000() {
     // DDL 後の UPDATE・DELETE・TRUNCATE・EXPLAIN・COPY 等は未対応。
     let (core, _guard) = new_core("sql80-post-ddl-gate");

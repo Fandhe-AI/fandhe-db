@@ -135,7 +135,7 @@ fn alter_scans_rows(stmt: &crate::sql::allowlist::ValidatedAlterTable) -> bool {
 /// DDL を積んだ Tx に対し、`parsed` を実行してよいか判定する（暫定の許可リスト。受け皿は #3314。V1・V5・V7）。
 ///
 /// 許可するのは、本モジュールが受理する DDL・Tx 制御・セッション変数の `SET`/`SHOW`・結線を済ませた
-/// `INSERT`・読み取り（`USING PLAN`・`EXPLAIN`・ルーチン呼び出し・集合返却関数・ビュー展開を伴う形は `view_definition` 側で拒否）。
+/// `INSERT ... VALUES`・読み取り（`INSERT ... SELECT` は結線まで拒否）（`USING PLAN`・`EXPLAIN`・ルーチン呼び出し・集合返却関数・ビュー展開を伴う形は `view_definition` 側で拒否）。
 /// 表・索引を DROP した後は、確定済みカタログでの解析・ビュー展開が古い名前を見るため DDL 以外を拒否する。
 /// DDL を積んでいない Tx では何もしない。文言は文の種類だけで、対象の名前・存在を含めない。
 pub(super) fn check_post_ddl_statement(
@@ -155,7 +155,9 @@ pub(super) fn check_post_ddl_statement(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_) => true,
-        ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) => !removed,
+        // `INSERT ... SELECT` は挿入先スキーマを確定済みカタログから取得する（束縛・実行とも）ため、同じ Tx で
+        // 作った表・追加した列を解決できない。overlay 結線までは fail-closed で拒否する（受け皿は #3314）。
+        ParsedSql::Insert(_) => !removed,
         ParsedSql::Statement(stmt) => match stmt {
             Statement::SetSearchMode { .. }
             | Statement::SetTimeZone { .. }
