@@ -2,7 +2,8 @@
 //! Issue #3327）。確認すること: v16 の往復（採番方式・移行済み）、生成列の無い表のバイト列が不変、
 //! decode の fail-closed（件数・行の形・識別子・hex・UTF-8・併存禁止）、FK 保持版・軽量スキャナ・
 //! 読み取りゲートが v16 を認識すること（P0。漏れると fail-open）、従来方式の表との併存禁止、
-//! ALTER の暫定ガード（参照列の DROP・RENAME）と生成式の保持。
+//! ALTER の依存検査（参照列の DROP の `2BP01`・RENAME の追随・CASCADE・DROP EXPRESSION。Issue #3331）と
+//! 生成式の保持。
 
 use super::{
     catalog_value_references_enum_type_in_table, decode_schema, encode_schema,
@@ -289,8 +290,8 @@ fn v16_survives_reopen() {
     );
 }
 
-/// 参照列の DROP は `2BP01`、RENAME は拒否される。生成列自身の改名・参照しない列の DROP は通り、
-/// 生成式は保たれる。
+/// 参照列の DROP は `2BP01`、RENAME は式へ追随する（TABLE-50 (3)・Issue #3331）。生成列自身の改名・
+/// 参照しない列の DROP は通り、生成式は保たれる。
 #[test]
 fn alter_guards_protect_generated_columns() {
     let (storage, _g) = open_storage("gen-alter");
@@ -304,26 +305,136 @@ fn alter_guards_protect_generated_columns() {
     storage
         .alter_table_drop_column("docs", "c")
         .expect("drop c");
-    assert!(storage
-        .alter_table_rename_column("docs", "a", "a2")
-        .is_err());
     storage
-        .alter_table_rename_column("docs", "b", "b2")
-        .expect("rename generated column itself");
+        .alter_table_rename_column("docs", "a", "a2")
+        .unwrap_or_else(|_| panic!("rename of a referenced column must follow the expression"));
     {
         let read = storage.db().begin_read().expect("read");
         let schema = crate::catalog::get_table_schema_in_txn(&read, "docs").expect("resolved");
-        let b2 = schema.columns.iter().find(|c| c.name == "b2").expect("b2");
-        assert_eq!(b2.generation_expression(), Some("a * 2"));
+        let b = schema.columns.iter().find(|c| c.name == "b").expect("b");
+        let def = b.generated.as_ref().expect("generated");
+        assert_eq!(def.referenced_columns, ["a2"]);
+        assert!(def.expression.contains("a2"), "{}", def.expression);
+        assert!(!def.expression.contains("a "), "{}", def.expression);
     }
+    storage
+        .alter_table_rename_column("docs", "b", "b2")
+        .expect("rename generated column itself");
     storage
         .alter_table_drop_column("docs", "b2")
         .expect("drop generated");
-    // 生成列が消えた後は `a` を参照する依存が無い（最後の 1 列の削除は別の理由で拒否される）。
+    // 生成列が消えた後は `a2` を参照する依存が無い（最後の 1 列の削除は別の理由で拒否される）。
     assert!(!matches!(
-        storage.alter_table_drop_column("docs", "a"),
+        storage.alter_table_drop_column("docs", "a2"),
         Err(CatalogError::DependentObjectsStillExist(_))
     ));
+}
+
+/// 行ストアへ直接置いた 1 行（`a = 7`・`b = 14`・`c = 'x'`）の物理バイト列を返す補助。
+fn put_row_and_read_bytes(storage: &Storage, schema: &TableSchema) -> Vec<u8> {
+    use crate::row_codec::{encode_scalar_columns, Value};
+    use crate::storage::{encode_row, RowInput, Visibility};
+    let write_txn = storage.begin_write_txn().expect("begin");
+    {
+        let name = crate::catalog::user_rows_table_name("docs");
+        let mut rows = write_txn
+            .open_table(crate::catalog::user_rows_table_def(&name))
+            .expect("open rows");
+        let metadata = encode_scalar_columns(
+            schema,
+            &[
+                Value::Integer(7),
+                Value::Integer(14),
+                Value::Text("x".to_string()),
+            ],
+        )
+        .expect("encode");
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Private,
+            embedding: &[],
+            metadata: &metadata,
+        };
+        let encoded = encode_row(&row).expect("encode row");
+        rows.insert(("tenant-a", 1u64), encoded.as_slice())
+            .expect("insert");
+    }
+    write_txn.commit_raw_for_test().expect("commit");
+    read_row_bytes(storage)
+}
+
+fn read_row_bytes(storage: &Storage) -> Vec<u8> {
+    let read = storage.db().begin_read().expect("read");
+    let name = crate::catalog::user_rows_table_name("docs");
+    let rows = read
+        .open_table(crate::catalog::user_rows_table_def(&name))
+        .expect("open rows");
+    let guard = rows.get(("tenant-a", 1u64)).expect("get").expect("row");
+    guard.value().to_vec()
+}
+
+/// `DROP EXPRESSION` は行を書き換えず、値・NOT NULL を保つ。最後の生成列が消えた表は v16 でなくなる。
+#[test]
+fn drop_expression_keeps_row_bytes_and_leaves_v16_when_last() {
+    let (storage, _g) = open_storage("gen-drop-expr");
+    let schema = schema_with(RowIdentity::Allocated);
+    storage.create_table(&schema).expect("create");
+    let before = put_row_and_read_bytes(&storage, &schema);
+    let applied = storage
+        .alter_table_drop_expression("docs", "b", false)
+        .unwrap_or_else(|_| panic!("drop expression"));
+    assert_eq!(applied, crate::catalog::AlterApply::Applied);
+    assert_eq!(read_row_bytes(&storage), before);
+    let after = storage.get_table_schema("docs").expect("schema");
+    assert!(after.columns.iter().all(|c| !c.is_generated()));
+    assert!(!text_of(&after).starts_with("v16\n"));
+    // 通常の列になった後の再実行は `55000`（`IF EXISTS` は no-op）。
+    assert!(storage
+        .alter_table_drop_expression("docs", "b", false)
+        .is_err());
+    assert_eq!(
+        storage
+            .alter_table_drop_expression("docs", "b", true)
+            .unwrap_or_else(|_| panic!("if exists")),
+        crate::catalog::AlterApply::Unchanged
+    );
+}
+
+/// `CASCADE` は依存する生成列を連鎖削除し、残る列の行バイト列を変えない。連鎖できない依存があれば
+/// 何も削除しない（部分削除なし）。
+#[test]
+fn cascade_drops_dependent_generated_column_and_keeps_row_bytes() {
+    use crate::catalog::DropBehavior;
+    let (storage, _g) = open_storage("gen-cascade");
+    let schema = schema_with(RowIdentity::Allocated);
+    storage.create_table(&schema).expect("create");
+    let before = put_row_and_read_bytes(&storage, &schema);
+    let cascaded = storage
+        .alter_table_drop_column_with_behavior("docs", "a", DropBehavior::Cascade)
+        .expect("cascade");
+    assert_eq!(cascaded, ["b"]);
+    assert_eq!(read_row_bytes(&storage), before);
+    let after = storage.get_table_schema("docs").expect("schema");
+    let names: Vec<&str> = after.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["c"]);
+    assert!(!text_of(&after).starts_with("v16\n"));
+
+    // 連鎖先の生成列が PRIMARY KEY の構成列なら全体を拒否し、何も削除しない。
+    let mut b = ColumnDef::new("b", ColumnType::Integer, false);
+    b.generated = Some(gen_def("a * 2", &["a"]));
+    let pk_schema = TableSchema::new(
+        "pk_docs",
+        vec![ColumnDef::new("a", ColumnType::Integer, true), b],
+    )
+    .with_row_identity(RowIdentity::Allocated)
+    .with_primary_key(vec!["b".to_string()]);
+    storage.create_table(&pk_schema).expect("create pk table");
+    assert!(matches!(
+        storage.alter_table_drop_column_with_behavior("pk_docs", "a", DropBehavior::Cascade),
+        Err(CatalogError::DependentObjectsStillExist(_))
+    ));
+    let still = storage.get_table_schema("pk_docs").expect("schema");
+    assert_eq!(still.columns.len(), 2);
 }
 
 /// 論理ダンプのデータ出力（COPY・INSERT）は生成列の列名と値を除く（TABLE-50・Issue #3327。復元は
