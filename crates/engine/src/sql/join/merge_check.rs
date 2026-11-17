@@ -24,7 +24,8 @@ use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
 
 use super::dml::JoinedResidual;
 use super::dml_residual::{plan_residual_with, ResidualMsgs};
-use super::values::{cell_scalar_supports, cmp_class};
+use super::values::{cell_scalar_supports, cmp_class, key_class};
+use crate::sql::udf_call::require_wired_collation;
 
 /// `MERGE` 用の残余束縛の固定文言。
 const MERGE_MSGS: ResidualMsgs = ResidualMsgs {
@@ -164,6 +165,27 @@ pub(crate) fn bind_condition(
                 if l.relation() != r.relation() {
                     match (cmp_class(l.column_type()), cmp_class(r.column_type())) {
                         (Some(a), Some(b)) if a == b => {
+                            // ハッシュ結合のキーにできない型（REAL／DOUBLE／NUMERIC 等）と、バイト列順でない
+                            // 照合の列（ICU）は、`UPDATE ... FROM` と同じく結合キーにせず残余の束縛へ回す
+                            // （バイト等価・浮動小数のハッシュで黙って誤結合しない。fail-closed）。
+                            let hashable = key_class(l.column_type()).is_ok()
+                                && key_class(r.column_type()).is_ok()
+                                && require_wired_collation(slot_collation(
+                                    &l,
+                                    target_schema,
+                                    source_schema,
+                                ))
+                                .is_ok()
+                                && require_wired_collation(slot_collation(
+                                    &r,
+                                    target_schema,
+                                    source_schema,
+                                ))
+                                .is_ok();
+                            if !hashable {
+                                rest.push(c);
+                                continue;
+                            }
                             let (t, s) = if l.relation() == 0 { (l, r) } else { (r, l) };
                             keys.push((t, s));
                             continue;
@@ -198,6 +220,23 @@ pub(crate) fn bind_condition(
         keys,
         residual,
     })
+}
+
+/// 解決済みの列の照合（疑似列 `id`・範囲外は `None`）。
+fn slot_collation(
+    r: &ResolvedColumn,
+    target_schema: &TableSchema,
+    source_schema: &TableSchema,
+) -> Option<crate::collation::Collation> {
+    let schema = if r.relation() == 0 {
+        target_schema
+    } else {
+        source_schema
+    };
+    match r.slot() {
+        ColumnSlot::Id => None,
+        ColumnSlot::Column(i) => schema.columns.get(i).and_then(|c| c.collation),
+    }
 }
 
 /// 元の列を式評価ビューへ写像できる型か（`dml_residual`・`dml_plan` と同じ範囲）。
@@ -252,11 +291,11 @@ pub(crate) fn bind_joined_set_expr(
                     None => {
                         columns.push(idx);
                         let pos = columns.len().saturating_sub(1);
-                        combined.columns.push(ColumnDef::new(
-                            format!("\u{0}msrc{pos}"),
-                            col.ty.clone(),
-                            true,
-                        ));
+                        // 照合・型を引き継ぐ（元の列の比較規則を落とさない）。
+                        let mut def = col.clone();
+                        def.name = format!("\u{0}msrc{pos}");
+                        def.nullable = true;
+                        combined.columns.push(def);
                         pos
                     }
                 };

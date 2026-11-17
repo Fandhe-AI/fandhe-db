@@ -322,3 +322,53 @@ fn insert_id_bare_default_is_omission_on_migrated_tables() {
     let legacy = bind_with(&sql, &schema("t", "x"), &src, &[]).expect_err("legacy id DEFAULT");
     assert_eq!(legacy.wire_code(), "0A000");
 }
+
+/// 生成列への `SET g = DEFAULT` は受理し（代入を省略）、値の指定は 428C9 のまま（`UPDATE ... FROM` と同じ）。
+#[test]
+fn set_default_on_generated_column_is_accepted_but_values_are_rejected() {
+    let mut g = ColumnDef::new("g", ColumnType::Integer, true);
+    g.generated = Some(crate::catalog::GeneratedColumnDef {
+        expression: "x + 1".to_string(),
+        referenced_columns: vec!["x".to_string()],
+    });
+    let mut target = schema("t", "x");
+    target.columns.push(g);
+    let source = schema("s", "v");
+    let ok = bind_with(
+        &format!("{HEAD} WHEN MATCHED THEN UPDATE SET g = DEFAULT"),
+        &target,
+        &source,
+        &[],
+    );
+    assert!(ok.is_ok(), "{:?}", ok.err());
+    let e = bind_with(
+        &format!("{HEAD} WHEN MATCHED THEN UPDATE SET g = 1"),
+        &target,
+        &source,
+        &[],
+    )
+    .expect_err("value for generated column");
+    assert_eq!(e.wire_code(), "428C9");
+}
+
+/// ハッシュできない型（浮動小数）どうしの列等値は結合キーにせず残余へ回す。
+#[test]
+fn non_hashable_equality_is_not_a_join_key() {
+    let mk = |n: &str| {
+        TableSchema::new(
+            n,
+            vec![
+                ColumnDef::new("k", ColumnType::Text, false),
+                ColumnDef::new("f", ColumnType::Double, true),
+            ],
+        )
+    };
+    let b = bind_with(
+        "MERGE INTO t USING s ON t.f = s.f WHEN MATCHED THEN DELETE",
+        &mk("t"),
+        &mk("s"),
+        &[],
+    )
+    .expect("bind");
+    assert!(b.on_keys().is_empty());
+}

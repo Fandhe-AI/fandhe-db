@@ -546,6 +546,17 @@ fn bind_update(
             )));
         }
         ctx.check_target_visible(name)?;
+        // 値（リテラル・`DEFAULT`・対象だけの式）は `bind_set_assignments` が左辺の検査を含めて束縛する
+        // （`SET g = DEFAULT` は生成列で受理・GENERATED ALWAYS の IDENTITY で 0A000。`UPDATE ... FROM` と
+        // 同じ規則）。そのため `check_set_target`（値の指定を 428C9 で拒否する）より先に振り分ける。
+        if let DmlFromSetValue::Value(v, _) = value {
+            if is_dummy(flags, ai, v) {
+                check_set_target(name, schema)?;
+                continue;
+            }
+            plain.push((name.clone(), v.clone()));
+            continue;
+        }
         let idx = check_set_target(name, schema)?;
         let target_col = schema
             .columns
@@ -589,12 +600,7 @@ fn bind_update(
                     out.joined_exprs.push((idx, bound, cols));
                 }
             }
-            DmlFromSetValue::Value(v, _) => {
-                if is_dummy(flags, ai, v) {
-                    continue;
-                }
-                plain.push((name.clone(), v.clone()));
-            }
+            DmlFromSetValue::Value(..) => {}
         }
     }
     let (literals, exprs) = crate::sql::parser::bind_set_assignments(&plain, schema)?;
