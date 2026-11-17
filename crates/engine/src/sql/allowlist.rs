@@ -23390,6 +23390,8 @@ impl<'a> Parser<'a> {
             Some(Token::Ident(w)) => {
                 self.quoted_null.contains(&self.pos)
                     || !(w.eq_ignore_ascii_case("true")
+                        // `CASE WHEN ...` は式の開始。後続の `WHEN` 境界判定で列 `CASE` と誤認しない。
+                        || w.eq_ignore_ascii_case("case")
                         || w.eq_ignore_ascii_case("false")
                         || w.eq_ignore_ascii_case("null")
                         || w.eq_ignore_ascii_case("default"))

@@ -315,3 +315,30 @@ fn sql79_privilege_bits_follow_the_when_actions() {
     operator("GRANT INSERT ON tx TO bob");
     assert_eq!(as_bob(both), "0A000");
 }
+
+/// SET 右辺・VALUES の先頭が `CASE WHEN` の式でも列 `CASE` と誤認されず構文解析を通る（0A000 で止まる）。
+#[test]
+fn sql79_case_when_expression_in_set_and_values_parses() {
+    let (core, _g) = new_core("sql79-case-when");
+    seed(&core);
+    for sql in [
+        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = CASE WHEN s.v > 1 THEN 1 ELSE 2 END",
+        "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, embedding, k, x) VALUES (s.id, '[0.1,0.2]', s.k, CASE WHEN s.v > 1 THEN 1 ELSE 2 END)",
+    ] {
+        let (code, msg) = run(&core, sql).expect_err(sql);
+        assert_eq!((code.as_str(), msg.as_str()), ("0A000", FIXED_MESSAGE), "{sql}");
+        assert!(matches!(core.parse_sql(sql).expect("parse"), ParsedSql::Merge(_)));
+    }
+}
+
+/// 既存の `UPDATE ... FROM` の SET 右辺が `CASE WHEN` で始まる式でも受理される。
+#[test]
+fn sql79_update_from_set_case_when_is_accepted() {
+    let (core, _g) = new_core("sql79-upd-case");
+    seed(&core);
+    run(
+        &core,
+        "UPDATE t SET x = CASE WHEN s.v > 150 THEN 1 ELSE 2 END FROM s WHERE t.id = s.id",
+    )
+    .expect("update from with CASE WHEN");
+}
