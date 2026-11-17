@@ -418,27 +418,10 @@ fn binding_errors_are_identical_across_tenants_and_hide_internal_names() {
     }
 }
 
-// tracked: #3324
-#[test]
-fn unsupported_lateral_shapes_stay_fail_closed() {
+/// LATERAL の拒否固定の共通検査: 全形が `0A000` で、拒否の後も表の内容が変わらない。
+fn assert_all_0a000(sqls: &[&str]) {
     let (core, _g) = open();
-    for sql in [
-        // 外側参照を置けない位置。
-        "SELECT * FROM docs d, LATERAL (SELECT d.lang FROM docs x) t",
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x ORDER BY d.lang) t",
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang IN (SELECT lang FROM docs y WHERE y.lang = d.lang)) t",
-        // 入れ子の LATERAL。
-        "SELECT * FROM (SELECT lang FROM docs a, LATERAL (SELECT lang FROM docs) b) t",
-        // 本文が SELECT 以外。
-        "SELECT * FROM docs d, LATERAL (VALUES (1)) t",
-        "SELECT * FROM docs d, LATERAL (WITH c AS (SELECT lang FROM docs) SELECT lang FROM c) t",
-        // EXPLAIN。
-        "EXPLAIN SELECT * FROM docs d, LATERAL (SELECT lang FROM docs) t",
-        // 別名なし（先頭以外）。
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs)",
-        // 書き込みを伴う CTE は書き込みなしで拒否される。
-        "WITH w AS (DELETE FROM docs WHERE lang = 'en' RETURNING id) SELECT * FROM docs d, LATERAL (SELECT lang FROM docs) t",
-    ] {
+    for sql in sqls {
         assert_eq!(code(&core, "alice", sql), "0A000", "{sql}");
     }
     assert_eq!(
@@ -450,9 +433,57 @@ fn unsupported_lateral_shapes_stay_fail_closed() {
     );
 }
 
+// 外側参照は本文の WHERE の連言にだけ置ける（L5）。投影・ORDER BY・部分クエリの内側は固定 `0A000`。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn outer_references_outside_where_stay_fail_closed() {
+    assert_all_0a000(&[
+        "SELECT * FROM docs d, LATERAL (SELECT d.lang FROM docs x) t",
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x ORDER BY d.lang) t",
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang IN (SELECT lang FROM docs y WHERE y.lang = d.lang)) t",
+    ]);
+}
+
+// 派生表の本文は単一の関係に限る（JOIN を持つ本文が無い）ため、派生表の本文の中の LATERAL は固定 `0A000`。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_inside_a_derived_table_body_stays_fail_closed() {
+    assert_all_0a000(&[
+        "SELECT * FROM (SELECT lang FROM docs a, LATERAL (SELECT lang FROM docs) b) t",
+    ]);
+}
+
+// LATERAL の本文は SELECT に限る（VALUES・WITH は単一の関係へ写せない）。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_bodies_other_than_select_stay_fail_closed() {
+    assert_all_0a000(&[
+        "SELECT * FROM docs d, LATERAL (VALUES (1)) t",
+        "SELECT * FROM docs d, LATERAL (WITH c AS (SELECT lang FROM docs) SELECT lang FROM c) t",
+    ]);
+}
+
+// 別名なしの LATERAL は、複数リレーションの FROM では公開名が内部名になるため受け付けない。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_without_alias_stays_fail_closed() {
+    assert_all_0a000(&["SELECT * FROM docs d, LATERAL (SELECT lang FROM docs)"]);
+}
+
+// 書き込みを伴う CTE は、書き込みを発生させないよう書き込みなしで拒否される。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_with_data_modifying_cte_stays_fail_closed() {
+    assert_all_0a000(&[
+        "WITH w AS (DELETE FROM docs WHERE lang = 'en' RETURNING id) SELECT * FROM docs d, LATERAL (SELECT lang FROM docs) t",
+    ]);
+}
+
 /// 受理しない入口（cursor・COPY・CTAS・ビュー本文）は従来どおり拒否され、書き込みは起きない
 /// （設計記録 L17。LATERAL を受理しない入口の `wire_code` は派生表を置いた場合と同じ）。
-// tracked: #3324
+/// ビュー本文は、左側を持つ JOIN 本文だけを受理する（`sql62_lateral_view.rs`）。単一 FROM の LATERAL は
+/// 従来どおり拒否する。
+// intentional: docs/design/lateral-derived-table.md
 #[test]
 fn lateral_in_other_entry_points_is_rejected() {
     let (core, _g) = open();

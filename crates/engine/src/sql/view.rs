@@ -342,6 +342,8 @@ pub(crate) fn body_output(
     let parsed = match kind {
         ViewBodyKind::Buffered { stmt, .. } => return Ok(BodyOutput::Statement(stmt)),
         ViewBodyKind::Simple(parsed) => parsed,
+        // 実カタログの検証（`Resolved`）は保留を返さない。到達しない（fail-closed）。
+        ViewBodyKind::LateralDeferred { .. } => return Err(corrupt_view_error()),
     };
     // 親の出力列は `SELECT *` のときだけ必要（明示列の本文は星の展開を行わない）。
     let need_star = matches!(parsed.projection, Projection::All);
@@ -501,7 +503,9 @@ fn reparse_buffered_body(
     };
     match classify_view_body(&tokens, &guarded, ViewBodyCheck::Resolved) {
         Ok(ViewBodyKind::Buffered { stmt, .. }) => Ok(*stmt),
-        Ok(ViewBodyKind::Simple(_)) => Err(corrupt_view_error()),
+        Ok(ViewBodyKind::Simple(_) | ViewBodyKind::LateralDeferred { .. }) => {
+            Err(corrupt_view_error())
+        }
         // 入れ子の深さ超過は規則に基づく拒否として呼び出し元へ伝える。
         Err(e @ SqlSurfaceError::PayloadTooLarge { .. }) => Err(e),
         Err(_) => Err(corrupt_view_error()),

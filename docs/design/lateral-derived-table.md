@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用。#3321 で構文受理と左側の列の束縛（L3・L4・L6・L17 の入口）、#3322 で INNER／CROSS／コンマの外側の行ごとの再評価（L1・L2・L7〜L15。「実装メモ（#3322）」参照）を実装済み。#3323 で `LEFT JOIN LATERAL` の外側保持と NULL 補完・ON 条件・RIGHT／FULL の `42P10`（L16。「実装メモ（#3323）」参照）を実装済み。#3360 で `LATERAL unnest(<左側の配列列>) [WITH ORDINALITY]`（L18〜L24。「実装メモ（#3360）」参照）を実装済み。行ごとの集計（L5 の後半）は #3322 では実装せず、固定文言の `0A000`
+- ステータス: 採用。#3321 で構文受理と左側の列の束縛（L3・L4・L6・L17 の入口）、#3322 で INNER／CROSS／コンマの外側の行ごとの再評価（L1・L2・L7〜L15。「実装メモ（#3322）」参照）を実装済み。#3323 で `LEFT JOIN LATERAL` の外側保持と NULL 補完・ON 条件・RIGHT／FULL の `42P10`（L16。「実装メモ（#3323）」参照）を実装済み。#3360 で `LATERAL unnest(<左側の配列列>) [WITH ORDINALITY]`（L18〜L24。「実装メモ（#3360）」参照）を実装済み。行ごとの集計（L5 の後半）は #3322 では実装せず、固定文言の `0A000`。#3324 で `EXPLAIN`・拡張クエリの `$n`・ビュー本文の LATERAL・3 テナントの越境試験（L15・L17。「実装メモ（#3324）」参照）を実装済み
 - ポインタ: SQL-60・SQL-61・SQL-62・TASK-344（spec 本文は転記しない）
 - 対象: `FROM` の `LATERAL (SELECT ...)` の実行方式、再評価の数え方と上限、RLS の適用、対象外の形
 - 親: #3319。先行記録: [nested-loop-join.md](nested-loop-join.md)・[outer-join.md](outer-join.md)・[multi-way-join.md](multi-way-join.md)・[join-limits-cli.md](join-limits-cli.md)・[sql-subquery.md](sql-subquery.md)（#1842・#1847）・[cte.md](cte.md)（#1865〜#1867）
@@ -49,7 +49,7 @@
 | L14 中断 | 外側タプルごとと、内側を評価するループ（`CHECK_STRIDE` で償却）で `interrupt::check()` を呼び、`57014` に協調する（[statement-interrupt.md](statement-interrupt.md) と NLJ の D9 の方針）。時間の上限値は新設しない |
 | L15 RLS | 内側の実体化と外側の各 relation の走査は、呼び出したセッションの `PolicyContext`・同じ `read_txn`（単一スナップショット）で、既存の側スキャン、または合成 CTE slot の評価経路を通す。ポリシー述語は行とセッションの文脈だけで決まり、外側の行には依存しない。そのため「1 回実体化した可視行に外側タプルごとの相関述語をかける」ことは、「再評価のたびに同じセッション文脈で RLS を暗黙適用する」ことと同じ可視集合になる。外側の値は相関述語にだけ渡り、ポリシーの評価・可視性の判定には入らない。実体化した行は文 1 回の実行に閉じ、他の文・他セッションと共有しない。上限の判定・バケット・件数は可視行だけで決まる |
 | L16 LEFT と RIGHT／FULL | LEFT JOIN LATERAL は外側タプルごとに一致の有無を持ち、内側の結果が 0 行（または ON で全行が落ちた）外側タプルを、内側の列を NULL にして 1 行出す。この NULL 補完行も L11 の出力上限の対象にする（#3323）。`ON true` 以外の ON は、内側の結果行と外側の組に対する残余として評価できる形だけ #3323 で受理し、それ以外は固定文言の `0A000` にする。左側を参照する LATERAL と RIGHT／FULL の組み合わせの SQLSTATE は記憶で断定せず、#3323 で PostgreSQL 17 実機と照合して固定する。未照合の間は束縛段で fail-closed に拒否する（NLJ の D11 と同じ扱い）。`USING`／`NATURAL` と LATERAL の組み合わせも #3323 で扱い、受理できない形は `0A000` |
-| L17 入口 | LATERAL の受理は、派生表と同じセッション最上位の `SELECT`／非再帰 `WITH`（`AllowMaterialize`）に限る。ビュー本文・派生表の入れ子での LATERAL・`EXPLAIN`・拡張クエリの `$n` は #3324 で扱う。cursor・COPY・CTAS・DML の `FROM`／`USING`・集合演算の枝・`WITH RECURSIVE` は従来どおり拒否する。Describe と Execute は同じ束縛を通し、上限の判定は実行段で行う（join-limits-cli.md の D5 と同型） |
+| L17 入口 | LATERAL の受理は、派生表と同じセッション最上位の `SELECT`／非再帰 `WITH`（`AllowMaterialize`）に限る。`EXPLAIN`・拡張クエリの `$n`（LATERAL 本文の WHERE の TEXT 列）・左側を持つ LATERAL を含む JOIN 本文のビューは #3324 で受理した（「実装メモ（#3324）」）。派生表の本文の中の LATERAL・LATERAL 本文の中の LATERAL・単一 FROM の派生表／LATERAL のビュー本文は固定 `0A000`／従来のコードのまま（「拒否する形」節）。cursor・COPY・CTAS・DML の `FROM`／`USING`・集合演算の枝・`WITH RECURSIVE` は従来どおり拒否する。Describe と Execute は同じ束縛を通し、上限の判定は実行段で行う（join-limits-cli.md の D5 と同型） |
 | L18 関数の relation の形 | `LATERAL unnest(<列参照>) [WITH ORDINALITY] [[AS] 別名 [(列名, ...)]]` を、派生表と同じプレースホルダ（`?derived<N>`）の 1 relation として結合連鎖に置く（#3360）。別名なしは PostgreSQL と同じ relation 名 `unnest` を合成する。実行は `sql/join/lateral_unnest.rs`（`lateral_step` の前段の供給元）。基底の行・後処理の層は持たず、外側タプルごとに引数の配列セルから要素行を作り、外側の文の側スキャンを適用して arena へ追記する。後段（ON の評価・NULL 補完の `materialize_step`）は #3323 と共有し、第 2 の評価器・実行器は作らない。合成 CTE は「左側 relation の当該列を出力列数だけ投影する本文」で、評価はせず（行は使わない）、公開列名・relation の解決と既存の検証を通すための足場にする |
 | L19 引数の束縛 | 引数は「左側 relation の列の裸の参照 1 個」（修飾あり・左側にだけある非修飾名）。束縛は `lateral_bind::bind_lateral_unnest_arg`（`42P01`／`42703`／`42702`／RIGHT・FULL は `42P10`。引数なしは `42883`）。外側の値は SQL 文字列・トークン列・AST のリテラルへ連結せず（L3）、実行時は外側タプルの当該セル（`Cell::Array`）を直接読む。式・定数・多引数は固定文言の `0A000` |
 | L20 出力列 | 要素型は左側 relation のスキーマの列型（`ColumnType::Array`）から決める。序数列は `bigint`。名前は PostgreSQL 17.12 と同じ（別名なしは `unnest`／`ordinality`、別名 `u` のみは値の列が `u`・序数は `ordinality`、列名リストで改名、列数超過は `42P10`）。非配列の列は `42883`。Describe と Execute は同じ導出（`unnest_columns_for`）を通す |
@@ -76,7 +76,7 @@
 
 ## テナント境界（RLS）
 
-L15 のとおり、すべての再評価は呼び出したセッションの `PolicyContext`・同じ `read_txn` の可視行だけを使う。外側の値はポリシーの評価に入らず、テナント境界を緩める経路は作らない。3 テナントの越境試験（ポリシーあり・なし）は #3324。
+L15 のとおり、すべての再評価は呼び出したセッションの `PolicyContext`・同じ `read_txn` の可視行だけを使う。外側の値はポリシーの評価に入らず、テナント境界を緩める経路は作らない。3 テナントの越境試験（ポリシーあり・なし。`crates/engine/tests/table_rls/rls10_lateral_paths.rs`）は #3324 で固定した。
 
 ## セキュリティ考慮（OWASP Top 10）
 
@@ -115,6 +115,29 @@ L15 のとおり、すべての再評価は呼び出したセッションの `Po
 - 受理しない形（いずれも評価前に固定文言の `0A000`）: `unnest` 以外の関数名（`LATERAL f(...)`・`generate_series` を含む）・多引数・式や定数の引数・`ROWS FROM`・相関の `USING`／`NATURAL`。`LATERAL` を付けない後続位置の関数は従来の `42601` のまま
 - 照合: PostgreSQL 17.12 の実機で、4 行（NULL 配列・空配列・NULL 要素・多次元・`text[]`・`bigint[]`）の結果と列名、LEFT／INNER の ON 条件（列どうし・文字列リテラル・行 id との比較）、連鎖した 2 つの `unnest`、`42883`（非配列・引数なし）・`42P01`・`42703`・`42P10`（RIGHT／FULL・列名リスト超過）・`42601` を確認した（`crates/engine/tests/sql_t40_up/sql62_lateral_unnest.rs`）。JOIN の述語は列どうし・文字列リテラルとの比較までが書ける範囲で、数値リテラルとの比較は既存の JOIN の制約（本 Issue の範囲外）
 
+## 実装メモ（#3324）
+
+- **EXPLAIN**: `EXPLAIN`（`ANALYZE`・`VERBOSE`・`COSTS OFF`・`FORMAT JSON` を含む。`FORMAT JSON` と `ANALYZE`／`VERBOSE` の併用は従来どおり `0A000`）は、非 EXPLAIN と同じ検証本体（派生表ゲート → `explain_cte_target` → JOIN の段の木）を通る。外側参照のある段だけ `join_method: lateral` に `reevaluation: per_outer_row` が付く（外側参照の無い LATERAL は通常の派生表の段で、この行は出ない）。表名・別名・列名・予約内部名・行数・LIMIT 値は出さず、全テナントで同一。LATERAL の側の `cte` 節の下には基底の `cte_source: with` が 1 段入る（基底 slot の内部名。値は出ない）。未知の列は EXPLAIN でも束縛段で `42703`（実行と同じ）。`EXPLAIN` と `$n` の併用は従来どおり `42601`
+- **`$n`**: 受理するのは LATERAL 本文（本文の FROM が単一の表のもの）の WHERE の最上位の連言に置いた `<内側列> (= | < | > | <= | >=) $n`。内側の別名／表名で修飾してよく、外側参照の連言と併用できる。型は内側の表の列から引き、**TEXT 系の列に限る**（引けない場合は `Text`。DATE・ENUM・整数・ベクトル等の列は Parse で固定 `42601`）。派生表の本文は整数の比較・`BETWEEN`・`<>` をリテラルでも持てない（既存の本文の文法）ため、これらの `$n` も同じ `42601`。外側の WHERE・投影・ON・LIMIT・`OR`・括弧・`::` 付き・`$n = <列>`・外側参照の列との比較・LATERAL を 2 つ持つ文・非 LATERAL の派生表の `$n` は `42601`。Describe 用の等価述語の序数フラグは LATERAL 文では渡さない（空＝すべての実リテラルを検証する）。Bind は検証済みのリテラルへ置換して再解析するため、結果は簡易クエリと同一。実装は `sql::params::lateral_param_layout`（受理位置の単一情報源）
+- **ビュー本文**: 本文が「左側を持つ LATERAL を含む JOIN（CTE 入力はすべて派生表。利用者 CTE を含まない）」で、非集計なら `LIMIT` を持つときに受理する。構造検証（`CREATE VIEW` の構文段。列を引けない）は固定文言の `0A000`（`lateral_bind::UNRESOLVABLE_LEFT_COLUMNS`）を合図に受理を保留し（`ViewBodyKind::LateralDeferred`。relation 一覧はトークン列から読み取る上位集合）、`create_view` が write txn 内の実カタログ（`Resolved`）で再検証して確定する。格納済み本文の形状導出（`DROP TABLE` の `2BP01`・`OR REPLACE` の循環検査）は保留形のまま保守側（`buffered`・`join`）に倒す。参照時は同じ分類を再実行し、参照者自身の `ctx`・同じ `read_txn` で既存の CTE 入力つき JOIN の実行器が評価する（作成者の可視性は引き継がない。第 2 の実行器なし）。LATERAL の内側の表も依存 relation に入る（`DROP TABLE` は `2BP01`、`OR REPLACE` は再検証）。スキーマ修飾の relation 名を含む本文は構造検証で解決できないため固定 `0A000`。ビュー経由の `EXPLAIN` は集計・LIMIT・JOIN 本文のビューと同じ `42601`
+- **入れ子**: 派生表の本文の中の LATERAL（`(SELECT ... FROM a, LATERAL (...) b) t`）は、派生表・CTE の本文が単一の関係に限られる（JOIN を持つ本文が無い）ため固定 `0A000` のまま。LATERAL 本文の中の LATERAL も同じ。PostgreSQL の意味での入れ子を動かすには JOIN を本文に持つ派生表が要り、別機能になる
+- **越境試験**: `rls10_lateral_paths.rs` が、3 テナント・Private の有無（`PolicyContext::new`／`with_visibilities`）・A の `other` を絞るポリシーの有無・外側と内側が同じ表／別の表・コンマ／CROSS／INNER ON true／LEFT ON true の全組合せを、独立オラクルと照合する。他テナントの Private 行を置いた DB と置かない DB（双子）で、結果・NULL 補完の数・`EXPLAIN`・`54000` の境界と文言（再評価上限・出力上限）・束縛エラーの `wire_code`／文言が一致することも固定した。LATERAL ビューは作成者ではなく参照者の可視行で評価され、`$n` 経路の結果は簡易クエリと一致する
+- 照合: PostgreSQL 17 実機との照合は本 Issue では実施していない（未照合）。EXPLAIN の語彙・`$n` の受理位置・ビューの受理範囲は本リポ固有の契約で、PostgreSQL の出力とは一致しない
+
+## 拒否する形（#3324 時点）
+
+本節は意図的な拒否の根拠（`intentional:` 注記の参照先）。いずれも固定文言の `0A000`、または派生表を置いた場合と同じコードで、書き込みは起きない。
+
+| 形 | コード | 理由 |
+| -- | ------ | ---- |
+| 外側参照を投影・`ORDER BY`・部分クエリの内側に置く | `0A000` | 外側参照は本文の WHERE の連言にだけ置ける（L5） |
+| 派生表の本文の中の LATERAL・LATERAL 本文の中の LATERAL | `0A000` | 派生表・CTE の本文は単一の関係に限り、JOIN を持つ本文が無い |
+| LATERAL の本文が SELECT 以外（VALUES・WITH） | `0A000` | 本文を単一の関係へ写せない |
+| 別名なしの LATERAL（複数リレーションの FROM） | `0A000` | 公開名が内部名になる |
+| 書き込みを伴う CTE との併用 | `0A000` | 書き込みを発生させない |
+| cursor・COPY・CTAS・具体化ビュー・単一 FROM の派生表／LATERAL のビュー本文 | 派生表と同じコード | 受理する入口は L17 のとおり |
+| ビュー経由の `EXPLAIN` | `42601` | 集計・LIMIT・JOIN 本文のビューと同じ |
+
 ## 実装の割り当て
 
 | Issue | 範囲 |
@@ -122,7 +145,7 @@ L15 のとおり、すべての再評価は呼び出したセッションの `Po
 | #3321 | 構文受理（L6・L17 の一部）と左側の列の束縛（L3・L4） |
 | #3322 | INNER／CROSS／カンマの再評価の実行器（L1・L2・L5 の top-n・L7〜L15）。行ごとの集計（L5 の後半）は後続 |
 | #3323 | LEFT JOIN LATERAL・ON 条件・RIGHT／FULL の SQLSTATE 照合（L16。実装済み） |
-| #3324 | EXPLAIN・`$n`・ビューと入れ子（L17）・3 テナントの越境試験（L15） |
+| #3324 | EXPLAIN・`$n`・ビュー本文（L17）・3 テナントの越境試験（L15）。入れ子は固定 `0A000` のまま（実装済み） |
 | #3360 | `LATERAL unnest(<左側の配列列>) [WITH ORDINALITY]` と単独の FROM 関数の `WITH ORDINALITY`（L18〜L24。実装済み） |
 
 ## 対象外
@@ -134,3 +157,6 @@ L15 のとおり、すべての再評価は呼び出したセッションの `Po
 | 内側の投影・`ORDER BY` などに置く外側参照、内側の結合・集合演算・相関サブクエリ、DML の `FROM`／`USING` での LATERAL、比較回数上限の CLI 化 | 現時点では対応しない（受け皿の Issue なし）。理由: 1 回の実体化と外側タプルごとの後処理という L1 の方式で、まだ束縛の部品が無い |
 | 行ごとの集計・`DISTINCT`・窓を含む相関 LATERAL の本文、相関 LATERAL の本文の `SELECT *`・サブクエリ（`LEFT` での `count(*)` が 0 になる挙動を含む） | #3322・#3323 では固定文言の `0A000`。受け皿の Issue なし（要起票。人間が判断） |
 | 相関 LATERAL の `USING`／`NATURAL`（INNER／LEFT） | #3323 では固定文言の `0A000`。受け皿の Issue なし（要起票。人間が判断） |
+| 派生表の本文の中の LATERAL（JOIN を持つ本文の派生表）・LATERAL 本文の中の LATERAL | #3324 では固定 `0A000` のまま（意図的な拒否。受け皿の Issue なし。「拒否する形」節） |
+| LATERAL 文の外側の WHERE・ON・投影の `$n`（一般の JOIN の `$n`）、LATERAL 本文の整数・日付・ENUM 列・`BETWEEN` の `$n` | `42601` のまま（受け皿の Issue なし。派生表の本文の文法の拡張が前提） |
+| 単一 FROM の派生表／LATERAL・LATERAL を含まない派生表のビュー本文、ビュー経由の `EXPLAIN` | 従来のコードのまま（受け皿の Issue なし） |

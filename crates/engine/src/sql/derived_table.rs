@@ -274,8 +274,8 @@ fn is_on_true(after: &[Token]) -> bool {
     }
 }
 
-/// `tokens` に FROM／JOIN／`,` の直後の `LATERAL (` があるか（`EXPLAIN` 入口が LATERAL を明示拒否する
-/// ための検出。抽出の拒否・受理に依存せず固定 `0A000` にする。Issue #3321・#3324 の受け皿）。
+/// `tokens` に FROM／JOIN／`,` の直後の `LATERAL (` があるか（`CREATE VIEW` 本文の分類が LATERAL を含む
+/// JOIN 本文の受理経路へ進むかの判定。抽出の受理・拒否には依存しない。Issue #3321・#3324）。
 pub(crate) fn contains_lateral(tokens: &[Token]) -> bool {
     tokens.iter().enumerate().any(|(i, t)| {
         let next = |n: usize| tokens.get(i.saturating_add(n));
@@ -330,6 +330,7 @@ fn extract_at(
     keep_alias: bool,
 ) -> Result<Option<Extracted>, SqlSurfaceError> {
     let mut found: Vec<RawDerived> = Vec::new();
+    let mut placements: Vec<(usize, bool)> = Vec::new();
     let mut outer: Vec<Token> = Vec::new();
     let mut depth: usize = 0;
     let mut in_from = false;
@@ -496,6 +497,9 @@ fn extract_at(
                                             qualifier.eq_ignore_ascii_case(&cand)
                                                 || name.eq_ignore_ascii_case(&cand)
                                         }
+                                        Token::QualifiedStar { qualifier } => {
+                                            qualifier.eq_ignore_ascii_case(&cand)
+                                        }
                                         _ => false,
                                     }) || found.iter().any(|d| {
                                         d.alias
@@ -554,6 +558,8 @@ fn extract_at(
                         }
                         st.count = st.count.saturating_add(1);
                         let number = st.count;
+                        // 別名なし `unnest` の位置を記録する（公開名 `unnest` の曖昧性を参照位置ごとに判定する）。
+                        placements.push((outer.len(), func_kw && !alias_given));
                         outer.push(Token::Ident(format!("{PLACEHOLDER_PREFIX}{number}")));
                         // 別名は暗黙別名の形で外側へ残す（`t.col` の修飾参照を外側の既存の
                         // 修飾列正規化が解決できるようにする。列名リストは合成 CTE が適用する）。
@@ -596,25 +602,57 @@ fn extract_at(
     if found.is_empty() {
         return Ok(None);
     }
-    // 別名なしの `unnest` が 2 個以上あるとき、公開名 `unnest` による修飾参照（`unnest.col`）は曖昧（`42712`）。
-    if keep_alias
-        && found
-            .iter()
-            .filter(|d| d.func.as_ref().is_some_and(|f| !f.alias_given))
-            .count()
-            > 1
-        && outer
-            .iter()
-            .chain(found.iter().flat_map(|d| d.body.iter()))
-            .any(|t| {
-                matches!(
-                    t,
-                    Token::QualifiedIdent { qualifier, .. } | Token::QualifiedStar { qualifier }
-                        if qualifier.eq_ignore_ascii_case("unnest")
-                )
-            })
-    {
-        return Err(SqlSurfaceError::duplicate_alias("unnest"));
+    // 公開名 `unnest` による修飾参照（`unnest.col`）は、その参照位置から可視な別名なし `unnest` が 2 個以上
+    // あるときだけ曖昧（`42712`）。可視性は FROM の左から右（ON 条件は直前までの項目、SELECT 句・WHERE 以降は
+    // 全項目、LATERAL 本文は自分より左の項目）で判定する。
+    if keep_alias {
+        let total = placements.iter().filter(|(_, u)| *u).count();
+        let ends_from = |t: &Token| {
+            matches!(t, Token::Ident(n) if ["WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET",
+                "UNION", "INTERSECT", "EXCEPT", "WINDOW", "FETCH", "FOR", "RETURNING"]
+                .iter()
+                .any(|k| n.eq_ignore_ascii_case(k)))
+        };
+        let is_ref = |t: &Token| {
+            matches!(
+                t,
+                Token::QualifiedIdent { qualifier, .. } | Token::QualifiedStar { qualifier }
+                    if qualifier.eq_ignore_ascii_case("unnest")
+            )
+        };
+        for (idx, t) in outer.iter().enumerate() {
+            if !is_ref(t) {
+                continue;
+            }
+            let before: Vec<&(usize, bool)> = placements.iter().filter(|(p, _)| *p < idx).collect();
+            let visible = match before.last() {
+                None => total,
+                Some((last, _)) => {
+                    let tail = outer.get(*last..idx).unwrap_or(&[]);
+                    if tail.iter().any(ends_from) {
+                        total
+                    } else {
+                        before.iter().filter(|(_, u)| *u).count()
+                    }
+                }
+            };
+            if visible > 1 {
+                return Err(SqlSurfaceError::duplicate_alias("unnest"));
+            }
+        }
+        for (k, d) in found.iter().enumerate() {
+            if d.lateral.is_none() || !d.body.iter().any(is_ref) {
+                continue;
+            }
+            let visible = found
+                .iter()
+                .take(k)
+                .filter(|e| e.func.as_ref().is_some_and(|f| !f.alias_given))
+                .count();
+            if visible > 1 {
+                return Err(SqlSurfaceError::duplicate_alias("unnest"));
+            }
+        }
     }
     Ok(Some((found, outer)))
 }
@@ -956,10 +994,7 @@ fn plan_correlated_execution(
         return Err(shape_unsupported());
     }
     let (Some(correlated_body), Some(inner_columns)) = (correlated_body, inner_columns) else {
-        return Err(
-            "columns of the relation referenced by a LATERAL subquery cannot be resolved"
-                .to_string(),
-        );
+        return Err(super::lateral_bind::UNRESOLVABLE_LEFT_COLUMNS.to_string());
     };
     // 内側の相関サブクエリは外側参照の再評価予算（相関サブクエリの再評価の上限）と二重に数えうる
     // ため、再評価する LATERAL の本文にはサブクエリを置かせない（L8。合計が上限の 2 倍になる経路を作らない）。
@@ -1362,7 +1397,9 @@ mod tests {
             .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("RIGHT"))));
     }
 
-    // tracked: #3324
+    // LATERAL の本文が SELECT 以外（VALUES・WITH）の形は、本文を単一の関係へ写せないため固定 `0A000`
+    // （設計記録 L17・「拒否する形」節）。
+    // intentional: docs/design/lateral-derived-table.md
     #[test]
     fn unsupported_lateral_shapes_are_rejected_with_0a000() {
         for sql in [
@@ -1444,6 +1481,9 @@ mod tests {
         ));
     }
 
+    // 派生表の本文の中の LATERAL は、JOIN を持つ本文（派生表の本文の FROM が複数の関係）が無いため固定 `0A000`
+    // （設計記録 L17・「拒否する形」節）。
+    // intentional: docs/design/lateral-derived-table.md
     #[test]
     fn nested_lateral_is_rejected_at_depth_two() {
         let body = tokenize("SELECT 1 FROM t, LATERAL (SELECT 1 FROM t) a").expect("t");

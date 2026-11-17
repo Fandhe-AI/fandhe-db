@@ -562,6 +562,27 @@ fn ambiguous_unnest_qualifier_is_detected_in_lateral_bodies_and_stars() {
     }
 }
 
+/// 曖昧性は参照位置から可視な別名なし `unnest` の数で判定する。後続の `unnest` はスコープ外なので、
+/// 先行する ON 条件の `unnest.<列>` は一意で受理する。
+#[test]
+fn unnest_qualifier_ambiguity_is_judged_per_reference_position() {
+    let (core, _g) = open();
+    let sql = "SELECT d.name FROM docs d JOIN LATERAL unnest(d.tags) ON unnest.unnest = d.name \
+               CROSS JOIN LATERAL unnest(d.arr)";
+    run(&core, "alice", sql).expect(sql);
+    let sql = "SELECT d.name FROM docs d JOIN LATERAL unnest(d.tags) ON unnest.unnest = d.name \
+               CROSS JOIN LATERAL unnest(d.arr) WHERE unnest.unnest = 'x'";
+    assert_eq!(code(&core, "alice", sql), "42712", "{sql}");
+}
+
+/// 内部別名（`unnest_2` 等）は `unnest_2.*` の修飾スターとも衝突しない。未宣言の `unnest_2` は解決しない。
+#[test]
+fn qualified_star_does_not_resolve_to_an_internal_alias() {
+    let (core, _g) = open();
+    let sql = "SELECT unnest_2.* FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b)";
+    assert!(run(&core, "alice", sql).is_err(), "{sql}");
+}
+
 /// 左側が CTE・派生表・自己結合の relation でも、引数の列から配列を展開できる。
 #[test]
 fn left_relation_may_be_a_cte_a_derived_table_or_a_self_join() {

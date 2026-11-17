@@ -4182,6 +4182,9 @@ pub enum CatalogError {
     /// 識別子・スキーマ定義）が渡した値そのものの検証失敗であり、`detail` は
     /// 呼び出し元が把握済みの情報のみを含む。
     Invalid(String),
+    /// ビュー本文（LATERAL 遅延再検証。Issue #3324）の非修飾列が複数の参照表に一致した
+    /// （SQL 表層では `42702`）。列名はクライアントが書いた綴りのみ。
+    AmbiguousColumn(String),
     /// redb に格納済みのカタログ値（[`decode_schema`]）、または格納済み行の
     /// スカラーペイロード（`tenant::update_row_columns_unchecked` が
     /// `row_codec::decode_scalar_columns` を呼ぶ経路。Issue #865）のデコードに
@@ -4366,6 +4369,9 @@ impl fmt::Display for CatalogError {
         match self {
             CatalogError::Backend(e) => write!(f, "catalog backend error: {e}"),
             CatalogError::Invalid(msg) => write!(f, "invalid catalog data: {msg}"),
+            CatalogError::AmbiguousColumn(name) => {
+                write!(f, "column reference is ambiguous: {name}")
+            }
             CatalogError::CorruptSchema(msg) => write!(f, "corrupt catalog schema: {msg}"),
             CatalogError::TableNotFound(name) => write!(f, "table not found: {name}"),
             CatalogError::TableAlreadyExists(name) => write!(f, "table already exists: {name}"),
@@ -4502,6 +4508,7 @@ impl std::error::Error for CatalogError {
             | CatalogError::BuiltinSchema(_)
             | CatalogError::NotObjectOwner
             | CatalogError::ColumnNotFound(_)
+            | CatalogError::AmbiguousColumn(_)
             | CatalogError::ProtectedColumn(_)
             | CatalogError::IncompatibleTypeChange { .. }
             | CatalogError::UniqueConstraintViolation
@@ -5934,6 +5941,13 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
             join: matches!(*stmt, crate::sql::allowlist::Statement::Join(_)),
             deferred_expr: crate::sql::allowlist::top_level_body_has_expression_predicate(&stmt),
         },
+        // Issue #3324: 構造検証で保留した LATERAL の JOIN 本文。`create_view` が実カタログで再検証する。
+        ViewBodyKind::LateralDeferred { relations } => ViewBodyShape {
+            relations,
+            buffered: true,
+            join: true,
+            deferred_expr: true,
+        },
     })
 }
 
@@ -6739,6 +6753,7 @@ fn validate_new_view_body_in_txn(
             };
             let tokens =
                 crate::sql::lexer::tokenize_stored_view_body(body_sql).map_err(|_| invalid())?;
+            let lateral_body = crate::sql::derived_table::contains_lateral(&tokens);
             classify_view_body(&tokens, &lookup, ViewBodyCheck::Resolved).map_err(|e| {
                 match e {
                     // 深さ超過は `54000` のまま（`Invalid`〔42601〕へ丸めない）。
@@ -6750,6 +6765,16 @@ fn validate_new_view_body_in_txn(
                     SqlSurfaceError::FeatureNotSupported { .. } => {
                         CatalogError::Invalid(VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string())
                     }
+                    // LATERAL を含む本文の遅延再検証（Issue #3324）では、未知列・曖昧列を
+                    // `42703`／`42702` のまま返し、その他の形式エラーはビュー本体形式の文言にする
+                    // （buffered-view-position の文言へ丸めない）。列名はクライアントが書いた綴りのみ。
+                    SqlSurfaceError::UndefinedColumn { name } if lateral_body => {
+                        CatalogError::ColumnNotFound(name)
+                    }
+                    SqlSurfaceError::AmbiguousColumn { name } if lateral_body => {
+                        CatalogError::AmbiguousColumn(name)
+                    }
+                    _ if lateral_body => CatalogError::Invalid(VIEW_BODY_SHAPE_MESSAGE.to_string()),
                     _ => invalid(),
                 }
             })?;
@@ -18059,6 +18084,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::ReservedSchemaName(_)
         | CatalogError::BuiltinSchema(_)
         | CatalogError::NotObjectOwner
+        | CatalogError::AmbiguousColumn(_)
         | CatalogError::ColumnNotFound(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }

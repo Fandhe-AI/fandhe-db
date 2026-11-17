@@ -516,3 +516,11 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
 ### 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`）の `$n`（Issue #3297）
 
 SET 右辺・WHERE の `<列|公開名.列> = $n`（`AND` 区切りの連言）・`USING OPERATION_ID $n` を受理する。型は修飾子が指す表の列から推論し。整数・浮動小数列の WHERE の等価比較も受理する。詳細は [update-from-delete-using.md](update-from-delete-using.md) の「`$n` と公開名重複」節。
+
+## Issue #3324 追記: LATERAL 本文の WHERE の `$n`（SQL-62 (7)・WIRE-12 のポインタ）
+
+- 受理位置: LATERAL 派生表の本文（FROM が単一の表）の WHERE の最上位の連言に置いた `<内側列> (= | < | > | <= | >=) $n`。内側の別名／表名で修飾してよく、外側参照の連言と併用できる（`sql::params::lateral_param_layout` が受理位置の単一情報源。`validate_param_positions` と型の引き当て `infer_param_positions` が共有する）
+- 型: 内側の表の列から引く。**TEXT 系の列に限る**（列が引けて TEXT 系でなければ Parse で固定 `42601`。引けなければ従来どおり `Text`。応答コードで表・列の存在を観測させない）。派生表の本文は整数の比較・`BETWEEN`・`<>` をリテラルでも持てないため、これらの `$n` も同じ `42601`
+- 拒否（`42601`）: 外側の WHERE・投影・ON・LIMIT・`OR`・括弧・`::` 付き・`$n = <列>`・外側参照の列との比較・LATERAL を 2 つ持つ文・非 LATERAL の派生表・`EXPLAIN` 前置・本文の部分クエリ内側の `$n`
+- Describe 用の等価述語の序数フラグは LATERAL 文では渡さない（空＝すべての実リテラルを検証する）。TEXT 系に限るためダミー値の語彙照合の省略は要らず、本文の外の実リテラルへフラグが誤適用される経路を作らない
+- Bind は検証済みのリテラルへ置換して再解析するため、実行結果は簡易クエリと同一（`sql62_lateral_params.rs`・`rls10_lateral_paths.rs`・wire の `wire_lateral.rs` で固定）。設計は [lateral-derived-table.md](lateral-derived-table.md)
