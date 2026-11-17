@@ -235,6 +235,24 @@ fn correlated_forms_pass_binding_and_stop_with_the_dedicated_message() {
     );
 }
 
+/// 暗黙 rowid の `id` は内側・左側のどちらでも列として束縛できる（`42703` にしない）。
+// tracked: #3322, #3323
+#[test]
+fn implicit_id_binds_on_inner_and_left_sides() {
+    let (core, _g) = open();
+    for sql in [
+        // 内側の述語が内側の `id` を参照し、外側の列とも比較する。
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.id = d.lang) t",
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE id = d.lang) t",
+        // 左側の `id` を外側参照する。
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.id) t",
+    ] {
+        let (c, m) = err_pair(&core, "alice", sql);
+        assert_eq!(c, "0A000", "{sql}: {m}");
+        assert!(m.ends_with(CORRELATED_MSG), "{sql}: {m}");
+    }
+}
+
 // tracked: #3323
 #[test]
 fn uncorrelated_left_join_lateral_is_a_dedicated_0a000() {
