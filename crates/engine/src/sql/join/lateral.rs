@@ -47,7 +47,15 @@ use super::values::{cell_scalar, cell_scalar_supports};
 use super::{JoinBudget, JoinLimits};
 
 /// 1 つの LATERAL relation を実行するための束縛済みの入力（外側タプルに依存しない部分）。
-pub(super) struct LateralRuntime {
+pub(super) enum LateralRuntime {
+    /// 本文つき LATERAL 派生表（基底の行を外側タプルごとに絞る。Issue #3322・#3323）。
+    Base(BaseRuntime),
+    /// `LATERAL unnest(<左側の配列列>)`（Issue #3360。外側タプルの配列セルから要素行を作る）。
+    Unnest(super::lateral_unnest::UnnestRuntime),
+}
+
+/// 本文つき LATERAL 派生表の実行用の入力（[`LateralRuntime::Base`]）。
+pub(super) struct BaseRuntime {
     /// 基底の評価済みの行（可視行。文内で 1 回だけ評価したもの）。
     base: QueryResult,
     /// 合成スキーマ（基底の列 ＋ 外側参照ごとの列）へ束縛した相関述語。
@@ -89,11 +97,11 @@ fn unsupported_column_type() -> SqlSurfaceError {
     )
 }
 
-fn too_large(what: &str) -> SqlSurfaceError {
+pub(super) fn too_large(what: &str) -> SqlSurfaceError {
     SqlSurfaceError::payload_too_large(what.to_string())
 }
 
-fn internal(detail: &str) -> SqlSurfaceError {
+pub(super) fn internal(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::Internal {
         detail: detail.to_string(),
     }
@@ -125,7 +133,7 @@ fn scrub_reserved_names(e: SqlSurfaceError) -> SqlSurfaceError {
     }
 }
 
-impl LateralRuntime {
+impl BaseRuntime {
     /// 基底の行 `base` と束縛情報から実行用の入力を組む。相関述語の束縛はスキーマだけで決まり行の内容・
     /// テナントに依存しない。外側タプルの評価の前に行うため、基底や外側が 0 行でも同じ束縛エラーになる
     /// （Describe は基底を評価しないため相関述語を束縛せず、この束縛エラーは Execute でだけ現れる）。
@@ -240,54 +248,26 @@ impl LateralRuntime {
     }
 }
 
-/// LATERAL の段 1 つを実行し、新しいタプル列を返す。`acc` は relation `0..new_rel` の結合結果で、出力領域
-/// （arena）は `sides[new_rel]` へ据える（下流の残余・並べ替え・集計・投影は `sides` を読む）。
-/// `stop_after_pairs` は最終段の早期停止の閾値（Issue #1797）。
-///
-/// 2 段で処理する（Issue #3323）。前段は外側タプルごとに「相関述語 → 後処理の層 → 側スキャン」を適用して
-/// 候補ペア `(外側タプル, arena の行)` を作る。後段は `sides[new_rel]` を据えたあと、候補ごとに結合キー・
-/// ON 残余（`on_new`・`on_mixed`）を共有の評価器（`residual::eval_all`）で評価して一致を決め、一致した
-/// 外側タプルを記録する。保存側（LEFT）では、LIMIT／OFFSET・側スキャン・ON をすべて適用した後に一致が 0 件の
-/// 外側タプルを NULL 補完行として残す（`exec::materialize_step` を共有。NULL 補完行も出力上限の対象）。
-#[allow(clippy::too_many_arguments)]
-pub(super) fn lateral_step(
-    sides: &mut [Vec<ResultRow>],
-    rt: &LateralRuntime,
-    step: &StepPlan,
-    new_rel: usize,
+/// LATERAL の前段の結果（候補ペア `(外側タプル, arena の行)` と出力領域〔arena〕）。
+pub(super) type LateralFront = (Vec<(u32, u32)>, Vec<ResultRow>);
+
+/// 本文つき LATERAL の前段（外側タプルごとに相関述語 → 後処理の層 → 側スキャンを適用して、候補ペアと
+/// 出力領域〔arena〕を作る。Issue #3322）。`passes` は外側だけを参照する ON 残余（`on_acc`）を通過した
+/// 外側タプルか。比較数の見積り・作業領域・出力行数は評価・確保の前に照合する（L10〜L12）。
+fn base_front(
+    sides: &[Vec<ResultRow>],
+    rt: &BaseRuntime,
     acc: &Tuples,
+    passes: &dyn Fn(usize) -> bool,
+    pass_count: usize,
     budget: &mut JoinBudget,
     limits: &JoinLimits,
-    stop_after_pairs: Option<usize>,
-) -> Result<Tuples, SqlSurfaceError> {
-    let n = acc.n;
+) -> Result<LateralFront, SqlSurfaceError> {
     let outer_count = acc.len();
     let base_len = rt.base_len();
-
-    // 外側だけを参照する ON 残余（`on_acc`）は外側タプルごとに 1 回だけ評価する。偽のタプルは再評価
-    // しない（L7）。評価は外側 relation の `sides` だけを読むため arena を据える前に行える。
     let mut scratch: Vec<StackValue> = Vec::new();
-    let mut passing: Vec<bool> = Vec::new();
-    let pass_count = if step.on_acc.is_empty() {
-        outer_count
-    } else {
-        budget.charge(outer_count)?;
-        passing.reserve(outer_count);
-        for ti in 0..outer_count {
-            if ti % crate::interrupt::CHECK_STRIDE as usize == 0 {
-                crate::interrupt::check()?;
-            }
-            let tuple = acc
-                .get(ti)
-                .ok_or_else(|| internal("JOIN accumulated tuple index out of range"))?;
-            passing.push(eval_all(&step.on_acc, sides, tuple, &mut scratch)?);
-        }
-        passing.iter().filter(|&&p| p).count()
-    };
-    let passes = |ti: usize| step.on_acc.is_empty() || passing.get(ti).copied().unwrap_or(false);
-
-    // L10: 評価・確保の前に、再評価数と比較数の見積り（通過した外側タプル数 × 基底の行数）を照合する。
-    budget.charge_reevaluations(pass_count)?;
+    // L10: 評価・確保の前に、比較数の見積り（通過した外側タプル数 × 基底の行数）を照合する（再評価数は
+    // 呼び出し元が計上済み）。
     let estimate = pass_count
         .checked_mul(base_len)
         .ok_or_else(|| too_large("JOIN comparison count exceeds the limit"))?;
@@ -305,7 +285,7 @@ pub(super) fn lateral_step(
     }
 
     // 前段。`scanned` は `sides` の外側セルを借用するため、後段で `sides` を更新する前にこの区間で閉じる。
-    let (mut pairs, arena) = {
+    let (pairs, arena) = {
         let sides_ro: &[Vec<ResultRow>] = sides;
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         let mut arena: Vec<ResultRow> = Vec::new();
@@ -400,6 +380,61 @@ pub(super) fn lateral_step(
             }
         }
         (pairs, arena)
+    };
+    Ok((pairs, arena))
+}
+
+/// LATERAL の段 1 つを実行し、新しいタプル列を返す。`acc` は relation `0..new_rel` の結合結果で、出力領域
+/// （arena）は `sides[new_rel]` へ据える（下流の残余・並べ替え・集計・投影は `sides` を読む）。
+/// `stop_after_pairs` は最終段の早期停止の閾値（Issue #1797）。
+///
+/// 2 段で処理する（Issue #3323）。前段は外側タプルごとに「相関述語 → 後処理の層 → 側スキャン」を適用して
+/// 候補ペア `(外側タプル, arena の行)` を作る。後段は `sides[new_rel]` を据えたあと、候補ごとに結合キー・
+/// ON 残余（`on_new`・`on_mixed`）を共有の評価器（`residual::eval_all`）で評価して一致を決め、一致した
+/// 外側タプルを記録する。保存側（LEFT）では、LIMIT／OFFSET・側スキャン・ON をすべて適用した後に一致が 0 件の
+/// 外側タプルを NULL 補完行として残す（`exec::materialize_step` を共有。NULL 補完行も出力上限の対象）。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lateral_step(
+    sides: &mut [Vec<ResultRow>],
+    rt: &LateralRuntime,
+    step: &StepPlan,
+    new_rel: usize,
+    acc: &Tuples,
+    budget: &mut JoinBudget,
+    limits: &JoinLimits,
+    stop_after_pairs: Option<usize>,
+) -> Result<Tuples, SqlSurfaceError> {
+    let n = acc.n;
+    let outer_count = acc.len();
+
+    // 外側だけを参照する ON 残余（`on_acc`）は外側タプルごとに 1 回だけ評価する。偽のタプルは再評価
+    // しない（L7）。評価は外側 relation の `sides` だけを読むため arena を据える前に行える。
+    let mut scratch: Vec<StackValue> = Vec::new();
+    let mut passing: Vec<bool> = Vec::new();
+    let pass_count = if step.on_acc.is_empty() {
+        outer_count
+    } else {
+        budget.charge(outer_count)?;
+        passing.reserve(outer_count);
+        for ti in 0..outer_count {
+            if ti % crate::interrupt::CHECK_STRIDE as usize == 0 {
+                crate::interrupt::check()?;
+            }
+            let tuple = acc
+                .get(ti)
+                .ok_or_else(|| internal("JOIN accumulated tuple index out of range"))?;
+            passing.push(eval_all(&step.on_acc, sides, tuple, &mut scratch)?);
+        }
+        passing.iter().filter(|&&p| p).count()
+    };
+    let passes = |ti: usize| step.on_acc.is_empty() || passing.get(ti).copied().unwrap_or(false);
+
+    budget.charge_reevaluations(pass_count)?;
+    let (mut pairs, arena) = match rt {
+        LateralRuntime::Base(b) => base_front(sides, b, acc, &passes, pass_count, budget, limits)?,
+        LateralRuntime::Unnest(u) => {
+            super::lateral_unnest::unnest_front(sides, u, acc, &passes, budget, limits)?
+        }
     };
     *sides
         .get_mut(new_rel)

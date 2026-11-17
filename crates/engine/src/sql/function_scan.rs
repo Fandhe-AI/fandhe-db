@@ -9,8 +9,8 @@
 //! （第 2 の外側処理を作らない）。ビュー本文・cursor・COPY・CTAS・サブクエリ内側・`EXPLAIN`・CTE 本文は
 //! この経路に入らず、従来どおり下流のパーサーが `42601` にする（fail-closed。派生表と同じ方針）。
 //!
-//! 未対応の形（JOIN／カンマ区切りの複数リレーション・`WITH ORDINALITY`・`ROWS FROM (...)`）は固定文言の
-//! `0A000`。関数の解決（レジストリ参照）・引数の型検査・評価は本モジュールでは行わない（呼び出し段が
+//! `WITH ORDINALITY`（Issue #3360）は受理し、末尾へ 1 始まりの `bigint` 列 `ordinality` を足す。
+//! 未対応の形（JOIN／カンマ区切りの複数リレーション・`ROWS FROM (...)`）は固定文言の `0A000`。関数の解決（レジストリ参照）・引数の型検査・評価は本モジュールでは行わない（呼び出し段が
 //! セッションの `UdfRegistry` で行い、他テナントの関数は不在と同じ応答になる）。
 //!
 //! RLS-10 (b) の不変条件: 本モジュールの型はテナント・`PolicyContext` を持たず、カタログにも触れない。
@@ -42,6 +42,8 @@ pub(crate) struct FunctionScanParts {
     pub(crate) column_aliases: Vec<String>,
     /// 関数呼び出し部分を公開名（別名、無ければ関数名）の 1 トークンへ置き換えた外側のトークン列。
     pub(crate) outer_tokens: Vec<Token>,
+    /// `WITH ORDINALITY` が付いたか（末尾へ 1 始まりの `bigint` 列を足す。Issue #3360）。
+    pub(crate) ordinality: bool,
 }
 
 fn unsupported(detail: &'static str) -> SqlSurfaceError {
@@ -149,8 +151,17 @@ pub(crate) fn extract(tokens: &[Token]) -> Result<Option<FunctionScanParts>, Sql
     let rest = tokens.get(open_idx..).unwrap_or(&[]);
     let (inner, after) = split_parenthesized(rest)?;
     let arg_tokens = split_args(inner)?;
+    // `WITH ORDINALITY`（Issue #3360）。`WITH` の後が `ORDINALITY` 以外なら構文エラー（`42601`）。
+    let mut ordinality = false;
+    let mut after = after;
     if is_ident(after.first(), "WITH") {
-        return Err(unsupported("WITH ORDINALITY is not supported"));
+        if !is_ident(after.get(1), "ORDINALITY") {
+            return Err(SqlSurfaceError::unsupported(
+                "expected ORDINALITY after WITH in a FROM function",
+            ));
+        }
+        ordinality = true;
+        after = after.get(2..).unwrap_or(&[]);
     }
     let (alias, column_aliases, consumed) = parse_derived_alias_head(after)?;
     let tail = after.get(consumed..).unwrap_or(&[]);
@@ -175,6 +186,7 @@ pub(crate) fn extract(tokens: &[Token]) -> Result<Option<FunctionScanParts>, Sql
         alias,
         column_aliases,
         outer_tokens: outer,
+        ordinality,
     }))
 }
 
@@ -200,6 +212,9 @@ pub(crate) struct ScanPlan {
     /// 出力列（公開名・宣言型）。名前は `SETOF` なら別名（無ければ関数名）、`TABLE` なら宣言名。
     pub(crate) columns: Vec<(String, CastType)>,
 }
+
+/// `WITH ORDINALITY` の序数列の既定名（PostgreSQL と同じ。列名リストで改名できる。Issue #3360）。
+pub(crate) const ORDINALITY_COLUMN: &str = "ordinality";
 
 /// 関数呼び出し `scan` をレジストリで解決し、引数の個数・型を検査して出力列を決める（本体は実行しない）。
 /// 関数が無い（他テナントの関数・不在・個数不一致）は区別せず `42883`。集合返却でない関数
@@ -253,10 +268,13 @@ pub(crate) fn plan(
         .alias
         .clone()
         .unwrap_or_else(|| display_function_name(&scan.name).to_ascii_lowercase());
-    let columns = cols
+    let mut columns: Vec<(String, CastType)> = cols
         .iter()
         .map(|(n, t)| (n.clone().unwrap_or_else(|| default_name.clone()), t.clone()))
         .collect();
+    if scan.ordinality {
+        columns.push((ORDINALITY_COLUMN.to_string(), CastType::Int8));
+    }
     Ok(ScanPlan { def, columns })
 }
 
@@ -354,11 +372,25 @@ mod tests {
         for sql in [
             "SELECT * FROM f(1), t",
             "SELECT * FROM f(1) JOIN t ON true",
-            "SELECT * FROM f(1) WITH ORDINALITY",
             "SELECT * FROM ROWS FROM (f(1))",
         ] {
             assert_eq!(code(sql), "0A000", "{sql}");
         }
+    }
+
+    /// Issue #3360: `WITH ORDINALITY` は受理し（別名・列名リストの前に置く）、`ORDINALITY` 以外は `42601`。
+    #[test]
+    fn with_ordinality_is_accepted_and_other_with_is_a_syntax_error() {
+        let p = parts("SELECT * FROM f(1) WITH ORDINALITY AS t(a, n)").expect("found");
+        assert!(p.ordinality);
+        assert_eq!(p.alias.as_deref(), Some("t"));
+        assert_eq!(p.column_aliases, vec!["a".to_string(), "n".to_string()]);
+        let p = parts("SELECT * FROM f(1) WITH ORDINALITY").expect("found");
+        assert!(p.ordinality);
+        assert_eq!(p.alias, None);
+        assert!(!parts("SELECT * FROM f(1)").expect("found").ordinality);
+        assert_eq!(code("SELECT * FROM f(1) WITH foo"), "42601");
+        assert_eq!(code("SELECT * FROM f(1) WITH"), "42601");
     }
 
     /// 引数の個数は確保の前に上限で検査する（`54000`）。

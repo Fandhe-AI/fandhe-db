@@ -477,8 +477,6 @@ fn unsupported_forms_are_rejected_fail_closed() {
         "SELECT f(1)",
         "SELECT * FROM f(1), t",
         "SELECT * FROM f(1) JOIN t ON true",
-        "SELECT * FROM f(1) WITH ORDINALITY",
-        "SELECT * FROM ROWS FROM (f(1))",
         "SELECT * FROM sc(1)",
         "SELECT * FROM dc(1)",
         "SELECT * FROM f(sc(1))",
@@ -495,6 +493,105 @@ fn unsupported_forms_are_rejected_fail_closed() {
     // 引数の個数不一致は不在と同じ `42883`、列参照の引数は定数式として拒否される（`22000`）。
     assert_eq!(code(&core, &mut s, "SELECT * FROM f()"), "42883");
     assert_eq!(code(&core, &mut s, "SELECT * FROM f(a)"), "22000");
+}
+
+/// `ROWS FROM (...)` は未対応で固定の `0A000`（Issue #3360 では対象外。追跡は #3160）。
+/// tracked: #3160
+#[test]
+fn rows_from_is_rejected_with_a_fixed_0a000() {
+    let (core, mut s, _g) = setup("sql67_rows_from");
+    run(
+        &core,
+        &mut s,
+        "CREATE FUNCTION f(x int) RETURNS SETOF int LANGUAGE sql STABLE AS $$ SELECT x $$",
+    );
+    assert_eq!(
+        code(&core, &mut s, "SELECT * FROM ROWS FROM (f(1))"),
+        "0A000"
+    );
+}
+
+/// Issue #3360: `WITH ORDINALITY` は 1 始まりの `bigint` 列を末尾へ足す。列名は PostgreSQL 17.12 と
+/// 同じ（別名だけなら値の列が別名・序数は `ordinality`、列名リストで改名。`WITH` の後が `ORDINALITY` 以外は `42601`）。外側の WHERE・ORDER BY は序数列にも効く。
+#[test]
+fn with_ordinality_appends_a_one_based_bigint_column() {
+    let (core, mut s, _g) = setup("sql67_ordinality");
+    run(
+        &core,
+        &mut s,
+        "CREATE FUNCTION f(lo int) RETURNS SETOF int LANGUAGE sql STABLE AS \
+         $$ SELECT a FROM t WHERE a >= $1 ORDER BY a $$",
+    );
+    run(
+        &core,
+        &mut s,
+        "CREATE FUNCTION w(x int) RETURNS TABLE (n int, label text) LANGUAGE sql STABLE AS \
+         $$ SELECT a, b FROM t WHERE a >= $1 ORDER BY a $$",
+    );
+    assert_eq!(
+        rows(&core, &mut s, "SELECT * FROM f(2) WITH ORDINALITY"),
+        vec![vec![int(2), int(1)], vec![int(3), int(2)]]
+    );
+    assert_eq!(
+        names(&core, &mut s, "SELECT * FROM f(2) WITH ORDINALITY"),
+        vec!["f", "ordinality"]
+    );
+    assert_eq!(
+        names(&core, &mut s, "SELECT * FROM f(2) WITH ORDINALITY AS x"),
+        vec!["x", "ordinality"]
+    );
+    assert_eq!(
+        names(&core, &mut s, "SELECT * FROM f(2) WITH ORDINALITY AS x(c)"),
+        vec!["c", "ordinality"]
+    );
+    assert_eq!(
+        names(
+            &core,
+            &mut s,
+            "SELECT * FROM f(2) WITH ORDINALITY AS x(c, n)"
+        ),
+        vec!["c", "n"]
+    );
+    assert_eq!(
+        names(&core, &mut s, "SELECT * FROM w(1) WITH ORDINALITY AS t(a)"),
+        vec!["a", "label", "ordinality"]
+    );
+    assert_eq!(
+        rows(
+            &core,
+            &mut s,
+            "SELECT * FROM f(1) WITH ORDINALITY ORDER BY ordinality DESC"
+        ),
+        vec![
+            vec![int(3), int(3)],
+            vec![int(2), int(2)],
+            vec![int(1), int(1)]
+        ]
+    );
+    assert_eq!(
+        rows(
+            &core,
+            &mut s,
+            "SELECT * FROM f(3) WITH ORDINALITY WHERE ordinality = 1"
+        ),
+        vec![vec![int(3), int(1)]]
+    );
+    assert_eq!(code(&core, &mut s, "SELECT * FROM f(2) WITH foo"), "42601");
+    // 序数列の型は bigint（Describe も同じ）。
+    let parsed = core
+        .parse_sql("SELECT * FROM f(2) WITH ORDINALITY")
+        .expect("parse");
+    let cols = core
+        .describe_parsed_in_session(&s, &parsed)
+        .expect("describe")
+        .expect("columns");
+    assert!(matches!(
+        cols.get(1),
+        Some(ColumnMeta::Scalar {
+            ty: engine::catalog::ColumnType::BigInt,
+            ..
+        })
+    ));
 }
 
 /// Describe は宣言列を公告し、本体を実行しない。

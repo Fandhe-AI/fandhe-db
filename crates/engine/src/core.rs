@@ -13247,8 +13247,25 @@ impl EngineCore {
                 // SQL-62・Issue #1861: CTE 入力は本文を実行せず、結果列だけを導出して Execute と同じ
                 // 関数で合成スキーマにする（Describe は本体を実行しない契約）。
                 if let Some(cte) = validated.cte_inputs.as_deref() {
-                    for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
+                    for (rel_idx, (rel, slot)) in validated
+                        .relations
+                        .iter()
+                        .zip(cte.relation_slot.iter())
+                        .enumerate()
+                    {
                         let Some(k) = slot else { continue };
+                        // `LATERAL unnest(...)`（Issue #3360）は Execute と同じ導出（足場の slot は使わない）。
+                        if let Some(Some(lat)) = cte.lateral.get(rel_idx) {
+                            if lat.unnest.is_some() {
+                                let cols =
+                                    crate::sql::join::unnest_columns_for(validated, &schemas, lat)?;
+                                let (schema, id_columns) =
+                                    crate::sql::join::cte_schema(rel.table(), &cols)?;
+                                schemas.insert(rel.table().to_string(), schema);
+                                cte_ids.insert(rel.table().to_string(), id_columns);
+                                continue;
+                            }
+                        }
                         let cols = self.describe_cte_slot(
                             session,
                             cte,
@@ -14825,7 +14842,17 @@ impl EngineCore {
             // 外側の行ごとに再評価する LATERAL（Issue #3322）は、後処理の slot を評価せず、基底（親 slot）だけを
             // 文内で 1 回評価して JOIN へ渡す。後処理は外側タプルごとに `sql::join::lateral` が適用する。
             // 結合のスキーマ・列メタは後処理後の列（Describe の `describe_cte_slot` と同じ導出）で作る。
-            if cte.lateral.get(rel_idx).is_some_and(Option::is_some) {
+            if let Some(Some(lat)) = cte.lateral.get(rel_idx) {
+                // `LATERAL unnest(...)`（Issue #3360）は slot の足場を評価せず（記憶域を読まず）、左側 relation の
+                // スキーマから出力列を導く（Describe と同じ `unnest_columns_for`）。行は JOIN の段が作る。
+                if lat.unnest.is_some() {
+                    let cols = crate::sql::join::unnest_columns_for(validated, schemas, lat)?;
+                    let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &cols)?;
+                    schemas.insert(rel.table().to_string(), schema);
+                    cte_ids.insert(rel.table().to_string(), id_columns);
+                    inputs.push(None);
+                    continue;
+                }
                 let (base, post_columns) = self.evaluate_lateral_base(
                     ctx, session, read_txn, cte, *k, limits, &mut cache, budget,
                 )?;
@@ -17316,6 +17343,13 @@ impl EngineCore {
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
         let cte_inputs = validated.cte_inputs.as_deref();
         if let Some(cte) = cte_inputs {
+            // LATERAL（本文つき・`unnest`）の EXPLAIN は #3324 の範囲で、入口（`contains_lateral`）が固定 `0A000` で
+            // 拒否する。ここへ来た場合の多重防御（足場の slot を実行計画として写さない）。
+            if cte.lateral.iter().any(Option::is_some) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN of a LATERAL subquery is not supported yet",
+                ));
+            }
             for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
                 let Some(k) = slot else { continue };
                 let cols = self.describe_cte_slot(
