@@ -8,7 +8,7 @@
 //! [`ExplainNode`] を返す純粋関数だけを置く。行・ロック・台帳・世代・キャッシュには触れない。
 //!
 //! 出力語彙は閉じている（`join_method`・`join_type`・`join_keys`・`join_filter`・`relation`・
-//! `residual_predicates`・`group_keys`・`aggregates`・`having`・`sort_keys`・`limit`・`offset`）。
+//! `reevaluation`（LATERAL 段のみ）・`residual_predicates`・`group_keys`・`aggregates`・`having`・`sort_keys`・`limit`・`offset`）。
 //! 表名・別名・LIMIT／OFFSET の値・行数・見積もりは出さない（SQL-75 (5)。テナント存在情報と
 //! 利用者リテラルの露出を避ける）。結合方式は実行器と同じ `StepPlan::method` で決める。
 
@@ -55,16 +55,21 @@ pub(crate) fn explain_tree_with_side_nodes(
             JoinMethod::Hash => ("hash", step.keys.len()),
             JoinMethod::NestedLoop => ("nested_loop", 0),
             JoinMethod::Cross => ("cross", 0),
+            JoinMethod::Lateral => ("lateral", 0),
         };
-        let mut node = ExplainNode::try_stage(
-            "join".to_string(),
-            vec![
-                format!("join_method: {method_token}"),
-                format!("join_type: {join_type}"),
-                format!("join_keys: {keys}"),
-                format!("join_filter: {}", present(step.has_on_residual())),
-            ],
-        )?;
+        let mut lines = vec![
+            format!("join_method: {method_token}"),
+            format!("join_type: {join_type}"),
+            format!("join_keys: {keys}"),
+            format!("join_filter: {}", present(step.has_on_residual())),
+        ];
+        // Issue #3324（SQL-62 (7)）: 外側参照のある LATERAL 段だけが外側行ごとに右側を再評価する。
+        // 外側参照の無い LATERAL は通常の派生表の段（`cross` 等）になるので、この行は出ない。
+        // 行数・名前・LIMIT 値は出さない閉じた固定トークン。
+        if matches!(step.method(), JoinMethod::Lateral) {
+            lines.push("reevaluation: per_outer_row".to_string());
+        }
+        let mut node = ExplainNode::try_stage("join".to_string(), lines)?;
         node.push_child(current)?;
         node.push_child(right)?;
         current = node;

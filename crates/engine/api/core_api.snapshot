@@ -276,6 +276,7 @@ pub enum StorageError {
 pub enum CatalogError {
     Backend(redb::Error),
     Invalid(String),
+    AmbiguousColumn(String),
     CorruptSchema(String),
     TableNotFound(String),
     TableAlreadyExists(String),

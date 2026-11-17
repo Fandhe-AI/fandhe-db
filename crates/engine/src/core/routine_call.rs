@@ -136,12 +136,23 @@ impl EngineCore {
                 self.run_set_routine_active(ctx, session, txn, &plan.def, values, may_write)?
             }
         };
+        // `WITH ORDINALITY`（Issue #3360）は本体の行へ 1 始まりの序数（`bigint`）を末尾に足す。
+        let ordinality = scan.ordinality;
         let rows = rows
             .into_iter()
-            .map(|r| crate::sql::exec::ResultRow {
-                id: 0,
-                score: 0.0,
-                cells: r.into_iter().map(|v| v.cell).collect(),
+            .enumerate()
+            .map(|(i, r)| {
+                let mut cells: Vec<crate::sql::exec::Cell> =
+                    r.into_iter().map(|v| v.cell).collect();
+                if ordinality {
+                    let n = i64::try_from(i.saturating_add(1)).unwrap_or(i64::MAX);
+                    cells.push(crate::sql::exec::Cell::SignedInteger(n));
+                }
+                crate::sql::exec::ResultRow {
+                    id: 0,
+                    score: 0.0,
+                    cells,
+                }
             })
             .collect();
         let result = crate::sql::exec::QueryResult { columns, rows };

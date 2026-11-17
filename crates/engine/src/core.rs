@@ -2855,7 +2855,18 @@ fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<S
         Statement::Select(v) => out.push(v.table_name().to_string()),
         Statement::Aggregate(v) => out.push(v.table_name().to_string()),
         Statement::Scan(v) => out.push(v.table_name().to_string()),
-        Statement::Join(v) => out.extend(crate::sql::join::collect_join_tables(v)),
+        Statement::Join(v) => {
+            out.extend(crate::sql::join::collect_join_tables(v));
+            // Issue #3324: LATERAL 派生表を本文に持つビューの CTE 入力（slot）が読む表も含める
+            // （照合の検査が内側の表を取りこぼさない）。
+            if let Some(inputs) = v.cte_inputs.as_deref() {
+                for slot in &inputs.slots {
+                    if let crate::sql::allowlist::CteSlotSource::Scan(scan) = &slot.source {
+                        out.push(scan.table_name().to_string());
+                    }
+                }
+            }
+        }
         Statement::SetOperation(v) => crate::sql::set_op::collect_branch_tables(&v.tree, out),
         Statement::BufferedView(v) => buffered_body_tables(&v.body, out),
         Statement::RecursiveCte(v) => recursive_cte_tables(v, out),
@@ -8987,11 +8998,16 @@ impl EngineCore {
         // `WherePredicate::Equality` にならず序数に数えない）。
         // 結合 DML（Issue #3297）は連言分ごとのフラグ（`sql::join::dml_plan` が対象側・source 側へ
         // 振り分ける）。それ以外は従来どおり等価述語の序数ごと。
-        let where_equality_dummy_flags = if crate::sql::params::is_joined_dml(&tokens) {
-            crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
-        } else {
-            crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
-        };
+        // Issue #3324: LATERAL 本文の `$n` は TEXT 系の列に限るためダミー値の語彙照合の省略が要らない。
+        // 序数フラグは本文の外の実リテラルへ誤適用されうるので、渡さない（空＝すべて検証する）。
+        let where_equality_dummy_flags =
+            if param_count > 0 && crate::sql::params::lateral_param_layout(&tokens).is_some() {
+                Vec::new()
+            } else if crate::sql::params::is_joined_dml(&tokens) {
+                crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
+            } else {
+                crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
+            };
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
         let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
@@ -9330,6 +9346,27 @@ impl EngineCore {
                                 .and_then(|(_, t)| column_type(t, column)),
                             Some(ParamContextKind::Operator),
                         ),
+                        // Issue #3324: LATERAL 本文の WHERE の `$n`。型は本文の FROM の表の列から引く。
+                        // 受理するのは TEXT 系の列（引けない場合は従来どおり `Text`）だけ。派生表の本文は
+                        // 数値比較・`BETWEEN` を持てず、ENUM・日付等の列は Describe 用ダミー値が型検証に
+                        // 当たる（等価述語の序数フラグが LATERAL 本文の内側では保証できない）ため、
+                        // 列が引けて TEXT 系でない場合は固定 `42601`（fail-closed）で拒否する。
+                        ParamPosition::LateralColumn { table, column } => {
+                            let ty = column_type(table, column);
+                            if let Some(t) = &ty {
+                                let text_like = matches!(
+                                    t,
+                                    PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })
+                                        if ty.is_text_like()
+                                );
+                                if !text_like {
+                                    return Err(SqlSurfaceError::unsupported(
+                                        "parameter placeholders in LATERAL derived tables are supported only for text columns",
+                                    ));
+                                }
+                            }
+                            (ty, Some(ParamContextKind::Operator))
+                        }
                         ParamPosition::SetColumn(col) => (
                             where_table.as_deref().and_then(|t| column_type(t, col)),
                             Some(ParamContextKind::Assignment),
@@ -13247,8 +13284,25 @@ impl EngineCore {
                 // SQL-62・Issue #1861: CTE 入力は本文を実行せず、結果列だけを導出して Execute と同じ
                 // 関数で合成スキーマにする（Describe は本体を実行しない契約）。
                 if let Some(cte) = validated.cte_inputs.as_deref() {
-                    for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
+                    for (rel_idx, (rel, slot)) in validated
+                        .relations
+                        .iter()
+                        .zip(cte.relation_slot.iter())
+                        .enumerate()
+                    {
                         let Some(k) = slot else { continue };
+                        // `LATERAL unnest(...)`（Issue #3360）は Execute と同じ導出（足場の slot は使わない）。
+                        if let Some(Some(lat)) = cte.lateral.get(rel_idx) {
+                            if lat.unnest.is_some() {
+                                let cols =
+                                    crate::sql::join::unnest_columns_for(validated, &schemas, lat)?;
+                                let (schema, id_columns) =
+                                    crate::sql::join::cte_schema(rel.table(), &cols)?;
+                                schemas.insert(rel.table().to_string(), schema);
+                                cte_ids.insert(rel.table().to_string(), id_columns);
+                                continue;
+                            }
+                        }
                         let cols = self.describe_cte_slot(
                             session,
                             cte,
@@ -14774,6 +14828,7 @@ impl EngineCore {
             &cte_ids,
             inputs,
             budget,
+            self.correlated_limits,
         )
     }
 
@@ -14811,19 +14866,121 @@ impl EngineCore {
         let mut cache: Vec<Option<crate::sql::exec::QueryResult>> = vec![None; cte.slots.len()];
         let mut inputs = Vec::with_capacity(validated.relations.len());
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
-        for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
+        for (rel_idx, (rel, slot)) in validated
+            .relations
+            .iter()
+            .zip(cte.relation_slot.iter())
+            .enumerate()
+        {
             let Some(k) = slot else {
                 inputs.push(None);
                 continue;
             };
-            let result = self
-                .evaluate_cte_slot(ctx, session, read_txn, cte, *k, limits, &mut cache, budget)?;
+            // 外側の行ごとに再評価する LATERAL（Issue #3322）は、後処理の slot を評価せず、基底（親 slot）だけを
+            // 文内で 1 回評価して JOIN へ渡す。後処理は外側タプルごとに `sql::join::lateral` が適用する。
+            // 結合のスキーマ・列メタは後処理後の列（Describe の `describe_cte_slot` と同じ導出）で作る。
+            if let Some(Some(lat)) = cte.lateral.get(rel_idx) {
+                // `LATERAL unnest(...)`（Issue #3360）は slot の足場を評価せず（記憶域を読まず）、左側 relation の
+                // スキーマから出力列を導く（Describe と同じ `unnest_columns_for`）。行は JOIN の段が作る。
+                if lat.unnest.is_some() {
+                    let cols = crate::sql::join::unnest_columns_for(validated, schemas, lat)?;
+                    let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &cols)?;
+                    schemas.insert(rel.table().to_string(), schema);
+                    cte_ids.insert(rel.table().to_string(), id_columns);
+                    inputs.push(None);
+                    continue;
+                }
+                let (base, post_columns) = self.evaluate_lateral_base(
+                    ctx, session, read_txn, cte, *k, limits, &mut cache, budget,
+                )?;
+                let (schema, id_columns) =
+                    crate::sql::join::cte_schema(rel.table(), &post_columns)?;
+                schemas.insert(rel.table().to_string(), schema);
+                cte_ids.insert(rel.table().to_string(), id_columns);
+                inputs.push(Some(base));
+                continue;
+            }
+            let result = self.evaluate_cte_slot(
+                ctx, session, read_txn, cte, *k, limits, &mut cache, budget, None,
+            )?;
             let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &result.columns)?;
             schemas.insert(rel.table().to_string(), schema);
             cte_ids.insert(rel.table().to_string(), id_columns);
             inputs.push(Some(result));
         }
         Ok((inputs, cte_ids))
+    }
+
+    /// 外側の行ごとに再評価する LATERAL の slot `k`（後処理）について、基底（`from` の親 slot）の評価済みの
+    /// 行と、後処理後の結果列（列名リスト適用後）を返す（Issue #3322。設計記録 L1・L15）。基底は参照者
+    /// 自身の `ctx`・呼び出し元と同一の `read_txn` で文内に 1 回だけ評価し、保持分は `budget` へ計上される。
+    /// 基底が実表を読む `Scan` のときの暗黙 `LIMIT`（結果行数上限）は、後処理が外側タプルごとに絞るため
+    /// ハード上限まで緩め、入力行数の上限は呼び出し先の JOIN が判定する（利用者の CTE を読む基底は設定値の
+    /// まま）。明示 `LIMIT` は設定値の範囲を検査する。
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_lateral_base<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        read_txn: &R,
+        cte: &crate::sql::allowlist::JoinCteInputs,
+        k: usize,
+        limits: crate::result_limits::ResultLimits,
+        cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
+        budget: &mut crate::sql::join::JoinBudget,
+    ) -> Result<
+        (
+            crate::sql::exec::QueryResult,
+            Vec<crate::sql::exec::ColumnMeta>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
+        let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "CTE slot out of range".to_string(),
+        })?;
+        let CteSlotSource::Derived { from, layer } = &slot.source else {
+            return Err(SqlSurfaceError::Internal {
+                detail: "LATERAL slot is not a derived layer".to_string(),
+            });
+        };
+        if layer.limit_explicit {
+            crate::sql::parser::validate_search_limit_with(layer.limit, &limits)?;
+        }
+        // 基底が実表を読む `Scan` のときだけ暗黙上限を緩める。基底が利用者の CTE を読む `Derived` のときは、
+        // 緩めた上限が（共有されうる）親 slot の評価・キャッシュへ伝わらないよう、設定値のまま渡す。
+        let base_is_scan = matches!(
+            cte.slots.get(*from).map(|b| &b.source),
+            Some(CteSlotSource::Scan(_))
+        );
+        let base_limits = if base_is_scan {
+            crate::result_limits::ResultLimits::new(crate::result_limits::MAX_RESULT_ROWS_HARD_CAP)
+        } else {
+            limits
+        };
+        let base = self.evaluate_cte_slot(
+            ctx,
+            session,
+            read_txn,
+            cte,
+            *from,
+            base_limits,
+            cache,
+            budget,
+            base_is_scan.then(|| self.join_limits.max_input_rows()),
+        )?;
+        let plan = crate::sql::view_buffered::plan_rows_layer(
+            &base.columns,
+            &slot.name,
+            layer,
+            session.udfs(),
+        )?;
+        let mut columns = plan.columns().to_vec();
+        if !slot.column_aliases.is_empty() {
+            columns =
+                crate::sql::view_buffered::rename_cte_columns(&columns, &slot.column_aliases)?;
+        }
+        Ok((base, columns))
     }
 
     /// CTE slot `k` の評価済みの行（列名リスト適用後）を返す（[`Self::evaluate_join_cte_inputs`]
@@ -14842,6 +14999,7 @@ impl EngineCore {
         limits: crate::result_limits::ResultLimits,
         cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
         budget: &mut crate::sql::join::JoinBudget,
+        scan_input_cap: Option<usize>,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
         let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
@@ -14857,13 +15015,18 @@ impl EngineCore {
             CteSlotSource::Scan(scan) => {
                 self.count_materialized_cte_eval();
                 let schema = table_schema_in(read_txn, scan.table_name())?;
-                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     scan,
                     &schema,
                     session.udfs(),
                     &[],
                     &limits,
                 )?;
+                // 入力上限つきの基底（LATERAL。Issue #3322 設計記録 L11）は、上限＋1 件で取得を止めて
+                // 超過を検出する（上限を超える行を読み込み・確保しない）。
+                if let Some(cap) = scan_input_cap {
+                    bound.limit = cap.saturating_add(1);
+                }
                 let result = crate::sql::scan::execute_scan_with_budget(
                     read_txn,
                     ctx,
@@ -14871,6 +15034,13 @@ impl EngineCore {
                     &bound,
                     budget.remaining(),
                 )?;
+                if let Some(cap) = scan_input_cap {
+                    if result.rows.len() > cap {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "JOIN input exceeds the visible row limit",
+                        ));
+                    }
+                }
                 budget.charge_result(&result)?;
                 result
             }
@@ -14900,6 +15070,7 @@ impl EngineCore {
                     parent_limits,
                     cache,
                     budget,
+                    None,
                 )?;
                 // tail CTE（Issue #1862）の明示 `LIMIT` は設定値の範囲で検査する（構文段は
                 // 設定値を持たない。Scan 側の `bind_scan_with_dummy_flags` と同じ契約）。
@@ -17209,6 +17380,13 @@ impl EngineCore {
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
         let cte_inputs = validated.cte_inputs.as_deref();
         if let Some(cte) = cte_inputs {
+            // LATERAL（本文つき・`unnest`）の EXPLAIN は #3324 の範囲で、入口（`contains_lateral`）が固定 `0A000` で
+            // 拒否する。ここへ来た場合の多重防御（足場の slot を実行計画として写さない）。
+            if cte.lateral.iter().flatten().any(|l| l.unnest.is_some()) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN of a LATERAL subquery is not supported yet",
+                ));
+            }
             for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
                 let Some(k) = slot else { continue };
                 let cols = self.describe_cte_slot(

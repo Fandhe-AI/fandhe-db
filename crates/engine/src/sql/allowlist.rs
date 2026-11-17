@@ -1279,6 +1279,9 @@ pub enum SqlSurfaceError {
     /// 一致しない（`42P10`。SQL-49・ERR-6、Issue #1707。`id` と他列の混在・未知列を含む）。
     /// 束縛段（`sql::parser::resolve_conflict_target`）が返す。固定文言で列名・値を含めない。
     InvalidColumnReference,
+    /// RIGHT／FULL JOIN の LATERAL 派生表が左側 relation の列を参照した（`42P10`。SQL-62・Issue #3323）。
+    /// `sql::derived_table` の束縛段が返す。固定文言で入力・列名を含めない。
+    LateralReferenceInvalidJoinType,
     /// ウィンドウのフレーム句のオフセット式に変数（識別子）がある（`42P10`。SQL-64 (2)・
     /// Issue #1887）。列を解決せず一律に返すため、ビューの非公開列か未知列かで応答が変わらない
     /// （存在情報を漏らさない）。`mode` は `ROWS`／`RANGE`／`GROUPS` の固定語で、利用者の入力は含めない。
@@ -2174,6 +2177,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference
+            | SqlSurfaceError::LateralReferenceInvalidJoinType
             | SqlSurfaceError::WindowFrameOffsetHasVariables { .. }
             | SqlSurfaceError::CteColumnListTooLong { .. }
             | SqlSurfaceError::DerivedTableColumnListTooLong { .. }
@@ -2511,6 +2515,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InvalidColumnReference => write!(
                 f,
                 "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ),
+            SqlSurfaceError::LateralReferenceInvalidJoinType => write!(
+                f,
+                "invalid reference to FROM-clause entry: the combining JOIN type must be INNER or LEFT for a LATERAL reference"
             ),
             SqlSurfaceError::WindowFrameOffsetHasVariables { mode } => {
                 write!(f, "argument of {mode} must not contain variables")
@@ -3720,6 +3728,8 @@ pub struct ValidatedFunctionScan {
     pub(crate) args: Vec<Expr>,
     /// 利用者が書いた別名（`SETOF` の列名の決定に使う）。
     pub(crate) alias: Option<String>,
+    /// `WITH ORDINALITY`（末尾へ 1 始まりの `bigint` 列を足す。Issue #3360）。
+    pub(crate) ordinality: bool,
 }
 
 /// 検証済みの再帰 CTE（[`Statement::RecursiveCte`]。SQL-35・Issue #1870）。フィールドは
@@ -4130,7 +4140,8 @@ pub(crate) enum JoinKind {
 /// 構文段では持たない。束縛段 `sql::join` が両入力のスキーマから共通列名を導出し、`Using` と
 /// 同じ経路で束縛する（共通列が 0 個なら条件なしの直積）。
 /// `Cross`（Issue #1831・SQL-60 ポインタ）は `CROSS JOIN` で、条件を持たない直積。結合種別は
-/// 常に [`JoinKind::Inner`]。束縛段では結合キー・ON 残余ともに空の段になる。
+/// 構文段では常に [`JoinKind::Inner`]（`sql::derived_table` が LATERAL 派生表の `ON true` を
+/// `CROSS JOIN` へ書き換えたときだけ、束縛前に Left／Right／Full へ設定する。Issue #3323）。束縛段では結合キー・ON 残余ともに空の段になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JoinCondition {
     On(JoinWhereExpr),
@@ -4258,6 +4269,34 @@ pub(crate) struct JoinCteInputs {
     /// `ValidatedJoin::relations` と同じ並びで、そのリレーションが参照する slot の添字
     /// （`None` は実表）。
     pub(crate) relation_slot: Vec<Option<usize>>,
+    /// `relation_slot` と同じ並びで、外側の行ごとに再評価する LATERAL 派生表（左側の列を参照する形。
+    /// Issue #3322）の実行情報。`None` は通常の入力。`Some` のリレーションの slot は後処理を表す
+    /// `Derived` で、`from` が基底（外側参照を含まない部分）を指す。`sql::derived_table` だけが設定する。
+    pub(crate) lateral: Vec<Option<JoinLateral>>,
+}
+
+/// 外側の行ごとに再評価する LATERAL 派生表の実行情報（Issue #3322・SQL-62。設計記録
+/// `docs/design/lateral-derived-table.md` の L1・L2）。テナント・`PolicyContext` は保持しない。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JoinLateral {
+    /// 参照する左側 relation の列 `(結合連鎖の添字, 列名)`。`WherePredicate` 内の予約内部名
+    /// （`correlation::lateral_ref_placeholder`）と対応する。
+    pub(crate) outer_refs: Vec<(usize, String)>,
+    /// 外側参照を含む連言（基底の行に外側タプルごとにかける相関述語）。`unnest` が `Some` のときは空。
+    pub(crate) correlated: Vec<WherePredicate>,
+    /// 集合を返す組み込み関数 `unnest(<左側の配列列>)` の relation（Issue #3360。L18〜L22）。`Some` のとき
+    /// `outer_refs` は引数の列 1 つだけで、基底の行・後処理の層は持たず、外側タプルの配列セルから要素行を作る。
+    pub(crate) unnest: Option<LateralUnnest>,
+}
+
+/// `LATERAL unnest(<左側の配列列>) [WITH ORDINALITY]` の実行情報（Issue #3360。設計記録 L18〜L22）。
+/// 要素型は実行時に左側 relation のスキーマから決める（Describe と Execute が同じ導出を通す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LateralUnnest {
+    /// `WITH ORDINALITY` が付いたか（末尾へ 1 始まりの `bigint` 列を足す）。
+    pub(crate) ordinality: bool,
+    /// 出力列名（列数は 1 または 2。別名・列名リスト・既定名を抽出段で確定済み）。
+    pub(crate) column_names: Vec<String>,
 }
 
 // 手書きの `Eq`: `slots` が持つ述語は f64 を含みうるため `derive(Eq)` できないが、構築経路が
@@ -19467,6 +19506,11 @@ pub(crate) enum ViewBodyKind {
         /// 連鎖拒否・依存検査（`2BP01`）の唯一の根拠になる。
         relations: Vec<String>,
     },
+    /// 左側を持つ LATERAL 派生表を含む JOIN 本文のうち、構造検証（[`ViewBodyCheck::Structural`]。
+    /// 列を引けない）では解決できず保留したもの（Issue #3324）。`relations` はトークン列から
+    /// 読み取った relation 名（本文が読む表の上位集合。重複なし）。`catalog::Storage::create_view` が
+    /// 実カタログ（`Resolved`）で必ず再検証して確定させ、参照時も同じ再検証を通す。
+    LateralDeferred { relations: Vec<String> },
 }
 
 /// カタログを照会しない構文専用の [`TableLookup`]（Issue #1192）。`CREATE VIEW`
@@ -19568,6 +19612,17 @@ pub(crate) fn classify_view_body(
     lookup: &impl TableLookup,
     check: ViewBodyCheck,
 ) -> Result<ViewBodyKind, SqlSurfaceError> {
+    classify_view_body_opts(tokens, lookup, check, true)
+}
+
+/// [`classify_view_body`] の本体。`allow_lateral` が偽なら LATERAL 本文の受理経路を使わず、従来の検証
+/// （派生表は拒否）へ進む（`CREATE MATERIALIZED VIEW` の本文は LATERAL を受理しない。Issue #3324）。
+pub(crate) fn classify_view_body_opts(
+    tokens: &[Token],
+    lookup: &impl TableLookup,
+    check: ViewBodyCheck,
+    allow_lateral: bool,
+) -> Result<ViewBodyKind, SqlSurfaceError> {
     if let Ok(simple) = parse_view_body(tokens) {
         return Ok(ViewBodyKind::Simple(simple));
     }
@@ -19584,7 +19639,39 @@ pub(crate) fn classify_view_body(
         ));
     }
     let body = strip_trailing_semicolons(tokens);
-    let stmt = validate_sql_tokens_with_subquery_ctx(body, lookup, 0)?;
+    // Issue #3324（SQL-62 (7)）: 左側を持つ LATERAL 派生表を含む JOIN 本文だけは、派生表ゲートを通した
+    // 文（CTE 入力つきの `Statement::Join`）を本文にできる。単一 FROM の派生表／LATERAL・LATERAL を含まない
+    // 派生表・利用者 CTE 併用は従来どおり下の検証（インライン展開のみ）へ進み、同じコードで拒否される。
+    // 参照時は同じ分類を再実行し、参照者自身の `ctx`・同一の `read_txn` で評価する（RLS-10 (b)）。
+    let lateral_join = if allow_lateral
+        && !is_with
+        && matches!(body.first(), Some(Token::Keyword(Keyword::Select)))
+        && super::derived_table::contains_lateral(body)
+    {
+        match super::derived_table::gate(
+            body,
+            lookup,
+            crate::nesting_limits::NestingLimits::default(),
+        ) {
+            Ok(stmt) => stmt.filter(is_lateral_view_join),
+            // 構造検証では列を引けず左側の列を解決できない。実カタログでの再検証へ保留する。
+            Err(SqlSurfaceError::FeatureNotSupported { detail })
+                if check == ViewBodyCheck::Structural
+                    && detail == super::lateral_bind::UNRESOLVABLE_LEFT_COLUMNS =>
+            {
+                return Ok(ViewBodyKind::LateralDeferred {
+                    relations: lateral_body_relations(body)?,
+                });
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    let stmt = match lateral_join {
+        Some(stmt) => stmt,
+        None => validate_sql_tokens_with_subquery_ctx(body, lookup, 0)?,
+    };
     let mut relations = Vec::new();
     check_buffered_body_shape(&stmt, lookup, check, &mut relations)?;
     if is_with {
@@ -19594,6 +19681,96 @@ pub(crate) fn classify_view_body(
         stmt: Box::new(stmt),
         relations,
     })
+}
+
+/// LATERAL を含む本文が読む relation 名をトークン列から読み取る（構造検証用。Issue #3324）。
+/// `SELECT` の範囲（本文の最上位・`LATERAL (`・`(SELECT` の括弧内）での `FROM`・`JOIN` の直後と、FROM 句内の
+/// `,` の直後の識別子を集める。関数引数の括弧内の `FROM`（`EXTRACT(... FROM col)`）と `IS DISTINCT FROM` は
+/// FROM 句として数えない。列を引けない構造検証で保留した本文の存在確認・依存（`DROP TABLE` の `2BP01`）の
+/// 根拠で、実カタログでの再検証が確定する。スキーマ修飾の relation 名は構造検証で解決できないため
+/// 固定の `0A000` で拒否する（fail-closed）。判定は O(トークン数)・添字は `get()`。
+fn lateral_body_relations(tokens: &[Token]) -> Result<Vec<String>, SqlSurfaceError> {
+    let mut out: Vec<String> = Vec::new();
+    // 括弧の深さごとの (SELECT の範囲か, FROM 句の中か)。
+    let mut scopes: Vec<(bool, bool)> = vec![(true, false)];
+    let take_name = |next: Option<&Token>, out: &mut Vec<String>| match next {
+        Some(Token::Ident(n) | Token::QuotedNull(n)) if !n.eq_ignore_ascii_case("LATERAL") => {
+            push_relation(out, n);
+            Ok(())
+        }
+        Some(Token::QualifiedIdent { .. }) => Err(SqlSurfaceError::feature_not_supported(
+            "schema-qualified relations are not supported in a view body with a LATERAL subquery",
+        )),
+        _ => Ok(()),
+    };
+    for (i, t) in tokens.iter().enumerate() {
+        let next = tokens.get(i.saturating_add(1));
+        let prev = i.checked_sub(1).and_then(|j| tokens.get(j));
+        let select_scope = scopes.last().is_some_and(|s| s.0);
+        match t {
+            Token::Punct('(') => {
+                let opens_select = matches!(next, Some(Token::Keyword(Keyword::Select)))
+                    || matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LATERAL"));
+                scopes.push((opens_select, false));
+            }
+            Token::Punct(')') => {
+                if scopes.len() > 1 {
+                    scopes.pop();
+                }
+            }
+            Token::Keyword(Keyword::From)
+                if select_scope
+                    && !matches!(prev, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT")) =>
+            {
+                if let Some(s) = scopes.last_mut() {
+                    s.1 = true;
+                }
+                take_name(next, &mut out)?;
+            }
+            Token::Keyword(Keyword::Where | Keyword::Order | Keyword::Limit) => {
+                if let Some(s) = scopes.last_mut() {
+                    s.1 = false;
+                }
+            }
+            Token::Ident(w) if select_scope && w.eq_ignore_ascii_case("JOIN") => {
+                take_name(next, &mut out)?;
+            }
+            Token::Punct(',') if scopes.last() == Some(&(true, true)) => {
+                take_name(next, &mut out)?;
+            }
+            Token::Ident(w)
+                if ["GROUP", "HAVING", "OFFSET", "WINDOW"]
+                    .iter()
+                    .any(|k| w.eq_ignore_ascii_case(k)) =>
+            {
+                if let Some(s) = scopes.last_mut() {
+                    s.1 = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// ビュー本文として受理できる LATERAL の JOIN か（Issue #3324）。CTE 入力を持つ JOIN で、CTE 入力の
+/// リレーションがすべて派生表の合成名（利用者 CTE の入力を含まない）のもの。
+fn is_lateral_view_join(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::Join(v) if is_lateral_view_join_validated(v))
+}
+
+fn is_lateral_view_join_validated(v: &ValidatedJoin) -> bool {
+    let Some(inputs) = v.cte_inputs.as_deref() else {
+        return false;
+    };
+    inputs.relation_slot.len() == v.relations.len()
+        && inputs
+            .relation_slot
+            .iter()
+            .zip(&v.relations)
+            .all(|(slot, r)| {
+                slot.is_none() || super::derived_table::is_derived_placeholder(r.table())
+            })
 }
 
 /// [`classify_view_body`] の検証の段（TABLE-18・Issue #1436）。
@@ -19693,9 +19870,26 @@ fn check_buffered_body_shape_with(
         Statement::Scan(v) if v.limit_implicit => Err(body_form_unsupported()),
         Statement::Scan(v) => check_body_scan(v, lookup, top_policy, out),
         Statement::Aggregate(v) => check_body_aggregate(v, lookup, top_policy, out),
-        // Issue #1861（SQL-62）: CTE を入力に持つ JOIN はセッションの最上位 SELECT だけが生成する
-        // （InlineOnly の本文検証は生成しない）。多層防御として本文では拒否する（fail-closed）。
-        Statement::Join(v) if v.cte_inputs.is_some() => Err(body_form_unsupported()),
+        // Issue #3324（SQL-62 (7)）: 本文として受理するのは、全 CTE 入力が派生表（LATERAL を含む）の
+        // 合成名で、JOIN の `LIMIT` を持つ形だけ（[`is_lateral_view_join`]）。利用者 CTE の入力を持つ JOIN は
+        // 従来どおり拒否する（多層防御。fail-closed）。slot が読む実表・ビューも依存 relation に加える
+        // （`DROP TABLE` の `2BP01`・`OR REPLACE` の再検証が LATERAL の内側の表にも効く）。
+        Statement::Join(v) if v.cte_inputs.is_some() => {
+            if !is_lateral_view_join_validated(v) || v.aggregate.is_none() && v.limit.is_none() {
+                return Err(body_form_unsupported());
+            }
+            for t in super::join::collect_join_tables(v) {
+                push_relation(out, &t);
+            }
+            if let Some(inputs) = v.cte_inputs.as_deref() {
+                for slot in &inputs.slots {
+                    if let CteSlotSource::Scan(scan) = &slot.source {
+                        push_relation(out, &scan.table_name);
+                    }
+                }
+            }
+            Ok(())
+        }
         // Issue #1796・SQL-34: 非集計 JOIN の `LIMIT` 省略・`LIMIT ALL` も本文では `42601`。
         Statement::Join(v) if v.aggregate.is_none() && v.limit.is_none() => {
             Err(body_form_unsupported())
@@ -20477,7 +20671,7 @@ pub(crate) fn validate_create_view_tokens(
     // 末尾の `WITH [CASCADED | LOCAL] CHECK OPTION`（Issue #1673）を本文から剥がす。
     let (body_tokens, check_option) = split_view_check_option(rest_tokens);
     let (relations, body_sql, buffered) =
-        validate_view_body_for_storage(body_tokens, &column_aliases)?;
+        validate_view_body_for_storage(body_tokens, &column_aliases, true)?;
     // 評価後射影形（LIMIT・集計・JOIN 等）の本文は自動更新できないため、CHECK OPTION は宣言できない
     // （構文段の拒否の後に判定する。カタログは照会しない）。
     if buffered && check_option != crate::catalog::ViewCheckOption::None {
@@ -20549,11 +20743,13 @@ type MatviewHead<'a> = (String, bool, Vec<String>, &'a [Token]);
 fn validate_view_body_for_storage(
     body_tokens: &[Token],
     column_aliases: &[String],
+    allow_lateral: bool,
 ) -> Result<(Vec<String>, String, bool), SqlSurfaceError> {
-    let (relations, body_sql, buffered) = match classify_view_body(
+    let (relations, body_sql, buffered) = match classify_view_body_opts(
         body_tokens,
         &StructuralOnlyLookup,
         ViewBodyCheck::Structural,
+        allow_lateral,
     )? {
         ViewBodyKind::Simple(body) => {
             // 列名を明示した単純形本文は出力列数が構造から確定するため、別名の件数超過を
@@ -20568,7 +20764,7 @@ fn validate_view_body_for_storage(
             let sql = render_stored_simple_view_body(&body)?;
             (vec![body.table_name], sql, false)
         }
-        ViewBodyKind::Buffered { relations, .. } => {
+        ViewBodyKind::Buffered { relations, .. } | ViewBodyKind::LateralDeferred { relations } => {
             // 検証済みトークン列そのものを正規化描画して永続化する
             // （AST からの再描画による丸め・形状取りこぼしを避ける）。
             let stripped = strip_trailing_semicolons(body_tokens);
@@ -20679,7 +20875,7 @@ pub(crate) fn validate_create_materialized_view_tokens(
     let (name, if_not_exists, column_aliases, rest) = p.parse_create_materialized_view()?;
     let (body_tokens, with_data) = split_matview_data_clause(rest);
     let (mut base_relations, body_sql, _buffered) =
-        validate_view_body_for_storage(body_tokens, &column_aliases)?;
+        validate_view_body_for_storage(body_tokens, &column_aliases, false)?;
     base_relations.sort();
     base_relations.dedup();
     Ok(ValidatedCreateMaterializedView {
@@ -29146,9 +29342,11 @@ fn build_join_cte_inputs(
         .iter()
         .map(|c| c.and_then(|i| slot_of.get(i).copied().flatten()))
         .collect();
+    let lateral = vec![None; rel_cte.len()];
     Ok(JoinCteInputs {
         slots,
         relation_slot,
+        lateral,
     })
 }
 
@@ -30338,6 +30536,7 @@ fn function_scan_statement(
         alias,
         column_aliases,
         outer_tokens,
+        ordinality,
     } = parts;
     let mut args: Vec<Expr> = Vec::with_capacity(arg_tokens.len());
     for toks in &arg_tokens {
@@ -30365,6 +30564,7 @@ fn function_scan_statement(
         name,
         args,
         alias,
+        ordinality,
     }));
     let view_name = main_table_name;
     let stmt = match main {
@@ -30622,13 +30822,6 @@ fn validate_sql_tokens_impl(
             // 同じ検証本体（`validate_with_statement`）へ渡し、返った文の形（インライン展開・具体化・
             // 再帰・CTE 入力の JOIN）を `explain_cte_target` が `ExplainTarget` に写す。
             // 第 2 の WITH パーサーを持たない。
-            // Issue #3321（#3324 の受け皿）: LATERAL 派生表は EXPLAIN の対象外。抽出が受理する形でも
-            // 実行計画の写像を持たないため、ここで固定 `0A000` にする。
-            if super::derived_table::contains_lateral(rest) {
-                return Err(SqlSurfaceError::feature_not_supported(
-                    "EXPLAIN is not supported for LATERAL derived tables",
-                ));
-            }
             if matches!(rest.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH")) {
                 return explain_with_statement(rest, lookup, limits, cte_evaluation);
             }
@@ -46968,7 +47161,9 @@ mod body_expr_policy_tests {
             ViewBodyKind::Buffered { stmt, .. } => {
                 assert!(top_level_body_has_expression_predicate(&stmt));
             }
-            ViewBodyKind::Simple(_) => panic!("expected buffered"),
+            ViewBodyKind::Simple(_) | ViewBodyKind::LateralDeferred { .. } => {
+                panic!("expected buffered")
+            }
         }
     }
 

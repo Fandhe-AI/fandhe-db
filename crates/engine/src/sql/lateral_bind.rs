@@ -54,6 +54,12 @@ pub(crate) struct BoundBody {
     /// 外側参照を含む連言を取り除いた本文（既存の本文検証へ渡す）。
     pub(crate) tokens: Vec<Token>,
     pub(crate) binding: LateralBinding,
+    /// 取り除いた相関連言だけを `WHERE` に持つ本文（`SELECT <元の投影> FROM <内側> WHERE <相関連言>`。
+    /// 外側参照は予約内部名のまま。外側参照が無ければ `None`）。`derived_table` が内側の別名を
+    /// 正規化したうえで述語へ解析し、外側タプルごとに評価する相関述語にする（Issue #3322。L2）。
+    pub(crate) correlated_body: Option<Vec<Token>>,
+    /// 内側 relation の列名（カタログの綴り。疑似列 `id` を含みうる。列集合を返せなければ `None`）。
+    pub(crate) inner_columns: Option<Vec<String>>,
 }
 
 fn outer_position_unsupported() -> SqlSurfaceError {
@@ -62,16 +68,25 @@ fn outer_position_unsupported() -> SqlSurfaceError {
     )
 }
 
+/// 左側 relation の列を解決できないときの固定文言。`CREATE VIEW` の構造検証（列を引けない）は、この文言の
+/// `0A000` だけを「実カタログでの再検証へ保留」の合図に使う（`sql::allowlist::classify_view_body_opts`。
+/// Issue #3324）。文言を共有して食い違いを防ぐ。
+pub(crate) const UNRESOLVABLE_LEFT_COLUMNS: &str =
+    "columns of the relation referenced by a LATERAL subquery cannot be resolved";
+
 fn unresolvable_left_columns() -> SqlSurfaceError {
-    SqlSurfaceError::feature_not_supported(
-        "columns of the relation referenced by a LATERAL subquery cannot be resolved",
-    )
+    SqlSurfaceError::feature_not_supported(UNRESOLVABLE_LEFT_COLUMNS)
 }
 
 fn is_literal_word(n: &str) -> bool {
     ["true", "false", "null", "nulls", "first", "last"]
         .iter()
         .any(|w| n.eq_ignore_ascii_case(w))
+}
+
+/// 括弧なしで書ける SQL 値関数（`CURRENT_DATE` 等）か。列名ではないので列探索・未知列判定から除外する。
+fn is_value_function_keyword(n: &str) -> bool {
+    crate::sql::lexer::is_value_function_keyword(n)
 }
 
 fn find_col<'a>(cols: &'a [String], name: &str) -> Option<&'a String> {
@@ -195,10 +210,14 @@ fn split_conjuncts(tokens: &[Token], from: usize, to: usize) -> Vec<(usize, usiz
 /// LATERAL の本文 `body`（`SELECT ...`。括弧なし）が参照する左側 relation `left` の列を束縛する。
 /// `columns` は relation の列集合（実表・利用者の CTE・先行の派生表）を返す。`Ok(None)` は列集合を
 /// 返せない relation で、その relation への修飾参照は `0A000`、非修飾名の推定からは外す（fail-closed）。
+/// `reject_left_ref` は RIGHT／FULL JOIN の LATERAL（Issue #3323）で、左側 relation を参照した時点
+/// （列が存在するかを問わない。PostgreSQL と同じ）で `42P10` を返す。内側の未知列（`42703`）・未知の
+/// 修飾子（`42P01`）は本文のテキスト順で先に現れた方が先に返る。
 pub(crate) fn bind_lateral_body<F>(
     body: &[Token],
     left: &[TableRef],
     columns: &mut F,
+    reject_left_ref: bool,
 ) -> Result<BoundBody, SqlSurfaceError>
 where
     F: FnMut(&TableRef) -> Result<Option<Vec<String>>, SqlSurfaceError>,
@@ -206,6 +225,8 @@ where
     let unchanged = || BoundBody {
         tokens: body.to_vec(),
         binding: LateralBinding::default(),
+        correlated_body: None,
+        inner_columns: None,
     };
     let Some(from_idx) = find_top_from(body) else {
         return Ok(unchanged());
@@ -235,6 +256,42 @@ where
     // （`WHERE a AND (x = d.k OR ...)` の外側参照は最上位 WHERE の中）。
     let mut parens: Vec<bool> = Vec::new();
     let mut depth = 0usize;
+    // SELECT リスト直下（括弧の外）の項目別名 `AS b` だけを集める（`CAST(x AS t)` やテーブル別名は
+    // 括弧内・FROM 以降なので含めない）。適用は `ORDER BY b` の単独の別名参照だけ（PostgreSQL と同じく
+    // 出力別名は ORDER BY の裸の名前でのみ列より優先して解決される）。
+    let output_aliases: Vec<&str> = {
+        let mut d = 0usize;
+        let mut v = Vec::new();
+        for (j, t) in body.iter().enumerate().take(from_idx) {
+            match t {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => d = d.saturating_sub(1),
+                Token::Ident(a) if d == 0 && a.eq_ignore_ascii_case("AS") => {
+                    if let Some(Token::Ident(n)) = body.get(j.saturating_add(1)) {
+                        v.push(n.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        v
+    };
+    let order_start: Option<usize> = {
+        let mut d = 0usize;
+        let mut found = None;
+        for (j, t) in body.iter().enumerate() {
+            match t {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => d = d.saturating_sub(1),
+                Token::Keyword(Keyword::Order) if d == 0 && j > from_idx => {
+                    found = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        found
+    };
     for (i, tok) in body.iter().enumerate() {
         match tok {
             Token::Punct('(') => {
@@ -262,6 +319,16 @@ where
         match tok {
             Token::QualifiedIdent { qualifier, name } => {
                 if inner_ref.matches_qualifier(qualifier) {
+                    // RIGHT／FULL では内側の未知列を、後続の左側参照（`42P10`）より先に出た順で `42703` にする。
+                    if reject_left_ref
+                        && !name.eq_ignore_ascii_case("id")
+                        && !is_non_column_position(body, i)
+                        && inner_cols
+                            .as_deref()
+                            .is_some_and(|ic| find_col(ic, name).is_none())
+                    {
+                        return Err(SqlSurfaceError::undefined_column(name.clone()));
+                    }
                     continue;
                 }
                 let Some(ridx) = left.iter().position(|r| r.matches_qualifier(qualifier)) else {
@@ -279,6 +346,9 @@ where
                         "qualified column reference named like a SQL keyword is not supported",
                     ));
                 }
+                if reject_left_ref {
+                    return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
+                }
                 let Some(cols) = lc.get(ridx)? else {
                     return Err(unresolvable_left_columns());
                 };
@@ -295,7 +365,31 @@ where
                 });
             }
             Token::Ident(n) if depth == 0 => {
-                if is_syntax_word(n) || is_literal_word(n) || is_non_column_position(body, i) {
+                if is_syntax_word(n)
+                    || is_literal_word(n)
+                    || is_value_function_keyword(n)
+                    || is_non_column_position(body, i)
+                {
+                    continue;
+                }
+                // ORDER BY の裸の出力別名は左側・内側の列探索へ進まず確定する。
+                if order_start.is_some_and(|o| i > o)
+                    && parens.is_empty()
+                    && output_aliases.iter().any(|a| a.eq_ignore_ascii_case(n))
+                    && matches!(
+                        i.checked_sub(1).and_then(|p| body.get(p)),
+                        Some(Token::Punct(',')) | Some(Token::Keyword(Keyword::By))
+                    )
+                    && match body.get(i.saturating_add(1)) {
+                        None
+                        | Some(Token::Punct(',' | ';'))
+                        | Some(Token::Keyword(Keyword::Limit)) => true,
+                        Some(Token::Ident(w)) => ["ASC", "DESC", "NULLS", "OFFSET", "FETCH"]
+                            .iter()
+                            .any(|k| w.eq_ignore_ascii_case(k)),
+                        _ => false,
+                    }
+                {
                     continue;
                 }
                 let Some(ic) = inner_cols.as_deref() else {
@@ -305,15 +399,26 @@ where
                     continue;
                 }
                 let mut hit: Option<(usize, String)> = None;
+                let mut all_known = true;
                 for ridx in 0..left.len() {
-                    if let Some(col) = lc.get(ridx)?.and_then(|cols| find_col(cols, n)) {
+                    let cols = lc.get(ridx)?;
+                    all_known &= cols.is_some();
+                    if let Some(col) = cols.and_then(|cols| find_col(cols, n)) {
                         if hit.is_some() {
                             return Err(SqlSurfaceError::AmbiguousColumn { name: n.clone() });
                         }
                         hit = Some((ridx, col.clone()));
                     }
                 }
+                // RIGHT／FULL: どちらの側にも解決できない非修飾名は、後続の左側参照（`42P10`）より
+                // 先に `42703` で確定する（修飾名と同じテキスト順規則）。左側の列が不明なら従来どおり通す。
+                if hit.is_none() && reject_left_ref && all_known && !n.eq_ignore_ascii_case("id") {
+                    return Err(SqlSurfaceError::undefined_column(n.clone()));
+                }
                 if let Some((ridx, col)) = hit {
+                    if reject_left_ref {
+                        return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
+                    }
                     if let Some(slot) = out.get_mut(i) {
                         *slot = Token::Ident(lateral_ref_placeholder(ridx, &col));
                     }
@@ -331,6 +436,8 @@ where
         return Ok(BoundBody {
             tokens: out,
             binding: LateralBinding::default(),
+            correlated_body: None,
+            inner_columns: None,
         });
     }
     refs.sort();
@@ -352,9 +459,11 @@ where
             .any(|t| matches!(t, Token::Ident(n) if parse_lateral_ref_placeholder(n).is_some()))
     };
     let mut kept: Vec<(usize, usize)> = Vec::new();
+    let mut dropped: Vec<(usize, usize)> = Vec::new();
     for &(s, e) in &conjuncts {
         if is_correlated(s, e) {
             check_dropped_conjunct(&out, s, e, &inner_ref, inner_cols.as_deref())?;
+            dropped.push((s, e));
         } else {
             kept.push((s, e));
         }
@@ -369,10 +478,189 @@ where
         tokens.extend_from_slice(out.get(s..e).unwrap_or(&[]));
     }
     tokens.extend_from_slice(out.get(where_end..).unwrap_or(&[]));
+    // 取り除いた連言を `AND` で連結した本文（元の投影・FROM を保つ。別名の正規化は呼び出し側）。
+    // 投影は `*` に置き換える（取り除いた連言の解析にだけ使うため、元の投影の形に依存させない）。
+    let mut correlated_body: Vec<Token> = vec![Token::Keyword(Keyword::Select), Token::Punct('*')];
+    correlated_body.extend_from_slice(out.get(from_idx..where_at).unwrap_or(&[]));
+    for (n, &(s, e)) in dropped.iter().enumerate() {
+        correlated_body.push(if n == 0 {
+            Token::Keyword(Keyword::Where)
+        } else {
+            Token::Keyword(Keyword::And)
+        });
+        correlated_body.extend_from_slice(out.get(s..e).unwrap_or(&[]));
+    }
     Ok(BoundBody {
         tokens,
         binding: LateralBinding { outer_refs: refs },
+        correlated_body: Some(correlated_body),
+        inner_columns: inner_cols,
     })
+}
+
+/// `LATERAL unnest(<引数>)` の引数トークン列 `arg` を左側 relation の列 1 つへ束縛する（Issue #3360。設計記録
+/// L19）。受理するのは左側 relation の列の裸の参照 1 個（修飾あり、または左側にだけある非修飾名）だけで、
+/// 式・定数・複数引数は固定文言の `0A000`、引数なしは `42883`（PostgreSQL 17.12 と照合済み）。
+/// 修飾子が左側に無いのは `42P01`、列が無いのは `42703`、複数の左側 relation に同名があるのは `42702`
+/// （本文の束縛 [`bind_lateral_body`] と同じ規則）。`reject_left_ref` は RIGHT／FULL で、左側 relation を
+/// 参照した時点で `42P10`。外側の値は SQL 文字列・トークン列へ連結せず、列の位置（[`LateralOuterRef`]）だけを返す。
+pub(crate) fn bind_lateral_unnest_arg<F>(
+    arg: &[Token],
+    left: &[TableRef],
+    columns: &mut F,
+    reject_left_ref: bool,
+) -> Result<LateralOuterRef, SqlSurfaceError>
+where
+    F: FnMut(&TableRef) -> Result<Option<Vec<String>>, SqlSurfaceError>,
+{
+    let mut lc = LeftCols {
+        left,
+        columns,
+        cache: vec![None; left.len()],
+    };
+    match arg {
+        [] => Err(SqlSurfaceError::undefined_function(
+            "function unnest() does not exist",
+        )),
+        [Token::QualifiedIdent { qualifier, name }] => {
+            let ridx = left
+                .iter()
+                .position(|r| r.matches_qualifier(qualifier))
+                .ok_or_else(|| SqlSurfaceError::undefined_table(qualifier))?;
+            if reject_left_ref {
+                return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
+            }
+            let Some(cols) = lc.get(ridx)? else {
+                return Err(unresolvable_left_columns());
+            };
+            let Some(col) = find_col(cols, name).cloned() else {
+                return Err(SqlSurfaceError::undefined_column(name.clone()));
+            };
+            Ok(LateralOuterRef {
+                rel_index: ridx,
+                column: col,
+            })
+        }
+        [Token::Ident(n)]
+            if !is_syntax_word(n) && !is_literal_word(n) && !is_value_function_keyword(n) =>
+        {
+            let mut hit: Option<LateralOuterRef> = None;
+            let mut all_known = true;
+            for ridx in 0..left.len() {
+                let cols = lc.get(ridx)?;
+                all_known &= cols.is_some();
+                if let Some(col) = cols.and_then(|cols| find_col(cols, n)) {
+                    if hit.is_some() {
+                        return Err(SqlSurfaceError::AmbiguousColumn { name: n.clone() });
+                    }
+                    hit = Some(LateralOuterRef {
+                        rel_index: ridx,
+                        column: col.clone(),
+                    });
+                }
+            }
+            match hit {
+                Some(_) if reject_left_ref => Err(SqlSurfaceError::LateralReferenceInvalidJoinType),
+                Some(r) => Ok(r),
+                None if !all_known => Err(unresolvable_left_columns()),
+                None => Err(SqlSurfaceError::undefined_column(n.clone())),
+            }
+        }
+        _ => Err(SqlSurfaceError::feature_not_supported(
+            "unnest in a LATERAL item supports only a column of a preceding relation as its single argument",
+        )),
+    }
+}
+
+/// 相関 LATERAL の実行形（Issue #3322。設計記録 L2）。内側を「外側参照を含まない基底」と
+/// 「外側タプルごとに適用する後処理」の 2 つの本文へ分ける。
+pub(crate) struct ExecutionBodies {
+    /// `SELECT <参照される内側の列> FROM <内側> [WHERE <外側参照を含まない連言>]`。tail は持たない。
+    pub(crate) base: Vec<Token>,
+    /// 元の投影・`ORDER BY`・`LIMIT`・`OFFSET` を基底の名前の relation へ適用する本文。
+    pub(crate) post: Vec<Token>,
+}
+
+fn star_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::feature_not_supported(
+        "SELECT * in a LATERAL subquery referencing outer columns is not supported yet",
+    )
+}
+
+/// 相関 LATERAL の本文（`body`。内側の別名除去済みで、外側参照を含む連言は取り除かれている）を
+/// 基底本文と後処理本文へ分ける。`base_name` は基底の合成 CTE 名、`inner_cols` は内側 relation の
+/// 列名（正規の綴り。疑似列 `id` を含みうる）、`correlated_body` は取り除いた連言の本文
+/// （[`BoundBody::correlated_body`] を正規化したもの）。基底の投影は、本文のどこかで参照される内側の
+/// 列だけにする（参照されない VECTOR 列などを実体化しない）。走査は反復処理・添字は `get()`。
+pub(crate) fn split_for_execution(
+    body: &[Token],
+    base_name: &str,
+    inner_cols: &[String],
+    correlated_body: &[Token],
+) -> Result<ExecutionBodies, SqlSurfaceError> {
+    let Some(from_idx) = find_top_from(body) else {
+        return Err(star_unsupported());
+    };
+    let projection = body.get(1..from_idx).unwrap_or(&[]);
+    if projection
+        .iter()
+        .any(|t| matches!(t, Token::Punct('*') | Token::QualifiedStar { .. }))
+    {
+        return Err(star_unsupported());
+    }
+    let probe_end = body.len().min(from_idx.saturating_add(5));
+    let Some((_inner_ref, consumed)) = body
+        .get(from_idx.saturating_add(1)..probe_end)
+        .and_then(probe_from_table_ref)
+    else {
+        return Err(unresolvable_left_columns());
+    };
+    let item_end = from_idx.saturating_add(1).saturating_add(consumed);
+    let from_item = body
+        .get(from_idx.saturating_add(1)..item_end)
+        .unwrap_or(&[]);
+    let (base_where, tail): (&[Token], &[Token]) = match find_where(body) {
+        Some((ws, we)) => (
+            body.get(ws..we).unwrap_or(&[]),
+            body.get(we..).unwrap_or(&[]),
+        ),
+        None => (&[], body.get(item_end..).unwrap_or(&[])),
+    };
+    // 参照される内側の列: 投影・tail・取り除いた連言（WHERE より後）の識別子。
+    let corr_conj: &[Token] = match find_where(correlated_body) {
+        Some((ws, we)) => correlated_body.get(ws..we).unwrap_or(&[]),
+        None => &[],
+    };
+    let referenced = |col: &String| {
+        projection
+            .iter()
+            .chain(tail.iter())
+            .chain(corr_conj.iter())
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case(col)))
+    };
+    let mut cols: Vec<&String> = inner_cols.iter().filter(|c| referenced(c)).collect();
+    if cols.is_empty() {
+        if let Some(first) = inner_cols.first() {
+            cols.push(first);
+        } else {
+            return Err(unresolvable_left_columns());
+        }
+    }
+    let mut base: Vec<Token> = vec![Token::Keyword(Keyword::Select)];
+    for (n, c) in cols.iter().enumerate() {
+        if n > 0 {
+            base.push(Token::Punct(','));
+        }
+        base.push(Token::Ident((*c).clone()));
+    }
+    base.push(Token::Keyword(Keyword::From));
+    base.extend_from_slice(from_item);
+    base.extend_from_slice(base_where);
+    let mut post: Vec<Token> = body.get(..from_idx).unwrap_or(&[]).to_vec();
+    post.push(Token::Keyword(Keyword::From));
+    post.push(Token::Ident(base_name.to_string()));
+    post.extend_from_slice(tail);
+    Ok(ExecutionBodies { base, post })
 }
 
 /// LATERAL の本文の `FROM` の別名（`FROM docs x`・`FROM docs AS x`）を落とす。内側の別名による修飾は
@@ -444,6 +732,7 @@ fn check_dropped_conjunct(
                 if parse_lateral_ref_placeholder(n).is_some()
                     || is_syntax_word(n)
                     || is_literal_word(n)
+                    || is_value_function_keyword(n)
                     || is_non_column_position(toks, i)
                 {
                     continue;
@@ -467,6 +756,7 @@ mod tests {
         Ok(match t.table() {
             "docs" => Some(vec!["id".into(), "lang".into(), "title".into()]),
             "other" => Some(vec!["id".into(), "k".into(), "lang".into()]),
+            "people" => Some(vec!["id".into(), "user".into(), "current_user".into()]),
             "opaque" => None,
             _ => None,
         })
@@ -474,11 +764,136 @@ mod tests {
 
     fn bind(sql: &str, left: &[TableRef]) -> Result<BoundBody, SqlSurfaceError> {
         let toks = tokenize(sql).expect("tokenize");
-        bind_lateral_body(&toks, left, &mut cols_of)
+        bind_lateral_body(&toks, left, &mut cols_of, false)
     }
 
     fn d() -> TableRef {
         TableRef::with_alias("docs", "d")
+    }
+
+    fn bind_arg(
+        sql: &str,
+        left: &[TableRef],
+        reject: bool,
+    ) -> Result<LateralOuterRef, SqlSurfaceError> {
+        let toks = tokenize(sql).expect("tokenize");
+        bind_lateral_unnest_arg(&toks, left, &mut cols_of, reject)
+    }
+
+    /// Issue #3360: `unnest` の引数は左側の列の裸の参照 1 個だけ。SQLSTATE は本文の束縛と同じ規則。
+    #[test]
+    fn unnest_argument_binds_a_single_left_column() {
+        let left = [d()];
+        let r = bind_arg("d.lang", &left, false).expect("qualified");
+        assert_eq!((r.rel_index, r.column.as_str()), (0, "lang"));
+        let r = bind_arg("title", &left, false).expect("unqualified");
+        assert_eq!((r.rel_index, r.column.as_str()), (0, "title"));
+        assert_eq!(
+            bind_arg("zz.lang", &left, false)
+                .expect_err("q")
+                .wire_code(),
+            "42P01"
+        );
+        assert_eq!(
+            bind_arg("d.nope", &left, false).expect_err("c").wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            bind_arg("nope", &left, false).expect_err("c").wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            bind_arg("", &left, false).expect_err("none").wire_code(),
+            "42883"
+        );
+        for sql in [
+            "d.lang, d.title",
+            "d.lang || d.title",
+            "1",
+            "'x'",
+            "d.lang + 1",
+        ] {
+            assert_eq!(
+                bind_arg(sql, &left, false).expect_err(sql).wire_code(),
+                "0A000",
+                "{sql}"
+            );
+        }
+        // RIGHT／FULL は左側の参照の時点で `42P10`。
+        assert_eq!(
+            bind_arg("d.lang", &left, true).expect_err("r").wire_code(),
+            "42P10"
+        );
+        assert_eq!(
+            bind_arg("lang", &left, true).expect_err("r").wire_code(),
+            "42P10"
+        );
+        // 複数の左側 relation に同名があれば `42702`。列集合を返せない relation は `0A000`。
+        let two = [d(), TableRef::with_alias("other", "o")];
+        assert_eq!(
+            bind_arg("lang", &two, false).expect_err("a").wire_code(),
+            "42702"
+        );
+        assert_eq!(bind_arg("k", &two, false).expect("k").rel_index, 1);
+        let opaque = [TableRef::with_alias("opaque", "q")];
+        assert_eq!(
+            bind_arg("q.x", &opaque, false).expect_err("o").wire_code(),
+            "0A000"
+        );
+        assert_eq!(
+            bind_arg("x", &opaque, false).expect_err("o").wire_code(),
+            "0A000"
+        );
+    }
+
+    #[test]
+    fn value_function_keywords_are_not_unknown_columns() {
+        let left = [d()];
+        for sql in [
+            "SELECT CURRENT_DATE AS today FROM docs x LIMIT 1",
+            "SELECT current_timestamp AS t FROM docs x LIMIT 1",
+            "SELECT CURRENT_TIMESTAMP(3) AS t, LOCALTIME AS l FROM docs x LIMIT 1",
+        ] {
+            let toks = tokenize(sql).expect("tokenize");
+            for reject in [false, true] {
+                bind_lateral_body(&toks, &left, &mut cols_of, reject).expect(sql);
+            }
+        }
+    }
+
+    #[test]
+    fn right_full_order_by_output_alias_is_not_an_unknown_column() {
+        let toks = tokenize("SELECT title AS b FROM docs x ORDER BY b LIMIT 1").expect("tokenize");
+        let left = [TableRef::with_alias("other", "o")];
+        // 出力別名 `b` は物理列ではないが、RIGHT／FULL（reject_left_ref）でも 42703 にしない。
+        bind_lateral_body(&toks, &left, &mut cols_of, true).expect("alias resolves");
+        let toks = tokenize("SELECT title FROM docs x ORDER BY b LIMIT 1").expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
+    }
+
+    #[test]
+    fn right_full_order_by_alias_wins_over_same_named_left_column() {
+        // 左側 `other` に列 `k` があっても、ORDER BY の別名 `k` は出力別名として解決する。
+        let toks = tokenize("SELECT title AS k FROM docs x ORDER BY k LIMIT 1").expect("tokenize");
+        let left = [TableRef::with_alias("other", "o")];
+        bind_lateral_body(&toks, &left, &mut cols_of, true).expect("alias wins");
+    }
+
+    #[test]
+    fn right_full_alias_does_not_hide_unknown_column_in_where() {
+        let left = [TableRef::with_alias("other", "o")];
+        // CAST の AS やテーブル別名は出力別名ではなく、WHERE の別名は列ではない。
+        let toks = tokenize(
+            "SELECT CAST(title AS t) FROM docs x WHERE t = 'a' AND lang = o.k ORDER BY id",
+        )
+        .expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
+        let toks = tokenize("SELECT title AS t FROM docs x WHERE t = 'a' AND lang = o.k")
+            .expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -512,6 +927,17 @@ mod tests {
     }
 
     #[test]
+    fn left_columns_named_like_session_functions_are_bound_as_outer_refs() {
+        // 本エンジンの値関数は日時系 5 種のみ。`user` 等は通常の識別子として外部参照に束縛する。
+        let p = TableRef::with_alias("people", "p");
+        for col in ["user", "current_user"] {
+            let sql = format!("SELECT lang FROM other WHERE k = {col}");
+            let b = bind(&sql, std::slice::from_ref(&p)).expect("bind");
+            assert!(b.binding.is_correlated(), "{col} must bind as outer ref");
+        }
+    }
+
+    #[test]
     fn unqualified_name_only_in_left_is_outer_and_inner_wins_on_tie() {
         let b = bind("SELECT k FROM other WHERE k = title", &[d()]).expect("bind");
         assert!(b.binding.is_correlated());
@@ -530,7 +956,7 @@ mod tests {
                 _ => cols_of(t)?,
             })
         };
-        let err = bind_lateral_body(&toks, &left, &mut cols).expect_err("ambiguous");
+        let err = bind_lateral_body(&toks, &left, &mut cols, false).expect_err("ambiguous");
         assert_eq!(err.wire_code(), "42702");
     }
 
@@ -612,5 +1038,99 @@ mod tests {
             .tokens
             .iter()
             .any(|t| matches!(t, Token::Ident(n) if parse_lateral_ref_placeholder(n).is_some())));
+    }
+    fn split(sql: &str) -> (Vec<Token>, Vec<Token>) {
+        let b = bind(sql, &[d()]).expect("bind");
+        let inner_cols: Vec<String> = vec!["id".into(), "k".into(), "lang".into()];
+        let norm = |t: Vec<Token>| {
+            strip_inner_alias(
+                crate::sql::qualified_column::normalize_single_table_qualifiers(&t)
+                    .expect("normalize")
+                    .into_owned(),
+            )
+        };
+        let tokens = norm(b.tokens);
+        let corr = norm(b.correlated_body.expect("correlated"));
+        let bodies =
+            split_for_execution(&tokens, "?derived0_base", &inner_cols, &corr).expect("split");
+        (bodies.base, bodies.post)
+    }
+
+    #[test]
+    fn correlated_conjuncts_are_kept_with_reserved_names_for_execution() {
+        let b = bind(
+            "SELECT lang FROM other o WHERE o.k = d.lang AND o.k = 'x' AND o.lang = d.title",
+            &[d()],
+        )
+        .expect("bind");
+        let corr = b.correlated_body.expect("correlated body");
+        let idents: Vec<&str> = corr
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(idents.contains(&lateral_ref_placeholder(0, "lang").as_str()));
+        assert!(idents.contains(&lateral_ref_placeholder(0, "title").as_str()));
+        // 取り除かれた連言だけが残り、非相関の `o.k = 'x'` は含まれない。
+        assert!(!corr
+            .iter()
+            .any(|t| matches!(t, Token::StringLiteral(s) if s == "x")));
+        // 外側参照が無い本文には相関本文が無い。
+        assert!(bind("SELECT lang FROM other WHERE k = 'x'", &[d()])
+            .expect("bind")
+            .correlated_body
+            .is_none());
+    }
+
+    #[test]
+    fn or_and_between_stay_one_correlated_conjunct() {
+        let b = bind(
+            "SELECT lang FROM other o WHERE o.k = 'x' OR o.lang = d.lang",
+            &[d()],
+        )
+        .expect("bind");
+        // 深さ 0 の OR があると全体が 1 連言で、非相関の部分も本文から取り除かれる。
+        assert_eq!(b.tokens, tokenize("SELECT lang FROM other o").expect("t"));
+        let corr = b.correlated_body.expect("correlated");
+        assert!(corr
+            .iter()
+            .any(|t| matches!(t, Token::StringLiteral(s) if s == "x")));
+    }
+
+    #[test]
+    fn split_for_execution_separates_base_and_post() {
+        let (base, post) = split(
+            "SELECT lang FROM other o WHERE o.k = d.lang AND o.k = 'x' ORDER BY o.lang LIMIT 1",
+        );
+        // 基底は参照される列（`k`・`lang`）だけを投影し、非相関の WHERE を残して tail を持たない。
+        assert_eq!(
+            base,
+            tokenize("SELECT k, lang FROM other WHERE k = 'x'").expect("t")
+        );
+        // 後処理は元の投影・tail を基底の名前の relation へ適用する。
+        let mut expected = tokenize("SELECT lang FROM").expect("t");
+        expected.push(Token::Ident("?derived0_base".into()));
+        expected.extend(tokenize("ORDER BY lang LIMIT 1").expect("t"));
+        assert_eq!(post, expected);
+    }
+
+    #[test]
+    fn split_without_remaining_where_has_no_base_where() {
+        let (base, _post) = split("SELECT lang FROM other o WHERE o.k = d.lang");
+        assert_eq!(base, tokenize("SELECT k, lang FROM other").expect("t"));
+    }
+
+    #[test]
+    fn select_star_is_rejected_for_execution() {
+        let b = bind("SELECT * FROM other o WHERE o.k = d.lang", &[d()]).expect("bind");
+        let inner_cols: Vec<String> = vec!["id".into(), "k".into(), "lang".into()];
+        let tokens = strip_inner_alias(b.tokens);
+        let corr = strip_inner_alias(b.correlated_body.expect("correlated"));
+        let err = split_for_execution(&tokens, "?d_base", &inner_cols, &corr)
+            .err()
+            .expect("star");
+        assert_eq!(err.wire_code(), "0A000");
     }
 }

@@ -81,7 +81,7 @@ pub(super) fn to_u32(v: usize, what: &str) -> Result<u32, SqlSurfaceError> {
 /// 結合キーを持たない（`Ok(None)`）——ビルド・プローブいずれからも除外する
 /// （Issue #925 §2.4。NULL は決して一致しない）。`row` が `None`（NULL 補完された
 /// relation）のときもキーを持たない。
-fn extract_key(
+pub(super) fn extract_key(
     row: Option<&ResultRow>,
     keys: &[StepKey],
     pos_of: impl Fn(&StepKey) -> usize,
@@ -119,18 +119,7 @@ pub(super) fn run_joins(
     final_stop: Option<usize>,
 ) -> Result<(Tuples, Vec<u32>), SqlSurfaceError> {
     let n = sides.len();
-    let first = sides.first().ok_or_else(|| SqlSurfaceError::Internal {
-        detail: "JOIN has no relations".to_string(),
-    })?;
-    budget.charge(first.len().saturating_mul(n).saturating_mul(SLOT_BYTES))?;
-    let mut data: Vec<Option<u32>> = Vec::with_capacity(first.len().saturating_mul(n));
-    for i in 0..first.len() {
-        data.push(Some(to_u32(i, "JOIN row count exceeds limit")?));
-        for _ in 1..n {
-            data.push(None);
-        }
-    }
-    let mut acc = Tuples { n, data };
+    let mut acc = initial_tuples(sides, budget)?;
 
     for (k, step) in steps.iter().enumerate() {
         let new_rel = k + 1;
@@ -146,7 +135,81 @@ pub(super) fn run_joins(
         };
         acc = join_step(sides, step, new_rel, new_rows, &acc, budget, limits, stop)?;
     }
+    debug_assert_eq!(acc.n, n);
+    sorted_order(acc, budget)
+}
 
+/// [`run_joins`] の LATERAL 対応版（Issue #3322）。`lateral[i]` が `Some` の relation `i` の段は
+/// [`super::lateral::lateral_step`] で外側タプルごとに実行し、得た出力領域を `sides[i]` に据える
+/// （下流の残余・並べ替え・集計・投影は `sides` を読むため変更が要らない。設計記録 L13）。
+pub(super) fn run_joins_lateral(
+    sides: &mut [Vec<ResultRow>],
+    lateral: &[Option<super::lateral::LateralRuntime>],
+    steps: &[StepPlan],
+    budget: &mut JoinBudget,
+    limits: &JoinLimits,
+    final_stop: Option<usize>,
+) -> Result<(Tuples, Vec<u32>), SqlSurfaceError> {
+    let mut acc = initial_tuples(sides, budget)?;
+    for (k, step) in steps.iter().enumerate() {
+        let new_rel = k + 1;
+        let stop = if k + 1 == steps.len() {
+            final_stop
+        } else {
+            None
+        };
+        let rt = lateral.get(new_rel).and_then(Option::as_ref);
+        match (rt, step.lateral.is_some()) {
+            (Some(rt), true) => {
+                // 出力領域は `lateral_step` が `sides[new_rel]` へ据える。
+                acc = super::lateral::lateral_step(
+                    sides, rt, step, new_rel, &acc, budget, limits, stop,
+                )?;
+            }
+            (None, false) => {
+                let new_rows = sides
+                    .get(new_rel)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN relation index out of range".to_string(),
+                    })?;
+                acc = join_step(sides, step, new_rel, new_rows, &acc, budget, limits, stop)?;
+            }
+            // 計画と実行時入力の食い違いは到達しない不変条件（fail-closed）。
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "LATERAL step and runtime input mismatch".to_string(),
+                })
+            }
+        }
+    }
+    sorted_order(acc, budget)
+}
+
+/// 先頭 relation だけを埋めた初期タプル列（他の relation は `None`）。
+fn initial_tuples(
+    sides: &[Vec<ResultRow>],
+    budget: &mut JoinBudget,
+) -> Result<Tuples, SqlSurfaceError> {
+    let n = sides.len();
+    let first = sides.first().ok_or_else(|| SqlSurfaceError::Internal {
+        detail: "JOIN has no relations".to_string(),
+    })?;
+    budget.charge(first.len().saturating_mul(n).saturating_mul(SLOT_BYTES))?;
+    let mut data: Vec<Option<u32>> = Vec::with_capacity(first.len().saturating_mul(n));
+    for i in 0..first.len() {
+        data.push(Some(to_u32(i, "JOIN row count exceeds limit")?));
+        for _ in 1..n {
+            data.push(None);
+        }
+    }
+    Ok(Tuples { n, data })
+}
+
+/// タプル列の決定的な出力順序（`(is_none_0, idx_0, ...)` の安定ソート）を作る。
+fn sorted_order(
+    acc: Tuples,
+    budget: &mut JoinBudget,
+) -> Result<(Tuples, Vec<u32>), SqlSurfaceError> {
     budget.charge(
         acc.len()
             .saturating_mul(std::mem::size_of::<u32>())
@@ -210,6 +273,12 @@ fn join_step(
     // Issue #1837: キー無し・ON 残余ありの段はネステッドループ結合へ振り分ける（D1。ハッシュ表を
     // 作る前）。SQL からの到達（束縛段の `42601` 解除）は #1839 で実装済み。キー無し・残余無しは下の直積経路。
     let method = step.method();
+    if method == JoinMethod::Lateral {
+        // LATERAL の段は `run_joins_lateral` が実行する。ここへ来るのは到達しない不変条件の破れ。
+        return Err(SqlSurfaceError::Internal {
+            detail: "LATERAL step reached the hash join".to_string(),
+        });
+    }
     if method == JoinMethod::NestedLoop {
         return super::nlj::nlj_step(
             sides,
@@ -228,8 +297,22 @@ fn join_step(
     // 判定に使うのは可視行（RLS・WHERE 適用後）の件数だけで、`LIMIT`／`OFFSET` の値には依存しない。
     if method == JoinMethod::Cross {
         match acc.len().checked_mul(new_rows.len()) {
-            Some(product) if product <= limits.max_output_rows => {
-                if matches!(stop_after_pairs, Some(t) if product > t) {
+            Some(product) => {
+                // 外部結合の保持（LATERAL ... ON true の LEFT／RIGHT／FULL。Issue #3323）では、片側が空で
+                // 積が 0 でも、保存側の NULL 補完行が出力される。その件数も上限判定へ含める。
+                let total = if product == 0 {
+                    let a = if step.preserve_acc { acc.len() } else { 0 };
+                    let b = if step.preserve_new { new_rows.len() } else { 0 };
+                    a.saturating_add(b)
+                } else {
+                    product
+                };
+                if total > limits.max_output_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "JOIN result exceeds the row limit",
+                    ));
+                }
+                if matches!(stop_after_pairs, Some(t) if total > t) {
                     return Err(crate::sql::scan::row_limit_exceeded());
                 }
             }
@@ -504,6 +587,7 @@ mod cross_precheck_tests {
             on_acc: Vec::new(),
             on_new: Vec::new(),
             on_mixed: Vec::new(),
+            lateral: None,
         }
     }
 
