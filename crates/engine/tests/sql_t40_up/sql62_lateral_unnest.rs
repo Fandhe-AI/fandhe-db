@@ -547,6 +547,21 @@ fn duplicate_unnest_public_name_is_ambiguous_and_internal_names_do_not_leak() {
     assert_eq!(e, "42P01");
 }
 
+/// 公開名 `unnest` の修飾参照は、外側の SELECT だけでなく後続の LATERAL 本体や `unnest.*` でも曖昧（`42712`）。
+#[test]
+fn ambiguous_unnest_qualifier_is_detected_in_lateral_bodies_and_stars() {
+    let (core, _g) = open();
+    for sql in [
+        "SELECT unnest.* FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b)",
+        "SELECT 1 FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b), \
+         LATERAL (SELECT unnest.unnest AS z) AS q",
+        "SELECT 1 FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b), \
+         LATERAL unnest(unnest.unnest)",
+    ] {
+        assert_eq!(code(&core, "alice", sql), "42712", "{sql}");
+    }
+}
+
 /// 左側が CTE・派生表・自己結合の relation でも、引数の列から配列を展開できる。
 #[test]
 fn left_relation_may_be_a_cte_a_derived_table_or_a_self_join() {

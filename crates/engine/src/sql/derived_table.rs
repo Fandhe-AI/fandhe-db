@@ -603,9 +603,16 @@ fn extract_at(
             .filter(|d| d.func.as_ref().is_some_and(|f| !f.alias_given))
             .count()
             > 1
-        && outer.iter().any(|t| {
-            matches!(t, Token::QualifiedIdent { qualifier, .. } if qualifier.eq_ignore_ascii_case("unnest"))
-        })
+        && outer
+            .iter()
+            .chain(found.iter().flat_map(|d| d.body.iter()))
+            .any(|t| {
+                matches!(
+                    t,
+                    Token::QualifiedIdent { qualifier, .. } | Token::QualifiedStar { qualifier }
+                        if qualifier.eq_ignore_ascii_case("unnest")
+                )
+            })
     {
         return Err(SqlSurfaceError::duplicate_alias("unnest"));
     }
