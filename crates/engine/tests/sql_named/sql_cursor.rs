@@ -2077,3 +2077,144 @@ fn fetch_without_from_or_in_is_rejected_for_now() {
         assert_eq!(txn.status(), TransactionStatus::Failed, "{sql}");
     }
 }
+
+// --- MOVE（Issue #3336・WIRE-27） --------------------------------------------------
+
+/// `SqlOutcome::Move(n)` の n を返す（行は返さない）。
+fn move_count<'a>(
+    engine: &'a EngineCore,
+    caller: &PolicyContext,
+    session: &mut SessionState,
+    txn: &mut Txn<'a>,
+    sql: &str,
+) -> u64 {
+    match engine.execute_sql_in_txn(caller, session, txn, sql) {
+        Ok(SqlOutcome::Move(n)) => n,
+        other => panic!("{sql}: {other:?}"),
+    }
+}
+
+/// 受入条件の 3 形（`MOVE FORWARD 2 IN`・`MOVE BACKWARD 1 FROM`・`MOVE ABSOLUTE 0 IN`）で、
+/// 件数が同じ向きの FETCH の行数と一致し、後続 FETCH が移動先の次から始まる。
+/// 末尾 `;` あり・なしの両方を流す。
+#[test]
+fn move_updates_position_and_following_fetch_starts_after_it() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    seed_rows(&engine, &caller, 5);
+    for suffix in ["", ";"] {
+        let (mut session, mut txn) = open_cursor_txn(&engine, &caller, "DECLARE c SCROLL CURSOR");
+        let mut m = |sql: &str| move_count(&engine, &caller, &mut session, &mut txn, sql);
+        assert_eq!(m(&format!("MOVE FORWARD 2 IN c{suffix}")), 2);
+        assert_eq!(m(&format!("MOVE BACKWARD 1 FROM c{suffix}")), 1);
+        assert_eq!(m(&format!("MOVE ABSOLUTE 0 IN c{suffix}")), 0);
+        assert_eq!(m(&format!("move forward 10 in c{suffix}")), 5);
+        assert_eq!(m(&format!("MOVE ABSOLUTE 3 IN c{suffix}")), 1);
+        assert_eq!(m(&format!("MOVE ABSOLUTE 10 IN c{suffix}")), 0);
+        assert_eq!(m(&format!("MOVE BACKWARD ALL FROM c{suffix}")), 5);
+        assert_eq!(m(&format!("MOVE FORWARD 2 IN c{suffix}")), 2);
+        let got = fetch_ids(
+            &engine,
+            &caller,
+            &mut session,
+            &mut txn,
+            "FETCH NEXT FROM c",
+        );
+        assert_eq!(got, vec![3], "{suffix}");
+    }
+}
+
+/// Tx 外・不在は `34000`、NO SCROLL の逆方向は `55000`（その後 Tx は Failed で `25P02`）。
+#[test]
+fn move_rejections_match_fetch_sqlstates() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    seed_rows(&engine, &caller, 5);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "MOVE NEXT FROM c")
+        .expect_err("outside a transaction");
+    assert_eq!(err.wire_code(), "34000");
+
+    let (mut session, mut txn) = open_cursor_txn(&engine, &caller, "DECLARE c NO SCROLL CURSOR");
+    assert_eq!(
+        move_count(&engine, &caller, &mut session, &mut txn, "MOVE 2 IN c"),
+        2
+    );
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "MOVE BACKWARD 1 FROM c")
+        .expect_err("backward on NO SCROLL");
+    assert_eq!(err.wire_code(), "55000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "MOVE NEXT FROM c")
+        .expect_err("failed transaction");
+    assert_eq!(err.wire_code(), "25P02");
+
+    let (mut session, mut txn) = open_cursor_txn(&engine, &caller, "DECLARE c CURSOR");
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "MOVE NEXT FROM nope")
+        .expect_err("missing cursor");
+    assert_eq!(err.wire_code(), "34000");
+}
+
+/// 別テナントは他者のカーソルへ MOVE できず（不在と同じ `34000`）、件数は自テナントの可視行だけに依存する。
+#[test]
+fn move_respects_tenant_boundary_and_counts_only_visible_rows() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    seed_rows(&engine, &alice, 3);
+    seed_rows(&engine, &bob, 5);
+    let (mut a_session, mut a_txn) = open_cursor_txn(&engine, &alice, "DECLARE c SCROLL CURSOR");
+    assert_eq!(
+        move_count(
+            &engine,
+            &alice,
+            &mut a_session,
+            &mut a_txn,
+            "MOVE FORWARD ALL IN c"
+        ),
+        3
+    );
+    for sql in ["MOVE NEXT FROM c", "MOVE NEXT FROM missing_cursor"] {
+        let mut b_session = SessionState::default();
+        let mut b_txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&bob, &mut b_session, &mut b_txn, "BEGIN")
+            .expect("bob begin");
+        let err = engine
+            .execute_sql_in_txn(&bob, &mut b_session, &mut b_txn, sql)
+            .expect_err(sql);
+        assert_eq!(err.wire_code(), "34000", "{sql}");
+    }
+}
+
+/// Describe は行なし（`None`）。構文の拒否は `FETCH` と同じ `42601`。
+#[test]
+fn move_describes_as_no_data_and_rejects_bad_syntax() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    seed_rows(&engine, &caller, 2);
+    let (session, txn) = open_cursor_txn(&engine, &caller, "DECLARE c SCROLL CURSOR");
+    let parsed = engine.parse_sql("MOVE NEXT FROM c").expect("parse MOVE");
+    assert!(engine
+        .describe_parsed_in_txn(&session, &txn, &parsed)
+        .expect("describe")
+        .is_none());
+    for sql in [
+        "MOVE c",
+        "MOVE NEXT c",
+        "MOVE PRIOR 1 FROM c",
+        "MOVE $1 FROM c",
+    ] {
+        let err = engine.parse_sql(sql).expect_err(sql);
+        assert_eq!(err.wire_code(), "42601", "{sql}");
+    }
+}

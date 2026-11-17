@@ -722,3 +722,47 @@ fn extended_declare_after_writer_fetch_portal_reads_acquire_time_snapshot() {
     assert_eq!(read_command_complete(&mut stream), "COMMIT");
     read_ready_for_query(&mut stream);
 }
+/// 拡張クエリの `MOVE`（Issue #3336・WIRE-27）: Describe(Portal) は NoData、Execute は行なしの
+/// `CommandComplete`（`MOVE n`）で、その後の `FETCH` が移動先の次の行から始まる。
+#[test]
+fn move_over_extended_query_describes_no_data_and_moves_position() {
+    let (core, _guard) = new_core_with_documents_table();
+    seed_rows(&core, 5);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, Arc::clone(&core));
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(&mut stream, "BEGIN");
+    assert_eq!(read_command_complete(&mut stream), "BEGIN");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM documents LIMIT 100",
+    );
+    assert_eq!(read_command_complete(&mut stream), "DECLARE CURSOR");
+    read_ready_for_query(&mut stream);
+
+    parse_and_bind(&mut stream, "sm", "pm", "MOVE FORWARD 2 IN c");
+    send_length_prefixed_message(&mut stream, b'D', b"Ppm\0");
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'n', "MOVE must describe as NoData");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pm", 0));
+    let (kind, tag) = read_message(&mut stream);
+    assert_eq!(kind, b'C', "MOVE must complete without rows");
+    assert_eq!(tag, b"MOVE 2\0");
+
+    parse_and_bind(&mut stream, "sf", "pf", "FETCH NEXT FROM c");
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("pf", 0));
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'D', "expected DataRow for the row after the move");
+    let (kind, tag) = read_message(&mut stream);
+    assert_eq!(kind, b'C');
+    assert_eq!(tag, b"FETCH 1\0");
+    send_sync(&mut stream);
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'Z');
+
+    send_simple_query(&mut stream, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut stream), "ROLLBACK");
+    read_ready_for_query(&mut stream);
+}
