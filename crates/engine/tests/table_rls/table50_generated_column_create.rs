@@ -128,8 +128,8 @@ fn accepts_documented_forms_and_keeps_canonical_expression() {
 }
 
 #[test]
-// `0A000` の固定: ADD COLUMN は #3330 が対応する。一時表・ベクトル系・式で代入できない型・式内 COLLATE は設計記録の対象外。
-// tracked: #3330
+// `0A000` の固定: 一時表・ベクトル系・式で代入できない型・式内 COLLATE は設計記録の対象外
+// （`ALTER TABLE ADD COLUMN` の生成列は #3330 で対応済み。`table50_generated_column_add_column.rs`）。
 // intentional: docs/design/generated-column.md
 fn rejects_forms_with_decided_sqlstates_and_leaves_no_table() {
     let (_p, _g, core) = fixture("gen-reject");
@@ -372,13 +372,9 @@ fn rejects_forms_with_decided_sqlstates_and_leaves_no_table() {
             "CREATE TABLE r (v VECTOR(2), b INTEGER GENERATED ALWAYS AS (v) STORED)",
             "0A000",
         ),
-        // 一時表・ALTER TABLE ADD COLUMN（0A000）。
+        // 一時表（0A000）。
         (
             "CREATE TEMP TABLE r (a INTEGER, b INTEGER GENERATED ALWAYS AS (a) STORED)",
-            "0A000",
-        ),
-        (
-            "ALTER TABLE base ADD COLUMN b INTEGER GENERATED ALWAYS AS (a) STORED",
             "0A000",
         ),
         // 生成列を参照元に含む FK の参照アクション（42601）。

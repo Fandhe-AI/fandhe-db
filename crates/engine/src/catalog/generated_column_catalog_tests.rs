@@ -558,3 +558,186 @@ fn logical_dump_data_rejects_rows_of_a_table_with_only_generated_columns() {
         .expect_err("rows of an only-generated table cannot be dumped");
     assert!(matches!(err, SchemaDdlError::Unsupported { .. }), "{err:?}");
 }
+/// 全行バックフィルのテスト用に、通常列だけの表 `docs`（`a INTEGER`・`c TEXT`）へ行を直接置く。
+fn put_plain_row(storage: &Storage, schema: &TableSchema, tenant: &str, id: u64, a: Option<i32>) {
+    use crate::row_codec::{encode_scalar_columns, Value};
+    use crate::storage::{encode_row, RowInput, Visibility};
+    let write_txn = storage.begin_write_txn().expect("begin");
+    {
+        let name = crate::catalog::user_rows_table_name("docs");
+        let mut rows = write_txn
+            .open_table(crate::catalog::user_rows_table_def(&name))
+            .expect("open rows");
+        let metadata = encode_scalar_columns(
+            schema,
+            &[
+                a.map_or(Value::Null, Value::Integer),
+                Value::Text("x".to_string()),
+            ],
+        )
+        .expect("encode");
+        let row = RowInput {
+            tenant_id: tenant,
+            visibility: Visibility::Private,
+            embedding: &[],
+            metadata: &metadata,
+        };
+        let encoded = encode_row(&row).expect("encode row");
+        rows.insert((tenant, id), encoded.as_slice())
+            .expect("insert");
+    }
+    write_txn.commit_raw_for_test().expect("commit");
+}
+
+fn plain_schema() -> TableSchema {
+    TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("a", ColumnType::Integer, true),
+            ColumnDef::new("c", ColumnType::Text, true),
+        ],
+    )
+    .with_row_identity(RowIdentity::Allocated)
+}
+
+fn raw_rows(storage: &Storage) -> Vec<((String, u64), Vec<u8>)> {
+    use redb::ReadableTable;
+    let read = storage.db().begin_read().expect("read");
+    let name = crate::catalog::user_rows_table_name("docs");
+    let rows = read
+        .open_table(crate::catalog::user_rows_table_def(&name))
+        .expect("open rows");
+    rows.iter()
+        .expect("iter")
+        .map(|e| {
+            let (k, v) = e.expect("entry");
+            let (t, id) = k.value();
+            ((t.to_string(), id), v.value().to_vec())
+        })
+        .collect()
+}
+
+/// 生成列の追加（Issue #3330）: 全テナントの全行が 1 つの write txn で計算され、既存の列の値は変わらない。
+#[test]
+fn add_generated_column_backfills_all_tenants_in_one_txn() {
+    use crate::row_codec::{decode_scalar_columns, Value};
+    use crate::storage::decode_row_for_key;
+    let (storage, _g) = open_storage("gen-add-backfill");
+    let schema = plain_schema();
+    storage.create_table(&schema).expect("create");
+    put_plain_row(&storage, &schema, "tenant-a", 1, Some(7));
+    put_plain_row(&storage, &schema, "tenant-b", 2, Some(3));
+    put_plain_row(&storage, &schema, "tenant-b", 3, None);
+    let mut g = ColumnDef::new("g", ColumnType::Integer, true);
+    g.generated = Some(gen_def("a * 2", &["a"]));
+    storage
+        .alter_table_in_single_txn("docs", |txn| {
+            Storage::alter_table_add_generated_column_in_txn(txn, "docs", g.clone(), 64, false)?;
+            Ok(((), true, Vec::new()))
+        })
+        .unwrap_or_else(|_| panic!("add generated column"));
+    let new_schema = storage.get_table_schema("docs").expect("schema");
+    assert_eq!(new_schema.columns[2].generation_expression(), Some("a * 2"));
+    let rows = raw_rows(&storage);
+    assert_eq!(rows.len(), 3);
+    let mut seen = Vec::new();
+    for ((tenant, id), raw) in &rows {
+        let row = decode_row_for_key(
+            tenant,
+            crate::storage::rowid::RowId::from_legacy_id(*id),
+            raw,
+        )
+        .expect("decode");
+        let values = decode_scalar_columns(&new_schema, &row.metadata).expect("values");
+        assert_eq!(values[1], Value::Text("x".to_string()));
+        seen.push((tenant.clone(), values[0].clone(), values[2].clone()));
+    }
+    assert_eq!(
+        seen,
+        [
+            (
+                "tenant-a".to_string(),
+                Value::Integer(7),
+                Value::Integer(14)
+            ),
+            ("tenant-b".to_string(), Value::Integer(3), Value::Integer(6)),
+            ("tenant-b".to_string(), Value::Null, Value::Null),
+        ]
+    );
+}
+
+/// 評価エラー（`22012`）は他テナントの行でも txn 全体を破棄し、カタログ・行のバイト列とも変えない。
+#[test]
+fn add_generated_column_eval_error_leaves_catalog_and_rows_unchanged() {
+    let (storage, _g) = open_storage("gen-add-error");
+    let schema = plain_schema();
+    storage.create_table(&schema).expect("create");
+    put_plain_row(&storage, &schema, "tenant-a", 1, Some(5));
+    put_plain_row(&storage, &schema, "tenant-b", 2, Some(0));
+    let before_rows = raw_rows(&storage);
+    let before_gen = storage.table_generation("docs").expect("generation");
+    let mut g = ColumnDef::new("g", ColumnType::Integer, true);
+    g.generated = Some(gen_def("10 / a", &["a"]));
+    let err = storage
+        .alter_table_in_single_txn("docs", |txn| {
+            Storage::alter_table_add_generated_column_in_txn(txn, "docs", g.clone(), 64, false)?;
+            Ok(((), true, Vec::new()))
+        })
+        .expect_err("division by zero");
+    match err {
+        crate::catalog::AlterCheckError::Sql(e) => {
+            assert_eq!(e.wire_code(), "22012");
+            let text = e.to_string();
+            assert!(
+                !text.contains("tenant-b") && !text.contains("tenant-a"),
+                "{text}"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(raw_rows(&storage), before_rows);
+    assert_eq!(
+        storage.table_generation("docs").expect("generation"),
+        before_gen
+    );
+    assert_eq!(
+        storage
+            .get_table_schema("docs")
+            .expect("schema")
+            .columns
+            .len(),
+        2
+    );
+}
+
+/// 最下層ガード: カタログだけを書く公開・内部の経路は生成列を受け付けない（行を計算せず列だけが増える
+/// 状態を作らせない。fail-closed）。
+#[test]
+fn catalog_only_add_column_paths_reject_generated_column() {
+    let (storage, _g) = open_storage("gen-add-guard");
+    storage.create_table(&plain_schema()).expect("create");
+    let mut g = ColumnDef::new("g", ColumnType::Integer, true);
+    g.generated = Some(gen_def("a * 2", &["a"]));
+    assert!(matches!(
+        storage.alter_table_add_column("docs", g.clone()),
+        Err(CatalogError::Invalid(_))
+    ));
+    assert!(matches!(
+        storage.alter_table_add_column_with_limit("docs", g.clone(), 64),
+        Err(CatalogError::Invalid(_))
+    ));
+    let write_txn = storage.begin_write_txn().expect("begin");
+    assert!(matches!(
+        Storage::alter_table_add_column_in_txn(&write_txn, "docs", g, 64, false),
+        Err(CatalogError::Invalid(_))
+    ));
+    drop(write_txn);
+    assert_eq!(
+        storage
+            .get_table_schema("docs")
+            .expect("schema")
+            .columns
+            .len(),
+        2
+    );
+}

@@ -6839,6 +6839,12 @@ pub struct ValidatedAlterTableAddColumn {
     /// 何も変えずに成功する（実行段が判定。構造検証はカタログを参照しない）。
     /// **BREAKING CHANGE**: pub フィールド追加。
     pub if_not_exists: bool,
+    /// 生成列の式（`GENERATED ALWAYS AS (<式>) STORED`。TABLE-50・RECOVER-11・Issue #3330）。
+    /// `Some` のとき実行段が式を束縛し、既存の全行を 1 つの write txn で計算して書き直す
+    /// （TABLE-5 の O(1) の fast default は使わない）。`DEFAULT`・`VIRTUAL`・IDENTITY との併記は
+    /// 構文段で拒否済み。`not_null` でも `default` なしで受理する（値は式で決まる）。
+    /// **BREAKING CHANGE**: pub フィールド追加。
+    pub generated: Option<Expr>,
 }
 
 /// `ALTER TABLE <table> <アクション>[, <アクション>]*`（2 個以上。TABLE-39 (5) のポインタ、
@@ -16719,14 +16725,25 @@ impl<'a> Parser<'a> {
                             .to_string(),
                     });
                 }
-                // 生成列は既存行のバックフィル（全行の計算）が要るため未対応（fail-closed。
-                // TABLE-50・Issue #3330 が対応する）。
-                // tracked: #3330
+                // 生成列（TABLE-50・Issue #3330）。全行の計算（バックフィル）は実行段が行う。ここでは
+                // CREATE TABLE と同じ構文段の組み合わせ規則だけを判定する（カタログ非参照のため存在オラクル
+                // にならない）。`DEFAULT`（`DEFAULT NULL` を含む）との併記は `42601`、ベクトル系の型は `0A000`。
+                // IDENTITY との併記は `GENERATED` 句の重複として `parse_column_constraints` が拒否済み。
                 if constraints.generated.is_some() {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "generated column is not supported in ALTER TABLE ADD COLUMN"
-                            .to_string(),
-                    });
+                    if constraints.default_declared {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "both default and generation expression specified for column {column_name:?}"
+                        )));
+                    }
+                    // intentional: docs/design/generated-column.md
+                    if matches!(
+                        column_type,
+                        crate::sql::ddl_column_type::SqlColumnTypeName::Vector(_)
+                    ) {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "generated columns of a vector type are not supported",
+                        ));
+                    }
                 }
                 // 時刻値関数の DEFAULT は既存行の補完値を固定できないため拒否する
                 // （fail-closed。設計 D10・SQL-37・Issue #1587）。
@@ -16751,7 +16768,11 @@ impl<'a> Parser<'a> {
                 // （TABLE-16）。`NOT NULL DEFAULT NULL` は既定値なしに正規化されるため
                 // ここで同じく拒否される（Issue #1524・fail-closed）。カタログ・行を参照しない構造判定のため、存在オラクル・
                 // 他テナント行の有無の判別手段にならない。
-                if constraints.not_null && constraints.default.is_none() {
+                // 生成列は値を式で決めるため対象外（TABLE-50・Issue #3330）。
+                if constraints.not_null
+                    && constraints.default.is_none()
+                    && constraints.generated.is_none()
+                {
                     return Err(SqlSurfaceError::unsupported(
                         "NOT NULL in ALTER TABLE ADD COLUMN requires a DEFAULT",
                     ));
@@ -16765,6 +16786,7 @@ impl<'a> Parser<'a> {
                         default: constraints.default,
                         collation: constraints.collation,
                         if_not_exists,
+                        generated: constraints.generated,
                     },
                 ));
             }
@@ -23168,6 +23190,8 @@ struct ParsedAlterTableAddColumnShape {
     default: Option<InsertLiteral>,
     collation: Option<crate::collation::Collation>,
     if_not_exists: bool,
+    /// 生成列の式（`GENERATED ALWAYS AS (<式>) STORED`。TABLE-50・Issue #3330）。
+    generated: Option<Expr>,
 }
 
 /// 構文木（[`ValidatedAlterTable`] の元）。カタログ存在確認前の中間結果
@@ -32439,6 +32463,7 @@ fn into_validated_alter_table(
                 default: shape.default,
                 collation: shape.collation,
                 if_not_exists: shape.if_not_exists,
+                generated: shape.generated,
             })
         }
         ParsedAlterTableShape::AddUnique {
