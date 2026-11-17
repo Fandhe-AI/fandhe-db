@@ -6,7 +6,9 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 ## ステータス
 
-方式は決定済み・実装は未了（#3351〜#3358）。各実装が入るまでは、現行の `42601`（文頭の判定段 `sql::allowlist` の未知キーワード腕）が正しい挙動である。本 Issue はドキュメントだけを扱い、コード・依存・CI は変えない。
+方式は決定済み・実装は進行中（#3351〜#3358）。**#3351 で構文解析を実装済み**（`sql::allowlist::merge`・`ParsedSql::Merge`）。解析を通った MERGE は Execute・Describe・明示 Tx のいずれも固定文言の `0A000`（`MERGE is not supported yet`）で止まり、行・台帳・writer・世代に触れない（`USING OPERATION_ID` も台帳に参加させない）。従来 `42601` だった形のうち、構文を通るものが `0A000` に変わる。束縛・実行・`RETURNING`・台帳・`EXPLAIN` は後続（#3352〜#3357）が入れる。
+
+Issue #3351 での `$n` の受理範囲: 構文段が受理するのは `USING OPERATION_ID $n` だけで、条件・SET・VALUES・元の中の `$n` は Parse 段で `42601`（`sql::params` の許可位置のまま。UPDATE FROM と同じ fail-closed）。値位置の `$n` の許可と型推論は、束縛と一緒に #3352 が広げる。
 
 各決定は「決定・理由・アンカー」で書く。アンカーは行番号でなく関数名・モジュール名で指す。
 

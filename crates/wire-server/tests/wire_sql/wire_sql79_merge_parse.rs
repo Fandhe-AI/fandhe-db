@@ -1,0 +1,180 @@
+//! `MERGE` 文の構文解析と固定文言 `0A000`（SQL-79・Issue #3351）の pg wire 結合テスト。
+//!
+//! 簡易クエリ（psql 流の末尾 `;` 付き単独送信を含む）と拡張クエリ（Parse／Bind／Execute／Sync と
+//! Parse／Describe／Sync）で、解析を通った MERGE が ErrorResponse `0A000` になり、ReadyForQuery の状態が
+//! 正しいこと、行が変わらないことを固定する。値位置の `$n` は構文段が受理しない（`42601`。束縛は #3352）。
+//! サーバーはポート 0・一意な一時ディレクトリで独立させ、時間計測は使わない。
+
+use crate::common;
+
+use crate::temp_db;
+
+use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
+
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::sql::mode::SessionState;
+use engine::storage::Storage;
+
+use common::*;
+
+const MERGE_SQL: &str = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE";
+
+fn start() -> (SocketAddr, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-sql79-merge");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let mut s = SessionState::default();
+    s.allow_ddl();
+    let ctx = PolicyContext::with_visibilities(
+        "tenant-a",
+        [
+            engine::storage::Visibility::Public,
+            engine::storage::Visibility::Private,
+        ],
+    )
+    .expect("tenant");
+    for sql in [
+        "CREATE TABLE t (k BIGINT PRIMARY KEY, v BIGINT)",
+        "CREATE TABLE s (k BIGINT PRIMARY KEY, v BIGINT)",
+        "INSERT INTO t (k, v) VALUES (1, 10)",
+        "INSERT INTO s (k, v) VALUES (1, 100)",
+    ] {
+        core.execute_sql_in_session(&ctx, &mut s, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    (addr, guard)
+}
+
+fn client(addr: SocketAddr) -> TcpStream {
+    authenticate_to_ready_for_query(addr, "alice", "correct-horse")
+}
+
+/// `t` の行数（簡易クエリの `SELECT COUNT(*)`）。
+fn count_t(s: &mut TcpStream) -> String {
+    send_simple_query(s, "SELECT COUNT(*) FROM t");
+    read_row_description(s);
+    let row = read_data_row(s);
+    let _tag = read_command_complete(s);
+    read_ready_for_query(s);
+    row.first().cloned().flatten().expect("count")
+}
+
+/// 拡張クエリの 1 往復で返ってきた ErrorResponse の SQLSTATE（無ければ `None`）と、最後の
+/// ReadyForQuery の状態を読む。`Sync` までの全メッセージを消費する。
+fn read_until_ready(s: &mut TcpStream) -> (Option<String>, u8) {
+    let mut code = None;
+    loop {
+        let (ty, body) = read_message(s);
+        match ty {
+            b'E' => {
+                let text = String::from_utf8_lossy(&body).to_string();
+                code = text
+                    .split('\0')
+                    .find_map(|f| f.strip_prefix('C').map(str::to_string));
+            }
+            b'Z' => return (code, body.first().copied().unwrap_or(0)),
+            _ => {}
+        }
+    }
+}
+
+fn send_sync(s: &mut TcpStream) {
+    send_length_prefixed_message(s, b'S', &[]);
+}
+
+#[test]
+fn simple_query_merge_alone_with_semicolon_is_0a000_and_ready_idle() {
+    let (addr, _g) = start();
+    let mut s = client(addr);
+    for sql in [MERGE_SQL.to_string(), format!("{MERGE_SQL};")] {
+        send_simple_query(&mut s, &sql);
+        expect_error_response_with_sqlstate(&mut s, "0A000");
+        assert_eq!(read_ready_for_query_status(&mut s), b'I');
+    }
+    assert_eq!(count_t(&mut s), "1");
+}
+
+#[test]
+fn simple_query_merge_in_explicit_transaction_fails_the_transaction() {
+    let (addr, _g) = start();
+    let mut s = client(addr);
+    send_simple_query(&mut s, "BEGIN");
+    assert_eq!(read_command_complete(&mut s), "BEGIN");
+    read_ready_for_query(&mut s);
+    send_simple_query(&mut s, MERGE_SQL);
+    expect_error_response_with_sqlstate(&mut s, "0A000");
+    // 既存の失敗文と同じ規約（Tx は失敗状態 `E`）。
+    assert_eq!(read_ready_for_query_status(&mut s), b'E');
+    send_simple_query(&mut s, "ROLLBACK");
+    assert_eq!(read_command_complete(&mut s), "ROLLBACK");
+    assert_eq!(read_ready_for_query_status(&mut s), b'I');
+    assert_eq!(count_t(&mut s), "1");
+}
+
+#[test]
+fn simple_query_merge_followed_by_another_statement_keeps_the_write_rule() {
+    let (addr, _g) = start();
+    let mut s = client(addr);
+    // MERGE は `Write` に分類されるため、複数文メッセージの最後以外には置けない（既存の DML と同じ扱い）。
+    send_simple_query(&mut s, &format!("{MERGE_SQL}; SELECT COUNT(*) FROM t"));
+    expect_error_response_with_sqlstate(&mut s, "0A000");
+    read_ready_for_query(&mut s);
+    assert_eq!(count_t(&mut s), "1");
+}
+
+#[test]
+fn simple_query_syntax_error_is_42601() {
+    let (addr, _g) = start();
+    let mut s = client(addr);
+    send_simple_query(&mut s, "MERGE INTO t USING s ON t.k = s.k");
+    expect_error_response_with_sqlstate(&mut s, "42601");
+    read_ready_for_query(&mut s);
+}
+
+#[test]
+fn extended_query_execute_and_describe_are_0a000() {
+    let (addr, _g) = start();
+    let mut s = client(addr);
+
+    // Parse／Bind／Execute／Sync。
+    send_length_prefixed_message(&mut s, b'P', &parse_body("m1", MERGE_SQL, 0));
+    send_length_prefixed_message(&mut s, b'B', &bind_body("p1", "m1"));
+    send_length_prefixed_message(&mut s, b'E', &execute_body("p1", 0));
+    send_sync(&mut s);
+    let (code, status) = read_until_ready(&mut s);
+    assert_eq!(code.as_deref(), Some("0A000"));
+    assert_eq!(status, b'I');
+
+    // Parse／Describe（文）／Sync。Describe も Execute と同じ SQLSTATE。
+    send_length_prefixed_message(&mut s, b'P', &parse_body("m2", MERGE_SQL, 0));
+    let mut describe = vec![b'S'];
+    describe.extend_from_slice(b"m2\0");
+    send_length_prefixed_message(&mut s, b'D', &describe);
+    send_sync(&mut s);
+    let (code, status) = read_until_ready(&mut s);
+    assert_eq!(code.as_deref(), Some("0A000"));
+    assert_eq!(status, b'I');
+
+    assert_eq!(count_t(&mut s), "1");
+}
+
+#[test]
+fn extended_query_placeholders_outside_the_allowed_positions_are_42601() {
+    let (addr, _g) = start();
+    let mut s = client(addr);
+    // 値位置の `$n` は構文段で受理しない（束縛は #3352）。Parse の時点で拒否される。
+    let sql = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = $1";
+    send_length_prefixed_message(&mut s, b'P', &parse_body("m3", sql, 0));
+    send_sync(&mut s);
+    let (code, _) = read_until_ready(&mut s);
+    assert_eq!(code.as_deref(), Some("42601"));
+}
