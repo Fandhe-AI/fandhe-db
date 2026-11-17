@@ -319,7 +319,7 @@ fn resend_does_not_recompute_and_matches_before_computing() {
     ok(
         &core,
         TA,
-        "ALTER TABLE t ADD COLUMN q INTEGER GENERATED ALWAYS AS (10 / (a + 1)) STORED",
+        "ALTER TABLE t ADD COLUMN q INTEGER GENERATED ALWAYS AS (10 / a) STORED",
     );
     assert_eq!(
         code(
