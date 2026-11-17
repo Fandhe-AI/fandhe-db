@@ -142,6 +142,14 @@ pub(crate) fn bind_generated_column(
         });
     }
 
+    // 代入キャストがセッション TZ 依存の変換（`TIMESTAMP`／`DATE` ⇔ `TIMESTAMPTZ`）を挟む宣言は、
+    // 構文木に現れない暗黙変換のため上の再判定を素通りする。式を不変に限る（G2）ため拒否する。
+    if crate::sql::index_expr::assignment_cast_is_session_dependent(&folded, &column.ty, schema) {
+        return Err(crate::sql::index_expr::not_immutable_at(
+            IndexExprSite::Generated,
+        ));
+    }
+
     // 正規描画と往復一致（保存するのは描画結果だけ。原文は連結しない）。
     let rendered = crate::sql::check_constraint::render_expr(&folded);
     if rendered.len() > MAX_GENERATED_EXPRESSION_SQL_LEN {

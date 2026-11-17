@@ -142,13 +142,15 @@ pub(crate) fn element_end(tokens: &[Token], start: usize) -> usize {
     let mut i = start;
     while let Some(tok) = tokens.get(i) {
         match tok {
-            Token::Punct('(') => depth = depth.saturating_add(1),
+            // `ARRAY[a, b]` 内のカンマで要素を切らないよう、角括弧も丸括弧と同じ深さで数える。
+            Token::Punct('(' | '[') => depth = depth.saturating_add(1),
             Token::Punct(')') => {
                 if depth == 0 {
                     return i;
                 }
                 depth -= 1;
             }
+            Token::Punct(']') => depth = depth.saturating_sub(1),
             Token::Punct(',') if depth == 0 => return i,
             _ => {}
         }
@@ -781,6 +783,28 @@ pub(crate) fn fold_session_local_literals(expr: &Expr) -> Result<Expr, SqlSurfac
     })
 }
 
+/// 代入先の列型 `target` と式 `expr` の静的な結果型の組が、代入キャストでセッション TZ 依存の変換
+/// （`TIMESTAMP`／`DATE` ⇔ `TIMESTAMPTZ`）を挿入するか。生成列は式を不変に限るため、この組は
+/// 呼び出し側（`generated_column::bind_generated_column`）が `42P17` で拒否する。
+pub(crate) fn assignment_cast_is_session_dependent(
+    expr: &Expr,
+    target: &crate::catalog::ColumnType,
+    schema: &crate::catalog::TableSchema,
+) -> bool {
+    use crate::catalog::ColumnType;
+    use crate::sql::udf_call::ExprType;
+    matches!(
+        (target, static_type_of(expr, schema)),
+        (
+            ColumnType::TimestampTz,
+            Some(ExprType::Timestamp | ExprType::Date)
+        ) | (
+            ColumnType::Timestamp | ColumnType::Date,
+            Some(ExprType::TimestampTz)
+        )
+    )
+}
+
 /// 部分式 `sub` の静的な結果型。束縛できない（文脈依存の型なし `NULL` 等）場合は `None`。
 fn static_type_of(
     sub: &Expr,
@@ -1252,6 +1276,11 @@ mod tests {
         // 閉じ括弧が無ければ終端は末尾。
         let t = toks("lower(a");
         assert_eq!(element_end(&t, 0), t.len());
+        // `ARRAY[...]` 内のカンマでは切らない。
+        let t = toks("ARRAY[a, b], c)");
+        let end = element_end(&t, 0);
+        assert!(matches!(t.get(end), Some(Token::Punct(','))));
+        assert_eq!(end, 6);
     }
     // --- 束縛段（Issue #1648） -------------------------------------------------------
 
