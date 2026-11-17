@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用（設計記録のみ。実装は #3321〜#3324。本記録の時点では `LATERAL (SELECT ...)` は固定文言の `0A000` のまま）
+- ステータス: 採用。#3321 で構文受理と左側の列の束縛（L3・L4・L6・L17 の入口）を実装済み。外側の行ごとの再評価の実行は #3322〜（左側を参照する形・`LEFT JOIN LATERAL` は専用文言の `0A000`）
 - ポインタ: SQL-60・SQL-61・SQL-62・TASK-344（spec 本文は転記しない）
 - 対象: `FROM` の `LATERAL (SELECT ...)` の実行方式、再評価の数え方と上限、RLS の適用、対象外の形
 - 親: #3319。先行記録: [nested-loop-join.md](nested-loop-join.md)・[outer-join.md](outer-join.md)・[multi-way-join.md](multi-way-join.md)・[join-limits-cli.md](join-limits-cli.md)・[sql-subquery.md](sql-subquery.md)（#1842・#1847）・[cte.md](cte.md)（#1865〜#1867）
@@ -56,9 +56,9 @@
 | 事象 | SQLSTATE | 判定位置 |
 | ---- | -------- | -------- |
 | 再評価回数・比較回数・出力行数・入力行数・共有バイト予算の超過（オーバーフローを含む） | `54000` | LATERAL の段の評価前（L10）。ループ内は安全網 |
-| 左側以外への参照・存在しない列 | `42P01`／`42703`（#3321 で照合） | 束縛段 |
+| 左側以外への参照・存在しない列・左側の複数 relation で曖昧な非修飾名 | `42P01`／`42703`／`42702`（#3321 で PostgreSQL 17 実機と照合済み） | 束縛段 |
 | 外側参照を置けない位置・`levels_up >= 2`・受理しない内側の形・集合を返す関数との LATERAL・`ROWS FROM` | `0A000`（固定文言） | 構文段・束縛段 |
-| RIGHT／FULL と左側を参照する LATERAL | #3323 で照合。未照合の間は fail-closed | 束縛段 |
+| RIGHT／FULL と左側を参照する LATERAL | PostgreSQL 17 は `42P10`（#3321 で確認）。本実装は #3323 まで固定文言の `0A000` で fail-closed | 束縛段 |
 | 切断・statement_timeout による中断 | `57014` | `interrupt::check()` |
 
 エラー文は英語の固定文言にし、行・件数・他テナントの存在情報を含めない（含めるとしても上限値だけ）。新しい `wire_code` クラスは追加しない。

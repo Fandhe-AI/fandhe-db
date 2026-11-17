@@ -54,6 +54,28 @@ pub(crate) fn parse_outer_ref_placeholder(ident: &str) -> Option<(usize, &str)> 
     Some((levels_up, name))
 }
 
+/// LATERAL 派生表の左側 relation の列への参照を表す予約内部名の接頭辞（Issue #3321）。
+/// [`OUTER_REF_PREFIX`]（`\u{2}outer`）と接頭辞が異なるため、互いに相手の予約名として解釈されない。
+pub(crate) const LATERAL_REF_PREFIX: &str = "\u{2}lateral";
+
+/// LATERAL の左側 relation 参照の予約内部名 `"\u{2}lateral<rel_index>.<name>"` を組み立てる。
+/// `rel_index` は左側 relation の並び（結合連鎖の 0 始まり）の添字で、`d.lang` と `e.lang` を区別する。
+/// `sql::lateral_bind` だけが呼ぶ。
+pub(crate) fn lateral_ref_placeholder(rel_index: usize, name: &str) -> String {
+    format!("{LATERAL_REF_PREFIX}{rel_index}.{name}")
+}
+
+/// LATERAL の予約内部名を `(rel_index, 列名)` へ分解する。予約名でない・数値が不正なら `None`
+/// （利用者の識別子は字句解析器が制御文字を作れないため予約名として解釈されない）。
+pub(crate) fn parse_lateral_ref_placeholder(ident: &str) -> Option<(usize, &str)> {
+    let rest = ident.strip_prefix(LATERAL_REF_PREFIX)?;
+    let (digits, name) = rest.split_once('.')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((digits.parse().ok()?, name))
+}
+
 /// 外側スコープの列への 1 つの参照。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OuterColumnRef {
@@ -201,6 +223,17 @@ pub(crate) fn reject_if_correlated(correlation: &Correlation) -> Result<(), SqlS
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lateral_and_outer_placeholders_do_not_mix() {
+        let l = lateral_ref_placeholder(2, "lang");
+        assert_eq!(parse_lateral_ref_placeholder(&l), Some((2, "lang")));
+        assert_eq!(parse_outer_ref_placeholder(&l), None);
+        let o = outer_ref_placeholder(1, "lang");
+        assert_eq!(parse_lateral_ref_placeholder(&o), None);
+        assert_eq!(parse_lateral_ref_placeholder("lateral0.x"), None);
+        assert_eq!(parse_lateral_ref_placeholder("\u{2}lateralx.x"), None);
+    }
+
     use super::*;
     use crate::catalog::ColumnDef;
 
