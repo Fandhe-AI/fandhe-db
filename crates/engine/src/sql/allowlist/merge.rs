@@ -639,6 +639,22 @@ mod tests {
 
     const HEAD: &str = "MERGE INTO t USING s ON t.id = s.id";
 
+    /// SET 右辺の引用付き `"case"` は列参照として受理する（非引用の `CASE WHEN` と区別。Issue #3351）。
+    #[test]
+    fn accepts_quoted_case_column_in_set_rhs() {
+        let tokens = lexer::tokenize_marked(&format!(
+            "{HEAD} WHEN MATCHED THEN UPDATE SET v = \"case\" WHEN NOT MATCHED THEN DO NOTHING"
+        ))
+        .expect("lex");
+        validate_merge_tokens_with_limits(
+            &tokens,
+            LedgerMode::Optional,
+            crate::nesting_limits::NestingLimits::default(),
+            &Cat,
+        )
+        .expect("quoted case column");
+    }
+
     #[test]
     fn accepts_the_three_when_kinds_and_actions() {
         let v = parse(&format!(

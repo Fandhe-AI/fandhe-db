@@ -33288,6 +33288,19 @@ mod tests {
         assert!(looks_like_delete_using(&t("DELETE FROM a AS d USING b")));
     }
 
+    /// Issue #3351: SET 右辺の引用付き `"case"` は列参照（非引用の `CASE WHEN` は式の開始）。
+    #[test]
+    fn update_from_set_rhs_accepts_quoted_case_column() {
+        use super::*;
+        let toks = crate::sql::lexer::tokenize_marked(
+            "UPDATE a SET x = \"case\" FROM b WHERE a.id = b.id",
+        )
+        .expect("lex");
+        let mut p = Parser::new(&toks);
+        p.parse_update_from().expect("quoted case column");
+        p.expect_end_of_statement().expect("end");
+    }
+
     /// SQL-53 (b)・Issue #1754: 構文段の受理形と拒否コード（カタログに触れない解析器単体）。
     #[test]
     fn parse_update_from_and_delete_using_structure() {
