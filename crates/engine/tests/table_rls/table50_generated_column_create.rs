@@ -221,6 +221,26 @@ fn rejects_forms_with_decided_sqlstates_and_leaves_no_table() {
             "CREATE TABLE r (a TIMESTAMPTZ, b DATE GENERATED ALWAYS AS (a) STORED)",
             "42P17",
         ),
+        (
+            "CREATE TABLE r (a TIMESTAMP[], b TIMESTAMPTZ[] GENERATED ALWAYS AS (a) STORED)",
+            "42P17",
+        ),
+        (
+            "CREATE TABLE r (a TIMESTAMPTZ[], b TIMESTAMP[] GENERATED ALWAYS AS (a) STORED)",
+            "42P17",
+        ),
+        (
+            "CREATE TABLE r (a DATE[], b TIMESTAMPTZ[] GENERATED ALWAYS AS (a) STORED)",
+            "42P17",
+        ),
+        (
+            "CREATE TABLE r (a TIMESTAMPTZ[], b DATE[] GENERATED ALWAYS AS (a) STORED)",
+            "42P17",
+        ),
+        (
+            "CREATE TABLE r (a TIMESTAMP, b TIMESTAMPTZ[] GENERATED ALWAYS AS (ARRAY[a]) STORED)",
+            "42P17",
+        ),
         // ARRAY[...] 内の後続要素に置いた部分クエリ・集計も拒否される（42P17）。
         (
             "CREATE TABLE r (a INTEGER, b INTEGER[] GENERATED ALWAYS AS (ARRAY[a, (SELECT 1)]) STORED)",

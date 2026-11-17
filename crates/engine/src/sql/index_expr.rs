@@ -793,6 +793,27 @@ pub(crate) fn assignment_cast_is_session_dependent(
 ) -> bool {
     use crate::catalog::ColumnType;
     use crate::sql::udf_call::ExprType;
+    // 配列列への代入は要素ごとの変換になる（`bind_array_assignment`）。変換元・先の要素型が
+    // 別ゾーン種別の日時（`TIMESTAMP`／`DATE` ⇔ `TIMESTAMPTZ`）なら TZ 依存として扱う（fail-closed）。
+    if let ColumnType::Array(at) = target {
+        use crate::catalog::ArrayElemType as E;
+        let tz_differs = |src: E| {
+            matches!(
+                (at.elem(), src),
+                (E::TimestampTz, E::Timestamp | E::Date) | (E::Timestamp | E::Date, E::TimestampTz)
+            )
+        };
+        if let Expr::ArrayConstructor(items) = expr {
+            return items.iter().any(|i| {
+                matches!(
+                    (at.elem(), static_type_of(i, schema)),
+                    (E::TimestampTz, Some(ExprType::Timestamp | ExprType::Date))
+                        | (E::Timestamp | E::Date, Some(ExprType::TimestampTz))
+                )
+            });
+        }
+        return array_source_elem(expr, schema).is_some_and(tz_differs);
+    }
     matches!(
         (target, static_type_of(expr, schema)),
         (
