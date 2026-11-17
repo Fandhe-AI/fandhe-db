@@ -227,6 +227,39 @@ fn insert_follows_the_single_insert_rules() {
     );
 }
 
+/// 裸の `DEFAULT` は通常の INSERT と同じく列の省略と等価で、GENERATED ALWAYS 列でも受理する
+/// （SET の `DEFAULT` 規則の 428C9・0A000 には従わない）。利用者指定の値は 428C9 のまま。
+#[test]
+fn insert_bare_default_is_an_omitted_column() {
+    let always = ColumnDef::new("g", ColumnType::BigInt, false).with_default(
+        crate::catalog::ColumnDefault::Identity {
+            sequence: "g_seq".to_string(),
+            kind: crate::catalog::IdentityKind::Always,
+        },
+    );
+    let mut cols = vec![ColumnDef::new("k", ColumnType::Text, false), always];
+    cols.push(ColumnDef::new("x", ColumnType::Integer, true).with_default(
+        crate::catalog::ColumnDefault::CurrentTime(crate::catalog::TimeDefault::Now),
+    ));
+    let target = TableSchema::new("t", cols).with_row_identity(RowIdentity::Allocated);
+    let src = schema("s", "v");
+    let b = bind_with(
+        &format!("{HEAD} WHEN NOT MATCHED THEN INSERT (k, g, x) VALUES (s.k, DEFAULT, DEFAULT)"),
+        &target,
+        &src,
+        &[],
+    );
+    assert!(b.is_ok(), "{:?}", b.err());
+    let err = bind_with(
+        &format!("{HEAD} WHEN NOT MATCHED THEN INSERT (k, g) VALUES (s.k, 1)"),
+        &target,
+        &src,
+        &[],
+    )
+    .expect_err("explicit value");
+    assert_eq!(err.wire_code(), "428C9");
+}
+
 #[test]
 fn dummy_flags_defer_value_validation_only_when_the_count_matches() {
     // `$n` のダミー（文字列リテラル）を整数列へ代入する。フラグが合えば値の検証を遅延する。

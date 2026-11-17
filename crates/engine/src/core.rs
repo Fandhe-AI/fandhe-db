@@ -9170,6 +9170,28 @@ impl EngineCore {
                 let schema = schema_of(&table)?;
                 Some((table, crate::catalog::lookup_star_columns_of(&schema)))
             });
+        // MERGE の列リスト省略 INSERT の `*` 展開（実表は自身、ビューは基底表。公開列を絞るビューは `None`）。
+        let merge_star_columns = |table: &str| -> Option<Vec<String>> {
+            if let Some(schema) = schema_of(table) {
+                return Some(crate::catalog::lookup_star_columns_of(&schema));
+            }
+            let base_star = |snap: &crate::catalog::ViewWriteSnapshot<'_>| {
+                let view = crate::sql::view_dml::resolve_merge_target(snap, table).ok()?;
+                if view.view_columns.is_some() {
+                    return None;
+                }
+                let base = snap.table_schema(&view.base_table).ok()?;
+                Some(crate::catalog::lookup_star_columns_of(&base))
+            };
+            match read_snap {
+                Some(rs) => base_star(&crate::catalog::ViewWriteSnapshot::over(rs)),
+                None => self
+                    .storage
+                    .with_view_write_snapshot(table, |snap, _| base_star(snap))
+                    .ok()
+                    .flatten(),
+            }
+        };
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match schema_of(table).ok_or(()) {
@@ -9354,11 +9376,10 @@ impl EngineCore {
                             merge_table.as_deref().and_then(|t| {
                                 let col = match columns {
                                     Some(cols) => cols.get(*index).cloned(),
-                                    None => schema_of(t).and_then(|s| {
-                                        crate::catalog::lookup_star_columns_of(&s)
-                                            .get(*index)
-                                            .cloned()
-                                    }),
+                                    // 実表は表の `*` 展開、ビューは基底表の `*` 展開（公開列を絞るビューは
+                                    // 列リストが必須のため引けず `Text`。束縛段の拒否に委ねる）。
+                                    None => merge_star_columns(t)
+                                        .and_then(|cols| cols.get(*index).cloned()),
                                 }?;
                                 column_type(t, &col)
                             }),

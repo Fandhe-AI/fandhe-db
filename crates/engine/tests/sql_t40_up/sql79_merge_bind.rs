@@ -367,7 +367,16 @@ fn the_privilege_gate_runs_before_binding() {
         as_bob("MERGE INTO tx USING sy ON tx.nope = sy.k WHEN MATCHED THEN DELETE"),
         "42501"
     );
+    // 対象の SELECT だけを持ち元の SELECT を持たない主体には、元の列・型による束縛エラー
+    // （42703・42804・0A000）が見えない。元の表・ビュー・部分クエリのどれでも 42501 で止まる。
     operator("GRANT SELECT ON tx TO bob");
+    for sql in [
+        "MERGE INTO tx USING sy ON tx.k = sy.guess WHEN MATCHED THEN DO NOTHING",
+        "MERGE INTO tx USING sy ON tx.k = sy.k WHEN MATCHED THEN DO NOTHING",
+        "MERGE INTO tx USING (SELECT k FROM sy) AS q ON tx.k = q.guess WHEN MATCHED THEN DO NOTHING",
+    ] {
+        assert_eq!(as_bob(sql), "42501", "{sql}");
+    }
     operator("GRANT SELECT ON sy TO bob");
     operator("GRANT DELETE ON tx TO bob");
     assert_eq!(

@@ -646,7 +646,7 @@ fn bind_insert(
 
     let has_pseudo_id = schema.has_pseudo_id();
     let mut slots: Vec<MergeInsertSlot> = Vec::with_capacity(names.len());
-    for name in &names {
+    for (pos, name) in names.iter().enumerate() {
         ctx.check_target_visible(name)?;
         if has_pseudo_id && name == "id" {
             slots.push(MergeInsertSlot::Id);
@@ -661,7 +661,15 @@ fn bind_insert(
             .columns
             .get(idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
-        crate::sql::parser::reject_generated_always_value(column)?;
+        // 裸の `DEFAULT` は通常の INSERT と同じく列の省略と等価（GENERATED ALWAYS 列でも許される）ため、
+        // 利用者指定の値だけを 428C9 で拒否する。`DEFAULT` の補完は実行側（#3353 以降）が省略列と同じ経路で行う。
+        let is_bare_default = matches!(
+            value_list.get(pos),
+            Some(DmlFromSetValue::Value(SetValue::Default, _))
+        );
+        if !is_bare_default {
+            crate::sql::parser::reject_generated_always_value(column)?;
+        }
         slots.push(MergeInsertSlot::Column(idx));
     }
     let id_listed = slots.contains(&MergeInsertSlot::Id);
@@ -743,6 +751,9 @@ fn bind_insert(
                         )?;
                         out.joined_exprs.push((*idx, bound, cols));
                     }
+                    // 裸の `DEFAULT`: 束縛済みの値を持たない省略列として扱う（SET の `bind_set_default` 規則
+                    // = 時刻・IDENTITY・SEQUENCE の 0A000 には従わない）。
+                    DmlFromSetValue::Value(SetValue::Default, _) => {}
                     DmlFromSetValue::Value(v, _) => {
                         if is_dummy(flags, i, v) {
                             continue;

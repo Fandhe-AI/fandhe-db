@@ -62,12 +62,13 @@ fn clause_starts(tokens: &[Token]) -> Vec<usize> {
         .collect()
 }
 
-/// 最後の `WHEN` 句の終端（深さ 0 の `RETURNING`、または `USING OPERATION_ID` の `USING`。無ければ末尾）。
+/// 最後の `WHEN` 句の終端（深さ 0 の `RETURNING`、`USING OPERATION_ID` の `USING`、文末の `;`。無ければ末尾）。
 fn tail_start(tokens: &[Token], after: usize) -> usize {
     depth_zero_positions(tokens, after, tokens.len())
         .into_iter()
         .find(|&i| {
             ident_is(tokens.get(i), "RETURNING")
+                || matches!(tokens.get(i), Some(Token::Punct(';')))
                 || (ident_is(tokens.get(i), "USING")
                     && ident_is(tokens.get(i.saturating_add(1)), "OPERATION_ID"))
         })
@@ -369,6 +370,16 @@ mod tests {
     }
 
     const HEAD: &str = "MERGE INTO t USING s ON t.k = s.k";
+
+    #[test]
+    fn trailing_semicolon_ends_last_clause() {
+        for sql in [
+            format!("{HEAD} WHEN MATCHED THEN UPDATE SET x = $1;"),
+            format!("{HEAD} WHEN NOT MATCHED THEN INSERT (k, x) VALUES ($1, $2);"),
+        ] {
+            assert!(check(&sql).is_ok(), "{sql}");
+        }
+    }
 
     #[test]
     fn accepts_value_positions_only() {
