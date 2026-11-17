@@ -247,6 +247,15 @@ where
     // （`WHERE a AND (x = d.k OR ...)` の外側参照は最上位 WHERE の中）。
     let mut parens: Vec<bool> = Vec::new();
     let mut depth = 0usize;
+    // 投影の出力別名（`AS b`）。`ORDER BY b` の別名参照は物理列ではないため、RIGHT／FULL の
+    // 未知列判定（`42703`）から除外する。
+    let output_aliases: Vec<&str> = body
+        .windows(2)
+        .filter_map(|w| match w {
+            [Token::Ident(a), Token::Ident(n)] if a.eq_ignore_ascii_case("AS") => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
     for (i, tok) in body.iter().enumerate() {
         match tok {
             Token::Punct('(') => {
@@ -343,7 +352,12 @@ where
                 }
                 // RIGHT／FULL: どちらの側にも解決できない非修飾名は、後続の左側参照（`42P10`）より
                 // 先に `42703` で確定する（修飾名と同じテキスト順規則）。左側の列が不明なら従来どおり通す。
-                if hit.is_none() && reject_left_ref && all_known && !n.eq_ignore_ascii_case("id") {
+                if hit.is_none()
+                    && reject_left_ref
+                    && all_known
+                    && !n.eq_ignore_ascii_case("id")
+                    && !output_aliases.iter().any(|a| a.eq_ignore_ascii_case(n))
+                {
                     return Err(SqlSurfaceError::undefined_column(n.clone()));
                 }
                 if let Some((ridx, col)) = hit {
@@ -624,6 +638,17 @@ mod tests {
 
     fn d() -> TableRef {
         TableRef::with_alias("docs", "d")
+    }
+
+    #[test]
+    fn right_full_order_by_output_alias_is_not_an_unknown_column() {
+        let toks = tokenize("SELECT title AS b FROM docs x ORDER BY b LIMIT 1").expect("tokenize");
+        let left = [TableRef::with_alias("other", "o")];
+        // 出力別名 `b` は物理列ではないが、RIGHT／FULL（reject_left_ref）でも 42703 にしない。
+        bind_lateral_body(&toks, &left, &mut cols_of, true).expect("alias resolves");
+        let toks = tokenize("SELECT title FROM docs x ORDER BY b LIMIT 1").expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
