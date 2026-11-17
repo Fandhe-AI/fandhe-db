@@ -890,3 +890,68 @@ fn view_read_after_ddl_is_rejected() {
         "0A000"
     );
 }
+/// 行を持つ実体化ビューへの一意索引は、通常表と同じく走査 DDL のゲートで `0A000` にする
+/// （期限なしの全行走査で共有 writer を保持しない）。
+#[test]
+fn unique_index_on_a_populated_matview_is_rejected() {
+    let (core, _guard) = new_core("sql80-matview-unique");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(1, "a"))
+        .expect("seed");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE MATERIALIZED VIEW mv AS SELECT id, body FROM t",
+    )
+    .expect("matview");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    assert_eq!(
+        tx_code(
+            &core,
+            &mut session,
+            &mut txn,
+            "CREATE UNIQUE INDEX mv_u ON mv (id)"
+        ),
+        "0A000"
+    );
+}
+
+/// 何も変えない成功の DDL（`IF NOT EXISTS` の既存名・`IF EXISTS` の不在名）は、DDL を積んだ印を立てず、
+/// 後続の通常文（ビュー読み取りを含む）を拒否しない。
+#[test]
+fn noop_ddl_does_not_mark_the_transaction_as_having_ddl() {
+    let (core, _guard) = new_core("sql80-noop-mark");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE VIEW v AS SELECT id FROM t",
+    )
+    .expect("view");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE TABLE IF NOT EXISTS t (id BIGINT PRIMARY KEY, body TEXT)",
+    );
+    tx_ok(&core, &mut session, &mut txn, "DROP TABLE IF EXISTS ghost");
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "DROP INDEX IF EXISTS ghost_i",
+    );
+    tx_ok(&core, &mut session, &mut txn, &insert(1, "a"));
+    assert_eq!(
+        tx_rows(&core, &mut session, &mut txn, "SELECT id FROM v"),
+        1
+    );
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+}

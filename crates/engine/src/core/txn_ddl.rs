@@ -55,7 +55,12 @@ fn reject_scan_ddl_on_nonempty_table(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<(), SqlSurfaceError> {
-    if crate::catalog::table_has_rows_in_txn(write_txn, table).map_err(|_| internal())? {
+    let has_rows = crate::catalog::table_has_rows_in_txn(write_txn, table)
+        .map_err(|_| internal())?
+        // 実体化ビューの行は別の行表にあるため、そちらも見る（既存行の走査が期限なしで走るのを防ぐ）。
+        || crate::catalog::materialized::matview_has_rows_in_txn(write_txn, table)
+            .map_err(|_| internal())?;
+    if has_rows {
         return Err(SqlSurfaceError::transaction_feature_not_supported(
             "this DDL scans existing rows and is not supported on a non-empty table inside a transaction block yet",
         ));
@@ -249,13 +254,17 @@ impl EngineCore {
                     return Err(schema_scoped_ddl_unsupported());
                 }
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 // 永続表の FOREIGN KEY がこのセッションの一時表の名前に解決される場合は `42P16`
                 // （autocommit の腕と同じ。`IF NOT EXISTS` で同名が既にあるときは no-op 成功が先）。
                 let existing_noop = stmt.if_not_exists
                     && crate::catalog::relation_name_exists_in_txn(write_txn, &stmt.table_name)
                         .map_err(|_| internal())?;
+                // 既存名への `IF NOT EXISTS` は何も変えない成功のため、DDL を積んだ印を立てない。
+                if !existing_noop {
+                    txn.mark_ddl_started();
+                }
+                let write_txn = txn.write_txn().ok_or_else(internal)?;
                 if !existing_noop
                     && stmt
                         .foreign_keys
@@ -292,10 +301,14 @@ impl EngineCore {
                     return Err(schema_scoped_ddl_unsupported());
                 }
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_started();
+                let snap = txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 let (outcome, evict) =
                     crate::sql::ddl::execute_drop_table_in_txn(&self.storage, write_txn, stmt)?;
+                if outcome.skipped {
+                    // `IF EXISTS` で対象が無い no-op は印を巻き戻す。
+                    txn.restore_ddl_started(snap);
+                }
                 txn.mark_ddl_done(!outcome.skipped, evict);
                 Ok(SqlOutcome::DropTable(outcome))
             }
@@ -347,7 +360,6 @@ impl EngineCore {
                     return Err(schema_scoped_ddl_unsupported());
                 }
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 // 既存行を走査する形（一意・式・述語つき・GIN）だけが対象。列の宣言だけの索引は走査しない。
                 // 同名の relation が既にある場合は構築（走査）に入る前に結果が決まる（`IF NOT EXISTS` の
@@ -366,6 +378,11 @@ impl EngineCore {
                 {
                     reject_scan_ddl_on_nonempty_table(write_txn, stmt.table())?;
                 }
+                // 同名の relation があり `IF NOT EXISTS` なら何も変えない成功のため、印を立てない。
+                if !(name_taken && stmt.if_not_exists()) {
+                    txn.mark_ddl_started();
+                }
+                let write_txn = txn.write_txn().ok_or_else(internal)?;
                 let outcome = crate::sql::ddl::execute_create_index_in_txn(write_txn, stmt)?;
                 txn.mark_ddl_done(false, Vec::new());
                 Ok(SqlOutcome::CreateIndex(outcome))
@@ -376,9 +393,12 @@ impl EngineCore {
                     return Err(schema_scoped_ddl_unsupported());
                 }
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_started();
+                let snap = txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 let outcome = crate::sql::ddl::execute_drop_index_in_txn(write_txn, stmt)?;
+                if outcome.skipped() {
+                    txn.restore_ddl_started(snap);
+                }
                 txn.mark_ddl_done(!outcome.skipped(), Vec::new());
                 Ok(SqlOutcome::DropIndex(outcome))
             }

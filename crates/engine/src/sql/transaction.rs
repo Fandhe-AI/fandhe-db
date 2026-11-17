@@ -697,6 +697,13 @@ impl TempTxn {
     }
 }
 
+/// [`SessionTransaction::mark_ddl_started`] 直前の状態（no-op の DDL で巻き戻す用）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DdlMarkSnapshot {
+    has_writes: bool,
+    started: bool,
+}
+
 enum TxnState<'e> {
     Idle,
     Active(Box<ActiveTxn<'e>>),
@@ -2002,10 +2009,29 @@ impl<'e> SessionTransaction<'e> {
     /// 表・索引の DDL を共有 write txn へ積み始めることを記録する（SQL-80・Issue #3313）。writer を取った後、
     /// DDL 本体を実行する**前**に呼ぶ（本体が途中で失敗しても印を残し、部分的な DDL を持つ Tx を復帰させない）。
     /// `has_writes` も立てる（立てないと COMMIT が書き込み txn を破棄してカタログの書き込みが落ちる）。
-    pub(crate) fn mark_ddl_started(&mut self) {
+    ///
+    /// 戻り値は印を立てる前の状態（[`Self::restore_ddl_started`] へ渡す）。本体が「何も変えない成功」
+    /// （`IF EXISTS` / `IF NOT EXISTS` の no-op）だったときに印を巻き戻すために使う。
+    pub(crate) fn mark_ddl_started(&mut self) -> DdlMarkSnapshot {
         if let TxnState::Active(active) = &mut self.state {
+            let snap = DdlMarkSnapshot {
+                has_writes: active.has_writes,
+                started: active.ddl.started,
+            };
             active.has_writes = true;
             active.ddl.started = true;
+            snap
+        } else {
+            DdlMarkSnapshot::default()
+        }
+    }
+
+    /// [`Self::mark_ddl_started`] の印を巻き戻す。DDL 本体がカタログを変えずに成功した場合だけ呼ぶ
+    /// （no-op の DDL で後続文の拒否・savepoint の復元不能を起こさない。失敗時は巻き戻さない）。
+    pub(crate) fn restore_ddl_started(&mut self, snap: DdlMarkSnapshot) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.has_writes = snap.has_writes;
+            active.ddl.started = snap.started;
         }
     }
 

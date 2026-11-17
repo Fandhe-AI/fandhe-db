@@ -748,6 +748,22 @@ fn enforce_unique_rows(sets: &[Vec<usize>], rows: &[Vec<Value>]) -> Result<()> {
     Ok(())
 }
 
+/// 実体化ビューの行表に 1 行以上あるか（空判定のみ。走査しない）。明示 Tx 内の既存行走査 DDL を
+/// 拒否するゲート（`core/txn_ddl.rs`）が、通常表の行ストアに加えて呼ぶ。実体化ビューでなければ
+/// 行表が無いため `false`。
+pub(crate) fn matview_has_rows_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<bool> {
+    let table_name = matview_rows_table_name(name);
+    let rows_def: MatviewRowsDef = TableDefinition::new(&table_name);
+    match ReadSource::open_table(write_txn, rows_def) {
+        Ok(t) => Ok(t.iter()?.next().is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 既存の全文脈の実体のいずれかが、列位置 `set` の一意性に違反するか（`CREATE UNIQUE INDEX`
 /// 時の走査）。文脈ごとに独立して判定する（行表は文脈キー順に並ぶためキーが変わるたびに集合を
 /// リセットする）。文脈数・文脈ごとの行数は上限で頭打ちにし、超過は `CorruptSchema`。
