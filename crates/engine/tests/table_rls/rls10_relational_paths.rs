@@ -1231,7 +1231,7 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
         ("SELECT id, (SELECT title || 'x' FROM documents WHERE documents.author_id = authors.id) FROM authors LIMIT 5", "42601"), // Issue #3276: 連結は text として束縛できるが、相関サブクエリの式射影は未対応のまま（構文段で 42601）
         ("SELECT id, title FROM documents WHERE EXISTS (SELECT 1 FROM authors WHERE authors.id = nosuch.author_id) LIMIT 5", "42P01"),
         ("SELECT title FROM (SELECT title FROM documents) t WHERE lang IN (SELECT lang FROM langs) LIMIT 5", "42601"),
-        ("SELECT t.title FROM (SELECT title FROM documents) t, LATERAL (SELECT 1) x LIMIT 5", "0A000"),
+        ("SELECT t.title FROM (SELECT title FROM documents) t, LATERAL (SELECT 1) x LIMIT 5", "42601"), // Issue #3321: LATERAL を受理し、FROM なしの本文は非 LATERAL の `(SELECT 1) x` と同じ構文段の拒否
         ("SELECT nosuch FROM (SELECT title FROM documents) t LIMIT 5", "42703"),
         ("SELECT documents.title FROM (SELECT title FROM documents) t LIMIT 5", "42P01"),
     ];
