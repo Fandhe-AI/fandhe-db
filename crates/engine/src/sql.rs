@@ -189,7 +189,6 @@ pub mod declarative_predicate;
 pub(crate) mod derived_table;
 pub(crate) mod describe;
 pub mod dml_from;
-// MERGE の束縛（SQL-79・Issue #3352）。
 pub(crate) mod embedded_unit;
 pub(crate) mod function_scan;
 #[cfg(test)]
@@ -200,6 +199,7 @@ pub(crate) mod int8vec_knn;
 pub(crate) mod interval_arith;
 pub(crate) mod json_agg;
 pub(crate) mod matview;
+// MERGE の束縛（SQL-79・Issue #3352）。
 pub mod merge_bind;
 pub mod record_text;
 pub(crate) mod recursive_cte;
