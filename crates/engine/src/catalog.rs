@@ -2431,7 +2431,10 @@ fn foreign_keys_relying_on_unique_columns_in_txn(
 /// `name` が [`INDEX_CATALOG_TABLE`] に索引名として登録済みかを write txn 内で
 /// 判定する（relation 名前空間の衝突・種別判定用）。索引カタログ自体が未作成
 /// （宣言 0 件）の場合は `false`。
-fn index_name_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+pub(crate) fn index_name_exists_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<bool> {
     match write_txn.open_table_logged(INDEX_CATALOG_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
@@ -2463,7 +2466,7 @@ pub(crate) fn table_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str
 }
 
 /// `name` が [`VIEWS_TABLE`] にビューとして登録済みかを write txn 内で判定する。
-fn view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+pub(crate) fn view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
     match write_txn.open_table_logged(VIEWS_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
@@ -2475,7 +2478,10 @@ fn view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<
 /// write txn 内で判定する（TABLE-42 (2)、Issue #1663）。表・ビュー・索引と名前空間を共有する
 /// ため、`index_name_exists_in_txn` を呼ぶ DDL の衝突・種別判定には必ず併記する。
 /// 表が未作成なら `false` で、表を作らない。
-fn materialized_view_exists_in_txn(write_txn: &redb::WriteTransaction, name: &str) -> Result<bool> {
+pub(crate) fn materialized_view_exists_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> Result<bool> {
     match write_txn.open_table_logged(materialized::MATERIALIZED_VIEWS_TABLE) {
         Ok(t) => Ok(t.get(name)?.is_some()),
         Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),

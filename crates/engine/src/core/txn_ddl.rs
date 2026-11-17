@@ -48,7 +48,7 @@ fn schema_scoped_ddl_unsupported() -> SqlSurfaceError {
     )
 }
 
-/// 既存行の走査を伴う DDL（`CREATE INDEX`・`SET NOT NULL`）は、走査ループに Tx の残り時間
+/// 既存行の走査を伴う DDL（`CREATE INDEX`・`SET NOT NULL`・生成列の `ADD COLUMN`）は、走査ループに Tx の残り時間
 /// （`remaining_duration`）の期限が結線されていないため、対象表に行がある間は `0A000` にする
 /// （共有 writer を持続時間上限を越えて保持しない。fail-closed。受け皿は #3314）。
 fn reject_scan_ddl_on_nonempty_table(
@@ -68,7 +68,7 @@ fn reject_scan_ddl_on_nonempty_table(
     Ok(())
 }
 
-/// `ALTER TABLE` が実際に既存行を走査しうるか。`SET NOT NULL` のうち、対象列が現在すでに NOT NULL で、
+/// `ALTER TABLE` が実際に既存行を走査しうるか。生成列の `ADD COLUMN`（既存列への `IF NOT EXISTS` を除く）と、`SET NOT NULL` のうち、対象列が現在すでに NOT NULL で、
 /// かつ同じ文の他アクション（`DROP NOT NULL`・`DROP/ADD COLUMN`）が同列を変えないものは no-op のため走査しない。
 /// 表・列が見つからない場合は実行側がエラーで返す（走査前）ので、ここでは走査なし扱いにする。
 fn alter_needs_row_scan(
@@ -88,6 +88,17 @@ fn alter_needs_row_scan(
         other => vec![other],
     };
     actions.iter().any(|a| {
+        if let V::AddColumn(x) = a {
+            if x.generated.is_none() {
+                return false;
+            }
+            // `ADD COLUMN IF NOT EXISTS` で既存列がある no-op は走査しない（同じ文で先に外す場合は走査あり）。
+            let exists = schema.columns.iter().any(|c| c.name == x.column_name);
+            let dropped_in_stmt = actions
+                .iter()
+                .any(|o| matches!(o, V::DropColumn(d) if d.column_name == x.column_name));
+            return !(x.if_not_exists && exists && !dropped_in_stmt);
+        }
         let V::AlterColumnSetNotNull(s) = a else {
             return false;
         };
@@ -109,11 +120,13 @@ fn alter_needs_row_scan(
     })
 }
 
-/// `ALTER TABLE` のアクションに既存行を走査する `SET NOT NULL` が含まれるか。
+/// `ALTER TABLE` のアクションに既存行を走査する `SET NOT NULL`・生成列の `ADD COLUMN` が含まれるか。
 fn alter_scans_rows(stmt: &crate::sql::allowlist::ValidatedAlterTable) -> bool {
     use crate::sql::allowlist::ValidatedAlterTable as V;
     match stmt {
         V::AlterColumnSetNotNull(_) => true,
+        // 生成列の追加は全テナントの既存行を計算して書き直す（`backfill_generated_column_in_txn`）。
+        V::AddColumn(a) => a.generated.is_some(),
         V::Multiple(m) => m.actions.iter().any(alter_scans_rows),
         _ => false,
     }
@@ -142,7 +155,7 @@ pub(super) fn check_post_ddl_statement(
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_) => true,
-        ParsedSql::Insert(_) => !removed,
+        ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) => !removed,
         ParsedSql::Statement(stmt) => match stmt {
             Statement::SetSearchMode { .. }
             | Statement::SetTimeZone { .. }
@@ -260,21 +273,29 @@ impl EngineCore {
                 let existing_noop = stmt.if_not_exists
                     && crate::catalog::relation_name_exists_in_txn(write_txn, &stmt.table_name)
                         .map_err(|_| internal())?;
+                if !existing_noop {
+                    // 何も書かない拒否（`42P16`・SERIAL/IDENTITY の `0A000` 等）は、DDL を積んだ印を立てる前に
+                    // 返す（`ROLLBACK TO` で戻せるままにする）。
+                    if stmt
+                        .foreign_keys
+                        .iter()
+                        .any(|fk| session.temp_tables().contains(fk.parent_table()))
+                    {
+                        return Err(SqlSurfaceError::invalid_table_definition(
+                            stmt.table_name.clone(),
+                        ));
+                    }
+                    crate::sql::ddl::precheck_create_table_in_txn(
+                        &self.storage,
+                        stmt,
+                        &self.schema_limits,
+                    )?;
+                }
                 // 既存名への `IF NOT EXISTS` は何も変えない成功のため、DDL を積んだ印を立てない。
                 if !existing_noop {
                     txn.mark_ddl_started();
                 }
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                if !existing_noop
-                    && stmt
-                        .foreign_keys
-                        .iter()
-                        .any(|fk| session.temp_tables().contains(fk.parent_table()))
-                {
-                    return Err(SqlSurfaceError::invalid_table_definition(
-                        stmt.table_name.clone(),
-                    ));
-                }
                 let _owner_guard = self.arm_created_relation_owner(ctx, session, &stmt.table_name);
                 let outcome = crate::sql::ddl::execute_create_table_in_txn(
                     &self.storage,
@@ -324,12 +345,14 @@ impl EngineCore {
                     return Err(schema_scoped_ddl_unsupported());
                 }
                 txn.ensure_writer(ctx)?;
-                let snap = txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                // 既に NOT NULL の列への `SET NOT NULL` は走査しない no-op のため、ゲートの対象外にする。
+                // 既に NOT NULL の列への `SET NOT NULL`・既存列への `ADD COLUMN IF NOT EXISTS` は走査しない
+                // no-op のため、ゲートの対象外にする。何も書かない拒否は、DDL を積んだ印を立てる前に返す。
                 if alter_needs_row_scan(write_txn, table_name, stmt) {
                     reject_scan_ddl_on_nonempty_table(write_txn, table_name)?;
                 }
+                let snap = txn.mark_ddl_started();
+                let write_txn = txn.write_txn().ok_or_else(internal)?;
                 let (outcome, evict, changed) = crate::sql::ddl::execute_alter_table_in_txn(
                     &self.storage,
                     write_txn,

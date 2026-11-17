@@ -355,6 +355,24 @@ pub(crate) fn execute_create_table(
     Ok(CreateTableOutcome {})
 }
 
+/// `CREATE TABLE` の Tx 内実行の書き込み前検査（SERIAL・IDENTITY の `0A000` を含む）。何も書かないため、
+/// 呼び出し元は DDL を積んだ印（`mark_ddl_started`）を立てる前に呼び、拒否された Tx を `ROLLBACK TO` で
+/// 戻せるままにする（Issue #3313）。検査を通った表スキーマを返す。
+pub(crate) fn precheck_create_table_in_txn(
+    storage: &Storage,
+    validated: &ValidatedCreateTable,
+    limits: &SchemaLimits,
+) -> Result<TableSchema, SqlSurfaceError> {
+    crate::sql::schema_dependency::check_create_table(validated)?;
+    let schema = build_table_schema(Some(storage), validated, limits)?;
+    if !implicit_sequences_in_column_order(&schema, validated)?.is_empty() {
+        return Err(SqlSurfaceError::transaction_feature_not_supported(
+            "SERIAL and IDENTITY columns are not supported in CREATE TABLE inside a transaction block",
+        ));
+    }
+    Ok(schema)
+}
+
 /// `CREATE TABLE` を共有 write txn（明示・暗黙 Tx）の中で作る（SQL-80・Issue #3313）。判定順・検査・
 /// エラー写像は [`execute_create_table`] と同じで、名前の存在確認は write txn で確定する（同じ Tx の
 /// 前の文で作った表・DROP した表を確定済みカタログで見誤らない）。SERIAL 系・IDENTITY 列は暗黙 SEQUENCE の
@@ -375,13 +393,7 @@ pub(crate) fn execute_create_table_in_txn(
     {
         return Ok(CreateTableOutcome {});
     }
-    crate::sql::schema_dependency::check_create_table(validated)?;
-    let schema = build_table_schema(Some(storage), validated, limits)?;
-    if !implicit_sequences_in_column_order(&schema, validated)?.is_empty() {
-        return Err(SqlSurfaceError::transaction_feature_not_supported(
-            "SERIAL and IDENTITY columns are not supported in CREATE TABLE inside a transaction block",
-        ));
-    }
+    let schema = precheck_create_table_in_txn(storage, validated, limits)?;
     match Storage::create_table_in_shared_txn(write_txn, &schema) {
         Err(CatalogError::TableAlreadyExists(_)) if validated.if_not_exists => {
             Ok(CreateTableOutcome {})
@@ -1400,7 +1412,16 @@ fn run_alter_actions_in_txn(
 /// （呼び出し元が writer を取る前に `0A000` で拒否する。SQL-80・Issue #3313）。
 pub(crate) fn alter_table_in_txn_target(validated: &ValidatedAlterTable) -> Option<&str> {
     match validated {
-        ValidatedAlterTable::Multiple(stmt) => Some(stmt.table_name.as_str()),
+        // 複数アクションの各アクションにも単独 ALTER と同じ形式フィルタを適用する（DROP EXPRESSION 等を
+        // 複数アクションの中から Tx 内へ持ち込ませない）。入れ子の Multiple は構文段で作られないため拒否する。
+        ValidatedAlterTable::Multiple(stmt) => stmt
+            .actions
+            .iter()
+            .all(|a| {
+                !matches!(a, ValidatedAlterTable::Multiple(_))
+                    && alter_table_in_txn_target(a).is_some()
+            })
+            .then_some(stmt.table_name.as_str()),
         ValidatedAlterTable::AddColumn(stmt) => Some(stmt.table_name.as_str()),
         ValidatedAlterTable::DropColumn(stmt) => Some(stmt.table_name.as_str()),
         ValidatedAlterTable::AlterColumnSetNotNull(stmt) => Some(stmt.table_name.as_str()),
@@ -1438,7 +1459,7 @@ pub(crate) fn execute_alter_table_in_txn(
     match crate::catalog::get_table_schema_in_txn_impl(write_txn, table_name, false) {
         Ok(_) => {}
         Err(CatalogError::TableNotFound(_)) => {
-            return Err(undefined_table_or_view(storage, table_name));
+            return Err(undefined_table_or_view_in_txn(write_txn, table_name));
         }
         Err(other) => return Err(map_drop_alter_column_error(other)),
     }
@@ -1449,7 +1470,12 @@ pub(crate) fn execute_alter_table_in_txn(
             changed.set(applied.1);
             Ok(applied)
         })
-        .map_err(|e| map_alter_check_error(storage, table_name, e))?;
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view_in_txn(write_txn, table_name)
+            }
+            other => map_alter_check_error(storage, table_name, other),
+        })?;
     let done: Vec<AlterTableAction> = results.into_iter().flatten().collect();
     let action = match validated {
         ValidatedAlterTable::Multiple(_) => AlterTableAction::Multiple { actions: done },
@@ -2562,6 +2588,33 @@ fn undefined_table_or_view(storage: &Storage, name: &str) -> SqlSurfaceError {
         SqlSurfaceError::UndefinedTable {
             name: name.to_string(),
         }
+    }
+}
+
+/// [`undefined_table_or_view`] の共有 write txn 版（明示・暗黙 Tx 内の DDL 用。Issue #3313）。種別（ビュー・
+/// 索引・実体化ビュー）を write txn から読むため、同じ Tx で作った索引・DROP した索引が `42809`／`42P01` の
+/// 判定に反映される。読み出し失敗は「存在しない」と同一視せず `catalog::table_lookup_error` で写す（fail-closed）。
+fn undefined_table_or_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> SqlSurfaceError {
+    let wrong_kind = crate::catalog::view_exists_in_txn(write_txn, name).and_then(|v| {
+        if v {
+            return Ok(true);
+        }
+        if crate::catalog::index_name_exists_in_txn(write_txn, name)? {
+            return Ok(true);
+        }
+        crate::catalog::materialized_view_exists_in_txn(write_txn, name)
+    });
+    match wrong_kind {
+        Ok(true) => SqlSurfaceError::WrongObjectType {
+            name: name.to_string(),
+        },
+        Ok(false) => SqlSurfaceError::UndefinedTable {
+            name: name.to_string(),
+        },
+        Err(e) => crate::catalog::table_lookup_error(e),
     }
 }
 
