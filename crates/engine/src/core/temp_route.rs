@@ -233,7 +233,11 @@ pub(crate) fn is_search_path_exempt(parsed: &ParsedSql) -> bool {
             | ParsedSql::DropRole(_)
             | ParsedSql::AlterRole(_)
             | ParsedSql::SetRole(_)
-            | ParsedSql::Cursor(CursorStatement::Fetch { .. } | CursorStatement::Close { .. })
+            | ParsedSql::Cursor(
+                CursorStatement::Fetch { .. }
+                    | CursorStatement::Move { .. }
+                    | CursorStatement::Close { .. },
+            )
             | ParsedSql::Statement(
                 Statement::SetSearchMode { .. }
                     | Statement::SetTimeZone { .. }
