@@ -458,6 +458,13 @@ pub enum TenantWriteError {
         table: String,
         referencing_table: String,
     },
+    /// 生成列（`GENERATED ALWAYS AS (<式>) STORED`。TABLE-50・Issue #3327）を持つ表への行の書き込み。
+    /// 計算点が未結線の間（Issue #3328・#3329 が経路ごとに結線する）、黙って NULL を書かないよう
+    /// 単一の検査点（`constraint::enforce_row_constraints_in_txn`。RLS の `WITH CHECK` より前）が返し、
+    /// `write_txn` は commit されない（行・台帳・世代・採番とも痕跡ゼロ）。`0A000`
+    /// （`FeatureNotSupported`）へ写像する。`Display`／`Debug` は表名・テナント・値を含まない固定文言。
+    /// **BREAKING CHANGE**（Issue #3327）: variant を追加した（網羅的 `match` の下流は追随が必要）。
+    GeneratedColumnWriteUnsupported,
     /// `PRIMARY KEY`（Issue #903）・UNIQUE 制約（Issue #905。いずれも TABLE-16・
     /// TASK-204）を宣言したテーブルへの書き込みがテナント内一意性制約に違反した
     /// （`constraint::enforce_unique_keys_in_txn`）。
@@ -782,6 +789,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::TruncateReferencedByForeignKey { .. } => {
                 ErrorClass::FeatureNotSupported
             }
+            TenantWriteError::GeneratedColumnWriteUnsupported => ErrorClass::FeatureNotSupported,
             TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
             TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
             TenantWriteError::WithCheckOptionViolation => ErrorClass::WithCheckOptionViolation,
@@ -905,6 +913,11 @@ impl std::fmt::Display for TenantWriteError {
                 f,
                 "cannot truncate table {table:?}: referenced by foreign key of {referencing_table:?}"
             ),
+            // 固定文言（表名・テナント・値を含めない。TABLE-50・Issue #3327）。
+            TenantWriteError::GeneratedColumnWriteUnsupported => write!(
+                f,
+                "writes to tables with generated columns are not supported yet"
+            ),
             TenantWriteError::UniqueViolation => write!(f, "unique constraint violation"),
             // 制約名のみを含む固定文言（行の値・id・テナントは含めない。
             // security.md P0）。
@@ -994,6 +1007,9 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::TooManyRowsScanned { .. } => f.write_str("TooManyRowsScanned"),
             TenantWriteError::TruncateReferencedByForeignKey { .. } => {
                 f.write_str("TruncateReferencedByForeignKey")
+            }
+            TenantWriteError::GeneratedColumnWriteUnsupported => {
+                f.write_str("GeneratedColumnWriteUnsupported")
             }
             TenantWriteError::UniqueViolation => f.write_str("UniqueViolation"),
             TenantWriteError::CheckViolation { .. } => f.write_str("CheckViolation(<redacted>)"),

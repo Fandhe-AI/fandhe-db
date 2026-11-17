@@ -31,6 +31,7 @@ mod wire_explain;
 mod wire_extended_query;
 mod wire_fk_allocated_actions;
 mod wire_float_columns;
+mod wire_generated_column;
 mod wire_grant_revoke;
 mod wire_hint_order;
 mod wire_identity_column;

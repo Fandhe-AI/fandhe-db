@@ -109,6 +109,8 @@ pub(crate) fn derive_ctas_column_defs(
             default_expr: None,
             fill_value: None,
             collation: None,
+            // CTAS・マテリアライズドビューの列は通常の列（生成列は引き継がない。PG と同じ。TABLE-50）。
+            generated: None,
         });
     }
     if vector_count > 1 {
@@ -148,6 +150,7 @@ pub(crate) fn ctas_validated_create_table(
         primary_key_name: None,
         serial_columns: Vec::new(),
         identity_columns: Vec::new(),
+        generated_columns: Vec::new(),
         legacy_row_identity: false,
         public_qualified,
     }

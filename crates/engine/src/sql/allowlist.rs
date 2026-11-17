@@ -5729,6 +5729,19 @@ struct ColumnConstraints {
     /// 列制約 `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(<SEQUENCE オプション>)]`
     /// （TABLE-24・Issue #1695）。`CREATE TABLE` だけが受理し、`ALTER TABLE ADD COLUMN` は `0A000`。
     identity: Option<(crate::catalog::IdentityKind, SequenceOptions)>,
+    /// 列制約 `GENERATED ALWAYS AS (<式>) STORED`（生成列。TABLE-50・Issue #3327）の式。構文段で
+    /// 先読み検査・決定性検査まで済み。`CREATE TABLE` だけが受理し、`ALTER TABLE ADD COLUMN` は
+    /// `0A000`（Issue #3330 で対応）。
+    generated: Option<Expr>,
+}
+
+/// `GENERATED` 句の解析結果（IDENTITY と生成列。[`Parser::parse_generated_clause`]）。
+#[derive(Debug)]
+enum GeneratedClause {
+    /// `{ALWAYS | BY DEFAULT} AS IDENTITY [(<オプション>)]`（TABLE-24・Issue #1695）。
+    Identity((crate::catalog::IdentityKind, SequenceOptions)),
+    /// `ALWAYS AS (<式>) STORED`（TABLE-50・Issue #3327）。
+    Stored(Expr),
 }
 
 /// `CREATE TABLE` の列 1 個ぶんの構文解析結果（[`Parser::parse_create_table_column`]
@@ -5760,6 +5773,9 @@ struct ParsedCreateTableColumn {
     /// IDENTITY 列だった場合の種別と SEQUENCE オプション（TABLE-24・Issue #1695）。`column` は
     /// `NOT NULL`・`DEFAULT` なしで、`DEFAULT` は暗黙 SEQUENCE の名前が決まる書き込み txn 内で付く。
     identity: Option<(crate::catalog::IdentityKind, SequenceOptions)>,
+    /// 生成列だった場合の式（TABLE-50・Issue #3327）。`column` は `DEFAULT` なしで、式の束縛・
+    /// 正規描画は全列がそろった後の実行段（`sql::ddl::build_table_schema`）が行う。
+    generated: Option<Expr>,
 }
 
 /// `REFERENCES` 句（列制約・表制約の双方で共有。TABLE-17・TASK-205、
@@ -6416,6 +6432,13 @@ pub struct ValidatedCreateTable {
     ///
     /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは追随が必要）。
     pub identity_columns: Vec<IdentityColumn>,
+    /// 生成列 `GENERATED ALWAYS AS (<式>) STORED` の宣言（宣言順。TABLE-50・Issue #3327）。該当列は
+    /// `columns` で `DEFAULT` なしの通常の列として並び、式は構文段で先読み・決定性検査まで済み。
+    /// 実行段（`sql::ddl::build_table_schema`）が DDL 権限ゲートの後に全列がそろった定義へ束縛し、
+    /// 正規描画と参照列をカタログ v16 へ永続化する。
+    ///
+    /// BREAKING CHANGE: 公開フィールドの追加（構造体リテラルで生成する外部コードは追随が必要）。
+    pub generated_columns: Vec<GeneratedColumn>,
     /// 従来方式（暗黙の `id` 疑似列を持つ）の表として作るかどうか（TABLE-23・Issue #2199）。
     /// 既定の SQL 表層（[`validate_create_table_tokens`]）は `false` で、暗黙の `id` を持たない採番方式の
     /// 表を作る。NoSQL 表層の `create_table` だけが [`validate_create_table_tokens_with_implicit_id`] 経由で
@@ -6440,6 +6463,15 @@ pub struct IdentityColumn {
     /// 括弧内の SEQUENCE オプション（解釈済みの i64。範囲の意味検証〔22023〕は実行段が列型の
     /// 境界つきで行う）。
     pub options: SequenceOptions,
+}
+
+/// 生成列の宣言 1 件（[`ValidatedCreateTable::generated_columns`]。TABLE-50・Issue #3327）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedColumn {
+    /// 列名（`ValidatedCreateTable::columns` に存在する）。
+    pub column: String,
+    /// `AS (<式>)` の式（構文段で検査済みの構文木。正規描画は実行段が作る）。
+    pub expression: Expr,
 }
 
 /// SEQUENCE オプション列（`START`／`INCREMENT`／`MINVALUE`／`MAXVALUE`／`CYCLE`）の構文解析結果。
@@ -6488,6 +6520,38 @@ pub struct ValidatedCreateTempTable {
     pub table: ValidatedCreateTable,
     /// `ON COMMIT` の動作（省略時は [`TempOnCommit::PreserveRows`]）。
     pub on_commit: TempOnCommit,
+}
+
+/// 生成列を参照元に含む `FOREIGN KEY` の参照アクションの検査（TABLE-50・Issue #3327）。
+/// `ON UPDATE CASCADE／SET NULL／SET DEFAULT` と `ON DELETE SET NULL／SET DEFAULT` は参照元の生成列の値を
+/// 子表側から直接書き換えるため `42601`（固定文言。列名・表名を載せない）。`ON DELETE CASCADE` は
+/// 行ごと削除するだけなので許す。
+/// `CREATE TABLE`（本ファイルの構文段）と `ALTER TABLE ADD FOREIGN KEY`（`sql::ddl` の実行段が
+/// カタログの列定義から生成列名を引いて呼ぶ）が共有する。`generated` は生成列の列名集合。
+pub(crate) fn reject_generated_fk_referential_actions(
+    foreign_keys: &[crate::catalog::ForeignKeyDef],
+    generated: &[&str],
+) -> Result<(), SqlSurfaceError> {
+    use crate::catalog::ReferentialAction;
+    if generated.is_empty() {
+        return Ok(());
+    }
+    for fk in foreign_keys {
+        if !fk.columns().iter().any(|c| generated.contains(&c.as_str())) {
+            continue;
+        }
+        let bad_update = fk.on_update() != ReferentialAction::NoAction;
+        let bad_delete = matches!(
+            fk.on_delete(),
+            ReferentialAction::SetNull | ReferentialAction::SetDefault
+        );
+        if bad_update || bad_delete {
+            return Err(SqlSurfaceError::unsupported(
+                "invalid referential action for a foreign key on a generated column",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// [`Parser::parse_create_table`] が列リスト全体の構文判定を終えた後に呼ぶ、
@@ -16627,6 +16691,15 @@ impl<'a> Parser<'a> {
                             .to_string(),
                     });
                 }
+                // 生成列は既存行のバックフィル（全行の計算）が要るため未対応（fail-closed。
+                // TABLE-50・Issue #3330 が対応する）。
+                // tracked: #3330
+                if constraints.generated.is_some() {
+                    return Err(SqlSurfaceError::FeatureNotSupported {
+                        detail: "generated column is not supported in ALTER TABLE ADD COLUMN"
+                            .to_string(),
+                    });
+                }
                 // 時刻値関数の DEFAULT は既存行の補完値を固定できないため拒否する
                 // （fail-closed。設計 D10・SQL-37・Issue #1587）。
                 if constraints.time_default.is_some() {
@@ -17054,6 +17127,8 @@ impl<'a> Parser<'a> {
         let mut array_len_defaulted: Vec<String> = Vec::new();
         let mut serial_columns: Vec<SerialColumn> = Vec::new();
         let mut identity_columns: Vec<IdentityColumn> = Vec::new();
+        // 生成列の宣言（TABLE-50・Issue #3327）。列数の上限（`MAX_COLUMN_COUNT`）で件数が抑えられる。
+        let mut generated_columns: Vec<GeneratedColumn> = Vec::new();
         // `PRIMARY KEY` 宣言（列制約・表制約のいずれか一方のみ。TABLE-16・
         // TASK-204、Issue #903）。列名の存在検証・`id` 混在検査・nullable の
         // 強制は列リスト全体の構文判定を終えた後（このループを抜けた後）に
@@ -17242,6 +17317,12 @@ impl<'a> Parser<'a> {
                         options,
                     });
                 }
+                if let Some(expression) = parsed.generated {
+                    generated_columns.push(GeneratedColumn {
+                        column: parsed.column.name.clone(),
+                        expression,
+                    });
+                }
                 if parsed.array_len_defaulted {
                     array_len_defaulted.push(parsed.column.name.clone());
                 }
@@ -17293,6 +17374,21 @@ impl<'a> Parser<'a> {
             .collect();
         let unique_constraints = finalize_unique_constraints(unique_constraints, &columns)?;
         let foreign_keys = finalize_foreign_keys(foreign_keys, &columns)?;
+        // NoSQL 表層の表作成（従来方式の行識別）は生成列を持てない（TABLE-50 (5)・Issue #3327）。
+        // intentional: docs/design/generated-column.md
+        if self.legacy_implicit_id && !generated_columns.is_empty() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "generated columns are not supported on this table surface",
+            ));
+        }
+        // 生成列を参照元に含む FK の参照アクション（`ON UPDATE CASCADE／SET NULL／SET DEFAULT`・
+        // `ON DELETE SET NULL／SET DEFAULT`）は生成列の値を直接書き換えるため `42601`（PG17 に合わせる
+        // 想定。要確認: Issue #3332）。生成列の集合は文の内部で決まりカタログを引かない。
+        let generated_names: Vec<&str> = generated_columns
+            .iter()
+            .map(|g| g.column.as_str())
+            .collect();
+        reject_generated_fk_referential_actions(&foreign_keys, &generated_names)?;
         // 制約名前空間の重複判定（Issue #1428）。主キーの実効名は明示名、無ければ
         // 主キーが実在するときの導出名 `<table>_pkey`。構文エラー（文末の余剰
         // トークン）を優先するため、先に文末検証を済ませてから返す（42P16 と同じ）。
@@ -17325,6 +17421,7 @@ impl<'a> Parser<'a> {
             primary_key_name,
             serial_columns,
             identity_columns,
+            generated_columns,
             legacy_row_identity: self.legacy_implicit_id,
             public_qualified: false,
         })
@@ -17534,6 +17631,24 @@ impl<'a> Parser<'a> {
                 });
             }
         }
+        // 生成列（TABLE-50・Issue #3327）。`DEFAULT`（`DEFAULT NULL` を含む）・SERIAL 型との併記は
+        // `42601`（SERIAL は暗黙の DEFAULT を持つため。宣言の順は問わない）、ベクトル系の型は `0A000`。
+        // IDENTITY との併記は `GENERATED` 句の重複として `parse_column_constraints` が拒否済み。
+        // いずれも構文段（カタログ非参照）で判定するため存在オラクルにならない。
+        let generated = constraints.generated.clone();
+        if generated.is_some() {
+            if constraints.default_declared || serial.is_some() {
+                return Err(SqlSurfaceError::unsupported(format!(
+                    "both default and generation expression specified for column {name:?}"
+                )));
+            }
+            // intentional: docs/design/generated-column.md
+            if ty.is_vector_family() {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "generated columns of a vector type are not supported",
+                ));
+            }
+        }
         let unique = constraints.unique;
         let unique_name = constraints.unique_name.clone();
         let column = if let ColumnType::Vector(_) = ty {
@@ -17656,6 +17771,7 @@ impl<'a> Parser<'a> {
             array_len_defaulted,
             serial,
             identity,
+            generated,
         })
     }
 
@@ -18019,17 +18135,22 @@ impl<'a> Parser<'a> {
         let mut unique_name: Option<String> = None;
         let mut collation: Option<crate::collation::Collation> = None;
         let mut identity: Option<(crate::catalog::IdentityKind, SequenceOptions)> = None;
+        let mut generated: Option<Expr> = None;
         loop {
             // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(<オプション>)]`（TABLE-24・
-            // Issue #1695）。生成列 `GENERATED ALWAYS AS (<式>) STORED` は未対応で `0A000`。
+            // Issue #1695）と生成列 `GENERATED ALWAYS AS (<式>) STORED`（TABLE-50・Issue #3327）。
+            // `GENERATED` 句は IDENTITY・生成列を合わせて 1 列に 1 つまで（重複は `42601`）。
             if self.peek_ident_matches("GENERATED") {
                 self.advance();
-                if identity.is_some() {
+                if identity.is_some() || generated.is_some() {
                     return Err(SqlSurfaceError::unsupported(
-                        "multiple identity specifications for a column",
+                        "multiple identity or generation specifications for a column",
                     ));
                 }
-                identity = Some(self.parse_identity_clause()?);
+                match self.parse_generated_clause()? {
+                    GeneratedClause::Identity(i) => identity = Some(i),
+                    GeneratedClause::Stored(e) => generated = Some(e),
+                }
                 continue;
             }
             // `COLLATE <name>`（TABLE-28。Issue #1609）。順序自由・1 回まで。
@@ -18112,16 +18233,16 @@ impl<'a> Parser<'a> {
             collation,
             default_declared: seen_default,
             identity,
+            generated,
         })
     }
 
-    /// `GENERATED` 直後から IDENTITY 句の残り（`{ALWAYS | BY DEFAULT} AS IDENTITY [(<オプション>)]`）
-    /// を読む（TABLE-24・Issue #1695）。`GENERATED ALWAYS AS (<式>) STORED`（生成列）は黙って受理せず
-    /// `0A000`。IDENTITY オプションのうち `AS`／`CACHE`／`OWNED BY`／`SEQUENCE NAME`／`RESTART` は
-    /// `CREATE SEQUENCE` と同じく `0A000`（fail-closed）。
-    fn parse_identity_clause(
-        &mut self,
-    ) -> Result<(crate::catalog::IdentityKind, SequenceOptions), SqlSurfaceError> {
+    /// `GENERATED` 直後から句の残りを読む。IDENTITY（`{ALWAYS | BY DEFAULT} AS IDENTITY
+    /// [(<オプション>)]`。TABLE-24・Issue #1695）と生成列（`ALWAYS AS (<式>) STORED`。TABLE-50・
+    /// Issue #3327）を `AS` の直後のトークンで分ける。IDENTITY オプションのうち `AS`／`CACHE`／
+    /// `OWNED BY`／`SEQUENCE NAME`／`RESTART` は `CREATE SEQUENCE` と同じく `0A000`（fail-closed）。
+    /// 生成列は `BY DEFAULT`・`STORED` の欠落・`VIRTUAL` を `42601` で拒否する。
+    fn parse_generated_clause(&mut self) -> Result<GeneratedClause, SqlSurfaceError> {
         use crate::catalog::IdentityKind;
         let kind = if self.peek_ident_matches("ALWAYS") {
             self.advance();
@@ -18139,9 +18260,12 @@ impl<'a> Parser<'a> {
         };
         self.expect_contextual_keyword("AS")?;
         if matches!(self.peek(), Some(Token::Punct('('))) {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "generated columns are not supported",
-            ));
+            if kind != IdentityKind::Always {
+                return Err(SqlSurfaceError::unsupported(
+                    "generated columns must be declared GENERATED ALWAYS",
+                ));
+            }
+            return Ok(GeneratedClause::Stored(self.parse_generated_stored_expr()?));
         }
         self.expect_contextual_keyword("IDENTITY")?;
         let mut options = SequenceOptions::default();
@@ -18150,7 +18274,38 @@ impl<'a> Parser<'a> {
             self.parse_sequence_option_list(&mut options, true, "identity column")?;
             self.expect_punct(')')?;
         }
-        Ok((kind, options))
+        Ok(GeneratedClause::Identity((kind, options)))
+    }
+
+    /// 生成列の `(<式>) STORED`（`AS` の直後の `(` から）を読む（TABLE-50・Issue #3327）。式の解析より前に
+    /// トークン区間を先読み検査し（部分クエリ・集計・ウィンドウ・SRF は `42P17`）、式はノード予算と
+    /// 深さ上限の内側（`parse_bounded_value_expr`）で解析し、決定性・組み込み関数のみの検査まで構文段で
+    /// 行う（カタログ非参照。存在オラクルにならない）。`STORED` の欠落・`VIRTUAL` は `42601`。
+    fn parse_generated_stored_expr(&mut self) -> Result<Expr, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let end = crate::sql::index_expr::element_end(&self.tokens, self.pos);
+        let element = self.tokens.get(self.pos..end).unwrap_or(&[]);
+        crate::sql::generated_column::precheck_tokens(element)?;
+        if matches!(self.peek(), Some(Token::Punct(')'))) {
+            return Err(SqlSurfaceError::unsupported(
+                "generation expression must not be empty",
+            ));
+        }
+        // 裸の `TRUE`／`FALSE`／`NULL` を列参照ではなくリテラルとして解析する（`ALTER COLUMN TYPE ... USING`
+        // と同じ文脈。定数の生成式を宣言できるようにする）。
+        let prev = std::mem::replace(&mut self.using_keyword_literals, true);
+        let parsed = self.parse_bounded_value_expr();
+        self.using_keyword_literals = prev;
+        let expr = parsed?;
+        self.expect_punct(')')?;
+        if !self.peek_ident_matches("STORED") {
+            return Err(SqlSurfaceError::unsupported(
+                "generated columns must be declared STORED",
+            ));
+        }
+        self.advance();
+        crate::sql::generated_column::check_expression_syntax(&expr)?;
+        Ok(expr)
     }
 
     /// `COLLATE` 直後の照合名を読み、許可リスト（[`crate::collation::Collation`]）で解決する
@@ -21637,6 +21792,18 @@ fn reject_unimplemented_expression_keys(
 pub(crate) fn parse_index_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
     let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
+    let expr = p.parse_bounded_value_expr()?;
+    p.expect_end_of_statement()?;
+    Ok(expr)
+}
+
+/// 生成列の保存式テキストを再解析する経路（宣言時の往復一致検証と再読込が共有する）。
+/// 構文段（[`Parser::parse_generated_stored_expr`]）と同じく `TRUE`／`FALSE`／`NULL` をリテラルとして
+/// 解析し、それ以外は [`parse_index_expression_text`] と同じ（ノード予算・余剰トークンは `42601`）。
+pub(crate) fn parse_generated_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
+    let tokens = lexer::tokenize_marked(sql)?;
+    let mut p = Parser::new(&tokens);
+    p.using_keyword_literals = true;
     let expr = p.parse_bounded_value_expr()?;
     p.expect_end_of_statement()?;
     Ok(expr)
@@ -44043,9 +44210,18 @@ mod tests {
                 "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS IDENTITY (CACHE 5))",
                 "0A000",
             ),
+            // 生成列（TABLE-50・Issue #3327）の構文違反。`BY DEFAULT`・`STORED` の欠落・`VIRTUAL` は `42601`。
             (
-                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS (1) STORED)",
-                "0A000",
+                "CREATE TABLE t (a INTEGER GENERATED BY DEFAULT AS (1) STORED)",
+                "42601",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS (1))",
+                "42601",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER GENERATED ALWAYS AS (1) VIRTUAL)",
+                "42601",
             ),
         ] {
             let tokens = crate::sql::lexer::tokenize(sql).expect("tokenize");

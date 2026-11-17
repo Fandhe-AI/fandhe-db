@@ -706,6 +706,14 @@ fn enforce_row_constraints_impl(
     fk_mode: FkCheckMode,
     policy: RowPolicyWrite<'_>,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
+    // 生成列（TABLE-50・Issue #3327）を持つ表への書き込みは、計算点が結線されるまで（Issue #3328・
+    // #3329 が経路ごとに外す）固定文言の `0A000` で拒否する。黙って NULL を書かない fail-closed。
+    // 追加の拒否にしか働かないため RLS の `WITH CHECK` より前に置いても境界は緩まない。公開ラッパーと
+    // FK の参照アクションの連鎖（`propagate_referential_actions`）の双方がこの関数を通る。
+    // `written_ids` が空でも止める（行の無い書き込み文でも一貫した拒否にする）。
+    if schema.columns.iter().any(|c| c.generated.is_some()) {
+        return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+    }
     // ビューの `WITH CHECK OPTION` は、ユーザーが直接書いた行にだけ掛ける（内部の連鎖書き込みには掛けない）。
     let view_checks = !matches!(policy, RowPolicyWrite::Internal);
     // 利用者定義ポリシーの `WITH CHECK`（RLS-13・Issue #2277）。PostgreSQL の RLS の WCO は
