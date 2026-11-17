@@ -363,7 +363,44 @@ G8 の方針（fast default を使わず全行を計算して書き直す）を�
 ### 対象外（受け皿）
 
 - COPY・NoSQL・ビュー・トリガ・FK 参照アクション・生の RowInput の結線: #3329
-- 台帳・crash・越境・PG17 実機との突き合わせ（複数アクションでの前方参照の分類、SERIAL と GENERATED の併記の分類、NOT NULL 生成列の ADD の分類を含む）: #3332
+- 台帳・crash・越境: #3332 で確定（上記）。PG17 実機との突き合わせ（複数アクションでの前方参照の分類、SERIAL と GENERATED の併記の分類、NOT NULL 生成列の ADD の分類を含む）は #3332 では未実施（同節の対象外を参照）
 - MERGE: #3355
 - 生成列自身の `ALTER COLUMN TYPE`・`SET EXPRESSION` の受理（全行の書き直しの部品は本 Issue でできる）: 本 Issue では対応しない（`0A000` のまま）。理由: 受け皿の Issue 起票にユーザー承認が要り、自動運転では得られないため。承認後に起票して番号を追記する。
 - 一時表・式で代入できない列型（NUMERIC 等）の生成列: 本 Issue では対応しない（`0A000` のまま）。理由: 式の評価器が対応した型から段階的に広げる方針で、受け皿の Issue 起票にユーザー承認が要るため。承認後に起票して番号を追記する。
+
+## Issue #3332 で確定した事項（台帳の内容照合・crash 耐性・越境。TABLE-50 (5)・RECOVER-11・TABLE-24 (3)・TASK-345）
+
+本 Issue は監査テストの追加で、production のコードは変えていない（台帳の契約・ハッシュの材料の選別は #3328 のまま）。
+
+### 台帳マトリクスの結果
+
+`engine/tests/table_rls/table50_generated_column_ledger.rs` で、INSERT（単一行・複数行・`INSERT ... SELECT`・`RETURNING`）・
+UPDATE（id 指定の述語形・複数行述語・`UPDATE ... FROM`・分割実行）・UPSERT（`DO NOTHING`・`DO UPDATE`）・COPY FROM・ビュー経由の
+各経路で、同じ文の再送が `23505`、内容違いが `22023` で、どちらも行・生成列の値を変えないことを固定した。
+
+- 省略形と `DEFAULT` 形（INSERT の列リスト・UPDATE の `SET g = DEFAULT`）は同じ内容として扱われる。
+- UPSERT の `DO UPDATE SET g = DEFAULT` は構文段で `42601` のため、内容照合の材料にそもそも入らない（UPDATE と異なり外す処理は不要）。
+- 照合は計算より前に行われる。再送は生成列を再計算しないので、後から参照列に `22012` になる式の生成列を足した表でも、
+  同じ文の再送は `23505`、評価で失敗する内容へ変えた再送は `22023` になる。
+- スキーマ変更（`ADD COLUMN ... GENERATED`・`DROP EXPRESSION`）や参照列の UPDATE を挟んだ再送も `23505` で行を変えない。
+- 計算の失敗（`22012`）で失敗した文は台帳を残さず、同じ `operation_id` で直した文は新規として通る。
+
+### 3 テナントの越境
+
+台帳キーはテナントを含み、3 テナントが同じ `operation_id` で別内容を書いても互いに成功し、他テナントの内容の再送は自分の台帳に対する
+`22023` になる（文言に他テナントの識別子を含まない）。述語形 UPDATE・UPSERT は他テナントの行と生成列の値を変えない。
+生成列の UNIQUE は通常の列と同じ振る舞いで、同じ生成値が別テナントにあっても衝突しない。`ADD COLUMN ... GENERATED` の評価エラーは
+他テナントの行が原因でも文言に識別子・値を含めない。
+
+### wire・crash
+
+- wire: `wire_generated_column.rs` で psql 形（末尾 `;`）の INSERT・UPDATE・UPSERT の再送と内容違いを `ErrorResponse` の SQLSTATE で固定した。
+- crash: `crash_tool_sequence` に `*-generated` の段を追加し（`scripts/crash_test_sequence.sh`）、SIGKILL 後に行・生成列・台帳が全か無かで
+  残ること、commit 済みの文の再送が `23505`、内容違いが `22023`、第 2 テナントの不変を検証する。
+
+### 対象外（受け皿）
+
+- PostgreSQL 17 実機との突き合わせ（式の分類・FK 参照アクション・COPY TO の列の並び等。#3328〜#3331 が「要確認: #3332」とした項目の
+  実測固定）: 本 Issue では未実施（実機採取が自動運転の範囲外）。該当コメントは未解決のまま残し、受け皿の起票はユーザー承認が要るため承認後に番号を追記する。
+- NoSQL 経由の台帳再送の試験の追加: 同上（既存の NoSQL の台帳の契約は #3329 で結線済み）。
+- MERGE: #3355

@@ -391,3 +391,49 @@ fn psql_shaped_add_generated_column_backfills_existing_rows() {
     assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
     read_ready_for_query(&mut stream);
 }
+/// 台帳の内容照合（Issue #3332。TABLE-50 (5)・RECOVER-11）を psql 形で確かめる。同じ文の再送は `23505`、
+/// 省略形と `DEFAULT` 形の入れ替えも `23505`、内容違いは `22023` で、どれも `ReadyForQuery` へ戻り行を変えない。
+#[test]
+fn psql_shaped_ledger_resend_and_content_mismatch() {
+    let (mut stream, _guard) = connect();
+    exec(
+        &mut stream,
+        "CREATE TABLE g (k INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+    );
+    let insert = "INSERT INTO g (k, a) VALUES (1, 5) USING OPERATION_ID 'wire-led-1';";
+    assert_eq!(exec(&mut stream, insert), "INSERT 0 1");
+    let update = "UPDATE g SET a = 6 WHERE k = 1 USING OPERATION_ID 'wire-led-2';";
+    assert_eq!(exec(&mut stream, update), "UPDATE 1");
+    let upsert = "INSERT INTO g (k, a) VALUES (1, 9) ON CONFLICT (k) DO UPDATE SET a = EXCLUDED.a USING OPERATION_ID 'wire-led-3';";
+    assert_eq!(exec(&mut stream, upsert), "INSERT 0 1");
+
+    for (sql, sqlstate) in [
+        (insert, "23505"),
+        (
+            "INSERT INTO g (k, a, b) VALUES (1, 5, DEFAULT) USING OPERATION_ID 'wire-led-1';",
+            "23505",
+        ),
+        (
+            "INSERT INTO g (k, a) VALUES (1, 6) USING OPERATION_ID 'wire-led-1';",
+            "22023",
+        ),
+        (update, "23505"),
+        (
+            "UPDATE g SET a = 7 WHERE k = 1 USING OPERATION_ID 'wire-led-2';",
+            "22023",
+        ),
+        (upsert, "23505"),
+        (
+            "INSERT INTO g (k, a) VALUES (1, 10) ON CONFLICT (k) DO UPDATE SET a = EXCLUDED.a USING OPERATION_ID 'wire-led-3';",
+            "22023",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, sqlstate);
+        read_ready_for_query(&mut stream);
+    }
+    assert_eq!(
+        select_rows(&mut stream, "SELECT a, b FROM g;", 1),
+        cells(&[&["9", "18"]])
+    );
+}

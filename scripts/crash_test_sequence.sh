@@ -27,6 +27,10 @@
 # SIGKILL し、巻き戻した書き込みが再起動後に見えず、commit 済みの Tx が欠けないことを検証する）。
 # 加えて、`ROLLBACK TO` 直後・`RELEASE` 直後・COMMIT 直後の 3 点で決定的に SIGKILL する段
 # （`write-savepoint-pause`）を持つ。新しい CI ジョブは作らない。
+# Issue #3332（TABLE-50 (5)・RECOVER-11 のポインタ）の生成列の段も同じ構成で続ける（`*-generated`
+# サブコマンド。生成列つきの表への単一行・複数行・`DEFAULT` 形・明示 Tx の INSERT と述語形 UPDATE を書く
+# プロセスを SIGKILL し、行・生成列の値・台帳の全か無か、再送の `23505`・内容違いの `22023` を検証する。
+# 新しい CI ジョブは作らない）。
 # Makefile の crash-test-sequence ターゲット・CI の crash-test-sequence ジョブから呼ばれる。
 #
 # 使い方: scripts/crash_test_sequence.sh [セット数（既定 2）] [反復回数（既定 10）]
@@ -338,6 +342,7 @@ run_mode identity write-identity verify-identity finish-identity self-check-iden
 run_mode do write-do verify-do finish-do self-check-do
 run_mode trigger write-trigger verify-trigger finish-trigger self-check-trigger
 run_mode savepoint write-savepoint verify-savepoint finish-savepoint self-check-savepoint
+run_mode generated write-generated verify-generated finish-generated self-check-generated
 run_savepoint_pause
 
 if [ "${completed}" -ne "${total_iterations}" ]; then
