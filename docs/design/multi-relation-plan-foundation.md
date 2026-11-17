@@ -78,6 +78,7 @@ spec に数値基準は無く、後続の JOIN 実装（#925 以降）が要求�
 公開名重複は新規分類を増やさず、既存の `UnsupportedSyntax`（`42601`）へ
 fail-closed に倒す（PostgreSQL の `42712` は採用しない。ERR-6 ポインタ）。JOIN 開放時に
 必要になれば #925 で再検討する。
+（Issue #3297 追記: 結合 DML の `UPDATE ... FROM`／`DELETE ... USING` の公開名重複だけは `42712` を使う。SELECT の JOIN・派生表は本 ADR のとおり `42601` のまま。[update-from-delete-using.md](update-from-delete-using.md) 参照）
 
 ### `TableGenerationKey` / `GenerationKeyedCache<V>`
 

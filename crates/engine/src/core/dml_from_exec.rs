@@ -112,6 +112,60 @@ impl EngineCore {
             .map(|(plan, _read_txn)| plan)
     }
 
+    /// Describe（拡張クエリの Parse 時のダミー値の計画を含む）用の [`Self::plan_update_from_stmt`]。
+    /// `conjunct_dummy` は WHERE の連言分ごとの「`$n` 由来のダミー値か」（Issue #3297）。
+    pub(super) fn plan_update_from_stmt_for_describe(
+        &self,
+        stmt: &ValidatedUpdateFrom,
+        udfs: &UdfRegistry,
+        conjunct_dummy: &[bool],
+    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+        let (_read_txn, target, others) =
+            self.dml_from_schemas(stmt.target_table(), &stmt.from, &stmt.sources)?;
+        let refs: Vec<&TableSchema> = others.iter().collect();
+        // Describe 用フラグの並びは「SET の代入ごと ++ WHERE の連言分ごと」（`joined_dml_dummy_flags`）。
+        // 代入数に満たなければ全て検証側へ倒す。
+        let n_set = stmt.assignments.len();
+        let (set_dummy, where_dummy) = if conjunct_dummy.len() >= n_set {
+            conjunct_dummy.split_at(n_set)
+        } else {
+            (&[][..], &[][..])
+        };
+        let bound =
+            crate::sql::dml_from::bind_update_from_describe(stmt, &target, &refs, udfs, set_dummy)?;
+        let (mut plan, source_dummy) = crate::sql::join::dml_plan::plan_update_from_describe(
+            &bound,
+            &target,
+            &refs,
+            udfs,
+            where_dummy,
+        )?;
+        apply_view_source(&mut plan, &stmt.sources, udfs, &source_dummy)?;
+        Ok(plan)
+    }
+
+    /// [`Self::plan_delete_using_stmt`] の Describe 用版（Issue #3297。上と同じ契約）。
+    pub(super) fn plan_delete_using_stmt_for_describe(
+        &self,
+        stmt: &ValidatedDeleteUsing,
+        udfs: &UdfRegistry,
+        conjunct_dummy: &[bool],
+    ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+        let (_read_txn, target, others) =
+            self.dml_from_schemas(stmt.target_table(), &stmt.using, &stmt.sources)?;
+        let refs: Vec<&TableSchema> = others.iter().collect();
+        let bound = crate::sql::dml_from::bind_delete_using_with_udfs(stmt, &target, &refs, udfs)?;
+        let (mut plan, source_dummy) = crate::sql::join::dml_plan::plan_delete_using_describe(
+            &bound,
+            &target,
+            &refs,
+            udfs,
+            conjunct_dummy,
+        )?;
+        apply_view_source(&mut plan, &stmt.sources, udfs, &source_dummy)?;
+        Ok(plan)
+    }
+
     /// [`Self::plan_update_from_stmt`] が使った読み取りトランザクションも返す版
     /// （`EXPLAIN UPDATE ... FROM` が GIN 宣言を同じスナップショットで読む。Issue #3293）。
     pub(super) fn plan_update_from_stmt_with_txn(
@@ -124,7 +178,7 @@ impl EngineCore {
         let refs: Vec<&TableSchema> = others.iter().collect();
         let bound = crate::sql::dml_from::bind_update_from_with_udfs(stmt, &target, &refs, udfs)?;
         let mut plan = crate::sql::join::dml_plan::plan_update_from(&bound, &target, &refs, udfs)?;
-        apply_view_source(&mut plan, &stmt.sources, udfs)?;
+        apply_view_source(&mut plan, &stmt.sources, udfs, &[])?;
         Ok((plan, read_txn))
     }
 
@@ -149,7 +203,7 @@ impl EngineCore {
         let refs: Vec<&TableSchema> = others.iter().collect();
         let bound = crate::sql::dml_from::bind_delete_using_with_udfs(stmt, &target, &refs, udfs)?;
         let mut plan = crate::sql::join::dml_plan::plan_delete_using(&bound, &target, &refs, udfs)?;
-        apply_view_source(&mut plan, &stmt.sources, udfs)?;
+        apply_view_source(&mut plan, &stmt.sources, udfs, &[])?;
         Ok((plan, read_txn))
     }
 
@@ -301,10 +355,14 @@ fn apply_view_source(
     plan: &mut JoinedDmlPlan,
     sources: &[DmlFromSource],
     udfs: &UdfRegistry,
+    source_dummy: &[bool],
 ) -> Result<(), SqlSurfaceError> {
     let Some(DmlFromSource::View(view)) = sources.first() else {
         return Ok(());
     };
+    // Describe では `$n` 由来のダミー値の葉の値検証を省く（実行・Bind は空で全て検証。Issue #3297）。
+    let dummy =
+        crate::sql::join::dml_plan::view_prefixed_dummy(&view.view_predicates, source_dummy);
     let mut preds = view.view_predicates.clone();
     preds.append(&mut plan.source.where_predicates);
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
@@ -313,7 +371,7 @@ fn apply_view_source(
         &plan.source.schema,
         udfs,
         &mut node_budget,
-        &[],
+        &dummy,
     )?;
     plan.source.table = view.base_table.clone();
     plan.source.where_predicates = preds;

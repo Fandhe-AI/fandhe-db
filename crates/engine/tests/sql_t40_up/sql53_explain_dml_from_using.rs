@@ -456,11 +456,14 @@ fn unsupported_forms_stay_fail_closed() {
         ),
         "42601"
     );
-    // `$n` は EXPLAIN 前置でも Parse で拒否（受理は別 Issue）。
+    // `$n`（Issue #3297）: 素の EXPLAIN の WHERE の `$n` は受理し、SET の `$n` は単一表の
+    // EXPLAIN UPDATE と同じく `42601`。ANALYZE・オプション前置の `$n` は既存規則（#2054・#2058）で `42601`。
+    core.parse_sql_prepared("EXPLAIN UPDATE a SET v = 'z' FROM pt WHERE a.k = pt.k AND pt.w = $1")
+        .expect("where param is accepted");
     for sql in [
-        "EXPLAIN UPDATE a SET v = 'z' FROM pt WHERE a.k = pt.k AND pt.w = $1",
         "EXPLAIN ANALYZE DELETE FROM a USING pt WHERE a.k = pt.k AND pt.w = $1",
         "EXPLAIN (ANALYZE) UPDATE a SET v = $1 FROM pt WHERE a.k = pt.k",
+        "EXPLAIN UPDATE a SET v = $1 FROM pt WHERE a.k = pt.k",
     ] {
         let err = core.parse_sql_prepared(sql).expect_err(sql);
         assert_eq!(err.wire_code(), "42601", "{sql}");

@@ -34,9 +34,9 @@ DELETE FROM <表> [[AS] <別名>] USING <from_list> [WHERE <join_where>]
   - 列参照 1 個（`DmlFromSetValue::Column`）: 修飾あり・なしとも FROM 側の列を指せる。直後が句境界（`,`・`FROM`・`WHERE`・`USING`・`RETURNING`・文末）のときだけ
   - 列参照を含む式（`DmlFromSetValue::Expr`。Issue #3296）: 式中の列参照は修飾の有無によらずプレースホルダへ置き換えて参照ごとに運び、FROM 側の列も参照できる
   - それ以外（`DmlFromSetValue::Value`）: リテラル・`DEFAULT`・列参照を含まない式（既存の `SetValue`）
-- 参照数（対象表を含む）は `MAX_TABLE_REFS` で積む前に検査する（超過は `54000`）。公開名の重複は `42601`（`BindingScope::new` と同じ契約）。別名で公開名を分ければ自己結合は受理する
+- 参照数（対象表を含む）は `MAX_TABLE_REFS` で積む前に検査する（超過は `54000`）。公開名の重複は `42712`（Issue #3297。PG の `duplicate_alias`。SELECT の JOIN が使う `BindingScope::new` は `42601` のまま）。別名で公開名を分ければ自己結合は受理する
 - 派生表・関数呼び出しは `42601`。`JOIN ... USING (...)`・`NATURAL JOIN`・カンマの後の `CROSS JOIN` 以外の明示 JOIN は `0A000`（意図的な拒否。下記「多方向結合」節）
-- `PARTITIONED` 併用は `42601`、`RETURNING` は `*`・`<公開名>.*`・列参照を受理する（#3204。式・関数・`AS` 別名は `42601`。束縛・実行は [sql-returning.md](sql-returning.md) の「結線」節）、`$n` は拡張クエリの Parse 段で `42601`
+- `PARTITIONED` 併用は `42601`、`RETURNING` は `*`・`<公開名>.*`・列参照を受理する（#3204。式・関数・`AS` 別名は `42601`。束縛・実行は [sql-returning.md](sql-returning.md) の「結線」節）、`$n` は Issue #3297 で受理（「`$n` と公開名重複」節）
 - `--require-where-for-dml` は FROM／USING 形でも `WHERE` 省略を `42601` で拒否する（opt-in のときだけ）
 
 ## 既存解析器との振り分け
@@ -59,7 +59,7 @@ FROM を黙って無視する（単一表として処理する）fail-open 経�
 
 対象表と FROM／USING 側の表を 1 つの `BindingScope` にまとめ、純関数で次を行う。カタログ照会・行の読み取り・RLS・台帳には触れない。
 
-1. スコープ構築（参照数 `54000`・公開名の重複 `42601`）
+1. スコープ構築（参照数 `54000`・公開名の重複 `42712`）
 2. `WHERE` の全列参照を解決（修飾子の不一致 `42P01`・非修飾で複数表に該当 `42702`・未知列 `42703`）
 3. SET 左辺の検査（重複・疑似列・未知列・`GENERATED ALWAYS`）
 4. SET 右辺: 列参照は解決と代入可否の判定（不一致は `42804`）、式は全参照をスコープで解決する（Issue #3296。`42P01`・`42702`・`42703`）。対象表の列だけの式は従来の式束縛、FROM 側を含む式は変換器が束縛する
@@ -189,7 +189,7 @@ SQL-53 (b)・RLS-10・RECOVER-10/11・SQL-28 のポインタ。等値キーが�
 
 SQL-53 (b)・SQL-75・SQL-76 のポインタ。`EXPLAIN [ANALYZE|VERBOSE|(オプション)] UPDATE ... FROM`／`DELETE ... USING` を受理する。
 
-- **構文段**: 先頭の `EXPLAIN` を外した文を既存の結合 DML 解析器へ再帰で通し、返った検証済みの値を `ExplainDml::UpdateFrom`／`DeleteUsing` に包む（第 2 の解析器を持たない）。`$n` は前置があっても Parse 段で `42601`（受理は #3297）
+- **構文段**: 先頭の `EXPLAIN` を外した文を既存の結合 DML 解析器へ再帰で通し、返った検証済みの値を `ExplainDml::UpdateFrom`／`DeleteUsing` に包む（第 2 の解析器を持たない）。`$n` は素の `EXPLAIN` の WHERE のみ受理（#3297。SET の `$n` と ANALYZE・オプション前置の `$n` は既存の EXPLAIN 規則どおり `42601`）
 - **静的な EXPLAIN の出力**（閉じた語彙）: 根 `update`／`delete`（`assignments`・`filter`・`returning`・`operation_id`）の下に `join`（`join_method: hash`・`join_type: inner`・`join_keys: n`・`join_filter: none`）、その下に対象表（`relation: 1`・全走査）と FROM／USING 側（`relation: 2`）の `scan`。source 側の分類は実行器と同じ `source_bound_scan` を共有分類（PK → GIN → 全走査）へ渡して作り、実経路と矛盾しない
 - **見積もりは出さない**: 行数・見積もり・表名・別名・値は載せない（SQL-75 (5)・RLS-10。既存の JOIN の `EXPLAIN` と同じ契約。テナントの存在情報を漏らさないため）
 - **副作用ゼロ**: 読むのはスキーマと GIN 宣言だけ。台帳・writer・世代・行には触れず、`READ ONLY` Tx でも実行できる。束縛・変換・走査前検証の順序と `wire_code` は実行と一致する
@@ -197,6 +197,20 @@ SQL-53 (b)・SQL-75・SQL-76 のポインタ。`EXPLAIN [ANALYZE|VERBOSE|(オプ
 - **VERBOSE**: `RETURNING` の列を `output:` に出す（Describe と同じ列）。`FORMAT JSON` は既存の包みで通り、`ANALYZE` との併用は `0A000`
 - **権限**: 非 EXPLAIN と同じビット（対象表 `UPDATE|SELECT`／`DELETE|SELECT`、FROM／USING 側の SELECT）。EXPLAIN は抜け道にならない
 - **まだ拒否する形**: target がビューの形・一時表が関与する形（FROM／USING 側の単純形ビューは #3292 で受理済みで、EXPLAIN も同じ計画を返す）、FROM 内の JOIN ON・多方向結合（#3294。木の組み立ては source 1 個前提で、#3294 が計画を拡張するときに追随させる）、分割実行（`PARTITIONED`）、セッション無しの入口
+
+## `$n` と公開名重複（Issue #3297）
+
+SQL-53 (b)・RLS-10・RECOVER-10・RECOVER-11・SQL-28 のポインタ。依存・unsafe の追加なし。
+
+- **前提**: Bind は `$n` を型付きリテラルへ置換して再解析する（`bind_prepared`）。Bind 後は同じ値をリテラルで書いた簡易クエリと同じ経路（結合 DML 解析器 → 束縛 → 変換 → 結合実行器・RLS・台帳）を通る。このため受理・拒否・`wire_code`・RLS の適用順は変えない。Parse の一律拒否（#1754）を撤去し、位置規則と型推論で受理範囲を決める。
+- **受理位置**: SET 右辺（`$n` 単独・式内。型は書き込み先の代入先列／演算の相手）、WHERE の `<列|公開名.列> = $n`（`AND` 区切りの連言で、`OR`・括弧内・`BETWEEN`・非等価比較は `42601`）、`USING OPERATION_ID $n`。IN・LIKE・RETURNING・FROM 句の `$n` は従来どおり `42601`。
+- **型推論**: WHERE の修飾列は修飾子（公開名）が指す表の列で引く。非修飾列は、列を持つ表がちょうど 1 つのときだけその型を使い、0 件・複数件は `Text`（束縛段が `42703`／`42702` を返す。応答コードで存在を観測させない）。整数・浮動小数列の WHERE は、数値列の `$n` を数値リテラルへ置換し、結合 WHERE の数値比較（`NumericCompare`）として受理する（等価比較は通る）。
+- **SET の別名形**: `UPDATE t [AS] x SET ...` の `$n` は FROM 形に限り受理する（単一表の別名形の受理範囲は変えない）。SET 節は深さ 0 の `FROM`（`IS [NOT] DISTINCT FROM` を除く）で終わる。
+- **EXPLAIN**: 素の `EXPLAIN` の WHERE の `$n` は受理し、SET の `$n` は単一表の EXPLAIN UPDATE と同じく `42601`。`EXPLAIN ANALYZE`・`EXPLAIN (オプション)` 前置は既存規則（#2054・#2058）のまま `42601`。
+- **Describe 用ダミー値**: WHERE の連言分ごとに「`$n` 由来か」のフラグを作り（`sql::params::joined_where_conjunct_flags`）、`sql::join::dml_plan` が対象側・source 側の述語列へ束縛の等価序数に揃えて振り分ける。`$n` 由来のダミー値に限り DATE・UUID・ENUM 等の値検証を省く。実リテラルは常に検証し、連言分の数が構文解析後と食い違うときはフラグを使わない（fail-closed）。Execute と Bind は従来どおり空のフラグ。
+- **公開名重複**: 対象表と FROM／USING の公開名（別名または表名）が重複したら `42712`（PG の `duplicate_alias`。文言は `table name "<name>" specified more than once`。内部キーはテナントの SCHEMA 名へ戻す）。新しい `SqlSurfaceError::DuplicateAlias`／`ErrorClass::DuplicateAlias` を使い、NoSQL 表層からは到達しない（射影は 400）。**SELECT の JOIN・派生表の別名重複は `42601` のまま**（[inner-join.md](inner-join.md)・[multi-relation-plan-foundation.md](multi-relation-plan-foundation.md) の判断を維持。テストで固定）。`42712` は ERR-6（エラー契約）に属する変更で、SSOT 側の定義は spec リポ側で管理し本リポでは変更しない（対応づけ: ERR-6・SQL-41・SQL-45。ポインタ表記のみ）。
+- **PG 17 との照合**: PG 17 の実機は使えない環境のため、`duplicate_alias` が `42712`（"table name ... specified more than once"）であることを PG のエラーコード定義に基づいて確認した。実機での全形の照合は未検証。
+- **テスト**: `crates/engine/tests/sql_t40_up/sql53_dml_from_using_params.rs`（拡張クエリと簡易クエリの一致・型推論・拒否位置・台帳・EXPLAIN・Describe・RLS・明示 Tx・公開名重複と据え置きの固定）、`crates/wire-server/tests/wire_sql/wire_sql53_dml_from_using_params.rs`（ParameterDescription の OID・タグ・`42712`）、`sql::params` の単体テスト。
 
 ## SET の行値代入と FROM 側の式（Issue #3296）
 
