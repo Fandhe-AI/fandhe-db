@@ -221,6 +221,12 @@ fn expansion_bytes(a: &ArrayValue, ordinality: bool) -> usize {
         .saturating_add(a.flat().len().saturating_mul(per_elem))
 }
 
+/// 展開の作業領域の実ピーク（これまでの最大値と配列 1 件分の上界の大きい方）。展開用ベクタは外側行ごとに
+/// 破棄されるため合算せず最大値を取る。
+fn peak_work_bytes(peak: usize, a: &ArrayValue, ordinality: bool) -> usize {
+    peak.max(expansion_bytes(a, ordinality))
+}
+
 /// 外側タプル `ti` の引数セル（配列）を借用で返す。NULL 補完された relation・NULL のセルは `None`（0 行）。
 fn outer_array<'a>(
     sides: &'a [Vec<ResultRow>],
@@ -258,7 +264,9 @@ pub(super) fn unnest_front(
     let outer_count = acc.len();
     // 事前判定: 通過した外側タプルの要素数の総和（確保なしで配列の長さだけを読む）。
     let mut total: usize = 0;
-    // 展開の作業領域（要素の Cell 複製・ペイロード・ResultRow・各行の cells）の上界。確保の前に計上する。
+    // 展開の作業領域（要素の Cell 複製・ペイロード・ResultRow・各行の cells）の上界。展開用ベクタは外側行ごとに
+    // 作って次の行の前に破棄するため、実ピークは最大の配列 1 つ分。全行を合算せず最大値を 1 回だけ計上する
+    // （`JoinBudget` は返却しないため、合算すると小配列が多い COUNT(*) 等で過大に `54000` となる）。
     let mut work_bytes: usize = 0;
     for ti in 0..outer_count {
         if ti % crate::interrupt::CHECK_STRIDE as usize == 0 {
@@ -272,7 +280,7 @@ pub(super) fn unnest_front(
             total = total
                 .checked_add(n)
                 .ok_or_else(|| too_large("JOIN result exceeds the row limit"))?;
-            work_bytes = work_bytes.saturating_add(expansion_bytes(a, rt.ordinality));
+            work_bytes = peak_work_bytes(work_bytes, a, rt.ordinality);
         }
     }
     if total > limits.max_output_rows {
@@ -396,6 +404,26 @@ mod tests {
         assert_eq!(e.wire_code(), "54000");
         let mut budget = JoinBudget::with_cap(expansion_bytes(&big, false));
         budget.charge(expansion_bytes(&big, false)).expect("fits");
+    }
+
+    /// 小配列が多数あっても作業領域の計上は最大配列 1 つ分で、行数に比例して増えない（合算で `54000` にならない）。
+    #[test]
+    fn many_small_arrays_do_not_overcharge_the_work_area() {
+        let small = ArrayValue::Integer(vec![Some(1); 4]);
+        let big = ArrayValue::Text(vec![Some("x".repeat(1024)); 64]);
+        let one = expansion_bytes(&small, true);
+        let mut peak = 0usize;
+        for _ in 0..100_000 {
+            peak = peak_work_bytes(peak, &small, true);
+        }
+        assert_eq!(peak, one);
+        // 大きい配列が混じればその 1 件分が最大値になる。
+        assert_eq!(
+            peak_work_bytes(peak, &big, true),
+            expansion_bytes(&big, true)
+        );
+        // 1 配列分の上限に収まる予算なら小配列だけの走査は通る。
+        JoinBudget::with_cap(one).charge(peak).expect("fits");
     }
 
     /// NULL 要素は `Cell::Null`、多次元は行優先に平坦化し、bigint は 2^53 を超えても欠けない。
