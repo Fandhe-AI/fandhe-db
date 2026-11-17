@@ -364,6 +364,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         // `ALTER TABLE`（Issue #901・`Storage::alter_table_drop_column` 等）
         // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
         | CatalogError::ColumnNotFound(_)
+        | CatalogError::AmbiguousColumn(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         // `ViewNotFound`／`DependentViewsExist`／`ViewLimitExceeded` は
@@ -1420,6 +1421,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::MultiplePrimaryKeys(table) => {
             SqlSurfaceError::invalid_table_definition(table)
@@ -2054,6 +2056,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         CatalogError::ProtectedColumn(name) => {
             SqlSurfaceError::unsupported(format!("column {name:?} cannot be dropped or altered"))
         }
@@ -2783,6 +2786,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TypeAlreadyExists(_)
         | CatalogError::DependentObjectsStillExist(_)
         | CatalogError::ColumnNotFound(_)
+        | CatalogError::AmbiguousColumn(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::ViewNotFound(_)
@@ -3074,6 +3078,9 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        // LATERAL を含むビュー本文の遅延再検証（Issue #3324）は未知列・曖昧列の分類を保つ。
+        CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         // 原因別の固定文言（Issue #3240。TABLE-18・TABLE-41・ERR-6）。catalog 側の定数と
         // 完全一致したものだけを写し、未知の detail は汎用文言へ丸める（fail-closed。
         // detail は応答へ連結しない）。

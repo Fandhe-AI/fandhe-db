@@ -230,6 +230,31 @@ fn body_shape_errors_are_fixed_and_leave_no_view_behind() {
     }
 }
 
+// 遅延再検証でも、左側の列・内側の列の解決エラーは `42703` のまま返す
+// （buffered-view-position の `42601` へ丸めない）。
+#[test]
+fn lateral_view_definition_keeps_unknown_column_code() {
+    let (core, _g) = open();
+    for (name, lateral, want) in [
+        (
+            "v_unknown_outer",
+            "LATERAL (SELECT lang FROM other x WHERE x.lang = d.nope ORDER BY lang LIMIT 2) t",
+            "42703",
+        ),
+        (
+            "v_unknown_inner",
+            "LATERAL (SELECT nope FROM other x WHERE x.lang = d.lang ORDER BY lang LIMIT 2) t",
+            "42703",
+        ),
+    ] {
+        let sql =
+            format!("CREATE VIEW {name} AS SELECT d.id AS did FROM docs d, {lateral} LIMIT 100");
+        assert_eq!(code(ddl(&core, "alice", &sql), &sql), want, "{name}");
+        let sel = format!("SELECT * FROM {name} LIMIT 1");
+        assert_eq!(code(query(&core, "alice", &sel), &sel), "42P01", "{name}");
+    }
+}
+
 #[test]
 fn other_view_forms_with_lateral_keep_their_codes() {
     let (core, _g) = open();
