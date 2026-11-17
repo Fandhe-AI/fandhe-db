@@ -14,7 +14,7 @@
 
 use super::plpgsql_host::{PlCallOptions, TriggerInvocation};
 use super::EngineCore;
-use crate::catalog::trigger::{TriggerEvents, TriggerLevel};
+use crate::catalog::trigger::{TriggerEvents, TriggerLevel, TriggerTiming};
 use crate::plpgsql::ast::{ParseOptions, ReturnShape};
 use crate::plpgsql::embedded::validate_embedded;
 use crate::plpgsql::parse_body;
@@ -95,14 +95,24 @@ impl EngineCore {
         if let Ok(schema) = self.storage.get_table_schema(&stmt.table) {
             if let Ok(tokens) = crate::sql::lexer::tokenize(when_sql) {
                 for t in &tokens {
-                    if let Token::QualifiedIdent { name, .. } = t {
+                    if let Token::QualifiedIdent { qualifier, name } = t {
                         // 発火時の NEW／OLD は利用者列だけが束縛される（`trigger_vars_from_call`）。
                         // 疑似列 `id` は束縛されないため、定義時に拒否する。
-                        let known = schema.columns.iter().any(|c| &c.name == name);
-                        if !known {
+                        let Some(column) = schema.columns.iter().find(|c| &c.name == name) else {
                             return Err(SqlSurfaceError::undefined_column(
                                 "column in trigger WHEN condition",
                             ));
+                        };
+                        // 生成列（TABLE-50・Issue #3329）は BEFORE ROW の後に計算するため、BEFORE の WHEN が
+                        // NEW の生成列を参照しても評価時点では未計算（NULL）。黙って誤った値で判定せず、
+                        // 定義時に `42P17` で拒否する（PG17 実機との突き合わせは #3332。未検証）。
+                        if stmt.timing == TriggerTiming::Before
+                            && qualifier.eq_ignore_ascii_case("NEW")
+                            && column.generated.is_some()
+                        {
+                            return Err(SqlSurfaceError::InvalidObjectDefinition {
+                                detail: "BEFORE trigger WHEN conditions cannot reference NEW generated columns",
+                            });
                         }
                     }
                 }

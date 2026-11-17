@@ -15,12 +15,15 @@
 #      例外（Issue #731）: live で detached のとき、状態のブランチ先端が HEAD の祖先・どの worktree も使用中でない・途中状態でない、をすべて満たせば
 #      `git update-ref`（旧値つき）でブランチを HEAD まで進め、update-ref の 1 トランザクション（HEAD の旧値つき symref-update + ブランチ先端の verify）で worktree をそのブランチへ付け直してから通常の live として進める
 #   2. live のとき、未コミット変更があれば WIP コミットを作る。汚れの観測は worktree-remove.sh と同じ対象の
-#      `git -c core.excludesFile= status --porcelain=v2 -z -uall --ignore-submodules=none`（利用者の status.showUntrackedFiles や submodule の ignore、
+#      `git -c core.excludesFile= status --porcelain=v2 -z -uall --ignore-submodules=all` に、それが隠す未初期化 submodule の gitlink だけの変更
+#      （index と HEAD の木の gitlink の差。Issue #867）を足したもの（利用者の status.showUntrackedFiles や
 #      グローバルの除外に左右されない。-z はパスの C 引用〔非 ASCII・"・\・タブ〕で入れ子の git リポジトリの検出が取りこぼすのを避けるため。
 #      worktree-remove.sh は行数だけを数え、引用で数は変わらないので -z なしのまま）。フックは通す（--no-verify を使わない）。退避完了（wipCommitted:true）の根拠はコミットの終了コードではなく、
 #      コミット後の同じ観測で汚れが無いこと。フックの拒否・フックによる書き換え・submodule 内の未コミットの変更・入れ子の git リポジトリ・
 #      未マージのエントリ・マージ／cherry-pick／revert／rebase の途中があれば false（推測で true にしない）。コミットの終了コードが成功でも、
 #      HEAD が進んでいない・進んだが前の HEAD との差分が空（フックが commit のあとで変更を捨てた）なら empty-commit・false。拒否されたときの add は戻さない（staged は worktree-remove.sh が汚れとして保持する）
+#      add -A は作業ツリーにディレクトリの無い gitlink を削除として index から落とすので、add の前の index を木に記録し、落ちた gitlink を戻してからコミットする
+#      （戻せなければコミットせず index を add の前に戻して commit-failed。Issue #867）
 #   3. 対象ブランチが確定したら `git fetch origin refs/heads/<base>:refs/remotes/origin/<base>` で base を最新化し、
 #      `git diff --quiet --no-ext-diff --ignore-submodules=none <base>...<branch>` で差分の有無を調べる（利用者の diff.ignoreSubmodules や
 #      diff.external に左右されない。submodule ポインタだけの変更も差分に数える）（fetch に失敗したら unknown。空とは扱わない）。差分があれば先行コミット数と変更ファイル数も出す
@@ -30,9 +33,14 @@
 #       先端が HEAD の祖先で途中状態でないときだけ。1 件でも資格の無い握り手があれば何も書かず従来どおり in-use で保全する。
 #       `--mode free --base BASE --branch BRANCH [--worktree PATH]` は解放だけを行う（WIP コミット・base の取得・差分は行わない）。resolved:false・reason:free-only で、
 #       detached は freed / none / in-use / failed / no-ref / base-branch。結果は助言的（ホストは判断に使わない）。
-# 初期化済み submodule の扱い: 親の `git add -A` は submodule 内の未コミットの変更を記録しない。そうした変更はコミット後も汚れとして残るので wip:submodule・
-#       wipCommitted:false になる。submodule の変更が無いなら、初期化済みであること自体は WIP の判定に影響しない（discard の可否は worktree-remove.sh が
-#       初期化済み submodule の存在で保持として判定する）。
+# 初期化済み submodule の扱い: submodule の中は観測しない（--ignore-submodules=all。その config はエージェントが書ける場所にあり、中へ降りる git が
+#       そこのコマンドを実行し得る）。中の未コミットの変更の有無を言えないので、初期化済み submodule があれば WIP コミットを作らず（親の add・commit も submodule の中を観測する）wip:submodule・
+#       wipCommitted:false にする（discard の可否は worktree-remove.sh が初期化済み submodule の存在で保持として判定する）。
+# 付属 worktree の中の git: worktree-remove.sh と同じく、worktree の中で git を呼ぶ前に wr_gitlink_check（ファイルの読み取りだけの照合）を行う。通らなければ git を
+#       呼ばず、回復対象は mismatch（toplevel-mismatch）、握り手は解放しない（in-use）。握り手の HEAD.lock は照合済みの git ディレクトリへ書く。
+#       信頼する共通ディレクトリを求められない（リポジトリの外・カレントの付属 worktree が照合に通らない）ときは、--mode free を含めて git を 1 回も呼ばずに何もしない
+#       （list-failed。free は detached:failed）。信頼の起点はカレントのリポジトリに対する最初の git より前にファイルだけで求める（wr_trust_cwd）。
+#       初期化済み submodule があれば WIP コミットを作らない（add・commit が submodule の中を観測する）。フックは通す（WIP コミット。--no-verify を使わない）。
 # 出力: 標準出力の最後の 1 行が `RECOVER_PREP_RESULT {json}`。値は固定語彙・真偽・件数・40 桁 16 進の sha と、検証済みのブランチ名だけ
 #       （パス・hook の出力・外部由来の文字列を入れない。診断は標準エラーへ）。結果を出せたときは、失敗や未確定を含めて exit 0。
 #         {"resolved":bool,"reason":"…","branch":"…","source":"worktree|state|none","worktreeMissing":bool,
@@ -50,6 +58,8 @@
 
 set -u
 unset POSIXLY_CORRECT
+# 環境の GIT_DIR などが残っていると、git の対象が引数のパスでなく環境の指すリポジトリになる（worktree-remove.sh と同じ）
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE
 LC_ALL=C
 export LC_ALL
 GIT_TERMINAL_PROMPT=0
@@ -61,6 +71,11 @@ script_dir=$(cd "$(dirname "$0")" && pwd -P) || exit 3
 . "${script_dir}/lib/worktree-remove-lib.sh" || exit 3
 # shellcheck source=lib/recover-prep-lib.sh
 . "${script_dir}/lib/recover-prep-lib.sh" || exit 3
+
+# 信頼する共通 git ディレクトリ（カレントの worktree から wr_main_common が求めたもの）。付属 worktree の中で git を呼ぶ前に、その .git・commondir・gitdir を
+# これとファイルの読み取りだけで照合する（wr_gitlink_check。worktree-remove.sh と同じ）。カレントのリポジトリに対する最初の git より前に、ファイルだけで求める
+# （wr_trust_cwd）。求められなければ空で、どのモードでも git を 1 回も呼ばずに fail-closed にする（下の list-failed）
+wr_trust_cwd
 
 usage() {
   echo "使い方: recover-prep.sh --base BASE [--worktree PATH] [--branch BRANCH]（--worktree か --branch の少なくとも 1 つ）／ recover-prep.sh --mode free --base BASE --branch BRANCH [--worktree PATH]" >&2
@@ -126,7 +141,7 @@ observe() { # $1 = worktree のパス
   local raw last
   OBS_RC=0
   OBS_OUT=""
-  raw=$({ git -C "$1" -c core.excludesFile= status --porcelain=v2 -z -uall --ignore-submodules=none 2>/dev/null; printf 'GITRC=%s\0' "$?"; } |
+  raw=$({ git --no-optional-locks -c core.fsmonitor=false -C "$1" -c core.excludesFile= status --porcelain=v2 -z -uall --ignore-submodules=all 2>/dev/null; printf 'GITRC=%s\0' "$?"; } |
     tr '\012\000' '?\012' |
     awk 'skip { skip = 0; next } { print } substr($0, 1, 2) == "2 " { skip = 1 }')
   last=${raw##*$'\n'}
@@ -140,14 +155,79 @@ observe() { # $1 = worktree のパス
   esac
 }
 
+# 実体のある submodule の数（$1 = worktree、$2 = 照合済みの git ディレクトリ）。index の gitlink のうち作業ツリー側に .git があるものと、この worktree 専用の
+# modules ディレクトリ。submodule の中へは降りない（その config はエージェントが書ける場所にあり、中へ降りる git がそこのコマンドを実行し得る）。
+# 観測は --ignore-submodules=all なので submodule の中の変更は見えない。1 以上なら呼び出し側は退避完了と言わない（wip:submodule）。index を読めなければ -1
+sub_populated() {
+  local out n
+  out=$(git --no-optional-locks -c core.fsmonitor=false -C "$1" ls-files -s 2>/dev/null) || { echo -1; return 0; }
+  n=$(wr_count_populated "$1" "${out}")
+  if [ -n "$2" ] && [ -d "$2/modules" ] && [ -n "$(ls -A "$2/modules" 2>/dev/null)" ]; then n=$((n + 1)); fi
+  echo "${n}"
+}
+
+# index と HEAD の木の間の gitlink の差の件数（$1 = worktree のパス。読めなければ -1）。observe の status は --ignore-submodules=all なので、
+# 未初期化 submodule の gitlink だけの変更（index での付け替え・削除・追加）が見えない（Issue #867。見えないと wip:none・wipCommitted:true と
+# 誤って報告し、変更を index に残す）。--cached は index と木だけを読み、submodule の中へは降りない。コミットが無ければ空の木と比べる。
+# 汚れの行数（wr_count_status の WR_DIRTY）に足して使う。gitlink 以外の行は status が数えるので数えない（worktree-remove.sh と同じ）
+gitlink_changes() {
+  local head raw
+  head=$(git --no-optional-locks -c core.fsmonitor=false -C "$1" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) || head=""
+  [ -n "${head}" ] || head=$(git --no-optional-locks -c core.fsmonitor=false -C "$1" hash-object -t tree /dev/null 2>/dev/null) || head=""
+  [ -n "${head}" ] || { echo -1; return 0; }
+  raw=$(git --no-optional-locks -c core.fsmonitor=false -C "$1" diff-index --cached --raw --no-renames --no-ext-diff --ignore-submodules=none "${head}" 2>/dev/null) || { echo -1; return 0; }
+  wr_count_gitlink_raw "${raw}"
+}
+
+# 汚れの行数（$1）に gitlink の差（$2。-1 = 読めなかった）を足す。どちらかが -1 なら -1
+add_dirty() {
+  if [ "$1" -lt 0 ] || [ "$2" -lt 0 ]; then echo -1; else echo $(($1 + $2)); fi
+}
+
+# index に gitlink（mode 160000）のエントリがあるか（$1 = worktree のパス）。読めなければ「ある」と答える（呼び出し側は gitlink を守る経路へ進む）
+gl_present() {
+  local out
+  out=$(git --no-optional-locks -c core.fsmonitor=false -C "$1" ls-files -s 2>/dev/null) || return 0
+  case $'\n'"${out}" in *$'\n'160000\ *) return 0 ;; esac
+  return 1
+}
+
+# index から消えた gitlink の件数（$1 = worktree のパス、$2 = add の前の index を write-tree した木。読めなければ -1）。木では gitlink（160000）で、
+# index に同じパスのエントリが無いもの（`:160000 000000 … D`）を数える。型の変更（gitlink → 通常ファイル。160000 → 100644）は作業ツリーの
+# 内容を add が拾ったものなので数えない。-z なしの出力はパスを引用するが、行数と先頭の mode は変わらない
+gl_lost() {
+  local raw line n=0
+  raw=$(git --no-optional-locks -c core.fsmonitor=false -C "$1" diff-index --cached --raw --no-renames --no-ext-diff --ignore-submodules=none "$2" 2>/dev/null) || { echo -1; return 0; }
+  while IFS= read -r line; do
+    case "${line}" in ':160000 000000 '*) n=$((n + 1)) ;; esac
+  done <<<"${raw}"
+  echo "${n}"
+}
+
+# add -A が index から落とした gitlink を戻す（$1 = worktree のパス、$2 = add の前の index を write-tree した木）。作業ツリーにディレクトリの無い
+# gitlink（未初期化 submodule の index だけの追加など）を add -A は削除として扱い、パスと sha を index から消す（Issue #867。戻さないと
+# 追加を失ったままコミットし、削除側は clean と見て worktree を消し得る）。木と index の比較を -z で読み（パスの空白・改行・先頭の - を
+# そのまま扱う）、消えたものを木の sha で `update-index --add --cacheinfo` する。戻したあとの同じ比較で消えたものが 0 件なら 0、残れば 1
+gl_restore() {
+  local meta p rest osha
+  while IFS= read -r -d '' meta && IFS= read -r -d '' p; do
+    case "${meta}" in ':160000 000000 '*) ;; *) continue ;; esac
+    rest=${meta#:160000 000000 }
+    osha=${rest%% *}
+    case "${osha}" in '' | *[!0-9a-f]*) continue ;; esac
+    git -c core.fsmonitor=false -C "$1" update-index --add --cacheinfo "160000,${osha},${p}" >&2 || true
+  done < <(git --no-optional-locks -c core.fsmonitor=false -C "$1" diff-index --cached --raw -z --no-renames --no-ext-diff --ignore-submodules=none "$2" 2>/dev/null)
+  [ "$(gl_lost "$1" "$2")" = 0 ]
+}
+
 # マージ・cherry-pick・revert・rebase の途中か（未解決の途中状態。add -A は確定させてしまうので触らない）。ref とディレクトリの両方で見る
 in_progress() { # $1 = worktree のパス
   local ref d gp
   for ref in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD; do
-    if git -C "$1" rev-parse -q --verify "${ref}" >/dev/null 2>&1; then return 0; fi
+    if git --no-optional-locks -c core.fsmonitor=false -C "$1" rev-parse -q --verify "${ref}" >/dev/null 2>&1; then return 0; fi
   done
   for d in rebase-merge rebase-apply sequencer; do
-    gp=$(git -C "$1" rev-parse --git-path "${d}" 2>/dev/null) || continue
+    gp=$(git --no-optional-locks -c core.fsmonitor=false -C "$1" rev-parse --git-path "${d}" 2>/dev/null) || continue
     case "${gp}" in /*) ;; *) gp="$1/${gp}" ;; esac
     if [ -d "${gp}" ]; then return 0; fi
   done
@@ -158,23 +238,18 @@ in_progress() { # $1 = worktree のパス
 # 途中状態なし）だけなら、各握り手を先端のコミットへ detached にする（HEAD.lock を排他作成した下で symref と先端を確かめて rename で確定する。コミットも作業ツリーも動かない）。$3 は握り手から除外する
 # 回復対象自身のパス（空でよい）。1 件でも資格が無い握り手があれば何も書かず in-use にする。結果は FH_WORD（none / freed / in-use / failed）、解放できた（または握り手が無い）とき 0
 FH_WORD=none
-# 登録のパス $1 が、このリポジトリに登録された worktree 自身であるかを確かめる（Issue #755）。.git が実在し、toplevel がパス自身、共通 git ディレクトリがこのリポジトリのもの、
-# git ディレクトリが <共通>/worktrees/ 配下（メインでない）、その gitdir ファイルがパスの .git を指す、をすべて満たすときだけ 0。.git が無く親リポジトリへ探索が抜ける
-# 別の clone・メイン worktree などは非 0（保全側）
+# 登録のパス $1 が、このリポジトリに登録された worktree 自身であるかを確かめる（Issue #755）。git を呼ぶ前に、.git が通常ファイルで 1 行の gitdir、その実体が
+# <共通>/worktrees/ 配下（メインでない）、commondir がこのリポジトリの共通ディレクトリ、gitdir ファイルがパスの .git を指す、をファイルの読み取りだけで照合し
+# （wr_gitlink_check）、そのうえで toplevel がパス自身であるときだけ 0。照合済みの git ディレクトリを HOLDER_GITDIR に入れる（detach_holder_locked が使う）。
+# .git が無く親リポジトリへ探索が抜ける別の clone・メイン worktree・偽の共通ディレクトリを指すものなどは非 0（保全側）
+HOLDER_GITDIR=""
 holder_is_registered_worktree() {
-  local p=$1 top gd cd_h cd_s gdir_file back
-  [ -e "${p}/.git" ] || return 1
-  top=$(git -C "${p}" rev-parse --show-toplevel 2>/dev/null) || return 1
+  local p=$1 top
+  HOLDER_GITDIR=""
+  wr_gitlink_check "${p}" "${TRUSTED_COMMON}" || return 1
+  top=$(git --no-optional-locks -c core.fsmonitor=false -C "${p}" rev-parse --show-toplevel 2>/dev/null) || return 1
   [ "$(wr_real "${top}")" = "$(wr_real "${p}")" ] || return 1
-  gd=$(git -C "${p}" rev-parse --absolute-git-dir 2>/dev/null) || return 1
-  cd_h=$(wr_common_dir "${p}") || return 1
-  cd_s=$(wr_common_dir .) || return 1
-  [ "$(wr_real "${cd_h}")" = "$(wr_real "${cd_s}")" ] || return 1
-  [ "$(wr_real "$(dirname "${gd}")")" = "$(wr_real "${cd_s}")/worktrees" ] || return 1
-  gdir_file="${gd}/gitdir"
-  [ -f "${gdir_file}" ] || return 1
-  IFS= read -r back <"${gdir_file}" || [ -n "${back}" ] || return 1
-  [ "$(wr_real "$(dirname "${back}")")" = "$(wr_real "${p}")" ] || return 1
+  HOLDER_GITDIR=${WR_GITDIR}
   return 0
 }
 
@@ -212,14 +287,17 @@ holder_owned() {
 detach_holder_locked() {
   local hd=$1 hgd hlock cur fmt
   # --show-ref-format は Git 2.45 以降のみ。それより前は出力が空（またはオプションをそのまま返す）で、files バックエンドしか無いので files とみなして続ける。files 以外が明示されたときだけ書かない
-  fmt=$(git -C "${hd}" rev-parse --show-ref-format 2>/dev/null) || fmt=""
+  fmt=$(git --no-optional-locks -c core.fsmonitor=false -C "${hd}" rev-parse --show-ref-format 2>/dev/null) || fmt=""
   case "${fmt}" in files | "" | --show-ref-format) ;; *) return 1 ;; esac
-  hgd=$(git -C "${hd}" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  # 書き込む先は、直前の holder_is_registered_worktree がファイルの読み取りで照合した git ディレクトリ（git に聞き直さない）
+  hgd=${HOLDER_GITDIR}
+  [ -n "${hgd}" ] && [ -d "${hgd}" ] || return 1
   hlock="${hgd}/HEAD.lock"
   ( set -C; printf '%s\n' "$3" >"${hlock}" ) 2>/dev/null || return 1
   cur=""
-  IFS= read -r cur <"${hgd}/HEAD" || true
-  if [ "${cur}" != "ref: refs/heads/$2" ] || [ "$(git -C "${hd}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" != "$3" ]; then
+  # HEAD も照合と同じ読み方（NUL・2 行目・シンボリックリンクを拒否）で読む。読めなければ一致しない側
+  if wr_read_one_line "${hgd}/HEAD"; then cur=${WR_LINE}; fi
+  if [ "${cur}" != "ref: refs/heads/$2" ] || [ "$(git --no-optional-locks -c core.fsmonitor=false -C "${hd}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" != "$3" ]; then
     # 確認が崩れたときは HEAD を元のバイト列のまま書き戻してロックを手放す（rm を使わない。読めなければロックを残して失敗にする = git の更新が失敗して気づける）
     cat "${hgd}/HEAD" >"${hlock}" 2>/dev/null || return 1
     mv -f "${hlock}" "${hgd}/HEAD"
@@ -229,7 +307,7 @@ detach_holder_locked() {
 }
 
 free_holders() {
-  local list ents hp hs hl hr hself hdirty hip htip howned plan frees="" hsym hrc holder holder_tip hold_sym
+  local list ents hp hs hl hr hself hdirty hsub hip htip howned plan frees="" hsym hrc holder holder_tip hold_sym
   FH_WORD=none
   list=$(git worktree list --porcelain 2>/dev/null) || { FH_WORD=failed; return 1; }
   ents=$(rp_holder_entries "${list}" "$1")
@@ -247,7 +325,7 @@ free_holders() {
       return 1
     fi
     # HEAD の symref が対象ブランチ自身であること（oid の一致だけでは別ブランチへ切り替わった握り手を見分けられない）
-    hold_sym=$(git -C "${hp}" symbolic-ref -q HEAD 2>/dev/null) || hold_sym=""
+    hold_sym=$(git --no-optional-locks -c core.fsmonitor=false -C "${hp}" symbolic-ref -q HEAD 2>/dev/null) || hold_sym=""
     if [ "${hold_sym}" != "refs/heads/$1" ]; then
       echo "recover-prep: 使用中の worktree の HEAD がブランチ ${1} を指していない。保全する" >&2
       FH_WORD=in-use
@@ -258,12 +336,15 @@ free_holders() {
       hdirty=-1
     else
       wr_count_status "${OBS_OUT}"
-      hdirty=${WR_DIRTY}
+      hdirty=$(add_dirty "${WR_DIRTY}" "$(gitlink_changes "${hp}")")
+      # 実体のある submodule は中を観測しないので clean と言えない（汚れとして数え、解放しない）
+      hsub=$(sub_populated "${hp}" "${HOLDER_GITDIR}")
+      if [ "${hsub}" != 0 ]; then hdirty=-1; fi
     fi
     hip=0
     if in_progress "${hp}"; then hip=1; fi
     htip=0
-    if [ "${hs}" = "$2" ] && [ "$(git -C "${hp}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" = "$2" ]; then htip=1; fi
+    if [ "${hs}" = "$2" ] && [ "$(git --no-optional-locks -c core.fsmonitor=false -C "${hp}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" = "$2" ]; then htip=1; fi
     howned=0
     if holder_owned "${hr}"; then howned=1; fi
     plan=$(rp_holder_plan "${hself}" "${htip}" "${hdirty}" "${hip}" "${hr}" "${howned}")
@@ -279,15 +360,17 @@ free_holders() {
     [ -n "${holder}" ] || continue
     hrc=0
     # 書き込み直前にもう一度、パスの同一性と HEAD の symref を確かめる（一覧取得後に切り替わった握り手へは書かない）
-    hold_sym=$(git -C "${holder}" symbolic-ref -q HEAD 2>/dev/null) || hold_sym=""
-    if ! holder_is_registered_worktree "${holder}" || [ "${hold_sym}" != "refs/heads/$1" ]; then
+    # 照合（ファイルの読み取り）を git より先に行う
+    hold_sym=""
+    if holder_is_registered_worktree "${holder}"; then hold_sym=$(git --no-optional-locks -c core.fsmonitor=false -C "${holder}" symbolic-ref -q HEAD 2>/dev/null) || hold_sym=""; fi
+    if [ -z "${HOLDER_GITDIR}" ] || [ "${hold_sym}" != "refs/heads/$1" ]; then
       echo "recover-prep: 使用中ブランチの worktree が解放の直前に変わった。保全する" >&2
       FH_WORD=failed
       return 1
     fi
     detach_holder_locked "${holder}" "$1" "${holder_tip}" || hrc=$?
-    hsym=$(git -C "${holder}" symbolic-ref -q HEAD 2>/dev/null) || hsym=""
-    if [ "${hrc}" != 0 ] || [ -n "${hsym}" ] || [ "$(git -C "${holder}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" != "${holder_tip}" ]; then
+    hsym=$(git --no-optional-locks -c core.fsmonitor=false -C "${holder}" symbolic-ref -q HEAD 2>/dev/null) || hsym=""
+    if [ "${hrc}" != 0 ] || [ -n "${hsym}" ] || [ "$(git --no-optional-locks -c core.fsmonitor=false -C "${holder}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" != "${holder_tip}" ]; then
       echo "recover-prep: 使用中ブランチの worktree の解放に失敗した。保全する" >&2
       FH_WORD=failed
       return 1
@@ -298,6 +381,15 @@ free_holders() {
   return 0
 }
 
+# 信頼する共通ディレクトリを求められない（リポジトリの外・カレントの付属 worktree が照合に通らない）ときは、free を含むどのモードでも何もしない。カレントのリポジトリで
+# 走る git（ref の読み取り・一覧・fetch の ref 更新が呼ぶ reference-transaction フック・update-ref）は、カレントの共通ディレクトリの config とフックを使い、照合に通らない
+# 付属 worktree ではそれが偽物であり得る。free は解放せず detached:failed（結果は助言的）
+if [ -z "${TRUSTED_COMMON}" ]; then
+  RP_RESOLVED=0
+  RP_REASON='list-failed'
+  if [ "${mode}" = free ]; then RP_BRANCH=${branch}; R_DETACHED=failed; fi
+  emit
+fi
 if [ "${mode}" = free ]; then
   # 握り手の解放だけを行うモード（Issue #755）。旧 worktree の状態調査・WIP コミット・base の取得・差分は行わない。結果は助言的
   RP_RESOLVED=0
@@ -320,6 +412,7 @@ fi
 # 1. 旧 worktree の状態
 wtstate=missing
 head_branch=""
+RP_GITDIR=""
 if [ -n "${path}" ]; then
   if [ ! -e "${path}" ] && [ ! -L "${path}" ]; then
     wtstate=missing
@@ -332,10 +425,16 @@ if [ -n "${path}" ]; then
     elif [ "${WR_REGISTERED}" != 1 ]; then
       wtstate=unregistered
     else
-      top=$(git -C "${path}" rev-parse --show-toplevel 2>/dev/null) || top=""
+      # git を呼ぶ前に、.git・commondir・gitdir をファイルの読み取りだけで照合する（偽の共通ディレクトリの config を git に読ませない）。
+      # 通らなければ git を呼ばず mismatch（toplevel-mismatch。何も書かない）
+      top=""
+      if wr_gitlink_check "${path}" "${TRUSTED_COMMON}"; then
+        RP_GITDIR=${WR_GITDIR}
+        top=$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" rev-parse --show-toplevel 2>/dev/null) || top=""
+      fi
       if [ -n "${top}" ] && [ "$(wr_real "${top}")" = "$(wr_real "${path}")" ]; then
         wtstate=live
-        head_branch=$(git -C "${path}" symbolic-ref -q --short HEAD 2>/dev/null) || head_branch=""
+        head_branch=$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" symbolic-ref -q --short HEAD 2>/dev/null) || head_branch=""
         wr_valid_branch "${head_branch}" || head_branch=""
       else
         wtstate=mismatch
@@ -351,7 +450,7 @@ if [ "${wtstate}" = live ] && [ -z "${head_branch}" ]; then
   adopt_branch=${branch}
   R_DETACHED=no-state-branch
   if [ -n "${adopt_branch}" ]; then
-    adopt_head=$(git -C "${path}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) || adopt_head=""
+    adopt_head=$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) || adopt_head=""
     adopt_tip=$(git rev-parse -q --verify "refs/heads/${adopt_branch}^{commit}" 2>/dev/null) || adopt_tip=""
     adopt_exists=0
     adopt_use=1
@@ -374,7 +473,7 @@ if [ "${wtstate}" = live ] && [ -z "${head_branch}" ]; then
       # refs/heads/<branch> が adopt_head のままであることの verify を同じトランザクションに入れ、確認と書き換えの間に積まれたコミットや
       # ブランチ先端の移動があれば git が全体を拒否する（HEAD が未観測のコミットへ付け替わらず detached のまま保全される）。symref-update を持たない git（2.51 未満）では失敗し、付け直さず保全する
       arc=0
-      adopt_same() { [ "$(git -C "${path}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" = "${adopt_head}" ] && [ "$(git -C "${path}" rev-parse --abbrev-ref HEAD 2>/dev/null)" = HEAD ]; }
+      adopt_same() { [ "$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" = "${adopt_head}" ] && [ "$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" rev-parse --abbrev-ref HEAD 2>/dev/null)" = HEAD ]; }
       adopt_same || arc=1
       if [ "${arc}" = 0 ]; then
         git update-ref "refs/heads/${adopt_branch}" "${adopt_head}" "${adopt_tip}" >/dev/null 2>&1 || arc=$?
@@ -382,10 +481,10 @@ if [ "${wtstate}" = live ] && [ -z "${head_branch}" ]; then
         if [ "${arc}" = 0 ] && ! adopt_same; then arc=1; fi
       fi
       if [ "${arc}" = 0 ]; then
-        printf 'start\nverify refs/heads/%s %s\nsymref-update HEAD refs/heads/%s oid %s\nprepare\ncommit\n' "${adopt_branch}" "${adopt_head}" "${adopt_branch}" "${adopt_head}" | git -C "${path}" update-ref --no-deref --stdin >/dev/null 2>&1 || arc=$?
+        printf 'start\nverify refs/heads/%s %s\nsymref-update HEAD refs/heads/%s oid %s\nprepare\ncommit\n' "${adopt_branch}" "${adopt_head}" "${adopt_branch}" "${adopt_head}" | git --no-optional-locks -c core.fsmonitor=false -C "${path}" update-ref --no-deref --stdin >/dev/null 2>&1 || arc=$?
       fi
       # 付け直し後の HEAD がブランチ経由で adopt_head のままであること（回収成功の根拠）
-      if [ "${arc}" = 0 ] && [ "$(git -C "${path}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" != "${adopt_head}" ]; then arc=1; fi
+      if [ "${arc}" = 0 ] && [ "$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null)" != "${adopt_head}" ]; then arc=1; fi
       if [ "${arc}" = 0 ]; then
         head_branch=${adopt_branch}
         R_DETACHED=attached
@@ -403,29 +502,55 @@ rp_resolve "${given}" "${wtstate}" "${head_branch}" "${branch}" "${base}"
 
 # 2. WIP コミット（live のときだけ）
 if [ "${wtstate}" = live ]; then
+  subs=$(sub_populated "${path}" "${RP_GITDIR}")
   observe "${path}"
   if [ "${OBS_RC}" -ne 0 ]; then
     R_DIRTY=-1
     rp_scan_status ""
   else
     wr_count_status "${OBS_OUT}"
-    R_DIRTY=${WR_DIRTY}
+    R_DIRTY=$(add_dirty "${WR_DIRTY}" "$(gitlink_changes "${path}")")
     rp_scan_status "${OBS_OUT}"
   fi
   ipg=0
   if in_progress "${path}"; then ipg=1; fi
   plan=$(rp_wip_plan "${R_DIRTY}" "${RP_UNMERGED}" "${RP_NESTED}" "${ipg}")
+  # 実体のある submodule があれば WIP コミットを作らない（add・commit は submodule の中を status で観測し、中の config〔エージェントが書ける〕の
+  # コマンドを実行し得る。フラグでは打ち消せない）。退避できていないので保全側（worktree-remove.sh も初期化済み submodule を保持する）
+  if [ "${plan}" = commit ] && [ "${subs}" != 0 ]; then
+    case "${subs}" in -1) plan=unverified ;; *) plan=submodule ;; esac
+  fi
   case "${plan}" in
     commit)
       crc=0
-      old_head=$(git -C "${path}" rev-parse -q --verify HEAD 2>/dev/null) || old_head=""
+      old_head=$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" rev-parse -q --verify HEAD 2>/dev/null) || old_head=""
       # 件名の type は commit-msg フックの type 検証（feat|fix|…|chore）を通すため chore にする（wip は拒否される・Issue #718）
       # stdin を閉じる（stdin 待ちのフックがハングしない）。フックの出力は標準エラーへ（標準出力の最後の 1 行を結果に保つ）
-      git -C "${path}" add -A >&2 && git -C "${path}" commit -q -m "chore(recover): 中断時の未コミット変更を退避" </dev/null >&2 || crc=$?
+      # index に gitlink があれば add の前の index を木に記録し、add -A が落とした gitlink（ディレクトリの無い追加など）を戻してからコミットする（Issue #867）。
+      # 記録できない・戻せない（同じ場所に通常ファイルがありファイルとディレクトリが衝突する等）ときはコミットせず、index を add の前に戻して
+      # commit-failed にする（gitlink は index に残り、汚れとして数え続けられる）
+      glbase=""
+      if gl_present "${path}"; then
+        glbase=$(git -c core.fsmonitor=false -C "${path}" write-tree 2>/dev/null) || glbase=""
+        [ -n "${glbase}" ] || crc=1
+      fi
+      if [ "${crc}" = 0 ]; then
+        git -C "${path}" add -A >&2 || crc=$?
+      fi
+      if [ "${crc}" = 0 ] && [ -n "${glbase}" ] && ! gl_restore "${path}" "${glbase}"; then
+        crc=1
+        git -c core.fsmonitor=false -C "${path}" read-tree "${glbase}" >&2 || echo "recover-prep: index を add の前に戻せなかった" >&2
+        echo "recover-prep: add -A が落とした gitlink を戻せない。コミットしない" >&2
+      fi
+      if [ "${crc}" = 0 ]; then
+        git -C "${path}" commit -q -m "chore(recover): 中断時の未コミット変更を退避" </dev/null >&2 || crc=$?
+      fi
+      # フックが gitlink をコミットと index の両方から落とすと、コミット後の観測は空になる。index に戻して汚れとして観測させる（退避完了と言わない）
+      if [ -n "${glbase}" ]; then gl_restore "${path}" "${glbase}" || true; fi
       # コミットの実体: 成功の終了コードでも、フックがあとで変更を捨てると HEAD が進まない・進んでも差分が空になる（汚れは無く見える）
       cstate=made
       if [ "${crc}" = 0 ]; then
-        new_head=$(git -C "${path}" rev-parse -q --verify HEAD 2>/dev/null) || new_head=""
+        new_head=$(git --no-optional-locks -c core.fsmonitor=false -C "${path}" rev-parse -q --verify HEAD 2>/dev/null) || new_head=""
         if [ -z "${new_head}" ] || [ "${new_head}" = "${old_head}" ]; then
           cstate=none
         else
@@ -434,7 +559,7 @@ if [ "${wtstate}" = live ]; then
           xrc=2
           if [ -n "${from}" ]; then
             xrc=0
-            git -C "${path}" diff --quiet --no-ext-diff --ignore-submodules=none "${from}" "${new_head}" >/dev/null 2>&1 || xrc=$?
+            git --no-optional-locks -c core.fsmonitor=false -C "${path}" diff --quiet --no-ext-diff --ignore-submodules=none "${from}" "${new_head}" >/dev/null 2>&1 || xrc=$?
           fi
           case "${xrc}" in
             1) cstate=made ;;
@@ -449,13 +574,21 @@ if [ "${wtstate}" = live ]; then
         after_sub=0
       else
         wr_count_status "${OBS_OUT}"
-        after_dirty=${WR_DIRTY}
         after_sub=${WR_SUB_DIRTY}
+        after_dirty=$(add_dirty "${WR_DIRTY}" "$(gitlink_changes "${path}")")
       fi
       R_WIP=$(rp_wip_after "${crc}" "${after_dirty}" "${after_sub}" "${cstate}")
       ;;
     *) R_WIP=${plan} ;;
   esac
+  # 実体のある submodule の中は観測しない（--ignore-submodules=all）ので、親が clean・退避済みでも submodule 内の未コミットの変更が残り得る。退避完了とは言わない
+  if rp_wip_ok "${R_WIP}"; then
+    case "${subs}" in
+      0) ;;
+      -1) R_WIP=unverified ;;
+      *) R_WIP=submodule ;;
+    esac
+  fi
 else
   R_WIP=skipped
 fi

@@ -4,6 +4,7 @@
 //! `EngineCore::execute_sql_in_session`（字句解析 → 許可リスト構文検証 → 束縛）を production 経路として、
 //! 構文段が受理した形が辞書式・三値論理（Issue #3256）で評価されること、成分数不一致・
 //! 構文違反が `42601` のままであること、DML の副作用範囲、テナント境界を固定する。
+//! 拡張クエリの `$n` 成分（Issue #3257）の受理・EXPLAIN の展開形一致もここで固定する。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -603,14 +604,122 @@ fn row_compare_does_not_cross_tenants() {
     );
 }
 
-/// `$n` を行値の成分に置く形は Parse の時点で拒否される（fail-closed。誤った型・個数を報告して
-/// 成功させない）。型推論・Describe への結線は #3257 の担当。tracked: #3257
+/// `$n` を行値の成分に置く形は拡張クエリで受理され、Bind・Execute でリテラル形と同じ id 集合を返す
+/// （Issue #3257。拒否を固定していた旧テストを新しい挙動へ更新した。型・Describe・RLS の網羅は
+/// `table_rls/prepared_row_compare.rs`・`table_rls/rls10_row_compare_paths.rs`）。
 #[test]
-fn row_compare_with_placeholders_fails_closed_at_parse() {
+fn row_compare_with_placeholders_is_accepted_and_evaluated() {
     let (path, _g) = setup("row-cmp-param");
     let core = core_at(&path);
-    let err = core
+    let prepared = core
         .parse_sql_prepared("SELECT id FROM t WHERE (a, b) < ($1, $2) LIMIT 10")
-        .expect_err("placeholders in a row value must be rejected");
+        .expect("placeholders in a row value are accepted");
+    assert_eq!(prepared.param_count(), 2);
+    let session = SessionState::default();
+    core.describe_prepared_in_session(&session, &prepared)
+        .expect("describe");
+    let bound = core
+        .bind_prepared(&prepared, &[Some(b"3".to_vec()), Some(b"5".to_vec())])
+        .expect("bind");
+    let mut s = SessionState::default();
+    let SqlOutcome::Query(r) = core
+        .execute_parsed_in_session(&ctx("alice"), &mut s, &bound)
+        .expect("execute")
+    else {
+        panic!("not a query");
+    };
+    let mut got: Vec<u64> = r.rows.iter().map(|r| r.id).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        ids(
+            &core,
+            "alice",
+            "SELECT id FROM t WHERE (a, b) < (3, 5) LIMIT 10"
+        )
+    );
+    assert_eq!(got, vec![1]);
+}
+
+/// EXPLAIN は展開後の束縛結果から導かれる閉じた語彙の出力で、等価な展開形を手で書いた文の EXPLAIN と
+/// 完全に一致する（SQL-75 (2)(5)・SQL-27 のポインタ。出力は値を含まない）。
+#[test]
+fn explain_of_row_compare_equals_explain_of_the_expanded_form() {
+    let (path, _g) = setup("row-cmp-explain");
+    let core = core_at(&path);
+    ok(&core, "alice", "CREATE INDEX t_s ON t (s)");
+    let pairs = [
+        ("(a, b) < (3, 5)", "a < 3 OR (a = 3 AND b < 5)"),
+        ("(a, b) = (3, 5)", "a = 3 AND b = 5"),
+        ("(a, b) <> (3, 5)", "a <> 3 OR b <> 5"),
+        ("(s, a) = ('x', 1)", "s = 'x' AND a = 1"),
+        ("(a, b) >= (3, 5)", "a > 3 OR (a = 3 AND b >= 5)"),
+    ];
+    let prefixes = [
+        "EXPLAIN SELECT id FROM t WHERE ",
+        "EXPLAIN (FORMAT JSON) SELECT id FROM t WHERE ",
+        "EXPLAIN VERBOSE SELECT id FROM t WHERE ",
+        "EXPLAIN DELETE FROM t WHERE ",
+        "EXPLAIN UPDATE t SET s = 'z' WHERE ",
+    ];
+    for (row, expanded) in pairs {
+        for prefix in prefixes {
+            let tail = if prefix.contains("SELECT") {
+                " LIMIT 10"
+            } else {
+                ""
+            };
+            let a = run(&core, "alice", &format!("{prefix}{row}{tail}"));
+            let b = run(&core, "alice", &format!("{prefix}{expanded}{tail}"));
+            let (a, b) = (
+                a.unwrap_or_else(|e| panic!("{prefix}{row}: {e:?}")),
+                b.unwrap_or_else(|e| panic!("{prefix}{expanded}: {e:?}")),
+            );
+            assert_eq!(a, b, "{prefix}{row} vs {expanded}");
+            // 出力に比較値は現れず、別テナントでも同一（テナント・データに依存しない）。
+            let text = format!("{a:?}");
+            assert!(!text.contains("'x'"), "{text}");
+            let bob = run(&core, "bob", &format!("{prefix}{row}{tail}")).expect("bob explain");
+            assert_eq!(a, bob, "{prefix}{row}: tenant-independent");
+        }
+    }
+    // ANALYZE も受理する（実測値の可視行限定は RLS 側の試験で固定）。
+    run(
+        &core,
+        "alice",
+        "EXPLAIN ANALYZE SELECT id FROM t WHERE (a, b) < (3, 5) LIMIT 10",
+    )
+    .expect("explain analyze");
+}
+
+/// 索引のある列を含む行値の等価でも、実行結果は展開形と一致する（EXPLAIN が主張する経路と矛盾しない）。
+#[test]
+fn row_compare_with_indexed_column_matches_expanded_form() {
+    let (path, _g) = setup("row-cmp-index");
+    let core = core_at(&path);
+    ok(&core, "alice", "CREATE INDEX t_s ON t (s)");
+    assert_eq!(
+        ids(
+            &core,
+            "alice",
+            "SELECT id FROM t WHERE (s, a) = ('x', 3) LIMIT 10"
+        ),
+        ids(
+            &core,
+            "alice",
+            "SELECT id FROM t WHERE s = 'x' AND a = 3 LIMIT 10"
+        )
+    );
+}
+
+/// `$n` を含む行値比較の EXPLAIN 前置は Parse で `42601`（fail-closed）。
+/// intentional: docs/design/wire-extended-query-param-binding.md
+#[test]
+fn explain_with_row_compare_placeholders_is_rejected_at_parse() {
+    let (path, _g) = setup("row-cmp-explain-param");
+    let core = core_at(&path);
+    let err = core
+        .parse_sql_prepared("EXPLAIN SELECT id FROM t WHERE (a, b) < ($1, $2) LIMIT 10")
+        .expect_err("EXPLAIN with row placeholders is rejected");
     assert_eq!(err.wire_code(), "42601");
 }

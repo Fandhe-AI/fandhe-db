@@ -4,7 +4,7 @@
 #
 # `crates/engine/examples/crash_tool_ddl.rs`（write/verify/self-check サブコマンド）を使い、
 # `CREATE TABLE`・`INSERT`・`ALTER TABLE ADD COLUMN`・スカラー／一意の `CREATE INDEX`・
-# `DROP TABLE` を 1 文ずつ実行中のプロセスを SIGKILL で強制終了させ、再オープン後の
+# 生成列の `ALTER TABLE ADD COLUMN ... GENERATED`（Issue #3330。全行の原子的な計算）・`DROP TABLE` を 1 文ずつ実行中のプロセスを SIGKILL で強制終了させ、再オープン後の
 # カタログ・行・索引宣言・物理表が「文の前」か「文の後」のどちらか一方に完全一致すること
 # （部分的な DDL が 0 件）を検証する反復を行う。骨格は `scripts/crash_test_cross_table.sh` と同じ
 # （セット × 反復の 2 段構成。セットごとに新規 DB）。冒頭で `self-check`（オラクルの空振り防止の
@@ -14,8 +14,8 @@
 #
 # Issue #2418（SQL-23 を併せて参照）: write.log の最後の進行行（STMT / COMMITTED）で kill 位置を
 # 分類する。STMT なら文の実行中で、再起動後の n は ack 済み n（文の前）か +1（文の後）のどちらか。
-# COMMITTED なら文と文の間で、n は ack 済み n と完全一致（幽霊適用の検出）。DDL 段（stage 0/2/3/4/5）
-# の実行中の kill を run 全体で 1 度も観測しなければ失敗にする（空虚な成功の拒否）。判定単位を
+# COMMITTED なら文と文の間で、n は ack 済み n と完全一致（幽霊適用の検出）。DDL 段（stage 0/2/3/4/5/6）
+# の実行中の kill と、生成列の段（stage 5）の実行中の kill を、それぞれ run 全体で 1 度も観測しなければ失敗にする（空虚な成功の拒否）。判定単位を
 # 反復ごとにしないのは遅い runner での不安定化を避けるため（アサーションの弱体化ではない）。
 #
 # 使い方: scripts/crash_test_ddl.sh [セット数（既定 1）] [反復回数（既定 60）]
@@ -67,11 +67,12 @@ WRITE_START_TIMEOUT_TENTHS=300
 total_iterations=$((SETS * ITERATIONS))
 completed=0
 # kill 位置の観測数（run 全体）。before/after は実行中の kill の結果（文の前/後）、by_stage は段別
-# （0 CREATE TABLE / 1 INSERT / 2 ALTER / 3 CREATE INDEX / 4 CREATE UNIQUE INDEX / 5 DROP TABLE）。
+# （0 CREATE TABLE / 1 INSERT / 2 ALTER / 3 CREATE INDEX / 4 CREATE UNIQUE INDEX / 5 ADD COLUMN GENERATED / 6 DROP TABLE）。
 inflight_before=0
 inflight_after=0
 ddl_inflight=0
-declare -a inflight_by_stage=(0 0 0 0 0 0)
+gen_inflight=0
+declare -a inflight_by_stage=(0 0 0 0 0 0 0)
 
 for set_no in $(seq 1 "${SETS}"); do
   echo "### set ${set_no}/${SETS} ==="
@@ -195,6 +196,9 @@ for set_no in $(seq 1 "${SETS}"); do
         exit 1
       fi
       inflight_by_stage[stmt_stage]=$((${inflight_by_stage[stmt_stage]:-0} + 1))
+      if [ "${stmt_stage}" -eq 5 ]; then
+        gen_inflight=$((gen_inflight + 1))
+      fi
       if [ "${stmt_stage}" -ne 1 ]; then
         ddl_inflight=$((ddl_inflight + 1))
       fi
@@ -244,4 +248,10 @@ if [ "${ddl_inflight}" -le 0 ]; then
   exit 1
 fi
 
-echo "crash_test_ddl.sh: OK (${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps; in-flight kills ddl=${ddl_inflight} before=${inflight_before} after=${inflight_after} by_stage=${inflight_by_stage[*]})"
+# 生成列の追加（stage 5）の実行中の中断を 1 度も観測していない実行は、全行の原子的な計算を検証できていない。
+if [ "${gen_inflight}" -le 0 ]; then
+  echo "ERROR: no kill landed while an ADD COLUMN ... GENERATED statement was in flight in ${completed} reps; raise iterations" >&2
+  exit 1
+fi
+
+echo "crash_test_ddl.sh: OK (${SETS} sets x ${ITERATIONS} iterations = ${completed} SIGKILL reps; in-flight kills ddl=${ddl_inflight} generated=${gen_inflight} before=${inflight_before} after=${inflight_after} by_stage=${inflight_by_stage[*]})"

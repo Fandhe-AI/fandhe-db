@@ -50,9 +50,10 @@ use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterSchema, ValidatedAlterSequence,
     ValidatedAlterTable, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnDropDefault,
-    ValidatedAlterTableAlterColumnDropNotNull, ValidatedAlterTableAlterColumnSetDefault,
-    ValidatedAlterTableAlterColumnSetNotNull, ValidatedAlterTableAlterColumnType,
-    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
+    ValidatedAlterTableAlterColumnDropExpression, ValidatedAlterTableAlterColumnDropNotNull,
+    ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
+    ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
+    ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedAlterTableSetSchema,
     ValidatedCreateIndex, ValidatedCreateSchema, ValidatedCreateSequence, ValidatedCreateTable,
     ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
@@ -231,6 +232,43 @@ pub(crate) fn build_table_schema(
     if !validated.unique_constraints.is_empty() {
         schema = schema.with_unique_constraints(validated.unique_constraints.clone());
     }
+    // 生成列（TABLE-50・Issue #3327）。全列がそろった定義に対して式を束縛・検証し、正規描画と
+    // 参照列を各列へ取り付ける（前方参照を許す）。CHECK・UNIQUE・FK・索引が生成列を参照できる状態に
+    // するため CHECK の束縛より前に行う。カタログを参照しないため存在オラクルにならない。
+    if !validated.generated_columns.is_empty() {
+        let names: Vec<String> = validated
+            .generated_columns
+            .iter()
+            .map(|g| g.column.clone())
+            .collect();
+        let mut bound: Vec<(usize, crate::catalog::GeneratedColumnDef)> = Vec::new();
+        for generated in &validated.generated_columns {
+            let Some(index) = schema
+                .columns
+                .iter()
+                .position(|c| c.name == generated.column)
+            else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                });
+            };
+            let Some(column) = schema.columns.get(index) else {
+                continue;
+            };
+            let def = crate::sql::generated_column::bind_generated_column(
+                &generated.expression,
+                column,
+                &schema,
+                &names,
+            )?;
+            bound.push((index, def));
+        }
+        for (index, def) in bound {
+            if let Some(column) = schema.columns.get_mut(index) {
+                column.generated = Some(def);
+            }
+        }
+    }
     // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）。意味論検証（列の存在・型・
     // 禁止要素・正規化の往復一致）は列定義だけを持つスキーマに対して行う（他の
     // `CHECK` を参照する `CHECK` は許可しない）。カタログを参照しないため、
@@ -364,6 +402,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         // `ALTER TABLE`（Issue #901・`Storage::alter_table_drop_column` 等）
         // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
         | CatalogError::ColumnNotFound(_)
+        | CatalogError::AmbiguousColumn(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         // `ViewNotFound`／`DependentViewsExist`／`ViewLimitExceeded` は
@@ -473,6 +512,14 @@ pub(crate) fn execute_create_temp_table(
     if !table.identity_columns.is_empty() {
         return Err(SqlSurfaceError::feature_not_supported(
             "identity columns are not supported for temporary tables",
+        ));
+    }
+    // 生成列も一時表では未対応（行ストアの確保・セッションの変更・式の束縛より前に拒否する。
+    // TABLE-50・Issue #3327）。
+    // intentional: docs/design/generated-column.md
+    if !table.generated_columns.is_empty() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "generated columns are not supported for temporary tables",
         ));
     }
     let schema = build_table_schema(None, table, schema_limits)?;
@@ -724,6 +771,9 @@ pub enum AlterTableAction {
     AlterColumnSetNotNull { column_name: String },
     /// `ALTER COLUMN <col> DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。**BREAKING CHANGE**: variant 追加。
     AlterColumnDropNotNull { column_name: String },
+    /// `ALTER COLUMN <col> DROP EXPRESSION [IF EXISTS]`（TABLE-50 (3)、Issue #3331）。
+    /// **BREAKING CHANGE**: variant 追加。
+    AlterColumnDropExpression { column_name: String },
     /// `ALTER COLUMN <col> SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
     AlterColumnSetDefault { column_name: String },
     /// `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
@@ -788,6 +838,33 @@ pub(crate) fn execute_alter_table_add_column(
     if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
         return Ok(add_column_skipped_outcome(stmt));
     }
+    // 生成列（TABLE-50・RECOVER-11・Issue #3330）。fast default（O(1)）は使えず、全行を計算して
+    // 書き直す。束縛・全行の計算・世代 bump・commit は 1 つの write txn で行う（部分状態を残さない）。
+    if let Some(expr) = &stmt.generated {
+        let action = storage
+            .alter_table_in_single_txn(&stmt.table_name, |txn| {
+                let (action, apply) = add_generated_column_in_txn(
+                    storage,
+                    txn,
+                    &stmt.table_name,
+                    stmt,
+                    expr,
+                    limits,
+                )?;
+                Ok((action, apply == AlterApply::Applied, Vec::new()))
+            })
+            .map_err(|e| match e {
+                AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                    undefined_table_or_view(storage, &stmt.table_name)
+                }
+                AlterCheckError::Catalog(other) => map_add_column_error(other),
+                AlterCheckError::Sql(sql_err) => sql_err,
+            })?;
+        return Ok(AlterTableOutcome {
+            table_name: stmt.table_name.clone(),
+            action,
+        });
+    }
     let column = build_add_column_def(storage, stmt, limits)?;
     match storage.alter_table_add_column_with_limit(
         &stmt.table_name,
@@ -810,6 +887,87 @@ pub(crate) fn execute_alter_table_add_column(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// 生成列の ADD COLUMN を write txn 内で適用する共有 helper（TABLE-50・RECOVER-11・Issue #3330）。
+/// 単一アクション経路（[`execute_alter_table_add_column`]）と複数アクション経路
+/// （[`apply_alter_action_in_txn`]）が呼ぶ。呼び出し元は DDL 権限ゲートと表の存在確認を済ませている。
+///
+/// 判定順（決定的）: txn 内のスキーマ取得 → `IF NOT EXISTS` の skip → 型名解決
+/// （[`build_add_column_def`]）→ 従来の行識別方式の表は `0A000` → 列名の重複 → 候補スキーマ（新しい列を
+/// 足したもの）への式の束縛（[`crate::sql::generated_column::bind_generated_column`]。CREATE TABLE と同じ
+/// 判定と SQLSTATE）→ カタログへの追加と全テナント・全可視性の全行の計算
+/// （`Storage::alter_table_add_generated_column_in_txn`）。束縛を txn 内で行うので判定と書き込みの間に
+/// TOCTOU を作らない。評価エラーは固定文言で返り、呼び出し元は commit せず txn を破棄する。
+fn add_generated_column_in_txn(
+    storage: &Storage,
+    txn: &redb::WriteTransaction,
+    table_name: &str,
+    stmt: &ValidatedAlterTableAddColumn,
+    expr: &crate::sql::udf_call::Expr,
+    limits: &SchemaLimits,
+) -> Result<(AlterTableAction, AlterApply), AlterCheckError> {
+    let schema = crate::catalog::get_table_schema_in_txn_impl(txn, table_name, false)
+        .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
+    if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
+        return Ok((
+            AlterTableAction::AddColumnSkipped {
+                column_name: stmt.column_name.clone(),
+            },
+            AlterApply::Unchanged,
+        ));
+    }
+    let mut column = build_add_column_def(storage, stmt, limits).map_err(AlterCheckError::Sql)?;
+    // NoSQL 表層が作る従来方式の表は、生成列の計算点が無いため CREATE TABLE と同じ `0A000`。
+    // intentional: docs/design/generated-column.md
+    if schema.row_identity() == crate::catalog::RowIdentity::LegacyId {
+        return Err(AlterCheckError::Sql(
+            SqlSurfaceError::feature_not_supported(
+                "generated columns are not supported on this table surface",
+            ),
+        ));
+    }
+    if schema.columns.iter().any(|c| c.name == stmt.column_name) {
+        return Err(alter_in_txn_error(
+            CatalogError::ColumnAlreadyExists(stmt.column_name.clone()),
+            map_add_column_error,
+        ));
+    }
+    let mut candidate = schema.clone();
+    candidate.columns.push(column.clone());
+    let mut generated_names: Vec<String> = schema
+        .columns
+        .iter()
+        .filter(|c| c.generated.is_some())
+        .map(|c| c.name.clone())
+        .collect();
+    generated_names.push(column.name.clone());
+    let def = crate::sql::generated_column::bind_generated_column(
+        expr,
+        &column,
+        &candidate,
+        &generated_names,
+    )
+    .map_err(AlterCheckError::Sql)?;
+    column.generated = Some(def);
+    // 呼び出し元の経路によらず、列数上限の判定はカタログ側（物理スロット総数）が行う。
+    Storage::alter_table_add_generated_column_in_txn(
+        txn,
+        table_name,
+        column,
+        limits.max_table_columns(),
+        true,
+    )
+    .map_err(|e| match e {
+        AlterCheckError::Catalog(c) => alter_in_txn_error(c, map_add_column_error),
+        other => other,
+    })?;
+    Ok((
+        AlterTableAction::AddColumn {
+            column_name: stmt.column_name.clone(),
+        },
+        AlterApply::Applied,
+    ))
 }
 
 /// `ADD COLUMN IF NOT EXISTS` が何もしなかったときの応答（Issue #1633）。
@@ -1044,6 +1202,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropNotNull(stmt) => {
             execute_alter_table_alter_column_drop_not_null(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropExpression(stmt) => {
+            execute_alter_table_alter_column_drop_expression(storage, stmt)
+        }
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetDefault(stmt) => {
             execute_alter_table_alter_column_set_default(storage, stmt)
         }
@@ -1153,7 +1314,8 @@ const ALTER_PASS_ATTRIBUTES: u8 = 2;
 /// 複数アクションに含められない種別は構文段で拒否済みのため最後尾（到達しない）に置く。
 fn alter_action_pass(action: &ValidatedAlterTable) -> u8 {
     match action {
-        ValidatedAlterTable::DropColumn(_) => 0,
+        // `DROP EXPRESSION` も PostgreSQL の `AT_PASS_DROP` と同じ pass（同じ pass 内は記述順）。
+        ValidatedAlterTable::DropColumn(_) | ValidatedAlterTable::AlterColumnDropExpression(_) => 0,
         ValidatedAlterTable::AddColumn(_) => 1,
         // 列属性変更（SET／DROP NOT NULL・SET／DROP DEFAULT）は ADD COLUMN の後に記述順で適用する
         // （同一 pass 内は安定ソートで記述順を保つ）。
@@ -1204,6 +1366,10 @@ fn apply_alter_action_in_txn(
                     AlterApply::Unchanged,
                 ));
             }
+            // 生成列は全行の計算を伴うため、専用の helper（単一アクション経路と共有）で適用する。
+            if let Some(expr) = &stmt.generated {
+                return add_generated_column_in_txn(storage, txn, table_name, stmt, expr, limits);
+            }
             let column =
                 build_add_column_def(storage, stmt, limits).map_err(AlterCheckError::Sql)?;
             let max_columns =
@@ -1223,20 +1389,46 @@ fn apply_alter_action_in_txn(
             Storage::validate_alter_column_target(table_name, &stmt.column_name)
                 .map_err(|e| alter_in_txn_error(e, map))?;
             // 所有 SEQUENCE は削除せず、列名だけ記録する（全アクション適用後に呼び出し元が一括処理）。
-            Storage::alter_table_drop_column_core_in_txn(
+            // `CASCADE` で連鎖削除した生成列も記録する（Issue #3331）。
+            let (_, cascaded) = Storage::alter_table_drop_column_with_behavior_in_txn(
                 txn,
                 table_name,
                 &stmt.column_name,
+                stmt.behavior,
                 true,
                 false,
             )
             .map_err(|e| alter_in_txn_error(e, map))?;
+            dropped_columns.extend(cascaded);
             dropped_columns.push(stmt.column_name.clone());
             Ok((
                 AlterTableAction::DropColumn {
                     column_name: stmt.column_name.clone(),
                 },
                 AlterApply::Applied,
+            ))
+        }
+        ValidatedAlterTable::AlterColumnDropExpression(stmt) => {
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            let apply = Storage::alter_table_drop_expression_in_txn(
+                txn,
+                table_name,
+                &stmt.column_name,
+                stmt.if_exists,
+            )
+            .map_err(|e| match e {
+                // `TableNotFound` は txn 破棄後に `42P01`／`42809` を判別するため未変換で返す。
+                AlterCheckError::Catalog(c @ CatalogError::TableNotFound(_)) => {
+                    AlterCheckError::Catalog(c)
+                }
+                other => AlterCheckError::Sql(map_drop_expression_error(other)),
+            })?;
+            Ok((
+                AlterTableAction::AlterColumnDropExpression {
+                    column_name: stmt.column_name.clone(),
+                },
+                apply,
             ))
         }
         ValidatedAlterTable::AlterColumnSetNotNull(stmt) => {
@@ -1365,6 +1557,18 @@ pub(crate) fn execute_alter_table_add_foreign_key(
                 &schema.columns,
                 std::slice::from_ref(&stmt.foreign_key),
             )?;
+            // 生成列を参照元に含む FK の禁止アクションは `CREATE TABLE` と同じ検査・同じ `42601`
+            // （TABLE-50・Issue #3327）。
+            let generated_names: Vec<&str> = schema
+                .columns
+                .iter()
+                .filter(|c| c.generated.is_some())
+                .map(|c| c.name.as_str())
+                .collect();
+            crate::sql::allowlist::reject_generated_fk_referential_actions(
+                std::slice::from_ref(&stmt.foreign_key),
+                &generated_names,
+            )?;
         }
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
@@ -1420,6 +1624,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::MultiplePrimaryKeys(table) => {
             SqlSurfaceError::invalid_table_definition(table)
@@ -1501,7 +1706,7 @@ pub(crate) fn execute_alter_table_drop_column(
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
     storage
-        .alter_table_drop_column(&stmt.table_name, &stmt.column_name)
+        .alter_table_drop_column_with_behavior(&stmt.table_name, &stmt.column_name, stmt.behavior)
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
             other => map_drop_alter_column_error(other),
@@ -1847,6 +2052,41 @@ fn execute_alter_table_alter_column_drop_not_null(
     })
 }
 
+/// `ALTER TABLE <table> ALTER COLUMN <column> DROP EXPRESSION [IF EXISTS]` の実行本体
+/// （TABLE-50 (3)、Issue #3331）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
+/// [`require_ddl_permission`] を先に通す）。判定順序: テーブル存在確認 →
+/// `catalog::Storage::alter_table_drop_expression`（列の存在 `42703` → 生成列でなければ
+/// `55000`〔`IF EXISTS` は no-op〕。行は書き換えない）。
+fn execute_alter_table_alter_column_drop_expression(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnDropExpression,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_drop_expression(&stmt.table_name, &stmt.column_name, stmt.if_exists)
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            other => map_drop_expression_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnDropExpression {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `DROP EXPRESSION` のカタログ層エラーを SQL 表層へ写す（`Sql` は透過、`Catalog` は
+/// [`map_drop_alter_column_error`] の契約）。
+fn map_drop_expression_error(e: AlterCheckError) -> SqlSurfaceError {
+    match e {
+        AlterCheckError::Sql(sql_err) => sql_err,
+        AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+    }
+}
+
 /// `SET DEFAULT` の検証済み列定義（`default_expr` のみ差し替え済み）を作る。列の取得
 /// （`42703`）・既定値の生成（型不一致 `42804`）・`TIMESTAMPTZ` 正規化・値の束縛検証・
 /// 時刻既定値と FK `SET DEFAULT` の組の拒否（`0A000`）を行う。単一アクション経路と、
@@ -2054,6 +2294,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         CatalogError::ProtectedColumn(name) => {
             SqlSurfaceError::unsupported(format!("column {name:?} cannot be dropped or altered"))
         }
@@ -2783,6 +3024,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TypeAlreadyExists(_)
         | CatalogError::DependentObjectsStillExist(_)
         | CatalogError::ColumnNotFound(_)
+        | CatalogError::AmbiguousColumn(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::ViewNotFound(_)
@@ -3074,6 +3316,9 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
+        // LATERAL を含むビュー本文の遅延再検証（Issue #3324）は未知列・曖昧列の分類を保つ。
+        CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         // 原因別の固定文言（Issue #3240。TABLE-18・TABLE-41・ERR-6）。catalog 側の定数と
         // 完全一致したものだけを写し、未知の detail は汎用文言へ丸める（fail-closed。
         // detail は応答へ連結しない）。
@@ -4014,6 +4259,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4210,6 +4456,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4243,6 +4490,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4298,6 +4546,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4329,6 +4578,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),

@@ -409,10 +409,6 @@ fn ddl_combination_rules_and_unsupported_forms() {
             "0A000",
         ),
         (
-            "CREATE TABLE r (id BIGINT PRIMARY KEY, n INTEGER GENERATED ALWAYS AS (1 + 1) STORED)",
-            "0A000",
-        ),
-        (
             "CREATE TEMP TABLE r (id BIGINT PRIMARY KEY, n INTEGER GENERATED ALWAYS AS IDENTITY)",
             "0A000",
         ),
@@ -421,6 +417,17 @@ fn ddl_combination_rules_and_unsupported_forms() {
     }
     assert_eq!(code(&core, "sys", "DROP TABLE r"), "42P01");
     assert_eq!(code(&core, "sys", "DROP SEQUENCE r_n_seq"), "42P01");
+
+    // 生成列 `GENERATED ALWAYS AS (<式>) STORED` は Issue #3327（TABLE-50）で受理されるようになった
+    // （以前は `0A000`）。IDENTITY と違い暗黙 SEQUENCE は作られず、作成後に表を落とせる。
+    ok(
+        &core,
+        "sys",
+        "CREATE TABLE r (id BIGINT PRIMARY KEY, n INTEGER GENERATED ALWAYS AS (1 + 1) STORED)",
+    );
+    assert_eq!(code(&core, "sys", "DROP SEQUENCE r_n_seq"), "42P01");
+    ok(&core, "sys", "DROP TABLE r");
+    assert_eq!(code(&core, "sys", "DROP TABLE r"), "42P01");
 
     // SERIAL と IDENTITY の混在は宣言順に `seq`・`seq1` の衝突番号が付く。
     ok(

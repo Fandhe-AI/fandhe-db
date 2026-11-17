@@ -116,6 +116,8 @@ impl EngineCore {
                     cap: c.cap,
                 })
             }
+            // Issue #3324: 具体化ビューの本文は LATERAL を受理しない（作成時に拒否済み。到達しない）。
+            ViewBodyKind::LateralDeferred { .. } => Err(invalid_body()),
             ViewBodyKind::Buffered { stmt, .. } => {
                 let c = self.write_input_cap()?;
                 Ok(EvalPlan {

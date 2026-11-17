@@ -5984,6 +5984,13 @@ pub(crate) fn map_write_error(
             "cannot truncate a table referenced in a foreign key constraint: \
              table \"{referencing_table}\" references \"{table}\""
         )),
+        // 生成列を持つ表への書き込み（計算点が未結線の経路。TABLE-50・Issue #3327）。`_` 節（`XX000`）へ
+        // 丸めず固定文言の `0A000` で返す（表名・テナント・値を含めない）。
+        TenantWriteError::GeneratedColumnWriteUnsupported => {
+            SqlSurfaceError::feature_not_supported(
+                "writes to tables with generated columns are not supported yet",
+            )
+        }
         // `FOREIGN KEY` の参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。
         // Issue #1076）の連鎖が深さ・行数の上限を超えた。`_` 節（`XX000`）へ丸めると
         // クライアントが上限超過をサーバー内部事象と取り違える。
@@ -7078,7 +7085,11 @@ pub(crate) fn execute_insert_returning_in(
     // INSERT トリガがある表では、BEFORE が値を短縮したり行をスキップしたりして最終行が入力値より小さく
     // なり得るため、入力値の事前投影による予算拒否（`54000`）を行わない。実際に返す行の予算は txn 内の
     // 収集（下の `returning_collector`）が検査する（Issue #3192）。トリガの無い表は従来どおり。
+    // 生成列（TABLE-50・Issue #3328）を持つ表も同様に、束縛値には生成列の値が無く、計算後の値は書き込み txn 内で
+    // しか確定しないため、事前投影を省いて txn 内の収集（計算後の行）の結果を採用する。
+    let has_generated = schema.columns.iter().any(|c| c.generated.is_some());
     let skip_pre_projection = match (&target, triggers) {
+        _ if has_generated => true,
         (_, None) => false,
         (crate::tenant::WriteTarget::InTxn(txn), Some(_)) => {
             table_has_insert_triggers(*txn, ctx.tenant_id(), schema_table_key(bounds))?
@@ -7153,11 +7164,12 @@ pub(crate) fn execute_insert_returning_in(
         triggers,
         // トリガ判定の確定は書き込み txn 内。事前判定とずれてトリガ無し経路になった場合も、tenant 側が
         // commit 前にこの収集で予算を検査する（Issue #3192）。トリガ機構が無い構成（`None`）では渡さない。
-        triggers.map(|_| &mut trigger_project as &mut crate::tenant::ReturningProjectFn<'_>),
+        (triggers.is_some() || has_generated)
+            .then_some(&mut trigger_project as &mut crate::tenant::ReturningProjectFn<'_>),
     )?;
     drop(trigger_project);
 
-    if trigger_path {
+    if trigger_path || has_generated {
         // 払い出し値は `final_row` に入っているため再投影は不要。ただし採番の受け渡し値は持ち越さない。
         if has_sequence {
             let _ = crate::sql::sequence_scope::take_assigned();

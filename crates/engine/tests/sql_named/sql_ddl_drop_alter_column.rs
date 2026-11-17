@@ -359,8 +359,7 @@ fn unsupported_qualifiers_are_rejected_with_42601() {
     for sql in [
         "ALTER TABLE docs DROP note",
         "ALTER TABLE docs DROP COLUMN IF EXISTS note",
-        "ALTER TABLE docs DROP COLUMN note CASCADE",
-        "ALTER TABLE docs DROP COLUMN note RESTRICT",
+        "ALTER TABLE docs DROP COLUMN note CASCADE RESTRICT",
         "ALTER TABLE docs DROP COLUMN note USING OPERATION_ID 'op-1'",
         "ALTER TABLE docs DROP COLUMN note RETURNING id",
         "ALTER TABLE docs DROP COLUMN note; SELECT 1",
@@ -372,6 +371,28 @@ fn unsupported_qualifiers_are_rejected_with_42601() {
     ] {
         assert_eq!(code_of(&core, &mut session, sql), "42601", "{sql}");
     }
+}
+
+/// TABLE-50 (3)・Issue #3331: 依存の無い列の `CASCADE`／`RESTRICT` 指定は通常の `DROP COLUMN` と同じに成功する
+/// （これまでは `42601`）。psql 形（末尾 `;`）も通る。
+#[test]
+fn cascade_and_restrict_on_an_independent_column_behave_like_plain_drop() {
+    let (core, path) = new_core();
+    let _guard = CleanupGuard(path);
+    let mut session = ddl_session();
+    for sql in [
+        "ALTER TABLE docs DROP COLUMN note CASCADE",
+        "ALTER TABLE docs DROP COLUMN qty RESTRICT;",
+    ] {
+        match run(&core, &mut session, sql).unwrap_or_else(|e| panic!("{sql}: {e}")) {
+            SqlOutcome::AlterTable(o) => assert_eq!(o.table_name, TABLE),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    assert_eq!(
+        code_of(&core, &mut session, "ALTER TABLE docs DROP COLUMN note"),
+        "42703"
+    );
 }
 
 /// TABLE-40・Issue #1635・#1636: `SET DATA TYPE` は `TYPE` と同義で受理し、`USING` 付きは束縛・型検査

@@ -3632,7 +3632,7 @@ fn bind_where_predicates_recursive(
     )?;
     if !generated.is_empty() {
         let mut gen_ordinal = 0usize;
-        let (gen_meta, gen_expr, _gen_rls, gen_or) = bind_where_predicates_recursive(
+        let (gen_meta, gen_expr, gen_rls, gen_or) = bind_where_predicates_recursive(
             &generated,
             schema,
             udfs,
@@ -3651,6 +3651,9 @@ fn bind_where_predicates_recursive(
         metadata_filters.extend(gen_meta);
         expr_filters.extend(gen_expr);
         or_filters.extend(gen_or);
+        // 生成葉の `visible()` の有無も取りこぼさない（Issue #3257。捨てると可視性の絞り込みが
+        // 呼び出し元へ伝わらない fail-open の芽になる）。
+        rls_predicate_present |= gen_rls;
     }
     Ok((
         metadata_filters,
@@ -4338,6 +4341,11 @@ pub(crate) fn fill_omitted_columns(
         if is_provided {
             continue;
         }
+        // 生成列（TABLE-50・Issue #3328）は印も DEFAULT も付けずに飛ばす。値は書き込み txn 内で
+        // 行の通常列が確定した後に計算される（`tenant` の計算点。NOT NULL の生成列も計算後に検査する）。
+        if column.generated.is_some() {
+            continue;
+        }
         match &column.default_expr {
             Some(ColumnDefault::Sequence(_) | ColumnDefault::Identity { .. }) => {
                 // 採番は書き込み txn 内（台帳照合の後）で行う。仮値 `Null` を置いて印だけ運ぶ
@@ -4529,6 +4537,13 @@ pub(crate) fn bind_column_default(
 /// スキーマだけで決まり、テナントの状態・SEQUENCE カタログを引かない（存在オラクルにならない）。
 /// COPY は PostgreSQL と同じく IDENTITY 列へ入力値をそのまま書くため呼ばない。
 pub(crate) fn reject_generated_always_value(column: &ColumnDef) -> Result<(), SqlSurfaceError> {
+    // 生成列（TABLE-50・Issue #3328）への値の指定も同じ `428C9`（`DEFAULT` だけが受理される）。
+    // 7 つの束縛経路がこの 1 か所を共有する。
+    if column.generated.is_some() {
+        return Err(SqlSurfaceError::GeneratedAlways {
+            column: column.name.clone(),
+        });
+    }
     if column
         .default_expr
         .as_ref()
@@ -5264,6 +5279,11 @@ pub(crate) fn bind_set_assignments(
         // `SET col = DEFAULT`（SQL-50・Issue #1746）。GENERATED ALWAYS の判定より前に解決し、
         // IDENTITY／SEQUENCE／時刻関数の DEFAULT は `bind_set_default` が `0A000` で拒否する。
         if matches!(set_value, crate::sql::allowlist::SetValue::Default) {
+            // 生成列への `DEFAULT` は受理して何も代入しない（式は決定的で、参照列が変わる行では
+            // 計算点が再計算し、変わらない行では値が同じ。TABLE-50・Issue #3328）。
+            if column.generated.is_some() {
+                continue;
+            }
             bound_exprs.push((
                 col_idx,
                 crate::sql::set_expr::bind_set_default(&schema.name, name, column)?,
@@ -6625,6 +6645,9 @@ fn bind_upsert_form(
         return Err(reject_sequence_call_literal());
     }
 
+    // 生成列（TABLE-50・Issue #3328）は行の通常列が確定した後に計算される。束縛段の文内重複検査と
+    // `EXCLUDED` の NULL 検査は、仮値 NULL ではなく計算後の値で行う。
+    let computed = generated_proposed_values(&rows, schema);
     let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     seen_ids
         .try_reserve(rows.len())
@@ -6651,8 +6674,12 @@ fn bind_upsert_form(
         seen_keys.try_reserve(rows.len()).map_err(|_| {
             SqlSurfaceError::payload_too_large("failed to reserve UPSERT target key set")
         })?;
-        for row in &rows {
-            let Some(key) = crate::constraint::unique_key_from_values(indices, &row.values)
+        for (row_idx, row) in rows.iter().enumerate() {
+            // 生成列を含む対象キーは計算後の値で見る（計算できなかった行は実行段の再検査に委ねる）。
+            let Some(values) = effective_values(row, &computed, row_idx) else {
+                continue;
+            };
+            let Some(key) = crate::constraint::unique_key_from_values(indices, values)
                 .map_err(SqlSurfaceError::invalid_input)?
             else {
                 continue;
@@ -6678,7 +6705,7 @@ fn bind_upsert_form(
             if !condition.is_empty() {
                 crate::sql::upsert_where::CompiledUpsertWhere::compile(condition, schema)?;
             }
-            check_excluded_not_null(&rows, &bound_assignments, schema)?;
+            check_excluded_not_null(&rows, &computed, &bound_assignments, schema)?;
             BoundConflictAction::DoUpdate {
                 assignments: bound_assignments,
                 condition: condition.clone(),
@@ -6695,6 +6722,53 @@ fn bind_upsert_form(
     }))
 }
 
+/// UPSERT の提案行ごとに、生成列（TABLE-50・Issue #3328）を計算した後の値の列を返す（束縛段の検査専用。
+/// [`BoundInsert::values`] は変えない。書き込みの計算は実行段が行う）。生成列の無い表は空の `Vec`。
+/// 計算できない行（式の評価失敗・カタログ漂流）は `None` で、実行段が実際のエラーを返す。
+fn generated_proposed_values(
+    rows: &[BoundInsert],
+    schema: &TableSchema,
+) -> Vec<Option<Vec<crate::row_codec::Value>>> {
+    if !schema.columns.iter().any(|c| c.generated.is_some()) {
+        return Vec::new();
+    }
+    let Ok(Some(generated)) =
+        crate::sql::generated_column::CompiledGeneratedColumns::compile_any(schema)
+    else {
+        return rows.iter().map(|_| None).collect();
+    };
+    let vector_idx = schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, ColumnType::Vector(_)));
+    rows.iter()
+        .map(|row| {
+            let embedding: &[f32] = match vector_idx.and_then(|i| row.values.get(i)) {
+                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                _ => &[],
+            };
+            let mut values = row.values.clone();
+            generated
+                .compute_values(row.id, embedding, &mut values, None)
+                .ok()
+                .map(|_| values)
+        })
+        .collect()
+}
+
+/// `row`（`row_idx` 番目）の検査用の値列。生成列の無い表（`computed` が空）は行の値そのもの、
+/// ある表は [`generated_proposed_values`] の計算後の値（計算できなかった行は `None`）。
+fn effective_values<'a>(
+    row: &'a BoundInsert,
+    computed: &'a [Option<Vec<crate::row_codec::Value>>],
+    row_idx: usize,
+) -> Option<&'a [crate::row_codec::Value]> {
+    if computed.is_empty() {
+        return Some(row.values.as_slice());
+    }
+    computed.get(row_idx).and_then(|v| v.as_deref())
+}
+
 /// `EXCLUDED.<col>` が参照する値が `Null` かつ代入先の列が非 nullable の組を行ごとに検出し、
 /// 固定形式の `23502` で拒否する（[`bind_upsert_form`] と [`build_upsert_from_select_rows`] が共有）。
 ///
@@ -6706,16 +6780,22 @@ fn bind_upsert_form(
 /// （TABLE-16・TASK-204、Issue #904）。
 fn check_excluded_not_null(
     rows: &[BoundInsert],
+    computed: &[Option<Vec<crate::row_codec::Value>>],
     assignments: &[(usize, BoundUpsertValue)],
     schema: &TableSchema,
 ) -> Result<(), SqlSurfaceError> {
-    for row in rows {
+    for (row_idx, row) in rows.iter().enumerate() {
+        // 生成列を参照する `EXCLUDED` は計算後の値で判定する（Issue #3328）。計算できなかった行は
+        // 仮値 NULL で誤拒否せず、実行段（計算と NOT NULL 検査）に委ねる。
+        let Some(values) = effective_values(row, computed, row_idx) else {
+            continue;
+        };
         for (col_idx, value) in assignments {
             let BoundUpsertValue::Excluded(src_idx) = value else {
                 continue;
             };
             let is_null = matches!(
-                row.values.get(*src_idx),
+                values.get(*src_idx),
                 None | Some(crate::row_codec::Value::Null)
             );
             let target_nullable = schema
@@ -6807,17 +6887,28 @@ pub(crate) fn build_upsert_from_select_rows(
     let do_update = matches!(action, BoundConflictAction::DoUpdate { .. });
 
     // 重複判定の鍵は対象ごとに決める。`None` は「判定しない」（NULL を含むキー・対象省略）。
-    let key_of = |row: &BoundInsert| -> Result<Option<Vec<u8>>, SqlSurfaceError> {
+    // `row_computed` は生成列の計算後の値（`Some(None)` は計算できなかった行で、キー判定を飛ばす。
+    // 実行段の再検査が拾う。`None` は生成列の無い表）。
+    let key_of = |row: &BoundInsert,
+                  row_computed: Option<Option<&[crate::row_codec::Value]>>|
+     -> Result<Option<Vec<u8>>, SqlSurfaceError> {
         match &target {
             BoundConflictTarget::RowId => Ok(Some(row.id.to_be_bytes().to_vec())),
             BoundConflictTarget::Unique(indices) => {
-                crate::constraint::unique_key_from_values(indices, &row.values)
+                let values = match row_computed {
+                    None => row.values.as_slice(),
+                    Some(Some(v)) => v,
+                    Some(None) => return Ok(None),
+                };
+                crate::constraint::unique_key_from_values(indices, values)
                     .map_err(SqlSurfaceError::invalid_input)
             }
             BoundConflictTarget::AnyUnique => Ok(None),
         }
     };
 
+    // 生成列は計算後の値で重複・`EXCLUDED` を判定する（Issue #3328）。`computed` は `rows` と同じ並び。
+    let mut computed = generated_proposed_values(&rows, schema);
     let rows = if matches!(target, BoundConflictTarget::AnyUnique) {
         rows
     } else {
@@ -6829,8 +6920,10 @@ pub(crate) fn build_upsert_from_select_rows(
         kept.try_reserve_exact(rows.len()).map_err(|_| {
             SqlSurfaceError::payload_too_large("failed to reserve UPSERT row batch buffer")
         })?;
-        for row in rows {
-            if let Some(key) = key_of(&row)? {
+        let mut kept_computed: Vec<Option<Vec<crate::row_codec::Value>>> = Vec::new();
+        for (row_idx, row) in rows.into_iter().enumerate() {
+            let row_computed = computed.get_mut(row_idx).map(Option::take);
+            if let Some(key) = key_of(&row, row_computed.as_ref().map(|v| v.as_deref()))? {
                 if !seen.insert(key) {
                     if do_update {
                         return Err(SqlSurfaceError::upsert_cardinality_violation());
@@ -6840,12 +6933,16 @@ pub(crate) fn build_upsert_from_select_rows(
                 }
             }
             kept.push(row);
+            if let Some(c) = row_computed {
+                kept_computed.push(c);
+            }
         }
+        computed = kept_computed;
         kept
     };
 
     if let BoundConflictAction::DoUpdate { assignments, .. } = &action {
-        check_excluded_not_null(&rows, assignments, schema)?;
+        check_excluded_not_null(&rows, &computed, assignments, schema)?;
     }
     Ok(BoundUpsert {
         table: table.to_string(),

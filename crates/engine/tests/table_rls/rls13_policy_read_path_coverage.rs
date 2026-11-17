@@ -82,15 +82,15 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "column_rewrite.rs",
-        2,
+        3,
         Class::NonRead,
         "列の追加・削除・型変更に伴う行の書き換え（DDL）",
     ),
     (
         "constraint.rs",
-        22,
+        23,
         Class::NonRead,
-        "一意性・参照整合性・CHECK の検査。テナント内の全行で判定する（ポリシーで隠れた行も含む。親 #2272 の規則）",
+        "一意性・参照整合性・CHECK・生成列の照合（Issue #3328）の検査。テナント内の全行で判定する（ポリシーで隠れた行も含む。親 #2272 の規則）",
     ),
     (
         "constraint/referential_triggers.rs",

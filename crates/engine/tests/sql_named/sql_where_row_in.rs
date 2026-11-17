@@ -4,7 +4,8 @@
 //! 構文段が RowCompare の Or／連言へ脱糖した述語が、束縛段（`row_compare`）で既存の比較葉へ展開され
 //! PostgreSQL と同じ三値論理で評価されること、形の誤りの fail-closed、DML の副作用範囲、
 //! テナント境界を `EngineCore::execute_sql_in_session` 経由で固定する。
-//! `$n`・EXPLAIN 描画・RLS 越境の拡充は #3300、サブクエリ形・定義文脈は #3254 の対象外。
+//! 拡張クエリの `$n`（Issue #3300）の評価・EXPLAIN の展開形一致もここで固定する。RLS 越境は
+//! `table_rls` の `rls10_row_in_paths`。サブクエリ形・定義文脈は #3254 の対象外。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -406,9 +407,10 @@ fn row_in_in_other_paths_never_drops_the_predicate() {
     }
 }
 
-/// 定義文脈（POLICY・VIEW・部分索引・CHECK）では拒否のまま。`$n` は構文段で拒否（#3300 が扱う）。
+/// 定義文脈（POLICY・VIEW・部分索引・CHECK）では拒否のまま（受け皿は #3254）。
+/// 行値の IN の要素の成分の `$n` は #3300 で受理し、リテラル形と同じ行集合になる。
 #[test]
-fn row_in_is_rejected_in_definition_contexts_and_placeholders() {
+fn row_in_is_rejected_in_definition_contexts_and_accepts_placeholders() {
     let (path, _g) = setup("row-in-defs");
     let core = core_at(&path);
     for sql in [
@@ -424,8 +426,95 @@ fn row_in_is_rejected_in_definition_contexts_and_placeholders() {
         .execute_sql(&ctx("alice"), "SELECT id FROM t WHERE s = 'x' LIMIT 10")
         .expect("select after rejected definitions");
     assert_eq!(r.rows.len(), 3);
+    let prepared = core
+        .parse_sql_prepared("SELECT id FROM t WHERE (a, b) IN (($1, $2), ($3, $4)) LIMIT 10")
+        .expect("placeholders in row IN elements are accepted");
+    core.describe_prepared_in_session(&SessionState::default(), &prepared)
+        .expect("describe");
+    let v = |s: &str| Some(s.as_bytes().to_vec());
+    let bound = core
+        .bind_prepared(&prepared, &[v("1"), v("1"), v("3"), v("5")])
+        .expect("bind");
+    let mut s = SessionState::default();
+    let got = core
+        .execute_parsed_in_session(&ctx("alice"), &mut s, &bound)
+        .expect("execute");
+    let SqlOutcome::Query(r) = got else {
+        panic!("not a query")
+    };
+    let mut got_ids: Vec<u64> = r.rows.iter().map(|r| r.id).collect();
+    got_ids.sort_unstable();
+    assert_eq!(
+        got_ids,
+        ids(
+            &core,
+            "alice",
+            "SELECT id FROM t WHERE (a, b) IN ((1, 1), (3, 5)) LIMIT 10"
+        )
+    );
+    assert_eq!(got_ids, vec![1, 2]);
+}
+
+/// EXPLAIN は脱糖後の束縛結果から導かれる閉じた語彙の出力で、等価な展開形を手で書いた文の EXPLAIN と
+/// 完全に一致する（SQL-75・SQL-27 のポインタ。出力は値を含まない。DML は `filter: present`）。
+#[test]
+fn explain_of_row_in_equals_explain_of_the_expanded_form() {
+    let (path, _g) = setup("row-in-explain");
+    let core = core_at(&path);
+    let pairs = [
+        (
+            "(a, b) IN ((1, 1), (3, 5))",
+            "(a = 1 AND b = 1) OR (a = 3 AND b = 5)",
+        ),
+        (
+            "(a, b) NOT IN ((1, 1), (3, 5))",
+            "(a <> 1 OR b <> 1) AND (a <> 3 OR b <> 5)",
+        ),
+        ("(a, s) IN ((3, 'x'))", "a = 3 AND s = 'x'"),
+    ];
+    let prefixes = [
+        "EXPLAIN SELECT id FROM t WHERE ",
+        "EXPLAIN (FORMAT JSON) SELECT id FROM t WHERE ",
+        "EXPLAIN VERBOSE SELECT id FROM t WHERE ",
+        "EXPLAIN DELETE FROM t WHERE ",
+        "EXPLAIN UPDATE t SET s = 'z' WHERE ",
+    ];
+    for (row, expanded) in pairs {
+        for prefix in prefixes {
+            let tail = if prefix.contains("SELECT") {
+                " LIMIT 10"
+            } else {
+                ""
+            };
+            let a = run(&core, "alice", &format!("{prefix}{row}{tail}"));
+            let b = run(&core, "alice", &format!("{prefix}{expanded}{tail}"));
+            let (a, b) = (
+                a.unwrap_or_else(|e| panic!("{prefix}{row}: {e:?}")),
+                b.unwrap_or_else(|e| panic!("{prefix}{expanded}: {e:?}")),
+            );
+            assert_eq!(a, b, "{prefix}{row} vs {expanded}");
+            let text = format!("{a:?}");
+            assert!(!text.contains("'x'"), "{text}");
+            let bob = run(&core, "bob", &format!("{prefix}{row}{tail}")).expect("bob explain");
+            assert_eq!(a, bob, "{prefix}{row}: tenant-independent");
+        }
+    }
+    run(
+        &core,
+        "alice",
+        "EXPLAIN ANALYZE SELECT id FROM t WHERE (a, b) IN ((3, 5)) LIMIT 10",
+    )
+    .expect("explain analyze");
+}
+
+/// `$n` を含む行値の IN の EXPLAIN 前置は Parse で `42601`（fail-closed。パターン 12 と同じ扱い）。
+/// intentional: docs/design/wire-extended-query-param-binding.md
+#[test]
+fn explain_with_row_in_placeholders_is_rejected_at_parse() {
+    let (path, _g) = setup("row-in-explain-param");
+    let core = core_at(&path);
     let err = core
-        .parse_sql_prepared("SELECT id FROM t WHERE (a, b) IN (($1, $2)) LIMIT 10")
-        .expect_err("placeholders in a row value must be rejected");
+        .parse_sql_prepared("EXPLAIN SELECT id FROM t WHERE (a, b) IN (($1, $2)) LIMIT 10")
+        .expect_err("EXPLAIN with row IN placeholders is rejected");
     assert_eq!(err.wire_code(), "42601");
 }

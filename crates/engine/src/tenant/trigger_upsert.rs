@@ -88,6 +88,7 @@ pub(super) fn upsert_rows_with_triggers(
     insert_plan: Option<&RowTriggerPlan<'_>>,
     update_plan: Option<&RowTriggerPlan<'_>>,
     writes: &TriggerWriteHandle<'_>,
+    generated: Option<&crate::sql::generated_column::CompiledGeneratedColumns>,
 ) -> Result<TriggeredUpsert, TenantWriteError> {
     // 行数が 0 でも `row_security = off` の拒否を開始時点で適用する（RLS-13・Issue #2278）。
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
@@ -189,7 +190,7 @@ pub(super) fn upsert_rows_with_triggers(
             None => *id,
         };
         // BEFORE ROW INSERT（表ハンドルを開く前に発火する。再入の不変条件）。
-        let new_values: Vec<Value> = match insert_before {
+        let mut new_values: Vec<Value> = match insert_before {
             Some(plan) => {
                 let fired = crate::trigger::fire::fire_before_row_insert(
                     plan.runtime,
@@ -207,6 +208,15 @@ pub(super) fn upsert_rows_with_triggers(
             }
             None => values.to_vec(),
         };
+        // 生成列（TABLE-50・Issue #3329）は BEFORE ROW INSERT の後、NOT NULL 検査・INSERT 側ポリシー検査・
+        // 衝突判定・`EXCLUDED` 参照のいずれより前に、提案行の全生成列を計算する。
+        super::trigger_dml::apply_generated_columns(
+            generated,
+            schema,
+            insert_id,
+            &mut new_values,
+            None,
+        )?;
         let (embedding, metadata) = encode_final_row(schema, &new_values)?;
         // 提案行（BEFORE 適用後）への INSERT 側ポリシー検査。衝突判定より前（PostgreSQL と同順）。
         if let Some(checks) = policy_proposed.as_ref() {
@@ -352,15 +362,16 @@ pub(super) fn upsert_rows_with_triggers(
                 // 行う（通常の UPDATE と同順。BEFORE の NULL スキップ・NEW 書き換えを SET 検証が先回りで
                 // 拒否しない）。
                 let defer = update_before.is_some();
-                let (pre_image_values, merged_values, merged_embedding) = apply_upsert_assignments(
-                    schema,
-                    vector_idx,
-                    assignments,
-                    &new_values,
-                    &existing,
-                    write_id,
-                    defer,
-                )?;
+                let (pre_image_values, mut merged_values, merged_embedding) =
+                    apply_upsert_assignments(
+                        schema,
+                        vector_idx,
+                        assignments,
+                        &new_values,
+                        &existing,
+                        write_id,
+                        defer,
+                    )?;
                 let old_values = if update_before.is_some() || update_after.is_some() {
                     captured_values_from_parts(
                         schema,
@@ -384,6 +395,18 @@ pub(super) fn upsert_rows_with_triggers(
                     }
                 } else {
                     schema.validate_row_embedding_dim(merged_embedding.len())?;
+                    // BEFORE UPDATE が無ければ、SET の対象列に依存する生成列だけを再計算する（Issue #3329）。
+                    if let Some(g) = generated {
+                        let assigned: Vec<usize> =
+                            assignments.iter().map(|(idx, _)| *idx).collect();
+                        let only = g.affected(&assigned);
+                        g.compute_values(
+                            write_id,
+                            &merged_embedding,
+                            &mut merged_values,
+                            Some(&only),
+                        )?;
+                    }
                     let md = crate::row_codec::encode_scalar_columns(schema, &merged_values)
                         .map_err(|e| CatalogError::Invalid(e.to_string()))?;
                     if update_after.is_some() {
@@ -405,9 +428,17 @@ pub(super) fn upsert_rows_with_triggers(
                             new_candidate,
                         )
                         .map_err(TenantWriteError::TriggerFailed)?;
-                        let Some(final_row) = fired else {
+                        let Some(mut final_row) = fired else {
                             continue;
                         };
+                        // BEFORE UPDATE の後に全生成列を計算し直す（NOT NULL 検査・encode より前。Issue #3329）。
+                        super::trigger_dml::apply_generated_columns(
+                            generated,
+                            schema,
+                            write_id,
+                            &mut final_row,
+                            None,
+                        )?;
                         let (e, m) = encode_final_row(schema, &final_row)?;
                         (e, m, final_row)
                     }
@@ -562,7 +593,16 @@ pub(super) fn upsert_rows_with_triggers(
                     let updated_columns: Vec<usize> = if update_before.is_some() {
                         (0..schema.columns.len()).collect()
                     } else {
-                        assignments.iter().map(|(idx, _)| *idx).collect()
+                        let mut cols: Vec<usize> =
+                            assignments.iter().map(|(idx, _)| *idx).collect();
+                        // SET の対象列に依存して再計算された生成列も変更列として扱う（Issue #3329）。
+                        if let Some(g) = generated {
+                            let extra = g.affected(&cols);
+                            cols.extend(extra);
+                            cols.sort_unstable();
+                            cols.dedup();
+                        }
+                        cols
                     };
                     crate::constraint::enforce_referencing_rows_with_triggers_in_txn(
                         write_txn,

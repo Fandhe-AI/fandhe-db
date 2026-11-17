@@ -1,9 +1,11 @@
 //! LATERAL 派生表の構文受理と左側の列の束縛の結合テスト（SQL-62・Issue #3321、親 #3319）。
 //! ポインタ: SQL-60・SQL-61・TASK-344・RLS-10 (b)。設計記録 `docs/design/lateral-derived-table.md`。
 //!
-//! 外側参照の無い LATERAL は通常の派生表と同じ結果になり（L6）、左側の列を参照する形は束縛を通した
-//! あと専用文言の `0A000` で止まる（実行は #3322 以降）。不正な外側参照は束縛段で拒否し、予約内部名を
-//! エラー文に出さない。
+//! 外側参照の無い LATERAL は通常の派生表と同じ結果になり（L6）、左側の列を参照する INNER／CROSS／
+//! コンマの形は #3322 で外側の行ごとに再評価して実行する（結果は `sql62_lateral_exec.rs` が固定。
+//! 本ファイルは束縛を通ったあとの件数で確かめる）。`LEFT JOIN LATERAL` は #3323 で実行でき、RIGHT／FULL の
+//! 左側参照の `42P10` は `sql62_lateral_left.rs` が固定する。
+//! 不正な外側参照は束縛段で拒否し、予約内部名をエラー文に出さない。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -119,8 +121,6 @@ fn exec_err(core: &EngineCore, tenant: &str, sql: &str) -> SqlSurfaceError {
         .expect_err("must be rejected")
 }
 
-const CORRELATED_MSG: &str = "LATERAL subqueries referencing outer columns are not supported yet";
-
 #[test]
 fn uncorrelated_lateral_matches_plain_derived_table() {
     let (core, _g) = open();
@@ -190,42 +190,77 @@ fn trailing_semicolon_gives_the_same_result() {
         let b = query(&core, "alice", &format!("{base};")).expect(base);
         assert_eq!(render(&a), render(&b), "{base}");
     }
-    // 外側参照のある形も末尾 `;` で束縛を通り、同じ専用文言で止まる。
-    let c = "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true";
-    assert_eq!(
-        err_pair(&core, "alice", c),
-        err_pair(&core, "alice", &format!("{c};"))
-    );
+    // 外側参照のある形（#3322 で実行できる）も、末尾 `;` の有無で結果が一致する。
+    let c = "SELECT d.id FROM docs d JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true ORDER BY d.id";
+    let a = query(&core, "alice", c).expect(c);
+    let b = query(&core, "alice", &format!("{c};")).expect(c);
+    assert_eq!(render(&a), render(&b));
+    assert_eq!(a.rows.len(), 26);
 }
 
-// tracked: #3322, #3323
+/// 左側の列を参照する INNER／CROSS／コンマの形は実行でき、件数は PostgreSQL の意味論どおり
+/// （alice は ja 5 行・en 1 行、carol は private 行が見えず ja 4 行・en 1 行）。
 #[test]
-fn correlated_forms_pass_binding_and_stop_with_the_dedicated_message() {
+fn correlated_forms_execute_with_the_expected_row_counts() {
     let (core, _g) = open();
-    for sql in [
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t",
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t(c)",
-        "SELECT * FROM docs d CROSS JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t",
-        "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
-        "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
-        "SELECT * FROM docs d LEFT OUTER JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
-        // 非修飾の外側参照（`lang` は内側にもあるため内側優先。内側に無い `body` を使う）。
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.body) t",
+    for (sql, alice, carol) in [
+        (
+            "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t",
+            26usize,
+            17usize,
+        ),
+        (
+            "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t(c)",
+            26,
+            17,
+        ),
+        (
+            "SELECT * FROM docs d CROSS JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t",
+            26,
+            17,
+        ),
+        (
+            "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
+            26,
+            17,
+        ),
+        // 非修飾の外側参照（`lang` は内側にもあるため内側優先。内側に無い `body` を使う）。`body` は
+        // 全行 `b` で `lang` と一致しないため 0 行。
+        (
+            "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.body) t",
+            0,
+            0,
+        ),
         // 左側が CTE で、外側の列を完全に非修飾で参照する（`only_c` は内側の `docs` に無い）。
-        "WITH c(only_c) AS (SELECT lang FROM docs) SELECT * FROM c, LATERAL (SELECT lang FROM docs WHERE lang = only_c) t",
+        (
+            "WITH c(only_c) AS (SELECT lang FROM docs) SELECT * FROM c, LATERAL (SELECT lang FROM docs WHERE lang = only_c) t",
+            26,
+            17,
+        ),
         // AND／OR／括弧の中。
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = 'ja' AND (x.body = d.body OR x.lang = 'en')) t",
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang OR x.lang = 'en') t",
+        (
+            "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = 'ja' AND (x.body = d.body OR x.lang = 'en')) t",
+            30,
+            20,
+        ),
+        (
+            "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang OR x.lang = 'en') t",
+            31,
+            21,
+        ),
         // 左側が 2 relation。
-        "SELECT * FROM docs a, docs b, LATERAL (SELECT lang FROM docs x WHERE x.lang = b.lang) t",
+        (
+            "SELECT * FROM docs a, docs b, LATERAL (SELECT lang FROM docs x WHERE x.lang = b.lang) t",
+            156,
+            85,
+        ),
     ] {
-        for tenant in ["alice", "carol"] {
-            let (c, m) = err_pair(&core, tenant, sql);
-            assert_eq!(c, "0A000", "{sql}");
-            assert!(m.ends_with(CORRELATED_MSG), "{sql}: {m}");
+        for (tenant, expected) in [("alice", alice), ("carol", carol)] {
+            let r = query(&core, tenant, sql).unwrap_or_else(|e| panic!("{sql} ({tenant}): {e}"));
+            assert_eq!(r.rows.len(), expected, "{sql} ({tenant})");
         }
     }
-    // 副作用なし: 拒否の前後で件数が変わらない。
+    // 副作用なし: 実行の前後で件数が変わらない。
     assert_eq!(
         query(&core, "alice", "SELECT * FROM docs")
             .expect("count")
@@ -235,8 +270,28 @@ fn correlated_forms_pass_binding_and_stop_with_the_dedicated_message() {
     );
 }
 
-/// 暗黙 rowid の `id` は内側・左側のどちらでも列として束縛できる（`42703` にしない）。
-// tracked: #3322, #3323
+/// 左側を参照する `LEFT JOIN LATERAL ... ON true` は束縛を通って実行され、全外側行が内側に一致する形では
+/// `JOIN LATERAL ... ON true` と同じ結果になる（#3323。NULL 補完の値は `sql62_lateral_left.rs` が固定）。
+#[test]
+fn correlated_left_join_lateral_executes_like_the_inner_form_when_every_row_matches() {
+    let (core, _g) = open();
+    let inner = "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true";
+    for sql in [
+        "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
+        "SELECT * FROM docs d LEFT OUTER JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
+    ] {
+        for tenant in ["alice", "carol"] {
+            let l = query(&core, tenant, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let i = query(&core, tenant, inner).expect("inner form");
+            assert!(!l.rows.is_empty(), "{sql}");
+            assert_eq!(l.rows.len(), i.rows.len(), "{tenant}: {sql}");
+        }
+    }
+}
+
+/// 暗黙 rowid の `id` は内側・左側のどちらでも列として束縛できる（`42703` にしない）。型の合わない比較
+/// （`bigint` と `text`）は内部エラーにならず、テナントに依らない `42883` で拒否される（PostgreSQL 17.12 の
+/// 実機で同じ型の組が `42883` になることを確認済み）。
 #[test]
 fn implicit_id_binds_on_inner_and_left_sides() {
     let (core, _g) = open();
@@ -247,23 +302,48 @@ fn implicit_id_binds_on_inner_and_left_sides() {
         // 左側の `id` を外側参照する。
         "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.id) t",
     ] {
-        let (c, m) = err_pair(&core, "alice", sql);
-        assert_eq!(c, "0A000", "{sql}: {m}");
-        assert!(m.ends_with(CORRELATED_MSG), "{sql}: {m}");
+        let a = err_pair(&core, "alice", sql);
+        assert_eq!(a, err_pair(&core, "carol", sql), "{sql}");
+        assert_eq!(a.0, "42883", "{sql}: {}", a.1);
+        assert!(!a.1.contains('\u{2}'), "{sql}: {}", a.1);
     }
+    // 同じ型どうし（`id` 対 `id`）の比較は実行できる。
+    let r = query(
+        &core,
+        "alice",
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.id = d.id) t",
+    )
+    .expect("id = id");
+    assert_eq!(r.rows.len(), 6);
 }
 
-// tracked: #3323
+/// 左側を参照しない `LEFT JOIN LATERAL` は通常の派生表の LEFT JOIN として実行され、内側が空なら外側の全行が
+/// NULL 補完で残る（#3323。L6）。
 #[test]
-fn uncorrelated_left_join_lateral_is_a_dedicated_0a000() {
+fn uncorrelated_left_join_lateral_executes_as_a_plain_left_join() {
     let (core, _g) = open();
-    let (c, m) = err_pair(
+    let outer = query(&core, "alice", "SELECT * FROM docs d")
+        .expect("outer")
+        .rows
+        .len();
+    let full = query(
         &core,
         "alice",
         "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs) t ON true",
-    );
-    assert_eq!(c, "0A000");
-    assert!(m.ends_with("LEFT JOIN LATERAL is not supported yet"), "{m}");
+    )
+    .expect("left join");
+    assert_eq!(full.rows.len(), outer * outer);
+    let empty = query(
+        &core,
+        "alice",
+        "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs WHERE lang = 'zz') t ON true",
+    )
+    .expect("empty inner");
+    assert_eq!(empty.rows.len(), outer);
+    assert!(empty
+        .rows
+        .iter()
+        .all(|r| matches!(r.cells.last(), Some(engine::sql::exec::Cell::Null))));
 }
 
 #[test]
@@ -325,7 +405,7 @@ fn binding_errors_are_identical_across_tenants_and_hide_internal_names() {
     for sql in [
         "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.nope) t",
         "SELECT * FROM docs a, LATERAL (SELECT lang FROM docs x WHERE x.lang = z.lang) t",
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t",
+        "SELECT * FROM docs d RIGHT JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
     ] {
         let a = err_pair(&core, "alice", sql);
         let c = err_pair(&core, "carol", sql);
@@ -338,30 +418,10 @@ fn binding_errors_are_identical_across_tenants_and_hide_internal_names() {
     }
 }
 
-// tracked: #3322, #3323, #3324
-#[test]
-fn unsupported_lateral_shapes_stay_fail_closed() {
+/// LATERAL の拒否固定の共通検査: 全形が `0A000` で、拒否の後も表の内容が変わらない。
+fn assert_all_0a000(sqls: &[&str]) {
     let (core, _g) = open();
-    for sql in [
-        // 外側参照を置けない位置。
-        "SELECT * FROM docs d, LATERAL (SELECT d.lang FROM docs x) t",
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x ORDER BY d.lang) t",
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang IN (SELECT lang FROM docs y WHERE y.lang = d.lang)) t",
-        // 入れ子の LATERAL・RIGHT／FULL／NATURAL。
-        "SELECT * FROM (SELECT lang FROM docs a, LATERAL (SELECT lang FROM docs) b) t",
-        "SELECT * FROM docs d RIGHT JOIN LATERAL (SELECT lang FROM docs) t ON true",
-        "SELECT * FROM docs d FULL JOIN LATERAL (SELECT lang FROM docs) t ON true",
-        "SELECT * FROM docs d NATURAL JOIN LATERAL (SELECT lang FROM docs) t",
-        // 本文が SELECT 以外。
-        "SELECT * FROM docs d, LATERAL (VALUES (1)) t",
-        "SELECT * FROM docs d, LATERAL (WITH c AS (SELECT lang FROM docs) SELECT lang FROM c) t",
-        // EXPLAIN。
-        "EXPLAIN SELECT * FROM docs d, LATERAL (SELECT lang FROM docs) t",
-        // 別名なし（先頭以外）。
-        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs)",
-        // 書き込みを伴う CTE は書き込みなしで拒否される。
-        "WITH w AS (DELETE FROM docs WHERE lang = 'en' RETURNING id) SELECT * FROM docs d, LATERAL (SELECT lang FROM docs) t",
-    ] {
+    for sql in sqls {
         assert_eq!(code(&core, "alice", sql), "0A000", "{sql}");
     }
     assert_eq!(
@@ -373,9 +433,57 @@ fn unsupported_lateral_shapes_stay_fail_closed() {
     );
 }
 
+// 外側参照は本文の WHERE の連言にだけ置ける（L5）。投影・ORDER BY・部分クエリの内側は固定 `0A000`。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn outer_references_outside_where_stay_fail_closed() {
+    assert_all_0a000(&[
+        "SELECT * FROM docs d, LATERAL (SELECT d.lang FROM docs x) t",
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x ORDER BY d.lang) t",
+        "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang IN (SELECT lang FROM docs y WHERE y.lang = d.lang)) t",
+    ]);
+}
+
+// 派生表の本文は単一の関係に限る（JOIN を持つ本文が無い）ため、派生表の本文の中の LATERAL は固定 `0A000`。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_inside_a_derived_table_body_stays_fail_closed() {
+    assert_all_0a000(&[
+        "SELECT * FROM (SELECT lang FROM docs a, LATERAL (SELECT lang FROM docs) b) t",
+    ]);
+}
+
+// LATERAL の本文は SELECT に限る（VALUES・WITH は単一の関係へ写せない）。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_bodies_other_than_select_stay_fail_closed() {
+    assert_all_0a000(&[
+        "SELECT * FROM docs d, LATERAL (VALUES (1)) t",
+        "SELECT * FROM docs d, LATERAL (WITH c AS (SELECT lang FROM docs) SELECT lang FROM c) t",
+    ]);
+}
+
+// 別名なしの LATERAL は、複数リレーションの FROM では公開名が内部名になるため受け付けない。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_without_alias_stays_fail_closed() {
+    assert_all_0a000(&["SELECT * FROM docs d, LATERAL (SELECT lang FROM docs)"]);
+}
+
+// 書き込みを伴う CTE は、書き込みを発生させないよう書き込みなしで拒否される。
+// intentional: docs/design/lateral-derived-table.md
+#[test]
+fn lateral_with_data_modifying_cte_stays_fail_closed() {
+    assert_all_0a000(&[
+        "WITH w AS (DELETE FROM docs WHERE lang = 'en' RETURNING id) SELECT * FROM docs d, LATERAL (SELECT lang FROM docs) t",
+    ]);
+}
+
 /// 受理しない入口（cursor・COPY・CTAS・ビュー本文）は従来どおり拒否され、書き込みは起きない
 /// （設計記録 L17。LATERAL を受理しない入口の `wire_code` は派生表を置いた場合と同じ）。
-// tracked: #3324
+/// ビュー本文は、左側を持つ JOIN 本文だけを受理する（`sql62_lateral_view.rs`）。単一 FROM の LATERAL は
+/// 従来どおり拒否する。
+// intentional: docs/design/lateral-derived-table.md
 #[test]
 fn lateral_in_other_entry_points_is_rejected() {
     let (core, _g) = open();
