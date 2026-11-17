@@ -270,10 +270,6 @@ fn derived_table_syntax_and_resolution_errors() {
             "42601",
         ),
         ("SELECT * FROM (SELECT lang FROM docs;) t", "42601"),
-        (
-            "SELECT * FROM LATERAL (SELECT lang FROM docs) t",
-            UNSUPPORTED,
-        ),
     ] {
         assert_eq!(code(&core, "alice", sql), expected, "{sql}");
     }
@@ -285,6 +281,9 @@ fn derived_table_in_join_positions() {
     for sql in [
         "SELECT * FROM docs d JOIN (SELECT lang FROM docs) t ON d.lang = t.lang",
         "SELECT * FROM docs d, (SELECT lang FROM docs) t",
+        // Issue #3321: 外側参照の無い LATERAL は通常の派生表と同じ位置で受理される。
+        "SELECT * FROM LATERAL (SELECT lang FROM docs) t",
+        "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs) t ON true",
         "SELECT * FROM (SELECT lang FROM docs) a JOIN (SELECT body FROM docs) b ON a.lang = b.body",
     ] {
         assert!(query(&core, "alice", sql).is_ok(), "{sql}");

@@ -349,16 +349,25 @@ fn materialization_cap_counts_only_visible_rows() {
 #[test]
 fn unsupported_shapes_stay_fail_closed() {
     let (core, _g) = open_seeded();
-    for (sql, expected) in [
-        ("SELECT * FROM LATERAL (SELECT lang FROM docs) t", "0A000"),
-        // 単一の派生表の EXPLAIN は Issue #2048 で受理（`sql75_explain_cte_subquery.rs`）。
-        (
-            "SELECT * FROM (SELECT lang FROM docs) t WHERE lang IN (SELECT lang FROM docs)",
-            "42601",
-        ),
-    ] {
-        assert_eq!(code(&core, "alice", sql), expected, "{sql}");
-    }
+    // 単一の派生表の EXPLAIN は Issue #2048 で受理（`sql75_explain_cte_subquery.rs`）。
+    let sql = "SELECT * FROM (SELECT lang FROM docs) t WHERE lang IN (SELECT lang FROM docs)";
+    assert_eq!(code(&core, "alice", sql), "42601", "{sql}");
+}
+
+/// Issue #3321: 外側参照の無い `FROM LATERAL (SELECT ...)` は通常の派生表と同じ結果になる
+/// （以前は固定 `0A000`。外側参照のある形は `sql62_lateral_bind.rs`）。
+#[test]
+fn lateral_without_outer_reference_runs_like_a_derived_table() {
+    let (core, _g) = open_seeded();
+    let lateral = query(
+        &core,
+        "alice",
+        "SELECT * FROM LATERAL (SELECT lang FROM docs) t",
+    )
+    .expect("lateral");
+    let plain = query(&core, "alice", "SELECT * FROM (SELECT lang FROM docs) t").expect("plain");
+    assert_eq!(render(&lateral), render(&plain));
+    assert!(!lateral.rows.is_empty());
 }
 
 #[test]

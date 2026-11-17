@@ -129,8 +129,8 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   判定順は 修飾語・hold の構文（`42601`）→ 内側 SELECT の構造検証 → `WITH HOLD`／`BINARY` の `0A000`
   （構文が壊れた文は常に構文エラー）。`0A000` は構文解析段で返るため、Tx 内では `Failed` になる。
   **意図した PG17 との差**: (1) 指定なしは `NO SCROLL` と同じで、PG が計画により許す逆方向を許さない。
-  (2) 矛盾指定は PG17 では `42P11`（invalid_cursor_definition）だが、ErrorClass を新設せず `42601` で拒否する
-  （突き合わせは #3337）。
+  (2) 矛盾指定は PG17 17.11 の実測で `42P11`（invalid_cursor_definition）だが、ErrorClass を新設せず
+  `42601` で拒否する（Issue #3337 で実測。一覧は後述「PG17 との意図した差」）。
 - **末尾の `;`（Issue #3171）**: `FETCH`・`CLOSE` は末尾の単一 `;` を受理する（`sql::lexer::strip_one_trailing_semicolon`）。`;;` は `42601`。`DECLARE` は内側 SELECT の検証が末尾 `;` を 1 個受理する。判断は [explicit-transaction.md](explicit-transaction.md) の「末尾 `;` の扱い」節。
 - **`DECLARE` のカタログ照合の遅延とビュー**: 構文解析段（`core.rs::parse_tokens`）
   は内側 `SELECT` の構造検証のみを行い、カタログを参照しない（トランザクション
@@ -321,22 +321,24 @@ N を行数、p を現在位置とし、「行 t を返す」は 1 ≦ t ≦ N �
 | `RELATIVE k`（k<0） | p.saturating_sub(\|k\|) | 行 t |
 | 件数 0 | p のまま | 1 ≦ p ≦ N なら行 p、それ以外は 0 行 |
 
-NO SCROLL のカーソルで `55000`（位置は変えない）にする条件は次のとおり（PG17 の portal 実行から導いた判定）。
+NO SCROLL のカーソルで `55000`（位置は変えない）にする条件は次のとおり。PostgreSQL 17.11 の実測
+（`crates/engine/tests/data/cursor_directions_pg17.tsv` の 700 ケース）と全件一致を確認済み（Issue #3337）。
 
 | 向き | NO SCROLL での扱い |
 | ---- | ------------------ |
 | `PRIOR`・`BACKWARD`（件数なし・n・0・ALL）・`FORWARD -n`・`FETCH -n`・`RELATIVE -n`・`ABSOLUTE -n`（`LAST` を含む） | 常に `55000` |
-| `FETCH 0`・`FORWARD 0`・`RELATIVE 0` | 1 ≦ p ≦ N（行の上）なら `55000`、それ以外は 0 行で受理 |
-| `ABSOLUTE k`（k>0。`FIRST` を含む） | p ≦ N かつ k > p なら受理、それ以外（末尾の後を含む）は `55000` |
+| `FETCH 0`・`FORWARD 0`・`RELATIVE 0`（`FETCH` のみ。`MOVE` は後述） | 1 ≦ p ≦ N（行の上）なら `55000`、それ以外は 0 行で受理 |
+| `ABSOLUTE k`（k>0。`FIRST` を含む） | k > p なら受理、k ≦ p なら `55000`（末尾の後 p = N+1 では k ≦ N+1 が `55000`、k ≧ N+2 は 0 行で受理） |
 | `ABSOLUTE 0` | p == 0 なら受理（0 行）、それ以外は `55000` |
 | `NEXT`・`n`・`FORWARD n`・`ALL`・`RELATIVE k`（k>0）・`BACKWARD -n` | 常に受理 |
 
 判定順は 構文と件数（`42601`／`22000`。構文解析段）→ カーソルの不在（`34000`）→ NO SCROLL（`55000`）→
 `ALL` の行数上限（`54000`）→ 位置の更新と行の切り出し。いずれの拒否でも位置は変えない。
 
-- **未検証**: 件数 0・`ABSOLUTE k` が現在位置以前・末尾の後からの `ABSOLUTE` を NO SCROLL で拒否する境界は
-  PG17 のソースからの導出で、実機では未確認。迷う境界は拒否側（fail-closed）に倒している。突き合わせは
-  #3337 の PG17 突き合わせ表で行う。
+- **PG17 実測で是正した境界（Issue #3337）**: 当初は PG17 のソースからの導出で拒否側に倒していた次の 2 点を、
+  実測に合わせて受理へ変えた。(1) 末尾の後からの `ABSOLUTE k`（k ≧ N+2）は 0 行で受理（`FETCH`・`MOVE` 共通）。
+  (2) `MOVE` の件数 0 と先頭の前の `MOVE BACKWARD ALL` は NO SCROLL でも受理（後述）。`FETCH` の
+  件数 0（行の上）・`FETCH BACKWARD ALL`（先頭の前を含む）は PG17 でも `55000` のまま。
 - **Issue の方針の行との差**: Issue 本文の方針は NO SCROLL の 6 つの向きを一律に `55000` と読めるが、仕様
   （WIRE-27 (2)）と PG17 は「後ろへ戻る取得」だけを拒否する。前方向の `RELATIVE k`（k>0）や先の位置への
   `ABSOLUTE` は NO SCROLL でも受理する。
@@ -346,9 +348,12 @@ NO SCROLL のカーソルで `55000`（位置は変えない）にする条件�
 `CursorRegistry::move_cursor(name, FetchDirection) -> u64` が `fetch` と同じ前段（不在 `34000`→
 NO SCROLL の後退走査 `55000`。共通の private 関数）と同じ `plan`／`apply` で位置だけを動かす。
 行は複製しないので `ALL` の行数上限（`54000`）は適用しない（結果メモリが増えない）。いずれの拒否でも位置は変えない。
-NO SCROLL の境界は `FETCH` と同じ判定で、`MOVE` 専用の例外は作らない。
+NO SCROLL の境界は `FETCH` と同じ判定だが、PG17 17.11 の実測に合わせて次の `MOVE` だけ例外にする
+（Issue #3337）: 件数 0 の向き（`MOVE 0`・`FORWARD 0`・`RELATIVE 0`・`BACKWARD 0`）は走査せず位置を変えないため
+NO SCROLL でも受理し、タグは行の上なら `MOVE 1`・それ以外は `MOVE 0`。先頭の前の `MOVE BACKWARD ALL` も
+受理（`MOVE 0`）。不在 `34000` の検査は先に行う。
 
-タグの n は「同じ向きの `FETCH` が返す行数」（PG17 の portal 実行の意味論から導いた期待値）。N=5・位置 0 からの例:
+タグの n は「同じ向きの `FETCH` が返す行数」（PG17 17.11 の実測と一致）。N=5・位置 0 からの例:
 
 | 文 | タグ |
 | -- | ---- |
@@ -361,7 +366,23 @@ NO SCROLL の境界は `FETCH` と同じ判定で、`MOVE` 専用の例外は作
 | 末尾の後から `MOVE BACKWARD ALL` | `MOVE 5` |
 | 行の上で `MOVE RELATIVE 0`（SCROLL） | `MOVE 1` |
 
-- **未検証**: 上のタグ件数と NO SCROLL の境界は PG17 実機では確認していない。突き合わせは #3337 で行う。
+- 上のタグ件数と NO SCROLL の境界は PG17 17.11 の実測と一致を確認済み（照合は
+  `crates/engine/tests/sql_named/sql_cursor_pg17_parity.rs`）。
+
+#### PG17 との意図した差（Issue #3337）
+
+| 形 | PG17 17.11 の実測 | 本実装 | 理由・受け皿 |
+| -- | ----------------- | ------ | ------------ |
+| 指定なしのカーソルの逆方向 | 計画次第で許す | NO SCROLL と同じ（`55000`） | 計画に依存しない決定的な挙動にする |
+| `SCROLL` と `NO SCROLL`・`INSENSITIVE` と `ASENSITIVE` の併記 | `42P11` | `42601` | ErrorClass を新設しない |
+| 同名カーソルの再 `DECLARE` | `42P03` | `22000` | 既存の契約 |
+| `WITH HOLD` | 受理 | `0A000` | 受け皿 #3340 |
+| `BINARY` | 受理 | `0A000` | 意図した拒否（上記） |
+| `FROM`／`IN` の省略（`FETCH c`・`MOVE c`） | 受理（`NEXT`） | `42601` | 受け皿 #3333 |
+| カーソル自身の実行が `55000` で失敗した後の `ROLLBACK TO` | そのカーソルは使えなくなる（以降 `55000`） | 位置を保って使い続けられる | 既存の契約（SQL-69 (5)・WIRE-27 (2) のポインタ先）を維持。PG17 に合わせるかは spec 側の判断事項 |
+
+- 他の形（SCROLL・NO SCROLL × 向き × 位置 × `FETCH`／`MOVE`）に差は無い。
+- 別の文のエラー後の `ROLLBACK TO`、SCROLL カーソルの位置が `ROLLBACK TO` で戻らないことは PG17 と一致する。
 
 ## 対象外・申し送り
 
