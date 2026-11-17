@@ -1693,6 +1693,10 @@ impl ParamLayout {
 /// パターン 7 の式セグメント（`sql::param_infer` が型推論に使う）を返す。
 /// [`infer_param_positions`] の `ParamPosition::InExpr(i)` の `i` は本戻り値の添字。
 pub(crate) fn expr_param_segments(tokens: &[Token]) -> Vec<ExprSegment> {
+    // `MERGE` は式の内側の `$n` を受理しない（Issue #3352。`sql::params_merge`）。
+    if crate::sql::allowlist::looks_like_merge(tokens) {
+        return Vec::new();
+    }
     ParamLayout::build(tokens).segments
 }
 
@@ -1704,6 +1708,11 @@ pub(crate) fn expr_param_segments(tokens: &[Token]) -> Vec<ExprSegment> {
 /// - `$n` の番号が [`MAX_PARAMS`] を超える場合は
 ///   [`SqlSurfaceError::payload_too_large`]（`54000`）。
 pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError> {
+    // SQL-79・Issue #3352: `MERGE` は `WHEN` 句ごとに SET／VALUES を持つため、専用の走査に閉じる
+    // （汎用の位置規則は広げない。他の文の判定は変えない）。
+    if crate::sql::allowlist::looks_like_merge(tokens) {
+        return crate::sql::params_merge::validate(tokens);
+    }
     // WIRE-15・TASK-218: カーソル（`DECLARE`/`FETCH`/`CLOSE`）は `$n` 束縛を
     // 本バージョンのスコープ外として一律拒否する（fail-closed。範囲を縮小）。
     // 特に `DECLARE ... FOR SELECT ... WHERE col = $1` は、後段のパターン 4
@@ -1990,6 +1999,14 @@ pub(crate) enum ParamPosition {
     /// `INSERT ... ON CONFLICT ... DO UPDATE SET <列> = <列> + $n` の代入先列名
     /// （Issue #2427・SQL-49）。型は INSERT 対象表の当該列から決める。
     UpsertAddColumn(String),
+    /// `MERGE ... WHEN ... THEN UPDATE SET <列> = $n` の対象の列名（Issue #3352。`sql::params_merge`）。
+    MergeSetColumn(String),
+    /// `MERGE ... WHEN ... THEN INSERT [(<列>, ...)] VALUES (...)` の値（Issue #3352）。`columns` は句の
+    /// 列リスト（省略は `None`＝対象表の `*` 展開）、`index` は値の序数（0 始まり）。
+    MergeInsertValue {
+        columns: Option<Vec<String>>,
+        index: usize,
+    },
 }
 
 /// `$n` の型公告（`ParameterDescription` の OID 決定と、バイナリ受理可否の
@@ -2512,6 +2529,18 @@ fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
 /// [`values_region_bounds`] を共有）。
 pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<Vec<ParamPosition>> {
     let mut out: Vec<Vec<ParamPosition>> = vec![Vec::new(); usize::from(param_count)];
+    // `MERGE`（Issue #3352）: 許可位置の分類は専用の走査が返す。それ以外（`USING OPERATION_ID $n`）は `Text`。
+    if crate::sql::allowlist::looks_like_merge(tokens) {
+        let positions = crate::sql::params_merge::param_positions(tokens);
+        for (i, token) in tokens.iter().enumerate() {
+            let Token::Param(n) = token else { continue };
+            let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
+                continue;
+            };
+            slot.push(positions.get(&i).cloned().unwrap_or(ParamPosition::Text));
+        }
+        return out;
+    }
     let where_bounds = where_region(tokens);
     let joined_dml = is_joined_dml(tokens);
     let layout = ParamLayout::build(tokens);

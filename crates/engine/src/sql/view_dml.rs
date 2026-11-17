@@ -129,6 +129,42 @@ fn resolve_for_write(
     }
 }
 
+/// `MERGE` の対象がビューのときの解決結果（Issue #3352）。束縛段（`sql::merge_bind`）が、単独のビュー
+/// 書き込みと同じ規則（自動更新可能性 → 連鎖の解決）で基底表・述語・公開列を得る入口。行・台帳には触れない。
+pub(crate) struct MergeTargetView {
+    /// 連鎖を辿った先の実表名。
+    pub(crate) base_table: String,
+    /// ビュー定義由来の述語（基底表の物理列名。内側の段が先）。
+    pub(crate) view_predicates: Vec<WherePredicate>,
+    /// ビューの公開列（`None` は全列）。
+    pub(crate) view_columns: Option<Vec<String>>,
+    /// 列別名の写像（`Some` は本 Issue では `0A000`。束縛段が判定する）。
+    pub(crate) has_column_map: bool,
+    /// 利用者列を公開名 `id` で公開しているか。
+    pub(crate) exposes_user_column_as_id: bool,
+    /// `WITH CHECK OPTION` の検査対象の述語（#3353 以降の実行段が使う）。
+    pub(crate) check_predicates: Vec<Vec<WherePredicate>>,
+    /// 基底表が採番方式か。
+    pub(crate) base_allocated: bool,
+}
+
+/// `MERGE` の対象ビューを書き込み用に解決する（自動更新できなければ `55000`。Issue #3352）。
+pub(crate) fn resolve_merge_target(
+    lookup: &impl TableLookup,
+    view_name: &str,
+) -> Result<MergeTargetView, SqlSurfaceError> {
+    let rv = resolve_for_write(lookup, view_name, ViewWriteOp::Merge)?;
+    Ok(MergeTargetView {
+        exposes_user_column_as_id: rv.exposes_user_column_as_id(),
+        has_column_map: rv.column_map.is_some(),
+        base_table: rv.base_table,
+        view_predicates: rv.view_predicates,
+        view_columns: rv.view_columns,
+        check_predicates: rv.check_predicates,
+        base_allocated: rv.base_allocated,
+    })
+}
+
 /// `PARTITIONED` 修飾はビュー経由では未対応（固定文言。fail-closed）。
 fn reject_partitioned() -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported("PARTITIONED is not supported on views")

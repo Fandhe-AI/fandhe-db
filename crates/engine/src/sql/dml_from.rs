@@ -187,6 +187,26 @@ pub(crate) fn build_scope<'a>(
     other_schemas: &[&'a TableSchema],
     other_visible: &[Option<Vec<String>>],
 ) -> Result<BindingScope<'a>, SqlSurfaceError> {
+    build_scope_with_target_visible(
+        target,
+        target_schema,
+        None,
+        others,
+        other_schemas,
+        other_visible,
+    )
+}
+
+/// [`build_scope`] の対象の可視列つき版（Issue #3352。`MERGE` の対象がビューのとき、ビューの公開列だけを
+/// 対象側へ見せる）。`target_visible` が `None` なら対象は制限なし（従来どおり）。
+pub(crate) fn build_scope_with_target_visible<'a>(
+    target: &TableRef,
+    target_schema: &'a TableSchema,
+    target_visible: Option<Vec<String>>,
+    others: &[TableRef],
+    other_schemas: &[&'a TableSchema],
+    other_visible: &[Option<Vec<String>>],
+) -> Result<BindingScope<'a>, SqlSurfaceError> {
     if others.len() != other_schemas.len() {
         return Err(SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
@@ -218,7 +238,7 @@ pub(crate) fn build_scope<'a>(
         }
     }
     // 先頭（対象表）は制限なし。FROM／USING 側はビューの公開列だけを見せる（Issue #3292）。
-    let visible = std::iter::once(None)
+    let visible = std::iter::once(target_visible)
         .chain(other_visible.iter().cloned())
         .collect();
     Ok(BindingScope::new(relations)?.with_visible(visible))
@@ -265,7 +285,7 @@ fn bind_join_steps(
 }
 
 /// `WHERE` の論理木が参照する列を出現順に集め、スコープで解決する。
-fn resolve_where_columns(
+pub(crate) fn resolve_where_columns(
     scope: &BindingScope<'_>,
     where_clause: Option<&JoinWhereExpr>,
 ) -> Result<Vec<ResolvedColumn>, SqlSurfaceError> {
@@ -301,7 +321,7 @@ fn resolve_where_columns(
 
 /// SET 左辺の列を対象表のスキーマで検査し、列添字を返す（`bind_set_assignments` と同じ規則。
 /// 右辺が列参照の項目は `bind_set_assignments` を通らないため、ここで同じ検査を行う）。
-fn check_set_target(name: &str, schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
+pub(crate) fn check_set_target(name: &str, schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
     if (name == "id" && schema.has_pseudo_id()) || name == "tenant_id" || name == "visibility" {
         return Err(SqlSurfaceError::unsupported(format!(
             "column {name:?} cannot be targeted by SET"
@@ -496,7 +516,7 @@ pub(crate) fn bind_update_from_describe(
 }
 
 /// 対象表（relation 0）の解決結果の列名。疑似列 `id` は `"id"`。範囲外は `Internal`（fail-closed）。
-fn target_slot_name(
+pub(crate) fn target_slot_name(
     resolved: &ResolvedColumn,
     schema: &TableSchema,
 ) -> Result<String, SqlSurfaceError> {

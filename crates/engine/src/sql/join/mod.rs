@@ -60,6 +60,7 @@ pub(crate) mod dml_plan;
 mod dml_residual;
 mod exec;
 mod explain;
+pub(crate) mod merge_check;
 mod nlj;
 mod on_split;
 mod plan;

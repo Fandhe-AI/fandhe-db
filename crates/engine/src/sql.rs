@@ -189,6 +189,7 @@ pub mod declarative_predicate;
 pub(crate) mod derived_table;
 pub(crate) mod describe;
 pub mod dml_from;
+// MERGE の束縛（SQL-79・Issue #3352）。
 pub(crate) mod embedded_unit;
 pub(crate) mod function_scan;
 #[cfg(test)]
@@ -199,6 +200,7 @@ pub(crate) mod int8vec_knn;
 pub(crate) mod interval_arith;
 pub(crate) mod json_agg;
 pub(crate) mod matview;
+pub mod merge_bind;
 pub mod record_text;
 pub(crate) mod recursive_cte;
 pub(crate) mod recursive_eval;
@@ -291,6 +293,8 @@ pub(crate) mod order_value;
 pub(crate) mod param_coerce;
 pub(crate) mod param_infer;
 pub mod params;
+// MERGE の `$n` 位置規則・型推論入力・Describe 用ダミーフラグ（SQL-79・Issue #3352）。
+pub(crate) mod params_merge;
 pub mod parser;
 pub mod partitioned;
 pub(crate) mod pk_point;

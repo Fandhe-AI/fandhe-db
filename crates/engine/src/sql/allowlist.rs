@@ -935,6 +935,8 @@ pub enum ViewWriteOp {
     Update,
     /// `DELETE`。
     Delete,
+    /// `MERGE`（Issue #3352。対象がビューの束縛。`sql::merge_bind`）。
+    Merge,
 }
 
 /// ビューが自動更新可能でない理由（TABLE-43・Issue #1670）。`sql::view_updatable` の判定結果で、
@@ -2393,6 +2395,7 @@ impl std::fmt::Display for SqlSurfaceError {
                 ViewWriteOp::Insert => write!(f, "cannot insert into view"),
                 ViewWriteOp::Update => write!(f, "cannot update view"),
                 ViewWriteOp::Delete => write!(f, "cannot delete from view"),
+                ViewWriteOp::Merge => write!(f, "cannot merge into view"),
             },
             SqlSurfaceError::TransactionFeatureNotSupported { detail } => {
                 write!(f, "not supported inside an explicit transaction: {detail}")
