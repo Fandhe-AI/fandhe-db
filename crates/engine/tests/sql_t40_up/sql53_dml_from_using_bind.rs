@@ -489,12 +489,12 @@ fn rejected_forms_fail_closed_with_expected_codes() {
             "UPDATE docs SET lang = 'a', lang = 'b' FROM langs WHERE docs.lang = langs.lang",
             "22000",
         ),
-        // 公開名の重複
+        // 公開名の重複（PG の `duplicate_alias`。Issue #3297）
         (
             "UPDATE docs SET lang = 'x' FROM docs WHERE docs.lang = docs.lang",
-            "42601",
+            "42712",
         ),
-        ("DELETE FROM docs USING docs WHERE docs.id = docs.id", "42601"),
+        ("DELETE FROM docs USING docs WHERE docs.id = docs.id", "42712"),
         // FROM／USING 側の表が存在しない・対象表が存在しない
         (
             "UPDATE docs SET lang = 'x' FROM nope WHERE docs.lang = nope.lang",
@@ -869,14 +869,21 @@ fn explicit_transaction_executes_and_respects_commit_and_rollback() {
     assert!(doc_rows(&core).contains("\"x\""), "{}", doc_rows(&core));
 }
 
-/// 拡張クエリの Parse は `$n` を含む FROM／USING 形を `42601` で拒否する。
+/// 拡張クエリの Parse は WHERE の TEXT 列への `= $n`（Issue #3297）を受理し、IN・RETURNING 等の
+/// 未対応位置は `42601` で拒否する（fail-closed）。詳細な受理形は `sql53_dml_from_using_params`。
 #[test]
-fn prepared_parse_rejects_bind_parameters() {
+fn prepared_parse_accepts_supported_bind_parameters_only() {
     let (core, path) = new_core("sql53-from-prepared", false);
     let _g = CleanupGuard(path);
     for sql in [
         "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = $1",
         "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND langs.label = $1",
+    ] {
+        core.parse_sql_prepared(sql).expect(sql);
+    }
+    for sql in [
+        "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang AND langs.label IN ($1)",
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING $1",
     ] {
         assert_eq!(code(core.parse_sql_prepared(sql)), "42601", "{sql}");
     }

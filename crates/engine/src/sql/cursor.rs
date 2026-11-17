@@ -1,7 +1,8 @@
 //! カーソル（`DECLARE`/`FETCH`/`CLOSE`。WIRE-15・TASK-218）の構文受理と
 //! セッション内保持状態を提供する。
 //!
-//! 責務境界: `DECLARE <name> CURSOR FOR <SELECT>` の内側 SELECT（集計
+//! 責務境界: `DECLARE <name> [SCROLL | NO SCROLL | INSENSITIVE | ASENSITIVE]... CURSOR
+//! [WITHOUT HOLD] FOR <SELECT>` の内側 SELECT（集計
 //! `SELECT`〔SQL-13・SQL-14〕・広域取得 `SELECT`〔SQL-15〕・JOIN〔CTE 入力を含む〕・集合演算に限る）の
 //! 構造検証は既存の [`crate::sql::allowlist::validate_cursor_query_tokens`] へそのまま委譲する
 //! （第 2 のパーサを作らない設計）。本モジュールは
@@ -12,7 +13,7 @@
 //!
 //! カーソルの実体は `DECLARE` 実行時点で内側 SELECT を 1 回だけ実行して
 //! 確定させた行集合であり（INSENSITIVE。以降の自トランザクションの書き込みで
-//! 内容が変わらない）、`FETCH` は先頭からの払い出し位置を進めるだけで
+//! 内容が変わらない）、`FETCH` は 0〜N+1 の位置（`CursorPosition`）を動かして行を払い出すだけで
 //! 検索本体を再実行しない。カーソルの寿命はトランザクションの寿命に一致し、
 //! [`crate::sql::transaction::ActiveTxn`] に埋め込まれるため、`COMMIT`／
 //! `ROLLBACK`／`fail`／期限切れ／接続断のいずれでも自動的に消える（`Drop`
@@ -43,6 +44,18 @@ pub enum FetchCount {
     All,
 }
 
+/// `DECLARE` の `SCROLL`／`NO SCROLL` 指定（Issue #3334・WIRE-27 (2)）。指定なしは
+/// [`CursorScroll::NoScroll`] と同じ扱い（PG は計画により指定なしでも逆方向を許すが、
+/// 本 DB は許さない。意図した差。`docs/design/sql-cursor.md` 参照）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CursorScroll {
+    /// 前方向のみ（`NO SCROLL`・指定なし）。逆方向の取得は `55000`。
+    #[default]
+    NoScroll,
+    /// 逆方向の取得を許す（`SCROLL`）。
+    Scroll,
+}
+
 /// `DECLARE`/`FETCH`/`CLOSE`（許可リスト検証済み。TASK-218・WIRE-15）。
 ///
 /// `Declare` の `query` は集計 `SELECT`（[`Statement::Aggregate`]）・広域取得
@@ -61,6 +74,8 @@ pub enum CursorStatement {
         /// codex P1 対応: 構造検証段の結果を保持すると、ビュー名がテーブル名と
         /// して残り実行時に `UndefinedTable` になるため）。
         query: Vec<Token>,
+        /// `SCROLL`／`NO SCROLL` 指定（指定なしは [`CursorScroll::NoScroll`]）。
+        scroll: CursorScroll,
     },
     Fetch {
         name: String,
@@ -104,11 +119,15 @@ fn expect_contextual_ident<'a>(
     }
 }
 
-/// `DECLARE <name> CURSOR FOR <SELECT>`（規範形のみ。`SCROLL`／`NO SCROLL`／
-/// `BINARY`／`INSENSITIVE`／`ASENSITIVE`／`WITH HOLD`／`WITHOUT HOLD` はいずれも
-/// 未対応構文として `42601` へ落ちる——`name` の直後が必ず `CURSOR` であることを
-/// 要求する構造上、これらの修飾語が割り込むと `expect_contextual_ident` が
-/// 失敗する）。`FOR` より後ろのトークン列は再トークナイズせず
+/// `DECLARE <name> [SCROLL | NO SCROLL | INSENSITIVE | ASENSITIVE | BINARY]...
+/// CURSOR [WITH HOLD | WITHOUT HOLD] FOR <SELECT>`（Issue #3334・WIRE-27。PG17 の文法順）。
+///
+/// 修飾語の扱い: `SCROLL`／`NO SCROLL` は [`CursorScroll`] へ、`INSENSITIVE`／`ASENSITIVE`／
+/// `WITHOUT HOLD` は受理して何もしない（もともと INSENSITIVE。同じ修飾語の重複は冪等）。
+/// `SCROLL` と `NO SCROLL`、`INSENSITIVE` と `ASENSITIVE` の併記および構文の誤りは `42601`
+/// （PG17 の `42P11` との差は `docs/design/sql-cursor.md` 参照）。`WITH HOLD`・`BINARY` は
+/// `0A000`（未対応。fail-closed）。判定順は 修飾語・hold の構文 → 内側 SELECT の構造検証 →
+/// `0A000`（構文が壊れた文は常に構文エラー）。`FOR` より後ろのトークン列は再トークナイズせず
 /// [`crate::sql::allowlist::validate_sql_tokens`] へそのまま渡す（`validate_insert_tokens`
 /// 等と同じ「トークン列を受け取る本体」の方針）。
 ///
@@ -132,15 +151,93 @@ pub(crate) fn validate_declare_tokens(
         return Err(SqlSurfaceError::unsupported("malformed DECLARE statement"));
     };
     let name = validate_cursor_name(raw_name)?;
-    let rest = expect_contextual_ident(rest, "CURSOR")?;
+    let (options, rest) = parse_declare_options(rest)?;
+    let (with_hold, rest) = parse_declare_hold(rest)?;
     let rest = expect_contextual_ident(rest, "FOR")?;
     // 構造検証のみ（結果の `Statement` は保持しない。実カタログでの再検証は
     // `Active` 内の実行時に [`validate_declare_inner`] で行う）。
     validate_declare_inner(rest, lookup, limits)?;
+    if with_hold {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "WITH HOLD cursors are not supported",
+        ));
+    }
+    if options.binary {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "BINARY cursors are not supported",
+        ));
+    }
     Ok(CursorStatement::Declare {
         name,
         query: rest.to_vec(),
+        scroll: options.scroll.unwrap_or_default(),
     })
+}
+
+/// `CURSOR` の前に並ぶ修飾語の解析結果（[`parse_declare_options`] 用）。
+#[derive(Default)]
+struct DeclareOptions {
+    scroll: Option<CursorScroll>,
+    insensitivity: Option<bool>,
+    binary: bool,
+}
+
+/// `DECLARE <name>` の直後から `CURSOR` までの修飾語を読み、`CURSOR` の次のトークン列を返す
+/// （[`validate_declare_tokens`] から呼ばれる）。許可リスト照合のみで、トークンの再結合・
+/// 再トークナイズはしない。矛盾指定・未知の語・`CURSOR` 不在は `42601`。
+fn parse_declare_options(
+    mut rest: &[Token],
+) -> Result<(DeclareOptions, &[Token]), SqlSurfaceError> {
+    let malformed = || SqlSurfaceError::unsupported("malformed DECLARE statement");
+    let conflict = || SqlSurfaceError::unsupported("conflicting DECLARE cursor options");
+    let mut opts = DeclareOptions::default();
+    loop {
+        let Some((Token::Ident(word), tail)) = rest.split_first() else {
+            return Err(malformed());
+        };
+        rest = tail;
+        if word.eq_ignore_ascii_case("CURSOR") {
+            return Ok((opts, rest));
+        }
+        if word.eq_ignore_ascii_case("SCROLL") {
+            if opts.scroll == Some(CursorScroll::NoScroll) {
+                return Err(conflict());
+            }
+            opts.scroll = Some(CursorScroll::Scroll);
+        } else if word.eq_ignore_ascii_case("NO") {
+            rest = expect_contextual_ident(rest, "SCROLL")?;
+            if opts.scroll == Some(CursorScroll::Scroll) {
+                return Err(conflict());
+            }
+            opts.scroll = Some(CursorScroll::NoScroll);
+        } else if word.eq_ignore_ascii_case("INSENSITIVE")
+            || word.eq_ignore_ascii_case("ASENSITIVE")
+        {
+            let insensitive = word.eq_ignore_ascii_case("INSENSITIVE");
+            if opts.insensitivity.is_some_and(|prev| prev != insensitive) {
+                return Err(conflict());
+            }
+            opts.insensitivity = Some(insensitive);
+        } else if word.eq_ignore_ascii_case("BINARY") {
+            opts.binary = true;
+        } else {
+            return Err(malformed());
+        }
+    }
+}
+
+/// `CURSOR` の直後の `WITH HOLD`／`WITHOUT HOLD`（省略可）を読み、保持指定の有無と残りの
+/// トークン列を返す。`WITH`／`WITHOUT` の後に `HOLD` が無い場合は `42601`。
+fn parse_declare_hold(rest: &[Token]) -> Result<(bool, &[Token]), SqlSurfaceError> {
+    match rest.split_first() {
+        Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case("WITH") => {
+            Ok((true, expect_contextual_ident(tail, "HOLD")?))
+        }
+        Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case("WITHOUT") => {
+            Ok((false, expect_contextual_ident(tail, "HOLD")?))
+        }
+        _ => Ok((false, rest)),
+    }
 }
 
 /// `DECLARE` の内側 SELECT（`FOR` より後ろのトークン列）を
@@ -388,16 +485,70 @@ pub(crate) fn estimate_result_bytes(result: &QueryResult) -> usize {
     })
 }
 
-/// `cursor` の現在位置から `end`（排他）までを複製して払い出し、位置を `end` へ進める。
+/// カーソルの位置（Issue #3334・WIRE-27 (5)(6)）。行数 `len`（N）に対し `0..=len+1` の値を取り、
+/// `0` は先頭の前、`k`（1..=N）は k 行目の上、`N+1` は末尾の後を表す。
+///
+/// 不変条件: `pos <= len + 1`。すべての遷移は `saturating_*`・`min` で行い、範囲外へ出ない。
+/// [`CursorRegistry`] の `fetch` 系が使う内部状態で、行集合の複製を持たない（O(1)）。
+#[derive(Debug, Clone, Copy)]
+struct CursorPosition {
+    pos: usize,
+    len: usize,
+}
+
+impl CursorPosition {
+    /// 先頭の前（位置 0）から始める。
+    fn new(len: usize) -> Self {
+        Self { pos: 0, len }
+    }
+
+    /// 現在位置（`0..=len+1`）。
+    fn get(&self) -> usize {
+        self.pos
+    }
+
+    /// 前方向に最大 `n` 行進み、返す行の添字範囲（0 始まり）を返す。`p+n <= N` なら位置は
+    /// `p+n`、それ以外（末尾を越える要求）は `N+1`。
+    fn forward(&mut self, n: usize) -> std::ops::Range<usize> {
+        let start = self.pos.min(self.len);
+        let want = self.pos.saturating_add(n);
+        let end = want.min(self.len);
+        self.pos = if want <= self.len {
+            want
+        } else {
+            self.len.saturating_add(1)
+        };
+        start..end
+    }
+
+    /// 残り全行を返し、位置を `N+1` へ進める。
+    fn forward_all(&mut self) -> std::ops::Range<usize> {
+        let start = self.pos.min(self.len);
+        self.pos = self.len.saturating_add(1);
+        start..self.len
+    }
+
+    /// 逆方向に最大 `n` 行戻り、返す行の添字範囲（0 始まり・昇順。呼び出し側が降順に並べる）を
+    /// 返す。新しい位置は `p.saturating_sub(n)`。`p` が 0 または 1 なら 0 行。
+    /// `N+1` からは N 行目から返す。
+    // #3335（FETCH の向き）が結線するまではテストからのみ呼ばれる。
+    #[allow(dead_code)]
+    fn backward(&mut self, n: usize) -> std::ops::Range<usize> {
+        let old = self.pos.min(self.len.saturating_add(1));
+        let new = old.saturating_sub(n);
+        self.pos = new;
+        // 位置 p は「p 行目の上」なので、戻って返す行は p-1 行目（添字 p-2）から
+        // max(new,1) 行目（添字 max(new,1)-1）まで。添字範囲は [max(new,1)-1, p-1)。
+        let hi = old.saturating_sub(1).min(self.len);
+        let lo = new.max(1).saturating_sub(1).min(hi);
+        lo..hi
+    }
+}
+
+/// `cursor` の払い出し範囲 `range`（行の添字）を複製して返す。範囲外は空。
 /// [`CursorRegistry::fetch`]／[`CursorRegistry::fetch_all`] が共有する切り出し処理。
-fn take_rows(cursor: &mut OpenCursor, end: usize) -> QueryResult {
-    let rows = cursor
-        .result
-        .rows
-        .get(cursor.next_row..end)
-        .unwrap_or(&[])
-        .to_vec();
-    cursor.next_row = end;
+fn take_rows(cursor: &OpenCursor, range: std::ops::Range<usize>) -> QueryResult {
+    let rows = cursor.result.rows.get(range).unwrap_or(&[]).to_vec();
     QueryResult {
         columns: cursor.result.columns.clone(),
         rows,
@@ -408,9 +559,10 @@ fn take_rows(cursor: &mut OpenCursor, end: usize) -> QueryResult {
 #[derive(Debug)]
 struct OpenCursor {
     result: QueryResult,
-    /// 次回 `FETCH` が返す先頭行の添字（末尾に達したら
-    /// `result.rows.len()` に一致し、以降の `FETCH` は常に 0 行を返す）。
-    next_row: usize,
+    /// 0〜N+1 の位置（[`CursorPosition`]）。末尾の後（N+1）以降の前方向 `FETCH` は常に 0 行。
+    position: CursorPosition,
+    /// `SCROLL` 指定（逆方向の取得の可否。バイト課金には影響しない。WIRE-27 (5)）。
+    scroll: CursorScroll,
     /// [`estimate_result_bytes`] によるこのカーソルの概算バイト数
     /// （`CursorRegistry::total_bytes` から差し引くために保持する）。
     bytes: usize,
@@ -484,6 +636,7 @@ impl CursorRegistry {
         &mut self,
         name: String,
         result: QueryResult,
+        scroll: CursorScroll,
     ) -> Result<(), SqlSurfaceError> {
         self.check_can_declare(&name)?;
         let bytes = estimate_result_bytes(&result);
@@ -501,8 +654,9 @@ impl CursorRegistry {
         self.cursors.insert(
             name,
             OpenCursor {
+                position: CursorPosition::new(result.rows.len()),
                 result,
-                next_row: 0,
+                scroll,
                 bytes,
                 id,
             },
@@ -531,9 +685,8 @@ impl CursorRegistry {
             .cursors
             .get_mut(name)
             .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
-        let total_rows = cursor.result.rows.len();
-        let end = cursor.next_row.saturating_add(count).min(total_rows);
-        Ok(take_rows(cursor, end))
+        let range = cursor.position.forward(count);
+        Ok(take_rows(cursor, range))
     }
 
     /// `name` のカーソルから残り全行を払い出し、位置を末尾へ進める（`FETCH ALL`・
@@ -551,12 +704,50 @@ impl CursorRegistry {
             .get_mut(name)
             .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
         let total_rows = cursor.result.rows.len();
-        if total_rows.saturating_sub(cursor.next_row) > max_rows {
+        if total_rows.saturating_sub(cursor.position.get().min(total_rows)) > max_rows {
             return Err(SqlSurfaceError::payload_too_large(
                 "result exceeds the row limit",
             ));
         }
-        Ok(take_rows(cursor, total_rows))
+        let range = cursor.position.forward_all();
+        Ok(take_rows(cursor, range))
+    }
+
+    /// `name` のカーソルから逆方向に最大 `count` 行（`All` は先頭まで）を降順で払い出す
+    /// （Issue #3334・WIRE-27 (2)）。判定順は 不在は `34000` → 非 SCROLL は `55000`
+    /// （位置不変）→ `All` の戻り行数が `max_rows` 超なら `54000`（位置不変）。
+    /// #3335（FETCH の向き）が SQL 構文を結線する。
+    // #3335 が結線するまではテストからのみ呼ばれる。
+    #[allow(dead_code)]
+    pub(crate) fn fetch_backward(
+        &mut self,
+        name: &str,
+        count: FetchCount,
+        max_rows: usize,
+    ) -> Result<QueryResult, SqlSurfaceError> {
+        let cursor = self
+            .cursors
+            .get_mut(name)
+            .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
+        if cursor.scroll != CursorScroll::Scroll {
+            return Err(SqlSurfaceError::CursorCanOnlyScanForward);
+        }
+        let n = match count {
+            FetchCount::Rows(n) => n,
+            FetchCount::All => {
+                let behind = cursor.position.get().saturating_sub(1);
+                if behind.min(cursor.result.rows.len()) > max_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "result exceeds the row limit",
+                    ));
+                }
+                usize::MAX
+            }
+        };
+        let range = cursor.position.backward(n);
+        let mut out = take_rows(cursor, range);
+        out.rows.reverse();
+        Ok(out)
     }
 
     /// `name` のカーソルが存在すれば、その結果列メタデータを返す（Describe
@@ -585,7 +776,7 @@ impl CursorRegistry {
     /// （`transaction.rs::restore_to_savepoint` から呼ばれる。Issue #1946・SQL-69 (5)）。
     ///
     /// 不変条件: `next_id` は戻さない（portal 束縛の `cursor_id` が再利用されず、閉じた
-    /// カーソルを指す portal は照合で必ず拒否される）。残るカーソルの取得位置も戻さない
+    /// カーソルを指す portal は照合で必ず拒否される）。残るカーソルの位置も戻さない
     /// （行集合は `DECLARE` 時点で確定済みで、巻き戻しの影響を受けない）。
     pub(crate) fn close_declared_since(&mut self, watermark: u64) {
         self.cursors.retain(|_, c| c.id < watermark);
@@ -645,7 +836,7 @@ mod tests {
         )
         .expect("scan form accepted");
         match stmt {
-            CursorStatement::Declare { name, query } => {
+            CursorStatement::Declare { name, query, .. } => {
                 assert_eq!(name, "c");
                 let inner = validate_declare_inner(&query, &FakeCatalog, Default::default())
                     .expect("inner revalidates");
@@ -751,16 +942,107 @@ mod tests {
         assert_eq!(err.wire_code(), "42601");
     }
 
+    fn declare_scroll_of(sql: &str) -> CursorScroll {
+        match validate_declare_tokens(&tokens_of(sql), &FakeCatalog, Default::default())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        {
+            CursorStatement::Declare { scroll, .. } => scroll,
+            _ => panic!("expected Declare"),
+        }
+    }
+
     #[test]
-    fn declare_rejects_scroll_and_with_hold_modifiers() {
+    fn declare_accepts_scroll_and_sensitivity_options() {
+        const Q: &str = "FOR SELECT id FROM documents LIMIT 1";
+        for (head, expected) in [
+            ("DECLARE c CURSOR", CursorScroll::NoScroll),
+            ("DECLARE c SCROLL CURSOR", CursorScroll::Scroll),
+            ("DECLARE c NO SCROLL CURSOR", CursorScroll::NoScroll),
+            ("declare c scroll cursor", CursorScroll::Scroll),
+            ("DECLARE c INSENSITIVE CURSOR", CursorScroll::NoScroll),
+            ("DECLARE c ASENSITIVE CURSOR", CursorScroll::NoScroll),
+            ("DECLARE c INSENSITIVE SCROLL CURSOR", CursorScroll::Scroll),
+            ("DECLARE c SCROLL ASENSITIVE CURSOR", CursorScroll::Scroll),
+            (
+                "DECLARE c NO SCROLL INSENSITIVE CURSOR",
+                CursorScroll::NoScroll,
+            ),
+            ("DECLARE c SCROLL SCROLL CURSOR", CursorScroll::Scroll),
+            (
+                "DECLARE c NO SCROLL NO SCROLL CURSOR",
+                CursorScroll::NoScroll,
+            ),
+            (
+                "DECLARE c INSENSITIVE INSENSITIVE CURSOR",
+                CursorScroll::NoScroll,
+            ),
+            ("DECLARE c CURSOR WITHOUT HOLD", CursorScroll::NoScroll),
+            ("DECLARE c SCROLL CURSOR WITHOUT HOLD", CursorScroll::Scroll),
+        ] {
+            assert_eq!(
+                declare_scroll_of(&format!("{head} {Q}")),
+                expected,
+                "{head}"
+            );
+            assert_eq!(
+                declare_scroll_of(&format!("{head} {Q};")),
+                expected,
+                "{head};"
+            );
+        }
+        // カーソル名が修飾語と同じ綴りでも名前の位置が先なので曖昧にならない。
+        assert_eq!(
+            declare_scroll_of(&format!("DECLARE scroll SCROLL CURSOR {Q}")),
+            CursorScroll::Scroll
+        );
+    }
+
+    // tracked: #3340
+    // intentional: docs/design/sql-cursor.md
+    #[test]
+    fn declare_rejects_with_hold_and_binary_with_0a000() {
         for sql in [
-            "DECLARE c SCROLL CURSOR FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c CURSOR WITH HOLD FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT id FROM documents LIMIT 1;",
             "DECLARE c BINARY CURSOR FOR SELECT id FROM documents LIMIT 1",
-            "DECLARE c INSENSITIVE CURSOR FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c BINARY SCROLL CURSOR FOR SELECT id FROM documents LIMIT 1",
         ] {
             let err = validate_declare_tokens(&tokens_of(sql), &FakeCatalog, Default::default())
-                .expect_err("rejected");
-            assert_eq!(err.wire_code(), "42601");
+                .expect_err(sql);
+            assert_eq!(err.wire_code(), "0A000", "{sql}");
+        }
+        // 構文が壊れた文は 0A000 より先に構文エラーになる。
+        let err = validate_declare_tokens(
+            &tokens_of("DECLARE c CURSOR WITH HOLD FOR SELECT nope"),
+            &FakeCatalog,
+            Default::default(),
+        )
+        .expect_err("malformed inner");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn declare_rejects_malformed_or_conflicting_options_with_42601() {
+        for sql in [
+            "DECLARE c NO CURSOR FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c NO FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c SCROLL NO SCROLL CURSOR FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c NO SCROLL SCROLL CURSOR FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c INSENSITIVE ASENSITIVE CURSOR FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c WITH HOLD CURSOR FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c CURSOR SCROLL FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c CURSOR WITH FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c CURSOR WITHOUT FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c CURSOR WITH HOLD WITHOUT HOLD FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c CURSOR WITH HOLD WITH HOLD FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c SCROLL FOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c SCROLL CURSOR SELECT id FROM documents LIMIT 1",
+            "DECLARE c SCROLL",
+            "DECLARE c FOO CURSOR FOR SELECT id FROM documents LIMIT 1",
+        ] {
+            let err = validate_declare_tokens(&tokens_of(sql), &FakeCatalog, Default::default())
+                .expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
         }
     }
 
@@ -896,17 +1178,21 @@ mod tests {
         };
         for i in 0..MAX_CURSORS_PER_SESSION {
             registry
-                .declare(format!("c{i}"), empty.clone())
+                .declare(format!("c{i}"), empty.clone(), CursorScroll::NoScroll)
                 .expect("within limit");
         }
         let err = registry
-            .declare("overflow".to_string(), empty.clone())
+            .declare(
+                "overflow".to_string(),
+                empty.clone(),
+                CursorScroll::NoScroll,
+            )
             .expect_err("count limit exceeded");
         assert_eq!(err.wire_code(), "54000");
 
         registry.close("c0").expect("close existing");
         registry
-            .declare("c0".to_string(), empty)
+            .declare("c0".to_string(), empty, CursorScroll::NoScroll)
             .expect("slot freed after close");
     }
 
@@ -925,15 +1211,21 @@ mod tests {
         };
         let mut registry = CursorRegistry::new();
         registry
-            .declare("old".to_string(), result(&[1, 2, 3]))
+            .declare(
+                "old".to_string(),
+                result(&[1, 2, 3]),
+                CursorScroll::NoScroll,
+            )
             .unwrap();
         registry.fetch("old", 1).unwrap();
         let old_bytes = registry.total_bytes;
         let watermark = registry.next_id();
         registry
-            .declare("new1".to_string(), result(&[4, 5]))
+            .declare("new1".to_string(), result(&[4, 5]), CursorScroll::NoScroll)
             .unwrap();
-        registry.declare("new2".to_string(), result(&[6])).unwrap();
+        registry
+            .declare("new2".to_string(), result(&[6]), CursorScroll::NoScroll)
+            .unwrap();
         let next_before = registry.next_id();
 
         registry.close_declared_since(watermark);
@@ -958,10 +1250,10 @@ mod tests {
             rows: vec![],
         };
         registry
-            .declare("c".to_string(), empty.clone())
+            .declare("c".to_string(), empty.clone(), CursorScroll::NoScroll)
             .expect("first declare");
         let err = registry
-            .declare("c".to_string(), empty)
+            .declare("c".to_string(), empty, CursorScroll::NoScroll)
             .expect_err("duplicate name rejected");
         assert_eq!(err.wire_code(), "22000");
     }
@@ -978,7 +1270,7 @@ mod tests {
             rows: vec![],
         };
         registry
-            .declare("c".to_string(), empty.clone())
+            .declare("c".to_string(), empty.clone(), CursorScroll::NoScroll)
             .expect("first declare");
         let first_id = registry.cursor_id("c").expect("cursor exists");
 
@@ -990,7 +1282,7 @@ mod tests {
         );
 
         registry
-            .declare("c".to_string(), empty)
+            .declare("c".to_string(), empty, CursorScroll::NoScroll)
             .expect("redeclare succeeds after close");
         let second_id = registry.cursor_id("c").expect("cursor exists again");
 
@@ -1021,6 +1313,7 @@ mod tests {
                     columns: vec![],
                     rows,
                 },
+                CursorScroll::NoScroll,
             )
             .expect("declare");
 
@@ -1056,6 +1349,7 @@ mod tests {
                     columns: vec![],
                     rows,
                 },
+                CursorScroll::NoScroll,
             )
             .expect("declare");
         registry
@@ -1152,5 +1446,184 @@ mod tests {
             let err = validate_fetch_tokens(&tokens_of(sql), &Default::default()).expect_err(sql);
             assert_eq!(err.wire_code(), "42601", "{sql}");
         }
+    }
+
+    fn rows_of(r: &QueryResult) -> Vec<u64> {
+        r.rows.iter().map(|x| x.id).collect()
+    }
+
+    /// 位置 1 始まりの素朴な参照モデル（PG の portal 位置の式。WIRE-27 (5)(6)）。
+    #[derive(Clone, Copy)]
+    enum Op {
+        Fwd(usize),
+        FwdAll,
+        Back(usize),
+    }
+
+    fn reference_step(pos: usize, len: usize, op: Op) -> (usize, Vec<usize>) {
+        // 戻り値は新しい位置と返す行番号（1 始まり・払い出し順）。
+        match op {
+            Op::Fwd(n) => {
+                let rows: Vec<usize> = (pos + 1..=(pos + n).min(len)).collect();
+                (if pos + n <= len { pos + n } else { len + 1 }, rows)
+            }
+            Op::FwdAll => ((len + 1), (pos + 1..=len).collect()),
+            Op::Back(n) => {
+                let new = pos.saturating_sub(n);
+                let mut rows = Vec::new();
+                let mut r = pos.saturating_sub(1);
+                while r >= new.max(1) && r >= 1 {
+                    rows.push(r);
+                    r -= 1;
+                }
+                (new, rows)
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_position_stays_within_bounds_and_matches_reference_model() {
+        let ops: Vec<Op> = (0..=7)
+            .map(Op::Fwd)
+            .chain(std::iter::once(Op::FwdAll))
+            .chain((0..=7).map(Op::Back))
+            .collect();
+        for len in 0..=5usize {
+            // 長さ 3 の全操作列を列挙する。
+            for a in &ops {
+                for b in &ops {
+                    for c in &ops {
+                        let mut p = CursorPosition::new(len);
+                        let mut model = 0usize;
+                        for op in [*a, *b, *c] {
+                            let (new_model, expect_rows) = reference_step(model, len, op);
+                            let range = match op {
+                                Op::Fwd(n) => p.forward(n),
+                                Op::FwdAll => p.forward_all(),
+                                Op::Back(n) => p.backward(n),
+                            };
+                            assert!(p.get() <= len + 1, "pos bound");
+                            assert!(range.start <= range.end && range.end <= len, "range");
+                            let mut got: Vec<usize> = range.map(|i| i + 1).collect();
+                            if matches!(op, Op::Back(_)) {
+                                got.reverse();
+                            }
+                            assert_eq!(got, expect_rows, "len={len}");
+                            assert_eq!(p.get(), new_model, "len={len}");
+                            model = new_model;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_position_boundary_examples() {
+        // N 行ちょうど取得した後は位置 N、続く FETCH は 0 行で位置 N+1。
+        let mut p = CursorPosition::new(3);
+        assert_eq!(p.forward(3), 0..3);
+        assert_eq!(p.get(), 3);
+        assert_eq!(p.forward(1), 3..3);
+        assert_eq!(p.get(), 4);
+        // N+1 からの backward(1) は N 行目（添字 2）。
+        assert_eq!(p.backward(1), 2..3);
+        assert_eq!(p.get(), 3);
+        // N=0 の forward は位置 1（= N+1）で 0 行。
+        let mut e = CursorPosition::new(0);
+        assert_eq!(e.forward(1), 0..0);
+        assert_eq!(e.get(), 1);
+        assert_eq!(e.backward(5), 0..0);
+        assert_eq!(e.get(), 0);
+    }
+
+    fn registry_with_scroll(n: i64, scroll: CursorScroll) -> CursorRegistry {
+        let mut registry = CursorRegistry::new();
+        let rows: Vec<crate::sql::exec::ResultRow> = (0..n)
+            .map(|i| crate::sql::exec::ResultRow {
+                id: i as _,
+                score: 0.0,
+                cells: vec![],
+            })
+            .collect();
+        registry
+            .declare(
+                "c".to_string(),
+                QueryResult {
+                    columns: vec![],
+                    rows,
+                },
+                scroll,
+            )
+            .expect("declare");
+        registry
+    }
+
+    #[test]
+    fn fetch_backward_on_no_scroll_is_55000_and_keeps_position() {
+        for scroll in [CursorScroll::NoScroll, CursorScroll::default()] {
+            let mut registry = registry_with_scroll(5, scroll);
+            registry.fetch("c", 2).expect("fetch");
+            for count in [FetchCount::Rows(1), FetchCount::All] {
+                let err = registry
+                    .fetch_backward("c", count, 100)
+                    .expect_err("no scroll");
+                assert_eq!(err.wire_code(), "55000");
+                assert_eq!(err.to_string(), "cursor can only scan forward");
+            }
+            assert_eq!(rows_of(&registry.fetch("c", 2).expect("next")), vec![2, 3]);
+        }
+    }
+
+    #[test]
+    fn fetch_backward_on_scroll_returns_rows_in_reverse() {
+        let mut registry = registry_with_scroll(5, CursorScroll::Scroll);
+        registry.fetch("c", 4).expect("fetch");
+        let back = registry
+            .fetch_backward("c", FetchCount::Rows(2), 100)
+            .expect("backward");
+        // 4 行取得後は 4 行目の上（位置 4）。戻ると 3 行目・2 行目（id 2・1）。
+        assert_eq!(rows_of(&back), vec![2, 1]);
+        let all = registry
+            .fetch_backward("c", FetchCount::All, 100)
+            .expect("backward all");
+        assert_eq!(rows_of(&all), vec![0]);
+        assert!(registry
+            .fetch_backward("c", FetchCount::Rows(1), 100)
+            .expect("at start")
+            .rows
+            .is_empty());
+        assert_eq!(rows_of(&registry.fetch("c", 1).expect("fwd")), vec![0]);
+    }
+
+    #[test]
+    fn fetch_backward_unknown_name_is_34000_before_55000() {
+        let mut registry = registry_with_scroll(1, CursorScroll::NoScroll);
+        let err = registry
+            .fetch_backward("nope", FetchCount::Rows(1), 10)
+            .expect_err("missing");
+        assert_eq!(err.wire_code(), "34000");
+    }
+
+    #[test]
+    fn fetch_backward_all_over_row_cap_is_54000_without_moving() {
+        let mut registry = registry_with_scroll(5, CursorScroll::Scroll);
+        registry.fetch_all("c", 10).expect("to end");
+        let err = registry
+            .fetch_backward("c", FetchCount::All, 2)
+            .expect_err("over cap");
+        assert_eq!(err.wire_code(), "54000");
+        let back = registry
+            .fetch_backward("c", FetchCount::Rows(1), 2)
+            .expect("still at end");
+        assert_eq!(rows_of(&back), vec![4]);
+    }
+
+    #[test]
+    fn scroll_and_no_scroll_charge_the_same_bytes() {
+        let a = registry_with_scroll(4, CursorScroll::Scroll);
+        let b = registry_with_scroll(4, CursorScroll::NoScroll);
+        assert_eq!(a.total_bytes, b.total_bytes);
+        assert_eq!(a.remaining_bytes(), b.remaining_bytes());
     }
 }

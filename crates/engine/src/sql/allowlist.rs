@@ -1143,6 +1143,9 @@ pub enum SqlSurfaceError {
     /// 未実体化の MATERIALIZED VIEW を読んだ（`55000`。TABLE-42・Issue #1664）。
     /// 文言は固定で、名前・件数・他文脈の情報を含めない。
     MaterializedViewNotPopulated,
+    /// 逆方向に移動できない（SCROLL でない）カーソルへ逆方向の取得を要求した（`55000`。
+    /// WIRE-27 (2)・Issue #3334）。文言は PG と同じ固定文で、カーソル名・件数を含めない。
+    CursorCanOnlyScanForward,
     /// `currval` を、そのセッションで `nextval` を一度も呼んでいない SEQUENCE に対して呼んだ
     /// （TABLE-24・ERR-6: `55000`。Issue #1690）。名前・値・テナントを含まない固定文言。
     SequenceNotYetDefined,
@@ -1495,6 +1498,11 @@ pub enum SqlSurfaceError {
     /// 集計の `HAVING`／`ORDER BY` が出力名（重複した集計名・キー別名の重複・
     /// キーと集計項目の衝突）を複数一致で解決できない場合も同分類（Issue #1270）。
     AmbiguousColumn { name: String },
+    /// 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`。SQL-53 (b)・Issue #3297）で、書き込み先と
+    /// FROM／USING の表の公開名（別名または表名）が重複した。PG の `duplicate_alias`（`42712`）。
+    /// 文言は名前 1 つだけを含める（内部キーはエラー出口でテナントの SCHEMA 名へ戻す）。
+    /// SELECT の JOIN・派生表の別名重複は ADR の判断で従来どおり `42601`（本分類を使わない）。
+    DuplicateAlias { name: String },
     /// jsonpath 評価（`jsonb_path_*`。Issue #2185）の失敗。分類・文言は内側の
     /// [`crate::json::jsonpath::JsonPathEvalError`] に委譲する（固定の英語文で入力の断片を含めない）。
     JsonPathEval(crate::json::jsonpath::JsonPathEvalError),
@@ -1562,6 +1570,7 @@ impl SqlSurfaceError {
             Self::UndefinedWindow { name } => Self::UndefinedWindow { name: f(&name) },
             Self::UndefinedColumn { name } => Self::UndefinedColumn { name: f(&name) },
             Self::AmbiguousColumn { name } => Self::AmbiguousColumn { name: f(&name) },
+            Self::DuplicateAlias { name } => Self::DuplicateAlias { name: f(&name) },
             Self::InvalidForeignKey { detail } => Self::InvalidForeignKey { detail: f(&detail) },
             Self::DatatypeMismatch { detail } => Self::DatatypeMismatch { detail: f(&detail) },
             // ENUM 列のラベル違反の文言は型名を含む。SCHEMA 配下の型の内部キーを公開名へ戻す（Issue #3289）。
@@ -2032,6 +2041,14 @@ impl SqlSurfaceError {
             name: truncate_for_error(&name.into()),
         }
     }
+
+    /// `pub(crate)`: 結合 DML の関係一覧で公開名が重複した場合（`42712`。Issue #3297）。
+    /// 名前は untrusted な字句解析結果のため他 variant と同じ切り詰め規約を経由する。
+    pub(crate) fn duplicate_alias(name: impl Into<String>) -> Self {
+        SqlSurfaceError::DuplicateAlias {
+            name: truncate_for_error(&name.into()),
+        }
+    }
 }
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
@@ -2108,6 +2125,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::SerializationFailure => ErrorClass::SerializationFailure,
             SqlSurfaceError::ReadOnlySqlTransaction => ErrorClass::ReadOnlySqlTransaction,
             SqlSurfaceError::MaterializedViewNotPopulated
+            | SqlSurfaceError::CursorCanOnlyScanForward
             | SqlSurfaceError::MaterializedViewNotRefreshableConcurrently
             | SqlSurfaceError::SequenceNotYetDefined
             | SqlSurfaceError::LastvalNotYetDefined
@@ -2197,6 +2215,7 @@ impl ClassifiedError for SqlSurfaceError {
             }
             SqlSurfaceError::AmbiguousFunction { .. } => ErrorClass::AmbiguousFunction,
             SqlSurfaceError::AmbiguousColumn { .. } => ErrorClass::AmbiguousColumn,
+            SqlSurfaceError::DuplicateAlias { .. } => ErrorClass::DuplicateAlias,
             SqlSurfaceError::JsonPathEval(e) => e.error_class(),
             SqlSurfaceError::JsonPathParse(e) => e.error_class(),
             SqlSurfaceError::Regex(e) => e.error_class(),
@@ -2344,6 +2363,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::MaterializedViewNotPopulated => {
                 write!(f, "materialized view has not been populated")
+            }
+            SqlSurfaceError::CursorCanOnlyScanForward => {
+                write!(f, "cursor can only scan forward")
             }
             SqlSurfaceError::MaterializedViewNotRefreshableConcurrently => {
                 write!(f, "cannot refresh materialized view concurrently")
@@ -2656,6 +2678,9 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::AmbiguousColumn { name } => {
                 write!(f, "column reference {name:?} is ambiguous")
+            }
+            SqlSurfaceError::DuplicateAlias { name } => {
+                write!(f, "table name {name:?} specified more than once")
             }
             SqlSurfaceError::JsonPathEval(e) => f.write_str(&e.client_message()),
             SqlSurfaceError::JsonPathParse(e) => f.write_str(&e.client_message()),
@@ -23157,6 +23182,15 @@ pub(crate) fn is_dml_target_reserved_word(w: &str) -> bool {
             .any(|r| w.eq_ignore_ascii_case(r))
 }
 
+/// `tokens[i]`（`FROM`）が `IS [NOT] DISTINCT FROM` の一部か。`looks_like_update_from` と
+/// `sql::params` の SET 節終端判定（Issue #3297）で共有する。列名 `distinct`（引用形）は対象外。
+pub(crate) fn is_distinct_from_at(tokens: &[Token], i: usize) -> bool {
+    let at = |back: usize| i.checked_sub(back).and_then(|p| tokens.get(p));
+    let is_word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
+    is_word(at(1), "DISTINCT")
+        && (is_word(at(2), "IS") || (is_word(at(2), "NOT") && is_word(at(3), "IS")))
+}
+
 /// `UPDATE <表> ... FROM <表の並び>` 形かをトークンの先読みだけで判定する（SQL-53 (b)、Issue #1754）。
 /// 括弧深さ 0 に `FROM`（`IS [NOT] DISTINCT FROM` を除く）がある `UPDATE` 文のみ真。`EXTRACT(.. FROM ..)`・
 /// サブクエリの `FROM` は括弧内なので対象外。`core.rs` の文解析が既存の `UPDATE` 解析器より前に呼ぶ。
@@ -23170,13 +23204,7 @@ pub(crate) fn looks_like_update_from(tokens: &[Token]) -> bool {
             Token::Punct('(') => depth = depth.saturating_add(1),
             Token::Punct(')') => depth = depth.saturating_sub(1),
             Token::Keyword(Keyword::From) if depth == 0 => {
-                let prev = i.checked_sub(1).and_then(|p| tokens.get(p));
-                // `IS [NOT] DISTINCT FROM` だけを除外する（列名 `distinct` の SET 右辺は FROM 形）。
-                let is_distinct = |t: Option<&Token>| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case("DISTINCT"));
-                let at = |back: usize| i.checked_sub(back).and_then(|p| tokens.get(p));
-                let is_word = |t: Option<&Token>, k: &str| matches!(t, Some(Token::Ident(w)) if w.eq_ignore_ascii_case(k));
-                let is_not_distinct_from = is_distinct(prev)
-                    && (is_word(at(2), "IS") || (is_word(at(2), "NOT") && is_word(at(3), "IS")));
+                let is_not_distinct_from = is_distinct_from_at(tokens, i);
                 if !is_not_distinct_from {
                     return true;
                 }
@@ -23303,7 +23331,7 @@ impl<'a> Parser<'a> {
     }
 
     /// FROM／USING 側の表参照 1 つ（`<表> [[AS] <別名>]`）。参照数の上限検査（`54000`）と公開名の
-    /// 重複検査（`42601`）を、`rels` へ積む前に行う。
+    /// 重複検査（`42712`）を、`rels` へ積む前に行う。
     fn parse_dml_from_relation(
         &mut self,
         target: &TableRef,
@@ -23325,9 +23353,8 @@ impl<'a> Parser<'a> {
         if rel.exposed_name() == target.exposed_name()
             || rels.iter().any(|r| r.exposed_name() == rel.exposed_name())
         {
-            return Err(SqlSurfaceError::unsupported(
-                "duplicate table reference name in UPDATE/DELETE",
-            ));
+            // Issue #3297: PG の `duplicate_alias`（`42712`）。SELECT の JOIN は従来どおり `42601`。
+            return Err(SqlSurfaceError::duplicate_alias(rel.exposed_name()));
         }
         Ok(rel)
     }
@@ -33299,10 +33326,10 @@ mod tests {
             ),
             (
                 "UPDATE a SET x = 1 FROM b JOIN c ON b.id = c.id JOIN b ON c.id = b.id",
-                "42601",
+                "42712",
             ),
             ("DELETE FROM a USING b JOIN c USING (id)", "0A000"),
-            ("UPDATE a SET x = 1 FROM a", "42601"),
+            ("UPDATE a SET x = 1 FROM a", "42712"),
             ("UPDATE a SET (x, y) = (b.p) FROM b", "42601"),
             ("UPDATE a SET (x) = (b.p) FROM b", "42601"),
             ("UPDATE a SET (x, y) = (b.p, 1, 2) FROM b", "42601"),
