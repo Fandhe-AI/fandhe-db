@@ -525,6 +525,28 @@ fn chained_unnests_without_alias_are_accepted() {
     assert_eq!(n, vec![vec![Cell::Integer(9)]]);
 }
 
+/// 重複した別名なし `unnest` の公開名は `unnest` のまま。修飾参照は曖昧（`42712`）で、明示した
+/// `AS unnest_2` は内部名と衝突しない。
+#[test]
+fn duplicate_unnest_public_name_is_ambiguous_and_internal_names_do_not_leak() {
+    let (core, _g) = open();
+    let sql = "SELECT unnest.unnest FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b)";
+    assert_eq!(code(&core, "alice", sql), "42712", "{sql}");
+    let n = rows(
+        &core,
+        "alice",
+        "SELECT count(*) FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b), \
+         LATERAL unnest(d.arr) AS unnest_2",
+    );
+    assert_eq!(n, vec![vec![Cell::Integer(27)]]);
+    let e = code(
+        &core,
+        "alice",
+        "SELECT unnest_2.unnest FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b)",
+    );
+    assert_eq!(e, "42P01");
+}
+
 /// 左側が CTE・派生表・自己結合の relation でも、引数の列から配列を展開できる。
 #[test]
 fn left_relation_may_be_a_cte_a_derived_table_or_a_self_join() {

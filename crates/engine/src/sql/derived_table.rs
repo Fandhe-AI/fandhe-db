@@ -465,23 +465,50 @@ fn extract_at(
                         // 別名の無い `unnest(...)` の relation 名は PostgreSQL と同じ `unnest`。外側の JOIN
                         // パーサーが別名なしの派生表を拒否するため、別名を合成して外側へ残す。
                         let alias_given = alias.is_some();
-                        // 同一 FROM 内の 2 個目以降の別名なし `unnest` は PostgreSQL が許すため、既出の
-                        // 名前と衝突しない内部名（`unnest_<連番>`）を合成して重複検査の対象から外す。
+                        // 同一 FROM 内の 2 個目以降の別名なし `unnest` は PostgreSQL が許す。公開名は常に `unnest` で、
+                        // 外側のトークン列へ残す内部名（`unnest_<連番>`）は、文全体のどの識別子とも一致しない綴りを選び、
+                        // 明示した別名（`AS unnest_2` 等）と衝突させず、利用者が内部名を参照して解決させることもない。
+                        // 公開名 `unnest` の修飾参照が曖昧になる場合は抽出の最後に `42712` で拒否する。
                         let alias = if func_kw && alias.is_none() {
-                            let taken = |n: &str| {
-                                found.iter().any(|d| {
-                                    d.alias
+                            let unnamed = found
+                                .iter()
+                                .filter(|d| d.func.as_ref().is_some_and(|f| !f.alias_given))
+                                .count();
+                            if found.iter().any(|d| {
+                                d.func.as_ref().is_none_or(|f| f.alias_given)
+                                    && d.alias
                                         .as_deref()
-                                        .is_some_and(|o| o.eq_ignore_ascii_case(n))
-                                })
-                            };
-                            let mut name = "unnest".to_string();
-                            let mut seq: usize = 2;
-                            while taken(&name) {
-                                name = format!("unnest_{seq}");
-                                seq = seq.saturating_add(1);
+                                        .is_some_and(|o| o.eq_ignore_ascii_case("unnest"))
+                            }) {
+                                return Err(SqlSurfaceError::unsupported(
+                                    "table name specified more than once",
+                                ));
                             }
-                            Some(name)
+                            if unnamed == 0 {
+                                Some("unnest".to_string())
+                            } else {
+                                let mut seq = unnamed.saturating_add(1);
+                                let name = loop {
+                                    let cand = format!("unnest_{seq}");
+                                    let used = tokens.iter().any(|t| match t {
+                                        Token::Ident(n) => n.eq_ignore_ascii_case(&cand),
+                                        Token::QualifiedIdent { qualifier, name } => {
+                                            qualifier.eq_ignore_ascii_case(&cand)
+                                                || name.eq_ignore_ascii_case(&cand)
+                                        }
+                                        _ => false,
+                                    }) || found.iter().any(|d| {
+                                        d.alias
+                                            .as_deref()
+                                            .is_some_and(|o| o.eq_ignore_ascii_case(&cand))
+                                    });
+                                    if !used {
+                                        break cand;
+                                    }
+                                    seq = seq.saturating_add(1);
+                                };
+                                Some(name)
+                            }
                         } else {
                             alias
                         };
@@ -567,10 +594,22 @@ fn extract_at(
         i = i.saturating_add(1);
     }
     if found.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some((found, outer)))
+        return Ok(None);
     }
+    // 別名なしの `unnest` が 2 個以上あるとき、公開名 `unnest` による修飾参照（`unnest.col`）は曖昧（`42712`）。
+    if keep_alias
+        && found
+            .iter()
+            .filter(|d| d.func.as_ref().is_some_and(|f| !f.alias_given))
+            .count()
+            > 1
+        && outer.iter().any(|t| {
+            matches!(t, Token::QualifiedIdent { qualifier, .. } if qualifier.eq_ignore_ascii_case("unnest"))
+        })
+    {
+        return Err(SqlSurfaceError::duplicate_alias("unnest"));
+    }
+    Ok(Some((found, outer)))
 }
 
 /// 抽出した派生表を解決する。`ctes` は先行する利用者の CTE で、本文から見える。本文に入れ子の
