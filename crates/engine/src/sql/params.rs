@@ -1146,6 +1146,158 @@ fn where_noneq_param_slots_and_bounds(
     (out, bounds, distinct)
 }
 
+/// LATERAL 派生表の本文の WHERE に置いた `$n` の受理位置の解析結果（Issue #3324・SQL-62 (7)）。
+#[derive(Debug, Clone)]
+pub(crate) struct LateralParamLayout {
+    /// 内側の関係（本文の FROM の単一の表）の名前。型の引き当て先。
+    pub(crate) table: String,
+    /// 受理した `$n` のトークン添字 → 比較相手の内側の列名。
+    pub(crate) slots: HashMap<usize, String>,
+}
+
+/// 文が「`SELECT` 先頭・LATERAL 派生表をちょうど 1 つ持つ」形のとき、LATERAL 本文の WHERE の
+/// 最上位の連言に置かれた `<内側列> <比較> $n`・`<内側列> [NOT] BETWEEN $a AND $b` の `$n` の位置を返す。
+///
+/// 呼び出し元は `validate_param_positions`（受理判定）と `infer_param_positions`（型の引き当て）。
+/// 受理位置の単一情報源で、判定は O(トークン数)・添字は `get()`。該当しない形（LATERAL が 0 または複数・
+/// 本文が単一の表の `SELECT ... FROM` でない・本文の WHERE に深さ 0 の `OR` がある）は `None`。
+/// `None` のとき `$n` は従来どおり派生表・JOIN の一律拒否（`42601`）に任せる（fail-closed）。
+/// 外側の WHERE・投影・ON・LIMIT の `$n` と、外側参照の列（`d.k`）への `$n` 比較は受理位置に含めない。
+/// Bind 後は検証済みのリテラルへ置換して再解析するため、ここは Parse／Describe の整合だけを担う。
+pub(crate) fn lateral_param_layout(tokens: &[Token]) -> Option<LateralParamLayout> {
+    if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+        return None;
+    }
+    let mut laterals = tokens.iter().enumerate().filter(|(i, t)| {
+        matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("LATERAL"))
+            && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
+    });
+    let (lat_idx, _) = laterals.next()?;
+    if laterals.next().is_some() {
+        return None;
+    }
+    let open = lat_idx.checked_add(1)?;
+    // 対応する `)`（本文の終端）。
+    let mut depth: usize = 0;
+    let mut close = None;
+    for (i, t) in tokens.iter().enumerate().skip(open) {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let body_start = open.checked_add(1)?;
+    if !matches!(
+        tokens.get(body_start),
+        Some(Token::Keyword(Keyword::Select))
+    ) {
+        return None;
+    }
+    let body = tokens.get(body_start..close)?;
+    // 本文の深さ 0 の FROM 句: `FROM <表> [[AS] <別名>]` の単一の表だけを受理する。
+    let mut d: usize = 0;
+    let mut from_at = None;
+    for (i, t) in body.iter().enumerate() {
+        match t {
+            Token::Punct('(') => d = d.saturating_add(1),
+            Token::Punct(')') => d = d.saturating_sub(1),
+            Token::Keyword(Keyword::From) if d == 0 => {
+                from_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let from_at = from_at?;
+    let table = match body.get(from_at.checked_add(1)?) {
+        Some(Token::Ident(n) | Token::QuotedNull(n)) => n.clone(),
+        _ => return None,
+    };
+    let mut alias_at = from_at.saturating_add(2);
+    if ident_eq_ignore_case(body.get(alias_at), "AS") {
+        alias_at = alias_at.saturating_add(1);
+    }
+    let alias = match body.get(alias_at) {
+        Some(Token::Ident(a) | Token::QuotedNull(a)) => Some(a.clone()),
+        _ => None,
+    };
+    // 修飾子つきの列は、内側の別名（無ければ表名）で修飾されたものだけを内側の列として扱う。
+    // それ以外（外側の別名）は列に正規化せず、`$n` の比較相手として受理しない。
+    let inner_name = alias.as_deref().unwrap_or(table.as_str());
+    let norm: Vec<Token> = body
+        .iter()
+        .map(|t| match t {
+            Token::QualifiedIdent { qualifier, name }
+                if qualifier.eq_ignore_ascii_case(inner_name) =>
+            {
+                Token::Ident(name.clone())
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let (start, end) = where_region(&norm)?;
+    // 深さ 0 の `OR` がある WHERE は連言として分解できない。
+    let mut depth_at: Vec<usize> = Vec::with_capacity(norm.len());
+    let mut dd: usize = 0;
+    for t in &norm {
+        match t {
+            Token::Punct('(') => dd = dd.saturating_add(1),
+            Token::Punct(')') => dd = dd.saturating_sub(1),
+            _ => {}
+        }
+        depth_at.push(dd);
+    }
+    let region_has_top_or = norm.iter().enumerate().take(end).skip(start).any(|(i, t)| {
+        matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("OR"))
+            && depth_at.get(i).copied() == Some(0)
+    });
+    if region_has_top_or {
+        return None;
+    }
+    let mut slots: HashMap<usize, String> = HashMap::new();
+    let mut accept = |rel: usize, col: &str| {
+        if depth_at.get(rel).copied() == Some(0) {
+            slots.insert(body_start.saturating_add(rel), col.to_string());
+        }
+    };
+    // 等価（パターン 4 と同じ形）: `<列> = $n`（左は連言の先頭、右は連言の終端）。
+    for i in start.saturating_add(1)..end {
+        let Some(Token::Param(_)) = norm.get(i) else {
+            continue;
+        };
+        let (Some(Token::Punct('=')), Some(col_tok)) = (
+            i.checked_sub(1).and_then(|j| norm.get(j)),
+            i.checked_sub(2).and_then(|j| norm.get(j)),
+        ) else {
+            continue;
+        };
+        let (Token::Ident(col) | Token::QuotedNull(col)) = col_tok else {
+            continue;
+        };
+        if is_noneq_left_boundary(&norm, i.saturating_sub(2))
+            && is_noneq_right_boundary(&norm, i.saturating_add(1), end)
+        {
+            accept(i, col);
+        }
+    }
+    // 非等価比較・BETWEEN（パターン 9 と同じ判定）。`$n op $m` などの型を決められない形は受理しない。
+    let (noneq, _, _) = where_noneq_param_slots_and_bounds(&norm);
+    for (rel, shape) in noneq {
+        if let WhereParamShape::Column(col) = shape {
+            accept(rel, &col);
+        }
+    }
+    Some(LateralParamLayout { table, slots })
+}
+
 /// 番号 `n`（1 始まり）の置換リテラル種別。範囲外・0 は `String`（fail-closed）。
 fn kind_of(kinds: &[ParamLiteralKind], n: u16) -> ParamLiteralKind {
     usize::from(n)
@@ -1741,6 +1893,36 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         ));
     }
 
+    // Issue #3324（SQL-62 (7)）: LATERAL 派生表の本文の WHERE の最上位の連言に置いた
+    // `<内側列> <比較> $n`・`BETWEEN $a AND $b` だけを受理する。この形の文では、全 `$n` が受理位置に
+    // あることを要求し（外側の WHERE・投影・ON・LIMIT 等の `$n` は `42601`）、後続の位置判定
+    // （`where_region` は最初の WHERE を指すため、外側の無修飾列の等価を誤受理しうる）には進まない。
+    if tokens.iter().any(|t| matches!(t, Token::Param(_))) {
+        if let Some(layout) = lateral_param_layout(tokens) {
+            let mut max_index: u16 = 0;
+            for (i, t) in tokens.iter().enumerate() {
+                let Token::Param(n) = t else { continue };
+                if !layout.slots.contains_key(&i) {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "parameter placeholder ${n} is not supported at this position"
+                    )));
+                }
+                if matches!(tokens.get(i.saturating_add(1)), Some(Token::TypeCast)) {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "parameter placeholder ${n} followed by '::' is not supported at this position"
+                    )));
+                }
+                max_index = max_index.max(*n);
+            }
+            if max_index > MAX_PARAMS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "parameter number ${max_index} exceeds the allowed maximum (${MAX_PARAMS})"
+                )));
+            }
+            return Ok(max_index);
+        }
+    }
+
     // SQL-62・Issue #1866: FROM の派生表を含む文も `$n` を一律拒否する（fail-closed）。内側の述語が
     // 外側の述語の前へ合成され、パターン 4 のトークン位置と束縛先がずれうるため（`WITH` と同じ理由）。
     if matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
@@ -1976,6 +2158,9 @@ pub(crate) enum ParamPosition {
     /// 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`。Issue #3297）の `WHERE <公開名>.<列> = $n`。
     /// 型は修飾子の公開名が指す表の列から引く。
     WhereQualifiedColumn { qualifier: String, column: String },
+    /// LATERAL 派生表の本文の WHERE の `<内側列> <比較> $n`（Issue #3324）。型は本文の FROM の表
+    /// （`table`）の列から引く（引けなければ `Text`）。
+    LateralColumn { table: String, column: String },
     /// `SELECT` の `WHERE` で `$n op $m`（両辺とも `$n`）の出現。型を決められない
     /// （Issue #2430。同じ番号の別の出現で決まればそれを使い、無ければ宣言型、
     /// それも無ければ `42P18`）。
@@ -2515,11 +2700,19 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
     let where_bounds = where_region(tokens);
     let joined_dml = is_joined_dml(tokens);
     let layout = ParamLayout::build(tokens);
+    let lateral = lateral_param_layout(tokens);
     for (i, token) in tokens.iter().enumerate() {
         let Token::Param(n) = token else { continue };
         let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
             continue;
         };
+        if let Some((l, col)) = lateral.as_ref().and_then(|l| Some((l, l.slots.get(&i)?))) {
+            slot.push(ParamPosition::LateralColumn {
+                table: l.table.clone(),
+                column: col.clone(),
+            });
+            continue;
+        }
         let prev1 = i.checked_sub(1).and_then(|j| tokens.get(j));
         let prev2 = i.checked_sub(2).and_then(|j| tokens.get(j));
         if matches!(prev1, Some(Token::DistanceOp(_))) {

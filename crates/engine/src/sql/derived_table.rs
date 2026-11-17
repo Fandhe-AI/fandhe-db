@@ -262,8 +262,8 @@ fn is_on_true(after: &[Token]) -> bool {
     }
 }
 
-/// `tokens` に FROM／JOIN／`,` の直後の `LATERAL (` があるか（`EXPLAIN` 入口が LATERAL を明示拒否する
-/// ための検出。抽出の拒否・受理に依存せず固定 `0A000` にする。Issue #3321・#3324 の受け皿）。
+/// `tokens` に FROM／JOIN／`,` の直後の `LATERAL (` があるか（`CREATE VIEW` 本文の分類が LATERAL を含む
+/// JOIN 本文の受理経路へ進むかの判定。抽出の受理・拒否には依存しない。Issue #3321・#3324）。
 pub(crate) fn contains_lateral(tokens: &[Token]) -> bool {
     tokens.iter().enumerate().any(|(i, t)| {
         is_ident(Some(t), "LATERAL")
@@ -732,10 +732,7 @@ fn plan_correlated_execution(
         return Err(shape_unsupported());
     }
     let (Some(correlated_body), Some(inner_columns)) = (correlated_body, inner_columns) else {
-        return Err(
-            "columns of the relation referenced by a LATERAL subquery cannot be resolved"
-                .to_string(),
-        );
+        return Err(super::lateral_bind::UNRESOLVABLE_LEFT_COLUMNS.to_string());
     };
     // 内側の相関サブクエリは外側参照の再評価予算（相関サブクエリの再評価の上限）と二重に数えうる
     // ため、再評価する LATERAL の本文にはサブクエリを置かせない（L8。合計が上限の 2 倍になる経路を作らない）。
@@ -1137,7 +1134,9 @@ mod tests {
             .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("RIGHT"))));
     }
 
-    // tracked: #3324
+    // LATERAL の本文が SELECT 以外（VALUES・WITH）の形は、本文を単一の関係へ写せないため固定 `0A000`
+    // （設計記録 L17・「拒否する形」節）。
+    // intentional: docs/design/lateral-derived-table.md
     #[test]
     fn unsupported_lateral_shapes_are_rejected_with_0a000() {
         for sql in [
@@ -1153,6 +1152,9 @@ mod tests {
         }
     }
 
+    // 派生表の本文の中の LATERAL は、JOIN を持つ本文（派生表の本文の FROM が複数の関係）が無いため固定 `0A000`
+    // （設計記録 L17・「拒否する形」節）。
+    // intentional: docs/design/lateral-derived-table.md
     #[test]
     fn nested_lateral_is_rejected_at_depth_two() {
         let body = tokenize("SELECT 1 FROM t, LATERAL (SELECT 1 FROM t) a").expect("t");

@@ -957,3 +957,11 @@ TABLE-18・TABLE-38・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ�
   `wire_create_view.rs`（末尾 `;` の単独送信）で固定した。
 - **対象外**: 受理範囲の拡大は #3237 の決定どおり行わない。`CREATE TABLE`・`DROP VIEW`・MATERIALIZED VIEW の
   `Invalid` 写像は本件の対象外（MATERIALIZED VIEW の原因別分離は未起票）。
+
+## Issue #3324 追記: LATERAL を含む JOIN 本文（SQL-62 (7)・TABLE-18 のポインタ）
+
+- 受理: 左側を持つ LATERAL 派生表を含む JOIN 本文（CTE 入力はすべて派生表で、利用者 CTE を含まない）。非集計なら `LIMIT` 必須（既存の JOIN 本文の規則）。単一 FROM の派生表／LATERAL・LATERAL を含まない派生表・具体化ビュー・CTAS は従来どおり拒否
+- 構造検証（`CREATE VIEW` の構文段）は列を引けず左側の列を解決できないため、固定文言の `0A000`（`lateral_bind::UNRESOLVABLE_LEFT_COLUMNS`）を合図に受理を保留する（`ViewBodyKind::LateralDeferred`。relation 一覧はトークン列から読み取る上位集合。スキーマ修飾の relation 名は固定 `0A000`）。`create_view` が write txn 内の実カタログ（`Resolved`）で再検証して確定する（保留形は `ViewBodyShape` で `buffered`・`join`・`deferred_expr` を立てる保守側）
+- 依存: 本文の relation 一覧に、JOIN の実表に加えて LATERAL の内側（CTE 入力の slot）が読む実表・ビューを含める。`DROP TABLE` は内側だけが読む表でも `2BP01`、`OR REPLACE` は再検証（存在しない内側の表は `42P01`、失敗した置換は元のビューを変えない）
+- 参照時は同じ分類を再実行し、参照者の `ctx`・同じ `read_txn` で CTE 入力つき JOIN の実行器が評価する（作成者の可視性は引き継がない。RLS-10 (b)）。ビュー経由の `EXPLAIN` は集計・LIMIT・JOIN 本文のビューと同じ `42601`。照合の検査（`check_buffered_view_collations`）は内側の表も含める
+- 試験: `sql62_lateral_view.rs`・`rls10_lateral_paths.rs`。設計は [lateral-derived-table.md](lateral-derived-table.md)

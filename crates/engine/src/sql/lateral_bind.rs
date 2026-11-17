@@ -68,10 +68,14 @@ fn outer_position_unsupported() -> SqlSurfaceError {
     )
 }
 
+/// 左側 relation の列を解決できないときの固定文言。`CREATE VIEW` の構造検証（列を引けない）は、この文言の
+/// `0A000` だけを「実カタログでの再検証へ保留」の合図に使う（`sql::allowlist::classify_view_body_opts`。
+/// Issue #3324）。文言を共有して食い違いを防ぐ。
+pub(crate) const UNRESOLVABLE_LEFT_COLUMNS: &str =
+    "columns of the relation referenced by a LATERAL subquery cannot be resolved";
+
 fn unresolvable_left_columns() -> SqlSurfaceError {
-    SqlSurfaceError::feature_not_supported(
-        "columns of the relation referenced by a LATERAL subquery cannot be resolved",
-    )
+    SqlSurfaceError::feature_not_supported(UNRESOLVABLE_LEFT_COLUMNS)
 }
 
 fn is_literal_word(n: &str) -> bool {
