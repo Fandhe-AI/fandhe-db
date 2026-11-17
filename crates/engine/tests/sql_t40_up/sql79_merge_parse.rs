@@ -167,6 +167,15 @@ fn sql79_rejections_keep_their_sqlstate() {
             "MERGE INTO t USING (SELECT k FROM s) ON t.k = k WHEN MATCHED THEN DELETE".to_string(),
             "42601",
         ),
+        // 非引用の `WHEN` は対象表の別名にできない。
+        (
+            "MERGE INTO t WHEN USING s ON t.k = s.k WHEN MATCHED THEN DELETE".to_string(),
+            "42601",
+        ),
+        (
+            "MERGE INTO t AS WHEN USING s ON t.k = s.k WHEN MATCHED THEN DELETE".to_string(),
+            "42601",
+        ),
         // 値位置の `$n` は構文段が受理しない（束縛は #3352）。リテラル化された ON は受理される。
         (format!("{head} WHEN MATCHED THEN DELETE PARTITIONED"), "0A000"),
         (

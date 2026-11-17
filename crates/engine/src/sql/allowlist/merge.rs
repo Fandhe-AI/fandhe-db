@@ -171,7 +171,7 @@ impl<'a> Parser<'a> {
     fn parse_merge(&mut self) -> Result<ParsedMerge, SqlSurfaceError> {
         self.expect_contextual_keyword("MERGE")?;
         self.expect_contextual_keyword("INTO")?;
-        let target = self.parse_dml_target_relation()?;
+        let target = self.parse_merge_target_relation()?;
         self.expect_contextual_keyword("USING")?;
         let source = self.parse_merge_source(&target)?;
         self.expect_ident_matching("ON")?;
@@ -188,6 +188,19 @@ impl<'a> Parser<'a> {
             when_clauses,
             returning,
             operation_id,
+        })
+    }
+
+    /// 対象表 `<表> [[AS] <別名>]`。別名は `WHEN` を含む句境界語を拒否する（非引用のみ。
+    /// 引用識別子は別名にできる）。`parse_dml_target_relation` との差は予約語判定だけ。
+    fn parse_merge_target_relation(&mut self) -> Result<TableRef, SqlSurfaceError> {
+        let table = self.expect_ident()?;
+        crate::catalog::validate_relation_key(&table)
+            .map_err(|e| SqlSurfaceError::unsupported(format!("invalid table name: {e}")))?;
+        let alias = self.parse_relation_alias(is_merge_reserved_word, "MERGE target")?;
+        Ok(match alias {
+            Some(a) => TableRef::with_alias(table, a),
+            None => TableRef::new(table),
         })
     }
 
