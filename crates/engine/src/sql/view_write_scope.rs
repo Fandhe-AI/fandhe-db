@@ -136,6 +136,17 @@ pub(crate) fn current_view_name() -> Option<String> {
     CURRENT.with(|c| c.borrow().as_ref().map(|a| a.view_name.clone()))
 }
 
+/// 現スレッドがビュー経由の書き込み区間にいて、その書き込み先の基表が `table_name` か。生成列の
+/// 計算点（`sql::generated_column::write_wired`・Issue #3329）が、ビュー経由で基表へ流れた書き込みだけを
+/// 結線済みとみなすために読む。基表名が一致しない書き込み（FK の参照アクションの連鎖等）は偽。
+pub(crate) fn current_view_base_table_is(table_name: &str) -> bool {
+    CURRENT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|a| !a.base_table.is_empty() && a.base_table == table_name)
+    })
+}
+
 /// 現スレッドがビュー経由の書き込み区間にいて、書き込み先が `table_name`（基表）のとき、
 /// `WITH CHECK OPTION` の検査対象の述語を返す（検査対象が無ければ `None`）。表名が一致しない
 /// 書き込み（FK の参照アクションの連鎖等）には適用しない。

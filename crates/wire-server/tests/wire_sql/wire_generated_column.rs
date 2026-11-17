@@ -210,3 +210,138 @@ fn psql_shaped_alter_on_generated_columns() {
         read_ready_for_query(&mut stream);
     }
 }
+/// 簡易クエリで文を送り、CommandComplete のタグを返す（末尾 `;` 付きの単独送信）。
+fn exec(stream: &mut TcpStream, sql: &str) -> String {
+    send_simple_query(stream, sql);
+    let tag = read_command_complete(stream);
+    read_ready_for_query(stream);
+    tag
+}
+
+/// SELECT の結果（`n` 行）を読む。
+fn select_rows(stream: &mut TcpStream, sql: &str, n: usize) -> Vec<Vec<Option<String>>> {
+    send_simple_query(stream, sql);
+    let _ = read_row_description(stream);
+    let rows: Vec<Vec<Option<String>>> = (0..n).map(|_| read_data_row(stream)).collect();
+    assert_eq!(read_command_complete(stream), format!("SELECT {n}"));
+    read_ready_for_query(stream);
+    rows
+}
+
+fn cells(rows: &[&[&str]]) -> Vec<Vec<Option<String>>> {
+    rows.iter()
+        .map(|r| r.iter().map(|c| Some(c.to_string())).collect())
+        .collect()
+}
+
+/// CopyInResponse を受け取り、CopyData と CopyDone を送る。
+fn copy_in_send(stream: &mut TcpStream, payload: &[u8]) {
+    let (ty, body) = read_message(stream);
+    assert_eq!(
+        ty,
+        b'G',
+        "expected CopyInResponse, got {}: {:?}",
+        ty as char,
+        String::from_utf8_lossy(&body)
+    );
+    send_length_prefixed_message(stream, b'd', payload);
+    send_length_prefixed_message(stream, b'c', b"");
+}
+
+/// psql 形（末尾 `;` 付きの単独 `COPY ... FROM STDIN;`）の COPY が生成列を計算する（Issue #3329）。列リスト省略は
+/// 生成列を除いた並び、列リストの生成列は CopyInResponse の前に `428C9`。
+#[test]
+fn psql_shaped_copy_from_stdin_computes_the_generated_column() {
+    let (mut stream, _guard) = connect();
+    exec(
+        &mut stream,
+        "CREATE TABLE g (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED, c INTEGER);",
+    );
+    send_simple_query(&mut stream, "COPY g FROM STDIN;");
+    copy_in_send(&mut stream, b"1\t7\n2\t8\n");
+    assert_eq!(read_command_complete(&mut stream), "COPY 2");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "COPY g (a) FROM STDIN WITH (FORMAT csv, HEADER true);",
+    );
+    copy_in_send(&mut stream, b"a\n3\n");
+    assert_eq!(read_command_complete(&mut stream), "COPY 1");
+    read_ready_for_query(&mut stream);
+    assert_eq!(
+        select_rows(&mut stream, "SELECT a, b, c FROM g ORDER BY a;", 3),
+        vec![
+            vec![Some("1".into()), Some("2".into()), Some("7".into())],
+            vec![Some("2".into()), Some("4".into()), Some("8".into())],
+            vec![Some("3".into()), Some("6".into()), None],
+        ]
+    );
+    // 列リストの生成列は、CopyInResponse を返す前に拒否される。
+    send_simple_query(&mut stream, "COPY g (a, b) FROM STDIN;");
+    expect_error_response_with_sqlstate(&mut stream, "428C9");
+    read_ready_for_query(&mut stream);
+}
+
+/// 自動更新可能ビュー経由の INSERT・UPDATE が基表の生成列を計算する（psql 形）。
+#[test]
+fn psql_shaped_view_writes_compute_the_generated_column() {
+    let (mut stream, _guard) = connect();
+    exec(
+        &mut stream,
+        "CREATE TABLE g (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+    );
+    exec(&mut stream, "CREATE VIEW gv AS SELECT a, b FROM g;");
+    assert_eq!(
+        exec(&mut stream, "INSERT INTO gv (a) VALUES (3);"),
+        "INSERT 0 1"
+    );
+    assert_eq!(exec(&mut stream, "UPDATE gv SET a = 4;"), "UPDATE 1");
+    assert_eq!(
+        select_rows(&mut stream, "SELECT a, b FROM g;", 1),
+        cells(&[&["4", "8"]])
+    );
+    send_simple_query(&mut stream, "INSERT INTO gv (a, b) VALUES (1, 1);");
+    expect_error_response_with_sqlstate(&mut stream, "428C9");
+    read_ready_for_query(&mut stream);
+}
+
+/// BEFORE ROW トリガ付きの表への INSERT・UPDATE は、トリガの書き換えの後に生成列を計算する。BEFORE トリガの
+/// WHEN が NEW の生成列を参照する定義は `42P17`（psql 形）。
+#[test]
+fn psql_shaped_before_trigger_runs_before_the_generated_computation() {
+    let (mut stream, _guard) = connect();
+    exec(&mut stream, "CREATE SCHEMA s;");
+    exec(&mut stream, "SET search_path TO s, public;");
+    exec(
+        &mut stream,
+        "CREATE TABLE s.g (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+    );
+    exec(
+        &mut stream,
+        "CREATE FUNCTION bump() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN NEW.a := NEW.a + 10; RETURN NEW; END $$;",
+    );
+    exec(
+        &mut stream,
+        "CREATE TRIGGER tb BEFORE INSERT OR UPDATE ON s.g FOR EACH ROW EXECUTE FUNCTION bump();",
+    );
+    assert_eq!(
+        exec(&mut stream, "INSERT INTO g (a) VALUES (1);"),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        select_rows(&mut stream, "SELECT a, b FROM g;", 1),
+        cells(&[&["11", "22"]])
+    );
+    assert_eq!(exec(&mut stream, "UPDATE g SET a = 2;"), "UPDATE 1");
+    assert_eq!(
+        select_rows(&mut stream, "SELECT a, b FROM g;", 1),
+        cells(&[&["12", "24"]])
+    );
+    send_simple_query(
+        &mut stream,
+        "CREATE TRIGGER tw BEFORE INSERT ON s.g FOR EACH ROW WHEN (NEW.b > 1) EXECUTE FUNCTION bump();",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42P17");
+    read_ready_for_query(&mut stream);
+}

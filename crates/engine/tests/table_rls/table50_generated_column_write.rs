@@ -7,7 +7,7 @@
 //! 分割実行）で参照列が変わる行だけ再計算されること。(3) UPSERT の挿入側・`DO UPDATE`・生成列への
 //! `ON CONFLICT`。(4) 生成列への値の指定が `428C9` で拒否されること（`DEFAULT` は受理）。
 //! (5) 計算後の値に対して UNIQUE・CHECK・FK・RLS WITH CHECK が働くこと、評価エラーで行が残らないこと。
-//! (6) 結線していない経路（COPY・ビュー・トリガ・DO ブロック・NoSQL 入口）が固定文言の `0A000` のままであること。
+//! (6) COPY・ビュー・DO ブロックも同じ計算点を通ること（トリガ・NoSQL・FK の連鎖は `table50_generated_column_paths`）。
 
 use engine::core::{CopyPlan, EngineCore};
 use engine::kernel::CpuScalarProvider;
@@ -496,17 +496,20 @@ fn text_and_bare_null_expressions_compute() {
     );
 }
 
+/// ビュー経由・COPY FROM（Issue #3329）も SQL 表層と同じ計算点で生成列を計算する。ビュー経由の生成列への
+/// 明示値と COPY の列リストの生成列は `428C9`（行・台帳を残さない）。
 #[test]
-fn unwired_paths_stay_rejected_with_0a000() {
-    // tracked: #3329
-    let (_p, _gd, core) = fixture("gen-w-unwired");
+fn view_and_copy_paths_compute_the_generated_column() {
+    let (_p, _gd, core) = fixture("gen-w-view-copy");
     mk(&core);
-    ok(&core, TENANT, "CREATE VIEW gv AS SELECT a FROM g");
-    let sql = "INSERT INTO gv (a) VALUES (1)";
-    assert_eq!(code(&core, TENANT, sql), "0A000", "{sql}");
-    let m = message(&core, TENANT, sql);
-    assert!(!m.contains(TENANT), "{m}");
-    assert!(!m.contains("\"g\""), "{m}");
+    ok(&core, TENANT, "CREATE VIEW gv AS SELECT a, b FROM g");
+    ok(&core, TENANT, "INSERT INTO gv (a) VALUES (1)");
+    assert_eq!(
+        code(&core, TENANT, "INSERT INTO gv (a, b) VALUES (2, 9)"),
+        "428C9"
+    );
+    ok(&core, TENANT, "UPDATE gv SET a = 3");
+    assert_eq!(grid(&core, TENANT, "SELECT a, b FROM g"), g(&[&["3", "6"]]));
     // COPY FROM STDIN。
     let policy = ctx(TENANT);
     let session = SessionState::default();
@@ -514,17 +517,23 @@ fn unwired_paths_stay_rejected_with_0a000() {
         .begin_copy(&policy, &session, "COPY g (a) FROM STDIN")
         .and_then(|plan| match plan {
             CopyPlan::From(mut s) => {
-                s.feed(b"1\n")?;
+                s.feed(b"5\n")?;
                 let batch = s.finish()?;
                 core.commit_copy_in(&policy, batch)
             }
             CopyPlan::To(..) => panic!("expected COPY FROM plan"),
         });
+    copy.expect("COPY must compute the generated column");
     assert_eq!(
-        copy.expect_err("COPY must be rejected").wire_code(),
-        "0A000"
+        grid(&core, TENANT, "SELECT a, b FROM g ORDER BY a"),
+        g(&[&["3", "6"], &["5", "10"]])
     );
-    assert_eq!(count(&core, TENANT, "g"), 0);
+    // 列リストの生成列は CopyInResponse の前に 428C9。
+    let err = core
+        .begin_copy(&policy, &session, "COPY g (a, b) FROM STDIN")
+        .expect_err("generated column in COPY column list");
+    assert_eq!(err.wire_code(), "428C9");
+    assert_eq!(count(&core, TENANT, "g"), 2);
 }
 /// 台帳（RECOVER-11 のポインタ）。生成列は内容照合ハッシュの材料から除くため、省略形と `DEFAULT` 形の再送が
 /// 一致する。評価エラーで失敗した文は台帳を残さない。
@@ -592,10 +601,9 @@ fn do_block_inserts_compute_through_the_sql_surface() {
     assert_eq!(grid(&core, TENANT, "SELECT a, b FROM g"), g(&[&["1", "2"]]));
 }
 /// スキーマ修飾の表でも書き込み先の表名（結線済みの区間のキー）が一致して計算される。トリガを持つ表への
-/// 書き込みは未結線（Issue #3329）で、台帳・行を残さず固定文言の `0A000` になる。
+/// 書き込みも、BEFORE ROW の後に計算される（Issue #3329）。
 #[test]
-fn schema_qualified_tables_compute_and_trigger_tables_stay_rejected() {
-    // tracked: #3329
+fn schema_qualified_tables_compute_with_and_without_triggers() {
     let (_p, _gd, core) = fixture("gen-w-schema-trigger");
     ok(&core, TENANT, "CREATE SCHEMA s");
     ok(
@@ -619,19 +627,15 @@ fn schema_qualified_tables_compute_and_trigger_tables_stay_rejected() {
         TENANT,
         "CREATE TRIGGER trg BEFORE INSERT OR UPDATE ON s.t FOR EACH ROW EXECUTE FUNCTION noop()",
     );
+    ok(&core, TENANT, "INSERT INTO s.t (a) VALUES (5)");
+    ok(&core, TENANT, "UPDATE s.t SET a = a + 5 WHERE a = 5");
     assert_eq!(
-        code(&core, TENANT, "INSERT INTO s.t (a) VALUES (5)"),
-        "0A000"
-    );
-    assert_eq!(code(&core, TENANT, "UPDATE s.t SET a = 7"), "0A000");
-    assert_eq!(
-        grid(&core, TENANT, "SELECT a, b FROM s.t"),
-        g(&[&["2", "3"]])
+        grid(&core, TENANT, "SELECT a, b FROM s.t ORDER BY a"),
+        g(&[&["2", "3"], &["10", "11"]])
     );
 }
-/// 行つきの論理ダンプ（INSERT 形式）の往復（Issue #3327 の `tracked: #3328`）。生成列はデータ出力から除かれ、
-/// 復元先の INSERT が計算し直す。再ダンプは元とバイト単位で一致する。COPY 形式の復元は `COPY` の結線
-/// （Issue #3329）が要る。
+/// 行つきの論理ダンプ（INSERT 形式）の往復（Issue #3328）。生成列はデータ出力から除かれ、
+/// 復元先の INSERT が計算し直す。再ダンプは元とバイト単位で一致する（COPY 形式は次のテスト）。
 #[test]
 fn row_bearing_logical_dump_round_trips_in_insert_format() {
     use engine::catalog::ddl_export::{
@@ -682,6 +686,84 @@ fn row_bearing_logical_dump_round_trips_in_insert_format() {
     let (_p2, _g2, dst) = fixture("gen-w-dump-dst");
     for (_, sql) in &pieces {
         ok(&dst, TENANT, sql);
+    }
+    assert_eq!(
+        grid(&dst, TENANT, "SELECT a, b, name FROM g ORDER BY name"),
+        grid(&src, TENANT, "SELECT a, b, name FROM g ORDER BY name")
+    );
+    assert_eq!(dump(&dst), pieces);
+}
+
+/// COPY 形式の行つき論理ダンプの往復（Issue #3329）。生成列は COPY の列リストから除かれ、復元先の COPY が計算し直す。
+/// 再ダンプは元と一致する。
+#[test]
+fn row_bearing_logical_dump_round_trips_in_copy_format() {
+    use engine::catalog::ddl_export::{
+        LogicalDumpItem, SchemaDdlScope, TableDataFormat, TableDataPart,
+    };
+    let (_p1, _g1, src) = fixture("gen-w-dump-copy-src");
+    mk(&src);
+    ok(
+        &src,
+        TENANT,
+        "INSERT INTO g (a, name) VALUES (1, 'x'), (2, 'y')",
+    );
+    ok(&src, TENANT, "INSERT INTO g (name) VALUES ('n')");
+    let dump = |core: &EngineCore| -> Vec<(TableDataPart, bool, String)> {
+        let mut out = Vec::new();
+        core.export_logical_dump(
+            &SchemaDdlScope::shared_and_tenant(TENANT),
+            TableDataFormat::Copy,
+            |item| {
+                out.push(match item {
+                    LogicalDumpItem::Schema(st) => {
+                        (TableDataPart::Insert, false, st.sql.to_string())
+                    }
+                    LogicalDumpItem::Data(d) => (d.part, true, d.text.to_string()),
+                });
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .expect("dump");
+        out
+    };
+    let pieces = dump(&src);
+    let header = pieces
+        .iter()
+        .find(|(part, data, _)| *data && *part == TableDataPart::CopyHeader)
+        .expect("COPY header");
+    assert!(!header.2.contains("\"b\""), "{}", header.2);
+    let (_p2, _g2, dst) = fixture("gen-w-dump-copy-dst");
+    let mut copy: Option<(String, Vec<u8>)> = None;
+    for (part, data, text) in &pieces {
+        if !*data {
+            ok(&dst, TENANT, text);
+            continue;
+        }
+        match part {
+            TableDataPart::CopyHeader => copy = Some((text.clone(), Vec::new())),
+            TableDataPart::CopyRow => {
+                let (_, buf) = copy.as_mut().expect("header before rows");
+                buf.extend_from_slice(text.as_bytes());
+                buf.push(b'\n');
+            }
+            TableDataPart::CopyEnd => {
+                let (sql, buf) = copy.take().expect("header before end");
+                let policy = ctx(TENANT);
+                let CopyPlan::From(mut s) = dst
+                    .begin_copy(&policy, &SessionState::default(), &sql)
+                    .unwrap_or_else(|e| panic!("{sql} must begin: {e}"))
+                else {
+                    panic!("expected COPY FROM");
+                };
+                s.feed(&buf).expect("feed");
+                let batch = s.finish().expect("finish");
+                dst.commit_copy_in(&policy, batch).expect("commit copy");
+            }
+            TableDataPart::Insert => {
+                ok(&dst, TENANT, text);
+            }
+        }
     }
     assert_eq!(
         grid(&dst, TENANT, "SELECT a, b, name FROM g ORDER BY name"),

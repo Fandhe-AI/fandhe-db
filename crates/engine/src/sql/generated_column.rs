@@ -218,10 +218,13 @@ impl Drop for GeneratedComputeScope {
 }
 
 /// 表 `table` への書き込みが結線済みの SQL 表層の区間にあるか。結線済みの区間の対象表と一致し、
-/// かつビュー経由の書き込み区間の外であることが条件（ビュー・INSTEAD OF は Issue #3329）。
+/// かつ、ビュー経由の書き込み区間の外か、区間の基表が `table` であること（Issue #3329）が条件。
+/// ビューは基表形の文へ書き換えられて基表の書き込み入口へ流れるため、基表への書き込みは結線済みとして
+/// 扱う。別表への書き込み（FK の連鎖等）は基表名が一致せず偽のまま。
 pub(crate) fn write_wired(table: &str) -> bool {
     WIRED_TABLE.with(|c| c.borrow().as_deref() == Some(table))
-        && crate::sql::view_write_scope::current_view_name().is_none()
+        && (crate::sql::view_write_scope::current_view_name().is_none()
+            || crate::sql::view_write_scope::current_view_base_table_is(table))
 }
 
 /// 書き込み先の表の生成列の保存式を束縛した計算器（1 文に 1 回だけ作る。行ループの外）。

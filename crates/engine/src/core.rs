@@ -18396,6 +18396,8 @@ impl EngineCore {
             &crate::catalog::TableSchema,
         ) -> Result<T, crate::sql::allowlist::SqlSurfaceError>,
     {
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
         self.ledger_mode
             .resolve(operation_id)
@@ -18518,6 +18520,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         use crate::sql::allowlist::SqlSurfaceError;
         self.ledger_mode
             .resolve(operation_id)
@@ -19340,6 +19344,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // Issue #3282: 発火元の主体の写しを書き込み区間へ張る（SQL 表層と同じ実行器・同じ発火計画）。
         let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
@@ -19546,6 +19552,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // Issue #3282: 発火元の主体の写しを書き込み区間へ張る。
         let _trigger_subject = crate::trigger::subject::TriggerSubjectScope::enter(session);
         // 判定 1: `operation_id` 必須化ガード（スキーマ取得より前）。
@@ -19684,6 +19692,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -19792,6 +19802,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         self.ledger_mode
             .resolve(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
@@ -19939,6 +19951,8 @@ impl EngineCore {
     {
         // RECOVER-15・Issue #2175: 読み取りレプリカでは NoSQL の書き込みも副作用の前に `25006` で拒否する。
         self.reject_if_read_replica()?;
+        // 生成列（TABLE-50・Issue #3329）: NoSQL・COPY の公開入口も SQL 表層と同じ計算点へ結線する。
+        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
         // 分割実行は構成に関わらず operation_id 必須（Issue #1704・RECOVER-1）。
         crate::recovery::required_op_id::require_partitioned(operation_id)
             .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
