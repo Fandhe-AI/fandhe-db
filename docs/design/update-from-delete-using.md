@@ -118,6 +118,8 @@ SET は、リテラルと対象表の列だけを使う式をそのまま運び�
 
 ## dispatch（Issue #3202）
 
+MERGE（Issue #3350）はこの結合実行器を共有する。方式は [sql-merge.md](sql-merge.md)。
+
 SQL の入口を結合実行器（`execute_joined_dml_in`）へ結線した。ポインタ: SQL-53 (b)・RLS-10・RECOVER-10/11・SQL-28。
 
 - **autocommit**: `execute_parsed_in_session_inner` が `is_joined_dml` を見て、サブクエリ付き述語 DML と同じ文単位の暗黙 Tx（`execute_subquery_dml_autocommit`）へ振り分ける。実行本体は明示 Tx と共通

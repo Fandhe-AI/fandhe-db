@@ -729,6 +729,8 @@ SQL-53 (5)・RECOVER-11 のポインタ。#1752 の申し送り（台帳の事�
 
 ## Issue #1757 追記（UPDATE … FROM／DELETE … USING の台帳 content_hash）
 
+MERGE の `OpTag`（`DataModifyingCte = 29` の続番）の予約と材料は [sql-merge.md](sql-merge.md) の D11（Issue #3350）で決めた。
+
 SQL-53 (5)・RECOVER-10/11 ポインタ。結合形 DML の `USING OPERATION_ID` を台帳へ結線した。
 
 - **タグ**: `OpTag::UpdateFrom = 27`・`DeleteUsing = 28`。述語形（9・10）・`InsertSelect`・`CreateTableAs` と
