@@ -209,6 +209,18 @@ fn element_cells(a: &ArrayValue) -> Result<Vec<Cell>, SqlSurfaceError> {
     })
 }
 
+/// 配列 1 件の展開が確保する作業領域（要素の `Cell` 複製・ペイロード・`ResultRow`・各行の `cells`）の
+/// 上界。`element_cells` と行生成の前に共有バイト予算へ計上するために使う（飽和加算。L12）。
+fn expansion_bytes(a: &ArrayValue, ordinality: bool) -> usize {
+    let width = if ordinality { 2usize } else { 1usize };
+    let per_row = std::mem::size_of::<ResultRow>()
+        .saturating_add(width.saturating_mul(std::mem::size_of::<Cell>()));
+    // 要素の Cell 複製（1 要素 1 Cell）も行ごとの cells とは別に確保される。
+    let per_elem = per_row.saturating_add(std::mem::size_of::<Cell>());
+    a.approx_heap_bytes()
+        .saturating_add(a.flat().len().saturating_mul(per_elem))
+}
+
 /// 外側タプル `ti` の引数セル（配列）を借用で返す。NULL 補完された relation・NULL のセルは `None`（0 行）。
 fn outer_array<'a>(
     sides: &'a [Vec<ResultRow>],
@@ -246,6 +258,8 @@ pub(super) fn unnest_front(
     let outer_count = acc.len();
     // 事前判定: 通過した外側タプルの要素数の総和（確保なしで配列の長さだけを読む）。
     let mut total: usize = 0;
+    // 展開の作業領域（要素の Cell 複製・ペイロード・ResultRow・各行の cells）の上界。確保の前に計上する。
+    let mut work_bytes: usize = 0;
     for ti in 0..outer_count {
         if ti % crate::interrupt::CHECK_STRIDE as usize == 0 {
             crate::interrupt::check()?;
@@ -254,9 +268,11 @@ pub(super) fn unnest_front(
             continue;
         }
         if let Some(a) = outer_array(sides, acc, rt, ti)? {
+            let n = a.flat().len();
             total = total
-                .checked_add(a.flat().len())
+                .checked_add(n)
                 .ok_or_else(|| too_large("JOIN result exceeds the row limit"))?;
+            work_bytes = work_bytes.saturating_add(expansion_bytes(a, rt.ordinality));
         }
     }
     if total > limits.max_output_rows {
@@ -264,6 +280,8 @@ pub(super) fn unnest_front(
     }
     // 候補行の総和を比較数の見積りとして一括消費する（ON の評価回数の上界。実際の評価数に依存させない）。
     budget.charge_comparisons(total, limits.max_comparisons)?;
+    // 作業領域のバイト量を共有予算へ確保の前に計上する（要素列を投影しない COUNT(*) 等でも漏らさない）。
+    budget.charge(work_bytes)?;
 
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let mut arena: Vec<ResultRow> = Vec::new();
@@ -361,6 +379,23 @@ mod tests {
         let e = unnest_columns(&array_ty(ArrayElemType::Text), &un(true, &["v"]))
             .expect_err("name count");
         assert_eq!(e.wire_code(), "XX000");
+    }
+
+    /// 展開の作業領域は要素数・ペイロードに比例して見積もられ、共有バイト予算を超えれば `54000`。
+    #[test]
+    fn expansion_work_area_is_charged_against_the_budget() {
+        let small = ArrayValue::Integer(vec![Some(1); 4]);
+        let big = ArrayValue::Text(vec![Some("x".repeat(1024)); 64]);
+        assert!(expansion_bytes(&big, false) > expansion_bytes(&small, false));
+        assert!(expansion_bytes(&small, true) > expansion_bytes(&small, false));
+        assert!(expansion_bytes(&big, false) >= 64 * 1024);
+        let mut budget = JoinBudget::with_cap(expansion_bytes(&big, false) - 1);
+        let e = budget
+            .charge(expansion_bytes(&big, false))
+            .expect_err("over budget");
+        assert_eq!(e.wire_code(), "54000");
+        let mut budget = JoinBudget::with_cap(expansion_bytes(&big, false));
+        budget.charge(expansion_bytes(&big, false)).expect("fits");
     }
 
     /// NULL 要素は `Cell::Null`、多次元は行優先に平坦化し、bigint は 2^53 を超えても欠けない。

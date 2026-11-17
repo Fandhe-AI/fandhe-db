@@ -507,6 +507,24 @@ fn count_and_chained_unnests_see_expanded_rows() {
     );
 }
 
+/// 別名なしの `unnest` を同じ FROM 内で連鎖させても重複テーブル名として拒否しない（PostgreSQL は許す）。
+#[test]
+fn chained_unnests_without_alias_are_accepted() {
+    let (core, _g) = open();
+    let n = rows(
+        &core,
+        "alice",
+        "SELECT count(*) FROM docs d CROSS JOIN LATERAL unnest(d.arr) CROSS JOIN LATERAL unnest(d.b)",
+    );
+    assert_eq!(n, vec![vec![Cell::Integer(9)]]);
+    let n = rows(
+        &core,
+        "alice",
+        "SELECT count(*) FROM docs d, LATERAL unnest(d.arr), LATERAL unnest(d.b)",
+    );
+    assert_eq!(n, vec![vec![Cell::Integer(9)]]);
+}
+
 /// 左側が CTE・派生表・自己結合の relation でも、引数の列から配列を展開できる。
 #[test]
 fn left_relation_may_be_a_cte_a_derived_table_or_a_self_join() {

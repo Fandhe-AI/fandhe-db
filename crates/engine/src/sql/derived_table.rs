@@ -465,8 +465,23 @@ fn extract_at(
                         // 別名の無い `unnest(...)` の relation 名は PostgreSQL と同じ `unnest`。外側の JOIN
                         // パーサーが別名なしの派生表を拒否するため、別名を合成して外側へ残す。
                         let alias_given = alias.is_some();
+                        // 同一 FROM 内の 2 個目以降の別名なし `unnest` は PostgreSQL が許すため、既出の
+                        // 名前と衝突しない内部名（`unnest_<連番>`）を合成して重複検査の対象から外す。
                         let alias = if func_kw && alias.is_none() {
-                            Some("unnest".to_string())
+                            let taken = |n: &str| {
+                                found.iter().any(|d| {
+                                    d.alias
+                                        .as_deref()
+                                        .is_some_and(|o| o.eq_ignore_ascii_case(n))
+                                })
+                            };
+                            let mut name = "unnest".to_string();
+                            let mut seq: usize = 2;
+                            while taken(&name) {
+                                name = format!("unnest_{seq}");
+                                seq = seq.saturating_add(1);
+                            }
+                            Some(name)
                         } else {
                             alias
                         };
