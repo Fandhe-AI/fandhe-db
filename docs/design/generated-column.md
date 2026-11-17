@@ -208,7 +208,7 @@ SQLSTATE を含む個別の規則は TABLE-50 (1) のポインタとし、本記
 | 描画→再解析が元の式と一致しない | `0A000` | 束縛 |
 | 生成列を参照元に含む FK の `ON UPDATE CASCADE／SET NULL／SET DEFAULT`・`ON DELETE SET NULL／SET DEFAULT` | `42601` | 構文（PG17 に合わせる想定。要確認: #3332） |
 | 一時表・NoSQL 表層の表作成 | `0A000` | 実行段の入口／構文（`intentional`） |
-| `ALTER TABLE ADD COLUMN ... GENERATED` | `0A000` | 構文（`tracked: #3330`） |
+| `ALTER TABLE ADD COLUMN ... GENERATED` | 受理（#3330 で結線。「Issue #3330 で確定した事項」） | 実行段 |
 
 - 修飾名（`t.a`）は構文段で `42601`、`tenant_id`・`visibility` は通常の列として解決できず `42703`（fail-closed）。式の中の `IS [NOT] DISTINCT FROM`・正規表現演算子は式索引と同じく未対応。
 - 式で代入できない列型の `0A000` は固定文言で、`UPDATE ... SET` の文言を流用しない。PG17 は NUMERIC 等の生成列を許すため、PG との既知の差として #3328 以降で式の評価器が対応した型から広げる。受け皿の Issue は未起票（承認待ち）。
@@ -216,7 +216,7 @@ SQLSTATE を含む個別の規則は TABLE-50 (1) のポインタとし、本記
 ### 永続形
 
 - カタログ v16 は、生存列のどれかが生成列のスキーマだけが書く（v15 の上位集合。`pkname:`・`rowmode:` を常に持ち、末尾の `fks:` の後に `gens:<n>`（`n >= 1`）と `gen:<列名>:<参照列 CSV>:<hex(正規描画)>` を `n` 行）。生成列の無いスキーマのバイト列は不変。
-- `rowmode:` は `allocated`／`migrated` だけ。従来方式の表と生成列の組み合わせは `validate_schema` が拒否する（NoSQL 表層の表作成は構文段で止まる）。ADD COLUMN（#3330）が既存の従来方式の表を扱うときに見直す。
+- `rowmode:` は `allocated`／`migrated` だけ。従来方式の表と生成列の組み合わせは `validate_schema` が拒否する（NoSQL 表層の表作成は構文段で止まる）。ADD COLUMN（#3330）は従来方式の表への生成列の追加を `0A000` で止める（`intentional`。「Issue #3330 で確定した事項」）。
 - 版の追随（P0）: `FK_BEARING_FORMAT_VERSIONS`（9 件）・ENUM 依存の軽量スキャナ（`gens:` 節を共有パーサーで検証）・読み取りゲート（v15・v16 の `rowmode:` 判定）に v16 を足し、単体テストで固定した。
 - `catalog::ColumnDef` の非公開フィールド `generated` の追加は公開 API の破壊的変更として扱う（CHANGELOG の `BREAKING CHANGE`）。workspace 内の構造体リテラル・構造体更新構文は `ColumnDef::new` 経由へ書き換えた。
 
@@ -311,3 +311,32 @@ TABLE-50 (3)・TABLE-38 のポインタ。G9 の決定を次のとおり実装�
 - `DROP COLUMN ... CASCADE` による生成列以外の依存の連鎖削除（TABLE-37 系）と NOTICE（`drop cascades to column ...`）: 未起票（起票は承認待ち）。
 - 行つきの表での SQL 経由の検証（値を保つ `DROP EXPRESSION`・CASCADE の往復）と、参照しない列の型変更が照合段を通ることの確認: #3328（計算点と照合段の結線後）。本 Issue は行ストアへ直接置いた行を使う catalog の単体テストで、行のバイト列が変わらないことを固定した。
 - `DROP COLUMN IF EXISTS`: 対象外（`42601` のまま）。
+
+## Issue #3330 で確定した事項（ADD COLUMN ... GENERATED の全行の原子的な計算。TABLE-50・RECOVER-11・TASK-345）
+
+G8 の方針（fast default を使わず全行を計算して書き直す）を結線した。判定順と帰結は次のとおり。
+
+| 項目 | 決定 |
+| ---- | ---- |
+| 構文段（カタログを見ない） | CREATE TABLE と同じ組み合わせ規則。`DEFAULT`（`DEFAULT NULL` を含む）・`VIRTUAL`・`BY DEFAULT`・`STORED` 欠落・IDENTITY 重複は `42601`、ベクトル系の型は `0A000`、SERIAL は既存の `0A000`、非決定的な式・部分クエリは `42P17`。生成列は「`DEFAULT` なしの `NOT NULL` は `42601`」の検査から外す（値は式で決まる） |
+| 実行段の判定順 | 権限ゲート（`42501`）→ 表の存在（`42P01`／ビュー `42809`）→ `IF NOT EXISTS` の skip → 型名解決 → 従来方式（`LegacyId`）の表は固定文言の `0A000`（`intentional`。CREATE の NoSQL 表層と揃える）→ 列名の重複 → txn 内の候補スキーマへの束縛（`bind_generated_column`。SQLSTATE は CREATE と同じ）→ カタログへの追加と全行の計算 |
+| 実行の構造 | 単一アクションと複数アクションが `sql::ddl::add_generated_column_in_txn` を共有する。単一アクションは `Storage::alter_table_in_single_txn` の中で呼び、世代 bump と commit は 1 回 |
+| 全行の計算 | `column_rewrite::backfill_generated_column_in_txn`。全テナント・全可視性の行を `REWRITE_BATCH_KEYS` 単位のキー集めで走査し、単一の計算器（`CompiledGeneratedColumns`）で新しい列だけを計算する（第 2 の評価器は作らない）。fast default の列は `fill_value` で補われた値から計算する。行数に上限は置かない |
+| 失敗 | 評価エラー（`22012`・`22003` 等）・NOT NULL 違反（`23502`・列名だけ）・行サイズの超過（`54000`）は固定文言（値・テナント・行 id を含まない）。commit せず txn を破棄するのでカタログ・行・世代とも不変。他テナントの不可視な行が原因でも同じ（RLS-9・RLS-10 のポインタ。ADD CHECK・ALTER COLUMN TYPE ... USING と同じ共有資源操作の既知の性質） |
+| 最下層ガード | カタログだけを書く `alter_table_add_column_in_txn`／`prevalidate_add_column` は生成列を `Invalid` で拒否する。生成列は新設の `alter_table_add_generated_column_in_txn` だけが追加できる（行を計算せず列だけが増える状態を作らせない） |
+| 一時表・明示 Tx | 一時表は既存の経路で `0A000`。明示 Tx の中の DDL は `0A000`（open PR の明示 Tx 内の表 DDL が入った場合は、同じ helper を通すか `0A000` に止めることを rebase で確かめる） |
+| 追加後の帰結 | 生成列を持つ表への COPY・NoSQL・ビュー・トリガ経由の書き込みは #3329 まで `0A000`（#3327 の暫定停止）。INSERT・UPDATE・UPSERT は #3328 の計算点で計算される |
+| 索引 | ADD COLUMN の時点で新しい列は索引・CHECK・UNIQUE・FK の対象にならないため、派生索引の失効・再構築は不要 |
+| crash | `scripts/crash_test_ddl.sh` に生成列の段（stage 5）を追加し、カタログだけが変わった状態・一部の行だけ計算済みの状態・生成式なしの通常の列を self-check の負の対照で拒否する。生成列の段の実行中の kill を run 全体で 1 度も観測しなければ失敗にする |
+
+### 公開 API の変更（BREAKING CHANGE）
+
+- `ValidatedAlterTableAddColumn` に公開フィールド `generated: Option<Expr>` を追加した。
+
+### 対象外（受け皿）
+
+- COPY・NoSQL・ビュー・トリガ・FK 参照アクション・生の RowInput の結線: #3329
+- 台帳・crash・越境・PG17 実機との突き合わせ（複数アクションでの前方参照の分類、SERIAL と GENERATED の併記の分類、NOT NULL 生成列の ADD の分類を含む）: #3332
+- MERGE: #3355
+- 生成列自身の `ALTER COLUMN TYPE`・`SET EXPRESSION` の受理（全行の書き直しの部品は本 Issue でできる）: 本 Issue では対応しない（`0A000` のまま）。理由: 受け皿の Issue 起票にユーザー承認が要り、自動運転では得られないため。承認後に起票して番号を追記する。
+- 一時表・式で代入できない列型（NUMERIC 等）の生成列: 本 Issue では対応しない（`0A000` のまま）。理由: 式の評価器が対応した型から段階的に広げる方針で、受け皿の Issue 起票にユーザー承認が要るため。承認後に起票して番号を追記する。
