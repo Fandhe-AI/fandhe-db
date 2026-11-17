@@ -55,6 +55,7 @@ pub(crate) fn explain_tree_with_side_nodes(
             JoinMethod::Hash => ("hash", step.keys.len()),
             JoinMethod::NestedLoop => ("nested_loop", 0),
             JoinMethod::Cross => ("cross", 0),
+            JoinMethod::Lateral => ("lateral", 0),
         };
         let mut node = ExplainNode::try_stage(
             "join".to_string(),

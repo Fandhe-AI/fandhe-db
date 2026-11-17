@@ -4258,6 +4258,21 @@ pub(crate) struct JoinCteInputs {
     /// `ValidatedJoin::relations` と同じ並びで、そのリレーションが参照する slot の添字
     /// （`None` は実表）。
     pub(crate) relation_slot: Vec<Option<usize>>,
+    /// `relation_slot` と同じ並びで、外側の行ごとに再評価する LATERAL 派生表（左側の列を参照する形。
+    /// Issue #3322）の実行情報。`None` は通常の入力。`Some` のリレーションの slot は後処理を表す
+    /// `Derived` で、`from` が基底（外側参照を含まない部分）を指す。`sql::derived_table` だけが設定する。
+    pub(crate) lateral: Vec<Option<JoinLateral>>,
+}
+
+/// 外側の行ごとに再評価する LATERAL 派生表の実行情報（Issue #3322・SQL-62。設計記録
+/// `docs/design/lateral-derived-table.md` の L1・L2）。テナント・`PolicyContext` は保持しない。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JoinLateral {
+    /// 参照する左側 relation の列 `(結合連鎖の添字, 列名)`。`WherePredicate` 内の予約内部名
+    /// （`correlation::lateral_ref_placeholder`）と対応する。
+    pub(crate) outer_refs: Vec<(usize, String)>,
+    /// 外側参照を含む連言（基底の行に外側タプルごとにかける相関述語）。
+    pub(crate) correlated: Vec<WherePredicate>,
 }
 
 // 手書きの `Eq`: `slots` が持つ述語は f64 を含みうるため `derive(Eq)` できないが、構築経路が
@@ -28979,9 +28994,11 @@ fn build_join_cte_inputs(
         .iter()
         .map(|c| c.and_then(|i| slot_of.get(i).copied().flatten()))
         .collect();
+    let lateral = vec![None; rel_cte.len()];
     Ok(JoinCteInputs {
         slots,
         relation_slot,
+        lateral,
     })
 }
 

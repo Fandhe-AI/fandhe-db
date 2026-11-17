@@ -25,23 +25,28 @@
 //! （コンマ区切り・`CROSS JOIN`・`[INNER] JOIN ... ON true`・`LEFT [OUTER] JOIN ... ON true`・FROM 先頭）
 //! を本モジュールが受理し、`LATERAL` 語と `ON true` を外側のトークン列から落として通常の派生表と
 //! 同じプレースホルダへ置き換える。本文が参照する左側 relation の列は `sql::lateral_bind` が束縛する。
-//! 左側を参照しない LATERAL は通常の派生表（合成 CTE）として実行し、参照する形・`LEFT JOIN LATERAL` は
-//! 束縛を通したあと固定文言の `0A000` で止める（外側の行ごとの再評価は #3322・#3323）。
+//! 左側を参照しない LATERAL は通常の派生表（合成 CTE）として実行する。参照する INNER／CROSS／コンマの形は
+//! 基底と後処理の 2 つの合成 CTE と相関述語へ分け、外側の行ごとに `sql::join::lateral` が再評価する
+//! （Issue #3322）。`LEFT JOIN LATERAL`（#3323）と再評価の形へ組めない形は、外側の文の検証を通した
+//! あと固定文言の `0A000` で止める。
 //!
 //! RLS-10 (b) の不変条件: 本モジュールの型はテナント・`PolicyContext` を持たない。解決時の
 //! `42P01`／`42P10` 等はカタログの構造だけで決まり、行やテナントに依存しない。
 
 use crate::nesting_limits::NestingLimits;
+use crate::sql::allowlist::JoinLateral;
 use crate::sql::allowlist::Statement;
 use crate::sql::allowlist::{
     derived_output_names, is_set_operator_ident, join_relations_of, looks_like_join,
-    parse_cte_select_body, parse_derived_alias_head, parse_with_clause_and_main,
+    parse_cte_select_body, parse_derived_alias_head, parse_view_body, parse_with_clause_and_main,
     set_operator_is_followed_by_branch, single_relation_main_over_ctes, split_parenthesized,
     validate_cte_definition_at, validate_cte_definitions, validate_with_join_main, SqlSurfaceError,
     TableLookup,
 };
 use crate::sql::cte::{CteDef, CteMaterialization};
-use crate::sql::lateral_bind::{bind_lateral_body, strip_inner_alias, LateralBinding};
+use crate::sql::lateral_bind::{
+    bind_lateral_body, split_for_execution, strip_inner_alias, LateralBinding,
+};
 use crate::sql::lexer::{Keyword, Token};
 use crate::sql::qualified_column::normalize_single_table_qualifiers;
 use crate::sql::relation::TableRef;
@@ -89,6 +94,14 @@ pub(crate) struct DerivedTable {
     pub(crate) lateral: Option<LateralForm>,
     /// LATERAL の左側 relation への参照の束縛結果（LATERAL 以外は `None`）。
     pub(crate) lateral_binding: Option<LateralBinding>,
+    /// 合成 CTE の内部名（`?derived<番号>`。外側の FROM の relation 名と一致する）。
+    pub(crate) placeholder: String,
+    /// 左側の列を参照する LATERAL を、外側の行ごとに再評価する形へ組めたときの実行情報
+    /// （Issue #3322）。この場合の合成 CTE は基底（`?derived<番号>_base`）と後処理の 2 定義になる。
+    pub(crate) lateral_exec: Option<JoinLateral>,
+    /// 左側を参照する LATERAL のうち、再評価の形へ組めなかった理由（固定文言。外側の文の検証を
+    /// 通したあとに `0A000` で拒否する）。
+    pub(crate) lateral_reject: Option<String>,
 }
 
 /// 抽出・解決の結果。
@@ -533,6 +546,8 @@ fn resolve_level(
             None => r.body.clone(),
         };
         let placeholder = format!("{PLACEHOLDER_PREFIX}{}", r.number);
+        let mut correlated_body: Option<Vec<Token>> = None;
+        let mut inner_columns: Option<Vec<String>> = None;
         let (body_tokens, lateral_binding) = match r.lateral {
             None => (body_tokens, None),
             Some(form) => {
@@ -573,26 +588,52 @@ fn resolve_level(
                 let bound = bind_lateral_body(&body_tokens, left, &mut columns)?;
                 // 内側の別名による修飾（`t.col`）は本文の検証の前に非修飾へ正規化する。
                 let normalized = normalize_single_table_qualifiers(&bound.tokens)?.into_owned();
+                // 取り除いた相関連言の本文も、同じ正規化・別名除去を通す（Issue #3322）。
+                correlated_body = match bound.correlated_body {
+                    Some(t) => Some(strip_inner_alias(
+                        normalize_single_table_qualifiers(&t)?.into_owned(),
+                    )),
+                    None => None,
+                };
+                inner_columns = bound.inner_columns;
                 (strip_inner_alias(normalized), Some(bound.binding))
             }
         };
         let (body, tail) = parse_cte_select_body(&body_tokens, limits)?;
-        let def = CteDef {
+        let mut def = CteDef {
             name: placeholder.clone(),
             column_aliases: r.column_aliases.clone(),
             body,
             materialization: CteMaterialization::Default,
             tail,
         };
-        if ctes.len().saturating_add(acc.len()).saturating_add(1) > limits.max_cte_definitions() {
-            return Err(SqlSurfaceError::payload_too_large(
-                "too many CTE definitions",
-            ));
+        // 左側の列を参照する LATERAL は、基底と後処理の 2 定義へ分ける（Issue #3322。L2）。組めない形は
+        // 理由を控え、外側の文の検証を通したあとに固定文言の `0A000` で拒否する（`lateral_not_executable`）。
+        let mut base_def: Option<CteDef> = None;
+        let mut lateral_exec: Option<JoinLateral> = None;
+        let mut lateral_reject: Option<String> = None;
+        if let (Some(form), Some(binding)) = (r.lateral, lateral_binding.as_ref()) {
+            if binding.is_correlated() && !matches!(form, LateralForm::Left { .. }) {
+                match plan_correlated_execution(
+                    form,
+                    &placeholder,
+                    &r.column_aliases,
+                    &def,
+                    &body_tokens,
+                    correlated_body.as_deref(),
+                    inner_columns.as_deref(),
+                    binding,
+                    limits,
+                ) {
+                    Ok((base, post, exec)) => {
+                        base_def = Some(base);
+                        def = post;
+                        lateral_exec = Some(exec);
+                    }
+                    Err(reason) => lateral_reject = Some(reason),
+                }
+            }
         }
-        let mut scope: Vec<CteDef> = ctes.to_vec();
-        scope.extend(acc.iter().cloned());
-        scope.push(def);
-        let idx = scope.len().saturating_sub(1);
         let remap = |e: SqlSurfaceError| match e {
             SqlSurfaceError::CteColumnListTooLong {
                 name,
@@ -605,22 +646,132 @@ fn resolve_level(
             },
             other => other,
         };
-        validate_cte_definition_at(&scope, idx, lookup, limits).map_err(remap)?;
-        // 公開列名の静的な決定可否もここで検査する（解決できない列は `42703` 等）。
-        derived_output_names(&scope, idx, lookup, limits).map_err(remap)?;
-        let def = scope.pop().ok_or_else(|| SqlSurfaceError::Internal {
-            detail: "derived table scope was empty".to_string(),
-        })?;
-        acc.push(def);
+        let mut pending: Vec<CteDef> = base_def.into_iter().collect();
+        pending.push(def);
+        for def in pending {
+            if ctes.len().saturating_add(acc.len()).saturating_add(1) > limits.max_cte_definitions()
+            {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many CTE definitions",
+                ));
+            }
+            let mut scope: Vec<CteDef> = ctes.to_vec();
+            scope.extend(acc.iter().cloned());
+            scope.push(def);
+            let idx = scope.len().saturating_sub(1);
+            validate_cte_definition_at(&scope, idx, lookup, limits).map_err(remap)?;
+            // 公開列名の静的な決定可否もここで検査する（解決できない列は `42703` 等）。
+            derived_output_names(&scope, idx, lookup, limits).map_err(remap)?;
+            let def = scope.pop().ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "derived table scope was empty".to_string(),
+            })?;
+            acc.push(def);
+        }
         tables.push(DerivedTable {
             alias: r.alias,
             column_aliases: r.column_aliases,
             position: r.position,
             lateral: r.lateral,
             lateral_binding,
+            placeholder,
+            lateral_exec,
+            lateral_reject,
         });
     }
     Ok(tables)
+}
+
+/// 左側の列を参照する LATERAL（`def` は外側参照を含む連言を取り除いた単一定義）を、基底と後処理の
+/// 2 つの合成 CTE と、外側の行ごとにかける相関述語へ組む（Issue #3322。設計記録 L1・L2・L5・L8）。
+/// 戻りは `(基底, 後処理, 実行情報)`。組めない形（`ON true` 以外の ON・集計・`DISTINCT`・窓・サブクエリ・
+/// `SELECT *`）は固定文言の理由を `Err` で返す（呼び出し側が外側の文の検証後に `0A000` へ写す）。
+#[allow(clippy::too_many_arguments)]
+fn plan_correlated_execution(
+    form: LateralForm,
+    placeholder: &str,
+    column_aliases: &[String],
+    def: &CteDef,
+    body_tokens: &[Token],
+    correlated_body: Option<&[Token]>,
+    inner_columns: Option<&[String]>,
+    binding: &LateralBinding,
+    limits: NestingLimits,
+) -> Result<(CteDef, CteDef, JoinLateral), String> {
+    if matches!(form, LateralForm::Inner { on_true: false }) {
+        return Err(
+            "JOIN LATERAL referencing outer columns with an ON condition other than true is not supported yet"
+                .to_string(),
+        );
+    }
+    let shape_unsupported = || {
+        "aggregates, DISTINCT and window functions in a LATERAL subquery referencing outer columns are not supported yet"
+            .to_string()
+    };
+    if def.select_body().is_none()
+        || def
+            .tail
+            .as_ref()
+            .is_some_and(|t| !t.window_items.is_empty())
+    {
+        return Err(shape_unsupported());
+    }
+    let (Some(correlated_body), Some(inner_columns)) = (correlated_body, inner_columns) else {
+        return Err(
+            "columns of the relation referenced by a LATERAL subquery cannot be resolved"
+                .to_string(),
+        );
+    };
+    // 内側の相関サブクエリは外側参照の再評価予算（相関サブクエリの再評価の上限）と二重に数えうる
+    // ため、再評価する LATERAL の本文にはサブクエリを置かせない（L8。合計が上限の 2 倍になる経路を作らない）。
+    let has_subquery = |t: &[Token]| {
+        t.windows(2)
+            .any(|w| matches!(w, [Token::Punct('('), Token::Keyword(Keyword::Select)]))
+    };
+    if has_subquery(body_tokens) || has_subquery(correlated_body) {
+        return Err(
+            "subqueries in a LATERAL subquery referencing outer columns are not supported yet"
+                .to_string(),
+        );
+    }
+    let base_name = format!("{placeholder}_base");
+    let bodies = split_for_execution(body_tokens, &base_name, inner_columns, correlated_body)
+        .map_err(|e| e.client_message())?;
+    // 解析の失敗は理由を含めず固定文言にする（入力の断片・内部名を出さない）。
+    let fixed = |_: SqlSurfaceError| "this LATERAL subquery shape is not supported yet".to_string();
+    let (base_body, base_tail) = parse_cte_select_body(&bodies.base, limits).map_err(fixed)?;
+    let (post_body, post_tail) = parse_cte_select_body(&bodies.post, limits).map_err(fixed)?;
+    // 相関述語は列どうしの比較などを含むため、ビュー本文と同じ（広い）述語の判定表で解析する。評価できない形は
+    // 実行段の束縛（`sql::join::lateral`）が拒否する。
+    let corr_select = parse_view_body(correlated_body).map_err(fixed)?;
+    if base_tail.is_some()
+        || !matches!(base_body, crate::sql::cte::CteBody::Select(_))
+        || !matches!(post_body, crate::sql::cte::CteBody::Select(_))
+    {
+        return Err(shape_unsupported());
+    }
+    let base = CteDef {
+        name: base_name,
+        column_aliases: Vec::new(),
+        body: base_body,
+        materialization: CteMaterialization::Default,
+        tail: None,
+    };
+    let post = CteDef {
+        name: placeholder.to_string(),
+        column_aliases: column_aliases.to_vec(),
+        body: post_body,
+        materialization: CteMaterialization::Default,
+        tail: post_tail,
+    };
+    let exec = JoinLateral {
+        outer_refs: binding
+            .outer_refs
+            .iter()
+            .map(|r| (r.rel_index, r.column.clone()))
+            .collect(),
+        correlated: corr_select.where_predicates,
+    };
+    Ok((base, post, exec))
 }
 
 /// 派生表を含むか（`$n` 束縛の fail-closed ガード用。`sql::params` から呼ばれる。第 2 の検出器を
@@ -663,26 +814,56 @@ fn build_statement(
     } else {
         validate_with_join_main(&outer_tokens, &scope, lookup, limits)
     }?;
-    // 実行器が未接続の LATERAL は、外側の文の構文・束縛まで通したあと固定 `0A000` で止める（書き込みなし）。
+    // 実行できない LATERAL は、外側の文の構文・束縛まで通したあと固定 `0A000` で止める（書き込みなし）。
     if let Some(err) = lateral_not_executable(&tables) {
         return Err(err);
     }
-    Ok(statement)
+    attach_lateral_inputs(statement, &tables)
 }
 
-/// 現時点で実行できない LATERAL の固定エラー。左側の列を参照する形は外側の行ごとの再評価（#3322）、
-/// 参照しない `LEFT JOIN LATERAL` は #3323 が実装する。左側を参照しない INNER／CROSS／コンマ／先頭の
-/// LATERAL は通常の派生表（合成 CTE。L6）として実行できるため `None`。
-fn lateral_not_executable(tables: &[DerivedTable]) -> Option<SqlSurfaceError> {
-    if tables.iter().any(|t| {
-        t.lateral_binding
-            .as_ref()
-            .is_some_and(LateralBinding::is_correlated)
-    }) {
-        return Some(SqlSurfaceError::feature_not_supported(
-            "LATERAL subqueries referencing outer columns are not supported yet",
-        ));
+/// 外側の行ごとに再評価する LATERAL の実行情報（[`DerivedTable::lateral_exec`]）を、JOIN の CTE 入力へ
+/// リレーション位置を合わせて載せる（Issue #3322）。該当する LATERAL が無ければ何もしない。載せられない
+/// （プレースホルダのリレーションが見つからない・CTE 入力が無い・単一表経路に来た）場合は `Internal`
+/// （fail-closed。到達しない不変条件）。
+fn attach_lateral_inputs(
+    statement: Statement,
+    tables: &[DerivedTable],
+) -> Result<Statement, SqlSurfaceError> {
+    if tables.iter().all(|t| t.lateral_exec.is_none()) {
+        return Ok(statement);
     }
+    let internal = || SqlSurfaceError::Internal {
+        detail: "LATERAL execution inputs could not be attached".to_string(),
+    };
+    let Statement::Join(mut join) = statement else {
+        return Err(internal());
+    };
+    let relations = join.relations.clone();
+    let Some(inputs) = join.cte_inputs.as_mut() else {
+        return Err(internal());
+    };
+    inputs.lateral = vec![None; relations.len()];
+    for t in tables {
+        let Some(exec) = &t.lateral_exec else {
+            continue;
+        };
+        let pos = relations
+            .iter()
+            .position(|r| r.table() == t.placeholder)
+            .ok_or_else(internal)?;
+        match inputs.lateral.get_mut(pos) {
+            Some(slot) => *slot = Some(exec.clone()),
+            None => return Err(internal()),
+        }
+    }
+    Ok(Statement::Join(join))
+}
+
+/// 現時点で実行できない LATERAL の固定エラー。左側の列を参照する INNER／CROSS／コンマの形は外側の
+/// 行ごとの再評価（#3322）で実行するが、再評価の形へ組めなかったもの（`lateral_reject`）と
+/// `LEFT JOIN LATERAL`（#3323）は拒否する。左側を参照しない INNER／CROSS／コンマ／先頭の LATERAL は
+/// 通常の派生表（合成 CTE。L6）として実行できるため `None`。
+fn lateral_not_executable(tables: &[DerivedTable]) -> Option<SqlSurfaceError> {
     if tables
         .iter()
         .any(|t| matches!(t.lateral, Some(LateralForm::Left { .. })))
@@ -690,6 +871,9 @@ fn lateral_not_executable(tables: &[DerivedTable]) -> Option<SqlSurfaceError> {
         return Some(SqlSurfaceError::feature_not_supported(
             "LEFT JOIN LATERAL is not supported yet",
         ));
+    }
+    if let Some(reason) = tables.iter().find_map(|t| t.lateral_reject.as_ref()) {
+        return Some(SqlSurfaceError::feature_not_supported(reason.clone()));
     }
     None
 }

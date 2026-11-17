@@ -60,6 +60,7 @@ pub(crate) mod dml_plan;
 mod dml_residual;
 mod exec;
 mod explain;
+mod lateral;
 mod nlj;
 mod on_split;
 mod plan;
@@ -175,6 +176,12 @@ pub(crate) struct JoinBudget {
     cap: usize,
     /// NLJ の比較回数の文全体の累計（Issue #1837・D5）。バイト予算とは別軸。
     comparisons_used: usize,
+    /// LATERAL の外側タプルごとの再評価回数の文全体の累計（Issue #3322・L8）。
+    reevaluations_used: usize,
+    /// 再評価回数の上限（既定・ハード上限は相関サブクエリと同じ
+    /// `CorrelatedLimits::max_reevaluations()`。JOIN 経路には `CorrelatedBudget` が無く、LATERAL の
+    /// 本文には相関サブクエリを置かせないため、2 つのカウンタが 1 文に併存することはない）。
+    max_reevaluations: usize,
 }
 
 impl JoinBudget {
@@ -183,6 +190,27 @@ impl JoinBudget {
             used: 0,
             cap,
             comparisons_used: 0,
+            reevaluations_used: 0,
+            max_reevaluations: crate::correlated_limits::MAX_CORRELATED_REEVALUATIONS,
+        }
+    }
+
+    /// 再評価回数の上限を差し替える（起動時設定 `--max-correlated-reevaluations`。ハード上限以下）。
+    pub(crate) fn with_max_reevaluations(mut self, max: usize) -> Self {
+        self.max_reevaluations = max;
+        self
+    }
+
+    /// LATERAL の再評価を `n` 回計上する。オーバーフローも上限超過も `54000`（部分結果は返さない）。
+    pub(super) fn charge_reevaluations(&mut self, n: usize) -> Result<(), SqlSurfaceError> {
+        match self.reevaluations_used.checked_add(n) {
+            Some(t) if t <= self.max_reevaluations => {
+                self.reevaluations_used = t;
+                Ok(())
+            }
+            _ => Err(SqlSurfaceError::payload_too_large(
+                "LATERAL re-evaluation count exceeds the limit",
+            )),
         }
     }
 
@@ -496,7 +524,10 @@ pub(crate) fn execute_with_cte_inputs(
     cte_ids: &CteIdColumns,
     inputs: Vec<Option<QueryResult>>,
     budget: JoinBudget,
+    correlated_limits: crate::correlated_limits::CorrelatedLimits,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // LATERAL の再評価回数の上限は相関サブクエリと同じ設定（`--max-correlated-reevaluations`。Issue #3322・L8）。
+    let budget = budget.with_max_reevaluations(correlated_limits.max_reevaluations());
     execute_with_inputs(
         read_txn,
         ctx,
@@ -558,7 +589,70 @@ fn execute_with_inputs(
     // ため、他テナント行は中間結果・結合キー・カーディナリティ判定のいずれにも
     // 現れない（RLS-10 相当）。
     let mut sides: Vec<Vec<ResultRow>> = Vec::with_capacity(plan.scans.len());
+    // 外側の行ごとに再評価する LATERAL（Issue #3322）があるときだけ、relation ごとの実行時入力を組む。
+    let lateral_cte = validated
+        .cte_inputs
+        .as_ref()
+        .filter(|c| c.lateral.iter().any(Option::is_some));
+    let mut lateral_rt: Vec<Option<lateral::LateralRuntime>> = Vec::new();
     for (i, (schema, bound_scan)) in plan.schemas.iter().zip(bound.iter()).enumerate() {
+        if let Some(cte) = lateral_cte {
+            if lateral_rt.is_empty() {
+                lateral_rt = (0..plan.scans.len()).map(|_| None).collect();
+            }
+            if let Some(Some(lat)) = cte.lateral.get(i) {
+                let internal = |d: &str| SqlSurfaceError::Internal {
+                    detail: d.to_string(),
+                };
+                // 基底は `core.rs` が文内で 1 回だけ評価した可視行（評価時に `budget` へ計上済み）。
+                let base = inputs
+                    .get_mut(i)
+                    .and_then(Option::take)
+                    .ok_or_else(|| internal("LATERAL base input missing"))?;
+                if base.rows.len() > limits.max_input_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "JOIN input exceeds the visible row limit",
+                    ));
+                }
+                let slot = cte
+                    .relation_slot
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .and_then(|k| cte.slots.get(k))
+                    .ok_or_else(|| internal("LATERAL slot missing"))?;
+                let crate::sql::allowlist::CteSlotSource::Derived { layer, .. } = &slot.source
+                else {
+                    return Err(internal("LATERAL slot is not a derived layer"));
+                };
+                let step = i
+                    .checked_sub(1)
+                    .and_then(|k| plan.steps.get(k))
+                    .and_then(|st| st.lateral.as_ref())
+                    .ok_or_else(|| internal("LATERAL step plan missing"))?;
+                let scan = plan
+                    .scans
+                    .get(i)
+                    .ok_or_else(|| internal("JOIN side scan missing"))?;
+                let rt = lateral::LateralRuntime::build(
+                    base,
+                    lateral::BuildInput {
+                        lat,
+                        step,
+                        schemas: &plan.schemas,
+                        slot,
+                        layer,
+                        scan,
+                        udfs,
+                    },
+                )?;
+                if let Some(dst) = lateral_rt.get_mut(i) {
+                    *dst = Some(rt);
+                }
+                sides.push(Vec::new());
+                continue;
+            }
+        }
         // CTE 入力の側スキャンは、出力行の見積もり（射影の重複込みの上界）を適用の **前** に
         // 計上する（`apply_cte_side_scan`）ため、適用後の再計上は不要。
         let mut charged_before_apply = false;
@@ -596,6 +690,9 @@ fn execute_with_inputs(
         sides.push(result.rows);
     }
 
+    if lateral_cte.is_some() {
+        return run_join_lateral(&prepared, sides, &lateral_rt, limits, budget);
+    }
     run_join_with_sides(&prepared, &sides, limits, budget, None).map(|(result, _)| result)
 }
 
@@ -777,16 +874,67 @@ fn run_join_with_sides(
     provenance_side: Option<usize>,
 ) -> Result<(QueryResult, Vec<usize>), SqlSurfaceError> {
     let plan = &prepared.plan;
-    let (limit, offset) = (prepared.limit, prepared.offset);
-
-    // Issue #1797・SQL-34: 非集計形・`LIMIT` 省略・残余述語なしのときに限り、最終段の一致ペアが
-    // `offset + cap` を超えた時点で結合を中断できる（残余述語・集計で件数が減りうる形は
-    // 完了後判定のまま）。
-    let final_stop = match (&plan.shape, limit, plan.residual.is_empty()) {
-        (Shape::Plain { .. }, None, true) => offset.checked_add(limits.max_result_rows),
-        _ => None,
-    };
+    let final_stop = final_stop_of(prepared, limits);
     let (tuples, order) = exec::run_joins(sides, &plan.steps, &mut budget, limits, final_stop)?;
+    finish_join(
+        prepared,
+        sides,
+        tuples,
+        order,
+        limits,
+        budget,
+        provenance_side,
+    )
+}
+
+/// [`run_join_with_sides`] の LATERAL 対応版（Issue #3322）。`lateral[i]` が `Some` の relation の段は
+/// 外側タプルごとに実行し、出力領域を `sides[i]` に据えてから残余・並べ替え・投影へ進む。
+fn run_join_lateral(
+    prepared: &PreparedJoin<'_>,
+    mut sides: Vec<Vec<ResultRow>>,
+    lateral: &[Option<lateral::LateralRuntime>],
+    limits: &JoinLimits,
+    mut budget: JoinBudget,
+) -> Result<QueryResult, SqlSurfaceError> {
+    let plan = &prepared.plan;
+    let final_stop = final_stop_of(prepared, limits);
+    let (tuples, order) = exec::run_joins_lateral(
+        &mut sides,
+        lateral,
+        &plan.steps,
+        &mut budget,
+        limits,
+        final_stop,
+    )?;
+    finish_join(prepared, &sides, tuples, order, limits, budget, None).map(|(result, _)| result)
+}
+
+/// 最終段の一致ペアが `offset + cap` を超えた時点で結合を中断できる閾値（Issue #1797・SQL-34）。
+/// 非集計形・`LIMIT` 省略・残余述語なしのときに限る（残余述語・集計で件数が減りうる形は完了後判定のまま）。
+fn final_stop_of(prepared: &PreparedJoin<'_>, limits: &JoinLimits) -> Option<usize> {
+    match (
+        &prepared.plan.shape,
+        prepared.limit,
+        prepared.plan.residual.is_empty(),
+    ) {
+        (Shape::Plain { .. }, None, true) => prepared.offset.checked_add(limits.max_result_rows),
+        _ => None,
+    }
+}
+
+/// 結合済みのタプル列に残余・集計・並べ替え・投影を適用して結果を作る（[`run_join_with_sides`]・
+/// [`run_join_lateral`] の共通の後段）。
+fn finish_join(
+    prepared: &PreparedJoin<'_>,
+    sides: &[Vec<ResultRow>],
+    tuples: exec::Tuples,
+    order: Vec<u32>,
+    limits: &JoinLimits,
+    mut budget: JoinBudget,
+    provenance_side: Option<usize>,
+) -> Result<(QueryResult, Vec<usize>), SqlSurfaceError> {
+    let plan = &prepared.plan;
+    let (limit, offset) = (prepared.limit, prepared.offset);
     let order = residual::filter_tuples(order, &tuples, &plan.residual, sides, &mut budget)?;
 
     match &plan.shape {
@@ -988,6 +1136,19 @@ fn apply_cte_side_scan(
     scan: &crate::sql::allowlist::ValidatedScan,
     udfs: &UdfRegistry,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    let plan = plan_cte_side_scan(&body.columns, scan, udfs)?;
+    // 出力行（射影の複製を含む）の分を、適用の前に共有予算へ計上する（唯一の見積もり）。
+    budget.charge_layer_output(&body, &plan)?;
+    crate::sql::view_buffered::apply_rows_layer(body, &plan)
+}
+
+/// 側スキャン `scan`（射影＋プッシュダウン済み述語）を、評価済みの行の列 `columns` に対して計画する。
+/// 通常の CTE 入力（[`apply_cte_side_scan`]）と LATERAL の外側タプルごとの適用（`lateral`）が共有する。
+fn plan_cte_side_scan(
+    columns: &[ColumnMeta],
+    scan: &crate::sql::allowlist::ValidatedScan,
+    udfs: &UdfRegistry,
+) -> Result<crate::sql::view_buffered::OuterPlan, SqlSurfaceError> {
     let layer = crate::sql::allowlist::BufferedRows {
         projection: scan.projection.clone(),
         where_predicates: scan.where_predicates.clone(),
@@ -999,11 +1160,7 @@ fn apply_cte_side_scan(
         limit_implicit: false,
         offset: 0,
     };
-    let plan =
-        crate::sql::view_buffered::plan_rows_layer(&body.columns, scan.table_name(), &layer, udfs)?;
-    // 出力行（射影の複製を含む）の分を、適用の前に共有予算へ計上する（唯一の見積もり）。
-    budget.charge_layer_output(&body, &plan)?;
-    crate::sql::view_buffered::apply_rows_layer(body, &plan)
+    crate::sql::view_buffered::plan_rows_layer(columns, scan.table_name(), &layer, udfs)
 }
 
 /// Describe（拡張クエリプロトコル）向けに、走査を一切行わず結果列メタデータだけを
@@ -1954,6 +2111,41 @@ mod tests {
     /// Issue #1839: ON の `OR`／非等価（キー無し）段は NLJ で実行され、比較回数の上限は
     /// 文全体で共有する（超過は部分結果を返さず `54000`）。実 SQL からの到達経路と同じ
     /// 束縛結果（`JoinCondition::On` の論理木）を直接組み立てて確かめる。
+    /// LATERAL の再評価回数（Issue #3322・L8）は `checked_add` で数え、上限ちょうどは通り、超過とオーバーフローは
+    /// `54000`。上限は `with_max_reevaluations` で下げられる。
+    #[test]
+    fn reevaluation_counter_is_checked_and_bounded() {
+        let mut b = JoinBudget::with_cap(1 << 20).with_max_reevaluations(5);
+        b.charge_reevaluations(3).expect("within the cap");
+        b.charge_reevaluations(2).expect("exactly the cap");
+        assert_eq!(b.charge_reevaluations(1).unwrap_err().wire_code(), "54000");
+        let mut b = JoinBudget::with_cap(1 << 20).with_max_reevaluations(usize::MAX);
+        b.charge_reevaluations(usize::MAX).expect("max");
+        assert_eq!(
+            b.charge_reevaluations(1).unwrap_err().wire_code(),
+            "54000",
+            "overflow is treated as over the cap"
+        );
+    }
+
+    /// LATERAL の比較数は見積り全量を一括して消費する（L10）。2 段で各見積りが残予算を超えるなら、実際の
+    /// 比較数に関係なく 2 段目は必ず `54000`（1 段目の後の残りは常に上限 − 見積り）。
+    #[test]
+    fn comparison_estimate_is_reserved_in_full_across_steps() {
+        let cap = 10_000_000usize;
+        let mut b = JoinBudget::with_cap(1 << 20);
+        b.charge_comparisons(6_000_000, cap).expect("first step");
+        assert_eq!(b.remaining_comparisons(cap), 4_000_000);
+        assert_eq!(
+            b.charge_comparisons(6_000_000, cap)
+                .unwrap_err()
+                .wire_code(),
+            "54000"
+        );
+        // 失敗した見積りは消費されない（部分的な計上を残さない）。
+        assert_eq!(b.remaining_comparisons(cap), 4_000_000);
+    }
+
     #[test]
     fn keyless_on_comparison_budget_is_enforced_per_statement() {
         use crate::sql::udf_call::BinOp;
