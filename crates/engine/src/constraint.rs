@@ -706,13 +706,20 @@ fn enforce_row_constraints_impl(
     fk_mode: FkCheckMode,
     policy: RowPolicyWrite<'_>,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
-    // 生成列（TABLE-50・Issue #3327）を持つ表への書き込みは、計算点が結線されるまで（Issue #3328・
-    // #3329 が経路ごとに外す）固定文言の `0A000` で拒否する。黙って NULL を書かない fail-closed。
-    // 追加の拒否にしか働かないため RLS の `WITH CHECK` より前に置いても境界は緩まない。公開ラッパーと
-    // FK の参照アクションの連鎖（`propagate_referential_actions`）の双方がこの関数を通る。
-    // `written_ids` が空でも止める（行の無い書き込み文でも一貫した拒否にする）。
+    // 生成列（TABLE-50・Issue #3327・#3328）を持つ表への書き込みは、計算点が結線された SQL 表層の区間
+    // （`sql::generated_column::GeneratedComputeScope`）の外・ビュー経由・FK の参照アクションの連鎖
+    // （`RowPolicyWrite::Internal`）では、固定文言の `0A000` で拒否する（Issue #3329 が経路ごとに結線する。
+    // 黙って NULL を書かない fail-closed）。追加の拒否にしか働かないため RLS の `WITH CHECK` より前に置いても
+    // 境界は緩まない。公開ラッパーと FK の参照アクションの連鎖（`propagate_referential_actions`）の双方が
+    // この関数を通る。`written_ids` が空でも止める（行の無い書き込み文でも一貫した拒否にする）。
+    // 結線済みなら、書いた行の生成列が式の再計算結果と一致することを確かめる（多層防御。不一致は `XX000`）。
     if schema.columns.iter().any(|c| c.generated.is_some()) {
-        return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+        if matches!(policy, RowPolicyWrite::Internal)
+            || !crate::sql::generated_column::write_wired(table_name)
+        {
+            return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+        }
+        verify_generated_columns_in_txn(write_txn, table_name, schema, tenant_id, written_ids)?;
     }
     // ビューの `WITH CHECK OPTION` は、ユーザーが直接書いた行にだけ掛ける（内部の連鎖書き込みには掛けない）。
     let view_checks = !matches!(policy, RowPolicyWrite::Internal);
@@ -957,6 +964,44 @@ fn enforce_check_constraints_in_txn(
         let (_dim, metadata) =
             crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
         compiled.enforce(schema, id.legacy_id(), &embedding, metadata)?;
+    }
+    Ok(())
+}
+
+/// 生成列（TABLE-50・Issue #3328）の照合段。`written_ids` の各行を読み戻し、生成列の保存値が式の再計算結果と
+/// 一致することを確かめる（計算点の結線漏れを commit 前に検出する多層防御。不一致は `XX000`）。読むのは
+/// 書き込んだ自テナントの行だけで、他テナントの存在オラクルにならない。
+fn verify_generated_columns_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    schema: &TableSchema,
+    tenant_id: &str,
+    written_ids: &[RowId],
+) -> Result<(), TenantWriteError> {
+    if written_ids.is_empty() {
+        return Ok(());
+    }
+    let Some(compiled) =
+        crate::sql::generated_column::CompiledGeneratedColumns::compile_any(schema)?
+    else {
+        return Ok(());
+    };
+    let row_table_name = crate::catalog::user_rows_table_name(table_name);
+    let row_table = write_txn
+        .open_table_logged(crate::catalog::user_rows_table_def(&row_table_name))
+        .map_err(crate::catalog::map_row_table_error)?;
+    let mut embedding: Vec<f32> = Vec::new();
+    for &id in written_ids {
+        let Some(guard) = row_table
+            .get(row_key(tenant_id, id))
+            .map_err(crate::catalog::CatalogError::from)?
+        else {
+            continue;
+        };
+        let buf = guard.value();
+        let (_dim, metadata) =
+            crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding)?;
+        compiled.verify_row(id.legacy_id(), &embedding, metadata)?;
     }
     Ok(())
 }

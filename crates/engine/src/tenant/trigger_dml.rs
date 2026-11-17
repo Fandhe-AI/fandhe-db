@@ -183,6 +183,10 @@ pub(super) fn update_rows_with_triggers(
     mut project: Option<&mut ReturningProjectFn<'_>>,
     mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
+    // 生成列（TABLE-50）を持つ表のトリガ付き UPDATE は未結線（Issue #3329）。固定文言の `0A000`。
+    if schema.columns.iter().any(|c| c.generated.is_some()) {
+        return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+    }
     // 対象行が 0 件でも `row_security = off` の拒否を文の開始時点で適用する（RLS-13・Issue #2278）。
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
     if spec
@@ -240,6 +244,7 @@ pub(super) fn update_rows_with_triggers(
                 spec.assignments,
                 spec.set_exprs,
                 row_extra,
+                None,
             )?;
             let new_candidate =
                 captured_values_from_parts(schema, merged_embedding.clone(), &merged_metadata)?;

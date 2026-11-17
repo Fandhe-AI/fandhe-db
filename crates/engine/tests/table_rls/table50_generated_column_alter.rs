@@ -217,7 +217,7 @@ fn drop_column_restrict_and_cascade() {
     ok(&core, TENANT, "ALTER TABLE g DROP COLUMN other CASCADE");
 }
 
-/// 生成列が 0 本になった表は通常の表へ戻り、書き込みの暫定停止が外れる。再起動後も一致する。
+/// 生成列が 0 本になった表は通常の表へ戻り、生成列の計算・直接指定の拒否が外れる。再起動後も一致する。
 #[test]
 fn cascade_dropping_the_last_generated_column_unblocks_writes() {
     let path = unique_db_path("t50a-unblock");
@@ -229,9 +229,10 @@ fn cascade_dropping_the_last_generated_column_unblocks_writes() {
             TENANT,
             "CREATE TABLE g (a INTEGER, z INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
         );
+        ok(&core, TENANT, "INSERT INTO g (a, z) VALUES (1, 2)");
         assert_eq!(
-            code(&core, TENANT, "INSERT INTO g (a, z) VALUES (1, 2)"),
-            "0A000"
+            code(&core, TENANT, "INSERT INTO g (a, z, b) VALUES (1, 2, 3)"),
+            "428C9"
         );
         ok(&core, TENANT, "ALTER TABLE g DROP COLUMN a CASCADE");
         ok(&core, TENANT, "INSERT INTO g (z) VALUES (2)");
@@ -346,7 +347,7 @@ fn drop_expression_turns_a_generated_column_into_a_plain_column() {
     ok(&core, TENANT, "ALTER TABLE g DROP COLUMN a2");
 }
 
-/// 生成列が 2 本ある表で 1 本だけ外しても、残りの生成列は保たれ書き込み停止も続く。
+/// 生成列が 2 本ある表で 1 本だけ外しても、残りの生成列は保たれ生成列の計算も続く。
 #[test]
 fn drop_expression_on_one_of_two_generated_columns_keeps_the_other() {
     let (_p, _g, core) = fixture("t50a-dropexpr-two");
@@ -363,7 +364,11 @@ fn drop_expression_on_one_of_two_generated_columns_keeps_the_other() {
     );
     let create = create_stmt_of(&core, TENANT, "g");
     assert!(create.contains("GENERATED"), "{create}");
-    assert_eq!(code(&core, TENANT, "INSERT INTO g (a) VALUES (1)"), "0A000");
+    ok(&core, TENANT, "INSERT INTO g (a) VALUES (1)");
+    assert_eq!(
+        code(&core, TENANT, "INSERT INTO g (a, c) VALUES (1, 2)"),
+        "428C9"
+    );
     assert_eq!(code(&core, TENANT, "ALTER TABLE g DROP COLUMN a"), "2BP01");
 }
 

@@ -205,6 +205,9 @@ impl EngineCore {
         let project: Option<&mut ReturningProjectFn<'_>> =
             collector.as_mut().map(|c| c as &mut ReturningProjectFn<'_>);
 
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間（`UPDATE ... FROM`）。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(&plan.target.table);
         let result = crate::sql::exec::run_where_predicate(
             schema,
             &plan.target.metadata_filters,

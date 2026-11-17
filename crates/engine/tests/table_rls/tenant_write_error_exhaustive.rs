@@ -78,8 +78,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
 /// `crates/engine/tests/error_format.rs` が別途カバーするため、ここでは
 /// 網羅 `match`（本ファイルの `expected_class`）のコンパイル固定が主目的。
 #[test]
-// `GeneratedColumnWriteUnsupported` は計算点が結線されるまでの暫定停止（#3328・#3329 が経路ごとに外す）。
-// tracked: #3328, #3329
+// `GeneratedColumnWriteUnsupported` は計算点が結線されていない経路（COPY・NoSQL・ビュー・トリガ等）の停止（#3329 が経路ごとに外す。SQL の INSERT・UPDATE・UPSERT は #3328 で結線済み）。
+// tracked: #3329
 fn tenant_write_error_class_matches_expected_for_constructible_variants() {
     let cases = [
         TenantWriteError::Forbidden,

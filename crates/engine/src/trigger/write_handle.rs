@@ -93,6 +93,8 @@ impl<'a> TriggerWriteHandle<'a> {
         id: Option<u64>,
         values: &[Value],
     ) -> Result<(), SqlSurfaceError> {
+        // 入れ子の書き込みは結線済みを継承しない（Issue #3328）。
+        let _generated_suspend = crate::sql::generated_column::GeneratedComputeScope::suspend();
         if table.starts_with('#') {
             // 内部キーは窓口から受けない（不在と同じ応答）。
             return Err(SqlSurfaceError::UndefinedTable {
@@ -178,6 +180,9 @@ impl<'a> TriggerWriteHandle<'a> {
         table: &str,
         f: impl FnOnce(WriteTarget<'_>) -> Result<T, SqlSurfaceError>,
     ) -> Result<T, SqlSurfaceError> {
+        // 入れ子の書き込みは外側の文の「生成列の計算点が結線済み」を継承しない（Issue #3328。
+        // トリガ本体の書き込みは Issue #3329 が結線するまで `0A000`）。
+        let _generated_suspend = crate::sql::generated_column::GeneratedComputeScope::suspend();
         let out = f(WriteTarget::InTxn(self.write_txn))?;
         self.note_written(table);
         Ok(out)
