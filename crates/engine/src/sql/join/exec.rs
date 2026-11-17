@@ -50,6 +50,19 @@ impl Tuples {
     }
 }
 
+impl Tuples {
+    /// フラット配置のスロット列から組み立てる（LATERAL の段。`data` の長さが `n` の倍数でなければ
+    /// 内部エラー＝fail-closed）。
+    pub(super) fn from_parts(n: usize, data: Vec<Option<u32>>) -> Result<Self, SqlSurfaceError> {
+        if n == 0 || !data.len().is_multiple_of(n) {
+            return Err(SqlSurfaceError::Internal {
+                detail: "JOIN tuple buffer length mismatch".to_string(),
+            });
+        }
+        Ok(Self { n, data })
+    }
+}
+
 #[cfg(test)]
 impl Tuples {
     /// フラット配置のスロット列から組み立てる（テスト用）。長さが `n` の倍数でなければ
@@ -119,18 +132,7 @@ pub(super) fn run_joins(
     final_stop: Option<usize>,
 ) -> Result<(Tuples, Vec<u32>), SqlSurfaceError> {
     let n = sides.len();
-    let first = sides.first().ok_or_else(|| SqlSurfaceError::Internal {
-        detail: "JOIN has no relations".to_string(),
-    })?;
-    budget.charge(first.len().saturating_mul(n).saturating_mul(SLOT_BYTES))?;
-    let mut data: Vec<Option<u32>> = Vec::with_capacity(first.len().saturating_mul(n));
-    for i in 0..first.len() {
-        data.push(Some(to_u32(i, "JOIN row count exceeds limit")?));
-        for _ in 1..n {
-            data.push(None);
-        }
-    }
-    let mut acc = Tuples { n, data };
+    let mut acc = initial_tuples(sides, budget)?;
 
     for (k, step) in steps.iter().enumerate() {
         let new_rel = k + 1;
@@ -146,7 +148,86 @@ pub(super) fn run_joins(
         };
         acc = join_step(sides, step, new_rel, new_rows, &acc, budget, limits, stop)?;
     }
+    debug_assert_eq!(acc.n, n);
+    sorted_order(acc, budget)
+}
 
+/// [`run_joins`] の LATERAL 対応版（Issue #3322）。`lateral[i]` が `Some` の relation `i` の段は
+/// [`super::lateral::lateral_step`] で外側タプルごとに実行し、得た出力領域を `sides[i]` に据える
+/// （下流の残余・並べ替え・集計・投影は `sides` を読むため変更が要らない。設計記録 L13）。
+pub(super) fn run_joins_lateral(
+    sides: &mut [Vec<ResultRow>],
+    lateral: &[Option<super::lateral::LateralRuntime>],
+    steps: &[StepPlan],
+    budget: &mut JoinBudget,
+    limits: &JoinLimits,
+    final_stop: Option<usize>,
+) -> Result<(Tuples, Vec<u32>), SqlSurfaceError> {
+    let mut acc = initial_tuples(sides, budget)?;
+    for (k, step) in steps.iter().enumerate() {
+        let new_rel = k + 1;
+        let stop = if k + 1 == steps.len() {
+            final_stop
+        } else {
+            None
+        };
+        let rt = lateral.get(new_rel).and_then(Option::as_ref);
+        match (rt, step.lateral.is_some()) {
+            (Some(rt), true) => {
+                let (tuples, arena) =
+                    super::lateral::lateral_step(sides, rt, new_rel, &acc, budget, limits, stop)?;
+                let slot = sides
+                    .get_mut(new_rel)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN relation index out of range".to_string(),
+                    })?;
+                *slot = arena;
+                acc = tuples;
+            }
+            (None, false) => {
+                let new_rows = sides
+                    .get(new_rel)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "JOIN relation index out of range".to_string(),
+                    })?;
+                acc = join_step(sides, step, new_rel, new_rows, &acc, budget, limits, stop)?;
+            }
+            // 計画と実行時入力の食い違いは到達しない不変条件（fail-closed）。
+            _ => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "LATERAL step and runtime input mismatch".to_string(),
+                })
+            }
+        }
+    }
+    sorted_order(acc, budget)
+}
+
+/// 先頭 relation だけを埋めた初期タプル列（他の relation は `None`）。
+fn initial_tuples(
+    sides: &[Vec<ResultRow>],
+    budget: &mut JoinBudget,
+) -> Result<Tuples, SqlSurfaceError> {
+    let n = sides.len();
+    let first = sides.first().ok_or_else(|| SqlSurfaceError::Internal {
+        detail: "JOIN has no relations".to_string(),
+    })?;
+    budget.charge(first.len().saturating_mul(n).saturating_mul(SLOT_BYTES))?;
+    let mut data: Vec<Option<u32>> = Vec::with_capacity(first.len().saturating_mul(n));
+    for i in 0..first.len() {
+        data.push(Some(to_u32(i, "JOIN row count exceeds limit")?));
+        for _ in 1..n {
+            data.push(None);
+        }
+    }
+    Ok(Tuples { n, data })
+}
+
+/// タプル列の決定的な出力順序（`(is_none_0, idx_0, ...)` の安定ソート）を作る。
+fn sorted_order(
+    acc: Tuples,
+    budget: &mut JoinBudget,
+) -> Result<(Tuples, Vec<u32>), SqlSurfaceError> {
     budget.charge(
         acc.len()
             .saturating_mul(std::mem::size_of::<u32>())
@@ -210,6 +291,12 @@ fn join_step(
     // Issue #1837: キー無し・ON 残余ありの段はネステッドループ結合へ振り分ける（D1。ハッシュ表を
     // 作る前）。SQL からの到達（束縛段の `42601` 解除）は #1839 で実装済み。キー無し・残余無しは下の直積経路。
     let method = step.method();
+    if method == JoinMethod::Lateral {
+        // LATERAL の段は `run_joins_lateral` が実行する。ここへ来るのは到達しない不変条件の破れ。
+        return Err(SqlSurfaceError::Internal {
+            detail: "LATERAL step reached the hash join".to_string(),
+        });
+    }
     if method == JoinMethod::NestedLoop {
         return super::nlj::nlj_step(
             sides,
@@ -504,6 +591,7 @@ mod cross_precheck_tests {
             on_acc: Vec::new(),
             on_new: Vec::new(),
             on_mixed: Vec::new(),
+            lateral: None,
         }
     }
 

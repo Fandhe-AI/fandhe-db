@@ -256,6 +256,7 @@ mod nlj_tests {
             on_acc,
             on_new,
             on_mixed,
+            lateral: None,
         }
     }
 

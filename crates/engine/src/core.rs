@@ -14774,6 +14774,7 @@ impl EngineCore {
             &cte_ids,
             inputs,
             budget,
+            self.correlated_limits,
         )
     }
 
@@ -14811,19 +14812,111 @@ impl EngineCore {
         let mut cache: Vec<Option<crate::sql::exec::QueryResult>> = vec![None; cte.slots.len()];
         let mut inputs = Vec::with_capacity(validated.relations.len());
         let mut cte_ids = crate::sql::join::CteIdColumns::new();
-        for (rel, slot) in validated.relations.iter().zip(cte.relation_slot.iter()) {
+        for (rel_idx, (rel, slot)) in validated
+            .relations
+            .iter()
+            .zip(cte.relation_slot.iter())
+            .enumerate()
+        {
             let Some(k) = slot else {
                 inputs.push(None);
                 continue;
             };
-            let result = self
-                .evaluate_cte_slot(ctx, session, read_txn, cte, *k, limits, &mut cache, budget)?;
+            // 外側の行ごとに再評価する LATERAL（Issue #3322）は、後処理の slot を評価せず、基底（親 slot）だけを
+            // 文内で 1 回評価して JOIN へ渡す。後処理は外側タプルごとに `sql::join::lateral` が適用する。
+            // 結合のスキーマ・列メタは後処理後の列（Describe の `describe_cte_slot` と同じ導出）で作る。
+            if cte.lateral.get(rel_idx).is_some_and(Option::is_some) {
+                let (base, post_columns) = self.evaluate_lateral_base(
+                    ctx, session, read_txn, cte, *k, limits, &mut cache, budget,
+                )?;
+                let (schema, id_columns) =
+                    crate::sql::join::cte_schema(rel.table(), &post_columns)?;
+                schemas.insert(rel.table().to_string(), schema);
+                cte_ids.insert(rel.table().to_string(), id_columns);
+                inputs.push(Some(base));
+                continue;
+            }
+            let result = self.evaluate_cte_slot(
+                ctx, session, read_txn, cte, *k, limits, &mut cache, budget, None,
+            )?;
             let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &result.columns)?;
             schemas.insert(rel.table().to_string(), schema);
             cte_ids.insert(rel.table().to_string(), id_columns);
             inputs.push(Some(result));
         }
         Ok((inputs, cte_ids))
+    }
+
+    /// 外側の行ごとに再評価する LATERAL の slot `k`（後処理）について、基底（`from` の親 slot）の評価済みの
+    /// 行と、後処理後の結果列（列名リスト適用後）を返す（Issue #3322。設計記録 L1・L15）。基底は参照者
+    /// 自身の `ctx`・呼び出し元と同一の `read_txn` で文内に 1 回だけ評価し、保持分は `budget` へ計上される。
+    /// 基底が実表を読む `Scan` のときの暗黙 `LIMIT`（結果行数上限）は、後処理が外側タプルごとに絞るため
+    /// ハード上限まで緩め、入力行数の上限は呼び出し先の JOIN が判定する（利用者の CTE を読む基底は設定値の
+    /// まま）。明示 `LIMIT` は設定値の範囲を検査する。
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_lateral_base<R: crate::storage::read_source::ReadSource>(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        read_txn: &R,
+        cte: &crate::sql::allowlist::JoinCteInputs,
+        k: usize,
+        limits: crate::result_limits::ResultLimits,
+        cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
+        budget: &mut crate::sql::join::JoinBudget,
+    ) -> Result<
+        (
+            crate::sql::exec::QueryResult,
+            Vec<crate::sql::exec::ColumnMeta>,
+        ),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
+        let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "CTE slot out of range".to_string(),
+        })?;
+        let CteSlotSource::Derived { from, layer } = &slot.source else {
+            return Err(SqlSurfaceError::Internal {
+                detail: "LATERAL slot is not a derived layer".to_string(),
+            });
+        };
+        if layer.limit_explicit {
+            crate::sql::parser::validate_search_limit_with(layer.limit, &limits)?;
+        }
+        // 基底が実表を読む `Scan` のときだけ暗黙上限を緩める。基底が利用者の CTE を読む `Derived` のときは、
+        // 緩めた上限が（共有されうる）親 slot の評価・キャッシュへ伝わらないよう、設定値のまま渡す。
+        let base_is_scan = matches!(
+            cte.slots.get(*from).map(|b| &b.source),
+            Some(CteSlotSource::Scan(_))
+        );
+        let base_limits = if base_is_scan {
+            crate::result_limits::ResultLimits::new(crate::result_limits::MAX_RESULT_ROWS_HARD_CAP)
+        } else {
+            limits
+        };
+        let base = self.evaluate_cte_slot(
+            ctx,
+            session,
+            read_txn,
+            cte,
+            *from,
+            base_limits,
+            cache,
+            budget,
+            base_is_scan.then(|| self.join_limits.max_input_rows()),
+        )?;
+        let plan = crate::sql::view_buffered::plan_rows_layer(
+            &base.columns,
+            &slot.name,
+            layer,
+            session.udfs(),
+        )?;
+        let mut columns = plan.columns().to_vec();
+        if !slot.column_aliases.is_empty() {
+            columns =
+                crate::sql::view_buffered::rename_cte_columns(&columns, &slot.column_aliases)?;
+        }
+        Ok((base, columns))
     }
 
     /// CTE slot `k` の評価済みの行（列名リスト適用後）を返す（[`Self::evaluate_join_cte_inputs`]
@@ -14842,6 +14935,7 @@ impl EngineCore {
         limits: crate::result_limits::ResultLimits,
         cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
         budget: &mut crate::sql::join::JoinBudget,
+        scan_input_cap: Option<usize>,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
         let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
@@ -14857,13 +14951,18 @@ impl EngineCore {
             CteSlotSource::Scan(scan) => {
                 self.count_materialized_cte_eval();
                 let schema = table_schema_in(read_txn, scan.table_name())?;
-                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     scan,
                     &schema,
                     session.udfs(),
                     &[],
                     &limits,
                 )?;
+                // 入力上限つきの基底（LATERAL。Issue #3322 設計記録 L11）は、上限＋1 件で取得を止めて
+                // 超過を検出する（上限を超える行を読み込み・確保しない）。
+                if let Some(cap) = scan_input_cap {
+                    bound.limit = cap.saturating_add(1);
+                }
                 let result = crate::sql::scan::execute_scan_with_budget(
                     read_txn,
                     ctx,
@@ -14871,6 +14970,13 @@ impl EngineCore {
                     &bound,
                     budget.remaining(),
                 )?;
+                if let Some(cap) = scan_input_cap {
+                    if result.rows.len() > cap {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "JOIN input exceeds the visible row limit",
+                        ));
+                    }
+                }
                 budget.charge_result(&result)?;
                 result
             }
@@ -14900,6 +15006,7 @@ impl EngineCore {
                     parent_limits,
                     cache,
                     budget,
+                    None,
                 )?;
                 // tail CTE（Issue #1862）の明示 `LIMIT` は設定値の範囲で検査する（構文段は
                 // 設定値を持たない。Scan 側の `bind_scan_with_dummy_flags` と同じ契約）。

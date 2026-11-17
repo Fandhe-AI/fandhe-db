@@ -54,6 +54,12 @@ pub(crate) struct BoundBody {
     /// 外側参照を含む連言を取り除いた本文（既存の本文検証へ渡す）。
     pub(crate) tokens: Vec<Token>,
     pub(crate) binding: LateralBinding,
+    /// 取り除いた相関連言だけを `WHERE` に持つ本文（`SELECT <元の投影> FROM <内側> WHERE <相関連言>`。
+    /// 外側参照は予約内部名のまま。外側参照が無ければ `None`）。`derived_table` が内側の別名を
+    /// 正規化したうえで述語へ解析し、外側タプルごとに評価する相関述語にする（Issue #3322。L2）。
+    pub(crate) correlated_body: Option<Vec<Token>>,
+    /// 内側 relation の列名（カタログの綴り。疑似列 `id` を含みうる。列集合を返せなければ `None`）。
+    pub(crate) inner_columns: Option<Vec<String>>,
 }
 
 fn outer_position_unsupported() -> SqlSurfaceError {
@@ -206,6 +212,8 @@ where
     let unchanged = || BoundBody {
         tokens: body.to_vec(),
         binding: LateralBinding::default(),
+        correlated_body: None,
+        inner_columns: None,
     };
     let Some(from_idx) = find_top_from(body) else {
         return Ok(unchanged());
@@ -331,6 +339,8 @@ where
         return Ok(BoundBody {
             tokens: out,
             binding: LateralBinding::default(),
+            correlated_body: None,
+            inner_columns: None,
         });
     }
     refs.sort();
@@ -352,9 +362,11 @@ where
             .any(|t| matches!(t, Token::Ident(n) if parse_lateral_ref_placeholder(n).is_some()))
     };
     let mut kept: Vec<(usize, usize)> = Vec::new();
+    let mut dropped: Vec<(usize, usize)> = Vec::new();
     for &(s, e) in &conjuncts {
         if is_correlated(s, e) {
             check_dropped_conjunct(&out, s, e, &inner_ref, inner_cols.as_deref())?;
+            dropped.push((s, e));
         } else {
             kept.push((s, e));
         }
@@ -369,10 +381,115 @@ where
         tokens.extend_from_slice(out.get(s..e).unwrap_or(&[]));
     }
     tokens.extend_from_slice(out.get(where_end..).unwrap_or(&[]));
+    // 取り除いた連言を `AND` で連結した本文（元の投影・FROM を保つ。別名の正規化は呼び出し側）。
+    // 投影は `*` に置き換える（取り除いた連言の解析にだけ使うため、元の投影の形に依存させない）。
+    let mut correlated_body: Vec<Token> = vec![Token::Keyword(Keyword::Select), Token::Punct('*')];
+    correlated_body.extend_from_slice(out.get(from_idx..where_at).unwrap_or(&[]));
+    for (n, &(s, e)) in dropped.iter().enumerate() {
+        correlated_body.push(if n == 0 {
+            Token::Keyword(Keyword::Where)
+        } else {
+            Token::Keyword(Keyword::And)
+        });
+        correlated_body.extend_from_slice(out.get(s..e).unwrap_or(&[]));
+    }
     Ok(BoundBody {
         tokens,
         binding: LateralBinding { outer_refs: refs },
+        correlated_body: Some(correlated_body),
+        inner_columns: inner_cols,
     })
+}
+
+/// 相関 LATERAL の実行形（Issue #3322。設計記録 L2）。内側を「外側参照を含まない基底」と
+/// 「外側タプルごとに適用する後処理」の 2 つの本文へ分ける。
+pub(crate) struct ExecutionBodies {
+    /// `SELECT <参照される内側の列> FROM <内側> [WHERE <外側参照を含まない連言>]`。tail は持たない。
+    pub(crate) base: Vec<Token>,
+    /// 元の投影・`ORDER BY`・`LIMIT`・`OFFSET` を基底の名前の relation へ適用する本文。
+    pub(crate) post: Vec<Token>,
+}
+
+fn star_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::feature_not_supported(
+        "SELECT * in a LATERAL subquery referencing outer columns is not supported yet",
+    )
+}
+
+/// 相関 LATERAL の本文（`body`。内側の別名除去済みで、外側参照を含む連言は取り除かれている）を
+/// 基底本文と後処理本文へ分ける。`base_name` は基底の合成 CTE 名、`inner_cols` は内側 relation の
+/// 列名（正規の綴り。疑似列 `id` を含みうる）、`correlated_body` は取り除いた連言の本文
+/// （[`BoundBody::correlated_body`] を正規化したもの）。基底の投影は、本文のどこかで参照される内側の
+/// 列だけにする（参照されない VECTOR 列などを実体化しない）。走査は反復処理・添字は `get()`。
+pub(crate) fn split_for_execution(
+    body: &[Token],
+    base_name: &str,
+    inner_cols: &[String],
+    correlated_body: &[Token],
+) -> Result<ExecutionBodies, SqlSurfaceError> {
+    let Some(from_idx) = find_top_from(body) else {
+        return Err(star_unsupported());
+    };
+    let projection = body.get(1..from_idx).unwrap_or(&[]);
+    if projection
+        .iter()
+        .any(|t| matches!(t, Token::Punct('*') | Token::QualifiedStar { .. }))
+    {
+        return Err(star_unsupported());
+    }
+    let probe_end = body.len().min(from_idx.saturating_add(5));
+    let Some((_inner_ref, consumed)) = body
+        .get(from_idx.saturating_add(1)..probe_end)
+        .and_then(probe_from_table_ref)
+    else {
+        return Err(unresolvable_left_columns());
+    };
+    let item_end = from_idx.saturating_add(1).saturating_add(consumed);
+    let from_item = body
+        .get(from_idx.saturating_add(1)..item_end)
+        .unwrap_or(&[]);
+    let (base_where, tail): (&[Token], &[Token]) = match find_where(body) {
+        Some((ws, we)) => (
+            body.get(ws..we).unwrap_or(&[]),
+            body.get(we..).unwrap_or(&[]),
+        ),
+        None => (&[], body.get(item_end..).unwrap_or(&[])),
+    };
+    // 参照される内側の列: 投影・tail・取り除いた連言（WHERE より後）の識別子。
+    let corr_conj: &[Token] = match find_where(correlated_body) {
+        Some((ws, we)) => correlated_body.get(ws..we).unwrap_or(&[]),
+        None => &[],
+    };
+    let referenced = |col: &String| {
+        projection
+            .iter()
+            .chain(tail.iter())
+            .chain(corr_conj.iter())
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case(col)))
+    };
+    let mut cols: Vec<&String> = inner_cols.iter().filter(|c| referenced(c)).collect();
+    if cols.is_empty() {
+        if let Some(first) = inner_cols.first() {
+            cols.push(first);
+        } else {
+            return Err(unresolvable_left_columns());
+        }
+    }
+    let mut base: Vec<Token> = vec![Token::Keyword(Keyword::Select)];
+    for (n, c) in cols.iter().enumerate() {
+        if n > 0 {
+            base.push(Token::Punct(','));
+        }
+        base.push(Token::Ident((*c).clone()));
+    }
+    base.push(Token::Keyword(Keyword::From));
+    base.extend_from_slice(from_item);
+    base.extend_from_slice(base_where);
+    let mut post: Vec<Token> = body.get(..from_idx).unwrap_or(&[]).to_vec();
+    post.push(Token::Keyword(Keyword::From));
+    post.push(Token::Ident(base_name.to_string()));
+    post.extend_from_slice(tail);
+    Ok(ExecutionBodies { base, post })
 }
 
 /// LATERAL の本文の `FROM` の別名（`FROM docs x`・`FROM docs AS x`）を落とす。内側の別名による修飾は
@@ -612,5 +729,99 @@ mod tests {
             .tokens
             .iter()
             .any(|t| matches!(t, Token::Ident(n) if parse_lateral_ref_placeholder(n).is_some())));
+    }
+    fn split(sql: &str) -> (Vec<Token>, Vec<Token>) {
+        let b = bind(sql, &[d()]).expect("bind");
+        let inner_cols: Vec<String> = vec!["id".into(), "k".into(), "lang".into()];
+        let norm = |t: Vec<Token>| {
+            strip_inner_alias(
+                crate::sql::qualified_column::normalize_single_table_qualifiers(&t)
+                    .expect("normalize")
+                    .into_owned(),
+            )
+        };
+        let tokens = norm(b.tokens);
+        let corr = norm(b.correlated_body.expect("correlated"));
+        let bodies =
+            split_for_execution(&tokens, "?derived0_base", &inner_cols, &corr).expect("split");
+        (bodies.base, bodies.post)
+    }
+
+    #[test]
+    fn correlated_conjuncts_are_kept_with_reserved_names_for_execution() {
+        let b = bind(
+            "SELECT lang FROM other o WHERE o.k = d.lang AND o.k = 'x' AND o.lang = d.title",
+            &[d()],
+        )
+        .expect("bind");
+        let corr = b.correlated_body.expect("correlated body");
+        let idents: Vec<&str> = corr
+            .iter()
+            .filter_map(|t| match t {
+                Token::Ident(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(idents.contains(&lateral_ref_placeholder(0, "lang").as_str()));
+        assert!(idents.contains(&lateral_ref_placeholder(0, "title").as_str()));
+        // 取り除かれた連言だけが残り、非相関の `o.k = 'x'` は含まれない。
+        assert!(!corr
+            .iter()
+            .any(|t| matches!(t, Token::StringLiteral(s) if s == "x")));
+        // 外側参照が無い本文には相関本文が無い。
+        assert!(bind("SELECT lang FROM other WHERE k = 'x'", &[d()])
+            .expect("bind")
+            .correlated_body
+            .is_none());
+    }
+
+    #[test]
+    fn or_and_between_stay_one_correlated_conjunct() {
+        let b = bind(
+            "SELECT lang FROM other o WHERE o.k = 'x' OR o.lang = d.lang",
+            &[d()],
+        )
+        .expect("bind");
+        // 深さ 0 の OR があると全体が 1 連言で、非相関の部分も本文から取り除かれる。
+        assert_eq!(b.tokens, tokenize("SELECT lang FROM other o").expect("t"));
+        let corr = b.correlated_body.expect("correlated");
+        assert!(corr
+            .iter()
+            .any(|t| matches!(t, Token::StringLiteral(s) if s == "x")));
+    }
+
+    #[test]
+    fn split_for_execution_separates_base_and_post() {
+        let (base, post) = split(
+            "SELECT lang FROM other o WHERE o.k = d.lang AND o.k = 'x' ORDER BY o.lang LIMIT 1",
+        );
+        // 基底は参照される列（`k`・`lang`）だけを投影し、非相関の WHERE を残して tail を持たない。
+        assert_eq!(
+            base,
+            tokenize("SELECT k, lang FROM other WHERE k = 'x'").expect("t")
+        );
+        // 後処理は元の投影・tail を基底の名前の relation へ適用する。
+        let mut expected = tokenize("SELECT lang FROM").expect("t");
+        expected.push(Token::Ident("?derived0_base".into()));
+        expected.extend(tokenize("ORDER BY lang LIMIT 1").expect("t"));
+        assert_eq!(post, expected);
+    }
+
+    #[test]
+    fn split_without_remaining_where_has_no_base_where() {
+        let (base, _post) = split("SELECT lang FROM other o WHERE o.k = d.lang");
+        assert_eq!(base, tokenize("SELECT k, lang FROM other").expect("t"));
+    }
+
+    #[test]
+    fn select_star_is_rejected_for_execution() {
+        let b = bind("SELECT * FROM other o WHERE o.k = d.lang", &[d()]).expect("bind");
+        let inner_cols: Vec<String> = vec!["id".into(), "k".into(), "lang".into()];
+        let tokens = strip_inner_alias(b.tokens);
+        let corr = strip_inner_alias(b.correlated_body.expect("correlated"));
+        let err = split_for_execution(&tokens, "?d_base", &inner_cols, &corr)
+            .err()
+            .expect("star");
+        assert_eq!(err.wire_code(), "0A000");
     }
 }

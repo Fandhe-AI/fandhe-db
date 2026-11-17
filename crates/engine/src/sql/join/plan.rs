@@ -106,6 +106,16 @@ pub(super) struct StepPlan {
     pub(super) on_new: Vec<ResNode>,
     /// ON の残余のうち、両側を跨ぐ非キー比較（キー一致の候補ペアごとに評価）。
     pub(super) on_mixed: Vec<ResNode>,
+    /// 外側の行ごとに再評価する LATERAL の段なら、その外側参照（Issue #3322。設計記録 L1）。
+    /// `Some` の段は `exec::run_joins_lateral` が `lateral::lateral_step` で実行する（ハッシュ・NLJ・
+    /// 直積の経路には入らない）。
+    pub(super) lateral: Option<LateralStepPlan>,
+}
+
+/// LATERAL の段が読む外側参照（左側 relation の列）の解決結果（Issue #3322）。
+pub(super) struct LateralStepPlan {
+    /// `(列名, 解決済みの位置)`。列名は `ValidatedJoin` の `JoinLateral::outer_refs` と同じ並び。
+    pub(super) refs: Vec<(String, Col)>,
 }
 
 /// 1 段の結合方式（`exec::join_step` の振り分け結果。Issue #2046・SQL-75 (2) ポインタ）。
@@ -119,6 +129,8 @@ pub(super) enum JoinMethod {
     NestedLoop,
     /// キー無し・ON 残余も無し: 直積。
     Cross,
+    /// 外側の行ごとの再評価（LATERAL。Issue #3322）。
+    Lateral,
 }
 
 impl StepPlan {
@@ -129,7 +141,9 @@ impl StepPlan {
 
     /// この段の結合方式。`exec::join_step` の分岐と `EXPLAIN` が共有する。
     pub(super) fn method(&self) -> JoinMethod {
-        if !self.keys.is_empty() {
+        if self.lateral.is_some() {
+            JoinMethod::Lateral
+        } else if !self.keys.is_empty() {
             JoinMethod::Hash
         } else if self.has_on_residual() {
             JoinMethod::NestedLoop
@@ -1082,8 +1096,12 @@ pub(super) fn build_plan<'a>(
             on_acc: on_res.acc,
             on_new: on_res.new,
             on_mixed: on_res.mixed,
+            lateral: None,
         });
     }
+    // LATERAL の段（Issue #3322）: 外側参照の列を左側 relation の側投影へ登録して位置を解決し、WHERE の
+    // 結合キーへの昇格を止める（昇格すると LATERAL の再評価の外で絞られ、内側の LIMIT との前後が変わる）。
+    let lateral_steps = bind_lateral_steps(&mut b, &mut steps, validated)?;
     // 以降（WHERE・投影・並べ替え・集計）は、全段適用後の統合列・可視列を持つスコープで解決する。
     let final_base = BindingScope::new(
         b.relations
@@ -1126,7 +1144,8 @@ pub(super) fn build_plan<'a>(
             if let Some(p) = promotable_where_key(c, &b.scope)? {
                 let inner = steps
                     .get(p.step)
-                    .is_some_and(|s| !s.preserve_acc && !s.preserve_new);
+                    .is_some_and(|s| !s.preserve_acc && !s.preserve_new)
+                    && !lateral_steps.get(p.step).copied().unwrap_or(false);
                 if inner {
                     let acc_col =
                         b.col_from(p.acc.relation(), p.acc.slot(), p.acc.column_type())?;
@@ -1211,6 +1230,72 @@ pub(super) fn build_plan<'a>(
         residual,
         shape,
     })
+}
+
+/// LATERAL の段の外側参照を解決する（Issue #3322）。`validated.cte_inputs.lateral` が `Some` の
+/// relation `i` の段 `i - 1` に、外側参照の列を左側 relation の側投影へ登録した位置を載せる。段の条件が
+/// 直積（`CROSS`）の INNER でなければ `0A000`、参照が左側に無い・列が見つからないのは `Internal`
+/// （束縛段が先に拒否しているため到達しない不変条件。fail-closed）。段ごとの LATERAL の有無を返す。
+fn bind_lateral_steps(
+    b: &mut Binder<'_, '_>,
+    steps: &mut [StepPlan],
+    validated: &ValidatedJoin,
+) -> Result<Vec<bool>, SqlSurfaceError> {
+    let internal = |d: &str| SqlSurfaceError::Internal {
+        detail: d.to_string(),
+    };
+    let mut flags = vec![false; steps.len()];
+    let Some(inputs) = validated.cte_inputs.as_ref() else {
+        return Ok(flags);
+    };
+    if inputs.lateral.is_empty() {
+        return Ok(flags);
+    }
+    if inputs.lateral.len() != validated.relations.len() {
+        return Err(internal("LATERAL input count is inconsistent"));
+    }
+    for (new_rel, lat) in inputs.lateral.iter().enumerate() {
+        let Some(lat) = lat else { continue };
+        let k = new_rel
+            .checked_sub(1)
+            .ok_or_else(|| internal("LATERAL relation cannot be the first"))?;
+        let vstep = validated
+            .steps
+            .get(k)
+            .ok_or_else(|| internal("LATERAL step missing"))?;
+        if !matches!(vstep.condition, JoinCondition::Cross) || vstep.kind != JoinKind::Inner {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "this JOIN form with a LATERAL subquery referencing outer columns is not supported yet",
+            ));
+        }
+        let mut refs: Vec<(String, Col)> = Vec::with_capacity(lat.outer_refs.len());
+        for (rel, name) in &lat.outer_refs {
+            if *rel >= new_rel {
+                return Err(internal("LATERAL outer reference is not on the left"));
+            }
+            let schema = *b
+                .schemas
+                .get(*rel)
+                .ok_or_else(|| internal("LATERAL outer relation out of range"))?;
+            let (slot, ty) = match schema.columns.iter().position(|c| &c.name == name) {
+                Some(i) => (
+                    ColumnSlot::Column(i),
+                    schema.columns.get(i).map(|c| c.ty.clone()),
+                ),
+                None if name == "id" && schema.has_pseudo_id() => (ColumnSlot::Id, None),
+                None => return Err(internal("LATERAL outer column not found")),
+            };
+            let col = b.col_from(*rel, slot, ty.as_ref())?;
+            refs.push((name.clone(), col));
+        }
+        if let Some(step) = steps.get_mut(k) {
+            step.lateral = Some(LateralStepPlan { refs });
+        }
+        if let Some(f) = flags.get_mut(k) {
+            *f = true;
+        }
+    }
+    Ok(flags)
 }
 
 /// 解決済みの列から非集計 JOIN の並べ替えキーを作る（列キー・序数キー共通。並べ替え不能な型は `22000`）。
