@@ -613,3 +613,18 @@ fn schema_qualified_relation_row_compare_params_use_column_types() {
     core.describe_prepared_in_session(&SessionState::default(), &prepared)
         .unwrap_or_else(|e| panic!("{sql}: describe {}", e.wire_code()));
 }
+
+/// スキーマ修飾の第 1 表の JOIN／カンマ結合では、行値比較の `$n` を 42601 で拒否する（fail-closed）。
+/// JOIN の述語は複数スキャンへ分かれ Describe のダミーフラグ序数が信頼できないため（Issue #3257・PR 指摘）。
+#[test]
+fn schema_qualified_first_table_join_rejects_row_compare_params() {
+    let (_p, _g, core) = setup("prep-row-cmp-qual-join");
+    for sql in [
+        "SELECT t.id FROM public.t JOIN t AS u ON t.id = u.id WHERE (t.a, t.bg) < ($1, $2) LIMIT 10",
+        "SELECT t.id FROM public.t AS x JOIN t ON x.id = t.id WHERE (x.a, x.bg) < ($1, $2) LIMIT 10",
+        "SELECT t.id FROM public.t, t AS u WHERE (t.a, t.bg) < ($1, $2) LIMIT 10",
+        "SELECT t.id FROM public.t LEFT JOIN t AS u ON t.id = u.id WHERE (t.a, t.bg) < ($1, $2) LIMIT 10",
+    ] {
+        assert_eq!(code_of_parse(&core, sql), "42601", "{sql}");
+    }
+}

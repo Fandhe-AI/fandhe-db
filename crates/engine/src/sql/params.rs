@@ -1207,6 +1207,38 @@ fn row_compare_param_slots(
     out
 }
 
+/// FROM 直後の第 1 表がスキーマ修飾（`schema.table`。`QualifiedIdent`）の JOIN／カンマ結合を検出する
+/// （`looks_like_join` は素の識別子の第 1 表しか見ないため、修飾の第 1 表がすり抜けて JOIN 内の `$n` が
+/// 受理されるのを防ぐ fail-closed の補完。allowlist 側の判定は変えない）。
+fn qualified_first_table_joins(tokens: &[Token]) -> bool {
+    if !matches!(
+        tokens.first(),
+        Some(Token::Keyword(crate::sql::lexer::Keyword::Select))
+    ) {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth -= 1,
+            Token::Keyword(crate::sql::lexer::Keyword::From) if depth == 0 => {
+                if !matches!(tokens.get(i + 1), Some(Token::QualifiedIdent { .. })) {
+                    return false;
+                }
+                // 修飾名を素の識別子 1 個に置き換えて、既存の先読み（別名・JOIN 語の判定）を再利用する。
+                let mut rest: Vec<Token> = tokens.get(i + 1..).unwrap_or(&[]).to_vec();
+                if let Some(first) = rest.first_mut() {
+                    *first = Token::Ident("t".to_string());
+                }
+                return crate::sql::allowlist::from_clause_starts_join(&rest, 0);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// パターン 12 の `$n` のうち、相手成分が列のもの（トークン添字 → 列名）。`core.rs` が Describe・構造検証用の
 /// 型付きダミーを作るために使う（受理・推論と同じ [`row_compare_param_slots`] を参照する）。
 pub(crate) fn row_compare_column_slots(tokens: &[Token]) -> HashMap<usize, String> {
@@ -1958,7 +1990,8 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         }
         _ => tokens,
     };
-    if crate::sql::allowlist::looks_like_join(join_tokens)
+    if (crate::sql::allowlist::looks_like_join(join_tokens)
+        || qualified_first_table_joins(join_tokens))
         && tokens.iter().any(|t| matches!(t, Token::Param(_)))
     {
         return Err(SqlSurfaceError::unsupported(
