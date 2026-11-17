@@ -241,6 +241,15 @@ fn rejects_forms_with_decided_sqlstates_and_leaves_no_table() {
             "CREATE TABLE r (a TIMESTAMP, b TIMESTAMPTZ[] GENERATED ALWAYS AS (ARRAY[a]) STORED)",
             "42P17",
         ),
+        // TIMESTAMPTZ 配列から文字列配列への暗黙の代入変換は描画がセッション TimeZone に依存する。
+        (
+            "CREATE TABLE t (a TIMESTAMPTZ[], g TEXT[] GENERATED ALWAYS AS (a) STORED)",
+            "42P17",
+        ),
+        (
+            "CREATE TABLE t (a TIMESTAMPTZ, g TEXT[] GENERATED ALWAYS AS (ARRAY[a]) STORED)",
+            "42P17",
+        ),
         // ARRAY[...] 内の後続要素に置いた部分クエリ・集計も拒否される（42P17）。
         (
             "CREATE TABLE r (a INTEGER, b INTEGER[] GENERATED ALWAYS AS (ARRAY[a, (SELECT 1)]) STORED)",
