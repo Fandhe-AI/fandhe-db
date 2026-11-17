@@ -798,23 +798,23 @@ pub(crate) fn assignment_cast_is_session_dependent(
     // （描画・解釈がセッションの TimeZone に依存）なら TZ 依存として扱う（fail-closed）。
     if let ColumnType::Array(at) = target {
         use crate::catalog::ArrayElemType as E;
+        // 文字列系の要素型（`TEXT`／`VARCHAR`／`CHAR(n)`）。`TIMESTAMPTZ` との間の変換は描画・解釈が
+        // セッションの TimeZone に依存する。`TIME` への代入キャスト（`TIMESTAMPTZ` → `TIME`）も同様。
+        let is_stringy = |e: E| matches!(e, E::Text | E::Varchar(_) | E::Bpchar(_));
         let tz_differs = |src: E| {
-            matches!(
-                (at.elem(), src),
-                (E::TimestampTz, E::Timestamp | E::Date | E::Text)
-                    | (E::Timestamp | E::Date | E::Text, E::TimestampTz)
-            )
+            let dst = at.elem();
+            (dst == E::TimestampTz && (matches!(src, E::Timestamp | E::Date) || is_stringy(src)))
+                || (src == E::TimestampTz
+                    && (matches!(dst, E::Timestamp | E::Date | E::Time) || is_stringy(dst)))
         };
         if let Expr::ArrayConstructor(items) = expr {
-            return items.iter().any(|i| {
-                matches!(
-                    (at.elem(), static_type_of(i, schema)),
-                    (E::TimestampTz, Some(ExprType::Timestamp | ExprType::Date))
-                        | (
-                            E::Timestamp | E::Date | E::Text,
-                            Some(ExprType::TimestampTz)
-                        )
-                )
+            return items.iter().any(|i| match static_type_of(i, schema) {
+                Some(ExprType::Timestamp | ExprType::Date) => at.elem() == E::TimestampTz,
+                Some(ExprType::TimestampTz) => {
+                    matches!(at.elem(), E::Timestamp | E::Date | E::Time) || is_stringy(at.elem())
+                }
+                Some(ExprType::Text) => at.elem() == E::TimestampTz,
+                _ => false,
             });
         }
         return array_source_elem(expr, schema).is_some_and(tz_differs);
