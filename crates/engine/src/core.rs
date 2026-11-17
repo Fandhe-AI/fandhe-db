@@ -11802,7 +11802,11 @@ impl EngineCore {
         use crate::sql::transaction::TxnReadSource;
 
         match stmt {
-            CursorStatement::Declare { name, query } => {
+            CursorStatement::Declare {
+                name,
+                query,
+                scroll,
+            } => {
                 // 構文解析段（`parse_tokens`）は構造検証のみでカタログを参照
                 // しないため、ここで内側 SELECT を実カタログに対して再検証する
                 // （PR #1049 レビュー指摘 codex P1 対応）。通常の広域取得
@@ -11887,7 +11891,7 @@ impl EngineCore {
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "internal error".to_string(),
                     })?
-                    .declare(name.clone(), result)?;
+                    .declare(name.clone(), result, *scroll)?;
                 Ok(crate::sql::SqlOutcome::DeclareCursor)
             }
             CursorStatement::Fetch { name, count } => {
