@@ -364,6 +364,7 @@ fn too_many_derived_tables_is_54000() {
     assert_eq!(code(&core, "alice", &sql), "54000");
 }
 
+// tracked: #3323
 #[test]
 fn inherited_join_input_restrictions_stay_fail_closed() {
     let (core, _g) = open_seeded();
@@ -392,9 +393,9 @@ fn inherited_join_input_restrictions_stay_fail_closed() {
             "0A000",
         ),
         ("SELECT * FROM docs d, (SELECT lang FROM docs)", "0A000"),
-        // LATERAL は対象外。
+        // `ON true` 以外の ON を持つ LEFT JOIN LATERAL は固定 `0A000`（#3323）。
         (
-            "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs) t ON true",
+            "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs) t ON d.lang = t.lang",
             "0A000",
         ),
     ] {

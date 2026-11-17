@@ -21,19 +21,30 @@
 //! 別名だけを残し、派生表の別名を実表名として走査へ流す経路は存在しない（合成名は `?` を含む。
 //! JOIN パーサーが合成名だけをカタログ検証の対象外にする例外は [`is_derived_placeholder`] で判定）。
 //!
+//! `LATERAL (SELECT ...)`（Issue #3321。設計記録 `docs/design/lateral-derived-table.md`）は、構文
+//! （コンマ区切り・`CROSS JOIN`・`[INNER] JOIN ... ON true`・`LEFT [OUTER] JOIN ... ON true`・FROM 先頭）
+//! を本モジュールが受理し、`LATERAL` 語と `ON true` を外側のトークン列から落として通常の派生表と
+//! 同じプレースホルダへ置き換える。本文が参照する左側 relation の列は `sql::lateral_bind` が束縛する。
+//! 左側を参照しない LATERAL は通常の派生表（合成 CTE）として実行し、参照する形・`LEFT JOIN LATERAL` は
+//! 束縛を通したあと固定文言の `0A000` で止める（外側の行ごとの再評価は #3322・#3323）。
+//!
 //! RLS-10 (b) の不変条件: 本モジュールの型はテナント・`PolicyContext` を持たない。解決時の
 //! `42P01`／`42P10` 等はカタログの構造だけで決まり、行やテナントに依存しない。
 
 use crate::nesting_limits::NestingLimits;
 use crate::sql::allowlist::Statement;
 use crate::sql::allowlist::{
-    derived_output_names, is_set_operator_ident, looks_like_join, parse_cte_select_body,
-    parse_derived_alias_head, parse_with_clause_and_main, set_operator_is_followed_by_branch,
-    single_relation_main_over_ctes, split_parenthesized, validate_cte_definition_at,
-    validate_cte_definitions, validate_with_join_main, SqlSurfaceError, TableLookup,
+    derived_output_names, is_set_operator_ident, join_relations_of, looks_like_join,
+    parse_cte_select_body, parse_derived_alias_head, parse_with_clause_and_main,
+    set_operator_is_followed_by_branch, single_relation_main_over_ctes, split_parenthesized,
+    validate_cte_definition_at, validate_cte_definitions, validate_with_join_main, SqlSurfaceError,
+    TableLookup,
 };
 use crate::sql::cte::{CteDef, CteMaterialization};
+use crate::sql::lateral_bind::{bind_lateral_body, strip_inner_alias, LateralBinding};
 use crate::sql::lexer::{Keyword, Token};
+use crate::sql::qualified_column::normalize_single_table_qualifiers;
+use crate::sql::relation::TableRef;
 
 /// 派生表の内部名の接頭辞。`catalog::validate_identifier` を通らない（`?` を含む）ため利用者が
 /// 書けず、カタログにも当たらない。
@@ -50,6 +61,22 @@ pub(crate) enum DerivedPosition {
     CommaList,
 }
 
+/// LATERAL 派生表の書かれ方（Issue #3321）。結合の種類で左側 relation の範囲と、後続 Issue の実行方式が
+/// 変わるため抽出段で確定させる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LateralForm {
+    /// `FROM LATERAL (...)`（左側 relation なし）。
+    Leading,
+    /// `FROM a, LATERAL (...)`。
+    Comma,
+    /// `a CROSS JOIN LATERAL (...)`。
+    Cross,
+    /// `a [INNER] JOIN LATERAL (...) ON ...`。`on_true` は `ON true`（定数）だったか。
+    Inner { on_true: bool },
+    /// `a LEFT [OUTER] JOIN LATERAL (...) ON ...`。
+    Left { on_true: bool },
+}
+
 /// 解決済みの派生表 1 件。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DerivedTable {
@@ -58,6 +85,10 @@ pub(crate) struct DerivedTable {
     /// 列名リスト（空ならリストなし）。
     pub(crate) column_aliases: Vec<String>,
     pub(crate) position: DerivedPosition,
+    /// `LATERAL` で書かれた派生表なら、その形（通常の派生表は `None`）。
+    pub(crate) lateral: Option<LateralForm>,
+    /// LATERAL の左側 relation への参照の束縛結果（LATERAL 以外は `None`）。
+    pub(crate) lateral_binding: Option<LateralBinding>,
 }
 
 /// 抽出・解決の結果。
@@ -81,6 +112,7 @@ struct RawDerived {
     alias: Option<String>,
     column_aliases: Vec<String>,
     position: DerivedPosition,
+    lateral: Option<LateralForm>,
 }
 
 /// 抽出結果（派生表の並びと、派生表をプレースホルダへ置き換えた外側のトークン列）。
@@ -132,6 +164,84 @@ fn position_before(tokens: &[Token], idx: usize) -> Option<DerivedPosition> {
         Token::Punct(',') => Some(DerivedPosition::CommaList),
         _ => None,
     }
+}
+
+/// `LATERAL` の直前（`JOIN` の前の修飾語）から [`LateralForm`] と、外側トークン列から落とす/書き換える
+/// 修飾語の個数（`JOIN` 自身を除く）を求める。RIGHT／FULL／NATURAL は固定 `0A000`（L16。#3323 で
+/// PostgreSQL 17 と照合するまで fail-closed）。`i` は `LATERAL` の位置。
+fn lateral_form(
+    tokens: &[Token],
+    i: usize,
+    position: DerivedPosition,
+) -> Result<(LateralForm, usize), SqlSurfaceError> {
+    let unsupported = || {
+        SqlSurfaceError::feature_not_supported(
+            "RIGHT, FULL and NATURAL JOIN with LATERAL are not supported yet",
+        )
+    };
+    match position {
+        DerivedPosition::From => Ok((LateralForm::Leading, 0)),
+        DerivedPosition::CommaList => Ok((LateralForm::Comma, 0)),
+        DerivedPosition::Join => {
+            let before = |n: usize| i.checked_sub(n).and_then(|p| tokens.get(p));
+            // 修飾語は直前に FROM／JOIN／`,` が無い位置の語だけ（`FROM left JOIN LATERAL` の `left` は
+            // 左側のテーブル名であり結合修飾子ではない）。
+            let word = |n: usize, w: &str| {
+                is_ident(before(n), w)
+                    && i.checked_sub(n)
+                        .is_none_or(|p| position_before(tokens, p).is_none())
+            };
+            let (form, extra): (LateralForm, usize) = if word(2, "INNER") {
+                (LateralForm::Inner { on_true: false }, 1)
+            } else if word(2, "CROSS") {
+                (LateralForm::Cross, 1)
+            } else if word(2, "LEFT") {
+                (LateralForm::Left { on_true: false }, 1)
+            } else if word(2, "OUTER") {
+                if word(3, "LEFT") {
+                    (LateralForm::Left { on_true: false }, 2)
+                } else {
+                    return Err(unsupported());
+                }
+            } else if word(2, "RIGHT") || word(2, "FULL") || word(2, "NATURAL") {
+                return Err(unsupported());
+            } else {
+                (LateralForm::Inner { on_true: false }, 0)
+            };
+            if word(extra.saturating_add(2), "NATURAL") {
+                return Err(unsupported());
+            }
+            Ok((form, extra))
+        }
+    }
+}
+
+/// 別名部の直後 `after` が `ON true` で FROM 項目が終わる形か（`ON true` を落としてよいか）。
+fn is_on_true(after: &[Token]) -> bool {
+    if !(is_ident(after.first(), "ON") && is_ident(after.get(1), "true")) {
+        return false;
+    }
+    let end = 2usize;
+    match after.get(end) {
+        None | Some(Token::Punct(',' | ')' | ';')) => true,
+        Some(Token::Ident(n)) => {
+            ["JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"]
+                .iter()
+                .any(|w| n.eq_ignore_ascii_case(w))
+                || ends_from_clause(after, end)
+        }
+        Some(_) => ends_from_clause(after, end),
+    }
+}
+
+/// `tokens` に FROM／JOIN／`,` の直後の `LATERAL (` があるか（`EXPLAIN` 入口が LATERAL を明示拒否する
+/// ための検出。抽出の拒否・受理に依存せず固定 `0A000` にする。Issue #3321・#3324 の受け皿）。
+pub(crate) fn contains_lateral(tokens: &[Token]) -> bool {
+    tokens.iter().enumerate().any(|(i, t)| {
+        is_ident(Some(t), "LATERAL")
+            && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
+            && position_before(tokens, i).is_some()
+    })
 }
 
 /// 深さ 0 の FROM 句を終わらせるトークンか。
@@ -198,22 +308,41 @@ fn extract_at(
                 in_from = false;
             }
             if in_from {
-                if is_ident(Some(tok), "LATERAL")
+                let lateral_kw = is_ident(Some(tok), "LATERAL")
                     && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
-                    && position_before(tokens, i).is_some()
-                {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "LATERAL derived tables are not supported",
-                    ));
-                }
-                if matches!(tok, Token::Punct('('))
-                    && matches!(
-                        tokens.get(i.saturating_add(1)),
+                    && position_before(tokens, i).is_some();
+                // `LATERAL (` の `(` の位置（LATERAL でなければ `i` 自身）。
+                let paren_at = if lateral_kw { i.saturating_add(1) } else { i };
+                if lateral_kw {
+                    if !matches!(
+                        tokens.get(i.saturating_add(2)),
                         Some(Token::Keyword(Keyword::Select))
-                    )
+                    ) {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "LATERAL is only supported for a parenthesized SELECT",
+                        ));
+                    }
+                    if depth_level > 1 {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "LATERAL inside a derived table is not supported yet",
+                        ));
+                    }
+                }
+                if lateral_kw
+                    || (matches!(tok, Token::Punct('('))
+                        && matches!(
+                            tokens.get(i.saturating_add(1)),
+                            Some(Token::Keyword(Keyword::Select))
+                        ))
                 {
                     if let Some(position) = position_before(tokens, i) {
-                        let rest = tokens.get(i..).unwrap_or(&[]);
+                        let (mut lateral, lateral_words) = if lateral_kw {
+                            let (f, w) = lateral_form(tokens, i, position)?;
+                            (Some(f), w)
+                        } else {
+                            (None, 0)
+                        };
+                        let rest = tokens.get(paren_at..).unwrap_or(&[]);
                         let (inner, after) = split_parenthesized(rest)?;
                         if inner.iter().any(|t| matches!(t, Token::Punct(';'))) {
                             return Err(SqlSurfaceError::unsupported(
@@ -231,7 +360,37 @@ fn extract_at(
                                 "too many derived tables",
                             ));
                         }
-                        let (alias, column_aliases, consumed) = parse_derived_alias_head(after)?;
+                        let (alias, column_aliases, mut consumed) =
+                            parse_derived_alias_head(after)?;
+                        // `[INNER|LEFT] JOIN LATERAL (...) t ON true` は `ON true` を落とす。INNER は
+                        // `CROSS JOIN`（同値）へ書き換えて既存の結合パーサーを変えない。LEFT は束縛のための
+                        // 外側の構文解析にだけ使い、実行は #3323 まで `0A000`（`on_true` を保持する）。
+                        let after_alias = after.get(consumed..).unwrap_or(&[]);
+                        let mut rewrite_join = false;
+                        // `JOIN LATERAL ... USING (...)` は #3323 まで NATURAL 等と同じく fail-closed。
+                        if lateral.is_some() && is_ident(after_alias.first(), "USING") {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "USING with LATERAL is not supported yet",
+                            ));
+                        }
+                        if let Some(
+                            LateralForm::Inner { on_true } | LateralForm::Left { on_true },
+                        ) = lateral.as_mut()
+                        {
+                            if is_on_true(after_alias) {
+                                *on_true = true;
+                                consumed = consumed.saturating_add(2);
+                                rewrite_join = true;
+                            }
+                        }
+                        if rewrite_join {
+                            // `JOIN` と直前の修飾語を落として `CROSS JOIN` にする。
+                            for _ in 0..lateral_words.saturating_add(1) {
+                                outer.pop();
+                            }
+                            outer.push(Token::Ident("CROSS".to_string()));
+                            outer.push(Token::Ident("JOIN".to_string()));
+                        }
                         // 同じ FROM 句内の別名重複は `42601`（公開名の重複と同じ方針）。
                         if let Some(a) = &alias {
                             if found.iter().any(|d| {
@@ -258,13 +417,14 @@ fn extract_at(
                             alias,
                             column_aliases,
                             position,
+                            lateral,
                         });
                         // 本文（`(` 〜 `)`）と別名部を読み飛ばす。
                         let skipped = rest
                             .len()
                             .saturating_sub(after.len())
                             .saturating_add(consumed);
-                        i = i.saturating_add(skipped);
+                        i = paren_at.saturating_add(skipped);
                         continue;
                     }
                 }
@@ -297,12 +457,43 @@ fn resolve(
     limits: NestingLimits,
 ) -> Result<DerivedFromClause, SqlSurfaceError> {
     let mut scope_defs: Vec<CteDef> = Vec::new();
-    let tables = resolve_level(raw, ctes, &mut scope_defs, st, 1, lookup, limits)?;
+    // 左側を持つ LATERAL（先頭以外）があるときだけ、置換後の外側トークン列を構文解析して FROM の
+    // relation 一覧を得る（構文 `42601` → 束縛の順序を保つ）。
+    let needs_left = raw
+        .iter()
+        .any(|r| matches!(r.lateral, Some(f) if f != LateralForm::Leading));
+    let outer_rels = if needs_left {
+        Some(join_relations_of(&outer_tokens)?)
+    } else {
+        None
+    };
+    let tables = resolve_level(
+        raw,
+        ctes,
+        &mut scope_defs,
+        st,
+        LevelCtx {
+            depth_level: 1,
+            outer_rels: outer_rels.as_deref(),
+        },
+        lookup,
+        limits,
+    )?;
     Ok(DerivedFromClause {
         tables,
         scope_defs,
         outer_tokens,
     })
+}
+
+/// [`resolve_level`] の階層の文脈（引数の個数を抑えるための束ね）。
+#[derive(Clone, Copy)]
+struct LevelCtx<'a> {
+    /// 入れ子の深さ（最上位は 1）。
+    depth_level: usize,
+    /// 置換後の外側トークン列を構文解析した FROM の relation 一覧（LATERAL の左側を求める。
+    /// 最上位で左側を持つ LATERAL があるときだけ `Some`）。
+    outer_rels: Option<&'a [TableRef]>,
 }
 
 /// [`resolve`] の 1 階層分（`depth_level` は `raw` の入れ子深さ）。再帰の段数は
@@ -312,10 +503,14 @@ fn resolve_level(
     ctes: &[CteDef],
     acc: &mut Vec<CteDef>,
     st: &mut ExtractState,
-    depth_level: usize,
+    level: LevelCtx<'_>,
     lookup: &impl TableLookup,
     limits: NestingLimits,
 ) -> Result<Vec<DerivedTable>, SqlSurfaceError> {
+    let LevelCtx {
+        depth_level,
+        outer_rels,
+    } = level;
     let mut tables: Vec<DerivedTable> = Vec::new();
     for r in raw {
         // 入れ子の派生表は本文の解析より前に切り出す（深さ超過 `54000` が本文の構文 `42601` に先行）。
@@ -326,7 +521,10 @@ fn resolve_level(
                     ctes,
                     acc,
                     st,
-                    depth_level.saturating_add(1),
+                    LevelCtx {
+                        depth_level: depth_level.saturating_add(1),
+                        outer_rels: None,
+                    },
                     lookup,
                     limits,
                 )?;
@@ -334,8 +532,51 @@ fn resolve_level(
             }
             None => r.body.clone(),
         };
-        let (body, tail) = parse_cte_select_body(&body_tokens, limits)?;
         let placeholder = format!("{PLACEHOLDER_PREFIX}{}", r.number);
+        let (body_tokens, lateral_binding) = match r.lateral {
+            None => (body_tokens, None),
+            Some(form) => {
+                let left: &[TableRef] = if form == LateralForm::Leading {
+                    &[]
+                } else {
+                    let rels = outer_rels.unwrap_or(&[]);
+                    let pos = rels
+                        .iter()
+                        .position(|t| t.table() == placeholder)
+                        .ok_or_else(|| {
+                            SqlSurfaceError::unsupported("LATERAL derived table is not a FROM item")
+                        })?;
+                    rels.get(..pos).unwrap_or(&[])
+                };
+                // 左側 relation の列集合（先行の派生表・利用者の CTE・実表）。
+                let known: Vec<CteDef> = ctes.iter().chain(acc.iter()).cloned().collect();
+                let mut columns = |t: &TableRef| -> Result<Option<Vec<String>>, SqlSurfaceError> {
+                    match known
+                        .iter()
+                        .position(|d| d.name.eq_ignore_ascii_case(t.table()))
+                    {
+                        Some(idx) => Ok(derived_output_names(&known, idx, lookup, limits)?
+                            .into_iter()
+                            .collect::<Option<Vec<String>>>()),
+                        None => {
+                            // 左側（と内側）の relation の存在は束縛より先に判定する（`42P01` が
+                            // `0A000` に先行）。ビューは列集合を返さず参照時に fail-closed。
+                            if !lookup.table_exists(t.table())?
+                                && lookup.view_definition(t.table())?.is_none()
+                            {
+                                return Err(SqlSurfaceError::undefined_table(t.table()));
+                            }
+                            lookup.table_columns(t.table())
+                        }
+                    }
+                };
+                let bound = bind_lateral_body(&body_tokens, left, &mut columns)?;
+                // 内側の別名による修飾（`t.col`）は本文の検証の前に非修飾へ正規化する。
+                let normalized = normalize_single_table_qualifiers(&bound.tokens)?.into_owned();
+                (strip_inner_alias(normalized), Some(bound.binding))
+            }
+        };
+        let (body, tail) = parse_cte_select_body(&body_tokens, limits)?;
         let def = CteDef {
             name: placeholder.clone(),
             column_aliases: r.column_aliases.clone(),
@@ -375,6 +616,8 @@ fn resolve_level(
             alias: r.alias,
             column_aliases: r.column_aliases,
             position: r.position,
+            lateral: r.lateral,
+            lateral_binding,
         });
     }
     Ok(tables)
@@ -412,14 +655,43 @@ fn build_statement(
     let mut scope: Vec<CteDef> = ctes.to_vec();
     scope.extend(scope_defs);
     let single = matches!(tables.as_slice(), [t] if t.position == DerivedPosition::From);
-    if single && !looks_like_join(&outer_tokens) {
-        return single_relation_main_over_ctes(&scope, &outer_tokens, lookup, limits);
+    let statement = if single && !looks_like_join(&outer_tokens) {
+        single_relation_main_over_ctes(&scope, &outer_tokens, lookup, limits)
+    } else if tables.iter().any(|t| t.alias.is_none()) {
+        // 別名なしの派生表は公開名が内部名になるため、複数リレーションの FROM では受け付けない。
+        Err(alias_required_in_join())
+    } else {
+        validate_with_join_main(&outer_tokens, &scope, lookup, limits)
+    }?;
+    // 実行器が未接続の LATERAL は、外側の文の構文・束縛まで通したあと固定 `0A000` で止める（書き込みなし）。
+    if let Some(err) = lateral_not_executable(&tables) {
+        return Err(err);
     }
-    // 別名なしの派生表は公開名が内部名になるため、複数リレーションの FROM では受け付けない。
-    if tables.iter().any(|t| t.alias.is_none()) {
-        return Err(alias_required_in_join());
+    Ok(statement)
+}
+
+/// 現時点で実行できない LATERAL の固定エラー。左側の列を参照する形は外側の行ごとの再評価（#3322）、
+/// 参照しない `LEFT JOIN LATERAL` は #3323 が実装する。左側を参照しない INNER／CROSS／コンマ／先頭の
+/// LATERAL は通常の派生表（合成 CTE。L6）として実行できるため `None`。
+fn lateral_not_executable(tables: &[DerivedTable]) -> Option<SqlSurfaceError> {
+    if tables.iter().any(|t| {
+        t.lateral_binding
+            .as_ref()
+            .is_some_and(LateralBinding::is_correlated)
+    }) {
+        return Some(SqlSurfaceError::feature_not_supported(
+            "LATERAL subqueries referencing outer columns are not supported yet",
+        ));
     }
-    validate_with_join_main(&outer_tokens, &scope, lookup, limits)
+    if tables
+        .iter()
+        .any(|t| matches!(t.lateral, Some(LateralForm::Left { .. })))
+    {
+        return Some(SqlSurfaceError::feature_not_supported(
+            "LEFT JOIN LATERAL is not supported yet",
+        ));
+    }
+    None
 }
 
 /// セッション最上位の入口で、FROM に派生表を持つ `SELECT` 文を検出して検証し、実行形へ組む。
@@ -520,14 +792,114 @@ mod tests {
     }
 
     #[test]
-    fn limits_and_lateral_are_rejected() {
+    fn table_limit_is_rejected() {
         let tokens = tokenize("SELECT * FROM (SELECT 1 FROM t) a, (SELECT 1 FROM t) b").expect("t");
         assert_eq!(extract(&tokens, 1).expect_err("limit").wire_code(), "54000");
-        let tokens = tokenize("SELECT * FROM LATERAL (SELECT 1 FROM t) a").expect("t");
+    }
+
+    fn lateral_forms(sql: &str) -> Vec<Option<LateralForm>> {
+        found(sql)
+            .expect("found")
+            .iter()
+            .map(|d| d.lateral)
+            .collect()
+    }
+
+    #[test]
+    fn table_named_like_join_qualifier_is_not_a_qualifier() {
+        for name in [
+            "left", "inner", "right", "full", "cross", "outer", "natural",
+        ] {
+            assert_eq!(
+                lateral_forms(&format!(
+                    "SELECT * FROM {name} JOIN LATERAL (SELECT 1 FROM t) a ON true"
+                )),
+                vec![Some(LateralForm::Inner { on_true: true })],
+                "{name}"
+            );
+        }
+        let tokens =
+            tokenize("SELECT * FROM left JOIN LATERAL (SELECT 1 FROM t) a ON true").expect("t");
+        let (_, outer) = extract(&tokens, 5).expect("extract").expect("found");
+        assert!(outer
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("left"))));
+    }
+
+    #[test]
+    fn lateral_forms_are_recognized_and_keyword_is_dropped() {
         assert_eq!(
-            extract(&tokens, 8).expect_err("lateral").wire_code(),
-            "0A000"
+            lateral_forms("SELECT * FROM LATERAL (SELECT 1 FROM t) a"),
+            vec![Some(LateralForm::Leading)]
         );
+        assert_eq!(
+            lateral_forms("SELECT * FROM t, LATERAL (SELECT 1 FROM t) a"),
+            vec![Some(LateralForm::Comma)]
+        );
+        assert_eq!(
+            lateral_forms("SELECT * FROM t CROSS JOIN LATERAL (SELECT 1 FROM t) a"),
+            vec![Some(LateralForm::Cross)]
+        );
+        assert_eq!(
+            lateral_forms("SELECT * FROM t JOIN LATERAL (SELECT 1 FROM t) a ON true"),
+            vec![Some(LateralForm::Inner { on_true: true })]
+        );
+        assert_eq!(
+            lateral_forms(
+                "SELECT * FROM t INNER JOIN LATERAL (SELECT 1 FROM t) a(x) ON true WHERE 1 = 1"
+            ),
+            vec![Some(LateralForm::Inner { on_true: true })]
+        );
+        assert_eq!(
+            lateral_forms("SELECT * FROM t LEFT OUTER JOIN LATERAL (SELECT 1 FROM t) a ON true"),
+            vec![Some(LateralForm::Left { on_true: true })]
+        );
+        assert_eq!(
+            lateral_forms("SELECT * FROM t LEFT JOIN LATERAL (SELECT 1 FROM t) a ON a.x = t.x"),
+            vec![Some(LateralForm::Left { on_true: false })]
+        );
+        let tokens =
+            tokenize("SELECT * FROM t INNER JOIN LATERAL (SELECT 1 FROM t) a ON true").expect("t");
+        let (_, outer) = extract(&tokens, 8).expect("extract").expect("found");
+        assert!(!outer
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("LATERAL") || n.eq_ignore_ascii_case("ON") || n.eq_ignore_ascii_case("INNER"))));
+        assert!(outer
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("CROSS"))));
+    }
+
+    // tracked: #3323, #3324
+    #[test]
+    fn unsupported_lateral_shapes_are_rejected_with_0a000() {
+        for sql in [
+            "SELECT * FROM t RIGHT JOIN LATERAL (SELECT 1 FROM t) a ON true",
+            "SELECT * FROM t FULL OUTER JOIN LATERAL (SELECT 1 FROM t) a ON true",
+            "SELECT * FROM t NATURAL JOIN LATERAL (SELECT 1 FROM t) a",
+            "SELECT * FROM t JOIN LATERAL (SELECT 1 AS k FROM t) a USING (k)",
+            "SELECT * FROM t LEFT JOIN LATERAL (SELECT 1 AS k FROM t) a USING (k)",
+            "SELECT * FROM t, LATERAL (VALUES (1)) a",
+            "SELECT * FROM t, LATERAL (WITH c AS (SELECT 1) SELECT 1) a",
+        ] {
+            let tokens = tokenize(sql).expect("t");
+            assert_eq!(
+                extract(&tokens, 8).expect_err(sql).wire_code(),
+                "0A000",
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_lateral_is_rejected_at_depth_two() {
+        let body = tokenize("SELECT 1 FROM t, LATERAL (SELECT 1 FROM t) a").expect("t");
+        let mut st = ExtractState {
+            count: 0,
+            max_tables: 8,
+            max_depth: 4,
+        };
+        let err = extract_at(&body, &mut st, 2, false).expect_err("nested lateral");
+        assert_eq!(err.wire_code(), "0A000");
     }
 
     #[test]

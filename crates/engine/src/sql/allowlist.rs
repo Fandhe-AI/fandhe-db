@@ -1676,7 +1676,9 @@ impl SqlSurfaceError {
         let name = name.into();
         // 外側参照の予約内部名（制御文字の接頭辞）が束縛段を素通りして到達しても、
         // 文言には利用者が書いた列名だけを出す（Issue #1841・SQL-61）。
-        let shown = match crate::sql::correlation::parse_outer_ref_placeholder(&name) {
+        let shown = match crate::sql::correlation::parse_outer_ref_placeholder(&name)
+            .or_else(|| crate::sql::correlation::parse_lateral_ref_placeholder(&name))
+        {
             Some((_, column)) => column,
             None => name.as_str(),
         };
@@ -24393,6 +24395,13 @@ fn parse_join_statement(
     Ok(validated)
 }
 
+/// 結合構文だけを解析して FROM の relation 一覧を返す（カタログを引かない）。`sql::derived_table` が
+/// LATERAL 派生表の「左側の relation」（結合連鎖で自分より前にあるもの）を求めるために呼ぶ
+/// （Issue #3321）。第 2 の JOIN パーサーを持たず [`parse_join_syntax`] を共有する。
+pub(super) fn join_relations_of(tokens: &[Token]) -> Result<Vec<TableRef>, SqlSurfaceError> {
+    Ok(parse_join_syntax(tokens)?.relations)
+}
+
 /// [`parse_join_statement`] の構文部（カタログを引かない）。`WITH` 主クエリの JOIN
 /// （Issue #1861）も同じ構文解析を共有し、FROM の各リレーションを CTE 名として先に照合してから
 /// 残りをカタログで解決する（第 2 の JOIN パーサーを作らない）。
@@ -30446,6 +30455,13 @@ fn validate_sql_tokens_impl(
             // 同じ検証本体（`validate_with_statement`）へ渡し、返った文の形（インライン展開・具体化・
             // 再帰・CTE 入力の JOIN）を `explain_cte_target` が `ExplainTarget` に写す。
             // 第 2 の WITH パーサーを持たない。
+            // Issue #3321（#3324 の受け皿）: LATERAL 派生表は EXPLAIN の対象外。抽出が受理する形でも
+            // 実行計画の写像を持たないため、ここで固定 `0A000` にする。
+            if super::derived_table::contains_lateral(rest) {
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "EXPLAIN is not supported for LATERAL derived tables",
+                ));
+            }
             if matches!(rest.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH")) {
                 return explain_with_statement(rest, lookup, limits, cte_evaluation);
             }
