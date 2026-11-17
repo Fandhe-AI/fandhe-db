@@ -327,6 +327,9 @@ fn is_write(parsed: &ParsedSql) -> bool {
             | ParsedSql::Update(_)
             | ParsedSql::UpdateFrom(_)
             | ParsedSql::DeleteUsing(_)
+            // SQL-79・Issue #3351: 書き込み文として分類する（`is_routable` は既定の `false`。一時表が絡めば
+            // 永続側の拒否〔`0A000`〕に倒れる）。
+            | ParsedSql::Merge(_)
     )
 }
 

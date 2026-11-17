@@ -439,6 +439,8 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
                             if n.eq_ignore_ascii_case("INSERT")
                                 || n.eq_ignore_ascii_case("UPDATE")
                                 || n.eq_ignore_ascii_case("DELETE")
+                                // SQL-79・Issue #3351: 本文が MERGE の形も `Write` に倒す（fail-closed）。
+                                || n.eq_ignore_ascii_case("MERGE")
                     )
             });
             if has_dml_body || calls_non_builtin_function(&tokens) || has_row_lock_clause(&tokens) {
@@ -1807,6 +1809,20 @@ mod tests {
         );
         assert_eq!(
             classify_statement("TRUNCATE TABLE t USING OPERATION_ID 'o1'"),
+            StatementEffect::Write
+        );
+        // SQL-79・Issue #3351: MERGE は既定（未知の先頭語）の `Write`。データ変更 CTE の本文が MERGE の形も
+        // `Write` に倒す（fail-closed）。
+        assert_eq!(
+            classify_statement(
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE USING OPERATION_ID 'o1'"
+            ),
+            StatementEffect::Write
+        );
+        assert_eq!(
+            classify_statement(
+                "WITH x AS (MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE) SELECT 1"
+            ),
             StatementEffect::Write
         );
         // TASK-202・SQL-23（Issue #900）: `ALTER` は `lexer::Keyword` へ含めない

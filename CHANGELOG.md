@@ -9,6 +9,7 @@
 
 ### Changed
 
+- `MERGE` 文の構文解析を追加した（Issue #3351・SQL-79 ポインタ。判断は [sql-merge.md](docs/design/sql-merge.md)）。解析を通った文は Execute・Describe・明示 Tx のいずれも固定文言の `0A000` で止まり、行・台帳には触れない。**挙動の変更**: 従来 `42601` だった構文上正しい `MERGE` が `0A000` になる（構文エラーは `42601` のまま）。新しい公開型 `ValidatedMerge`・`MergeSource`・`MergeWhenClause`・`MergeMatchKind`・`MergeAction`・`MergeInsertValues` と `ParsedSql::Merge`（`ParsedSql` は `#[non_exhaustive]` のため下流の網羅 `match` は壊れない）。値位置の `$n` は後続（#3352）まで Parse で `42601`。
 - `UPDATE ... FROM`／`DELETE ... USING` の `$n` を拡張クエリで受理し、結合 DML の公開名重複を `42712` にした（Issue #3297・SQL-53 (b)・RLS-10 ポインタ。判断は [update-from-delete-using.md](docs/design/update-from-delete-using.md) の「`$n` と公開名重複」節）。SET 右辺・WHERE の `<列|公開名.列> = $n`・`USING OPERATION_ID $n` が通り。整数・浮動小数列の WHERE の等価比較も受理する。**挙動の変更**: これまで Parse で `42601` だった `$n` を受理し、結合 DML の公開名重複は `42601` から `42712` になる（SELECT の JOIN・派生表は `42601` のまま）。依存の追加はない。
   BREAKING CHANGE: 公開 enum `allowlist::SqlSurfaceError`・`error_format::ErrorClass`（`#[non_exhaustive]` ではない）に variant `DuplicateAlias` を追加した（網羅 `match` の下流はコンパイルできなくなる。移行は腕の追加）。
 - 別名つき単一表の `UPDATE`／`DELETE`（`FROM`／`USING` なし）を受理するようにした（Issue #3291・SQL-53・RLS-10・RECOVER-10/11 ポインタ。判断は [update-from-delete-using.md](docs/design/update-from-delete-using.md) の「別名つき単一表 DML」節）。入口のトークン正規化で別名なしの同じ文へ書き換え、WHERE・SET 右辺・RETURNING の別名修飾が別名なし文と同じ結果になる。別名を付けた表を本名で修飾すると `42P01`。**挙動の変更**: 従来 `42601` で拒否していた `UPDATE t AS x SET ...`・`DELETE FROM t x WHERE ...` が通る。公開 API の型変更はない。

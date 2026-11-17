@@ -45,6 +45,12 @@ pub(crate) use schema_elements::{
 mod do_block;
 pub use do_block::ValidatedDo;
 pub(crate) use do_block::{is_do_statement, validate_do_tokens};
+// MERGE の構文解析（SQL-79・Issue #3351）。
+mod merge;
+pub(crate) use merge::{looks_like_merge, validate_merge_tokens_with_limits};
+pub use merge::{
+    MergeAction, MergeInsertValues, MergeMatchKind, MergeSource, MergeWhenClause, ValidatedMerge,
+};
 // TRIGGER DDL の構文検証（TABLE-45・Issue #1722）。
 mod trigger;
 pub(crate) use trigger::{
@@ -18884,6 +18890,11 @@ fn parse_data_modifying_cte_body(
         DmlCommand::Update
     } else if head.eq_ignore_ascii_case("DELETE") {
         DmlCommand::Delete
+    } else if head.eq_ignore_ascii_case("MERGE") {
+        // SQL-79・Issue #3351: データ変更 CTE の本文が MERGE の形は固定文言の `0A000`（fail-closed）。
+        return Err(SqlSurfaceError::feature_not_supported(
+            "MERGE in a data-modifying CTE is not supported",
+        ));
     } else {
         return Ok(None);
     };
@@ -23393,7 +23404,7 @@ impl<'a> Parser<'a> {
             // `)` は行値代入 `(a, b) = (u.x, u.y)` の要素の終端（Issue #3296）。
             Some(Token::Punct(',' | ';' | ')')) => true,
             Some(Token::Keyword(Keyword::From | Keyword::Where)) => true,
-            Some(Token::Ident(w)) => ["USING", "RETURNING", "PARTITIONED"]
+            Some(Token::Ident(w)) => ["USING", "RETURNING", "PARTITIONED", "WHEN"]
                 .iter()
                 .any(|k| w.eq_ignore_ascii_case(k)),
             _ => false,
@@ -28136,6 +28147,12 @@ fn parse_with_main(
     let _colref_alias = super::colref_sink::register_alias(&main_normalized, remaining);
     let main_tokens: &[Token] = &main_normalized;
 
+    // SQL-79・Issue #3351: 最上位の `WITH` の主文が MERGE の形は固定文言の `0A000`。
+    if matches!(main_tokens.first(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("MERGE")) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "MERGE with a WITH clause is not supported",
+        ));
+    }
     if !matches!(main_tokens.first(), Some(Token::Keyword(Keyword::Select))) {
         return Err(SqlSurfaceError::unsupported(
             "WITH must be followed by a SELECT statement",

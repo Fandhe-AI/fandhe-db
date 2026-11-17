@@ -2063,6 +2063,12 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1754）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
+    /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析までを
+    /// 担い、Execute・Describe・明示 Tx の各腕は固定文言の `0A000`（[`MERGE_NOT_SUPPORTED_YET`]）で
+    /// 副作用なしに止める。束縛は #3352、実行は #3353・#3354、台帳・`OpTag`・`EXPLAIN` は #3357、
+    /// `RETURNING` は #3356 が結線する。既存 variant にフィールドを足さず別 variant にしているのは、
+    /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
+    Merge(Box<crate::sql::allowlist::ValidatedMerge>),
     /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
     /// 契約は [`Self::UpdateFrom`] と同じ。
     ///
@@ -2516,6 +2522,10 @@ fn row_lock_not_supported() -> crate::sql::allowlist::SqlSurfaceError {
     )
 }
 
+/// `MERGE` の実行・Describe が返す固定文言（SQL-79・Issue #3351。構文解析のみで、実行は #3353・#3354）。
+/// 入力断片・件数・他テナントの情報を含めない。
+const MERGE_NOT_SUPPORTED_YET: &str = "MERGE is not supported yet";
+
 fn statement_clock_scope(
     parsed: &ParsedSql,
     txn_start_micros: Option<i64>,
@@ -2540,6 +2550,9 @@ fn statement_clock_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
+        // SQL-79・Issue #3351: MERGE の SET・INSERT 値も文の開始時刻を共有する想定（実行は #3354 で結線。
+        // 現状は `0A000` のため影響しない）。
+        | ParsedSql::Merge(_)
         // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 等の評価に文の開始時刻を要する。
         | ParsedSql::ExplainInsert(_)
         // Issue #2050: `EXPLAIN UPDATE|DELETE` も非 EXPLAIN の DML と同じく束縛段が時刻を読む。
@@ -2637,6 +2650,8 @@ fn insert_sequence_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
+        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
+        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -2730,6 +2745,8 @@ fn insert_default_clock_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
+        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
+        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -2938,6 +2955,9 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         // （`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体の各ゲートも operation_id 付きを拒否側に倒す）。
         ParsedSql::UpdateFrom(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::DeleteUsing(stmt) => stmt.operation_id().map(|id| id.as_str()),
+        // SQL-79・Issue #3351: 台帳・Tx 内の再利用判定には参加させない（`None`）。実行は `0A000` で、台帳との
+        // 結線は #3357。`USING OPERATION_ID` 付きでも `23505` 等が `0A000` より先に出る経路を作らない。
+        ParsedSql::Merge(_) => None,
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
         ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => None,
@@ -7442,7 +7462,7 @@ impl EngineCore {
         let literal_sensitive_head = matches!(
             tokens.first(),
             Some(crate::sql::lexer::Token::Ident(name))
-                if ["INSERT", "UPDATE", "CREATE", "ALTER", "WITH"]
+                if ["INSERT", "UPDATE", "CREATE", "ALTER", "WITH", "MERGE"]
                     .iter()
                     .any(|kw| name.eq_ignore_ascii_case(kw))
         ) || matches!(
@@ -7670,6 +7690,20 @@ impl EngineCore {
             )
             .map_err(|e| self.reclassify_write_to_view_error(e))?;
             return Ok(ParsedSql::Truncate(stmt));
+        }
+
+        // SQL-79・Issue #3351: `MERGE` は専用の構文解析器へ回す（既存の単一表 DML の解析器へ落とさない）。
+        // 解析を通った文の実行は固定文言の `0A000`（実行系の結線は #3353・#3354）。対象・元の存在確認は
+        // 他の書き込みと同じく書き込み先ビュー・索引の写像（`reclassify_write_to_view_error`）を通す。
+        if crate::sql::allowlist::looks_like_merge(&tokens) {
+            let stmt = crate::sql::allowlist::validate_merge_tokens_with_limits(
+                &tokens,
+                ledger_mode,
+                self.nesting_limits,
+                &storage_lookup,
+            )
+            .map_err(|e| self.reclassify_write_to_view_error(e))?;
+            return Ok(ParsedSql::Merge(Box::new(stmt)));
         }
 
         // SQL-53 (b)・Issue #1754: `DELETE ... USING <表の並び>`／`UPDATE ... FROM <表の並び>` は既存の
@@ -9900,6 +9934,13 @@ impl EngineCore {
                     dml_from_exec::JOINED_DML_UNSUPPORTED_HERE,
                 ),
             ),
+            // SQL-79・Issue #3351: 構文解析のみ。writer の取得・暗黙 Tx の開始・台帳の照合より前に固定文言の
+            // `0A000` で返し、行・台帳・世代へ一切触れない（実行は #3353・#3354）。
+            ParsedSql::Merge(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    MERGE_NOT_SUPPORTED_YET,
+                ),
+            ),
             ParsedSql::Update(stmt) => {
                 // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = stmt {
@@ -11585,6 +11626,13 @@ impl EngineCore {
             // SQL-53 (b)・Issue #3202: 共有 write txn 上で結合実行器へ dispatch し、`mark_written` する。
             // 失敗時は呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
             ParsedSql::UpdateFrom(stmt) => self.execute_update_from_in_txn(ctx, session, txn, stmt),
+            // SQL-79・Issue #3351: 明示 Tx 内の MERGE も固定文言の `0A000`。`mark_written` は呼ばず、共有 write txn
+            // へ何も書かない（失敗文としての Tx 状態遷移は呼び出し元の既存規約）。
+            ParsedSql::Merge(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    MERGE_NOT_SUPPORTED_YET,
+                ),
+            ),
             ParsedSql::DeleteUsing(stmt) => {
                 self.execute_delete_using_in_txn(ctx, session, txn, stmt)
             }
@@ -13016,6 +13064,12 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
+            // SQL-79・Issue #3351: Describe も Execute と同じ SQLSTATE（固定文言の `0A000`）。
+            ParsedSql::Merge(_) => Err(
+                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                    MERGE_NOT_SUPPORTED_YET,
+                ),
+            ),
             // SQL-53 (b)・Issue #3202・#3204: Execute と同じ準備段（束縛・変換）を通し、
             // エラーコードを揃える。`RETURNING` つきなら Execute の `QueryResult.columns` と同じ列を返す。
             ParsedSql::UpdateFrom(stmt) => {
