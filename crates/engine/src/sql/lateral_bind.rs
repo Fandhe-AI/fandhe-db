@@ -247,15 +247,42 @@ where
     // （`WHERE a AND (x = d.k OR ...)` の外側参照は最上位 WHERE の中）。
     let mut parens: Vec<bool> = Vec::new();
     let mut depth = 0usize;
-    // 投影の出力別名（`AS b`）。`ORDER BY b` の別名参照は物理列ではないため、RIGHT／FULL の
-    // 未知列判定（`42703`）から除外する。
-    let output_aliases: Vec<&str> = body
-        .windows(2)
-        .filter_map(|w| match w {
-            [Token::Ident(a), Token::Ident(n)] if a.eq_ignore_ascii_case("AS") => Some(n.as_str()),
-            _ => None,
-        })
-        .collect();
+    // SELECT リスト直下（括弧の外）の項目別名 `AS b` だけを集める（`CAST(x AS t)` やテーブル別名は
+    // 括弧内・FROM 以降なので含めない）。適用は `ORDER BY b` の単独の別名参照だけ（PostgreSQL と同じく
+    // 出力別名は ORDER BY の裸の名前でのみ列より優先して解決される）。
+    let output_aliases: Vec<&str> = {
+        let mut d = 0usize;
+        let mut v = Vec::new();
+        for (j, t) in body.iter().enumerate().take(from_idx) {
+            match t {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => d = d.saturating_sub(1),
+                Token::Ident(a) if d == 0 && a.eq_ignore_ascii_case("AS") => {
+                    if let Some(Token::Ident(n)) = body.get(j.saturating_add(1)) {
+                        v.push(n.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        v
+    };
+    let order_start: Option<usize> = {
+        let mut d = 0usize;
+        let mut found = None;
+        for (j, t) in body.iter().enumerate() {
+            match t {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => d = d.saturating_sub(1),
+                Token::Keyword(Keyword::Order) if d == 0 && j > from_idx => {
+                    found = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        found
+    };
     for (i, tok) in body.iter().enumerate() {
         match tok {
             Token::Punct('(') => {
@@ -332,6 +359,26 @@ where
                 if is_syntax_word(n) || is_literal_word(n) || is_non_column_position(body, i) {
                     continue;
                 }
+                // ORDER BY の裸の出力別名は左側・内側の列探索へ進まず確定する。
+                if order_start.is_some_and(|o| i > o)
+                    && parens.is_empty()
+                    && output_aliases.iter().any(|a| a.eq_ignore_ascii_case(n))
+                    && matches!(
+                        i.checked_sub(1).and_then(|p| body.get(p)),
+                        Some(Token::Punct(',')) | Some(Token::Keyword(Keyword::By))
+                    )
+                    && match body.get(i.saturating_add(1)) {
+                        None
+                        | Some(Token::Punct(',' | ';'))
+                        | Some(Token::Keyword(Keyword::Limit)) => true,
+                        Some(Token::Ident(w)) => ["ASC", "DESC", "NULLS", "OFFSET", "FETCH"]
+                            .iter()
+                            .any(|k| w.eq_ignore_ascii_case(k)),
+                        _ => false,
+                    }
+                {
+                    continue;
+                }
                 let Some(ic) = inner_cols.as_deref() else {
                     continue;
                 };
@@ -352,12 +399,7 @@ where
                 }
                 // RIGHT／FULL: どちらの側にも解決できない非修飾名は、後続の左側参照（`42P10`）より
                 // 先に `42703` で確定する（修飾名と同じテキスト順規則）。左側の列が不明なら従来どおり通す。
-                if hit.is_none()
-                    && reject_left_ref
-                    && all_known
-                    && !n.eq_ignore_ascii_case("id")
-                    && !output_aliases.iter().any(|a| a.eq_ignore_ascii_case(n))
-                {
+                if hit.is_none() && reject_left_ref && all_known && !n.eq_ignore_ascii_case("id") {
                     return Err(SqlSurfaceError::undefined_column(n.clone()));
                 }
                 if let Some((ridx, col)) = hit {
@@ -647,6 +689,30 @@ mod tests {
         // 出力別名 `b` は物理列ではないが、RIGHT／FULL（reject_left_ref）でも 42703 にしない。
         bind_lateral_body(&toks, &left, &mut cols_of, true).expect("alias resolves");
         let toks = tokenize("SELECT title FROM docs x ORDER BY b LIMIT 1").expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
+    }
+
+    #[test]
+    fn right_full_order_by_alias_wins_over_same_named_left_column() {
+        // 左側 `other` に列 `k` があっても、ORDER BY の別名 `k` は出力別名として解決する。
+        let toks = tokenize("SELECT title AS k FROM docs x ORDER BY k LIMIT 1").expect("tokenize");
+        let left = [TableRef::with_alias("other", "o")];
+        bind_lateral_body(&toks, &left, &mut cols_of, true).expect("alias wins");
+    }
+
+    #[test]
+    fn right_full_alias_does_not_hide_unknown_column_in_where() {
+        let left = [TableRef::with_alias("other", "o")];
+        // CAST の AS やテーブル別名は出力別名ではなく、WHERE の別名は列ではない。
+        let toks = tokenize(
+            "SELECT CAST(title AS t) FROM docs x WHERE t = 'a' AND lang = o.k ORDER BY id",
+        )
+        .expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
+        let toks = tokenize("SELECT title AS t FROM docs x WHERE t = 'a' AND lang = o.k")
+            .expect("tokenize");
         let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
         assert_eq!(err.wire_code(), "42703");
     }
