@@ -81,6 +81,13 @@
 //!     推論・Describe 用ダミー置換が同じ表を参照する。展開で生成される比較葉は等価述語の序数に数えない。
 //!     Describe・構造検証用のダミーは相手列の型で有効な値（`row_compare_dummy_token`）。
 //!
+//! 13. `SELECT／UPDATE／DELETE ... WHERE (<c1>, ..., <ck>) [NOT] IN ((<d1>, ..., <dk>) [, ...])` の
+//!     要素の成分のうち、成分全体が `$n` 単独で同じ位置の左辺成分が裸の列の位置（Issue #3300・SQL-9・
+//!     WIRE-12 のポインタ。パターン 12 と同じ文種・`WHERE` 領域・境界規則）。`$n` の型は左辺の列の型。
+//!     左辺成分の `$n`・リテラル／式／修飾列の左辺・要素が行でない形・サブクエリ形・スカラー
+//!     `n IN ($1)` は登録せず `42601`。判定は `row_in_param_slots` に集約し、受理・推論・Describe 用
+//!     ダミー置換が同じ表を参照する（`row_compare_param_slots` 経由）。脱糖で生成される葉は序数に数えない。
+//!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
 //! 引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
@@ -1133,6 +1140,8 @@ fn row_compare_param_slots(
 ) -> HashMap<usize, WhereParamShape> {
     let mut out = HashMap::new();
     let closes = matching_closes(tokens, start, end);
+    // パターン 13: 行値の `[NOT] IN` の要素の成分の `$n`（Issue #3300）。
+    out.extend(row_in_param_slots(tokens, start, end, &closes));
     let mut i = start + 1;
     while i < end {
         if !matches!(tokens.get(i), Some(Token::Punct('('))) || !is_noneq_left_boundary(tokens, i) {
@@ -1203,6 +1212,128 @@ fn row_compare_param_slots(
             }
         }
         i = r_close + 1;
+    }
+    out
+}
+
+/// パターン 13 の構造判定の単一情報源（Issue #3300・SQL-9・WIRE-12 のポインタ）。
+/// `WHERE` 領域 `(start, end)` 内の行値の `( C1 , ... , Ck ) [NOT] IN ( ( D1 , ... , Dk ) [, ...] )`
+/// （左 `(` の直前が [`is_noneq_left_boundary`]、リスト閉じ `)` の直後が [`is_noneq_right_boundary`]、
+/// `2 <= k <= MAX_ROW_COMPARE_COMPONENTS`・各要素の成分数は左辺と同数・要素数は
+/// [`crate::sql::allowlist::MAX_IN_LIST_ITEMS`] 以下）の要素の成分のうち、成分全体が `$n` 単独で、
+/// 同じ位置の左辺成分が裸の列のものだけを返す（トークン添字 → [`WhereParamShape::Column`]）。
+/// 左辺成分の `$n`（1 個の `$n` が複数要素と対になり型を決められない）・リテラル／式／修飾列の
+/// 左辺・要素が行でない形・サブクエリ形・空リストは登録せず、呼び出し側の既存経路で `42601`
+/// （構文段の `0A000` を含む）になる（fail-closed）。`closes` は [`matching_closes`] の表で、
+/// パターン 12 と共有して全体を線形時間に保つ。脱糖で生成される葉は序数に数えない。
+fn row_in_param_slots(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+    closes: &[Option<usize>],
+) -> HashMap<usize, WhereParamShape> {
+    let mut out = HashMap::new();
+    let mut i = start + 1;
+    while i < end {
+        if !matches!(tokens.get(i), Some(Token::Punct('('))) || !is_noneq_left_boundary(tokens, i) {
+            i += 1;
+            continue;
+        }
+        let Some(close) = closes.get(i).copied().flatten() else {
+            i += 1;
+            continue;
+        };
+        let mut at = close + 1;
+        if ident_eq_ignore_case(tokens.get(at), "NOT") {
+            at += 1;
+        }
+        if !ident_eq_ignore_case(tokens.get(at), "IN") {
+            i += 1;
+            continue;
+        }
+        let list_open = at + 1;
+        if !matches!(tokens.get(list_open), Some(Token::Punct('('))) {
+            i += 1;
+            continue;
+        }
+        let Some(list_close) = closes.get(list_open).copied().flatten() else {
+            i += 1;
+            continue;
+        };
+        if !is_noneq_right_boundary(tokens, list_close + 1, end) {
+            i += 1;
+            continue;
+        }
+        let Some(left) = row_components(tokens, i, close) else {
+            i += 1;
+            continue;
+        };
+        if left.len() < 2 {
+            i += 1;
+            continue;
+        }
+        // リストの中身は `( 要素 ) , ( 要素 ) ...` の並びだけを受理する。
+        let mut items: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut pos = list_open + 1;
+        let mut ok = true;
+        loop {
+            if items.len() >= crate::sql::allowlist::MAX_IN_LIST_ITEMS
+                || !matches!(tokens.get(pos), Some(Token::Punct('(')))
+            {
+                ok = false;
+                break;
+            }
+            let Some(item_close) = closes.get(pos).copied().flatten() else {
+                ok = false;
+                break;
+            };
+            if item_close >= list_close {
+                ok = false;
+                break;
+            }
+            match row_components(tokens, pos, item_close) {
+                Some(comps) if comps.len() == left.len() => items.push(comps),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+            match tokens.get(item_close + 1) {
+                Some(Token::Punct(',')) => pos = item_close + 2,
+                _ if item_close + 1 == list_close => break,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            i += 1;
+            continue;
+        }
+        for comps in &items {
+            for (l, r) in left.iter().zip(comps.iter()) {
+                let is_param = r.1 == r.0 + 1 && matches!(tokens.get(r.0), Some(Token::Param(_)));
+                if !is_param || l.1 != l.0 + 1 {
+                    continue;
+                }
+                let shape = match tokens.get(l.0) {
+                    Some(Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
+                    Some(Token::Ident(c))
+                        if !c.eq_ignore_ascii_case("true")
+                            && !c.eq_ignore_ascii_case("false")
+                            && !c.eq_ignore_ascii_case("null") =>
+                    {
+                        Some(WhereParamShape::Column(c.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some(shape) = shape {
+                    out.insert(r.0, shape);
+                }
+            }
+        }
+        i = list_close + 1;
     }
     out
 }
@@ -5648,6 +5779,75 @@ mod typed_value_tests {
         );
         assert_eq!(
             flags("SELECT id FROM t WHERE NOT (a, b) < ($1, $2) AND m = $3"),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn accepts_row_in_component_params_and_classifies_them() {
+        for sql in [
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2), ($3, $4))",
+            "SELECT id FROM t WHERE (a, b) NOT IN (($1, $2)) LIMIT 5;",
+            "SELECT id FROM t WHERE NOT (a, b) IN (($1, $2))",
+            "SELECT id FROM t WHERE NOT ((a, b) IN (($1, $2)))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, 5), (3, $2))",
+            "SELECT id FROM t WHERE x = 1 AND (a, b) IN (($1, $2))",
+            "UPDATE t SET s = 'z' WHERE (a, b) IN (($1, $2)) USING OPERATION_ID $3",
+            "DELETE FROM t WHERE (a, b) NOT IN (($1, $2)) USING OPERATION_ID $3",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+        let got = positions_of("SELECT id FROM t WHERE (a, b) IN (($1, $2), ($3, $4))");
+        assert_eq!(got[0], vec![ParamPosition::WhereColumn("a".to_string())]);
+        assert_eq!(got[1], vec![ParamPosition::WhereColumn("b".to_string())]);
+        assert_eq!(got[2], vec![ParamPosition::WhereColumn("a".to_string())]);
+        assert_eq!(got[3], vec![ParamPosition::WhereColumn("b".to_string())]);
+    }
+
+    #[test]
+    fn rejects_row_in_params_outside_pattern_13() {
+        for sql in [
+            // 左辺成分の `$n`
+            "SELECT id FROM t WHERE ($1, $2) IN ((a, b))",
+            "SELECT id FROM t WHERE ($1, b) IN (($2, $3))",
+            // 相手がリテラル・式・修飾列
+            "SELECT id FROM t WHERE (a, 7) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, a + 1) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, t.b) IN (($1, $2))",
+            // `$n` が式の内側・型キャスト付き
+            "SELECT id FROM t WHERE (a, b) IN (($1 + 1, $2))",
+            "SELECT id FROM t WHERE (a, b) IN (($1::int, $2))",
+            // 要素が行でない・成分数の不一致
+            "SELECT id FROM t WHERE (a, b) IN ($1, $2)",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2, $3))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2) $3)",
+            // スカラー IN は従来どおり拒否
+            "SELECT id FROM t WHERE n IN ($1)",
+            "SELECT id FROM t WHERE n IN ($1, $2)",
+            // 先頭語・文種・領域の外
+            "EXPLAIN SELECT id FROM t WHERE (a, b) IN (($1, $2))",
+            "WITH c AS (SELECT 1) SELECT id FROM t WHERE (a, b) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2)) UNION SELECT id FROM t WHERE a = 1",
+            "SELECT a FROM t GROUP BY a HAVING (a, b) IN (($1, $2))",
+            "INSERT INTO t (id, embedding) VALUES (1, '[0,0]') ON CONFLICT (id) DO UPDATE SET a = 1 WHERE (a, b) IN (($1, $2))",
+        ] {
+            let r = positions(sql);
+            assert!(
+                matches!(&r, Err(e) if e.wire_code() == "42601"),
+                "{sql}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_in_params_do_not_shift_dummy_flag_ordinals() {
+        assert_eq!(
+            flags("SELECT id FROM t WHERE (a, b) IN (($1, $2)) AND lang = $3"),
+            vec![true]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE m = $1 AND (a, b) NOT IN (($2, $3), ($4, $5))"),
             vec![true]
         );
     }
