@@ -21300,6 +21300,16 @@ impl EngineCore {
         else {
             return Ok(());
         };
+        // SQL-80・Issue #3313: 重ね見の区間（DDL を積んだ Tx）では、確定済みの索引カタログに同じ Tx で作った
+        // 一意索引が無いため `CREATE UNIQUE INDEX` 由来かを判定できない。誤って制約として受理（fail-open）
+        // しないよう、write txn の索引カタログを引く結線（#3314）まで `0A000` で拒否する。
+        if crate::sql::txn_overlay::overlay_active(&self.storage) {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                    "ON CONFLICT ON CONSTRAINT is not supported after DDL inside a transaction block yet",
+                ),
+            );
+        }
         match self.storage.is_unique_index_of_table(table_name, name) {
             Ok(false) => Ok(()),
             Ok(true) => {
@@ -21395,6 +21405,15 @@ impl EngineCore {
                 )
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
+                // SQL-80・Issue #3313: ファイル形のチャンク化は確定済みカタログからスキーマを引くため、
+                // 同じ Tx で作った表・追加した列を解決できない。結線（#3314）まで `0A000` で拒否する。
+                if crate::sql::txn_overlay::overlay_active(&self.storage) {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                            "file-form INSERT is not supported after DDL inside a transaction block yet",
+                        ),
+                    );
+                }
                 // 明示トランザクション内でも受理する（Issue #1353）。埋め込み I/O は BEGIN
                 // 時点で保持済みの単一ライタの下・セッションの `max_duration` の範囲で行う。
                 crate::sql::exec::execute_file_insert(

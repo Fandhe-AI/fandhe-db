@@ -17,6 +17,7 @@ use engine::sql::transaction::{SessionTransaction, TransactionStatus};
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
+use crate::legacy_table::LegacyExec;
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
@@ -401,6 +402,67 @@ fn insert_select_after_ddl_is_rejected_with_0a000() {
         assert_eq!(txn.status(), TransactionStatus::Failed);
         tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
     }
+}
+
+#[test]
+// tracked: #3314
+fn conflict_on_constraint_and_file_form_insert_after_ddl_are_rejected_with_0a000() {
+    // 同じ Tx で作った一意索引を ON CONFLICT ON CONSTRAINT の対象として受理せず（SQL-49 の 42704 を判定できる
+    // 結線まで 0A000）、ファイル形 INSERT も確定済みカタログを引くため結線まで 0A000 で拒否する（部分実行しない）。
+    let (core, _guard) = new_core("sql80-conflict-file-gate");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE TABLE v (id BIGINT PRIMARY KEY, k INTEGER)",
+    );
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE UNIQUE INDEX u ON v (k)",
+    );
+    assert_eq!(
+        tx_code(
+            &core,
+            &mut session,
+            &mut txn,
+            "INSERT INTO v (id, k) VALUES (1, 1) ON CONFLICT ON CONSTRAINT u DO NOTHING"
+        ),
+        "0A000"
+    );
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+
+    // ファイル形は疑似列 `id` を持つ従来方式の表だけが対象（`execute_sql_in_session_legacy` で作る）。
+    core.execute_sql_in_session_legacy(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TABLE f (embedding VECTOR(3), path TEXT, body TEXT)",
+    )
+    .expect("create file-form table");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "ALTER TABLE f ADD COLUMN extra TEXT",
+    );
+    assert_eq!(
+        tx_code(
+            &core,
+            &mut session,
+            &mut txn,
+            "INSERT INTO f (path, body) VALUES ('a.txt', 'hello') USING OPERATION_ID 'op-file'"
+        ),
+        "0A000"
+    );
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
 }
 
 #[test]

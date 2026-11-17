@@ -566,27 +566,37 @@ fn temporary_is_rejected_and_explicit_transaction_applies_atomically() {
         )
         .expect_err("temp table generated column");
     assert_eq!(err.wire_code(), "0A000");
-    // 明示トランザクションの中の DDL（Issue #3313 で積めるようになった）。ROLLBACK は痕跡を残さない。
+    // 明示トランザクションの中の DDL（Issue #3313）。行のある表への生成列の追加は、全行の走査に Tx の期限が
+    // 結線されるまで 0A000 で拒否する（受け皿は #3314）。失敗した Tx は ROLLBACK で痕跡を残さない。
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    core.execute_sql_in_txn(&c, &mut session, &mut txn, ADD_G)
-        .expect("generated ADD COLUMN in explicit transaction");
+    let err = core
+        .execute_sql_in_txn(&c, &mut session, &mut txn, ADD_G)
+        .expect_err("scan DDL on a non-empty table in a transaction");
+    assert_eq!(err.wire_code(), "0A000");
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
     assert_eq!(dump(&core, TENANT), before);
     assert_eq!(code(&core, TENANT, "SELECT g FROM t"), "42703");
-    // COMMIT は全行の計算結果を原子的に確定する。
+    // 空の表への追加は走査が無いため、COMMIT で原子的に確定する。ROLLBACK は痕跡を残さない。
+    ok(&core, TENANT, "CREATE TABLE e (a INTEGER)");
+    let add_e = "ALTER TABLE e ADD COLUMN g INTEGER GENERATED ALWAYS AS (a * 2) STORED";
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    core.execute_sql_in_txn(&c, &mut session, &mut txn, ADD_G)
-        .expect("generated ADD COLUMN in explicit transaction");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, add_e)
+        .expect("generated ADD COLUMN on an empty table in explicit transaction");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(code(&core, TENANT, "SELECT g FROM e"), "42703");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, add_e)
+        .expect("generated ADD COLUMN on an empty table in explicit transaction");
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "COMMIT")
         .expect("commit");
-    assert_eq!(
-        grid(&core, TENANT, "SELECT a, g FROM t ORDER BY a"),
-        g(&[&["1", "2"], &["2", "4"]])
-    );
+    ok(&core, TENANT, "INSERT INTO e (a) VALUES (3)");
+    assert_eq!(grid(&core, TENANT, "SELECT a, g FROM e"), g(&[&["3", "6"]]));
 }
 
 #[test]
