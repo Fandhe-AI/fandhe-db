@@ -67,7 +67,7 @@
 - ハッシュ経路の候補数上限を比較回数軸へ統一すること
 - 帯域結合・ソートマージ等の最適化、外側ブロック化
 - DML の結合（`UPDATE ... FROM`／`DELETE ... USING`）での NLJ
-- `EXPLAIN` の JOIN 対応、LATERAL・派生テーブル
+- `EXPLAIN` の JOIN 対応、LATERAL・派生テーブル（LATERAL の実行方式は [lateral-derived-table.md](lateral-derived-table.md)）
 - statement_timeout 本体（#1950／#1951／#1954）
 - PostgreSQL 17 実機との照合（各実装 Issue で実施）
 
