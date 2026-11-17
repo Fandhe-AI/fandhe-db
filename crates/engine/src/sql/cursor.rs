@@ -812,10 +812,10 @@ impl CursorPosition {
     }
 
     /// NO SCROLL カーソルで `dir` が「後ろへ戻る走査」を要するか（要するなら `55000`）。
-    /// PG17 の portal 実行（`DoPortalRunFetch`・`PortalRunSelect`・`DoPortalRewind`）の挙動から
-    /// 導いた判定で、実機との突き合わせは #3337 で行う（`docs/design/sql-cursor.md` §9）。
-    /// 判定に迷う境界（行の上での件数 0・`ABSOLUTE k` が現在位置以前・末尾の後からの
-    /// `ABSOLUTE`）は拒否側（fail-closed）に倒す。
+    /// PG17 の portal 実行の挙動から導いた判定で、PostgreSQL 17.11 の実測と一致を確認済み
+    /// （Issue #3337。`tests/data/cursor_directions_pg17.tsv`・`docs/design/sql-cursor.md` §9）。
+    /// `ABSOLUTE k`（k>0）は k が現在位置以前なら後退走査（末尾の後 `pos = len + 1` を含む）、
+    /// より先なら前方向で済む。
     fn requires_backward_scan(&self, dir: FetchDirection) -> bool {
         let on_row = (1..=self.len).contains(&self.pos);
         match dir {
@@ -828,9 +828,10 @@ impl CursorPosition {
                 } else if k == 0 {
                     self.pos != 0
                 } else {
-                    // 現在位置より先（かつ末尾の後ではない）へ進む場合だけ前方向で済む。
+                    // 現在位置より先へ進む場合だけ前方向で済む（PG17 実測。末尾の後からでも
+                    // k >= len + 2 は受理される）。
                     let target = usize::try_from(k).unwrap_or(usize::MAX);
-                    self.pos > self.len || target <= self.pos
+                    target <= self.pos
                 }
             }
             FetchDirection::Relative(k) => k < 0,
@@ -974,12 +975,14 @@ impl CursorRegistry {
         &mut self,
         name: &str,
         direction: FetchDirection,
+        check_scroll: bool,
     ) -> Result<&mut OpenCursor, SqlSurfaceError> {
         let cursor = self
             .cursors
             .get_mut(name)
             .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
-        if cursor.scroll != CursorScroll::Scroll
+        if check_scroll
+            && cursor.scroll != CursorScroll::Scroll
             && cursor.position.requires_backward_scan(direction)
         {
             return Err(SqlSurfaceError::CursorCanOnlyScanForward);
@@ -995,7 +998,16 @@ impl CursorRegistry {
         name: &str,
         direction: FetchDirection,
     ) -> Result<u64, SqlSurfaceError> {
-        let cursor = self.checked_cursor_mut(name, direction)?;
+        // 件数 0 の MOVE は走査せず現在位置の行の有無だけを数えるため、NO SCROLL でも受理する。
+        // `MOVE BACKWARD ALL` は先頭の前（位置 0）では巻き戻す行が無く、同様に受理される。
+        // いずれも PG17 17.11 の実測（`FETCH` 側は同じ形でも `55000` のまま）。不在 `34000` の検査は保つ。
+        let at_start = self
+            .cursors
+            .get(name)
+            .is_some_and(|c| c.position.get() == 0);
+        let check_scroll = !(matches!(direction, FetchDirection::Current { .. })
+            || (at_start && direction == FetchDirection::Backward(FetchCount::All)));
+        let cursor = self.checked_cursor_mut(name, direction, check_scroll)?;
         let planned = cursor.position.plan(direction);
         cursor.position.apply(&planned);
         Ok(u64::try_from(planned.range.len()).unwrap_or(u64::MAX))
@@ -1021,7 +1033,7 @@ impl CursorRegistry {
         direction: FetchDirection,
         max_rows: usize,
     ) -> Result<QueryResult, SqlSurfaceError> {
-        let cursor = self.checked_cursor_mut(name, direction)?;
+        let cursor = self.checked_cursor_mut(name, direction, true)?;
         let total_rows = cursor.result.rows.len();
         let over_cap = match direction {
             FetchDirection::Forward(FetchCount::All) => {
@@ -2086,7 +2098,7 @@ mod tests {
     }
 
     /// 位置 `p`（0..=N+1）での NO SCROLL 判定の期待値（PG17 の portal 実行からの導出を表にしたもの。
-    /// 実機未確認の境界は #3337 で突き合わせる）。
+    /// PostgreSQL 17.11 の実測と一致を確認済み。Issue #3337）。
     fn expect_requires_backward(p: usize, n: usize, dir: FetchDirection) -> bool {
         let on_row = (1..=n).contains(&p);
         match dir {
@@ -2097,7 +2109,7 @@ mod tests {
             FetchDirection::Relative(k) => k < 0,
             FetchDirection::Absolute(k) if k < 0 => true,
             FetchDirection::Absolute(0) => p != 0,
-            FetchDirection::Absolute(k) => !(p <= n && (k as usize) > p),
+            FetchDirection::Absolute(k) => (k as usize) <= p,
         }
     }
 
@@ -2414,5 +2426,68 @@ mod tests {
             .expect_err("missing");
         assert_eq!(err.wire_code(), "34000");
         assert_eq!(rows_of(&r.fwd("c", 1).expect("next")), vec![2]);
+    }
+
+    /// Issue #3337: 件数 0 の MOVE は NO SCROLL でも受理され、件数は行の上なら 1・それ以外は 0、
+    /// 位置は不変（PG17 17.11 実測）。不在は `34000` のまま。
+    #[test]
+    fn no_scroll_move_count_zero_is_accepted_and_keeps_position() {
+        let zero_dirs = [
+            FetchDirection::Current { backward: false },
+            FetchDirection::Current { backward: true },
+        ];
+        for dir in zero_dirs {
+            let mut r = registry_with_scroll(5, CursorScroll::NoScroll);
+            assert_eq!(mv(&mut r, dir), 0, "before first {dir:?}");
+            mv(&mut r, FetchDirection::Forward(FetchCount::Rows(3)));
+            assert_eq!(mv(&mut r, dir), 1, "on row {dir:?}");
+            assert_eq!(rows_of(&r.fwd("c", 1).expect("next")), vec![3], "{dir:?}");
+            mv(&mut r, FetchDirection::Forward(FetchCount::All));
+            assert_eq!(mv(&mut r, dir), 0, "after last {dir:?}");
+        }
+        let mut r = registry_with_scroll(5, CursorScroll::NoScroll);
+        // 先頭の前の `MOVE BACKWARD ALL` は受理（0 件）、行の上では `55000`。
+        assert_eq!(mv(&mut r, FetchDirection::Backward(FetchCount::All)), 0);
+        mv(&mut r, FetchDirection::Forward(FetchCount::Rows(1)));
+        assert_eq!(
+            r.move_cursor("c", FetchDirection::Backward(FetchCount::All))
+                .expect_err("on row")
+                .wire_code(),
+            "55000"
+        );
+        let mut r = registry_with_scroll(5, CursorScroll::NoScroll);
+        let err = r
+            .move_cursor("nope", FetchDirection::Current { backward: true })
+            .expect_err("missing");
+        assert_eq!(err.wire_code(), "34000");
+        // FETCH 側は行の上で従来どおり 55000。
+        mv(&mut r, FetchDirection::Forward(FetchCount::Rows(2)));
+        let err = r
+            .fetch("c", FetchDirection::Current { backward: true }, 100)
+            .expect_err("fetch 0");
+        assert_eq!(err.wire_code(), "55000");
+    }
+
+    /// Issue #3337: NO SCROLL で末尾の後からの `ABSOLUTE k` は k <= N+1 が `55000`、k >= N+2 が受理。
+    #[test]
+    fn no_scroll_absolute_after_last_matches_pg17() {
+        for k in [1i64, 3, 5, 6] {
+            let mut r = registry_with_scroll(5, CursorScroll::NoScroll);
+            mv(&mut r, FetchDirection::Forward(FetchCount::All));
+            let err = r
+                .fetch("c", FetchDirection::Absolute(k), 100)
+                .expect_err("rejected");
+            assert_eq!(err.wire_code(), "55000", "k={k}");
+        }
+        for k in [7i64, 100] {
+            let mut r = registry_with_scroll(5, CursorScroll::NoScroll);
+            mv(&mut r, FetchDirection::Forward(FetchCount::All));
+            assert!(r
+                .fetch("c", FetchDirection::Absolute(k), 100)
+                .expect("accepted")
+                .rows
+                .is_empty());
+            assert_eq!(mv(&mut r, FetchDirection::Absolute(k)), 0);
+        }
     }
 }
