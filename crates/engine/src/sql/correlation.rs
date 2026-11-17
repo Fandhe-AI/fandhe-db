@@ -223,17 +223,6 @@ pub(crate) fn reject_if_correlated(correlation: &Correlation) -> Result<(), SqlS
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn lateral_and_outer_placeholders_do_not_mix() {
-        let l = lateral_ref_placeholder(2, "lang");
-        assert_eq!(parse_lateral_ref_placeholder(&l), Some((2, "lang")));
-        assert_eq!(parse_outer_ref_placeholder(&l), None);
-        let o = outer_ref_placeholder(1, "lang");
-        assert_eq!(parse_lateral_ref_placeholder(&o), None);
-        assert_eq!(parse_lateral_ref_placeholder("lateral0.x"), None);
-        assert_eq!(parse_lateral_ref_placeholder("\u{2}lateralx.x"), None);
-    }
-
     use super::*;
     use crate::catalog::ColumnDef;
 
@@ -252,6 +241,17 @@ mod tests {
 
     fn ph(levels_up: usize, name: &str) -> String {
         outer_ref_placeholder(levels_up, name)
+    }
+
+    #[test]
+    fn lateral_and_outer_placeholders_do_not_mix() {
+        let l = lateral_ref_placeholder(2, "lang");
+        assert_eq!(parse_lateral_ref_placeholder(&l), Some((2, "lang")));
+        assert_eq!(parse_outer_ref_placeholder(&l), None);
+        let o = outer_ref_placeholder(1, "lang");
+        assert_eq!(parse_lateral_ref_placeholder(&o), None);
+        assert_eq!(parse_lateral_ref_placeholder("lateral0.x"), None);
+        assert_eq!(parse_lateral_ref_placeholder("\u{2}lateralx.x"), None);
     }
 
     #[test]
