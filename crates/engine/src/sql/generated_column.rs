@@ -94,17 +94,12 @@ pub(crate) fn bind_generated_column(
     });
     let mut referenced_indexes: Vec<usize> = Vec::new();
     for name in seen.into_inner() {
-        // 完全一致を優先し、無ければ大小無視で解決する（字句段は引用符なしの識別子を正規化済み）。
+        // 他の束縛処理と同じ厳密一致で解決する（字句段は引用符なしの識別子を正規化済み）。
+        // 引用符付きで定義された別名の列へ大小無視で寄せると、未定義列が生成列参照として拒否されるため寄せない。
         let index = schema
             .columns
             .iter()
             .position(|c| c.name == name)
-            .or_else(|| {
-                schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case(&name))
-            })
             .ok_or_else(|| SqlSurfaceError::undefined_column(name.clone()))?;
         let target = schema
             .columns

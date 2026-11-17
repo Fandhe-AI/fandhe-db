@@ -414,6 +414,20 @@ fn rejects_forms_with_decided_sqlstates_and_leaves_no_table() {
 
 /// 拒否の文言は固定で、他テナントの情報・表の存在情報・値を含まない。構文段の拒否はカタログを引かない。
 #[test]
+fn unquoted_name_matching_only_quoted_generated_column_is_undefined_column() {
+    // 未引用の識別子は厳密一致で解決する。引用符付きの別名の生成列へ大小無視で寄せず 42703 とする。
+    let (_p, _g, core) = fixture("gen-quoted-ref");
+    assert_eq!(
+        code(
+            &core,
+            TENANT,
+            "CREATE TABLE q (a INTEGER, \"Gen\" INTEGER GENERATED ALWAYS AS (a) STORED, b INTEGER GENERATED ALWAYS AS (gen) STORED)"
+        ),
+        "42703"
+    );
+}
+
+#[test]
 fn rejection_messages_do_not_leak_tenant_or_table_information() {
     let (_p, _g, core) = fixture("gen-leak");
     ok(&core, OTHER, "CREATE TABLE secret_table (a INTEGER)");
