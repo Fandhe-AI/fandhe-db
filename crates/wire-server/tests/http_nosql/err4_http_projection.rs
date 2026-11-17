@@ -309,7 +309,7 @@ fn query_as_alice(addr: SocketAddr, body: &[u8]) -> HttpResponse {
 /// `status.rs::EXPECTED`（`#[cfg(test)]` 内で外部から参照不可）と同値の
 /// 期待表。両者の乖離は [`err4_projection_table_is_closed_over_all_error_classes`]
 /// が `http_status` 経由で検出する。
-const EXPECTED_STATUS: [(&str, u16); 100] = [
+const EXPECTED_STATUS: [(&str, u16); 101] = [
     ("22000", 400),
     ("22001", 400),
     ("22012", 400),
@@ -478,6 +478,9 @@ const EXPECTED_STATUS: [(&str, u16); 100] = [
     // 参照スコープでの非修飾列の曖昧解決。`aggregate.sort` の出力名の複数一致
     // からも到達可能（Issue #1270。`err4_f_ambiguous_sort_reachable_via_nosql_aggregate`）。
     ("42702", 400),
+    // `DuplicateAlias`（`42712`。SQL-53 (b)・Issue #3297）: 結合 DML の公開名重複。NoSQL 表層に
+    // 該当する op が無く到達不能（網羅性のための射影規則）。
+    ("42712", 400),
 ];
 
 /// (a)〜(f) 全類型の共通アサーション: `wire_code` が逆引き可能・射影ステータス
@@ -559,7 +562,7 @@ fn assert_projected_as(resp: &HttpResponse, expected_class: ErrorClass) {
 
 // --- R7: 射影表が ErrorClass::ALL 全体を閉じて覆うことの機械検証 -----------
 
-const _: () = assert!(ErrorClass::ALL.len() == 104);
+const _: () = assert!(ErrorClass::ALL.len() == 105);
 
 /// `wire_code` を共有する分類と、逆引き（`from_wire_code`）が返す分類の組
 /// （ERR-6。`23502`: TABLE-16・TASK-204・Issue #904、`23505`: Issue #1180）。
@@ -1062,6 +1065,9 @@ fn err4_f_unreachable_classes_project_via_production_encoder() {
         // `AmbiguousFunction`（`42725`。SQL-66、Issue #1917）: `DROP FUNCTION` の候補曖昧。
         // NoSQL 表層に `DROP FUNCTION` が無いため到達不能。
         ErrorClass::AmbiguousFunction,
+        // `DuplicateAlias`（`42712`。SQL-53 (b)・Issue #3297）: 結合 DML の公開名重複。NoSQL 表層に
+        // `UPDATE ... FROM`／`DELETE ... USING` が無いため到達不能。
+        ErrorClass::DuplicateAlias,
         // （`AmbiguousColumn`〔`42702`〕は Issue #1270 で `aggregate.sort` から到達
         // 可能になったためこの一覧から外した。固定は
         // `err4_f_ambiguous_sort_reachable_via_nosql_aggregate` が担う）

@@ -896,3 +896,35 @@ fn wire15_declare_set_operation_and_cte_join_over_simple_query_isolates_tenants(
         read_ready_for_query(&mut stream);
     }
 }
+
+// --- DECLARE の SCROLL／NO SCROLL・末尾 `;` の単独送信（Issue #3334・WIRE-27） ----
+
+/// psql と同じく末尾 `;` 付きで 1 文ずつ送る `DECLARE c SCROLL CURSOR ...;` → `FETCH`
+/// → `CLOSE` が通る。`WITH HOLD` は ErrorResponse `0A000` で Tx が `Failed`（`'E'`）になる。
+#[test]
+fn wire15_declare_scroll_cursor_with_trailing_semicolon_over_simple_query() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    send_simple_query(&mut stream, "FETCH 2 FROM c;");
+    let (page, tag) = read_fetch_page(&mut stream);
+    assert_eq!(page.len(), 2);
+    assert_eq!(tag, "FETCH 2");
+    simple_ok(&mut stream, "CLOSE c;", "CLOSE CURSOR");
+
+    send_simple_query(
+        &mut stream,
+        "DECLARE h CURSOR WITH HOLD FOR SELECT id FROM docs LIMIT 100;",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}

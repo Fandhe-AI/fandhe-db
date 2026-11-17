@@ -642,7 +642,7 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     DropTable(ddl::DropTableOutcome),
-    /// `DECLARE <name> CURSOR FOR <SELECT>`（WIRE-15・TASK-218）がセッション
+    /// `DECLARE <name> [SCROLL | NO SCROLL | ...] CURSOR FOR <SELECT>`（WIRE-15・TASK-218）がセッション
     /// 経由の実行経路（`crate::core::EngineCore::execute_sql_in_txn`。カーソルは
     /// 明示トランザクション内でのみ有効）で成功したことを示す応答。
     /// `wire-server::simple_query` は `CommandComplete` タグ `DECLARE CURSOR`

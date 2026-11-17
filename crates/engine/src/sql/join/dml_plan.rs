@@ -68,8 +68,43 @@ struct Split {
     /// 畳み込み source の述語（修飾済みの論理木。合成 JOIN 文の `WHERE` へ渡す）。
     source_join: Vec<JoinWhereExpr>,
     keys: Vec<EquiKey>,
+    /// 対象側・source 側の述語列それぞれの Describe 用ダミーフラグ（Issue #3297）。
+    /// 束縛の等価序数（`Equality`・`Compare`・`Between` の葉ごとに 1 つ進む）に揃えた並び。
+    target_dummy: Vec<bool>,
+    source_dummy: Vec<bool>,
     /// 対象と単一表 source をまたぐ残余（Issue #3295。畳み込み source では拒否する）。
     residual: Option<JoinedResidual>,
+}
+
+/// 束縛の等価序数を進める葉の数（`bind_where_predicates` の `dummy_equality_flags` の並びと対応。
+/// `Equality`・`Compare`・`Between` が 1 葉 1 つ、`Not` は内側、`Or` は分岐の合計）。
+fn ordinal_leaf_count(pred: &WherePredicate) -> usize {
+    match pred {
+        WherePredicate::Equality { .. }
+        | WherePredicate::Compare { .. }
+        | WherePredicate::Between { .. } => 1,
+        WherePredicate::Not(inner) => ordinal_leaf_count(inner),
+        WherePredicate::Or(branches) => branches
+            .iter()
+            .flatten()
+            .map(ordinal_leaf_count)
+            .fold(0usize, usize::saturating_add),
+        _ => 0,
+    }
+}
+
+/// 1 連言分（`preds`）が積むダミーフラグ。単一の葉で、その連言分が `$n` 由来のときだけ真を積み、
+/// それ以外は葉の数だけ偽（実リテラルは必ず検証する。fail-closed）を積む。
+fn push_dummy_flags(out: &mut Vec<bool>, preds: &[WherePredicate], dummy: bool) {
+    let n = preds
+        .iter()
+        .map(ordinal_leaf_count)
+        .fold(0usize, usize::saturating_add);
+    if n == 0 {
+        return;
+    }
+    out.push(dummy && matches!(preds, [WherePredicate::Equality { .. }]));
+    out.extend(std::iter::repeat_n(false, n.saturating_sub(1)));
 }
 
 /// source 側の列を、`JoinedDmlSource` の添字系列（`columns`・`EquiKey::source_column`）へ写像する。
@@ -311,7 +346,7 @@ fn split_where(
     other_schemas: &[&TableSchema],
     map: &mut SourceMap,
     other_visible: &[Option<Vec<String>>],
-    udfs: &UdfRegistry,
+    (conjunct_dummy, udfs): (&[bool], &UdfRegistry),
 ) -> Result<Split, SqlSurfaceError> {
     let (Some(target_ref), others) = (relations.first(), relations.get(1..).unwrap_or(&[])) else {
         return Err(internal("DML join without a target relation"));
@@ -324,6 +359,8 @@ fn split_where(
         source: Vec::new(),
         source_join: Vec::new(),
         keys: Vec::new(),
+        target_dummy: Vec::new(),
+        source_dummy: Vec::new(),
         residual: None,
     };
     let Some(where_clause) = where_clause else {
@@ -352,16 +389,31 @@ fn split_where(
             .ok_or_else(|| internal("relation index out of range in DML join WHERE"))?;
         slot_name(resolved.slot(), schema)
     };
-    for c in conjuncts {
+    // 連言分の数と一致しないフラグ列は使わない（対応を保証できないため全て検証側へ倒す）。
+    let usable_flags = conjunct_dummy.len() == conjuncts.len();
+    for (ci, c) in conjuncts.into_iter().enumerate() {
+        let dummy = usable_flags && conjunct_dummy.get(ci).copied().unwrap_or(false);
         // 判定は解決済みの relation 添字だけで行い、全域にする（取りこぼしは書き込み範囲を広げる）。
         match relation_set(c, &scope)? {
-            (true, false) => split.target.extend(convert(c, &mut name_of)?),
-            (false, true) if map.is_folded() => {
-                split
-                    .source_join
-                    .push(qualify_expr(c, &scope, relations, &schemas)?);
+            (true, false) => {
+                let preds = convert(c, &mut name_of)?;
+                push_dummy_flags(&mut split.target_dummy, &preds, dummy);
+                split.target.extend(preds);
             }
-            (false, true) => split.source.extend(convert(c, &mut name_of)?),
+            (false, true) if map.is_folded() => {
+                // 列の解決（`42703`／`42702`）は常に行う。`$n` 由来のダミー値の連言分は、後段の合成 JOIN 文の
+                // 再束縛（`fold.prepare`）へダミーフラグを運べないため、Describe 用計画からだけ外して値検証を
+                // Bind へ遅延する（Describe の計画は実行されず、Bind は実値で改めて計画する。Issue #3297）。
+                let q = qualify_expr(c, &scope, relations, &schemas)?;
+                if !dummy {
+                    split.source_join.push(q);
+                }
+            }
+            (false, true) => {
+                let preds = convert(c, &mut name_of)?;
+                push_dummy_flags(&mut split.source_dummy, &preds, dummy);
+                split.source.extend(preds);
+            }
             (true, true) => {
                 // 列同士の等値は結合キー。キー化できない型・等値以外・`OR` などは残余（Issue #3295）。
                 if let JoinWhereExpr::Leaf(JoinWherePredicate::ColumnCompare { lhs, op, rhs }) = c {
@@ -399,11 +451,18 @@ fn build_target(
     table: &str,
     schema: &TableSchema,
     preds: &[WherePredicate],
+    dummy_flags: &[bool],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlTarget, SqlSurfaceError> {
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let (metadata_filters, expr_filters, _rls, or_filters) =
-        crate::sql::parser::bind_where_predicates(preds, schema, udfs, &mut node_budget, &[])?;
+        crate::sql::parser::bind_where_predicates(
+            preds,
+            schema,
+            udfs,
+            &mut node_budget,
+            dummy_flags,
+        )?;
     if expr_filters
         .iter()
         .any(crate::sql::udf_call::references_embedding)
@@ -427,14 +486,14 @@ fn build_target(
 fn build_source(
     table: &str,
     schema: &TableSchema,
-    preds: Vec<WherePredicate>,
+    (preds, dummy_flags): (Vec<WherePredicate>, &[bool]),
     columns: Vec<usize>,
     returning_columns: Vec<usize>,
     include_pseudo_id: bool,
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlSource, SqlSurfaceError> {
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    crate::sql::parser::bind_where_predicates(&preds, schema, udfs, &mut node_budget, &[])?;
+    crate::sql::parser::bind_where_predicates(&preds, schema, udfs, &mut node_budget, dummy_flags)?;
     Ok(JoinedDmlSource {
         table: table.to_string(),
         schema: schema.clone(),
@@ -775,7 +834,8 @@ fn plan_joined(
     target_schema: &TableSchema,
     other_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
-) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+    conjunct_dummy: &[bool],
+) -> Result<(JoinedDmlPlan, Vec<bool>), SqlSurfaceError> {
     let (Some(target_ref), others) = (
         input.relations.first(),
         input.relations.get(1..).unwrap_or(&[]),
@@ -795,9 +855,15 @@ fn plan_joined(
         other_schemas,
         &mut map,
         input.source_visible,
+        (conjunct_dummy, udfs),
+    )?;
+    let target = build_target(
+        target_ref.table(),
+        target_schema,
+        &split.target,
+        &split.target_dummy,
         udfs,
     )?;
-    let target = build_target(target_ref.table(), target_schema, &split.target, udfs)?;
     let (update, columns) = match input.update {
         Some(bound) => {
             let (u, c) = plan_set(bound, target_schema, other_schemas, &mut map)?;
@@ -825,6 +891,8 @@ fn plan_joined(
             returning_columns.push(i);
         }
     }
+    // ビュー述語の畳み込み（`core::dml_from_exec`）が再束縛で引き継ぐ、source 側のダミーフラグ。
+    let source_dummy = split.source_dummy.clone();
     let source = match &map {
         SourceMap::Single => {
             let (Some(source_ref), Some(source_schema)) = (others.first(), other_schemas.first())
@@ -834,7 +902,7 @@ fn plan_joined(
             build_source(
                 source_ref.table(),
                 source_schema,
-                split.source,
+                (split.source, &split.source_dummy),
                 columns,
                 returning_columns,
                 include_pseudo_id,
@@ -860,7 +928,25 @@ fn plan_joined(
         returning: None,
     };
     resolve_returning(&mut plan, &map, input.returning.cloned())?;
-    finish(plan, udfs)
+    Ok((finish(plan, udfs)?, source_dummy))
+}
+
+/// ビュー述語を source 述語の先頭へ畳み込んだ後の再束縛用ダミーフラグ（Issue #3297）。
+/// ビュー定義の述語は実リテラルなので、その葉の数だけ偽を先頭に置き、続けて source 側のフラグを引き継ぐ。
+pub(crate) fn view_prefixed_dummy(
+    view_preds: &[WherePredicate],
+    source_dummy: &[bool],
+) -> Vec<bool> {
+    if source_dummy.is_empty() {
+        return Vec::new();
+    }
+    let n = view_preds
+        .iter()
+        .map(ordinal_leaf_count)
+        .fold(0usize, usize::saturating_add);
+    let mut out = vec![false; n];
+    out.extend_from_slice(source_dummy);
+    out
 }
 
 /// 束縛済みの `UPDATE ... FROM` を [`JoinedDmlPlan`] へ変換する。呼び出し元は
@@ -871,6 +957,19 @@ pub(crate) fn plan_update_from(
     from_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+    plan_update_from_describe(bound, target_schema, from_schemas, udfs, &[]).map(|(p, _)| p)
+}
+
+/// [`plan_update_from`] の Describe 用版（Issue #3297）。`conjunct_dummy` は WHERE の連言分ごとの
+/// 「`$n` 由来のダミー値か」で、真の連言分に限り値の検証（DATE・UUID・ENUM 等）を省く。Execute と
+/// Bind は空を渡し、実リテラルは常に検証する。
+pub(crate) fn plan_update_from_describe(
+    bound: &BoundUpdateFrom,
+    target_schema: &TableSchema,
+    from_schemas: &[&TableSchema],
+    udfs: &UdfRegistry,
+    conjunct_dummy: &[bool],
+) -> Result<(JoinedDmlPlan, Vec<bool>), SqlSurfaceError> {
     plan_joined(
         PlanInput {
             relations: bound.relations(),
@@ -883,6 +982,7 @@ pub(crate) fn plan_update_from(
         target_schema,
         from_schemas,
         udfs,
+        conjunct_dummy,
     )
 }
 
@@ -893,6 +993,17 @@ pub(crate) fn plan_delete_using(
     using_schemas: &[&TableSchema],
     udfs: &UdfRegistry,
 ) -> Result<JoinedDmlPlan, SqlSurfaceError> {
+    plan_delete_using_describe(bound, target_schema, using_schemas, udfs, &[]).map(|(p, _)| p)
+}
+
+/// [`plan_delete_using`] の Describe 用版（Issue #3297。[`plan_update_from_describe`] と同じ契約）。
+pub(crate) fn plan_delete_using_describe(
+    bound: &BoundDeleteUsing,
+    target_schema: &TableSchema,
+    using_schemas: &[&TableSchema],
+    udfs: &UdfRegistry,
+    conjunct_dummy: &[bool],
+) -> Result<(JoinedDmlPlan, Vec<bool>), SqlSurfaceError> {
     plan_joined(
         PlanInput {
             relations: bound.relations(),
@@ -905,6 +1016,7 @@ pub(crate) fn plan_delete_using(
         target_schema,
         using_schemas,
         udfs,
+        conjunct_dummy,
     )
 }
 #[cfg(test)]

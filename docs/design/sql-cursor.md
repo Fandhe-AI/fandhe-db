@@ -14,7 +14,7 @@
 大量の結果を分割して取得する手段がこれまで `LIMIT` しかなかったため、
 明示トランザクション（Issue #942）の中で次の 3 文を受理できるようにする。
 
-- `DECLARE <name> CURSOR FOR <SELECT>`
+- `DECLARE <name> [SCROLL | NO SCROLL | INSENSITIVE | ASENSITIVE]... CURSOR [WITHOUT HOLD] FOR <SELECT>`（修飾語は Issue #3334）
 - `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`
 - `CLOSE <name>`
 
@@ -95,9 +95,9 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 同じ応答になり、存在情報は漏れない（固定文言のみを保持し、カーソル名・
 他セッション所有かどうかを一切含めない）。
 
-### 4. 構文（許可リスト方式・規範形のみ）
+### 4. 構文（許可リスト方式）
 
-- **`DECLARE`**: 受理するのは `DECLARE <name> CURSOR FOR <SELECT...>` のみ。
+- **`DECLARE`**: 受理するのは `DECLARE <name> [修飾語]... CURSOR [WITH HOLD | WITHOUT HOLD] FOR <SELECT...>` のみ（修飾語は下記の表）。
   `FOR` より後のトークン列は再トークナイズせず
   `sql::allowlist::validate_sql_tokens` へそのまま渡す（第 2 のパーサを
   作らない設計）。受理する内側 `SELECT` は集計 `SELECT`（SQL-13・SQL-14）・
@@ -111,10 +111,26 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   JOIN を枝に持つ集合演算・`WITH` ＋ 集合演算の主クエリは通常の SELECT でも未対応のため `42601`。
   ベクトル順位付けの検索 `SELECT`・
   `EXPLAIN`・`SET`／`CREATE FUNCTION` は許可形状に一致せず `42601`。
-  `SCROLL`／`NO SCROLL`／`BINARY`／`INSENSITIVE`／`ASENSITIVE`／`WITH HOLD`／
-  `WITHOUT HOLD` はいずれも `42601`（規範形のみ受理。`name` の直後が必ず
-  `CURSOR` であることを要求する構造上、これらの修飾語が割り込むと自然に
-  拒否される）。
+- **`DECLARE` の修飾語（Issue #3334・WIRE-27 (2)(5)(6)）**: PG17 の文法順（`CURSOR` の前に任意順の
+  修飾語、`CURSOR` と `FOR` の間に hold 指定）に合わせる。トークン列の許可リスト照合だけで、再結合・
+  再トークナイズはしない。
+
+  | 形 | 扱い |
+  | -- | ---- |
+  | `SCROLL` | 受理。逆方向の取得を許す |
+  | `NO SCROLL`・指定なし | 受理。逆方向の取得は `55000`（`cursor can only scan forward`） |
+  | `INSENSITIVE`・`ASENSITIVE`・`WITHOUT HOLD` | 受理して何もしない（もともと INSENSITIVE） |
+  | 同じ修飾語の重複 | 受理（冪等。PG と同じ） |
+  | `WITH HOLD` | `0A000`（受け皿 #3340。黙って無視して受理する経路は作らない） |
+  | `BINARY` | `0A000`（意図した拒否。カーソルの行の出力形式は Bind の format code に従う既存の経路しか無い） |
+  | `SCROLL` と `NO SCROLL`、`INSENSITIVE` と `ASENSITIVE` の併記 | `42601` |
+  | 未知の語・`NO` の後に `SCROLL` が無い・`CURSOR` の後の修飾語・`CURSOR` より前の `WITH HOLD`・`HOLD` の欠落／重複／相反 | `42601` |
+
+  判定順は 修飾語・hold の構文（`42601`）→ 内側 SELECT の構造検証 → `WITH HOLD`／`BINARY` の `0A000`
+  （構文が壊れた文は常に構文エラー）。`0A000` は構文解析段で返るため、Tx 内では `Failed` になる。
+  **意図した PG17 との差**: (1) 指定なしは `NO SCROLL` と同じで、PG が計画により許す逆方向を許さない。
+  (2) 矛盾指定は PG17 では `42P11`（invalid_cursor_definition）だが、ErrorClass を新設せず `42601` で拒否する
+  （突き合わせは #3337）。
 - **末尾の `;`（Issue #3171）**: `FETCH`・`CLOSE` は末尾の単一 `;` を受理する（`sql::lexer::strip_one_trailing_semicolon`）。`;;` は `42601`。`DECLARE` は内側 SELECT の検証が末尾 `;` を 1 個受理する。判断は [explicit-transaction.md](explicit-transaction.md) の「末尾 `;` の扱い」節。
 - **`DECLARE` のカタログ照合の遅延とビュー**: 構文解析段（`core.rs::parse_tokens`）
   は内側 `SELECT` の構造検証のみを行い、カタログを参照しない（トランザクション
@@ -257,11 +273,27 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
 それ以前のカーソルは位置を保ったまま残り、portal は続きから送出できる。詳細は
 [explicit-transaction.md](explicit-transaction.md) の「savepoint 巻き戻しとカーソル」節。
 
+### 9. 位置モデル（Issue #3334・WIRE-27 (5)(6)）
+
+`sql::cursor::CursorPosition` が、確定済み行集合（N 行）の上の位置を `0..=N+1` で持つ。
+`0` は先頭の前、`k`（1..=N）は k 行目の上、`N+1` は末尾の後。位置は `usize` 1 個で、行集合の複製を作らない。
+不変条件 `pos <= N+1` はすべての遷移（`saturating_*`・`min`）で守り、単体テストで 1 始まりの参照モデルと
+突き合わせて固定する。
+
+- 前方向 `forward(n)`（現在位置 p）: p+1..=min(p+n, N) の行を返し、p+n <= N なら位置は p+n、それ以外は N+1。
+  N 行をちょうど取り切った直後の `FETCH n` は 0 行で位置は N+1。`forward_all` は残り全行を返し位置は N+1。
+- 逆方向 `backward(n)`: 位置は `p.saturating_sub(n)`。p-1 行目から max(新位置,1) 行目までを降順で返す
+  （N+1 からは N 行目から）。p が 0／1 なら 0 行。
+- `55000`（非 SCROLL への逆方向）・`54000`（`ALL` の行数上限超過）では位置を変えない。
+- メモリ課金は SCROLL／NO SCROLL で同じ（`estimate_result_bytes`）で、16 MiB・16 本の上限に数える。
+- 逆方向の取得口 `CursorRegistry::fetch_backward` は engine 内に置くが、SQL の方向構文（`PRIOR`・`BACKWARD` 等）の
+  結線は #3335、`MOVE` は #3336 が担う。それまで SQL 経由の逆方向は従来どおり `42601`。
+
 ## 対象外・申し送り
 
-- `SCROLL`／`WITH HOLD`／`BINARY`／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／
-  `ABSOLUTE`／`RELATIVE`／件数なし `FORWARD`／`FROM`・`IN` 省略の `FETCH`／`CLOSE ALL`／
-  `MOVE`、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
+- `WITH HOLD`（#3339・#3340）／`BACKWARD`／`PRIOR`／`FIRST`／`LAST`／
+  `ABSOLUTE`／`RELATIVE`（#3335）／件数なし `FORWARD`／`FROM`・`IN` 省略の `FETCH`／`CLOSE ALL`／
+  `MOVE`（#3336）、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。
 - 主クエリが tail CTE（本文に `ORDER BY`／`LIMIT`／`OFFSET`）を直接読む単一表の `DECLARE`・

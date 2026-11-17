@@ -179,7 +179,7 @@ impl BoundDeleteUsing {
     }
 }
 
-/// 対象表と FROM／USING 側の表から束縛スコープを作る。参照数の超過は `54000`、公開名の重複は `42601`。
+/// 対象表と FROM／USING 側の表から束縛スコープを作る。参照数の超過は `54000`、公開名の重複は `42712`（Issue #3297）。
 pub(crate) fn build_scope<'a>(
     target: &TableRef,
     target_schema: &'a TableSchema,
@@ -201,6 +201,21 @@ pub(crate) fn build_scope<'a>(
     relations.push((target.clone(), target_schema));
     for (r, s) in others.iter().zip(other_schemas.iter()) {
         relations.push((r.clone(), *s));
+    }
+    // Issue #3297: 結合 DML の公開名重複は PG の `duplicate_alias`（`42712`）。参照数の超過（`54000`）を
+    // 先に判定する順序は `BindingScope::new` と同じ。スキーマ修飾の解決後に初めて同名になる形も
+    // ここで拾う。SELECT の JOIN が使う `BindingScope::new` 自体は従来どおり `42601`（ADR の判断を維持）。
+    if relations.len() <= crate::sql::relation::MAX_TABLE_REFS {
+        for (i, (r, _)) in relations.iter().enumerate() {
+            let exposed = r.exposed_name();
+            if relations
+                .iter()
+                .take(i)
+                .any(|(other, _)| other.exposed_name() == exposed)
+            {
+                return Err(SqlSurfaceError::duplicate_alias(exposed));
+            }
+        }
     }
     // 先頭（対象表）は制限なし。FROM／USING 側はビューの公開列だけを見せる（Issue #3292）。
     let visible = std::iter::once(None)
@@ -333,7 +348,7 @@ pub(crate) fn check_set_expr_scope(
     Ok(())
 }
 
-/// `UPDATE ... FROM` を束縛する。判定順は決定的: スコープ構築（`54000`・`42601`）→ `JOIN ... ON` の列解決（Issue #3294）→ `WHERE` の列解決 →
+/// `UPDATE ... FROM` を束縛する。判定順は決定的: スコープ構築（`54000`・`42712`）→ `JOIN ... ON` の列解決（Issue #3294）→ `WHERE` の列解決 →
 /// SET 左辺の検査（重複・疑似列・未知列・`GENERATED ALWAYS`）→ SET 右辺（列参照は解決と型照合〔`42804`〕、
 /// 式はスコープ照合の後に既存の式束縛、リテラルは既存のリテラル束縛）。
 pub fn bind_update_from(
@@ -357,6 +372,21 @@ pub(crate) fn bind_update_from_with_udfs(
     from_schemas: &[&TableSchema],
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundUpdateFrom, SqlSurfaceError> {
+    bind_update_from_describe(stmt, target_schema, from_schemas, udfs, &[])
+}
+
+/// [`bind_update_from_with_udfs`] の Describe 用版（Issue #3297）。`set_dummy` は SET 句の代入ごと
+/// （宣言順）の「`$n` 由来のダミー値か」で、真の文字列リテラル項は左辺（重複・疑似列・未知列・
+/// `GENERATED ALWAYS`）だけを検査し、値の検証（DATE・UUID・ENUM 等）は Bind まで遅延する。
+/// 代入数と一致しないフラグ列は使わない（全て検証側へ倒す。fail-closed）。実リテラルは常に検証する。
+pub(crate) fn bind_update_from_describe(
+    stmt: &ValidatedUpdateFrom,
+    target_schema: &TableSchema,
+    from_schemas: &[&TableSchema],
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    set_dummy: &[bool],
+) -> Result<BoundUpdateFrom, SqlSurfaceError> {
+    let usable_set_flags = set_dummy.len() == stmt.assignments.len();
     let scope = build_scope(
         &stmt.target,
         target_schema,
@@ -376,7 +406,7 @@ pub(crate) fn bind_update_from_with_udfs(
     let mut set_columns: Vec<(usize, ResolvedColumn)> = Vec::new();
     let mut plain: Vec<(String, SetValue)> = Vec::new();
     let mut set_joined_exprs: Vec<(usize, Expr, Vec<ResolvedColumn>)> = Vec::new();
-    for (name, value) in &stmt.assignments {
+    for (ai, (name, value)) in stmt.assignments.iter().enumerate() {
         if !seen.insert(name.as_str()) {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "duplicate column in SET clause: {name}"
@@ -424,6 +454,16 @@ pub(crate) fn bind_update_from_with_udfs(
             DmlFromSetValue::Value(v, unqualified) => {
                 if let SetValue::Expr(_) = v {
                     check_set_expr_scope(&scope, unqualified)?;
+                }
+                let is_dummy = usable_set_flags
+                    && set_dummy.get(ai).copied().unwrap_or(false)
+                    && matches!(
+                        v,
+                        SetValue::Literal(crate::sql::allowlist::InsertLiteral::String(_))
+                    );
+                if is_dummy {
+                    check_set_target(name, target_schema)?;
+                    continue;
                 }
                 plain.push((name.clone(), v.clone()));
             }

@@ -1560,3 +1560,214 @@ fn fetch_all_respects_tenant_boundary() {
         assert_eq!(err.wire_code(), "34000", "{sql}");
     }
 }
+
+// --- DECLARE の SCROLL／NO SCROLL（Issue #3334・WIRE-27） --------------------------
+
+/// `SCROLL`／`NO SCROLL`／指定なし／`INSENSITIVE`／`ASENSITIVE`／`WITHOUT HOLD` のどのカーソルも、
+/// 末尾 `;` 付きで宣言でき、前方向の FETCH は同じ行を同じページ分割で返す（末尾の後は 0 行）。
+#[test]
+fn scroll_no_scroll_and_unspecified_cursors_fetch_forward_identically() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    seed_rows(&engine, &caller, 5);
+
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN;")
+        .expect("begin");
+    let heads = [
+        "DECLARE c0 CURSOR",
+        "DECLARE c1 SCROLL CURSOR",
+        "DECLARE c2 NO SCROLL CURSOR",
+        "DECLARE c3 INSENSITIVE CURSOR",
+        "DECLARE c4 ASENSITIVE SCROLL CURSOR",
+        "DECLARE c5 CURSOR WITHOUT HOLD",
+    ];
+    for head in heads {
+        engine
+            .execute_sql_in_txn(
+                &caller,
+                &mut session,
+                &mut txn,
+                &format!("{head} FOR SELECT id FROM {TABLE} LIMIT 100;"),
+            )
+            .unwrap_or_else(|e| panic!("{head}: {e}"));
+    }
+    let mut fetch = |sql: &str| -> Vec<u64> {
+        let outcome = engine
+            .execute_sql_in_txn(&caller, &mut session, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        let SqlOutcome::Fetch(result) = outcome else {
+            panic!("expected Fetch outcome for {sql}");
+        };
+        row_ids(&result)
+    };
+    let mut reference: Option<Vec<Vec<u64>>> = None;
+    for i in 0..heads.len() {
+        let pages = vec![
+            fetch(&format!("FETCH 2 FROM c{i};")),
+            fetch(&format!("FETCH 2 FROM c{i};")),
+            fetch(&format!("FETCH 2 FROM c{i};")),
+            fetch(&format!("FETCH 2 FROM c{i};")),
+        ];
+        assert_eq!(pages[0].len(), 2);
+        assert_eq!(pages[2].len(), 1);
+        assert!(pages[3].is_empty());
+        match &reference {
+            None => reference = Some(pages),
+            Some(r) => assert_eq!(&pages, r, "c{i}"),
+        }
+    }
+}
+
+/// SCROLL 指定でも別テナントの行は件数・行に現れない（他テナントの行の有無で FETCH の件数が
+/// 変わらない。WIRE-27 (4)）。
+#[test]
+fn scroll_cursor_respects_tenant_boundary() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    seed_rows(&engine, &alice, 3);
+    let mut seen = Vec::new();
+    for with_bob_rows in [false, true] {
+        if with_bob_rows {
+            seed_rows(&engine, &bob, 7);
+        }
+        let mut session = SessionState::default();
+        let mut txn = engine.new_session_transaction();
+        engine
+            .execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        engine
+            .execute_sql_in_txn(
+                &alice,
+                &mut session,
+                &mut txn,
+                &format!("DECLARE c SCROLL CURSOR FOR SELECT id FROM {TABLE} LIMIT 100"),
+            )
+            .expect("declare");
+        let outcome = engine
+            .execute_sql_in_txn(&alice, &mut session, &mut txn, "FETCH ALL FROM c")
+            .expect("fetch all");
+        let SqlOutcome::Fetch(result) = outcome else {
+            panic!("expected Fetch outcome");
+        };
+        seen.push(row_ids(&result));
+        engine
+            .execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[0].len(), 3);
+}
+
+/// `WITH HOLD` は `0A000` で拒否され、Tx は `Failed`（`ROLLBACK` 以外は `25P02`）。
+// tracked: #3340
+#[test]
+fn declare_with_hold_is_0a000_and_fails_transaction() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE c SCROLL CURSOR WITH HOLD FOR SELECT id FROM {TABLE} LIMIT 10;"),
+        )
+        .expect_err("WITH HOLD is unsupported");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    let err = engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "FETCH 1 FROM c")
+        .expect_err("failed txn");
+    assert_eq!(err.wire_code(), "25P02");
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+}
+
+/// `BINARY` カーソルは `0A000`（意図した拒否。理由は設計記録）。
+// intentional: docs/design/sql-cursor.md
+#[test]
+fn declare_binary_is_0a000() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE c BINARY CURSOR FOR SELECT id FROM {TABLE} LIMIT 10"),
+        )
+        .expect_err("BINARY is unsupported");
+    assert_eq!(err.wire_code(), "0A000");
+}
+
+/// `SCROLL` と `NO SCROLL` の併記は `42601`。
+#[test]
+fn declare_conflicting_scroll_options_is_42601() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let mut txn = engine.new_session_transaction();
+    engine
+        .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = engine
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            &format!("DECLARE c SCROLL NO SCROLL CURSOR FOR SELECT id FROM {TABLE} LIMIT 10"),
+        )
+        .expect_err("conflict");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+/// Tx の外の `DECLARE ... SCROLL ...` は従来どおり `25P01`。
+#[test]
+fn declare_scroll_outside_transaction_is_25p01() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    let err = engine
+        .execute_sql_in_session(
+            &caller,
+            &mut session,
+            &format!("DECLARE c SCROLL CURSOR FOR SELECT id FROM {TABLE} LIMIT 10"),
+        )
+        .expect_err("outside txn");
+    assert_eq!(err.wire_code(), "25P01");
+}
+
+/// 拡張クエリの Parse 経路（`parse_sql_prepared`）でも修飾語つきの `DECLARE` が構文として通る。
+#[test]
+fn parse_sql_prepared_accepts_declare_scroll() {
+    let (engine, path) = new_core();
+    let _cleanup = CleanupGuard(path);
+    for sql in [
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM missing_table LIMIT 10",
+        "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM missing_table LIMIT 10;",
+    ] {
+        engine
+            .parse_sql_prepared(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}

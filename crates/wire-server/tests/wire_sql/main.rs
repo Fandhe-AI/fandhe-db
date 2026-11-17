@@ -84,6 +84,7 @@ mod wire_sql45_param_infer;
 mod wire_sql49_upsert_add_param;
 mod wire_sql50_update_delete_param;
 mod wire_sql53_dml_from_using;
+mod wire_sql53_dml_from_using_params;
 mod wire_sql53_dml_subquery_operation_id;
 mod wire_sql53_single_table_alias;
 mod wire_sql56_order_by_ordinal;
