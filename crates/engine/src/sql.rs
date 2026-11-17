@@ -203,6 +203,8 @@ pub(crate) mod interval_arith;
 pub(crate) mod json_agg;
 pub(crate) mod lateral_bind;
 pub(crate) mod matview;
+// MERGE の束縛（SQL-79・Issue #3352）。
+pub mod merge_bind;
 pub mod record_text;
 pub(crate) mod recursive_cte;
 pub(crate) mod recursive_eval;
@@ -295,6 +297,8 @@ pub(crate) mod order_value;
 pub(crate) mod param_coerce;
 pub(crate) mod param_infer;
 pub mod params;
+// MERGE の `$n` 位置規則・型推論入力・Describe 用ダミーフラグ（SQL-79・Issue #3352）。
+pub(crate) mod params_merge;
 pub mod parser;
 pub mod partitioned;
 pub(crate) mod pk_point;

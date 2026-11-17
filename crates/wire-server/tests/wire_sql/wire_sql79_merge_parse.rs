@@ -2,7 +2,7 @@
 //!
 //! 簡易クエリ（psql 流の末尾 `;` 付き単独送信を含む）と拡張クエリ（Parse／Bind／Execute／Sync と
 //! Parse／Describe／Sync）で、解析を通った MERGE が ErrorResponse `0A000` になり、ReadyForQuery の状態が
-//! 正しいこと、行が変わらないことを固定する。値位置の `$n` は構文段が受理しない（`42601`。束縛は #3352）。
+//! 正しいこと、行が変わらないことを固定する。束縛と値位置の `$n` は `wire_sql79_merge_bind.rs`（Issue #3352）。
 //! サーバーはポート 0・一意な一時ディレクトリで独立させ、時間計測は使わない。
 
 use crate::common;
@@ -141,7 +141,7 @@ fn simple_query_syntax_error_is_42601() {
 }
 
 #[test]
-fn extended_query_execute_and_describe_are_0a000() {
+fn extended_query_execute_is_0a000_and_describe_succeeds() {
     let (addr, _g) = start();
     let mut s = client(addr);
 
@@ -154,27 +154,37 @@ fn extended_query_execute_and_describe_are_0a000() {
     assert_eq!(code.as_deref(), Some("0A000"));
     assert_eq!(status, b'I');
 
-    // Parse／Describe（文）／Sync。Describe も Execute と同じ SQLSTATE。
+    // Parse／Describe（文）／Sync。Describe は束縛を通って成功する（結果列なし。Issue #3352）。
     send_length_prefixed_message(&mut s, b'P', &parse_body("m2", MERGE_SQL, 0));
     let mut describe = vec![b'S'];
     describe.extend_from_slice(b"m2\0");
     send_length_prefixed_message(&mut s, b'D', &describe);
     send_sync(&mut s);
     let (code, status) = read_until_ready(&mut s);
-    assert_eq!(code.as_deref(), Some("0A000"));
+    assert_eq!(code, None);
     assert_eq!(status, b'I');
 
     assert_eq!(count_t(&mut s), "1");
 }
 
 #[test]
-fn extended_query_placeholders_outside_the_allowed_positions_are_42601() {
+fn extended_query_placeholders_in_unsupported_positions_are_42601() {
     let (addr, _g) = start();
     let mut s = client(addr);
-    // 値位置の `$n` は構文段で受理しない（束縛は #3352）。Parse の時点で拒否される。
-    let sql = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = $1";
-    send_length_prefixed_message(&mut s, b'P', &parse_body("m3", sql, 0));
-    send_sync(&mut s);
-    let (code, _) = read_until_ready(&mut s);
-    assert_eq!(code.as_deref(), Some("42601"));
+    // 値位置以外の `$n`（ON・WHEN の AND の条件・式の内側・部分クエリの元）は Parse の時点で拒否される
+    // （値位置の `$n` は `wire_sql79_merge_bind.rs`）。
+    for (i, sql) in [
+        "MERGE INTO t USING s ON t.k = $1 WHEN MATCHED THEN DELETE",
+        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v = $1 THEN DELETE",
+        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = $1 + 1",
+        "MERGE INTO t USING (SELECT k FROM s WHERE v = $1) AS q ON t.k = q.k WHEN MATCHED THEN DELETE",
+    ]
+    .iter()
+    .enumerate()
+    {
+        send_length_prefixed_message(&mut s, b'P', &parse_body(&format!("m3-{i}"), sql, 0));
+        send_sync(&mut s);
+        let (code, _) = read_until_ready(&mut s);
+        assert_eq!(code.as_deref(), Some("42601"), "{sql}");
+    }
 }

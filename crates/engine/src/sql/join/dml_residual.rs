@@ -107,19 +107,55 @@ pub(super) fn plan_residual(
     source_schema: &TableSchema,
     udfs: &UdfRegistry,
 ) -> Result<JoinedResidual, SqlSurfaceError> {
+    plan_residual_with(
+        conjuncts,
+        &|r| scope.resolve(r),
+        target_schema,
+        source_schema,
+        udfs,
+        &DML_FROM_MSGS,
+    )
+}
+
+/// 残余の束縛が返す固定文言（`UPDATE ... FROM`／`DELETE ... USING` と `MERGE`〔Issue #3352〕で
+/// 文の名前だけを差し替える）。
+pub(super) struct ResidualMsgs {
+    /// source の疑似列 `id` を残余で参照したとき。
+    pub(super) source_id: &'static str,
+    /// source 列の型が式評価ビューへ写像できないとき。
+    pub(super) source_type: &'static str,
+    /// VECTOR 列を参照したとき。
+    pub(super) vector: &'static str,
+}
+
+/// `UPDATE ... FROM`／`DELETE ... USING` の固定文言（既存の文言を変えない）。
+const DML_FROM_MSGS: ResidualMsgs = ResidualMsgs {
+    source_id: "UPDATE ... FROM / DELETE ... USING: the pseudo column id of the FROM table cannot be used in a cross-table condition",
+    source_type: "UPDATE ... FROM / DELETE ... USING: the FROM-table column type is not supported in a cross-table condition",
+    vector: "UPDATE ... FROM / DELETE ... USING WHERE cannot reference a VECTOR column",
+};
+
+/// [`plan_residual`] の本体。列の解決を関数で受け取り（`MERGE` は WHEN 句ごとに狭めたスコープを使う）、
+/// 固定文言を差し替えられる。解決結果の relation は 0 = 対象、1 = source。
+pub(super) fn plan_residual_with(
+    conjuncts: &[&JoinWhereExpr],
+    resolve: &dyn Fn(&ColumnRef) -> Result<crate::sql::relation::ResolvedColumn, SqlSurfaceError>,
+    target_schema: &TableSchema,
+    source_schema: &TableSchema,
+    udfs: &UdfRegistry,
+    msgs: &ResidualMsgs,
+) -> Result<JoinedResidual, SqlSurfaceError> {
     // 合成スキーマ: 対象表 ++ 参照される source 列。対象列の添字は不変で末尾へ追記する。
     let mut combined = target_schema.clone();
     let mut columns: Vec<usize> = Vec::new();
     let mut preds: Vec<WherePredicate> = Vec::new();
     for c in conjuncts {
         let mut name_of = |r: &ColumnRef| -> Result<String, SqlSurfaceError> {
-            let resolved = scope.resolve(r)?;
+            let resolved = resolve(r)?;
             match resolved.relation() {
                 0 => slot_name(resolved.slot(), target_schema),
                 1 => match resolved.slot() {
-                    ColumnSlot::Id => Err(SqlSurfaceError::feature_not_supported(
-                        "UPDATE ... FROM / DELETE ... USING: the pseudo column id of the FROM table cannot be used in a cross-table condition",
-                    )),
+                    ColumnSlot::Id => Err(SqlSurfaceError::feature_not_supported(msgs.source_id)),
                     ColumnSlot::Column(i) => {
                         let col = source_schema.columns.get(i).ok_or_else(|| {
                             SqlSurfaceError::Internal {
@@ -127,9 +163,7 @@ pub(super) fn plan_residual(
                             }
                         })?;
                         if !residual_type_supported(&col.ty) {
-                            return Err(SqlSurfaceError::feature_not_supported(
-                                "UPDATE ... FROM / DELETE ... USING: the FROM-table column type is not supported in a cross-table condition",
-                            ));
+                            return Err(SqlSurfaceError::feature_not_supported(msgs.source_type));
                         }
                         let pos = match columns.iter().position(|&x| x == i) {
                             Some(p) => p,
@@ -163,9 +197,7 @@ pub(super) fn plan_residual(
         .any(crate::sql::udf_call::references_embedding)
         || or_filters.iter().any(|g| g.references_embedding())
     {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "UPDATE ... FROM / DELETE ... USING WHERE cannot reference a VECTOR column",
-        ));
+        return Err(SqlSurfaceError::feature_not_supported(msgs.vector));
     }
     // `IS [NOT] NULL` はメタデータフィルタとして束縛され `references_embedding` に現れない。
     // 評価は埋め込みを復号せず VECTOR 列が常に NULL に見えるため、OR 群の内側も含めて拒否する
@@ -177,9 +209,7 @@ pub(super) fn plan_residual(
         g.visit_column_indices(&mut |i| vector_ref |= is_vector_slot(&combined, i));
     }
     if vector_ref {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "UPDATE ... FROM / DELETE ... USING WHERE cannot reference a VECTOR column",
-        ));
+        return Err(SqlSurfaceError::feature_not_supported(msgs.vector));
     }
     Ok(JoinedResidual {
         source_columns: columns,

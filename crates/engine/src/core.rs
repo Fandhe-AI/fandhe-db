@@ -90,6 +90,7 @@ mod write_input_cap;
 
 // UPDATE ... FROM／DELETE ... USING の束縛と実行腕（SQL-53 (b)・Issue #1754。実行は #1755 以降）。
 mod dml_from_exec;
+mod merge_exec;
 
 // 述語形 UPDATE／DELETE の WHERE 内サブクエリの実行（SQL-53・Issue #1751）。
 mod dml_subquery_exec;
@@ -2156,8 +2157,8 @@ pub enum ParsedSql {
     /// マッチするクレート外コードは追随が必要。
     UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
     /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析までを
-    /// 担い、Execute・Describe・明示 Tx の各腕は固定文言の `0A000`（[`MERGE_NOT_SUPPORTED_YET`]）で
-    /// 副作用なしに止める。束縛は #3352、実行は #3353・#3354、台帳・`OpTag`・`EXPLAIN` は #3357、
+    /// 担い、Execute・Describe・明示 Tx の各腕は束縛（#3352。`sql::merge_bind`）を通してから固定文言の
+    /// `0A000`（[`MERGE_NOT_SUPPORTED_YET`]）で副作用なしに止める。実行は #3353・#3354、台帳・`OpTag`・`EXPLAIN` は #3357、
     /// `RETURNING` は #3356 が結線する。既存 variant にフィールドを足さず別 variant にしているのは、
     /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
     Merge(Box<crate::sql::allowlist::ValidatedMerge>),
@@ -9109,14 +9110,16 @@ impl EngineCore {
         // 振り分ける）。それ以外は従来どおり等価述語の序数ごと。
         // Issue #3324: LATERAL 本文の `$n` は TEXT 系の列に限るためダミー値の語彙照合の省略が要らない。
         // 序数フラグは本文の外の実リテラルへ誤適用されうるので、渡さない（空＝すべて検証する）。
-        let where_equality_dummy_flags =
-            if param_count > 0 && crate::sql::params::lateral_param_layout(&tokens).is_some() {
-                Vec::new()
-            } else if crate::sql::params::is_joined_dml(&tokens) {
-                crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
-            } else {
-                crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
-            };
+        let where_equality_dummy_flags = if crate::sql::allowlist::looks_like_merge(&tokens) {
+            // SQL-79・Issue #3352: MERGE は「WHEN 句ごとに SET の代入／INSERT の値の宣言順」のフラグ。
+            crate::sql::params_merge::dummy_flags(&tokens, &kinds)
+        } else if param_count > 0 && crate::sql::params::lateral_param_layout(&tokens).is_some() {
+            Vec::new()
+        } else if crate::sql::params::is_joined_dml(&tokens) {
+            crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
+        } else {
+            crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
+        };
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
         let dummy_overrides: Vec<(usize, crate::sql::lexer::Token)> = row_dummies
@@ -9280,6 +9283,12 @@ impl EngineCore {
                 }),
             }
         };
+        // SQL-79・Issue #3352: MERGE の対象表（SET・INSERT の `$n` の型を引く先）。
+        let merge_table: Option<String> = if crate::sql::allowlist::looks_like_merge(tokens) {
+            crate::sql::params_merge::merge_target_table(tokens)
+        } else {
+            None
+        };
         // Issue #3257: 行値比較の成分の `$n` が当たる列と、相手列を引く関係名の一覧。
         // 主表で引けない列は `FROM`／`JOIN`／`USING` の関係から引く（下の `WhereColumn` と後段で共有）。
         let row_slots = crate::sql::params::row_compare_column_slots(tokens);
@@ -9306,6 +9315,28 @@ impl EngineCore {
                 let schema = schema_of(&table)?;
                 Some((table, crate::catalog::lookup_star_columns_of(&schema)))
             });
+        // MERGE の列リスト省略 INSERT の `*` 展開（実表は自身、ビューは基底表。公開列を絞るビューは `None`）。
+        let merge_star_columns = |table: &str| -> Option<Vec<String>> {
+            if let Some(schema) = schema_of(table) {
+                return Some(crate::catalog::lookup_star_columns_of(&schema));
+            }
+            let base_star = |snap: &crate::catalog::ViewWriteSnapshot<'_>| {
+                let view = crate::sql::view_dml::resolve_merge_target(snap, table).ok()?;
+                if view.view_columns.is_some() {
+                    return None;
+                }
+                let base = snap.table_schema(&view.base_table).ok()?;
+                Some(crate::catalog::lookup_star_columns_of(&base))
+            };
+            match read_snap {
+                Some(rs) => base_star(&crate::catalog::ViewWriteSnapshot::over(rs)),
+                None => self
+                    .storage
+                    .with_view_write_snapshot(table, |snap, _| base_star(snap))
+                    .ok()
+                    .flatten(),
+            }
+        };
         let column_type = |table: &str, column: &str| -> Option<PreparedParamType> {
             let id_type = || Some(PreparedParamType::Column(ColumnMeta::Id));
             let (schema, column) = match schema_of(table).ok_or(()) {
@@ -9508,6 +9539,25 @@ impl EngineCore {
                         }
                         ParamPosition::SetColumn(col) => (
                             where_table.as_deref().and_then(|t| column_type(t, col)),
+                            Some(ParamContextKind::Assignment),
+                        ),
+                        // SQL-79・Issue #3352: MERGE の SET は対象の列、INSERT は句の列リスト（省略時は対象表の
+                        // `*` 展開）の序数の列で引く（引けなければ `Text`。応答コードで列の存在を観測させない）。
+                        ParamPosition::MergeSetColumn(col) => (
+                            merge_table.as_deref().and_then(|t| column_type(t, col)),
+                            Some(ParamContextKind::Assignment),
+                        ),
+                        ParamPosition::MergeInsertValue { columns, index } => (
+                            merge_table.as_deref().and_then(|t| {
+                                let col = match columns {
+                                    Some(cols) => cols.get(*index).cloned(),
+                                    // 実表は表の `*` 展開、ビューは基底表の `*` 展開（公開列を絞るビューは
+                                    // 列リストが必須のため引けず `Text`。束縛段の拒否に委ねる）。
+                                    None => merge_star_columns(t)
+                                        .and_then(|cols| cols.get(*index).cloned()),
+                                }?;
+                                column_type(t, &col)
+                            }),
                             Some(ParamContextKind::Assignment),
                         ),
                         ParamPosition::InsertValue(k) => (
@@ -10163,13 +10213,17 @@ impl EngineCore {
                     dml_from_exec::JOINED_DML_UNSUPPORTED_HERE,
                 ),
             ),
-            // SQL-79・Issue #3351: 構文解析のみ。writer の取得・暗黙 Tx の開始・台帳の照合より前に固定文言の
-            // `0A000` で返し、行・台帳・世代へ一切触れない（実行は #3353・#3354）。
-            ParsedSql::Merge(_) => Err(
-                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                    MERGE_NOT_SUPPORTED_YET,
-                ),
-            ),
+            // SQL-79・Issue #3351・#3352: 束縛（列解決・型照合）を通してから固定文言の `0A000` で返す。
+            // writer の取得・暗黙 Tx の開始・台帳の照合より前で、行・台帳・世代へ一切触れない
+            // （実行は #3353・#3354）。
+            ParsedSql::Merge(stmt) => {
+                self.bind_merge_stmt(session, stmt, session.udfs(), &[], None)?;
+                Err(
+                    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                        MERGE_NOT_SUPPORTED_YET,
+                    ),
+                )
+            }
             ParsedSql::Update(stmt) => {
                 // Issue #1129: `PARTITIONED` 付きは分割実行（非原子・autocommit 専用）。
                 if let crate::sql::allowlist::ValidatedUpdateForm::Predicate(v) = stmt {
@@ -11856,13 +11910,20 @@ impl EngineCore {
             // SQL-53 (b)・Issue #3202: 共有 write txn 上で結合実行器へ dispatch し、`mark_written` する。
             // 失敗時は呼び出し元が明示トランザクションを `Failed` へ遷移させる（他の失敗文と同じ契約）。
             ParsedSql::UpdateFrom(stmt) => self.execute_update_from_in_txn(ctx, session, txn, stmt),
-            // SQL-79・Issue #3351: 明示 Tx 内の MERGE も固定文言の `0A000`。`mark_written` は呼ばず、共有 write txn
-            // へ何も書かない（失敗文としての Tx 状態遷移は呼び出し元の既存規約）。
-            ParsedSql::Merge(_) => Err(
-                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                    MERGE_NOT_SUPPORTED_YET,
-                ),
-            ),
+            // SQL-79・Issue #3351・#3352: 明示 Tx 内の MERGE も束縛を通してから固定文言の `0A000`。束縛は
+            // 読み取りスナップショットだけを使い、`mark_written` は呼ばず共有 write txn へ何も書かない
+            // （失敗文としての Tx 状態遷移は呼び出し元の既存規約）。
+            ParsedSql::Merge(stmt) => {
+                // writer 取得前は `BEGIN` 時点のスナップショットで束縛し、Describe（`describe_snapshot`）と
+                // 読み取り源をそろえる（並行 DDL 後も SQLSTATE が食い違わない）。
+                let snap = Self::describe_snapshot(txn)?;
+                self.bind_merge_stmt(session, stmt, session.udfs(), &[], snap)?;
+                Err(
+                    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                        MERGE_NOT_SUPPORTED_YET,
+                    ),
+                )
+            }
             ParsedSql::DeleteUsing(stmt) => {
                 self.execute_delete_using_in_txn(ctx, session, txn, stmt)
             }
@@ -13302,12 +13363,22 @@ impl EngineCore {
                     None => Ok(None),
                 }
             }
-            // SQL-79・Issue #3351: Describe も Execute と同じ SQLSTATE（固定文言の `0A000`）。
-            ParsedSql::Merge(_) => Err(
-                crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                    MERGE_NOT_SUPPORTED_YET,
-                ),
-            ),
+            // SQL-79・Issue #3351・#3352: Describe も Execute と同じ束縛を通し、束縛エラーのコードをそろえる。
+            // フラグの並びは「WHEN 句ごとに SET の代入／INSERT の値の宣言順」（`sql::params_merge`）。
+            // 束縛に成功した `RETURNING` なしの形は結果列なし（`None`。拡張クエリの Parse／Describe が
+            // ParameterDescription を返せる）で、実行は Execute の固定文言 `0A000` が担う。`RETURNING` つきは
+            // 結果列の束縛（#3356）が未結線のため固定文言の `0A000`（fail-closed）。
+            ParsedSql::Merge(stmt) => {
+                self.bind_merge_stmt(session, stmt, session.udfs(), dummy_equality_flags, snap)?;
+                if stmt.returning.is_some() {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
+                            MERGE_NOT_SUPPORTED_YET,
+                        ),
+                    );
+                }
+                Ok(None)
+            }
             // SQL-53 (b)・Issue #3202・#3204: Execute と同じ準備段（束縛・変換）を通し、
             // エラーコードを揃える。`RETURNING` つきなら Execute の `QueryResult.columns` と同じ列を返す。
             ParsedSql::UpdateFrom(stmt) => {

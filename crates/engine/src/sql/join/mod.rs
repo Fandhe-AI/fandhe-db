@@ -63,6 +63,7 @@ mod explain;
 mod lateral;
 mod lateral_unnest;
 pub(crate) use lateral_unnest::unnest_columns_for;
+pub(crate) mod merge_check;
 mod nlj;
 mod on_split;
 mod plan;

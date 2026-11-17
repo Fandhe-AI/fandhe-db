@@ -1,10 +1,10 @@
 //! `MERGE` 文の構文解析と実行の固定文言 `0A000`（SQL-79・Issue #3351。親 #3349、設計記録
 //! `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
 //!
-//! 契約: 構文解析を通った MERGE は、autocommit・明示 Tx・Describe のいずれでも固定文言の `0A000` で止まり、
-//! 行・台帳・世代に一切触れない（`USING OPERATION_ID` 付きを再送しても `23505` にならない）。従来の
-//! `42601` だった形が `0A000` になる。構文エラーは `42601`、上限超過は `54000`、権限は書き込みゲートの
-//! `42501`。束縛・実行は #3352〜#3357 の担当（本ファイルは対象外）。
+//! 契約: 構文解析と束縛（#3352。`sql79_merge_bind.rs`）を通った MERGE は、autocommit・明示 Tx・Describe の
+//! いずれでも固定文言の `0A000` で止まり、行・台帳・世代に一切触れない（`USING OPERATION_ID` 付きを再送しても
+//! `23505` にならない）。従来の `42601` だった形が `0A000` になる。構文エラーは `42601`、上限超過は `54000`、
+//! 権限は書き込みゲートの `42501`。実行は #3353〜#3357 の担当（本ファイルは対象外）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, ParsedSql};
@@ -78,9 +78,11 @@ fn snapshot(core: &EngineCore) -> String {
 const ACCEPTED: &[&str] = &[
     "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v",
     "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE",
-    "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT (k, x) VALUES (s.k, s.v)",
+    "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN \
+     INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v)",
     "MERGE INTO t AS d USING s AS x ON d.k = x.k WHEN MATCHED AND x.v > 1 THEN UPDATE SET x = x.v + 1 \
-     WHEN NOT MATCHED THEN INSERT DEFAULT VALUES WHEN NOT MATCHED BY SOURCE THEN DELETE",
+     WHEN NOT MATCHED THEN INSERT (id, embedding, k) VALUES (x.id, x.embedding, x.k) \
+     WHEN NOT MATCHED BY SOURCE THEN DELETE",
     "MERGE INTO t USING (SELECT k, v FROM s) AS q (k, v) ON t.k = q.k WHEN MATCHED THEN DO NOTHING",
     "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.k",
 ];
@@ -122,7 +124,7 @@ fn sql79_operation_id_is_not_consumed_by_the_fixed_rejection() {
 }
 
 #[test]
-fn sql79_explicit_transaction_and_describe_use_the_same_fixed_error() {
+fn sql79_explicit_transaction_is_fixed_0a000_and_describe_binds() {
     let (core, _g) = new_core("sql79-txn");
     seed(&core);
     let before = snapshot(&core);
@@ -141,10 +143,19 @@ fn sql79_explicit_transaction_and_describe_use_the_same_fixed_error() {
         .expect("rollback");
     assert_eq!(before, snapshot(&core));
 
+    // Describe は Execute と同じ束縛を通る。`RETURNING` なしは結果列なし（実行は Execute の `0A000`）、
+    // `RETURNING` つきは結果列の束縛（#3356）が未結線のため固定文言の `0A000`。
     let parsed = core.parse_sql(sql).expect("parse");
+    assert_eq!(
+        core.describe_parsed_in_session(&SessionState::default(), &parsed)
+            .expect("describe without RETURNING"),
+        None
+    );
+    let returning = ACCEPTED.last().expect("returning form");
+    let parsed = core.parse_sql(returning).expect("parse");
     let err = core
         .describe_parsed_in_session(&SessionState::default(), &parsed)
-        .expect_err("describe");
+        .expect_err("describe with RETURNING");
     assert_eq!(err.wire_code(), "0A000");
     assert_eq!(err.client_message(), FIXED_MESSAGE);
 }
@@ -176,8 +187,7 @@ fn sql79_rejections_keep_their_sqlstate() {
             "MERGE INTO t AS WHEN USING s ON t.k = s.k WHEN MATCHED THEN DELETE".to_string(),
             "42601",
         ),
-        // 値位置の `$n` は構文段が受理しない（束縛は #3352）。リテラル化された ON は受理される。
-        (format!("{head} WHEN MATCHED THEN DELETE PARTITIONED"), "0A000"),
+                (format!("{head} WHEN MATCHED THEN DELETE PARTITIONED"), "0A000"),
         (
             "MERGE INTO t USING s, t AS u ON t.k = s.k WHEN MATCHED THEN DELETE".to_string(),
             "0A000",
