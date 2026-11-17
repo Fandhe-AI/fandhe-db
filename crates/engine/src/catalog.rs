@@ -5934,6 +5934,13 @@ fn view_body_shape(body_sql: &str) -> Result<ViewBodyShape> {
             join: matches!(*stmt, crate::sql::allowlist::Statement::Join(_)),
             deferred_expr: crate::sql::allowlist::top_level_body_has_expression_predicate(&stmt),
         },
+        // Issue #3324: 構造検証で保留した LATERAL の JOIN 本文。`create_view` が実カタログで再検証する。
+        ViewBodyKind::LateralDeferred { relations } => ViewBodyShape {
+            relations,
+            buffered: true,
+            join: true,
+            deferred_expr: true,
+        },
     })
 }
 

@@ -2855,7 +2855,18 @@ fn buffered_body_tables(stmt: &crate::sql::allowlist::Statement, out: &mut Vec<S
         Statement::Select(v) => out.push(v.table_name().to_string()),
         Statement::Aggregate(v) => out.push(v.table_name().to_string()),
         Statement::Scan(v) => out.push(v.table_name().to_string()),
-        Statement::Join(v) => out.extend(crate::sql::join::collect_join_tables(v)),
+        Statement::Join(v) => {
+            out.extend(crate::sql::join::collect_join_tables(v));
+            // Issue #3324: LATERAL 派生表を本文に持つビューの CTE 入力（slot）が読む表も含める
+            // （照合の検査が内側の表を取りこぼさない）。
+            if let Some(inputs) = v.cte_inputs.as_deref() {
+                for slot in &inputs.slots {
+                    if let crate::sql::allowlist::CteSlotSource::Scan(scan) = &slot.source {
+                        out.push(scan.table_name().to_string());
+                    }
+                }
+            }
+        }
         Statement::SetOperation(v) => crate::sql::set_op::collect_branch_tables(&v.tree, out),
         Statement::BufferedView(v) => buffered_body_tables(&v.body, out),
         Statement::RecursiveCte(v) => recursive_cte_tables(v, out),
@@ -8987,11 +8998,16 @@ impl EngineCore {
         // `WherePredicate::Equality` にならず序数に数えない）。
         // 結合 DML（Issue #3297）は連言分ごとのフラグ（`sql::join::dml_plan` が対象側・source 側へ
         // 振り分ける）。それ以外は従来どおり等価述語の序数ごと。
-        let where_equality_dummy_flags = if crate::sql::params::is_joined_dml(&tokens) {
-            crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
-        } else {
-            crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
-        };
+        // Issue #3324: LATERAL 本文の `$n` は TEXT 系の列に限るためダミー値の語彙照合の省略が要らない。
+        // 序数フラグは本文の外の実リテラルへ誤適用されうるので、渡さない（空＝すべて検証する）。
+        let where_equality_dummy_flags =
+            if param_count > 0 && crate::sql::params::lateral_param_layout(&tokens).is_some() {
+                Vec::new()
+            } else if crate::sql::params::is_joined_dml(&tokens) {
+                crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
+            } else {
+                crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
+            };
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
         let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
@@ -9330,6 +9346,27 @@ impl EngineCore {
                                 .and_then(|(_, t)| column_type(t, column)),
                             Some(ParamContextKind::Operator),
                         ),
+                        // Issue #3324: LATERAL 本文の WHERE の `$n`。型は本文の FROM の表の列から引く。
+                        // 受理するのは TEXT 系の列（引けない場合は従来どおり `Text`）だけ。派生表の本文は
+                        // 数値比較・`BETWEEN` を持てず、ENUM・日付等の列は Describe 用ダミー値が型検証に
+                        // 当たる（等価述語の序数フラグが LATERAL 本文の内側では保証できない）ため、
+                        // 列が引けて TEXT 系でない場合は固定 `42601`（fail-closed）で拒否する。
+                        ParamPosition::LateralColumn { table, column } => {
+                            let ty = column_type(table, column);
+                            if let Some(t) = &ty {
+                                let text_like = matches!(
+                                    t,
+                                    PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })
+                                        if ty.is_text_like()
+                                );
+                                if !text_like {
+                                    return Err(SqlSurfaceError::unsupported(
+                                        "parameter placeholders in LATERAL derived tables are supported only for text columns",
+                                    ));
+                                }
+                            }
+                            (ty, Some(ParamContextKind::Operator))
+                        }
                         ParamPosition::SetColumn(col) => (
                             where_table.as_deref().and_then(|t| column_type(t, col)),
                             Some(ParamContextKind::Assignment),

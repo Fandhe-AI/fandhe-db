@@ -38,6 +38,7 @@ mod wire_index_ddl;
 mod wire_insert_operation_id;
 mod wire_integer_bigint_column;
 mod wire_json_column;
+mod wire_lateral;
 mod wire_like_quantified;
 mod wire_lock_table;
 mod wire_policy_ddl;
