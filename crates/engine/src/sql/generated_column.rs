@@ -129,7 +129,11 @@ pub(crate) fn bind_generated_column(
     }
 
     // 代入の束縛（型の不一致は `42804`）。結果の束縛式は使わず、検証だけを行う。
-    let _ = crate::sql::set_expr::bind_set_expr(&column.name, &folded, column, schema)?;
+    // 式全体が裸の `NULL` の場合は束縛器が「NULL は CASE／COALESCE／NULLIF の被演算子のみ」として拒否するが、
+    // `NULL` はどの列型にも代入できるため束縛検証を省く（定数 NULL の生成式を宣言可能にする）。
+    if !matches!(folded, Expr::Null) {
+        let _ = crate::sql::set_expr::bind_set_expr(&column.name, &folded, column, schema)?;
+    }
     // 型に依存する決定性（`TIMESTAMPTZ` の CAST 等）の再判定。式索引の文言を生成列の文言へ差し替える。
     if let Err(e) =
         crate::sql::index_expr::check_bound_index_expression_determinism(&folded, schema)
@@ -158,7 +162,7 @@ pub(crate) fn bind_generated_column(
     let not_storable = || SqlSurfaceError::FeatureNotSupported {
         detail: MSG_NOT_STORABLE.to_string(),
     };
-    let reparsed = crate::sql::allowlist::parse_index_expression_text(&rendered)
+    let reparsed = crate::sql::allowlist::parse_generated_expression_text(&rendered)
         .map_err(|_| not_storable())?;
     if reparsed != folded {
         return Err(not_storable());

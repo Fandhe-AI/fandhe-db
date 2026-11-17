@@ -128,7 +128,7 @@ fn binding_stage_attaches_canonical_expression_and_references() {
     assert!(def.expression.len() <= crate::catalog::MAX_GENERATED_EXPRESSION_SQL_LEN);
     // 描画は再解析で同じ描画に戻る（往復一致）。
     let reparsed =
-        crate::sql::allowlist::parse_index_expression_text(&def.expression).expect("reparse");
+        crate::sql::allowlist::parse_generated_expression_text(&def.expression).expect("reparse");
     assert_eq!(
         crate::sql::check_constraint::render_expr(&reparsed),
         def.expression
@@ -186,4 +186,28 @@ fn binding_stage_rejects_too_many_referenced_columns() {
         sum.join(" + ")
     );
     assert_eq!(build(&sql).err().as_deref(), Some("54000"));
+}
+
+#[test]
+fn keyword_literal_generated_expressions_are_accepted_and_roundtrip() {
+    for sql in [
+        "CREATE TABLE t (g BOOLEAN GENERATED ALWAYS AS (TRUE) STORED)",
+        "CREATE TABLE t (g BOOLEAN GENERATED ALWAYS AS (FALSE) STORED)",
+        "CREATE TABLE t (g INTEGER GENERATED ALWAYS AS (NULL) STORED)",
+        "CREATE TABLE t (a INTEGER, g INTEGER GENERATED ALWAYS AS (COALESCE(a, NULL)) STORED)",
+    ] {
+        let schema = build_ok(sql);
+        let def = schema
+            .columns
+            .iter()
+            .find_map(|c| c.generated.as_ref())
+            .expect("generated");
+        let reparsed = crate::sql::allowlist::parse_generated_expression_text(&def.expression)
+            .expect("reparse");
+        assert_eq!(
+            crate::sql::check_constraint::render_expr(&reparsed),
+            def.expression,
+            "{sql}"
+        );
+    }
 }

@@ -18250,7 +18250,12 @@ impl<'a> Parser<'a> {
                 "generation expression must not be empty",
             ));
         }
-        let expr = self.parse_bounded_value_expr()?;
+        // 裸の `TRUE`／`FALSE`／`NULL` を列参照ではなくリテラルとして解析する（`ALTER COLUMN TYPE ... USING`
+        // と同じ文脈。定数の生成式を宣言できるようにする）。
+        let prev = std::mem::replace(&mut self.using_keyword_literals, true);
+        let parsed = self.parse_bounded_value_expr();
+        self.using_keyword_literals = prev;
+        let expr = parsed?;
         self.expect_punct(')')?;
         if !self.peek_ident_matches("STORED") {
             return Err(SqlSurfaceError::unsupported(
@@ -21589,6 +21594,18 @@ fn reject_unimplemented_expression_keys(
 pub(crate) fn parse_index_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
     let tokens = lexer::tokenize_marked(sql)?;
     let mut p = Parser::new(&tokens);
+    let expr = p.parse_bounded_value_expr()?;
+    p.expect_end_of_statement()?;
+    Ok(expr)
+}
+
+/// 生成列の保存式テキストを再解析する経路（宣言時の往復一致検証と再読込が共有する）。
+/// 構文段（[`Parser::parse_generated_stored_expr`]）と同じく `TRUE`／`FALSE`／`NULL` をリテラルとして
+/// 解析し、それ以外は [`parse_index_expression_text`] と同じ（ノード予算・余剰トークンは `42601`）。
+pub(crate) fn parse_generated_expression_text(sql: &str) -> Result<Expr, SqlSurfaceError> {
+    let tokens = lexer::tokenize_marked(sql)?;
+    let mut p = Parser::new(&tokens);
+    p.using_keyword_literals = true;
     let expr = p.parse_bounded_value_expr()?;
     p.expect_end_of_statement()?;
     Ok(expr)
