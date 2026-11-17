@@ -1615,6 +1615,7 @@ Date: <IMF-fixdate>
 | `42703` | `UNDEFINED_COLUMN` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE INDEX` は op 許可リスト外。後述） |
 | `42704` | `UNDEFINED_OBJECT` | 400 | Bad Request | 未登録の ENUM 型名（`create_table`／`alter_table`。Issue #2306）で到達可能。`DROP INDEX` 由来は op 許可リスト外 |
 | `42710` | `DUPLICATE_OBJECT` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`ALTER TABLE ... ADD CONSTRAINT` は SQL 表層専用。後述） |
+| `42712` | `DUPLICATE_ALIAS` | 400 | Bad Request | 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`。SQL-53 (b)・Issue #3297）の公開名重複。NoSQL 表層に該当する op が無く到達しない（網羅性のための射影規則） |
 | `42723` | `DUPLICATE_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（`CREATE FUNCTION` は SQL 表層専用。後述） |
 | `42725` | `AMBIGUOUS_FUNCTION` | 400 | Bad Request | NoSQL 表層の実要求からは到達不能（名前だけの `DROP FUNCTION` の候補曖昧は SQL 表層専用。Issue #1917） |
 | `42803` | `GROUPING_ERROR` | 400 | Bad Request | 式索引の式に集計関数がある（SQL 表層専用。NoSQL の `op` 語彙からは到達しない）。Issue #1647 |

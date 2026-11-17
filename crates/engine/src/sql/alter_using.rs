@@ -456,7 +456,8 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::UndefinedColumn { .. }
         | E::CheckViolation { .. }
         | E::WithCheckOptionViolation
-        | E::AmbiguousColumn { .. } => e,
+        | E::AmbiguousColumn { .. }
+        | E::DuplicateAlias { .. } => e,
         // 式評価では到達しない想定で、文言が値を含みうる残りの variant は固定文言の
         // `Internal` へ丸める（到達しても fail-closed）。
         E::CannotCoerce { .. }
