@@ -46,6 +46,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
         TenantWriteError::TooManyRowsScanned { .. } => ErrorClass::PayloadTooLarge,
         TenantWriteError::TruncateReferencedByForeignKey { .. } => ErrorClass::FeatureNotSupported,
+        // Issue #3327（TABLE-50）: 生成列を持つ表への書き込みの暫定拒否は `0A000`。
+        TenantWriteError::GeneratedColumnWriteUnsupported => ErrorClass::FeatureNotSupported,
         TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
         TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
         TenantWriteError::WithCheckOptionViolation => ErrorClass::WithCheckOptionViolation,
@@ -76,6 +78,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
 /// `crates/engine/tests/error_format.rs` が別途カバーするため、ここでは
 /// 網羅 `match`（本ファイルの `expected_class`）のコンパイル固定が主目的。
 #[test]
+// `GeneratedColumnWriteUnsupported` は計算点が結線されるまでの暫定停止（#3328・#3329 が経路ごとに外す）。
+// tracked: #3328, #3329
 fn tenant_write_error_class_matches_expected_for_constructible_variants() {
     let cases = [
         TenantWriteError::Forbidden,
@@ -92,6 +96,7 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
             table: "p".to_string(),
             referencing_table: "c".to_string(),
         },
+        TenantWriteError::GeneratedColumnWriteUnsupported,
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
         TenantWriteError::ReferentialActionLimitExceeded,

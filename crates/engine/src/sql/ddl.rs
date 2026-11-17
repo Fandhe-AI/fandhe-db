@@ -231,6 +231,43 @@ pub(crate) fn build_table_schema(
     if !validated.unique_constraints.is_empty() {
         schema = schema.with_unique_constraints(validated.unique_constraints.clone());
     }
+    // 生成列（TABLE-50・Issue #3327）。全列がそろった定義に対して式を束縛・検証し、正規描画と
+    // 参照列を各列へ取り付ける（前方参照を許す）。CHECK・UNIQUE・FK・索引が生成列を参照できる状態に
+    // するため CHECK の束縛より前に行う。カタログを参照しないため存在オラクルにならない。
+    if !validated.generated_columns.is_empty() {
+        let names: Vec<String> = validated
+            .generated_columns
+            .iter()
+            .map(|g| g.column.clone())
+            .collect();
+        let mut bound: Vec<(usize, crate::catalog::GeneratedColumnDef)> = Vec::new();
+        for generated in &validated.generated_columns {
+            let Some(index) = schema
+                .columns
+                .iter()
+                .position(|c| c.name == generated.column)
+            else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                });
+            };
+            let Some(column) = schema.columns.get(index) else {
+                continue;
+            };
+            let def = crate::sql::generated_column::bind_generated_column(
+                &generated.expression,
+                column,
+                &schema,
+                &names,
+            )?;
+            bound.push((index, def));
+        }
+        for (index, def) in bound {
+            if let Some(column) = schema.columns.get_mut(index) {
+                column.generated = Some(def);
+            }
+        }
+    }
     // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）。意味論検証（列の存在・型・
     // 禁止要素・正規化の往復一致）は列定義だけを持つスキーマに対して行う（他の
     // `CHECK` を参照する `CHECK` は許可しない）。カタログを参照しないため、
@@ -473,6 +510,14 @@ pub(crate) fn execute_create_temp_table(
     if !table.identity_columns.is_empty() {
         return Err(SqlSurfaceError::feature_not_supported(
             "identity columns are not supported for temporary tables",
+        ));
+    }
+    // 生成列も一時表では未対応（行ストアの確保・セッションの変更・式の束縛より前に拒否する。
+    // TABLE-50・Issue #3327）。
+    // intentional: docs/design/generated-column.md
+    if !table.generated_columns.is_empty() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "generated columns are not supported for temporary tables",
         ));
     }
     let schema = build_table_schema(None, table, schema_limits)?;
@@ -4014,6 +4059,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4210,6 +4256,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4243,6 +4290,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4298,6 +4346,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4329,6 +4378,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),

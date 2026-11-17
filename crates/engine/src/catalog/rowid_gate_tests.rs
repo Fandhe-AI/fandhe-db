@@ -253,10 +253,12 @@ fn table23_allocator_state_survives_reopen() {
     assert_eq!(r.start().raw_for_state(), 4);
 }
 
-/// `v15` 以外で `rowmode:` を持てる版は無い。後続の版が `rowmode:` を持つ場合は
-/// `require_legacy_row_identity_read` の判定（先頭行の一致）も更新が要る。
+/// `rowmode:` を持てる版は v15 と v16（生成列を持つ表。TABLE-50・Issue #3327）だけで、どちらも
+/// `require_legacy_row_identity_read` の判定（先頭行の一致）に掛かる。後続の版が `rowmode:` を持つ場合は
+/// 判定の更新が要る（漏れると採番方式の表を行 API・走査へ通す fail-open になる）。v16 の読み取りゲートの
+/// 検査は `generated_column_catalog_tests` が担う。
 #[test]
-fn table23_only_v15_carries_rowmode_and_is_caught_by_read_gate() {
+fn table23_only_v15_and_v16_carry_rowmode_and_are_caught_by_read_gate() {
     let schema = TableSchema::new(
         "docs",
         vec![ColumnDef::new("kind", ColumnType::Text, false)],
@@ -264,6 +266,18 @@ fn table23_only_v15_carries_rowmode_and_is_caught_by_read_gate() {
     .with_row_identity(RowIdentity::Allocated);
     let bytes = crate::catalog::encode_schema(&schema).expect("encode");
     assert!(bytes.starts_with(b"v15\n"));
+    let mut generated = ColumnDef::new("g", ColumnType::Integer, true);
+    generated.generated = Some(crate::catalog::GeneratedColumnDef {
+        expression: "1 + 1".to_string(),
+        referenced_columns: Vec::new(),
+    });
+    let schema = TableSchema::new(
+        "docs",
+        vec![ColumnDef::new("kind", ColumnType::Text, false), generated],
+    )
+    .with_row_identity(RowIdentity::Allocated);
+    let bytes = crate::catalog::encode_schema(&schema).expect("encode");
+    assert!(bytes.starts_with(b"v16\n"));
 }
 
 /// 採番方式の親を `id` で参照する FK は、DDL 段で `0A000` の固定文言により拒否される

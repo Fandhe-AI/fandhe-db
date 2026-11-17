@@ -25,9 +25,10 @@ const BIG: &str = "big";
 const MIB: usize = 1024 * 1024;
 
 fn schema() -> TableSchema {
-    let col = |name: &str, ty: ColumnType, c: Option<Collation>| ColumnDef {
-        collation: c,
-        ..ColumnDef::new(name, ty, true)
+    let col = |name: &str, ty: ColumnType, c: Option<Collation>| {
+        let mut def = ColumnDef::new(name, ty, true);
+        def.collation = c;
+        def
     };
     TableSchema::new(
         TABLE,

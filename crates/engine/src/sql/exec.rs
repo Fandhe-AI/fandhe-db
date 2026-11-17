@@ -5984,6 +5984,13 @@ pub(crate) fn map_write_error(
             "cannot truncate a table referenced in a foreign key constraint: \
              table \"{referencing_table}\" references \"{table}\""
         )),
+        // 生成列を持つ表への書き込み（計算点が未結線の経路。TABLE-50・Issue #3327）。`_` 節（`XX000`）へ
+        // 丸めず固定文言の `0A000` で返す（表名・テナント・値を含めない）。
+        TenantWriteError::GeneratedColumnWriteUnsupported => {
+            SqlSurfaceError::feature_not_supported(
+                "writes to tables with generated columns are not supported yet",
+            )
+        }
         // `FOREIGN KEY` の参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。
         // Issue #1076）の連鎖が深さ・行数の上限を超えた。`_` 節（`XX000`）へ丸めると
         // クライアントが上限超過をサーバー内部事象と取り違える。

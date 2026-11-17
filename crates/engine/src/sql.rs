@@ -191,6 +191,9 @@ pub(crate) mod describe;
 pub mod dml_from;
 pub(crate) mod embedded_unit;
 pub(crate) mod function_scan;
+pub(crate) mod generated_column;
+#[cfg(test)]
+mod generated_column_tests;
 #[cfg(test)]
 mod identity_column_tests;
 pub mod insert_explain;

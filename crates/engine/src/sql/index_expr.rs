@@ -50,6 +50,9 @@ pub(crate) enum IndexExprSite {
     Key,
     /// 部分索引の `WHERE` 述語。
     Predicate,
+    /// 生成列 `GENERATED ALWAYS AS (<式>) STORED` の式（TABLE-50・Issue #3327）。決定性検査と先読みを
+    /// 共有し文言だけ切り替える。SQLSTATE は呼び出し側（`sql::generated_column`）が `42P17` へ揃える。
+    Generated,
 }
 
 impl IndexExprSite {
@@ -57,36 +60,77 @@ impl IndexExprSite {
         match self {
             Self::Key => MSG_SUBQUERY,
             Self::Predicate => "cannot use subquery in index predicate",
+            Self::Generated => "cannot use subquery in generated column expression",
         }
     }
     fn aggregate(self) -> &'static str {
         match self {
             Self::Key => MSG_AGGREGATE,
             Self::Predicate => "aggregate functions are not allowed in index predicates",
+            Self::Generated => {
+                "aggregate functions are not allowed in generated column expressions"
+            }
         }
     }
     fn window(self) -> &'static str {
         match self {
             Self::Key => MSG_WINDOW,
             Self::Predicate => "window functions are not allowed in index predicates",
+            Self::Generated => "window functions are not allowed in generated column expressions",
         }
     }
     fn srf(self) -> &'static str {
         match self {
             Self::Key => MSG_SRF,
             Self::Predicate => "set-returning functions are not allowed in index predicates",
+            Self::Generated => {
+                "set-returning functions are not allowed in generated column expressions"
+            }
         }
     }
     fn not_immutable(self) -> &'static str {
         match self {
             Self::Key => MSG_NOT_IMMUTABLE,
             Self::Predicate => "functions in index predicate must be marked IMMUTABLE",
+            Self::Generated => "generation expression is not immutable",
+        }
+    }
+    /// 部分クエリ・集計・ウィンドウ・SRF の拒否の SQLSTATE を文脈で切り替える。生成列
+    /// （TABLE-50 (1)・Issue #3327）は常に `42P17`（`InvalidObjectDefinition`）、索引の文脈は
+    /// 従来の `default`（PostgreSQL と同じ分類）。
+    fn rejection(self, detail: &'static str, default: SqlSurfaceError) -> SqlSurfaceError {
+        match self {
+            Self::Generated => SqlSurfaceError::InvalidObjectDefinition { detail },
+            Self::Key | Self::Predicate => default,
+        }
+    }
+    fn distinct_from(self) -> &'static str {
+        match self {
+            Self::Key | Self::Predicate => {
+                "IS [NOT] DISTINCT FROM is not supported in an index expression or predicate"
+            }
+            Self::Generated => {
+                "IS [NOT] DISTINCT FROM is not supported in a generated column expression"
+            }
+        }
+    }
+    fn regex(self) -> &'static str {
+        match self {
+            Self::Key | Self::Predicate => {
+                "regular expression operators are not supported in an index expression or predicate"
+            }
+            Self::Generated => {
+                "regular expression operators are not supported in a generated column expression"
+            }
         }
     }
     fn udf(self) -> &'static str {
         match self {
             Self::Key => MSG_UDF,
             Self::Predicate => "user-defined functions in index predicates are not supported",
+            Self::Generated => {
+                "user-defined functions in generated column expressions are not supported"
+            }
         }
     }
 }
@@ -166,9 +210,12 @@ pub(crate) fn precheck_index_tokens(
                     Some(Token::Keyword(Keyword::Select))
                 ) =>
             {
-                return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: site.subquery().to_string(),
-                });
+                return Err(site.rejection(
+                    site.subquery(),
+                    SqlSurfaceError::FeatureNotSupported {
+                        detail: site.subquery().to_string(),
+                    },
+                ));
             }
             Token::Ident(name)
                 if matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('('))) =>
@@ -186,18 +233,24 @@ pub(crate) fn precheck_index_tokens(
                 let is_window = WindowFunc::from_name(name).is_some();
                 if has_over {
                     if is_agg || is_window {
-                        return Err(SqlSurfaceError::WindowingError {
-                            detail: site.window(),
-                        });
+                        return Err(site.rejection(
+                            site.window(),
+                            SqlSurfaceError::WindowingError {
+                                detail: site.window(),
+                            },
+                        ));
                     }
                     return Err(SqlSurfaceError::unsupported(
                         "OVER is not allowed for a non-window function",
                     ));
                 }
                 if is_agg {
-                    return Err(SqlSurfaceError::GroupingError {
-                        detail: site.aggregate(),
-                    });
+                    return Err(site.rejection(
+                        site.aggregate(),
+                        SqlSurfaceError::GroupingError {
+                            detail: site.aggregate(),
+                        },
+                    ));
                 }
                 if is_window {
                     return Err(SqlSurfaceError::unsupported(
@@ -205,9 +258,12 @@ pub(crate) fn precheck_index_tokens(
                     ));
                 }
                 if is_set_returning_name(&name.to_ascii_lowercase()) {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: site.srf().to_string(),
-                    });
+                    return Err(site.rejection(
+                        site.srf(),
+                        SqlSurfaceError::FeatureNotSupported {
+                            detail: site.srf().to_string(),
+                        },
+                    ));
                 }
             }
             _ => {}
@@ -348,6 +404,17 @@ fn defer_udf(
     }
 }
 
+/// 生成列の式（[`IndexExprSite::Generated`]）の構文段の決定性検査（TABLE-50・Issue #3327）。
+/// [`check_expr_with`] を共有し、組み込み以外の関数（セッション UDF・WASM UDF・カタログ関数）は
+/// 保留せずその場で `42P17` にする（本体の実行が未実装で、書き込みごとの再束縛で評価できず
+/// fail-open になるため。IMMUTABLE な UDF も拒否する。PG との既知の差）。カタログを引かない。
+pub(crate) fn check_generated_expression_determinism(expr: &Expr) -> Result<(), SqlSurfaceError> {
+    let site = IndexExprSite::Generated;
+    check_expr_with(expr, site, &|_, _| {
+        Err(SqlSurfaceError::InvalidObjectDefinition { detail: site.udf() })
+    })
+}
+
 /// 組み込み以外の関数に達したときに呼ばれるフック（`Err` で走査を打ち切る）。
 type UdfHook<'a> = dyn Fn(&str, usize) -> Result<(), SqlSurfaceError> + 'a;
 
@@ -410,14 +477,11 @@ fn check_expr_with(
         }
         // `IS [NOT] DISTINCT FROM` は索引の式・述語では対象外（fail-closed。設計文書の対象外節）。
         Expr::IsDistinctFrom { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail: "IS [NOT] DISTINCT FROM is not supported in an index expression or predicate"
-                .to_string(),
+            detail: site.distinct_from().to_string(),
         }),
         // 正規表現マッチも同様（SQL-55・Issue #1787。fail-closed）。
         Expr::RegexMatch { .. } => Err(SqlSurfaceError::FeatureNotSupported {
-            detail:
-                "regular expression operators are not supported in an index expression or predicate"
-                    .to_string(),
+            detail: site.regex().to_string(),
         }),
         Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => check_expr_with(expr, site, udf),
         Expr::SqlJsonQuery(q) => q

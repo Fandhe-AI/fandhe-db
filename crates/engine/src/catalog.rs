@@ -69,6 +69,8 @@ pub(crate) use dependency::{truncate_closure_in_txn, TruncateClosureError};
 pub(crate) mod materialized;
 // SEQUENCE のカタログ（TABLE-24・Issue #1688）。relation 名前空間を表・ビュー・索引・matview と
 // 共有するため、`index_name_exists_in_txn` を呼ぶ DDL は `sequence::sequence_exists_in_txn` も併記する。
+#[cfg(test)]
+mod generated_column_catalog_tests;
 pub(crate) mod legacy_id_migration;
 pub(crate) mod rowid_alloc;
 #[cfg(test)]
@@ -3812,13 +3814,29 @@ const CATALOG_FORMAT_VERSION_V14: &str = "v14";
 /// 「未知のフォーマットバージョン」として fail-closed に拒否する。
 const CATALOG_FORMAT_VERSION_V15: &str = "v15";
 
+/// カタログ v16（TABLE-50・Issue #3327）。v15 の上位集合（列行 7 フィールド・`pkname:`・
+/// `rowmode:` 行を常に持つ）で、`fks:` セクションの後ろに `gens:<n>`（`n >= 1`）と `n` 行の
+/// `gen:<列名>:<参照列 CSV>:<hex(正規描画)>` を持つ。**生存列のどれかが生成列のスキーマだけ**が
+/// この版で書かれ、生成列の無いスキーマは従来の版のバイト列のまま（正規形の一意性。
+/// `gens:0` の v16 は decode で拒否する）。`rowmode:` は `allocated`／`migrated` のみ
+/// （従来方式の表は生成列を持てない）。v16 を知らない旧バイナリは「未知のフォーマットバージョン」
+/// として fail-closed に拒否する（前方互換は持たない）。
+const CATALOG_FORMAT_VERSION_V16: &str = "v16";
+
+/// 生成列 1 件あたりの正規描画の式のバイト長上限（[`MAX_CHECK_PREDICATE_SQL_LEN`] と同値。
+/// TABLE-50・Issue #3327）。decode 時はアロケーション前に検査する。
+pub(crate) const MAX_GENERATED_EXPRESSION_SQL_LEN: usize = MAX_CHECK_PREDICATE_SQL_LEN;
+
+/// 生成列 1 件が参照できる列数の上限（[`MAX_CHECK_REFERENCED_COLUMNS`] と同値。TABLE-50・Issue #3327）。
+pub(crate) const MAX_GENERATED_REFERENCED_COLUMNS: usize = MAX_CHECK_REFERENCED_COLUMNS;
+
 /// `FOREIGN KEY` を持ちうるカタログフォーマット版の一覧（TABLE-17・TASK-205・
 /// TABLE-22・TASK-233、Issue #907・#1069）。[`referencing_foreign_keys_in_txn`]
 /// が候補行の絞り込みに使う唯一の情報源。**P0**: 新しい FK 保持版を追加する際は
 /// 必ずここへ追記すること——見落とすと参照先側の書き込み検査
 /// （`constraint::enforce_referencing_rows_in_txn`）と `DROP TABLE` の依存検査
 /// （`2BP01`）の双方が fail-open になる（advisor 指摘・codex-review 指摘）。
-const FK_BEARING_FORMAT_VERSIONS: [&str; 8] = [
+const FK_BEARING_FORMAT_VERSIONS: [&str; 9] = [
     CATALOG_FORMAT_VERSION_V8,
     CATALOG_FORMAT_VERSION_V9,
     CATALOG_FORMAT_VERSION_V10,
@@ -3827,6 +3845,7 @@ const FK_BEARING_FORMAT_VERSIONS: [&str; 8] = [
     CATALOG_FORMAT_VERSION_V13,
     CATALOG_FORMAT_VERSION_V14,
     CATALOG_FORMAT_VERSION_V15,
+    CATALOG_FORMAT_VERSION_V16,
 ];
 
 /// 1 テーブルが持てる `CHECK` 制約数の上限（TABLE-16・TASK-204、Issue #906。
@@ -8159,6 +8178,24 @@ pub struct ColumnDef {
     /// 両側で fail-closed に検査する）。比較・ソートへの反映は `sql` 層が行い（#1610・#2190）、
     /// スカラー二次索引の辞書は列の実効照合（起動時 opt-in では索引宣言の照合）順に並ぶ（#2191）。
     pub collation: Option<crate::collation::Collation>,
+    /// 生成列 `GENERATED ALWAYS AS (<式>) STORED` の宣言（TABLE-50・Issue #3327）。`Some` の列は
+    /// `default_expr`・IDENTITY・SEQUENCE を持たない。構築・変更は crate 内（`sql::generated_column` の
+    /// 束縛段とカタログの decode）に限り、Rust API から任意の SQL テキストを差し込ませない
+    /// （CHECK の `with_checks` と同じ作法）。公開するのは読み取り用の
+    /// [`ColumnDef::generation_expression`]・[`ColumnDef::is_generated`] だけ。
+    pub(crate) generated: Option<GeneratedColumnDef>,
+}
+
+/// 生成列の宣言（正規描画と参照列。TABLE-50・Issue #3327）。`expression` は
+/// `sql::check_constraint::render_expr` が描いた正規描画（原文は保存しない）で、永続形は
+/// カタログ v16 の `gen:` 行（[`CATALOG_FORMAT_VERSION_V16`]）。`referenced_columns` は式が
+/// 参照する生存列名（宣言順・重複なし。依存検査と UPDATE の再計算に使う）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratedColumnDef {
+    /// 正規描画の式（長さは [`MAX_GENERATED_EXPRESSION_SQL_LEN`] 以下）。
+    pub(crate) expression: String,
+    /// 参照する列名（宣言順・重複なし。件数は [`MAX_GENERATED_REFERENCED_COLUMNS`] 以下）。
+    pub(crate) referenced_columns: Vec<String>,
 }
 
 impl ColumnDef {
@@ -8170,7 +8207,19 @@ impl ColumnDef {
             default_expr: None,
             fill_value: None,
             collation: None,
+            generated: None,
         }
+    }
+
+    /// 生成列の正規描画（生成列でなければ `None`。TABLE-50・Issue #3327）。読み取り専用で、
+    /// 構築は crate 内に限る（[`GeneratedColumnDef`]）。
+    pub fn generation_expression(&self) -> Option<&str> {
+        self.generated.as_ref().map(|g| g.expression.as_str())
+    }
+
+    /// 生成列かどうか（TABLE-50・Issue #3327）。
+    pub fn is_generated(&self) -> bool {
+        self.generated.is_some()
     }
 
     /// [`ColumnDef::new`] に照合を追加した版（TABLE-28・Issue #1609）。
@@ -9151,6 +9200,16 @@ impl TableSchema {
         self
     }
 
+    /// 列 `name` を式が参照している生成列があるか（TABLE-50・Issue #3327）。参照列の DROP・RENAME・
+    /// 型変更を ALTER 系が拒否する判定に使う。
+    pub(crate) fn column_referenced_by_generated(&self, name: &str) -> bool {
+        self.columns.iter().any(|c| {
+            c.generated
+                .as_ref()
+                .is_some_and(|g| g.referenced_columns.iter().any(|r| r == name))
+        })
+    }
+
     /// 行識別方式（TABLE-23・Issue #2193）。既存の全表は [`RowIdentity::LegacyId`]。
     pub(crate) fn row_identity(&self) -> RowIdentity {
         self.row_identity
@@ -9783,6 +9842,7 @@ fn validate_schema_impl(schema: &TableSchema, require_live: bool) -> Result<()> 
     }
     validate_unique_constraints(schema)?;
     validate_check_constraints(schema)?;
+    validate_generated_columns(schema)?;
     validate_foreign_keys(schema, false)?;
     // 主キーの明示名（Issue #1364）: 主キー宣言を伴い、識別子として妥当で、
     // UNIQUE・CHECK・FOREIGN KEY の実名と衝突しないこと（同じテーブル単位の
@@ -10542,6 +10602,80 @@ fn validate_check_constraints(schema: &TableSchema) -> Result<()> {
     Ok(())
 }
 
+/// 生成列（[`GeneratedColumnDef`]。TABLE-50・Issue #3327）の不変条件検査。encode・decode の双方が
+/// [`validate_schema`] 経由で通す多層防御で、sql 層の束縛をすり抜けた Rust API 経由の構築も
+/// 手書きの不正データもここで fail-closed に拒否する。検査項目: 従来方式の表と併存しない（従来方式は
+/// 生成列を持てない）・ベクトル系の型でない・`DEFAULT`（IDENTITY・SEQUENCE を含む）を持たない・
+/// 式テキストが空でなく上限以内・参照列が上限以内で識別子として妥当・実在する生存列で重複せず、
+/// 生成列（自分自身を含む）でないこと。式の再束縛は行わない（catalog は sql 層に依存しないため。
+/// 保存済みの式の漂流は書き込みの計算点が `XX000` で拒否する）。
+fn validate_generated_columns(schema: &TableSchema) -> Result<()> {
+    for column in &schema.columns {
+        let Some(generated) = &column.generated else {
+            continue;
+        };
+        if schema.row_identity == RowIdentity::LegacyId {
+            return Err(CatalogError::Invalid(format!(
+                "generated column {:?} is not supported on a legacy row identity table",
+                column.name
+            )));
+        }
+        if column.ty.is_vector_family() {
+            return Err(CatalogError::Invalid(format!(
+                "generated column {:?} must not be a vector type",
+                column.name
+            )));
+        }
+        if column.default_expr.is_some() || column.fill_value.is_some() {
+            return Err(CatalogError::Invalid(format!(
+                "generated column {:?} must not declare a DEFAULT",
+                column.name
+            )));
+        }
+        if generated.expression.is_empty()
+            || generated.expression.len() > MAX_GENERATED_EXPRESSION_SQL_LEN
+        {
+            return Err(CatalogError::Invalid(format!(
+                "generated column {:?} expression is empty or exceeds {} bytes",
+                column.name, MAX_GENERATED_EXPRESSION_SQL_LEN
+            )));
+        }
+        if generated.referenced_columns.len() > MAX_GENERATED_REFERENCED_COLUMNS {
+            return Err(CatalogError::Invalid(format!(
+                "generated column {:?} references too many columns",
+                column.name
+            )));
+        }
+        let mut seen: Vec<&str> = Vec::with_capacity(generated.referenced_columns.len());
+        for name in &generated.referenced_columns {
+            validate_identifier(name)?;
+            if seen.contains(&name.as_str()) {
+                return Err(CatalogError::Invalid(format!(
+                    "generated column {:?} references column {:?} twice",
+                    column.name, name
+                )));
+            }
+            seen.push(name.as_str());
+            match schema.columns.iter().find(|c| &c.name == name) {
+                None => {
+                    return Err(CatalogError::Invalid(format!(
+                        "generated column {:?} references unknown column {:?}",
+                        column.name, name
+                    )));
+                }
+                Some(target) if target.generated.is_some() => {
+                    return Err(CatalogError::Invalid(format!(
+                        "generated column {:?} must not reference generated column {:?}",
+                        column.name, name
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 制約名（UNIQUE・CHECK）の既定名接尾辞衝突解決の共通ヘルパー（設計 D2。
 /// Issue #1067）。`candidate` が識別子として妥当（[`validate_identifier`]）かつ
 /// `used` に未登録なら採用し、そうでなければ `_2`・`_3`… の接尾辞を試す
@@ -11001,6 +11135,116 @@ fn check_references_column(schema: &TableSchema, c: &CheckConstraint, column_nam
             Ok(columns) => columns.iter().any(|col| col == column_name),
             Err(_) => true,
         }
+}
+
+/// 生成列セクション（`gens:<N>` 行 + N 行の `gen:<列名>:<参照列 CSV>:<hex(正規描画)>`）を
+/// `out` へ追記する（[`encode_schema_impl`] の v16 分岐が呼ぶ。TABLE-50・Issue #3327）。
+/// 行は生存列の宣言順。正規描画は `:`／改行と衝突しないよう小文字 16 進で符号化する
+/// （[`encode_check_section`] と同じ [`hex_encode_byte`] を共有）。名前・列名は
+/// [`validate_identifier`] により `:`／`,`／改行を含み得ない。
+fn encode_generated_section(out: &mut String, schema: &TableSchema) -> Result<()> {
+    let generated: Vec<(&ColumnDef, &GeneratedColumnDef)> = schema
+        .columns
+        .iter()
+        .filter_map(|c| c.generated.as_ref().map(|g| (c, g)))
+        .collect();
+    out.push_str(&format!("gens:{}\n", generated.len()));
+    for (column, generated) in generated {
+        validate_identifier(&column.name)?;
+        for name in &generated.referenced_columns {
+            validate_identifier(name)?;
+        }
+        out.push_str("gen:");
+        out.push_str(&column.name);
+        out.push(':');
+        out.push_str(&generated.referenced_columns.join(","));
+        out.push(':');
+        for byte in generated.expression.as_bytes() {
+            out.push_str(&hex_encode_byte(*byte));
+        }
+        out.push('\n');
+    }
+    Ok(())
+}
+
+/// カタログ v16 の生成列セクション（[`encode_generated_section`] の逆変換）を構造検証しつつ読み取る
+/// 共有パーサー。[`decode_schema_body`] と軽量パーサー [`catalog_value_references_enum_type`] の両方が
+/// 使い、fail-closed 判定を 1 か所に揃える（[`parse_check_section`] と同じ理由）。`live_columns` は
+/// 件数の上限（生存列数）。
+///
+/// 検証順序（CHECK の D2 と同じ。確保より前に上限を検査する）: `gens:` 行の存在・件数の数値形式・
+/// `1..=live_columns`（0 件は正規形の一意性違反）→ 各行の `gen:` 接頭辞・フィールド数 →
+/// 識別子形状 → 参照列数上限（`Vec` へ積む前）→ hex 長 → hex → UTF-8。生成列名の重複と、
+/// 参照列の実在・生成列どうしの参照の不在は呼び出し元の [`validate_schema`] が判定する。
+/// 返す値は `(生成列名, GeneratedColumnDef)` の列。
+fn parse_generated_section<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    live_columns: usize,
+) -> std::result::Result<Vec<(String, GeneratedColumnDef)>, String> {
+    let gens_line = lines
+        .next()
+        .ok_or_else(|| "catalog value truncated: missing gens line".to_string())?;
+    let count_str = gens_line
+        .strip_prefix("gens:")
+        .ok_or_else(|| format!("malformed gens line: {gens_line:?}"))?;
+    let count: usize = count_str
+        .parse()
+        .map_err(|_| format!("malformed generated column count: {count_str:?}"))?;
+    if count == 0 {
+        return Err("v16 catalog format requires at least one generated column".to_string());
+    }
+    if count > live_columns {
+        return Err(format!("too many generated columns: {count}"));
+    }
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let line = lines
+            .next()
+            .ok_or_else(|| "catalog value truncated: missing gen line".to_string())?;
+        let body = line
+            .strip_prefix("gen:")
+            .ok_or_else(|| format!("malformed gen line: {line:?}"))?;
+        let mut fields = body.split(':');
+        let (Some(name), Some(columns_field), Some(hex_expr), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(format!("malformed gen line: {line:?}"));
+        };
+        validate_identifier(name).map_err(|_| format!("malformed gen line: {line:?}"))?;
+        let mut referenced: Vec<String> = Vec::new();
+        if !columns_field.is_empty() {
+            for (i, column_name) in columns_field.split(',').enumerate() {
+                if i >= MAX_GENERATED_REFERENCED_COLUMNS {
+                    return Err(format!(
+                        "generated column {name:?} references too many columns"
+                    ));
+                }
+                validate_identifier(column_name)
+                    .map_err(|_| format!("malformed gen line: {line:?}"))?;
+                referenced.push(column_name.to_string());
+            }
+        }
+        if hex_expr.len() > MAX_GENERATED_EXPRESSION_SQL_LEN.saturating_mul(2) {
+            return Err(format!(
+                "generated column {name:?} expression exceeds {MAX_GENERATED_EXPRESSION_SQL_LEN} bytes"
+            ));
+        }
+        let expr_bytes = hex_decode(hex_expr)
+            .map_err(|_| format!("generated column {name:?} expression is not valid hex"))?;
+        let expression = String::from_utf8(expr_bytes)
+            .map_err(|_| format!("generated column {name:?} expression is not valid UTF-8"))?;
+        if expression.is_empty() {
+            return Err(format!("generated column {name:?} expression is empty"));
+        }
+        out.push((
+            name.to_string(),
+            GeneratedColumnDef {
+                expression,
+                referenced_columns: referenced,
+            },
+        ));
+    }
+    Ok(out)
 }
 
 /// `CHECK` 制約セクション（`checks:<N>` 行 + N 行の
@@ -11644,7 +11888,9 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
         .any(|c| c.fill_value != c.default_expr);
     // v15 選択条件（TABLE-23・Issue #2193）: 行識別方式が従来方式以外（最優先）。
     let has_row_identity = schema.row_identity != RowIdentity::LegacyId;
-    let v14_shape = has_fill_divergence || has_row_identity;
+    // v16 選択条件（TABLE-50・Issue #3327）: 生存列のどれかが生成列（最優先）。
+    let has_generated = schema.columns.iter().any(|c| c.generated.is_some());
+    let v14_shape = has_fill_divergence || has_row_identity || has_generated;
     let has_unique = !schema.unique_constraints.is_empty();
     let has_check = !schema.checks.is_empty();
     let has_fk = !schema.foreign_keys.is_empty();
@@ -11723,7 +11969,9 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
         // v13（Issue #1364）は v12 と同じ本体に `pk:` 行の直後の `pkname:` 行を
         // 足しただけの上位集合で、同じ出力経路を共有する（UNIQUE・FK の名前は
         // 常に明示形で書く）。
-        out.push_str(if has_row_identity {
+        out.push_str(if has_generated {
+            CATALOG_FORMAT_VERSION_V16
+        } else if has_row_identity {
             CATALOG_FORMAT_VERSION_V15
         } else if has_fill_divergence {
             CATALOG_FORMAT_VERSION_V14
@@ -11817,6 +12065,9 @@ fn encode_schema_impl(schema: &TableSchema, require_live: bool) -> Result<Vec<u8
         }
         encode_check_section(&mut out, &schema.checks)?;
         encode_foreign_key_section_v12(&mut out, &schema.foreign_keys)?;
+        if has_generated {
+            encode_generated_section(&mut out, schema)?;
+        }
     } else if has_named_unique {
         // カタログ v10／v11（TABLE-16/17・TASK-204/205、Issue #1067・#1077）:
         // v8 の上位集合で `uniq:` セクションの `U:` 行が `U:<name>:<cols>` の
@@ -12198,6 +12449,7 @@ fn decode_schema_body(
         V13,
         V14,
         V15,
+        V16,
     }
     let format_version = match version_line {
         CATALOG_FORMAT_VERSION_LINE => FormatVersion::V2,
@@ -12214,6 +12466,7 @@ fn decode_schema_body(
         CATALOG_FORMAT_VERSION_V13 => FormatVersion::V13,
         CATALOG_FORMAT_VERSION_V14 => FormatVersion::V14,
         CATALOG_FORMAT_VERSION_V15 => FormatVersion::V15,
+        CATALOG_FORMAT_VERSION_V16 => FormatVersion::V16,
         other => {
             return Err(CatalogError::Invalid(format!(
                 "unknown catalog format version: {other:?}"
@@ -12242,6 +12495,7 @@ fn decode_schema_body(
             | FormatVersion::V13
             | FormatVersion::V14
             | FormatVersion::V15
+            | FormatVersion::V16
     );
     // `pk:` 行を持つのは v4〜v13（v4 は非空必須、v5〜v12 は空を「主キー
     // なし」として許容する）。
@@ -12259,6 +12513,7 @@ fn decode_schema_body(
             | FormatVersion::V13
             | FormatVersion::V14
             | FormatVersion::V15
+            | FormatVersion::V16
     );
 
     let cols_line = lines.next().ok_or_else(|| {
@@ -12321,20 +12576,23 @@ fn decode_schema_body(
     // v14（Issue #1627）は `pkname:` を常に持ち、空本体を許す。
     let primary_key_name: Option<String> = if matches!(
         format_version,
-        FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15
+        FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15 | FormatVersion::V16
     ) {
         parse_primary_key_name_line(
             &mut lines,
             primary_key.as_deref(),
             Some(table_name),
-            matches!(format_version, FormatVersion::V14 | FormatVersion::V15),
+            matches!(
+                format_version,
+                FormatVersion::V14 | FormatVersion::V15 | FormatVersion::V16
+            ),
         )
         .map_err(CatalogError::Invalid)?
     } else {
         None
     };
     // v15 専用: `pkname:` 行の直後の `rowmode:` 行（TABLE-23・Issue #2193）。
-    let row_identity = if format_version == FormatVersion::V15 {
+    let row_identity = if matches!(format_version, FormatVersion::V15 | FormatVersion::V16) {
         parse_row_mode_line(&mut lines).map_err(CatalogError::Invalid)?
     } else {
         RowIdentity::LegacyId
@@ -12394,7 +12652,10 @@ fn decode_schema_body(
             };
         // v14（Issue #1627）は 7 番目に読み出し時補完値 `fill` を必須で持つ。
         let fill_field =
-            if matches!(format_version, FormatVersion::V14 | FormatVersion::V15) {
+            if matches!(
+                format_version,
+                FormatVersion::V14 | FormatVersion::V15 | FormatVersion::V16
+            ) {
                 Some(fields.next().ok_or_else(|| {
                     CatalogError::Invalid(format!("malformed column line: {line:?}"))
                 })?)
@@ -12557,13 +12818,15 @@ fn decode_schema_body(
             .collect(),
         // v12（設計 F4・Issue #1069）は名前付き FK の有無のみで選ばれる形式で
         // あり UNIQUE の有無とは独立なため、0 件を許容する（`allow_empty = true`）。
-        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15 => {
-            parse_unique_section(&mut lines, true, true)
-                .map_err(CatalogError::Invalid)?
-                .into_iter()
-                .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
-                .collect()
-        }
+        FormatVersion::V12
+        | FormatVersion::V13
+        | FormatVersion::V14
+        | FormatVersion::V15
+        | FormatVersion::V16 => parse_unique_section(&mut lines, true, true)
+            .map_err(CatalogError::Invalid)?
+            .into_iter()
+            .map(|(name, cols)| UniqueConstraint::with_name(name.unwrap_or_default(), cols))
+            .collect(),
         _ => Vec::new(),
     };
     // v7 専用の `checks:` セクション（TABLE-16・TASK-204、Issue #906）。構造は
@@ -12578,7 +12841,8 @@ fn decode_schema_body(
         | FormatVersion::V12
         | FormatVersion::V13
         | FormatVersion::V14
-        | FormatVersion::V15 => {
+        | FormatVersion::V15
+        | FormatVersion::V16 => {
             parse_check_section(&mut lines, format_version != FormatVersion::V7)
                 .map_err(CatalogError::Invalid)?
         }
@@ -12608,10 +12872,18 @@ fn decode_schema_body(
         FormatVersion::V12 => {
             parse_foreign_key_section_v12(&mut lines, false).map_err(CatalogError::Invalid)?
         }
-        FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15 => {
+        FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15 | FormatVersion::V16 => {
             parse_foreign_key_section_v12(&mut lines, true).map_err(CatalogError::Invalid)?
         }
         _ => Vec::new(),
+    };
+    // v16 専用の `gens:` セクション（TABLE-50・Issue #3327）。構造は共有パーサー
+    // [`parse_generated_section`] が検証し、参照列の実在・生成列どうしの参照の不在・
+    // DEFAULT／IDENTITY／ベクトル系との併存は後続の `validate_schema` が担う。
+    let generated: Vec<(String, GeneratedColumnDef)> = if format_version == FormatVersion::V16 {
+        parse_generated_section(&mut lines, columns.len()).map_err(CatalogError::Invalid)?
+    } else {
+        Vec::new()
     };
 
     // 宣言スロット数（v6 は `uniq:` セクションも）を超える残り行は、「末尾の
@@ -12627,6 +12899,20 @@ fn decode_schema_body(
         trailing_seen = true;
     }
 
+    // 生成列の宣言を生存列へ取り付ける（未知列・重複は fail-closed）。
+    for (name, def) in generated {
+        let Some(column) = columns.iter_mut().find(|c| c.name == name) else {
+            return Err(CatalogError::Invalid(format!(
+                "generated column {name:?} is not a live column"
+            )));
+        };
+        if column.generated.is_some() {
+            return Err(CatalogError::Invalid(format!(
+                "duplicate generated column: {name:?}"
+            )));
+        }
+        column.generated = Some(def);
+    }
     let schema = TableSchema::from_parts(
         table_name,
         columns,
@@ -12650,6 +12936,7 @@ fn decode_schema_body(
             | FormatVersion::V13
             | FormatVersion::V14
             | FormatVersion::V15
+            | FormatVersion::V16
     ) {
         schema
     } else {
@@ -12661,7 +12948,11 @@ fn decode_schema_body(
     // 呼んでも安全だが、意図を明示するため分岐する）。
     let schema = if matches!(
         format_version,
-        FormatVersion::V12 | FormatVersion::V13 | FormatVersion::V14 | FormatVersion::V15
+        FormatVersion::V12
+            | FormatVersion::V13
+            | FormatVersion::V14
+            | FormatVersion::V15
+            | FormatVersion::V16
     ) {
         schema
     } else {
@@ -13160,10 +13451,11 @@ fn require_table_defined_read(
     require_row_identity_read(read_txn, table_name, true)
 }
 
-/// v15 のカタログ値が移行済み（`rowmode:migrated`。Issue #2200）かを、全体を decode せず判定する。
-/// v15 の行構成は「版・`cols:`・`pk:`・`pkname:`・`rowmode:`」の順で、`rowmode:` は 5 行目。
-/// 移行済みの表は従来方式と同じく行 API・走査を通すため、読み取りゲートの拒否対象から外す。
-fn v15_row_mode_is_migrated(value: &[u8]) -> bool {
+/// v15・v16 のカタログ値が移行済み（`rowmode:migrated`。Issue #2200）かを、全体を decode せず判定する。
+/// v15・v16 の行構成は「版・`cols:`・`pk:`・`pkname:`・`rowmode:`」の順で、`rowmode:` は 5 行目
+/// （v16 は v15 の上位集合。TABLE-50・Issue #3327）。移行済みの表は従来方式と同じく行 API・走査を
+/// 通すため、読み取りゲートの拒否対象から外す。
+fn row_mode_is_migrated(value: &[u8]) -> bool {
     value.split(|b| *b == b'\n').nth(4) == Some(b"rowmode:migrated".as_slice())
 }
 
@@ -13187,9 +13479,13 @@ fn require_row_identity_read(
         .iter()
         .position(|b| *b == b'\n')
         .unwrap_or(value.len());
+    // v16（生成列を持つ表。TABLE-50・Issue #3327）も v15 と同じく従来方式以外の表だけが書く版。
+    // 版の追随漏れは採番方式の表を行 API・走査へ通す fail-open になる（P0）。
+    let first_line = value.get(..first_line_len);
     if !allow_allocated
-        && value.get(..first_line_len) == Some(CATALOG_FORMAT_VERSION_V15.as_bytes())
-        && !v15_row_mode_is_migrated(value)
+        && (first_line == Some(CATALOG_FORMAT_VERSION_V15.as_bytes())
+            || first_line == Some(CATALOG_FORMAT_VERSION_V16.as_bytes()))
+        && !row_mode_is_migrated(value)
     {
         return Err(row_identity_unsupported_error());
     }
@@ -14122,6 +14418,9 @@ impl Storage {
                     .iter()
                     .any(|u| u.columns().iter().any(|c| c == column_name))
                 || schema_check_references_column(&schema, column_name)
+                // 生成列の式が参照する列も同様に拒否する（TABLE-50・Issue #3327。`2BP01`。
+                // CASCADE による連鎖削除は #3331）。
+                || schema.column_referenced_by_generated(column_name)
                 // `FOREIGN KEY`（TABLE-17・TASK-205、Issue #907）の参照元列も同様に
                 // 拒否する（`DROP CONSTRAINT` を持たないため、制約を黙って消す
                 // 暗黙 cascade を作らない）。参照先側の列は主キー・UNIQUE 制約の
@@ -14292,6 +14591,14 @@ impl Storage {
         }
         if schema.columns.iter().any(|c| c.name == new_name) {
             return Err(CatalogError::ColumnAlreadyExists(new_name.to_string()).into());
+        }
+        // 生成列の式が参照する列の改名は、式の追随（正規描画の書き換えと往復一致の再検証）が入るまで
+        // 拒否する（TABLE-50・Issue #3327 の暫定ガード。式を黙って壊さない fail-closed）。
+        // tracked: #3331
+        if schema.column_referenced_by_generated(old_name) {
+            return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                detail: "renaming a column used by a generated column is not supported".to_string(),
+            }));
         }
         // ビュー定義の追随（TABLE-38、Issue #1621）。拒否・計画失敗時は何も書かない。
         // CATALOG_TABLE のハンドルは解放済み。`schema` は改名前のもの。
@@ -15176,6 +15483,14 @@ impl Storage {
                     "column {column_name:?} type changed concurrently; retry the statement"
                 )));
             }
+            // 生成列の DEFAULT の付け替え・削除は未対応（TABLE-50・Issue #3327。生成列は `DEFAULT` を
+            // 併記できない。PG17 との同等化は #3331）。冪等な no-op 判定より前に拒否する。
+            // tracked: #3331
+            if column.generated.is_some() {
+                return Err(CatalogError::Invalid(
+                    "cannot change the DEFAULT of a generated column".to_string(),
+                ));
+            }
             if column.default_expr == default_expr {
                 // 既に同じ既定値（既定値なしへの DROP を含む）。冪等な no-op。
                 return Ok(AlterApply::Unchanged);
@@ -16038,6 +16353,19 @@ impl Storage {
                 .columns
                 .get_mut(logical_index)
                 .ok_or_else(|| CatalogError::ColumnNotFound(column_name.to_string()))?;
+            // 生成列の式が参照する列の型変更は拒否する（式の再束縛を伴うため。TABLE-50・Issue #3327。
+            // ビューのゲートと同じ固定文言）。生成列自身の型変更は PG17 との同等化まで未対応。
+            // tracked: #3331
+            if old_schema.column_referenced_by_generated(column_name) {
+                return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                    detail: "cannot alter type of a column used by a generated column".to_string(),
+                }));
+            }
+            if column.generated.is_some() {
+                return Err(AlterCheckError::Sql(SqlSurfaceError::FeatureNotSupported {
+                    detail: "ALTER COLUMN TYPE on a generated column is not supported".to_string(),
+                }));
+            }
             // IDENTITY 列の型変更は暗黙 SEQUENCE の型・範囲も変える必要があるが未対応（fail-closed。
             // TABLE-24・Issue #1695）。拡幅の高速経路が DEFAULT を素通しする前に拒否する。
             if column
@@ -18358,6 +18686,9 @@ fn catalog_value_references_any_enum_type(
         // v15（TABLE-23・Issue #2193）は v14 の上位集合で、`pkname:` 行の直後に
         // `rowmode:` 行を持つ（補完値の食い違い 0 件を許す）。
         CATALOG_FORMAT_VERSION_V15 => (true, true),
+        // v16（TABLE-50・Issue #3327）は v15 の上位集合で、`fks:` セクションの後ろに
+        // `gens:` セクションを持つ（下記で `decode_schema_body` と同じ共有パーサーで検証する）。
+        CATALOG_FORMAT_VERSION_V16 => (true, true),
         other => {
             return Err(CatalogError::CorruptSchema(format!(
                 "unknown catalog format version: {other:?}"
@@ -18376,8 +18707,9 @@ fn catalog_value_references_any_enum_type(
     let is_v13 = version_line == CATALOG_FORMAT_VERSION_V13;
     let is_v14 = version_line == CATALOG_FORMAT_VERSION_V14;
     let is_v15 = version_line == CATALOG_FORMAT_VERSION_V15;
-    // v14 と同じ列行・`pkname:` 行の形（v15 は v14 の上位集合）。
-    let v14_shape = is_v14 || is_v15;
+    let is_v16 = version_line == CATALOG_FORMAT_VERSION_V16;
+    // v14 と同じ列行・`pkname:` 行の形（v15・v16 は v14 の上位集合）。
+    let v14_shape = is_v14 || is_v15 || is_v16;
     let has_pk_line = is_v4
         || is_v5
         || is_v6
@@ -18389,7 +18721,8 @@ fn catalog_value_references_any_enum_type(
         || is_v12
         || is_v13
         || is_v14
-        || is_v15;
+        || is_v15
+        || is_v16;
 
     let cols_line = lines.next().ok_or_else(|| {
         CatalogError::CorruptSchema("catalog value truncated: missing cols line".to_string())
@@ -18461,7 +18794,7 @@ fn catalog_value_references_any_enum_type(
     } else {
         None
     };
-    if is_v15 {
+    if is_v15 || is_v16 {
         parse_row_mode_line(&mut lines).map_err(CatalogError::CorruptSchema)?;
     }
 
@@ -18681,6 +19014,15 @@ fn catalog_value_references_any_enum_type(
     } else {
         Vec::new()
     };
+    // v16 の `gens:` セクション（TABLE-50・Issue #3327）。生成列は ENUM 型への新たな依存を
+    // 作らないが、壊れたセクションを本関数だけが「依存なし」に丸めないよう
+    // `decode_schema_body` と同じ共有パーサーで構造を検証し、対象列の実在も検査する。
+    let generated: Vec<(String, GeneratedColumnDef)> = if is_v16 {
+        parse_generated_section(&mut lines, seen_names.len())
+            .map_err(CatalogError::CorruptSchema)?
+    } else {
+        Vec::new()
+    };
 
     // 宣言列数を超える残り行は、`decode_schema_body` と同じく「末尾の空行
     // （トレーリング改行）1 行のみ」を許容しそれ以外は余剰行として拒否する。
@@ -18782,6 +19124,16 @@ fn catalog_value_references_any_enum_type(
                     "constraint name {name:?} is already used by a CHECK constraint on this table"
                 )));
             }
+        }
+    }
+
+    // 生成列の対象列の実在・重複なし（`decode_schema_body` の取り付けと同じ契約。Issue #3327）。
+    let mut generated_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (name, _) in &generated {
+        if !seen_names.contains(name.as_str()) || !generated_seen.insert(name.as_str()) {
+            return Err(CatalogError::CorruptSchema(format!(
+                "generated column {name:?} is unknown or duplicated"
+            )));
         }
     }
 
@@ -27640,7 +27992,9 @@ mod tests {
     fn v14_is_registered_as_foreign_key_bearing_version() {
         assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V14));
         assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V15));
-        assert_eq!(FK_BEARING_FORMAT_VERSIONS.len(), 8);
+        // v16（生成列。TABLE-50・Issue #3327）も FK を持ちうる版として登録されている。
+        assert!(FK_BEARING_FORMAT_VERSIONS.contains(&CATALOG_FORMAT_VERSION_V16));
+        assert_eq!(FK_BEARING_FORMAT_VERSIONS.len(), 9);
     }
 
     fn allocated_schema() -> TableSchema {

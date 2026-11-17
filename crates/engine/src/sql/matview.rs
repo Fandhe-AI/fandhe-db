@@ -106,6 +106,8 @@ pub(crate) fn column_defs_from_view_columns(
             default_expr: None,
             fill_value: None,
             collation: None,
+            // CTAS・マテリアライズドビューの列は通常の列（生成列は引き継がない。PG と同じ。TABLE-50）。
+            generated: None,
         });
     }
     Ok(out)
