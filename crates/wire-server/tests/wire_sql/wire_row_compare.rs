@@ -326,3 +326,97 @@ fn wire_row_in_malformed_carries_sqlstate() {
     expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 }
+/// 行値の `IN`／`NOT IN` の要素の成分 `$n`（Issue #3300・WIRE-12）の拡張クエリ: Describe(S) が相手列の型
+/// （int4）を公告し、値付き Bind → Execute が期待行を返す。同じ名前付き文を別の値で再利用できる。
+#[test]
+fn wire_row_in_extended_query_binds_element_params() {
+    let (core, _guard) = new_core();
+    let users_path = write_user_store_file(&[("alice", "tenant-alice", "pw-alice")]);
+    let addrs = [spawn_server_with_engine(&users_path, core)];
+    let mut stream = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+    insert(&mut stream, 1, "1", "1");
+    insert(&mut stream, 2, "3", "5");
+    insert(&mut stream, 3, "3", "NULL");
+
+    type Case = ([&'static [u8]; 4], Vec<&'static str>, &'static str);
+    let groups: Vec<(&str, &str, Vec<Case>)> = vec![
+        (
+            "ri",
+            "IN",
+            vec![
+                ([b"3", b"5", b"1", b"1"], vec!["1", "2"], "SELECT 2"),
+                ([b"3", b"5", b"0", b"0"], vec!["2"], "SELECT 1"),
+            ],
+        ),
+        (
+            "rn",
+            "NOT IN",
+            vec![([b"1", b"1", b"0", b"0"], vec!["2", "3"], "SELECT 2")],
+        ),
+    ];
+    for (name, op, cases) in groups {
+        let sql = format!(
+            "SELECT id FROM docs WHERE (a, b) {op} (($1, $2), ($3, $4)) ORDER BY id LIMIT 10;"
+        );
+        send(&mut stream, b'P', &parse_msg(name, &sql));
+        expect_kind(&mut stream, b'1');
+        send(&mut stream, b'D', &describe_msg(b'S', name));
+        let body = expect_kind(&mut stream, b't');
+        assert_eq!(param_description_oids(&body), vec![23, 23, 23, 23]);
+        let (k, _) = read_message(&mut stream);
+        assert!(k == b'T' || k == b'n');
+        send(&mut stream, b'S', b"");
+        expect_kind(&mut stream, b'Z');
+
+        for (vals, want, tag) in cases {
+            let values: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(*v)).collect();
+            send(&mut stream, b'B', &bind_msg("", name, &values));
+            send(&mut stream, b'E', &execute_body("", 0));
+            send(&mut stream, b'S', b"");
+            expect_kind(&mut stream, b'2');
+            let (ids, got_tag) = read_until_z(&mut stream);
+            assert_eq!(ids, want, "{op}");
+            assert_eq!(got_tag, tag, "{op}");
+        }
+    }
+}
+
+/// 行値の IN の未対応形（左辺成分の `$n`）は Parse で `42601`、NULL のバインドはリテラル `NULL` 成分と
+/// 同じ SQLSTATE。どちらも ErrorResponse の後に Sync で ReadyForQuery が返り、接続が継続する。
+#[test]
+fn wire_row_in_extended_query_errors_keep_the_connection() {
+    let (core, _guard) = new_core();
+    let users_path = write_user_store_file(&[("alice", "tenant-alice", "pw-alice")]);
+    let addrs = [spawn_server_with_engine(&users_path, core)];
+    let mut stream = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+    insert(&mut stream, 1, "1", "1");
+
+    send(
+        &mut stream,
+        b'P',
+        &parse_msg("", "SELECT id FROM docs WHERE ($1, $2) IN ((a, b)) LIMIT 5"),
+    );
+    send(&mut stream, b'S', b"");
+    let body = expect_kind(&mut stream, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("42601"));
+    expect_kind(&mut stream, b'Z');
+
+    send(
+        &mut stream,
+        b'P',
+        &parse_msg("", "SELECT id FROM docs WHERE (a, b) IN (($1, $2)) LIMIT 5"),
+    );
+    send(&mut stream, b'B', &bind_msg("", "", &[None, Some(b"5")]));
+    send(&mut stream, b'E', &execute_body("", 0));
+    send(&mut stream, b'S', b"");
+    expect_kind(&mut stream, b'1');
+    let body = expect_kind(&mut stream, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("42703"));
+    expect_kind(&mut stream, b'Z');
+
+    expect_ids(
+        &mut stream,
+        "SELECT id FROM docs WHERE (a, b) IN ((1, 1)) ORDER BY id LIMIT 10;",
+        &["1"],
+    );
+}
