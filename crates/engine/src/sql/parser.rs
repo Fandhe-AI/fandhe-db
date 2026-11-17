@@ -4341,6 +4341,11 @@ pub(crate) fn fill_omitted_columns(
         if is_provided {
             continue;
         }
+        // 生成列（TABLE-50・Issue #3328）は印も DEFAULT も付けずに飛ばす。値は書き込み txn 内で
+        // 行の通常列が確定した後に計算される（`tenant` の計算点。NOT NULL の生成列も計算後に検査する）。
+        if column.generated.is_some() {
+            continue;
+        }
         match &column.default_expr {
             Some(ColumnDefault::Sequence(_) | ColumnDefault::Identity { .. }) => {
                 // 採番は書き込み txn 内（台帳照合の後）で行う。仮値 `Null` を置いて印だけ運ぶ
@@ -4532,6 +4537,13 @@ pub(crate) fn bind_column_default(
 /// スキーマだけで決まり、テナントの状態・SEQUENCE カタログを引かない（存在オラクルにならない）。
 /// COPY は PostgreSQL と同じく IDENTITY 列へ入力値をそのまま書くため呼ばない。
 pub(crate) fn reject_generated_always_value(column: &ColumnDef) -> Result<(), SqlSurfaceError> {
+    // 生成列（TABLE-50・Issue #3328）への値の指定も同じ `428C9`（`DEFAULT` だけが受理される）。
+    // 7 つの束縛経路がこの 1 か所を共有する。
+    if column.generated.is_some() {
+        return Err(SqlSurfaceError::GeneratedAlways {
+            column: column.name.clone(),
+        });
+    }
     if column
         .default_expr
         .as_ref()
@@ -5267,6 +5279,11 @@ pub(crate) fn bind_set_assignments(
         // `SET col = DEFAULT`（SQL-50・Issue #1746）。GENERATED ALWAYS の判定より前に解決し、
         // IDENTITY／SEQUENCE／時刻関数の DEFAULT は `bind_set_default` が `0A000` で拒否する。
         if matches!(set_value, crate::sql::allowlist::SetValue::Default) {
+            // 生成列への `DEFAULT` は受理して何も代入しない（式は決定的で、参照列が変わる行では
+            // 計算点が再計算し、変わらない行では値が同じ。TABLE-50・Issue #3328）。
+            if column.generated.is_some() {
+                continue;
+            }
             bound_exprs.push((
                 col_idx,
                 crate::sql::set_expr::bind_set_default(&schema.name, name, column)?,

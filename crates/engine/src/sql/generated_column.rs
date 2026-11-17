@@ -10,13 +10,17 @@
 //!   全列がそろったスキーマに対して各生成列の式を束縛・検証し、正規描画と参照列を持つ
 //!   `catalog::GeneratedColumnDef` を返す。保存するのは正規描画だけで原文は保存しない。
 //!
-//! 計算（書き込み時の評価）は本モジュールの責務外（Issue #3328 以降）。本 Issue の間は生成列を持つ表への
-//! 書き込みを `constraint` の検査点が固定文言の `0A000` で拒否する。
+//! 書き込み時の計算（Issue #3328）: [`GeneratedComputeScope`]（SQL 表層の入口だけが張る「結線済み」の
+//! 宣言。許可リスト方式で、張り忘れは `0A000` に倒れる）、[`CompiledGeneratedColumns`]（1 文に 1 回だけ
+//! 保存式を再解析・再束縛する単一の計算器。`tenant` の INSERT・UPDATE・UPSERT の計算点が呼ぶ）、
+//! 検査点の照合（`constraint::enforce_row_constraints_impl` が [`CompiledGeneratedColumns::verify_row`] を呼ぶ）。
+//! 結線していない経路（COPY・NoSQL・ビュー・トリガ・FK の参照アクション等。Issue #3329）は固定文言の
+//! `0A000` のまま拒否する。
 //!
 //! 判定表（SQLSTATE）と PostgreSQL との差は `docs/design/generated-column.md` を参照する。
 
 use crate::catalog::{
-    ColumnDef, GeneratedColumnDef, TableSchema, MAX_GENERATED_EXPRESSION_SQL_LEN,
+    CatalogError, ColumnDef, GeneratedColumnDef, TableSchema, MAX_GENERATED_EXPRESSION_SQL_LEN,
     MAX_GENERATED_REFERENCED_COLUMNS,
 };
 use crate::sql::allowlist::SqlSurfaceError;
@@ -173,4 +177,236 @@ pub(crate) fn bind_generated_column(
         expression: rendered,
         referenced_columns,
     })
+}
+type WriteError = crate::tenant::TenantWriteError;
+
+thread_local! {
+    /// 生成列の計算点が結線された SQL 表層の書き込み区間の対象表（`tenant` に渡る表名と同じ文字列）。
+    /// `None` は結線済みの区間の外（既定。生成列を持つ表への書き込みは `0A000`）。
+    static WIRED_TABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 生成列の計算点が結線済みであることを宣言する RAII ガード（Issue #3328）。`core` の SQL 表層の入口
+/// （INSERT・UPDATE・UPSERT の各形）だけが、対象表名を指定して張る。COPY・NoSQL・PL/pgSQL・トリガの
+/// 書き込みは張らないため、共有の書き込み関数へ到達しても [`write_wired`] が偽になり `0A000` に倒れる
+/// （`RowPolicyWrite` と違い既定が拒否側。張り忘れは fail-closed）。drop で直前の状態へ戻す。
+pub(crate) struct GeneratedComputeScope {
+    prev: Option<String>,
+}
+
+impl GeneratedComputeScope {
+    /// 表 `table` への書き込み区間を結線済みとして張る。
+    pub(crate) fn enter(table: &str) -> Self {
+        Self {
+            prev: WIRED_TABLE.with(|c| c.replace(Some(table.to_string()))),
+        }
+    }
+
+    /// 入れ子の書き込み（トリガ関数・PL/pgSQL の DML）が結線済みを継承しないよう、一時的に外す。
+    pub(crate) fn suspend() -> Self {
+        Self {
+            prev: WIRED_TABLE.with(|c| c.replace(None)),
+        }
+    }
+}
+
+impl Drop for GeneratedComputeScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        WIRED_TABLE.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// 表 `table` への書き込みが結線済みの SQL 表層の区間にあるか。結線済みの区間の対象表と一致し、
+/// かつビュー経由の書き込み区間の外であることが条件（ビュー・INSTEAD OF は Issue #3329）。
+pub(crate) fn write_wired(table: &str) -> bool {
+    WIRED_TABLE.with(|c| c.borrow().as_deref() == Some(table))
+        && crate::sql::view_write_scope::current_view_name().is_none()
+}
+
+/// 書き込み先の表の生成列の保存式を束縛した計算器（1 文に 1 回だけ作る。行ループの外）。
+pub(crate) struct CompiledGeneratedColumns {
+    cols: Vec<GenCol>,
+    /// 生成列を nullable に読み替えた作業用スキーマ（NOT NULL の生成列の仮値 NULL を含む行の符号化・走査に使う）。
+    scratch: TableSchema,
+}
+
+struct GenCol {
+    idx: usize,
+    name: String,
+    nullable: bool,
+    /// `None` は式全体が裸の `NULL`（束縛を省いた定数 NULL）。
+    set: Option<crate::sql::set_expr::BoundSetExpr>,
+    refs: Vec<usize>,
+}
+
+fn corrupt() -> WriteError {
+    WriteError::Catalog(CatalogError::CorruptSchema(
+        "generated column definition is corrupt".to_string(),
+    ))
+}
+
+impl CompiledGeneratedColumns {
+    /// 生成列が無ければ `None`。結線済みでなければ `0A000`（`GeneratedColumnWriteUnsupported`）。
+    /// 保存式の再解析・再束縛・参照列の解決のどれかが失敗した（カタログ漂流）場合は `XX000`
+    /// （`CorruptSchema`・固定文言）で拒否する。
+    pub(crate) fn for_write(schema: &TableSchema, table: &str) -> Result<Option<Self>, WriteError> {
+        if !schema.columns.iter().any(|c| c.generated.is_some()) {
+            return Ok(None);
+        }
+        if !write_wired(table) {
+            return Err(WriteError::GeneratedColumnWriteUnsupported);
+        }
+        Self::compile(schema).map(Some)
+    }
+
+    /// 結線の判定なしで束縛する（検査点の照合段が使う）。生成列が無ければ `None`。
+    pub(crate) fn compile_any(schema: &TableSchema) -> Result<Option<Self>, WriteError> {
+        if !schema.columns.iter().any(|c| c.generated.is_some()) {
+            return Ok(None);
+        }
+        Self::compile(schema).map(Some)
+    }
+
+    fn compile(schema: &TableSchema) -> Result<Self, WriteError> {
+        let mut cols = Vec::new();
+        let mut scratch = schema.clone();
+        for (idx, column) in schema.columns.iter().enumerate() {
+            let Some(generated) = &column.generated else {
+                continue;
+            };
+            let expr =
+                crate::sql::allowlist::parse_generated_expression_text(&generated.expression)
+                    .map_err(|_| corrupt())?;
+            let set = if matches!(expr, Expr::Null) {
+                None
+            } else {
+                Some(
+                    crate::sql::set_expr::bind_set_expr(&column.name, &expr, column, schema)
+                        .map_err(|_| corrupt())?,
+                )
+            };
+            let mut refs = Vec::new();
+            for name in &generated.referenced_columns {
+                let i = schema
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .ok_or_else(corrupt)?;
+                refs.push(i);
+            }
+            if let Some(c) = scratch.columns.get_mut(idx) {
+                c.nullable = true;
+            }
+            cols.push(GenCol {
+                idx,
+                name: column.name.clone(),
+                nullable: column.nullable,
+                set,
+                refs,
+            });
+        }
+        Ok(Self { cols, scratch })
+    }
+
+    /// 変更された列 `changed` に依存して再計算が要る生成列の位置（生成列自身が `changed` に含まれる場合も含む）。
+    pub(crate) fn affected(&self, changed: &[usize]) -> Vec<usize> {
+        self.cols
+            .iter()
+            .filter(|c| changed.contains(&c.idx) || c.refs.iter().any(|r| changed.contains(r)))
+            .map(|c| c.idx)
+            .collect()
+    }
+
+    /// 行の通常列（`scalars`）から、`only`（`None` は全生成列）の生成列を評価して `(列位置, 値)` を返す。
+    fn eval_into(
+        &self,
+        id: u64,
+        embedding: &[f32],
+        scalars: &[Option<crate::row_codec::ScalarRef<'_>>],
+        only: Option<&[usize]>,
+    ) -> Result<Vec<(usize, crate::row_codec::Value)>, WriteError> {
+        let mut out = Vec::with_capacity(self.cols.len());
+        for col in &self.cols {
+            if let Some(only) = only {
+                if !only.contains(&col.idx) {
+                    continue;
+                }
+            }
+            let value = match &col.set {
+                None => {
+                    if !col.nullable {
+                        return Err(WriteError::SetExpressionEvaluationFailed(
+                            SqlSurfaceError::not_null_violation(col.name.clone()),
+                        ));
+                    }
+                    crate::row_codec::Value::Null
+                }
+                Some(set) => {
+                    crate::sql::set_expr::eval_set_expr_to_value(set, id, embedding, scalars)
+                        .map_err(WriteError::SetExpressionEvaluationFailed)?
+                }
+            };
+            out.push((col.idx, value));
+        }
+        Ok(out)
+    }
+
+    /// 符号化済みの行 `metadata` から生成列を評価する（UPDATE が使う）。
+    pub(crate) fn compute_from_metadata(
+        &self,
+        id: u64,
+        embedding: &[f32],
+        metadata: &[u8],
+        only: Option<&[usize]>,
+    ) -> Result<Vec<(usize, crate::row_codec::Value)>, WriteError> {
+        let scalars = crate::row_codec::scan_scalar_columns(&self.scratch, metadata)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        self.eval_into(id, embedding, &scalars, only)
+    }
+
+    /// 値の列 `values`（スキーマ幅）の生成列の位置を、通常列から計算した値で上書きする（INSERT・UPSERT が使う）。
+    /// `only` が `Some` のときはその位置だけ再計算する。
+    pub(crate) fn compute_values(
+        &self,
+        id: u64,
+        embedding: &[f32],
+        values: &mut [crate::row_codec::Value],
+        only: Option<&[usize]>,
+    ) -> Result<(), WriteError> {
+        let buf = crate::row_codec::encode_scalar_columns(&self.scratch, values)
+            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+        let computed = self.compute_from_metadata(id, embedding, &buf, only)?;
+        for (idx, v) in computed {
+            let slot = values.get_mut(idx).ok_or_else(corrupt)?;
+            *slot = v;
+        }
+        Ok(())
+    }
+
+    /// 書き込んだ行の生成列が式の再計算結果と一致することを確かめる（検査点の多層防御）。
+    /// 比較は `Value` の等値ではなく符号化バイトで行う（NaN・-0.0 を誤検出しない）。不一致は `XX000`。
+    pub(crate) fn verify_row(
+        &self,
+        id: u64,
+        embedding: &[f32],
+        metadata: &[u8],
+    ) -> Result<(), WriteError> {
+        let scalars = crate::row_codec::scan_scalar_columns(&self.scratch, metadata)
+            .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+        let computed = self.eval_into(id, embedding, &scalars, None)?;
+        let overrides: Vec<(usize, &crate::row_codec::Value)> =
+            computed.iter().map(|(i, v)| (*i, v)).collect();
+        let expected =
+            crate::row_codec::merge_encode_scalar_columns(&self.scratch, &scalars, &overrides)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+        let stored = crate::row_codec::merge_encode_scalar_columns(&self.scratch, &scalars, &[])
+            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+        if expected != stored {
+            return Err(WriteError::Catalog(CatalogError::CorruptSchema(
+                "generated column value does not match its expression".to_string(),
+            )));
+        }
+        Ok(())
+    }
 }

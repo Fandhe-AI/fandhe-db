@@ -21222,6 +21222,10 @@ impl EngineCore {
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
         let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。ファイル形は結線しない
+        // （Issue #3329）ため張らず、生成列を持つ表への書き込みは `0A000` のまま。
+        let _generated_scope = (!matches!(bound, crate::sql::parser::BoundInsertForm::File(_)))
+            .then(|| crate::sql::generated_column::GeneratedComputeScope::enter(&stmt.table_name));
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
                 crate::sql::exec::execute_insert_with_schema_in(
@@ -21334,6 +21338,9 @@ impl EngineCore {
         self.reject_index_derived_conflict_constraint(&stmt.table_name, stmt.on_conflict.as_ref())?;
         let _sparsevec_limits_scope = self.sparsevec_limits_scope();
         let bound = crate::sql::parser::bind_insert_form(stmt, &schema)?;
+        // 生成列の計算点が結線された SQL 表層の書き込み区間（Issue #3328）。
+        let _generated_scope = (!matches!(bound, crate::sql::parser::BoundInsertForm::File(_)))
+            .then(|| crate::sql::generated_column::GeneratedComputeScope::enter(&stmt.table_name));
         match bound {
             crate::sql::parser::BoundInsertForm::Row(bound) => {
                 crate::sql::exec::execute_insert_returning_in(
@@ -21704,6 +21711,9 @@ impl EngineCore {
         let limits =
             crate::sql::partitioned::apply_chunk_override(clause, &self.partitioned_dml_limits)?;
         let schema = self.load_table_schema_for_dml(stmt.table_name())?;
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(stmt.table_name());
         // SQL-40・Issue #1968: 各チャンクの write txn 内で権限を再判定する（束縛済みの主体だけ）。
         let recheck = crate::sql::privilege_gate::write::RelationPrivilegeRecheck::for_session(
             session,
@@ -22293,6 +22303,9 @@ impl EngineCore {
         stmt: &crate::sql::allowlist::ValidatedUpdate,
         lookup: &InsertSchemaLookup<'_>,
     ) -> Result<crate::sql::exec::UpdateOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(&stmt.table_name);
         let schema = match lookup.take_schema(&stmt.table_name) {
             Some(schema) => schema,
             None => self
@@ -22363,6 +22376,9 @@ impl EngineCore {
             ValidatedUpdateForm::Single(v) => v.table_name.as_str(),
             ValidatedUpdateForm::Predicate(v) => v.table_name(),
         };
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(table_name);
         let schema = self
             .storage
             .get_table_schema(table_name)
@@ -22533,6 +22549,9 @@ impl EngineCore {
             ValidatedUpdateForm::Predicate(v) => (v.table_name(), v.returning()),
         };
         let schema = self.load_table_schema_for_dml(table_name)?;
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(table_name);
         let returning =
             crate::sql::parser::bind_returning_with_udfs(projection, &schema, returning_udfs)?
                 .ok_or_else(|| crate::sql::allowlist::SqlSurfaceError::Internal {

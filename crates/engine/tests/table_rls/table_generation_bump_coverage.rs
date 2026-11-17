@@ -582,7 +582,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1723（`TenantWriteError::TriggerFailed` の追加）で現行行へ追随（commit 対象は変わらない）。
     // Issue #2277 の追加と Issue #2276 の追随で現行行へ更新（commit 対象は変わらない）。
     // Issue #1953（書き込み経路のデッドライン確認結線）の行追加で追随（旧: 659。commit 対象は変わらない）。
-    ("tenant.rs", 687),
+    ("tenant.rs", 688),
     // Issue #1688（SEQUENCE のカタログ）: `catalog/sequence.rs` の `create_sequence`／`drop_sequence` は
     // SEQUENCE の定義表・状態表・ID カウンタだけを書く。表の行スキーマ（`user_rows/{table}`）も
     // 表のスキーマ世代も変えないため、`bump_table_generation_in_txn` を伴わない。Issue #1690 の
@@ -704,11 +704,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     ("catalog/function.rs", 1599),
     // Issue #1689（ALTER SEQUENCE）: `alter_sequence`／`rename_sequence`（803・842）も同じ表だけを書く
     // （定義 blob の上書き・キーの付け替え・状態行の削除）ため同じ理由で対象外。
-    // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1031・1163 行（Issue #2613・#2614・#2615・#2212・#1726・#3184・#3191・#3192・#3250 で追随）は `#[cfg(test)]` 内の
+    // Issue #1733（INSERT ... SELECT）: `core/insert_select_exec.rs` の 1034・1166 行（Issue #3328・#2613・#2614・#2615・#2212・#1726・#3184・#3191・#3192・#3250 で追随）は `#[cfg(test)]` 内の
     // 明示トランザクション検証で共有 write txn を commit するだけの呼び出し。行の書き込みと世代 bump は
     // 既存の `sql::exec::execute_insert_*_in` 経路が同じ txn 内で済ませており、ここで追加の bump は不要。
-    ("core/insert_select_exec.rs", 1031),
-    ("core/insert_select_exec.rs", 1163),
+    ("core/insert_select_exec.rs", 1034),
+    ("core/insert_select_exec.rs", 1166),
     // Issue #1679（CTAS の台帳）: `core/ctas_exec.rs` の 302 行は `IF NOT EXISTS` の no-op（既存の表がある）で
     // `operation_id` の台帳だけを記録する commit。表の中身・定義は変えないため世代 bump は不要
     // （表を作る commit 側の 235 行は直前で bump 済み）。

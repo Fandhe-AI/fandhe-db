@@ -512,23 +512,25 @@ fn persists_across_reopen_and_roundtrips_through_schema_dump() {
         }
     }
     assert_eq!(dump(&restored, TENANT), first);
-    // 復元後の表も生成列として動作する（書き込みは暫定の `0A000`）。
+    // 復元後の表も生成列として動作する（明示値は `428C9`、省略すれば計算される。Issue #3328）。
     assert_eq!(
         code(
             &restored,
             TENANT,
             "INSERT INTO g (a, g1, name) VALUES (1, 1, 'x')"
         ),
-        "0A000"
+        "428C9"
     );
+    ok(&restored, TENANT, "INSERT INTO g (a, name) VALUES (1, 'x')");
 }
 
-/// 計算点が未結線の間、生成列を持つ表への書き込みは固定文言の `0A000` で拒否され、行・台帳が残らない。
-/// DELETE・TRUNCATE・SELECT は通る。
+/// 計算点が結線されていない経路（ビュー・COPY。SQL の INSERT・UPDATE・UPSERT は Issue #3328 で結線済みで
+/// `table50_generated_column_write` が検証する）は、生成列を持つ表への書き込みを固定文言の `0A000` で拒否し、
+/// 行・台帳が残らない。計算を伴わない文（0 件一致の UPDATE・DELETE・TRUNCATE）は通る。
 #[test]
-// 書き込み経路の暫定停止（SQL 経路は #3328、COPY・ビュー等は #3329 が結線して外す）。
-// tracked: #3328, #3329
-fn writes_to_generated_tables_are_rejected_until_wired() {
+// ビュー・COPY 等の結線（#3329）。
+// tracked: #3329
+fn unwired_writes_to_generated_tables_are_rejected() {
     let (_p, _g, core) = fixture("gen-write-stop");
     ok(
         &core,
@@ -536,19 +538,11 @@ fn writes_to_generated_tables_are_rejected_until_wired() {
         "CREATE TABLE g (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
     );
     ok(&core, TENANT, "CREATE VIEW gv AS SELECT a FROM g");
-    for sql in [
-        "INSERT INTO g (a) VALUES (1)",
-        "INSERT INTO g (a) VALUES (1), (2)",
-        "INSERT INTO g (a, b) VALUES (1, DEFAULT)",
-        "INSERT INTO g (a) SELECT 1",
-        "INSERT INTO g (a) VALUES (1) ON CONFLICT DO NOTHING",
-        "INSERT INTO gv (a) VALUES (1)",
-    ] {
-        assert_eq!(code(&core, TENANT, sql), "0A000", "{sql}");
-        let m = message(&core, TENANT, sql);
-        assert!(!m.contains(TENANT), "{m}");
-        assert!(!m.contains("\"g\""), "{m}");
-    }
+    let sql = "INSERT INTO gv (a) VALUES (1)";
+    assert_eq!(code(&core, TENANT, sql), "0A000", "{sql}");
+    let m = message(&core, TENANT, sql);
+    assert!(!m.contains(TENANT), "{m}");
+    assert!(!m.contains("\"g\""), "{m}");
     // COPY FROM STDIN。
     let policy = ctx(TENANT);
     let session = SessionState::default();
@@ -575,12 +569,6 @@ fn writes_to_generated_tables_are_rejected_until_wired() {
     ok(&core, TENANT, "UPDATE g SET a = 1 WHERE a = 0");
     ok(&core, TENANT, "DELETE FROM g WHERE a = 0");
     ok(&core, TENANT, "TRUNCATE g");
-    // 他テナントでも同じ結果で、拒否の後に別の表への書き込みは通る。
-    assert_eq!(
-        code(&core, OTHER, "INSERT INTO g (a) VALUES (1)"),
-        "0A000",
-        "the catalog is shared across tenants, so the rejection is the same"
-    );
 }
 
 /// 参照列の DROP・RENAME は拒否され、参照しない列の変更・生成列自身の改名・表の改名の後も生成式が残る。

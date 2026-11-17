@@ -4,7 +4,7 @@
 //! 宣言の意味論・SQLSTATE の表は engine の `table50_generated_column_create` が確定オラクルとして
 //! 検証済みのため、本ファイルは (1) psql 形（末尾 `;` を付けた単独の simple query）で生成列つきの
 //! `CREATE TABLE` が `CommandComplete` で通ること、(2) 拒否形が `ErrorResponse` の SQLSTATE で返ること、
-//! (3) 計算点が未結線の間、生成列を持つ表への INSERT が `0A000` で返ること、を pg wire 越しに確認する。
+//! (3) INSERT・UPDATE・UPSERT の計算（Issue #3328）と生成列への値の指定の `428C9`、を pg wire 越しに確認する。
 
 use crate::common;
 
@@ -107,11 +107,52 @@ fn rejected_forms_return_sqlstate() {
     read_ready_for_query(&mut stream);
 }
 
-/// 計算点が未結線の間、生成列を持つ表への書き込みは `0A000`。
+/// psql 形（末尾 `;` 付きの単独送信）の INSERT・UPDATE・UPSERT で生成列が計算され、SELECT が計算後の値を返す
+/// （Issue #3328）。
 #[test]
-// 書き込み経路の暫定停止（#3328・#3329 が結線して外す）。
-// tracked: #3328, #3329
-fn insert_into_generated_table_is_rejected_with_0a000() {
+fn insert_update_upsert_compute_the_generated_column() {
+    let (mut stream, _guard) = connect();
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE g (k INTEGER PRIMARY KEY, a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO g (k, a) VALUES (1, 1) USING OPERATION_ID 'wire-gen-1';",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "UPDATE g SET a = 5 WHERE k = 1 USING OPERATION_ID 'wire-gen-2';",
+    );
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO g (k, a) VALUES (1, 7) ON CONFLICT (k) DO UPDATE SET a = EXCLUDED.a USING OPERATION_ID 'wire-gen-3';",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT a, b FROM g;");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("7".to_string()), Some("14".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// 生成列への値の指定は `428C9`。拒否の後も接続は使える。
+#[test]
+fn explicit_value_for_generated_column_is_rejected_with_428c9() {
     let (mut stream, _guard) = connect();
     send_simple_query(
         &mut stream,
@@ -120,10 +161,12 @@ fn insert_into_generated_table_is_rejected_with_0a000() {
     assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
     read_ready_for_query(&mut stream);
 
-    send_simple_query(
-        &mut stream,
-        "INSERT INTO g (a) VALUES (1) USING OPERATION_ID 'wire-gen-1';",
-    );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
-    read_ready_for_query(&mut stream);
+    for sql in [
+        "INSERT INTO g (a, b) VALUES (1, 2) USING OPERATION_ID 'wire-gen-4';",
+        "UPDATE g SET b = 1 WHERE a = 1 USING OPERATION_ID 'wire-gen-5';",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "428C9");
+        read_ready_for_query(&mut stream);
+    }
 }

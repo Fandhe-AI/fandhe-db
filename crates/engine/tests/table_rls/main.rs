@@ -142,6 +142,7 @@ mod table45_trigger_partitioned;
 mod table45_trigger_prod_invoker;
 mod table45_trigger_when;
 mod table50_generated_column_create;
+mod table50_generated_column_write;
 mod table_generation_bump_coverage;
 mod tenant_breach;
 mod tenant_isolation;

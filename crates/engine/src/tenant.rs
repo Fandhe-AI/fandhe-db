@@ -459,7 +459,8 @@ pub enum TenantWriteError {
         referencing_table: String,
     },
     /// 生成列（`GENERATED ALWAYS AS (<式>) STORED`。TABLE-50・Issue #3327）を持つ表への行の書き込み。
-    /// 計算点が未結線の間（Issue #3328・#3329 が経路ごとに結線する）、黙って NULL を書かないよう
+    /// 計算点が結線されていない経路（COPY・NoSQL・ビュー・トリガ・FK の参照アクション等。Issue #3329 が経路ごとに
+    /// 結線する。SQL の INSERT・UPDATE・UPSERT は Issue #3328 で結線済み）は、黙って NULL を書かないよう
     /// 単一の検査点（`constraint::enforce_row_constraints_in_txn`。RLS の `WITH CHECK` より前）が返し、
     /// `write_txn` は commit されない（行・台帳・世代・採番とも痕跡ゼロ）。`0A000`
     /// （`FeatureNotSupported`）へ写像する。`Display`／`Debug` は表名・テナント・値を含まない固定文言。
@@ -1590,6 +1591,11 @@ fn named_value_columns<'a>(
         if Some(idx) == vector_idx || matches!(column.ty, crate::catalog::ColumnType::Vector(_)) {
             continue;
         }
+        // 生成列（TABLE-50・Issue #3328）は材料から除く。値は式から導かれ、省略・`DEFAULT` のどちらでも
+        // 同じ文として再送が一致する（RECOVER-11 のポインタ）。生成列の無い表のハッシュはバイト不変。
+        if column.generated.is_some() {
+            continue;
+        }
         if volatile.iter().any(|c| {
             matches!(
                 c,
@@ -1627,6 +1633,10 @@ fn named_expr_columns<'a>(
     })?;
     for (idx, column) in schema.columns.iter().enumerate() {
         if Some(idx) == vector_idx || matches!(column.ty, crate::catalog::ColumnType::Vector(_)) {
+            continue;
+        }
+        // 生成列は材料から除く（[`named_value_columns`] と同じ。Issue #3328）。
+        if column.generated.is_some() {
             continue;
         }
         match volatile.iter().find(|c| c.index() == idx) {
@@ -2185,6 +2195,13 @@ fn insert_typed_row_impl(
         // `WHEN` 付きは `0A000`）。
         let trigger_chain =
             crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?;
+        // 生成列（TABLE-50・Issue #3328）: 結線していない経路・トリガを持つ表は台帳より前に `0A000`
+        // （Issue #3329 が結線する）。束縛は 1 文に 1 回。
+        let generated =
+            crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
+        if generated.is_some() && trigger_chain.is_some() {
+            return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+        }
         // 採番方式の表（TABLE-23・Issue #2199）は呼び出し元の `id` を使わず、内容照合ハッシュの
         // 材料には固定値 0 を使う（rowid は再送前に分からないため。再送判定を決定的に保つ）。
         let allocated = schema.is_allocated();
@@ -2321,6 +2338,16 @@ fn insert_typed_row_impl(
                 allocated || id_omitted || sequence_rows.is_some() || trigger_wrote,
             );
         }
+        // 生成列は行の通常列が確定した後（SEQUENCE の採番・`id` の払い出しの後）に計算する（Issue #3328）。
+        let computed_values: Option<Vec<crate::row_codec::Value>> = match &generated {
+            Some(g) => {
+                let mut v = values.to_vec();
+                g.compute_values(id, embedding, &mut v, None)?;
+                Some(v)
+            }
+            None => None,
+        };
+        let values: &[crate::row_codec::Value] = computed_values.as_deref().unwrap_or(values);
         // 行のエンコードは台帳照合と NOT NULL 検査の後に行う（省略された非 nullable 列の仮値
         // `Null` が、再送判定より先に `22000` を起こさないため。Issue #1629）。
         let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
@@ -2798,6 +2825,12 @@ pub(crate) fn insert_typed_rows_unchecked(
             // `WHEN` 付きは `0A000`）。
             let trigger_chain =
                 crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?;
+            // 生成列（TABLE-50・Issue #3328）: 未結線・トリガ付きは台帳より前に `0A000`。束縛は 1 文に 1 回。
+            let generated =
+                crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
+            if generated.is_some() && trigger_chain.is_some() {
+                return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+            }
             // `id` 省略（Issue #1700。全行一様）は移行済み表だけが受理できる。束縛段の判定を、
             // 書き込み txn 内で取得したスキーマで再確認する（仮値 `id` を書かない fail-closed）。
             if id_omitted && !schema.is_migrated_id() {
@@ -3044,6 +3077,22 @@ pub(crate) fn insert_typed_rows_unchecked(
                     Some(idx) => vector_embedding_slice(&schema, idx, values)?,
                     None => &[],
                 };
+                let row_id = row_ids.get(row_idx).copied().ok_or_else(|| {
+                    TenantWriteError::Catalog(CatalogError::Invalid(
+                        "row id allocation count mismatch".to_string(),
+                    ))
+                })?;
+                // 生成列は行の通常列が確定した後に行ごとに計算する（Issue #3328）。
+                let computed_values: Option<Vec<crate::row_codec::Value>> = match &generated {
+                    Some(g) => {
+                        let mut v = values.to_vec();
+                        g.compute_values(row_id.legacy_id(), embedding, &mut v, None)?;
+                        Some(v)
+                    }
+                    None => None,
+                };
+                let values: &[crate::row_codec::Value] =
+                    computed_values.as_deref().unwrap_or(values);
                 let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
                     .map_err(|e| CatalogError::Invalid(e.to_string()))?;
                 let row = RowInput {
@@ -3052,11 +3101,6 @@ pub(crate) fn insert_typed_rows_unchecked(
                     embedding,
                     metadata: &metadata,
                 };
-                let row_id = row_ids.get(row_idx).copied().ok_or_else(|| {
-                    TenantWriteError::Catalog(CatalogError::Invalid(
-                        "row id allocation count mismatch".to_string(),
-                    ))
-                })?;
                 let key = row_key(ctx.tenant_id(), row_id);
                 let encoded = encode_row(&row)?;
                 insert_unique_row(write_txn, table, &mut row_table, key, encoded.as_slice())?;
@@ -3583,6 +3627,12 @@ fn upsert_typed_rows_impl(
             let (insert_plan, update_plan) =
                 plan_upsert_triggers(write_txn, ctx, table, &schema, action, triggers)?;
             let has_triggers = insert_plan.is_some() || update_plan.is_some();
+            // 生成列（TABLE-50・Issue #3328）: 未結線・トリガ付きは台帳より前に `0A000`。束縛は 1 文に 1 回。
+            let generated =
+                crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
+            if generated.is_some() && has_triggers {
+                return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+            }
             // `RETURNING` 付きの最終値投影はトリガ経路では未結線（INSERT の `RETURNING` と同じ方針）。
             if has_triggers && project.is_some() {
                 return Err(TenantWriteError::TriggerFailed(
@@ -3963,7 +4013,7 @@ fn upsert_typed_rows_impl(
             // `DO UPDATE` で実際に既存行を書き換えた場合のみ、書き換え前の全列値を
             // 積む（新規挿入行は「更新」ではないため対象外）。
             let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
-            for (row_idx, (id, values)) in rows.iter().enumerate() {
+            for (row_idx, (id, orig_values)) in rows.iter().enumerate() {
                 check_interrupt()?;
                 // 新規挿入分岐が使う行 id（採番方式の表は払い出し済みの rowid）。
                 let insert_id: u64 = match &new_row_ids {
@@ -3974,6 +4024,22 @@ fn upsert_typed_rows_impl(
                     })?,
                     None => *id,
                 };
+                // 生成列は提案行の通常列が確定した直後（INSERT 側ポリシー検査・衝突判定・`EXCLUDED` 参照の
+                // いずれより前）に計算する。以降はすべて計算後の提案行を見る（Issue #3328）。
+                let computed_values: Option<Vec<crate::row_codec::Value>> = match &generated {
+                    Some(g) => {
+                        let mut v = orig_values.to_vec();
+                        let proposed_embedding: &[f32] = match vector_idx {
+                            Some(idx) => vector_embedding_slice(&schema, idx, orig_values)?,
+                            None => &[],
+                        };
+                        g.compute_values(insert_id, proposed_embedding, &mut v, None)?;
+                        Some(v)
+                    }
+                    None => None,
+                };
+                let values: &[crate::row_codec::Value] =
+                    computed_values.as_deref().unwrap_or(orig_values);
                 // 提案行への INSERT 側ポリシー検査（RLS-13・Issue #2277）。衝突判定より前。
                 if let Some(checks) = policy_proposed.as_ref() {
                     let proposed_embedding: &[f32] = match vector_idx {
@@ -4183,6 +4249,19 @@ fn upsert_typed_rows_impl(
                                 pre_images
                                     .record(RowId::from_legacy_id(write_id), pre_image_values);
                             }
+                            // 生成列は SET の対象列に依存するものだけ再計算する（Issue #3328）。
+                            let mut merged_values = merged_values;
+                            if let Some(g) = &generated {
+                                let assigned: Vec<usize> =
+                                    assignments.iter().map(|(idx, _)| *idx).collect();
+                                let only = g.affected(&assigned);
+                                g.compute_values(
+                                    write_id,
+                                    &embedding_value,
+                                    &mut merged_values,
+                                    Some(&only),
+                                )?;
+                            }
                             let metadata =
                                 crate::row_codec::encode_scalar_columns(&schema, &merged_values)
                                     .map_err(|e| CatalogError::Invalid(e.to_string()))?;
@@ -4311,8 +4390,16 @@ fn upsert_typed_rows_impl(
                 // は ON UPDATE 参照アクション（Issue #1076）の連鎖起点。
                 if updated > 0 {
                     if let UpsertAction::DoUpdate(assignments, _) = action {
-                        let updated_columns: Vec<usize> =
+                        let mut updated_columns: Vec<usize> =
                             assignments.iter().map(|(idx, _)| *idx).collect();
+                        // SET の対象列に依存して再計算された生成列も変更列として扱う（生成列を参照先とする
+                        // FK の参照先側の検査をすり抜けさせない。Issue #3328）。
+                        if let Some(g) = &generated {
+                            let extra = g.affected(&updated_columns);
+                            updated_columns.extend(extra);
+                            updated_columns.sort_unstable();
+                            updated_columns.dedup();
+                        }
                         crate::constraint::enforce_referencing_rows_in_txn(
                             write_txn,
                             table,
@@ -5375,21 +5462,46 @@ fn merge_row_for_update_set(
     // 結合形 `UPDATE ... FROM`（Issue #1755・SQL-53）が probe 時点で確定した当該行の SET 値。
     // 空なら従来どおり。非空のときは式項と同様に全項を再検証してから merge する。
     row_extra: &[(usize, crate::row_codec::Value)],
+    // 生成列（TABLE-50・Issue #3328）の計算器。`Some` のとき、SET の対象列（式・行ごとの上書き値を含む）に
+    // 依存する生成列だけを、SET を適用した後の行から再計算して書く。
+    generated: Option<&crate::sql::generated_column::CompiledGeneratedColumns>,
 ) -> Result<(Vec<f32>, Vec<u8>), TenantWriteError> {
-    if set_exprs.is_empty() && row_extra.is_empty() {
-        return Ok(merge_row_for_update(schema, existing, assignments)?);
+    let (embedding, metadata) = if set_exprs.is_empty() && row_extra.is_empty() {
+        merge_row_for_update(schema, existing, assignments)?
+    } else {
+        let resolved = resolve_update_set_values(
+            schema,
+            &existing,
+            id,
+            assignments,
+            set_exprs,
+            row_extra,
+            false,
+        )?;
+        validate_set_assignments(schema, &resolved)?;
+        merge_row_for_update(schema, existing, &resolved)?
+    };
+    let Some(generated) = generated else {
+        return Ok((embedding, metadata));
+    };
+    let changed: Vec<usize> = assignments
+        .iter()
+        .map(|(idx, _)| *idx)
+        .chain(set_exprs.iter().map(|(idx, _)| *idx))
+        .chain(row_extra.iter().map(|(idx, _)| *idx))
+        .collect();
+    let only = generated.affected(&changed);
+    if only.is_empty() {
+        return Ok((embedding, metadata));
     }
-    let resolved = resolve_update_set_values(
-        schema,
-        &existing,
-        id,
-        assignments,
-        set_exprs,
-        row_extra,
-        false,
-    )?;
-    validate_set_assignments(schema, &resolved)?;
-    Ok(merge_row_for_update(schema, existing, &resolved)?)
+    let computed = generated.compute_from_metadata(id, &embedding, &metadata, Some(&only))?;
+    let overrides: Vec<(usize, &crate::row_codec::Value)> =
+        computed.iter().map(|(i, v)| (*i, v)).collect();
+    let scanned = crate::row_codec::scan_scalar_columns(schema, &metadata)
+        .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
+    let metadata = crate::row_codec::merge_encode_scalar_columns(schema, &scanned, &overrides)
+        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+    Ok((embedding, metadata))
 }
 
 /// UPDATE の SET 項（リテラル・式・行ごとの上書き値）を、更新前の行に対して評価して
@@ -5627,6 +5739,12 @@ fn update_row_columns_impl(
                 &[],
                 triggers,
             )?;
+            // 生成列（TABLE-50・Issue #3328）: 未結線・トリガ付きは台帳より前に `0A000`。
+            let generated =
+                crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
+            if generated.is_some() && trigger_plan.is_some() {
+                return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
+            }
 
             // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
             // index でソートして宣言順非依存にする（下記コメント参照）。列 index の
@@ -5916,8 +6034,15 @@ fn update_row_columns_impl(
                             pre_images.record(RowId::from_legacy_id(id), old_values);
                         }
                     }
-                    let (embedding, metadata) =
-                        merge_row_for_update_set(&schema, row, id, assignments, set_exprs, &[])?;
+                    let (embedding, metadata) = merge_row_for_update_set(
+                        &schema,
+                        row,
+                        id,
+                        assignments,
+                        set_exprs,
+                        &[],
+                        generated.as_ref(),
+                    )?;
                     let row_input = RowInput {
                         tenant_id: ctx.tenant_id(),
                         visibility,
@@ -5972,11 +6097,18 @@ fn update_row_columns_impl(
                 // このテーブルを参照先とする `FOREIGN KEY` の参照先側（TABLE-17・
                 // TASK-205、Issue #907。SET 列が主キー・UNIQUE 構成列を含む場合のみ
                 // 検査。永続キー索引の差分は直前の同期をそのまま再利用する）。
-                let updated_columns: Vec<usize> = assignments
+                let mut updated_columns: Vec<usize> = assignments
                     .iter()
                     .map(|(idx, _)| *idx)
                     .chain(set_exprs.iter().map(|(idx, _)| *idx))
                     .collect();
+                // 再計算された生成列も変更列として扱う（Issue #3328）。
+                if let Some(g) = &generated {
+                    let extra = g.affected(&updated_columns);
+                    updated_columns.extend(extra);
+                    updated_columns.sort_unstable();
+                    updated_columns.dedup();
+                }
                 crate::constraint::enforce_referencing_rows_in_txn(
                     write_txn,
                     table,
@@ -8059,6 +8191,10 @@ fn apply_predicate_update_in_txn<E>(
             "internal: per-row SET values do not match the candidate rows".to_string(),
         )));
     }
+    // 生成列（TABLE-50・Issue #3328）: 未結線の経路は `0A000`。束縛は 1 文（チャンク）に 1 回。
+    let generated =
+        crate::sql::generated_column::CompiledGeneratedColumns::for_write(schema, table)
+            .map_err(dml_write_err)?;
     // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
     let mut pre_images = crate::constraint::UpdatedKeyPreImages::new();
     let mut applied = 0usize;
@@ -8124,9 +8260,16 @@ fn apply_predicate_update_in_txn<E>(
             // [`merge_row_for_update`] へ委譲済み（Issue #996。エラー分類・
             // 借用版デコードによるピーク確保回避・SET 列重複時の意味論
             // （先勝ち）などの設計判断は同関数のドキュメント参照）。
-            let (embedding_value, metadata) =
-                merge_row_for_update_set(schema, existing, *id, assignments, set_exprs, row_extra)
-                    .map_err(dml_write_err)?;
+            let (embedding_value, metadata) = merge_row_for_update_set(
+                schema,
+                existing,
+                *id,
+                assignments,
+                set_exprs,
+                row_extra,
+                generated.as_ref(),
+            )
+            .map_err(dml_write_err)?;
             let row = RowInput {
                 tenant_id: ctx.tenant_id(),
                 // 既存行の可視性を保持する（SET で触れない列と同じ扱い）。
@@ -8194,8 +8337,16 @@ fn apply_predicate_update_in_txn<E>(
                     .flat_map(|row| row.iter().map(|(idx, _)| *idx)),
             )
             .collect();
+        // 再計算された生成列も変更列として扱う（生成列を参照先とする FK の参照先側の検査を
+        // すり抜けさせない。Issue #3328）。
+        let mut fold_columns = row_overrides.is_some();
+        if let Some(g) = &generated {
+            let extra = g.affected(&updated_columns);
+            fold_columns |= !extra.is_empty();
+            updated_columns.extend(extra);
+        }
         // 行ごとの上書き値由来の重複列を畳む（FK 検査の入力を一意にする。安定ソート）。
-        if row_overrides.is_some() {
+        if fold_columns {
             updated_columns.sort();
             updated_columns.dedup();
         }
