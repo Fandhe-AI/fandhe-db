@@ -124,6 +124,7 @@ mod sql62_derived_table_join;
 mod sql62_derived_table_syntax;
 mod sql62_lateral_bind;
 mod sql62_lateral_exec;
+mod sql62_lateral_left;
 mod sql63_data_modifying_cte_exec;
 mod sql63_data_modifying_cte_semantics;
 mod sql63_data_modifying_cte_syntax;

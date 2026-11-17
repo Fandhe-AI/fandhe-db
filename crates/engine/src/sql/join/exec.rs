@@ -50,19 +50,6 @@ impl Tuples {
     }
 }
 
-impl Tuples {
-    /// フラット配置のスロット列から組み立てる（LATERAL の段。`data` の長さが `n` の倍数でなければ
-    /// 内部エラー＝fail-closed）。
-    pub(super) fn from_parts(n: usize, data: Vec<Option<u32>>) -> Result<Self, SqlSurfaceError> {
-        if n == 0 || !data.len().is_multiple_of(n) {
-            return Err(SqlSurfaceError::Internal {
-                detail: "JOIN tuple buffer length mismatch".to_string(),
-            });
-        }
-        Ok(Self { n, data })
-    }
-}
-
 #[cfg(test)]
 impl Tuples {
     /// フラット配置のスロット列から組み立てる（テスト用）。長さが `n` の倍数でなければ
@@ -94,7 +81,7 @@ pub(super) fn to_u32(v: usize, what: &str) -> Result<u32, SqlSurfaceError> {
 /// 結合キーを持たない（`Ok(None)`）——ビルド・プローブいずれからも除外する
 /// （Issue #925 §2.4。NULL は決して一致しない）。`row` が `None`（NULL 補完された
 /// relation）のときもキーを持たない。
-fn extract_key(
+pub(super) fn extract_key(
     row: Option<&ResultRow>,
     keys: &[StepKey],
     pos_of: impl Fn(&StepKey) -> usize,
@@ -174,15 +161,10 @@ pub(super) fn run_joins_lateral(
         let rt = lateral.get(new_rel).and_then(Option::as_ref);
         match (rt, step.lateral.is_some()) {
             (Some(rt), true) => {
-                let (tuples, arena) =
-                    super::lateral::lateral_step(sides, rt, new_rel, &acc, budget, limits, stop)?;
-                let slot = sides
-                    .get_mut(new_rel)
-                    .ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "JOIN relation index out of range".to_string(),
-                    })?;
-                *slot = arena;
-                acc = tuples;
+                // 出力領域は `lateral_step` が `sides[new_rel]` へ据える。
+                acc = super::lateral::lateral_step(
+                    sides, rt, step, new_rel, &acc, budget, limits, stop,
+                )?;
             }
             (None, false) => {
                 let new_rows = sides

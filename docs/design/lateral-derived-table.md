@@ -2,7 +2,7 @@
 
 ## ステータス・対象
 
-- ステータス: 採用。#3321 で構文受理と左側の列の束縛（L3・L4・L6・L17 の入口）、#3322 で INNER／CROSS／コンマの外側の行ごとの再評価（L1・L2・L7〜L15。「実装メモ（#3322）」参照）を実装済み。`LEFT JOIN LATERAL` は専用文言の `0A000`（#3323）。行ごとの集計（L5 の後半）は #3322 では実装せず、固定文言の `0A000`
+- ステータス: 採用。#3321 で構文受理と左側の列の束縛（L3・L4・L6・L17 の入口）、#3322 で INNER／CROSS／コンマの外側の行ごとの再評価（L1・L2・L7〜L15。「実装メモ（#3322）」参照）を実装済み。#3323 で `LEFT JOIN LATERAL` の外側保持と NULL 補完・ON 条件・RIGHT／FULL の `42P10`（L16。「実装メモ（#3323）」参照）を実装済み。行ごとの集計（L5 の後半）は #3322 では実装せず、固定文言の `0A000`
 - ポインタ: SQL-60・SQL-61・SQL-62・TASK-344（spec 本文は転記しない）
 - 対象: `FROM` の `LATERAL (SELECT ...)` の実行方式、再評価の数え方と上限、RLS の適用、対象外の形
 - 親: #3319。先行記録: [nested-loop-join.md](nested-loop-join.md)・[outer-join.md](outer-join.md)・[multi-way-join.md](multi-way-join.md)・[join-limits-cli.md](join-limits-cli.md)・[sql-subquery.md](sql-subquery.md)（#1842・#1847）・[cte.md](cte.md)（#1865〜#1867）
@@ -59,7 +59,8 @@
 | 左側以外への参照・存在しない列・左側の複数 relation で曖昧な非修飾名 | `42P01`／`42703`／`42702`（#3321 で PostgreSQL 17 実機と照合済み） | 束縛段 |
 | 相関述語の型が合わない比較（`bigint = text` など） | `42883`（#3322 で PostgreSQL 17.12 実機と照合済み。同じ型の組で同じ SQLSTATE） | 実行段の束縛（基底と左側の評価の後・外側タプルの評価の前。Describe では判定しない） |
 | 外側参照を置けない位置・`levels_up >= 2`・受理しない内側の形・集合を返す関数との LATERAL・`ROWS FROM` | `0A000`（固定文言） | 構文段・束縛段 |
-| RIGHT／FULL と左側を参照する LATERAL | PostgreSQL 17 は `42P10`（#3321 で確認）。本実装は #3323 まで固定文言の `0A000` で fail-closed | 束縛段 |
+| RIGHT／FULL と左側を参照する LATERAL（`ON true`・ON 条件・`USING`） | `42P10`（#3323 で PostgreSQL 17.12 実機と照合済み。左側の修飾子を参照した時点で、列が無くても `42P10`）。左側を参照しない RIGHT／FULL は受理 | 束縛段（外側の文の検証より前） |
+| 相関 LATERAL の `USING`／`NATURAL`（PostgreSQL は受理。本実装は未対応） | `0A000`（固定文言） | 外側の文の検証の後 |
 | 切断・statement_timeout による中断 | `57014` | `interrupt::check()` |
 
 エラー文は英語の固定文言にし、行・件数・他テナントの存在情報を含めない（含めるとしても上限値だけ）。新しい `wire_code` クラスは追加しない。
@@ -84,8 +85,18 @@ L15 のとおり、すべての再評価は呼び出したセッションの `Po
 - 実行: 結合方式 `Lateral`（`join/lateral.rs`、`exec::run_joins_lateral`）。外側タプルごとに相関述語 → 後処理の層 → 外側の文の側スキャンの順に適用し、出力領域（arena）を `sides[新 relation]` に据える。外側の WHERE の結合キーへの昇格は LATERAL の段では行わない（内側の `LIMIT` の後に効かせるため）
 - 上限: 再評価回数は `JoinBudget` が持つ（上限は `CorrelatedLimits::max_reevaluations()` を `execute_with_cte_inputs` で設定する。`JoinLimits` の構造体リテラルを増やさないための置き場の選択で、L8 の「1 つのカウンタ・同じ上限」は保たれる）。JOIN 経路には `CorrelatedBudget` が無く、LATERAL の本文に相関サブクエリを置かせない（サブクエリを含む形は固定文言の `0A000`、外側の WHERE のサブクエリは JOIN の WHERE が `42601` で拒否する）ため、2 つのカウンタは 1 文に併存しない。比較数は見積り（外側タプル数 × 基底の行数）を評価前に一括して消費し、作業領域（基底の複製の最大値・後処理の出力の上界）は評価前に 1 回だけ計上する。出力行は追加の前に `max_output_rows` と照合する。基底の暗黙の結果行数上限は後処理が外側タプルごとに絞るためハード上限まで緩め、入力行数は `max_input_rows` で判定する
 - 等価キーのバケット化は実装していない（L2 の任意最適化。結果・SQLSTATE は変わらず、L10 の判定もバケット化に依存しない）
-- 受理しない形（いずれも評価前に固定文言の `0A000`）: `LEFT JOIN LATERAL`（#3323）、`ON true` 以外の ON を伴う相関 INNER（#3323）、集計・`DISTINCT`・窓を含む本文（行ごとの集計。受け皿 Issue は未起票）、本文のサブクエリ、`SELECT *`
+- 受理しない形（いずれも評価前に固定文言の `0A000`）: 集計・`DISTINCT`・窓を含む本文（行ごとの集計。受け皿 Issue は未起票）、本文のサブクエリ、`SELECT *`
 - 照合: PostgreSQL 17.12 の実機で、top-1・`OFFSET`・NULL の外側値・`OR`・2 段の LATERAL・外側 WHERE の結果と、`bigint`／`text` の比較の `42883` を確認した
+
+## 実装メモ（#3323）
+
+- `ON true` の LEFT／RIGHT／FULL は、抽出段が `CROSS JOIN` へ書き換えたうえで `build_statement` が結合段の種別（`JoinStep::kind`）を Left／Right／Full へ戻す（段が `Cross`＋`Inner` でなければ `Internal`）。非相関の形は通常の派生表（L6）として既存の直積経路の NULL 補完に乗る。`ON <条件>` は外側のトークン列に残るため、既存の結合パーサー・ON の分解（キー・`on_acc`・`on_new`・`on_mixed`）をそのまま使う
+- 実行（`join/lateral.rs::lateral_step`）は 2 段。前段は外側タプルごとに相関述語・後処理・側スキャンを適用して候補ペアを作る。後段は arena を `sides[新 relation]` へ据えたあと、候補ごとにキー等価・`on_new`・`on_mixed` を `residual::eval_all` で評価して一致を決め、一致の無い外側タプルを `exec::materialize_step` で NULL 補完行にする。ON は内側の `LIMIT`／`OFFSET` の後に効く（PostgreSQL と一致）。`on_acc`（外側だけを参照する ON）は外側タプルごとに 1 回だけ評価し、偽のタプルは再評価予算・比較見積りに数えない
+- WHERE の strict な述語が LATERAL の列を参照すると、既存の外部結合の簡約で `preserve_acc` が落ち、実質 INNER になる（PostgreSQL と一致）。NULL 補完された relation を参照する後続の LATERAL は、外側値を NULL として相関述語へ渡し（strict な比較は偽）、INNER は行を落とし LEFT は NULL 補完する
+- NULL 補完行も出力上限（`max_output_rows`）と最終段の停止閾値の対象で、実体化の前に判定する。候補数（ON で落ちるものを含む）も追加前に出力上限と照合する
+- RIGHT／FULL: 左側を参照する形は束縛段が `LateralReferenceInvalidJoinType`（`42P10`。固定文言）で拒否する。内側の未知列（`42703`）は本文のテキスト順で先に現れた場合だけ `42P10` に先行する。未知の修飾子（`42P01`）は束縛の後段で判定するため、左側参照より前に書かれていても `42P10` が先に出る（PostgreSQL との意図した差。照合した `z.a` のみの形は一致）
+- 相関 LATERAL の `USING`／`NATURAL`（INNER／LEFT）は固定文言の `0A000`。左側を参照しない `USING`／`NATURAL`／RIGHT／FULL は通常の派生表と同じ経路で受理する
+- 照合: PostgreSQL 17.12 の実機で、LEFT の `ON true`・内側のみ／外側のみ／混在の ON（LEFT と INNER）・`OFFSET` で空になる内側・WHERE の strict／外側のみの述語・LEFT の連鎖・非相関の LEFT／RIGHT／FULL・RIGHT／FULL の `42P10`／`42703`／`42P01` を、alice 相当の 6 行と carol 相当の 5 行で確認した（`crates/engine/tests/sql_t40_up/sql62_lateral_left.rs`）
 
 ## 実装の割り当て
 
@@ -93,7 +104,7 @@ L15 のとおり、すべての再評価は呼び出したセッションの `Po
 | ----- | ---- |
 | #3321 | 構文受理（L6・L17 の一部）と左側の列の束縛（L3・L4） |
 | #3322 | INNER／CROSS／カンマの再評価の実行器（L1・L2・L5 の top-n・L7〜L15）。行ごとの集計（L5 の後半）は後続 |
-| #3323 | LEFT JOIN LATERAL・ON 条件・RIGHT／FULL の SQLSTATE 照合（L16） |
+| #3323 | LEFT JOIN LATERAL・ON 条件・RIGHT／FULL の SQLSTATE 照合（L16。実装済み） |
 | #3324 | EXPLAIN・`$n`・ビューと入れ子（L17）・3 テナントの越境試験（L15） |
 | #3360 | 集合を返す関数との LATERAL・`WITH ORDINALITY` |
 
@@ -104,4 +115,5 @@ L15 のとおり、すべての再評価は呼び出したセッションの `Po
 | 集合を返す関数との LATERAL・`WITH ORDINALITY` | #3360（#3320〜#3324 の範囲では `0A000` のまま） |
 | `ROWS FROM (...)` | `0A000` のまま（#3160 の追跡注記） |
 | 内側の投影・`ORDER BY` などに置く外側参照、内側の結合・集合演算・相関サブクエリ、DML の `FROM`／`USING` での LATERAL、比較回数上限の CLI 化 | 現時点では対応しない（受け皿の Issue なし）。理由: 1 回の実体化と外側タプルごとの後処理という L1 の方式で、まだ束縛の部品が無い |
-| 行ごとの集計・`DISTINCT`・窓を含む相関 LATERAL の本文、相関 LATERAL の本文の `SELECT *`・サブクエリ | #3322 では固定文言の `0A000`。受け皿の Issue なし（要起票。人間が判断） |
+| 行ごとの集計・`DISTINCT`・窓を含む相関 LATERAL の本文、相関 LATERAL の本文の `SELECT *`・サブクエリ（`LEFT` での `count(*)` が 0 になる挙動を含む） | #3322・#3323 では固定文言の `0A000`。受け皿の Issue なし（要起票。人間が判断） |
+| 相関 LATERAL の `USING`／`NATURAL`（INNER／LEFT） | #3323 では固定文言の `0A000`。受け皿の Issue なし（要起票。人間が判断） |

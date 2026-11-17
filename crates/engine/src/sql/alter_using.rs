@@ -440,6 +440,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InvalidViewReplacement { .. }
         | E::DuplicateColumn { .. }
         | E::InvalidColumnReference
+        | E::LateralReferenceInvalidJoinType
         | E::WindowFrameOffsetHasVariables { .. }
         | E::CteColumnListTooLong { .. }
         | E::DerivedTableColumnListTooLong { .. }

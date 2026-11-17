@@ -201,10 +201,14 @@ fn split_conjuncts(tokens: &[Token], from: usize, to: usize) -> Vec<(usize, usiz
 /// LATERAL の本文 `body`（`SELECT ...`。括弧なし）が参照する左側 relation `left` の列を束縛する。
 /// `columns` は relation の列集合（実表・利用者の CTE・先行の派生表）を返す。`Ok(None)` は列集合を
 /// 返せない relation で、その relation への修飾参照は `0A000`、非修飾名の推定からは外す（fail-closed）。
+/// `reject_left_ref` は RIGHT／FULL JOIN の LATERAL（Issue #3323）で、左側 relation を参照した時点
+/// （列が存在するかを問わない。PostgreSQL と同じ）で `42P10` を返す。内側の未知列（`42703`）・未知の
+/// 修飾子（`42P01`）は本文のテキスト順で先に現れた方が先に返る。
 pub(crate) fn bind_lateral_body<F>(
     body: &[Token],
     left: &[TableRef],
     columns: &mut F,
+    reject_left_ref: bool,
 ) -> Result<BoundBody, SqlSurfaceError>
 where
     F: FnMut(&TableRef) -> Result<Option<Vec<String>>, SqlSurfaceError>,
@@ -270,6 +274,16 @@ where
         match tok {
             Token::QualifiedIdent { qualifier, name } => {
                 if inner_ref.matches_qualifier(qualifier) {
+                    // RIGHT／FULL では内側の未知列を、後続の左側参照（`42P10`）より先に出た順で `42703` にする。
+                    if reject_left_ref
+                        && !name.eq_ignore_ascii_case("id")
+                        && !is_non_column_position(body, i)
+                        && inner_cols
+                            .as_deref()
+                            .is_some_and(|ic| find_col(ic, name).is_none())
+                    {
+                        return Err(SqlSurfaceError::undefined_column(name.clone()));
+                    }
                     continue;
                 }
                 let Some(ridx) = left.iter().position(|r| r.matches_qualifier(qualifier)) else {
@@ -286,6 +300,9 @@ where
                     return Err(SqlSurfaceError::unsupported(
                         "qualified column reference named like a SQL keyword is not supported",
                     ));
+                }
+                if reject_left_ref {
+                    return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
                 }
                 let Some(cols) = lc.get(ridx)? else {
                     return Err(unresolvable_left_columns());
@@ -322,6 +339,9 @@ where
                     }
                 }
                 if let Some((ridx, col)) = hit {
+                    if reject_left_ref {
+                        return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
+                    }
                     if let Some(slot) = out.get_mut(i) {
                         *slot = Token::Ident(lateral_ref_placeholder(ridx, &col));
                     }
@@ -591,7 +611,7 @@ mod tests {
 
     fn bind(sql: &str, left: &[TableRef]) -> Result<BoundBody, SqlSurfaceError> {
         let toks = tokenize(sql).expect("tokenize");
-        bind_lateral_body(&toks, left, &mut cols_of)
+        bind_lateral_body(&toks, left, &mut cols_of, false)
     }
 
     fn d() -> TableRef {
@@ -647,7 +667,7 @@ mod tests {
                 _ => cols_of(t)?,
             })
         };
-        let err = bind_lateral_body(&toks, &left, &mut cols).expect_err("ambiguous");
+        let err = bind_lateral_body(&toks, &left, &mut cols, false).expect_err("ambiguous");
         assert_eq!(err.wire_code(), "42702");
     }
 

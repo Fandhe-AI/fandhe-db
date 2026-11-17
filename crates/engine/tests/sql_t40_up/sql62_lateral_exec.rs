@@ -472,27 +472,24 @@ fn tailless_lateral_is_bounded_by_the_result_row_cap() {
     assert_eq!(err_of(&core, "alice", sql).wire_code(), "54000");
 }
 
-// tracked: #3323
+/// `LEFT [OUTER] JOIN LATERAL ... ON true` と外側だけの ON（`ON d.id = d.id`）は #3323 で実行でき、全外側行に
+/// 一致がある形では INNER と同じ結果になる（NULL 補完を含む値は `sql62_lateral_left.rs` が固定）。
 #[test]
-fn left_and_non_true_on_forms_stay_fail_closed() {
+fn left_and_outer_only_on_forms_execute_like_inner_when_every_row_matches() {
     let (core, _g) = open();
-    for (sql, msg) in [
-        (
-            format!("SELECT * FROM docs d LEFT JOIN LATERAL {TOP1} ON true"),
-            "LEFT JOIN LATERAL is not supported yet",
-        ),
-        (
-            format!("SELECT * FROM docs d LEFT OUTER JOIN LATERAL {TOP1} ON true"),
-            "LEFT JOIN LATERAL is not supported yet",
-        ),
-        (
-            format!("SELECT * FROM docs d JOIN LATERAL {TOP1} ON d.id = d.id"),
-            "JOIN LATERAL referencing outer columns with an ON condition other than true is not supported yet",
-        ),
+    let expected = rows(
+        &core,
+        "alice",
+        &format!("SELECT d.id, s.body FROM docs d JOIN LATERAL {TOP1} ON true ORDER BY d.id"),
+    );
+    assert_eq!(expected.len(), 6);
+    for from in [
+        format!("docs d LEFT JOIN LATERAL {TOP1} ON true"),
+        format!("docs d LEFT OUTER JOIN LATERAL {TOP1} ON true"),
+        format!("docs d JOIN LATERAL {TOP1} ON d.id = d.id"),
     ] {
-        let (c, m) = err_pair(&core, "alice", &sql);
-        assert_eq!(c, "0A000", "{sql}");
-        assert!(m.ends_with(msg), "{sql}: {m}");
+        let sql = format!("SELECT d.id, s.body FROM {from} ORDER BY d.id");
+        assert_eq!(rows(&core, "alice", &sql), expected, "{sql}");
     }
 }
 
