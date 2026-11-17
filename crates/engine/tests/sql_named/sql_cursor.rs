@@ -1812,7 +1812,8 @@ fn fetch_ids<'a>(
     }
 }
 
-/// SCROLL カーソルの全ての向きの行と位置（手計算した表。実機 PG17 との突き合わせは #3337）。
+/// SCROLL カーソルの全ての向きの行と位置（手計算した表。PG17 実測との突き合わせは
+/// `sql_cursor_pg17_parity.rs`）。
 /// 同じ列を末尾 `;` なし・ありの両方で流す。位置は 0（先頭の前）から始まる。
 #[test]
 fn scroll_cursor_fetch_directions_follow_position_model() {
@@ -1958,6 +1959,10 @@ fn no_scroll_cursor_accepts_forward_moves_and_rejects_backward_scans() {
 
 /// 拒否（`55000`）は位置を変えない: SAVEPOINT 内で拒否 → ROLLBACK TO で Tx を戻しても、
 /// savepoint 前に宣言したカーソルの位置は保たれ、次の NEXT は直前の続きを返す。
+///
+/// PG17 17.11 はこの形でカーソル自身の実行が失敗した（`55000`）カーソルを使えなくし、続く
+/// `FETCH NEXT` も `55000`（portal cannot be run）を返す。本実装は SQL-69 (5)・WIRE-27 (2) の
+/// ポインタ先の契約に従い位置を保つ（意図した差。`docs/design/sql-cursor.md`「PG17 との意図した差」）。
 #[test]
 fn no_scroll_rejection_leaves_position_after_rollback_to_savepoint() {
     let (engine, path) = new_core();
