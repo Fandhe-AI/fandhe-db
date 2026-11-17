@@ -150,8 +150,8 @@ fn start_sql(start: &str) -> Option<&'static str> {
 }
 
 /// 1 ケースを再現して `(result, probe)` を返す。`scroll_head` は `DECLARE` の修飾語部分。
-fn replay<'a>(
-    engine: &'a EngineCore,
+fn replay(
+    engine: &EngineCore,
     caller: &PolicyContext,
     scroll_head: &str,
     start: &str,
