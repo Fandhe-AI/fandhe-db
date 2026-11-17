@@ -50,7 +50,7 @@ fn depth_zero_positions(tokens: &[Token], from: usize, to: usize) -> Vec<usize> 
     out
 }
 
-/// `i` の直前のトークンが式の終端として妥当か（識別子・リテラル・`)`／`]`）。`THEN end`・`ELSE end`・
+/// `i` の直前のトークンが式の終端として妥当か（識別子・引用付き識別子〔`QuotedNull`〕・リテラル・`)`／`]`）。`THEN end`・`ELSE end`・
 /// `a.end` のように直前が式を終えていない／ドット修飾の `end` は列名であり、`CASE` の `END` ではない。
 fn prev_ends_expression(tokens: &[Token], i: usize) -> bool {
     let Some(prev_idx) = i.checked_sub(1) else {
@@ -64,6 +64,7 @@ fn prev_ends_expression(tokens: &[Token], i: usize) -> bool {
             Token::Number(_)
             | Token::StringLiteral(_)
             | Token::QuotedBoolWord(_)
+            | Token::QuotedNull(_)
             | Token::Param(_)
             | Token::Punct(')' | ']'),
         ) => true,
@@ -428,6 +429,21 @@ mod tests {
             ),
             format!(
                 "{HEAD} WHEN MATCHED AND CASE WHEN matched = 1 THEN true ELSE false END THEN UPDATE SET k = $1"
+            ),
+        ] {
+            assert_eq!(check(&sql), Ok(1), "{sql}");
+        }
+    }
+
+    #[test]
+    fn quoted_ident_before_end_closes_case() {
+        // `THEN "null" END` の引用付き識別子（QuotedNull）も式の終端。CASE を閉じ損ねると後続の句境界を飛ばす。
+        for sql in [
+            format!(
+                "{HEAD} WHEN MATCHED THEN UPDATE SET x = CASE WHEN k = 'a' THEN \"null\" END WHEN NOT MATCHED THEN INSERT (k) VALUES ($1)"
+            ),
+            format!(
+                "{HEAD} WHEN MATCHED THEN UPDATE SET x = CASE WHEN k = 'a' THEN 1 ELSE \"NULL\" END WHEN MATCHED THEN UPDATE SET k = $1"
             ),
         ] {
             assert_eq!(check(&sql), Ok(1), "{sql}");
