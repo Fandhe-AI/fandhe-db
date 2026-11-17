@@ -519,6 +519,35 @@ fn trigger_bodies_write_generated_tables_through_the_computation() {
     assert_eq!(grid(&core, TENANT, "SELECT a FROM gp").len(), 1);
 }
 
+/// ビュー経由の書き込みで基表のトリガ本体が別の生成列表へ書いても、本体の書き込みは計算される
+/// （外側のビュー区間の基表照合に左右されない）。
+#[test]
+fn view_write_with_trigger_body_writing_another_generated_table() {
+    let (_gd, core) = fixture("gen-p-view-body");
+    ok_public(
+        &core,
+        TENANT,
+        "CREATE TABLE gp (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
+    );
+    ok(&core, TENANT, "CREATE TABLE s.src (a INTEGER)");
+    func(
+        &core,
+        "to_g",
+        "BEGIN INSERT INTO gp (a) VALUES (NEW.a); RETURN NEW; END",
+    );
+    ok(
+        &core,
+        TENANT,
+        "CREATE TRIGGER t1 AFTER INSERT ON s.src FOR EACH ROW EXECUTE FUNCTION to_g()",
+    );
+    ok(&core, TENANT, "CREATE VIEW sv AS SELECT a FROM src");
+    ok(&core, TENANT, "INSERT INTO sv (a) VALUES (5)");
+    assert_eq!(
+        grid(&core, TENANT, "SELECT a, b FROM gp"),
+        g(&[&["5", "10"]])
+    );
+}
+
 /// FK の参照アクション（ON UPDATE CASCADE・ON DELETE／UPDATE SET NULL）が書き換える子表の生成列も再計算され、
 /// 孫の FK が子の生成列を参照する連鎖でも整合する。
 #[test]

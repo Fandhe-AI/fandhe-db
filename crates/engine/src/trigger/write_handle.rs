@@ -184,7 +184,8 @@ impl<'a> TriggerWriteHandle<'a> {
         // 入れ子の書き込みは外側の文の「生成列の計算点が結線済み」を継承せず、本体の書き込み先の表で張り直す
         // （TABLE-50・Issue #3329）。束縛は通常の `bind_insert_form`／`bind_update_form` を通るため、本体からの
         // 生成列への明示値は `428C9`。drop で外側の文のスコープへ戻る。
-        let _generated_scope = crate::sql::generated_column::GeneratedComputeScope::enter(table);
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter_trigger_body(table);
         let out = f(WriteTarget::InTxn(self.write_txn))?;
         self.note_written(table);
         Ok(out)
