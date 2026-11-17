@@ -345,3 +345,49 @@ fn psql_shaped_before_trigger_runs_before_the_generated_computation() {
     expect_error_response_with_sqlstate(&mut stream, "42P17");
     read_ready_for_query(&mut stream);
 }
+
+/// 生成列の追加（Issue #3330。TABLE-50）を psql 形（末尾 `;` の単独 simple query）で流す。既存行は全行が
+/// 計算され、SELECT が計算済みの値を返す。評価エラーは `22012` で返り、その後も表は変わらず接続は使える。
+/// 意味論の確定オラクルは engine の `table50_generated_column_add_column`。
+#[test]
+fn psql_shaped_add_generated_column_backfills_existing_rows() {
+    let (mut stream, _guard) = connect();
+    for (sql, tag) in [
+        ("CREATE TABLE g (a INTEGER, d INTEGER);", "CREATE TABLE"),
+        ("INSERT INTO g (a, d) VALUES (1, 5), (2, 0);", "INSERT 0 2"),
+        (
+            "ALTER TABLE g ADD COLUMN b INTEGER GENERATED ALWAYS AS (a * 2) STORED;",
+            "ALTER TABLE",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+    send_simple_query(&mut stream, "SELECT a, b FROM g ORDER BY a;");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("2".to_string())]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("2".to_string()), Some("4".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+
+    // 評価エラー（`d = 0` の行）は `22012`。表は変わらず、同名の通常の列を追加できる。
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE g ADD COLUMN q INTEGER GENERATED ALWAYS AS (10 / d) STORED;",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "22012");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "SELECT q FROM g;");
+    expect_error_response_with_sqlstate(&mut stream, "42703");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ALTER TABLE g ADD COLUMN q INTEGER;");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+}

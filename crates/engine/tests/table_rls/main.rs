@@ -141,6 +141,7 @@ mod table45_trigger_fire;
 mod table45_trigger_partitioned;
 mod table45_trigger_prod_invoker;
 mod table45_trigger_when;
+mod table50_generated_column_add_column;
 mod table50_generated_column_alter;
 mod table50_generated_column_create;
 mod table50_generated_column_paths;

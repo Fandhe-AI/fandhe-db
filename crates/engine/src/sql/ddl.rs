@@ -838,6 +838,33 @@ pub(crate) fn execute_alter_table_add_column(
     if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
         return Ok(add_column_skipped_outcome(stmt));
     }
+    // 生成列（TABLE-50・RECOVER-11・Issue #3330）。fast default（O(1)）は使えず、全行を計算して
+    // 書き直す。束縛・全行の計算・世代 bump・commit は 1 つの write txn で行う（部分状態を残さない）。
+    if let Some(expr) = &stmt.generated {
+        let action = storage
+            .alter_table_in_single_txn(&stmt.table_name, |txn| {
+                let (action, apply) = add_generated_column_in_txn(
+                    storage,
+                    txn,
+                    &stmt.table_name,
+                    stmt,
+                    expr,
+                    limits,
+                )?;
+                Ok((action, apply == AlterApply::Applied, Vec::new()))
+            })
+            .map_err(|e| match e {
+                AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                    undefined_table_or_view(storage, &stmt.table_name)
+                }
+                AlterCheckError::Catalog(other) => map_add_column_error(other),
+                AlterCheckError::Sql(sql_err) => sql_err,
+            })?;
+        return Ok(AlterTableOutcome {
+            table_name: stmt.table_name.clone(),
+            action,
+        });
+    }
     let column = build_add_column_def(storage, stmt, limits)?;
     match storage.alter_table_add_column_with_limit(
         &stmt.table_name,
@@ -860,6 +887,87 @@ pub(crate) fn execute_alter_table_add_column(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// 生成列の ADD COLUMN を write txn 内で適用する共有 helper（TABLE-50・RECOVER-11・Issue #3330）。
+/// 単一アクション経路（[`execute_alter_table_add_column`]）と複数アクション経路
+/// （[`apply_alter_action_in_txn`]）が呼ぶ。呼び出し元は DDL 権限ゲートと表の存在確認を済ませている。
+///
+/// 判定順（決定的）: txn 内のスキーマ取得 → `IF NOT EXISTS` の skip → 型名解決
+/// （[`build_add_column_def`]）→ 従来の行識別方式の表は `0A000` → 列名の重複 → 候補スキーマ（新しい列を
+/// 足したもの）への式の束縛（[`crate::sql::generated_column::bind_generated_column`]。CREATE TABLE と同じ
+/// 判定と SQLSTATE）→ カタログへの追加と全テナント・全可視性の全行の計算
+/// （`Storage::alter_table_add_generated_column_in_txn`）。束縛を txn 内で行うので判定と書き込みの間に
+/// TOCTOU を作らない。評価エラーは固定文言で返り、呼び出し元は commit せず txn を破棄する。
+fn add_generated_column_in_txn(
+    storage: &Storage,
+    txn: &redb::WriteTransaction,
+    table_name: &str,
+    stmt: &ValidatedAlterTableAddColumn,
+    expr: &crate::sql::udf_call::Expr,
+    limits: &SchemaLimits,
+) -> Result<(AlterTableAction, AlterApply), AlterCheckError> {
+    let schema = crate::catalog::get_table_schema_in_txn_impl(txn, table_name, false)
+        .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
+    if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
+        return Ok((
+            AlterTableAction::AddColumnSkipped {
+                column_name: stmt.column_name.clone(),
+            },
+            AlterApply::Unchanged,
+        ));
+    }
+    let mut column = build_add_column_def(storage, stmt, limits).map_err(AlterCheckError::Sql)?;
+    // NoSQL 表層が作る従来方式の表は、生成列の計算点が無いため CREATE TABLE と同じ `0A000`。
+    // intentional: docs/design/generated-column.md
+    if schema.row_identity() == crate::catalog::RowIdentity::LegacyId {
+        return Err(AlterCheckError::Sql(
+            SqlSurfaceError::feature_not_supported(
+                "generated columns are not supported on this table surface",
+            ),
+        ));
+    }
+    if schema.columns.iter().any(|c| c.name == stmt.column_name) {
+        return Err(alter_in_txn_error(
+            CatalogError::ColumnAlreadyExists(stmt.column_name.clone()),
+            map_add_column_error,
+        ));
+    }
+    let mut candidate = schema.clone();
+    candidate.columns.push(column.clone());
+    let mut generated_names: Vec<String> = schema
+        .columns
+        .iter()
+        .filter(|c| c.generated.is_some())
+        .map(|c| c.name.clone())
+        .collect();
+    generated_names.push(column.name.clone());
+    let def = crate::sql::generated_column::bind_generated_column(
+        expr,
+        &column,
+        &candidate,
+        &generated_names,
+    )
+    .map_err(AlterCheckError::Sql)?;
+    column.generated = Some(def);
+    // 呼び出し元の経路によらず、列数上限の判定はカタログ側（物理スロット総数）が行う。
+    Storage::alter_table_add_generated_column_in_txn(
+        txn,
+        table_name,
+        column,
+        limits.max_table_columns(),
+        true,
+    )
+    .map_err(|e| match e {
+        AlterCheckError::Catalog(c) => alter_in_txn_error(c, map_add_column_error),
+        other => other,
+    })?;
+    Ok((
+        AlterTableAction::AddColumn {
+            column_name: stmt.column_name.clone(),
+        },
+        AlterApply::Applied,
+    ))
 }
 
 /// `ADD COLUMN IF NOT EXISTS` が何もしなかったときの応答（Issue #1633）。
@@ -1257,6 +1365,10 @@ fn apply_alter_action_in_txn(
                     },
                     AlterApply::Unchanged,
                 ));
+            }
+            // 生成列は全行の計算を伴うため、専用の helper（単一アクション経路と共有）で適用する。
+            if let Some(expr) = &stmt.generated {
+                return add_generated_column_in_txn(storage, txn, table_name, stmt, expr, limits);
             }
             let column =
                 build_add_column_def(storage, stmt, limits).map_err(AlterCheckError::Sql)?;

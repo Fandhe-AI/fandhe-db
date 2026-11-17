@@ -287,3 +287,10 @@ NULL 許容 VECTOR 列の導入に合わせ、`ALTER TABLE ... ADD COLUMN v VECT
 `ALTER TABLE <表> ADD COLUMN IF NOT EXISTS <列> <型> ...` を受理する。同名の生存列があれば型解決・DEFAULT の
 束縛より前に副作用なしで成功する。判定の詳細・複数アクションとの関係は
 [alter-table-multi-action.md](alter-table-multi-action.md) を参照。
+
+## Issue #3330 追記（TABLE-50）: 生成列の追加
+
+`ADD COLUMN <列> <型> GENERATED ALWAYS AS (<式>) STORED` を受理する。これは TABLE-5 の O(1)（fast default）の
+例外で、既存の全行（全テナント・全可視性）を 1 つの write txn で計算して書き直す。評価エラー・NOT NULL 違反では
+カタログも行も世代も変わらない。`NOT NULL` は `DEFAULT` なしで受け付ける。判定順・失敗の扱い・対象外は
+[generated-column.md](generated-column.md) の「Issue #3330 で確定した事項」を参照。

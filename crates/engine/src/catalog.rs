@@ -14130,6 +14130,14 @@ impl Storage {
         let max_columns = max_columns.min(MAX_COLUMN_COUNT);
         validate_relation_key(table_name)?;
         validate_column(column)?;
+        // 生成列は全行の計算（バックフィル）を伴うため、カタログだけを書くこの経路では作らせない
+        // （fail-closed。TABLE-50・Issue #3330。生成列の追加は
+        // [`Self::alter_table_add_generated_column_in_txn`] だけが行う）。
+        if column.generated.is_some() {
+            return Err(CatalogError::Invalid(
+                "generated column cannot be added without computing existing rows".to_string(),
+            ));
+        }
         // 時刻値関数の DEFAULT は既存行の補完値を固定できず、読み出し時補完が常に失敗して
         // テーブルを読めなくするため、Rust API 直接呼び出しでも拒否する（多層防御。SQL 表層は
         // `sql::allowlist` が `0A000` で先に拒否する。SQL-37・Issue #1587、設計 D10）。
@@ -14182,11 +14190,91 @@ impl Storage {
     pub(crate) fn alter_table_add_column_in_txn(
         write_txn: &redb::WriteTransaction,
         table_name: &str,
-        mut column: ColumnDef,
+        column: ColumnDef,
         max_columns: usize,
         allow_empty_before: bool,
     ) -> Result<()> {
+        // 最下層ガード（fail-closed）。カタログだけを書くこの経路は、既存行の計算を伴わないため
+        // 生成列を受け付けない（TABLE-50・Issue #3330）。
+        if column.generated.is_some() {
+            return Err(CatalogError::Invalid(
+                "generated column cannot be added without computing existing rows".to_string(),
+            ));
+        }
+        Self::add_column_to_catalog_in_txn(
+            write_txn,
+            table_name,
+            column,
+            max_columns,
+            allow_empty_before,
+        )
+        .map(|_| ())
+    }
+
+    /// `ALTER TABLE ... ADD COLUMN ... GENERATED ALWAYS AS (<式>) STORED` の write txn 内本体
+    /// （TABLE-50・RECOVER-11・Issue #3330）。`sql::ddl` の生成列追加 helper（単一アクションと
+    /// 複数アクションが共有）が、式の束縛・`column.generated` の設定を済ませて呼ぶ。
+    ///
+    /// 列をカタログへ足した後、カタログのハンドルを手放してから全テナント・全可視性の既存行を
+    /// [`crate::column_rewrite::backfill_generated_column_in_txn`] で計算し直して書く。これは TABLE-5 の
+    /// O(1)（fast default）の例外で、行を書き直す。評価エラー（`22012`・`22003`・`23502` 等）は
+    /// 固定文言の [`AlterCheckError::Sql`] で返し、呼び出し元は commit せず txn を破棄する
+    /// （カタログ・行・世代とも不変）。begin・世代 bump・commit は呼び出し元（`alter_table_in_single_txn`）の責務。
+    /// DEFAULT・補完値を持つ生成列は拒否し、`NOT NULL` は DEFAULT なしで受け付ける（値は式で決まる）。
+    pub(crate) fn alter_table_add_generated_column_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        column: ColumnDef,
+        max_columns: usize,
+        allow_empty_before: bool,
+    ) -> std::result::Result<(), AlterCheckError> {
+        validate_relation_key(table_name)?;
+        validate_column(&column)?;
+        if column.generated.is_none()
+            || column.default_expr.is_some()
+            || column.fill_value.is_some()
         {
+            return Err(CatalogError::Invalid(
+                "generated column definition is invalid".to_string(),
+            )
+            .into());
+        }
+        let max_columns = max_columns.min(MAX_COLUMN_COUNT);
+        let (old_schema, new_schema) = Self::add_column_to_catalog_in_txn(
+            write_txn,
+            table_name,
+            column,
+            max_columns,
+            allow_empty_before,
+        )?;
+        let new_index = new_schema
+            .columns
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| CatalogError::CorruptSchema("empty schema".to_string()))?;
+        match crate::column_rewrite::backfill_generated_column_in_txn(
+            write_txn,
+            table_name,
+            &old_schema,
+            &new_schema,
+            new_index,
+        )? {
+            crate::column_rewrite::ConversionOutcome::Done => Ok(()),
+            crate::column_rewrite::ConversionOutcome::Failed(e) => Err(AlterCheckError::Sql(e)),
+        }
+    }
+
+    /// 列をカタログへ足す共通本体（行は読まない）。列を足す前と後のスキーマを返す。
+    /// 生成列の可否の判定は呼び出し元（[`Self::alter_table_add_column_in_txn`] のガードと
+    /// [`Self::alter_table_add_generated_column_in_txn`]）の責務。
+    fn add_column_to_catalog_in_txn(
+        write_txn: &redb::WriteTransaction,
+        table_name: &str,
+        mut column: ColumnDef,
+        max_columns: usize,
+        allow_empty_before: bool,
+    ) -> Result<(TableSchema, TableSchema)> {
+        let result = {
             // 呼び出し元が渡した `ColumnType::Enum` の `Arc<EnumTypeDef>` は信頼せず、
             // この write txn から見えるカタログ登録済みの定義で必ず置き換える
             // （未登録の語彙を呼び出し元が持ち込めないようにする。Issue #890 D2）。
@@ -14251,11 +14339,13 @@ impl Storage {
                     count: schema.physical_slot_count().saturating_add(1),
                 });
             }
+            let old_schema = schema.clone();
             schema.columns.push(column);
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
-        }
-        Ok(())
+            (old_schema, schema)
+        };
+        Ok(result)
     }
 
     /// 既存列を削除する（`ALTER TABLE ... DROP COLUMN`。TABLE-19・TASK-203、

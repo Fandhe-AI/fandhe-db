@@ -82,7 +82,7 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "column_rewrite.rs",
-        2,
+        3,
         Class::NonRead,
         "列の追加・削除・型変更に伴う行の書き換え（DDL）",
     ),
