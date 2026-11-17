@@ -80,6 +80,25 @@ fn is_literal_word(n: &str) -> bool {
         .any(|w| n.eq_ignore_ascii_case(w))
 }
 
+/// 括弧なしで書ける SQL 値関数（`CURRENT_DATE` 等）か。列名ではないので列探索・未知列判定から除外する。
+fn is_value_function_keyword(n: &str) -> bool {
+    [
+        "current_date",
+        "current_time",
+        "current_timestamp",
+        "localtime",
+        "localtimestamp",
+        "current_user",
+        "session_user",
+        "user",
+        "current_role",
+        "current_catalog",
+        "current_schema",
+    ]
+    .iter()
+    .any(|w| n.eq_ignore_ascii_case(w))
+}
+
 fn find_col<'a>(cols: &'a [String], name: &str) -> Option<&'a String> {
     cols.iter().find(|c| c.eq_ignore_ascii_case(name))
 }
@@ -356,7 +375,11 @@ where
                 });
             }
             Token::Ident(n) if depth == 0 => {
-                if is_syntax_word(n) || is_literal_word(n) || is_non_column_position(body, i) {
+                if is_syntax_word(n)
+                    || is_literal_word(n)
+                    || is_value_function_keyword(n)
+                    || is_non_column_position(body, i)
+                {
                     continue;
                 }
                 // ORDER BY の裸の出力別名は左側・内側の列探索へ進まず確定する。
@@ -645,6 +668,7 @@ fn check_dropped_conjunct(
                 if parse_lateral_ref_placeholder(n).is_some()
                     || is_syntax_word(n)
                     || is_literal_word(n)
+                    || is_value_function_keyword(n)
                     || is_non_column_position(toks, i)
                 {
                     continue;
@@ -680,6 +704,21 @@ mod tests {
 
     fn d() -> TableRef {
         TableRef::with_alias("docs", "d")
+    }
+
+    #[test]
+    fn value_function_keywords_are_not_unknown_columns() {
+        let left = [d()];
+        for sql in [
+            "SELECT CURRENT_DATE AS today FROM docs x LIMIT 1",
+            "SELECT current_timestamp AS t FROM docs x LIMIT 1",
+            "SELECT CURRENT_TIMESTAMP(3) AS t, LOCALTIME AS l FROM docs x LIMIT 1",
+        ] {
+            let toks = tokenize(sql).expect("tokenize");
+            for reject in [false, true] {
+                bind_lateral_body(&toks, &left, &mut cols_of, reject).expect(sql);
+            }
+        }
     }
 
     #[test]
