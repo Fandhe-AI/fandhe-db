@@ -274,6 +274,21 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         ParsedSql::DeleteUsing(v) => {
             WriteRequirement::one(v.target.table(), PRIV_DELETE | PRIV_SELECT)
         }
+        // SQL-79・Issue #3351: 対象表に、WHEN 句に現れた操作の和（INSERT／UPDATE／DELETE）と SELECT を課す
+        // （`DO NOTHING` は操作ビットを足さない）。実行が `0A000` の間も権限の無い主体は `42501` で止め、
+        // `na()` で素通りさせない。元側の読み取りゲートの完成と検証は #3355。
+        ParsedSql::Merge(v) => {
+            let bits = v
+                .when_clauses
+                .iter()
+                .fold(PRIV_SELECT, |acc, w| match &w.action {
+                    crate::sql::allowlist::MergeAction::Update { .. } => acc | PRIV_UPDATE,
+                    crate::sql::allowlist::MergeAction::Delete => acc | PRIV_DELETE,
+                    crate::sql::allowlist::MergeAction::Insert { .. } => acc | PRIV_INSERT,
+                    crate::sql::allowlist::MergeAction::DoNothing => acc,
+                });
+            WriteRequirement::one(v.target.table(), bits)
+        }
         ParsedSql::Truncate(v) => WriteRequirement {
             targets: v
                 .table_names
