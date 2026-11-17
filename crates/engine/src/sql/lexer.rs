@@ -860,6 +860,8 @@ fn tokenize_impl(
                 && (content.eq_ignore_ascii_case("NULL")
                     || content.eq_ignore_ascii_case("ARRAY")
                     || content.eq_ignore_ascii_case("DEFAULT")
+                    // 引用付き `"case"` は SET 右辺で `CASE WHEN ...` の開始と区別して列参照にする（Issue #3351）。
+                    || content.eq_ignore_ascii_case("CASE")
                     || (is_create_function_head(&tokens)
                         && (is_clause_word(content) || is_standard_body_started(&tokens)))))
                 || is_value_function_keyword(content)

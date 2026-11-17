@@ -102,8 +102,11 @@ pub(crate) struct RelPos {
 /// ないため、WHERE 内の列名 `using` を USING 句と誤判定しないよう位置で限定する
 /// （`allowlist::looks_like_delete_using` と同じ規則。こちらは修飾表名も許す）。
 fn delete_using_opener(tokens: &[Token], i: usize) -> bool {
-    if !ident_is(tokens.first(), "DELETE")
-        || !matches!(tokens.get(1), Some(Token::Keyword(Keyword::From)))
+    // `MERGE INTO <表> [[AS] <別名>] USING <表>`（SQL-79・Issue #3351）の元も同じ位置規則で表参照位置にする。
+    let head_ok = (ident_is(tokens.first(), "DELETE")
+        && matches!(tokens.get(1), Some(Token::Keyword(Keyword::From))))
+        || (ident_is(tokens.first(), "MERGE") && ident_is(tokens.get(1), "INTO"));
+    if !head_ok
         || !matches!(
             tokens.get(2),
             Some(Token::Ident(_) | Token::QualifiedIdent { .. })
@@ -389,7 +392,8 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                                 && i == 1
                                 && !(ident_is(Some(cur), "TABLE")
                                     && tokens.get(i.saturating_add(1)).is_some_and(is_ident_like)))
-                            || is("UPDATE")
+                            // MERGE の `WHEN MATCHED THEN UPDATE SET` の `SET` は構文語（表参照ではない）。
+                            || (is("UPDATE") && !ident_is(tokens.first(), "MERGE"))
                             || is("ONLY")
                             || is("REFERENCES")
                     }
@@ -1248,6 +1252,25 @@ mod tests {
         // `DELETE` で始まらない文の `USING`（`ALTER ... USING <式>`・JOIN の USING）は影響を受けない。
         let t = tokenize("ALTER TABLE t ALTER COLUMN c TYPE int USING c").expect("lex");
         assert_eq!(relation_positions(&t).positions.len(), 1);
+    }
+
+    /// SQL-79・Issue #3351: `MERGE INTO <対象> USING <元>` の対象と元が表参照位置になる（`THEN UPDATE SET` の
+    /// `SET` と `USING OPERATION_ID` は参照位置にしない）。
+    #[test]
+    fn merge_target_and_source_are_relation_positions() {
+        same(
+            "MERGE INTO public.a USING public.b ON a.id = b.id WHEN MATCHED THEN UPDATE SET x = b.x",
+            "MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET x = b.x",
+        );
+        same(
+            "MERGE INTO public.a AS t USING public.b s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "MERGE INTO a AS t USING b s ON t.id = s.id WHEN MATCHED THEN DELETE",
+        );
+        let t = tokenize(
+            "MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET x = 1 USING OPERATION_ID 'x'",
+        )
+        .expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 2);
     }
 
     /// Issue #3294: FROM／USING 内の `JOIN` の直後の表と、`ON` 式の後のカンマの直後の表も表参照位置になる
