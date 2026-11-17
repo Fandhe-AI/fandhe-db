@@ -689,3 +689,123 @@ fn row_bearing_logical_dump_round_trips_in_insert_format() {
     );
     assert_eq!(dump(&dst), pieces);
 }
+
+/// `EXCLUDED` が生成列を参照する場合の NOT NULL 検査は計算後の値で行う（VALUES 形・`INSERT ... SELECT` 形）。
+#[test]
+fn upsert_excluded_generated_column_is_checked_after_computation() {
+    let (_p, _gd, core) = fixture("gen-w-excluded");
+    ok(
+        &core,
+        TENANT,
+        "CREATE TABLE e (k INTEGER PRIMARY KEY, a INTEGER, g INTEGER GENERATED ALWAYS AS (a * 2) STORED, n INTEGER NOT NULL)",
+    );
+    ok(&core, TENANT, "INSERT INTO e (k, a, n) VALUES (1, 1, 0)");
+    ok(
+        &core,
+        TENANT,
+        "INSERT INTO e (k, a, n) VALUES (1, 5, 0) ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.g",
+    );
+    assert_eq!(
+        grid(&core, TENANT, "SELECT k, g, n FROM e"),
+        g(&[&["1", "2", "10"]])
+    );
+    ok(
+        &core,
+        TENANT,
+        "CREATE TABLE src (k INTEGER PRIMARY KEY, a INTEGER)",
+    );
+    ok(&core, TENANT, "INSERT INTO src (k, a) VALUES (1, 7)");
+    ok(
+        &core,
+        TENANT,
+        "INSERT INTO e (k, a, n) SELECT k, a, 0 FROM src ON CONFLICT (k) DO UPDATE SET n = EXCLUDED.g",
+    );
+    assert_eq!(
+        grid(&core, TENANT, "SELECT k, g, n FROM e"),
+        g(&[&["1", "2", "14"]])
+    );
+}
+
+/// 生成列の衝突キーは計算後の値で文内重複を検査する（同じ既存行を 2 回更新して成功させない）。
+#[test]
+fn upsert_in_statement_duplicates_on_generated_target_are_rejected() {
+    let (_p, _gd, core) = fixture("gen-w-dup");
+    ok(
+        &core,
+        TENANT,
+        "CREATE TABLE d (k INTEGER PRIMARY KEY, a INTEGER, g INTEGER GENERATED ALWAYS AS (a * 2) STORED UNIQUE)",
+    );
+    ok(&core, TENANT, "INSERT INTO d (k, a) VALUES (1, 1)");
+    assert_eq!(
+        code(
+            &core,
+            TENANT,
+            "INSERT INTO d (k, a) VALUES (2, 1), (3, 1) ON CONFLICT (g) DO UPDATE SET a = EXCLUDED.a"
+        ),
+        "22000"
+    );
+    ok(
+        &core,
+        TENANT,
+        "CREATE TABLE s (k INTEGER PRIMARY KEY, a INTEGER)",
+    );
+    ok(&core, TENANT, "INSERT INTO s (k, a) VALUES (2, 1), (3, 1)");
+    assert_eq!(
+        code(
+            &core,
+            TENANT,
+            "INSERT INTO d (k, a) SELECT k, a FROM s ON CONFLICT (g) DO UPDATE SET a = EXCLUDED.a"
+        ),
+        "21000"
+    );
+    // DO NOTHING は先勝ち。
+    ok(
+        &core,
+        TENANT,
+        "INSERT INTO d (k, a) SELECT k, a FROM s ON CONFLICT (g) DO NOTHING",
+    );
+    assert_eq!(
+        grid(&core, TENANT, "SELECT k, a, g FROM d ORDER BY k"),
+        g(&[&["1", "1", "2"]])
+    );
+}
+
+/// 生成列への `SET g = DEFAULT` は何も代入しない項で、台帳の内容照合ハッシュの材料から除く
+/// （`SET g = DEFAULT, name = ..` の再送が `SET name = ..` と同じ文として一致する。`id` 指定形は
+/// 束縛後の SET 列でハッシュするため、述語形も同じ材料に揃える）。
+#[test]
+fn update_set_generated_default_is_not_hash_material() {
+    let path = unique_db_path("gen-w-ledger-upd");
+    let _gd = CleanupGuard(path.clone());
+    let core = EngineCore::from_storage(
+        Storage::open(&path).expect("open storage"),
+        Box::new(CpuScalarProvider),
+    );
+    mk(&core);
+    ok(
+        &core,
+        TENANT,
+        "INSERT INTO g (a, name) VALUES (1, 'x') USING OPERATION_ID 'i1'",
+    );
+    ok(
+        &core,
+        TENANT,
+        "UPDATE g SET b = DEFAULT, name = 'k' WHERE a = 1 USING OPERATION_ID 'u1'",
+    );
+    assert_eq!(
+        code(
+            &core,
+            TENANT,
+            "UPDATE g SET name = 'k' WHERE a = 1 USING OPERATION_ID 'u1'"
+        ),
+        "23505"
+    );
+    assert_eq!(
+        code(
+            &core,
+            TENANT,
+            "UPDATE g SET name = 'z' WHERE a = 1 USING OPERATION_ID 'u1'"
+        ),
+        "22023"
+    );
+}

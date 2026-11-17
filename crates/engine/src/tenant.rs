@@ -4009,6 +4009,47 @@ fn upsert_typed_rows_impl(
                 } else {
                     None
                 };
+            // 生成列（TABLE-50・Issue #3328）を含む UNIQUE 対象は、事前（write txn の外）の文内重複検査が
+            // 仮値 NULL を見て素通しするため、計算後のキーで文単位に重複を拒否する（同じ既存行を 2 回
+            // 更新して成功する経路を塞ぐ。束縛段が計算後の値で拒否済みの多層防御）。
+            if let (Some(g), UpsertTarget::Unique(indices)) = (&generated, target) {
+                let mut seen_keys: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
+                seen_keys.try_reserve(rows.len()).map_err(|_| {
+                    TenantWriteError::Storage(StorageError::Codec(
+                        "failed to reserve upsert batch target key set".to_string(),
+                    ))
+                })?;
+                for (row_idx, (id, orig_values)) in rows.iter().enumerate() {
+                    let row_id: u64 = match &new_row_ids {
+                        Some(ids) => ids.get(row_idx).map(|r| r.legacy_id()).ok_or_else(|| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(
+                                "row id allocation count mismatch".to_string(),
+                            ))
+                        })?,
+                        None => *id,
+                    };
+                    let proposed_embedding: &[f32] = match vector_idx {
+                        Some(idx) => vector_embedding_slice(&schema, idx, orig_values)?,
+                        None => &[],
+                    };
+                    let mut v = orig_values.to_vec();
+                    g.compute_values(row_id, proposed_embedding, &mut v, None)?;
+                    let Some(key) = crate::constraint::unique_key_from_values(indices, &v)
+                        .map_err(|m| {
+                            TenantWriteError::Catalog(CatalogError::Invalid(m.to_string()))
+                        })?
+                    else {
+                        continue;
+                    };
+                    if !seen_keys.insert(key) {
+                        return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                            "duplicate ON CONFLICT target key within the same UPSERT statement"
+                                .to_string(),
+                        )));
+                    }
+                }
+            }
             // `FOREIGN KEY` の `ON UPDATE` 参照アクション（Issue #1076）の連鎖起点。
             // `DO UPDATE` で実際に既存行を書き換えた場合のみ、書き換え前の全列値を
             // 積む（新規挿入行は「更新」ではないため対象外）。
