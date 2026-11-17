@@ -170,3 +170,43 @@ fn explicit_value_for_generated_column_is_rejected_with_428c9() {
         read_ready_for_query(&mut stream);
     }
 }
+
+/// 参照列の変更・削除・改名の依存検査（Issue #3331。TABLE-50 (3)）を psql 形（末尾 `;` の単独 simple query）で
+/// 流す。受理する形は `CommandComplete "ALTER TABLE"`、拒否する形は `ErrorResponse` の SQLSTATE で返り、
+/// どちらの後も `ReadyForQuery` へ戻る。意味論の確定オラクルは engine の `table50_generated_column_alter`。
+#[test]
+fn psql_shaped_alter_on_generated_columns() {
+    let (mut stream, _guard) = connect();
+    for sql in [
+        "CREATE TABLE g (a INTEGER, other INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED);",
+        "CREATE TABLE h (a INTEGER, b INTEGER GENERATED ALWAYS AS (a + 1) STORED, keep INTEGER);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), "CREATE TABLE");
+        read_ready_for_query(&mut stream);
+    }
+    for (sql, code) in [
+        ("ALTER TABLE g DROP COLUMN a;", "2BP01"),
+        ("ALTER TABLE g DROP COLUMN a RESTRICT;", "2BP01"),
+        ("ALTER TABLE g ALTER COLUMN a TYPE BIGINT;", "0A000"),
+        (
+            "ALTER TABLE g ALTER COLUMN b SET EXPRESSION AS (a);",
+            "0A000",
+        ),
+        ("ALTER TABLE g ALTER COLUMN other DROP EXPRESSION;", "55000"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, code);
+        read_ready_for_query(&mut stream);
+    }
+    for sql in [
+        "ALTER TABLE g RENAME COLUMN a TO a2;",
+        "ALTER TABLE g ALTER COLUMN other DROP EXPRESSION IF EXISTS;",
+        "ALTER TABLE g ALTER COLUMN b DROP EXPRESSION;",
+        "ALTER TABLE h DROP COLUMN a CASCADE;",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), "ALTER TABLE", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+}

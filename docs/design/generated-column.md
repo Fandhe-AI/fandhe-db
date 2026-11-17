@@ -234,15 +234,15 @@ SQLSTATE を含む個別の規則は TABLE-50 (1) のポインタとし、本記
 
 UPDATE は一致する行が 0 件なら検査点に到達せず成功する（書く行が無いため）。
 
-### ALTER の暫定ガード（最終形は #3331）
+### ALTER の暫定ガード（最終形は「Issue #3331 で確定した事項」節）
 
 | 操作 | 本 Issue での挙動 |
 | -- | -- |
-| 参照列の `DROP COLUMN` | `2BP01`（G9 の最終形。CASCADE は #3331） |
-| 参照列の `RENAME COLUMN` | `0A000`（式の追随は #3331） |
+| 参照列の `DROP COLUMN` | `2BP01`（G9 の最終形。`CASCADE` は #3331 で連鎖削除へ変更） |
+| 参照列の `RENAME COLUMN` | `0A000`（#3331 で式への追随へ変更） |
 | 参照列の `ALTER COLUMN TYPE` | `0A000`（固定文言 `cannot alter type of a column used by a generated column`。G9 の最終形） |
-| 生成列自身の `ALTER COLUMN TYPE` | `0A000`（`tracked: #3331`） |
-| 生成列自身の `SET／DROP DEFAULT` | `42601`（`tracked: #3331`） |
+| 生成列自身の `ALTER COLUMN TYPE` | `0A000`（#3331 で最終形として確定。`intentional`） |
+| 生成列自身の `SET／DROP DEFAULT` | `42601`（PG17 との突き合わせは #3332） |
 | 生成列自身の `DROP COLUMN`・`RENAME COLUMN`、表の改名・SET SCHEMA、参照しない列の変更、`SET／DROP NOT NULL`、制約・索引の追加 | 通る。生成式が保たれることをテストで固定した |
 
 ### ダンプ
@@ -273,3 +273,41 @@ SQL の INSERT・UPDATE・UPSERT の計算点を結線した。spec は TABLE-50
 ### 残す経路（`tracked: #3329`）
 
 COPY FROM・NoSQL・ビュー・INSTEAD OF・トリガ付きの表・トリガ本体の書き込み・FK の参照アクション・ファイル形 INSERT・生の RowInput は `0A000` のまま。MERGE は #3355。式で代入できない列型（NUMERIC 等）と一時表の生成列は `0A000` のままで、受け皿の Issue は未起票。PG17 実機との突き合わせ（`EXCLUDED.<生成列>`・UPDATE の `428C9` の文言差）は #3332。
+- データ出力（COPY ヘッダ・COPY 行・INSERT の列リストと値）は生成列を除く。生成列しか持たない表に行があれば固定文言の `Unsupported`（黙って省かない）。行つきのデータ往復は、行を書ける #3328 が結線した時点で往復テストを足す（`tracked: #3328`）。本 Issue は列リストの除外を単体テストで固定した。
+- データ出力（COPY ヘッダ・COPY 行・INSERT の列リストと値）は生成列を除く。生成列しか持たない表に行があれば固定文言の `Unsupported`（黙って省かない）。行つきのデータ往復は、行を書ける #3328 が結線した時点で往復テストを足す（`tracked: #3328`）。本 Issue は列リストの除外を単体テストで固定した。
+
+## Issue #3331 で確定した事項
+
+TABLE-50 (3)・TABLE-38 のポインタ。G9 の決定を次のとおり実装した（実装の正）。
+
+### 判定段と SQLSTATE
+
+「生成列か」「参照されているか」の判定はすべて DDL 権限ゲートの後（実行段）に置く。構文段の新しい拒否はカタログを見ない。固定文言に載せるのは利用者が書いた列名だけで、テナント・行・値は載せない。
+
+| 操作 | 挙動 | 段 |
+| -- | -- | -- |
+| 参照列の `RENAME COLUMN` | 同じ write txn で、生成列の正規描画と参照列を AST 経由で書き換える（再解析 → 識別子の一括写像 → 再束縛 → 往復一致 → 参照列集合の一致）。どの段で失敗しても `0A000`（固定文言）で全体を破棄する。文字列置換は使わない | 実行段 |
+| 参照列の `DROP COLUMN`（無指定・`RESTRICT`） | `2BP01` | 実行段 |
+| 参照列の `DROP COLUMN ... CASCADE` | 依存する生成列を先に削除し、続けて対象列を同じ txn で削除する。生成列は生成列を参照できないため連鎖の深さは 1。連鎖先・対象列に生成列以外の依存（PK・UNIQUE・CHECK・FK・ビュー・matview・ポリシー・トリガ・関数本体・SEQUENCE）があれば `2BP01` で全体を拒否する（部分削除なし）。連鎖する列の索引宣言と ACL は通常の DROP と同じく掃除する | 構文段で句を受理、依存判定は実行段 |
+| 依存の無い列の `DROP COLUMN ... CASCADE／RESTRICT` | 通常の DROP と同じく成功する（これまでは `42601`） | 同上 |
+| `DROP COLUMN IF EXISTS` | `42601` のまま（対象外） | 構文段 |
+| 参照列の `ALTER COLUMN TYPE` | `0A000`（固定文言 `cannot alter type of a column used by a generated column`）。G9 のとおり「再検証に通れば許す」案は採らない | 実行段 |
+| 生成列自身の `ALTER COLUMN TYPE`（`USING` を含む） | `0A000`（固定文言）。PG17 は全行を再計算して許すが、再計算の計算点（#3328）と全行の書き直し（#3330）が無いため受理しない。`intentional` | 実行段 |
+| `ALTER COLUMN <列> SET EXPRESSION AS (...)` | `0A000`（固定文言 `ALTER COLUMN ... SET EXPRESSION is not supported`。これまでは `42601`）。カタログを見ないので存在オラクルにならない。理由は上と同じで `intentional` | 構文段 |
+| 生成列の `SET DEFAULT`／`DROP DEFAULT` | `42601`（変更なし）。PG17 の分類との突き合わせは #3332 | 実行段 |
+| `ALTER COLUMN <生成列> DROP EXPRESSION [IF EXISTS]` | `generated = None` にする。行は書き換えず、値・NOT NULL・照合・索引・制約は保つ。最後の生成列が消えた表は encoder が自動でカタログ v16 より前のバイト列へ戻し、#3327 の暫定書き込み停止（生成列を持つ表の検査）も外れる | 実行段 |
+| `DROP EXPRESSION` を生成列でない列に適用 | `55000`（固定文言 `column is not a stored generated column`）。`IF EXISTS` なら何もせず成功する（PG17 の NOTICE は出さない。既知の差） | 実行段 |
+| `DROP EXPRESSION` で列が無い・予約列 | `42703`／`42601` | 実行段・構文段 |
+| 複数アクション | `DROP COLUMN ... CASCADE`・`DROP EXPRESSION` は複数アクション `ALTER TABLE` に含められる（同じ pass の `DROP COLUMN` と並べて記述順に適用）。連鎖で消えた列への後続アクションは `42703` で全体を破棄する。連鎖削除した生成列も所有 SEQUENCE の一括処理の対象に積む | 実行段 |
+
+### 公開 API の変更（BREAKING CHANGE）
+
+- `ValidatedAlterTableDropColumn` に `behavior: DropBehavior` を追加した。
+- `ValidatedAlterTable::AlterColumnDropExpression`・`AlterTableAction::AlterColumnDropExpression`・`SqlSurfaceError::ColumnNotGenerated` を追加した。
+
+### 対象外（受け皿）
+
+- 生成列自身の `ALTER COLUMN TYPE` と `SET EXPRESSION` の受理: 前提は #3328（計算点）と #3330（全行の書き直し）。受け皿の Issue は未起票（起票は承認待ち）。
+- `DROP COLUMN ... CASCADE` による生成列以外の依存の連鎖削除（TABLE-37 系）と NOTICE（`drop cascades to column ...`）: 未起票（起票は承認待ち）。
+- 行つきの表での SQL 経由の検証（値を保つ `DROP EXPRESSION`・CASCADE の往復）と、参照しない列の型変更が照合段を通ることの確認: #3328（計算点と照合段の結線後）。本 Issue は行ストアへ直接置いた行を使う catalog の単体テストで、行のバイト列が変わらないことを固定した。
+- `DROP COLUMN IF EXISTS`: 対象外（`42601` のまま）。

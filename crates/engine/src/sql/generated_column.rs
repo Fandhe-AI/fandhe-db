@@ -410,3 +410,52 @@ impl CompiledGeneratedColumns {
         Ok(())
     }
 }
+
+/// 列改名（`catalog::Storage::alter_table_rename_column`。TABLE-38・TABLE-50 (3) のポインタ、
+/// Issue #3331）で、永続化済みの生成列 `column` の式を `old` → `new` へ追随させた定義を返す。
+///
+/// `new_schema` は**改名済み**の列定義（生成列の定義は旧名のままで可）を持つスキーマ。手順は文字列
+/// 置換を使わず、保存テキストを untrusted として再解析 → 式木上の識別子写像（1 回の走査で一括適用）→
+/// [`bind_generated_column`]（再束縛・正規描画・往復一致・上限検証の唯一の実装）→ 参照列集合の一致
+/// 確認の順で行う。どの段で失敗しても `Err`（呼び出し元は `0A000` に写像し txn を破棄する。fail-closed）。
+pub(crate) fn rename_column_in_generated(
+    new_schema: &TableSchema,
+    column: &ColumnDef,
+    def: &GeneratedColumnDef,
+    old: &str,
+    new: &str,
+) -> Result<GeneratedColumnDef, SqlSurfaceError> {
+    let parsed = crate::sql::allowlist::parse_generated_expression_text(&def.expression)?;
+    let renamed = crate::sql::check_constraint::map_expr_idents(&parsed, &|name| {
+        if name == old {
+            new.to_string()
+        } else {
+            name.to_string()
+        }
+    });
+    let generated_names: Vec<String> = new_schema
+        .columns
+        .iter()
+        .filter(|c| c.generated.is_some())
+        .map(|c| c.name.clone())
+        .collect();
+    let rebuilt = bind_generated_column(&renamed, column, new_schema, &generated_names)?;
+    let mut expected: Vec<&str> = def
+        .referenced_columns
+        .iter()
+        .map(|c| if c == old { new } else { c.as_str() })
+        .collect();
+    let mut actual: Vec<&str> = rebuilt
+        .referenced_columns
+        .iter()
+        .map(String::as_str)
+        .collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
+    if expected != actual {
+        return Err(SqlSurfaceError::unsupported(
+            "renamed generated column expression references a different column set",
+        ));
+    }
+    Ok(rebuilt)
+}
