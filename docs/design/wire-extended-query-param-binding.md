@@ -489,6 +489,23 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   明示トランザクション）、`crates/wire-server/tests/wire_sql50_update_delete_param.rs`
   （text／binary の Bind・型不一致・テナント境界）、`sql::params` の単体テスト（行値の位置判定）。
 
+## 行値比較の成分の `$n`（パターン 12。Issue #3257。SQL-9・SQL-75・WIRE-12・RLS-10 のポインタ）
+
+`SELECT`／`UPDATE`／`DELETE` の `WHERE` 内の行値比較 `(c1, ..., ck) op (d1, ..., dk)` の成分のうち、成分全体が `$n` 単独の位置を受理する（親 #3254・評価は #3256）。
+
+- **受理形と判定**: パターン 9 と同じ文種・`WHERE` 領域・左右の境界規則。判定は `sql::params::row_compare_param_slots` に集約し、受理（`validate_param_positions`）・型推論（`infer_param_positions`）・Describe 用ダミー置換が同じ表を参照する。括弧の対応は `row_compare_ahead` と同じ規則（括弧深さ 1・角括弧深さ 0 の `,` で区切る）で、成分数は `MAX_ROW_COMPARE_COMPONENTS` 以下・左右同数。
+- **型**: 同じ位置の相手成分が裸の列ならその列の型（左右どちらの辺の `$n` も可）。相手も `$n` なら型を決められず、宣言型が無ければ `42P18`（パターン 9 と同じ）。
+- **序数**: 展開で生成される比較葉は等価述語のダミーフラグの序数に数えられない（束縛段が別カウンタ・空フラグで束縛する）。行値の `$n` は序数に数えず、既存の序数機構には触れない。
+- **Describe・構造検証用の型付きダミー**: 生成葉は実リテラルとして検証されるため、String 種別の `$n` の既定ダミー `'0'` では DATE・UUID・ENUM 等の列が `22007`／`22P02` になる。そこで相手列の型で有効な値（DATE `'2000-01-01'`、TIMESTAMP、TIMESTAMPTZ は明示オフセット付き、TIME、INTERVAL、UUID、BYTEA、ENUM は先頭ラベル。TEXT・NUMERIC 等は `'0'` のまま）を `core.rs` が上書き表として作り、`substitute_dummy_typed_with` へ渡す。ダミーは固定の定数かカタログのラベルだけで、利用者入力を含まない。Parse の構造検証と Describe にだけ使い、Bind は常に実値で再置換して再 parse する。`BEGIN` 時点のスナップショットでの再 parse のため `PreparedSql` が上書き表を保持する。
+- **意図的な拒否（`intentional:`。いずれも fail-closed）**:
+  - 相手成分がリテラル・式・修飾列の位置の `$n`、`$n` が式の内側（`$1 + 1`）・型キャスト付きの形は `42601`（安全に型を決められないため登録しない）。
+  - `EXPLAIN` 前置・`WITH`・集合演算・JOIN・派生表は先頭語・既存の一律拒否のまま `42601`（フラグの序数が検証できないため。パターン 9 と同じ）。
+  - 型付きダミーを持たない列型（JSON 系・配列・ビット列・ベクトル系）の相手は Parse で固定文言の `0A000`。
+  - NULL のバインドはリテラル `NULL` 成分と同じ SQLSTATE（現状は裸の識別子として解決され `42703`）。行値の NULL 成分の評価は本 Issue の対象外で、スカラー比較と同じ規則を維持する。
+- **EXPLAIN**: 出力は閉じた語彙で値・述語テキストを含まず、展開後の束縛結果から導かれる。等価な展開形を手で書いた文の EXPLAIN と完全に一致し、テナントによらず同一（述語の描画器は新設しない。SQL-75・SQL-27 のポインタ）。
+- **RLS**: 展開は既存の述語木だけを生成し、テナント境界・ポリシー・`visible()` の合成点には手を入れない。生成葉の束縛結果の `visible()` の有無を取りこぼさないよう伝播する。ポリシー式（`CREATE/ALTER POLICY`）での行値比較は従来どおり `0A000`（親 #3254）。
+- **検証**: `tests/table_rls/prepared_row_compare.rs`（リテラル形とのパリティ・型付きダミー・序数）・`tests/table_rls/rls10_row_compare_paths.rs`（T2／T3 の越境）・`tests/sql_named/sql_where_row_compare.rs`（EXPLAIN）・`crates/wire-server/tests/wire_sql/wire_row_compare.rs`（wire）。
+
 ## スコープ外・申し送り
 
 - wire 側（Parse の宣言型受理・`ParameterDescription`・Bind の値保持・

@@ -291,6 +291,98 @@ fn insert_table_name_only(tokens: &[crate::sql::lexer::Token]) -> Option<String>
     }
 }
 
+/// 行値比較の `$n` のダミー型照会用に、文中で実際に表として参照される名前（出現順）を集める
+/// （Issue #3257）。`FROM`／`JOIN`／`DELETE ... USING` 直後の関係名（スキーマ修飾は表名部分、
+/// カンマ区切りの後続の表を含む）だけを拾い、表参照ではない `FROM`（`EXTRACT(f FROM x)`・
+/// `SUBSTRING`／`TRIM`／`OVERLAY`／`POSITION` の括弧内と `IS DISTINCT FROM`）と
+/// `USING OPERATION_ID` は拾わない。`infer_param_types` から呼ばれる。
+fn row_compare_relation_names(tokens: &[crate::sql::lexer::Token]) -> Vec<String> {
+    use crate::sql::lexer::{Keyword, Token};
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Ident(x)) if x.eq_ignore_ascii_case(w));
+    let is_delete = word(tokens.first(), "DELETE");
+    let mut out: Vec<String> = Vec::new();
+    // 括弧ごとの「関数構文の括弧（内側の FROM は表参照ではない）」フラグ。
+    let mut stack: Vec<bool> = Vec::new();
+    let mut k = 0usize;
+    while let Some(tok) = tokens.get(k) {
+        match tok {
+            Token::Punct('(') => {
+                let func = matches!(
+                    k.checked_sub(1).and_then(|p| tokens.get(p)),
+                    Some(Token::Ident(w)) if ["EXTRACT", "SUBSTRING", "TRIM", "OVERLAY", "POSITION"]
+                        .iter()
+                        .any(|f| w.eq_ignore_ascii_case(f))
+                );
+                stack.push(func);
+            }
+            Token::Punct(')') => {
+                stack.pop();
+            }
+            _ => {}
+        }
+        let in_func = stack.last().copied().unwrap_or(false);
+        let prev = k.checked_sub(1).and_then(|p| tokens.get(p));
+        let is_head = !in_func
+            && match tok {
+                Token::Keyword(Keyword::From) => !word(prev, "DISTINCT"),
+                Token::Ident(w) if w.eq_ignore_ascii_case("JOIN") => true,
+                Token::Ident(w) if w.eq_ignore_ascii_case("USING") => {
+                    is_delete && !word(tokens.get(k + 1), "OPERATION_ID")
+                }
+                _ => false,
+            };
+        k += 1;
+        if !is_head {
+            continue;
+        }
+        // 関係名 [別名] {, 関係名 [別名]}
+        loop {
+            match tokens.get(k) {
+                Some(Token::Ident(n) | Token::QuotedNull(n)) => out.push(n.clone()),
+                Some(Token::QualifiedIdent { name, .. }) => out.push(name.clone()),
+                _ => break,
+            }
+            k += 1;
+            if word(tokens.get(k), "AS") {
+                k += 1;
+                if matches!(tokens.get(k), Some(Token::Ident(_) | Token::QuotedNull(_))) {
+                    k += 1;
+                }
+            } else if matches!(tokens.get(k), Some(Token::QuotedNull(_))) {
+                // 引用付きの暗黙別名（`FROM u "U"`）も読み飛ばす。
+                k += 1;
+            } else if let Some(Token::Ident(a)) = tokens.get(k) {
+                const NOT_ALIAS: [&str; 11] = [
+                    "JOIN",
+                    "INNER",
+                    "LEFT",
+                    "RIGHT",
+                    "FULL",
+                    "CROSS",
+                    "ON",
+                    "USING",
+                    "SET",
+                    "RETURNING",
+                    "OFFSET",
+                ];
+                if !NOT_ALIAS.iter().any(|w| a.eq_ignore_ascii_case(w)) {
+                    k += 1;
+                }
+            }
+            if matches!(tokens.get(k), Some(Token::Punct(','))) {
+                k += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[path = "core/row_compare_relation_names_tests.rs"]
+mod row_compare_relation_names_tests;
+
 /// トークン列のうち括弧深さ 0 で最初の `FROM` の添字を返す（Issue #1188）。`EXTRACT(field
 /// FROM src)` の括弧内 `FROM` をテーブル名の手掛かりと取り違えないための走査で、
 /// prepared statement のパラメータ型推論（`EngineCore::prepare_*`）が呼ぶ。
@@ -3072,6 +3164,18 @@ fn read_only_permits(parsed: &ParsedSql) -> bool {
     }
 }
 
+/// 行値比較の成分の `$n`（パターン 12。Issue #3257）の Describe 用ダミー候補
+/// （トークン添字・パラメータ番号・ダミー）。種別が `String` の番号のものだけが採用される。
+type RowDummyCandidate = (usize, u16, crate::sql::lexer::Token);
+
+/// [`EngineCore::infer_param_types`] の結果（`$n` ごとの型公告・宣言型の変換可否判定の入力・行値比較の
+/// Describe 用ダミー候補）。
+type InferredParams = (
+    Vec<crate::sql::params::PreparedParamType>,
+    Vec<crate::sql::param_coerce::ParamCheck>,
+    Vec<RowDummyCandidate>,
+);
+
 /// [`EngineCore::parse_sql_prepared`] の結果（Issue #935・WIRE-12・TASK-217）。
 /// 拡張クエリプロトコルの Parse が `$n` を含む SQL テキストを値未確定のまま
 /// 構造検証した「束縛前テンプレート」を運ぶ。行・台帳・世代のいずれにも触れて
@@ -3116,6 +3220,10 @@ pub struct PreparedSql {
     /// （PR #1012 Cursor Bugbot 指摘対応: `$n` を含まない等価述語では `false`
     /// のままとなり、実リテラルは通常の Describe と同じく必ず検証される）。
     where_equality_dummy_flags: Vec<bool>,
+    /// 行値比較の成分の `$n`（パターン 12。Issue #3257）に使った、相手列の型の Describe 用ダミー
+    /// （トークン添字 → ダミー）。`BEGIN` 時点のスナップショットでの再 parse
+    /// （[`EngineCore::reparse_dummy_with_snapshot`]）が `dummy_parsed` と同じ置換を再現するために保持する。
+    dummy_overrides: Vec<(usize, crate::sql::lexer::Token)>,
     /// `$n` ごとの型公告（`param_types().len() == param_count`。WIRE-12）。
     /// Parse 時点のカタログ（スキーマ）だけから導出し、行には触れない。
     param_types: Vec<crate::sql::params::PreparedParamType>,
@@ -8916,6 +9024,7 @@ impl EngineCore {
                 )),
                 literal_skip: crate::sql::parser::LiteralSkip::NONE,
                 where_equality_dummy_flags: Vec::new(),
+                dummy_overrides: Vec::new(),
                 param_types: Vec::new(),
                 declared: Vec::new(),
                 typed_positions: crate::sql::params::TypedPositions::default(),
@@ -8970,7 +9079,7 @@ impl EngineCore {
         // 式内 `$n`（`1 + $1` 等）は文字列ダミーでは定数畳み込み／束縛の型検査に落ちるため、
         // 推論を parse より前に置く。推論不能（`42P18`）のときだけ、構文エラー（`42601`）を
         // 先に返す（PostgreSQL と同じ優先順位）ため文字列ダミーで parse を試す。
-        let (param_types, param_checks) = match self.infer_param_types(
+        let (param_types, param_checks, row_dummies) = match self.infer_param_types(
             &tokens,
             param_count,
             declared,
@@ -9010,7 +9119,21 @@ impl EngineCore {
             };
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
-        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
+        let dummy_overrides: Vec<(usize, crate::sql::lexer::Token)> = row_dummies
+            .into_iter()
+            .filter(|(_, n, _)| {
+                usize::from(*n)
+                    .checked_sub(1)
+                    .and_then(|k| kinds.get(k))
+                    .is_some_and(|k| *k == crate::sql::params::ParamLiteralKind::String)
+            })
+            .map(|(i, _, tok)| (i, tok))
+            .collect();
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed_with(
+            &tokens,
+            &kinds,
+            &dummy_overrides.iter().cloned().collect(),
+        );
         let parse_hits = crate::sql::temp_catalog::RelationHits::default();
         let dummy_parsed = {
             let positions: Vec<usize> = tokens
@@ -9078,6 +9201,7 @@ impl EngineCore {
             dummy_parsed,
             literal_skip,
             where_equality_dummy_flags,
+            dummy_overrides,
             param_types,
             declared: (0..usize::from(param_count))
                 .map(|i| declared.get(i).copied().flatten())
@@ -9118,13 +9242,7 @@ impl EngineCore {
         param_count: u16,
         declared: &[Option<crate::sql::params::DeclaredParamType>],
         read_snap: Option<&redb::ReadTransaction>,
-    ) -> Result<
-        (
-            Vec<crate::sql::params::PreparedParamType>,
-            Vec<crate::sql::param_coerce::ParamCheck>,
-        ),
-        crate::sql::allowlist::SqlSurfaceError,
-    > {
+    ) -> Result<InferredParams, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::SqlSurfaceError;
         use crate::sql::exec::ColumnMeta;
         use crate::sql::lexer::Token;
@@ -9148,15 +9266,27 @@ impl EngineCore {
             match tokens.first() {
                 Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
                     Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                    // スキーマ修飾の対象表（`UPDATE public.t`）は表名部分を引く（row_compare_relation_names と同じ扱い）。
+                    Some(Token::QualifiedIdent { name, .. }) => Some(name.clone()),
                     _ => None,
                 },
                 // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
                 // 引く `FROM` は括弧深さ 0 の最初のものに限る。
                 _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
                     Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                    // スキーマ修飾の参照表（`SELECT ... FROM public.t`・`DELETE FROM public.t`）も表名部分を引く。
+                    Some(Token::QualifiedIdent { name, .. }) => Some(name.clone()),
                     _ => None,
                 }),
             }
+        };
+        // Issue #3257: 行値比較の成分の `$n` が当たる列と、相手列を引く関係名の一覧。
+        // 主表で引けない列は `FROM`／`JOIN`／`USING` の関係から引く（下の `WhereColumn` と後段で共有）。
+        let row_slots = crate::sql::params::row_compare_column_slots(tokens);
+        let rels = if row_slots.is_empty() {
+            Vec::new()
+        } else {
+            row_compare_relation_names(tokens)
         };
         // 表スキーマの引き先。再 Parse は `BEGIN` 時点のスナップショット、通常の Parse は最新カタログ。
         let schema_of = |table: &str| -> Option<crate::catalog::TableSchema> {
@@ -9333,6 +9463,15 @@ impl EngineCore {
                                 }
                                 None => where_table.as_deref().and_then(|t| column_type(t, col)),
                             };
+                            // 行値比較の相手列は主表以外（結合・`FROM`・`USING` の相手表）にもありうる。
+                            // 行値比較の列に限り、追加関係から型を引く（整数・真偽値でも Text に落とさない）。
+                            let ty = ty.or_else(|| {
+                                if row_slots.values().any(|c| c == col) {
+                                    rels.iter().find_map(|t| column_type(t, col))
+                                } else {
+                                    None
+                                }
+                            });
                             (ty, Some(ParamContextKind::Operator))
                         }
                         // Issue #3297: 結合 DML の `<公開名>.<列> = $n`。修飾子が指す表の列で引く
@@ -9475,7 +9614,46 @@ impl EngineCore {
                 }
             });
         }
-        Ok((out, checks))
+        // Issue #3257・パターン 12: 行値比較の成分の `$n` に使う、相手列の型の Describe 用ダミー候補
+        // （トークン添字・番号・ダミー）。種別が `String` のものだけが後段で採用される。
+        let mut row_dummies: Vec<(usize, u16, Token)> = Vec::new();
+        // 参照表一覧と候補はスロットごとに作り直さず 1 回だけ構築して使い回す（上で構築済み）。
+        let candidates: Vec<&str> = where_table
+            .as_deref()
+            .into_iter()
+            .chain(rels.iter().map(String::as_str))
+            .collect();
+        for (i, col) in row_slots {
+            let Some(Token::Param(n)) = tokens.get(i) else {
+                continue;
+            };
+            // 相手列は主表だけでなく、文中の `FROM`／`JOIN`／`USING` 直後の表名（結合・`UPDATE ... FROM`・
+            // `DELETE ... USING` の相手表）からも引く。主表で引けない列を既定ダミー `'0'` のまま
+            // 検証に回すと DATE／UUID／ENUM 列で Parse／Describe が誤って失敗するため。
+            // 一時表は一時コア（`temp_route`）がこの関数を呼ぶので、`column_type` が一時表も引ける。
+            // 候補は主表を先頭に、実際に表として参照される名前だけ（`row_compare_relation_names`）。
+            // 疑似 `id`（`ColumnMeta::Id`）が解決した時点で探索を終える（後続の無関係な表の物理 `id` へ進まない）。
+            let resolved_ty = candidates
+                .iter()
+                .copied()
+                .find_map(|t| match column_type(t, &col) {
+                    Some(PreparedParamType::Column(ColumnMeta::Id)) => Some(None),
+                    Some(PreparedParamType::Column(ColumnMeta::Scalar { ty, .. })) => {
+                        Some(Some(ty))
+                    }
+                    _ => None,
+                });
+            {
+                let Some(Some(ty)) = resolved_ty else {
+                    continue;
+                };
+                if let Some(tok) = crate::sql::params::row_compare_dummy_token(&ty)? {
+                    row_dummies.push((i, *n, tok));
+                }
+            }
+        }
+        row_dummies.sort_by_key(|(i, _, _)| *i);
+        Ok((out, checks, row_dummies))
     }
 
     /// Bind（拡張クエリプロトコルの 'B' 種別。Issue #935・WIRE-12・TASK-217）:
@@ -12263,7 +12441,11 @@ impl EngineCore {
             .iter()
             .map(|t| t.literal_kind())
             .collect();
-        let dummy_tokens = crate::sql::params::substitute_dummy_typed(&prepared.tokens, &kinds);
+        let dummy_tokens = crate::sql::params::substitute_dummy_typed_with(
+            &prepared.tokens,
+            &kinds,
+            &prepared.dummy_overrides.iter().cloned().collect(),
+        );
         let positions: Vec<usize> = prepared
             .tokens
             .iter()
