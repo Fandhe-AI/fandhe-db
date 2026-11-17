@@ -548,7 +548,7 @@ fn legacy_row_identity_table_is_rejected_with_a_fixed_message() {
 }
 
 #[test]
-fn temporary_and_explicit_transaction_forms_are_rejected() {
+fn temporary_is_rejected_and_explicit_transaction_applies_atomically() {
     let (_p, _gd, core) = fixture("gen-add-forms");
     mk(&core);
     let before = dump(&core, TENANT);
@@ -566,16 +566,27 @@ fn temporary_and_explicit_transaction_forms_are_rejected() {
         )
         .expect_err("temp table generated column");
     assert_eq!(err.wire_code(), "0A000");
-    // 明示トランザクションの中の DDL。
+    // 明示トランザクションの中の DDL（Issue #3313 で積めるようになった）。ROLLBACK は痕跡を残さない。
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(&c, &mut session, &mut txn, ADD_G)
-        .expect_err("DDL in explicit transaction");
-    assert_eq!(err.wire_code(), "0A000");
-    let _ = core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, ADD_G)
+        .expect("generated ADD COLUMN in explicit transaction");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
     assert_eq!(dump(&core, TENANT), before);
+    assert_eq!(code(&core, TENANT, "SELECT g FROM t"), "42703");
+    // COMMIT は全行の計算結果を原子的に確定する。
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, ADD_G)
+        .expect("generated ADD COLUMN in explicit transaction");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+    assert_eq!(
+        grid(&core, TENANT, "SELECT a, g FROM t ORDER BY a"),
+        g(&[&["1", "2"], &["2", "4"]])
+    );
 }
 
 #[test]
