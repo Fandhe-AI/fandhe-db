@@ -82,21 +82,7 @@ fn is_literal_word(n: &str) -> bool {
 
 /// 括弧なしで書ける SQL 値関数（`CURRENT_DATE` 等）か。列名ではないので列探索・未知列判定から除外する。
 fn is_value_function_keyword(n: &str) -> bool {
-    [
-        "current_date",
-        "current_time",
-        "current_timestamp",
-        "localtime",
-        "localtimestamp",
-        "current_user",
-        "session_user",
-        "user",
-        "current_role",
-        "current_catalog",
-        "current_schema",
-    ]
-    .iter()
-    .any(|w| n.eq_ignore_ascii_case(w))
+    crate::sql::lexer::is_value_function_keyword(n)
 }
 
 fn find_col<'a>(cols: &'a [String], name: &str) -> Option<&'a String> {
@@ -692,6 +678,7 @@ mod tests {
         Ok(match t.table() {
             "docs" => Some(vec!["id".into(), "lang".into(), "title".into()]),
             "other" => Some(vec!["id".into(), "k".into(), "lang".into()]),
+            "people" => Some(vec!["id".into(), "user".into(), "current_user".into()]),
             "opaque" => None,
             _ => None,
         })
@@ -784,6 +771,17 @@ mod tests {
             b.tokens,
             tokenize("SELECT lang FROM other o WHERE o.k = 'x'").expect("t")
         );
+    }
+
+    #[test]
+    fn left_columns_named_like_session_functions_are_bound_as_outer_refs() {
+        // 本エンジンの値関数は日時系 5 種のみ。`user` 等は通常の識別子として外部参照に束縛する。
+        let p = TableRef::with_alias("people", "p");
+        for col in ["user", "current_user"] {
+            let sql = format!("SELECT lang FROM other WHERE k = {col}");
+            let b = bind(&sql, std::slice::from_ref(&p)).expect("bind");
+            assert!(b.binding.is_correlated(), "{col} must bind as outer ref");
+        }
     }
 
     #[test]
