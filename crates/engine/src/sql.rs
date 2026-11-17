@@ -666,6 +666,10 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query` は `CommandComplete` タグ `CLOSE CURSOR`
     /// （件数を持たない固定タグ）を返す。
     CloseCursor,
+    /// `MOVE [<向き>] { FROM | IN } <name>`（Issue #3336・WIRE-27）が成功したことを示す応答。
+    /// 値は同じ向きの `FETCH` が返す行数。行は返さず、`wire-server::simple_query` は
+    /// `CommandComplete` タグ `MOVE <n>` のみを送出する。BREAKING CHANGE: 公開 enum への variant 追加。
+    Move(u64),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（TASK-202・SQL-23。
     /// Issue #900）がセッション経由の実行経路で成功したことを示す応答。DDL
     /// 権限ゲート（`sql::ddl::require_ddl_permission`）・実行本体

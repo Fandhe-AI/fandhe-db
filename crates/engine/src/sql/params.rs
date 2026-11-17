@@ -1715,6 +1715,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         Some(Token::Ident(name))
             if name.eq_ignore_ascii_case("DECLARE")
                 || name.eq_ignore_ascii_case("FETCH")
+                || name.eq_ignore_ascii_case("MOVE")
                 || name.eq_ignore_ascii_case("CLOSE")
     ) && tokens.iter().any(|t| matches!(t, Token::Param(_)))
     {

@@ -1,4 +1,4 @@
-//! カーソル（`DECLARE`/`FETCH`/`CLOSE`。WIRE-15・TASK-218）の構文受理と
+//! カーソル（`DECLARE`/`FETCH`/`MOVE`/`CLOSE`。WIRE-15・TASK-218・WIRE-27）の構文受理と
 //! セッション内保持状態を提供する。
 //!
 //! 責務境界: `DECLARE <name> [SCROLL | NO SCROLL | INSENSITIVE | ASENSITIVE]... CURSOR
@@ -6,7 +6,7 @@
 //! `SELECT`〔SQL-13・SQL-14〕・広域取得 `SELECT`〔SQL-15〕・JOIN〔CTE 入力を含む〕・集合演算に限る）の
 //! 構造検証は既存の [`crate::sql::allowlist::validate_cursor_query_tokens`] へそのまま委譲する
 //! （第 2 のパーサを作らない設計）。本モジュールは
-//! (1) `DECLARE`/`FETCH`/`CLOSE` 自体の規範形トークン検証、
+//! (1) `DECLARE`/`FETCH`/`MOVE`/`CLOSE` 自体の規範形トークン検証（`FETCH`/`MOVE` は向きの文法を共有）、
 //! (2) カーソル名の識別子検証、
 //! (3) 確定済み [`crate::sql::exec::QueryResult`] を保持・払い出す
 //! [`CursorRegistry`]、の 3 点を担う。
@@ -106,9 +106,32 @@ pub enum CursorStatement {
         /// を再利用する）。`ALL` は [`FetchCount::All`]。
         direction: FetchDirection,
     },
+    /// `MOVE`（Issue #3336・WIRE-27）。向き・件数は `Fetch` と同一の意味で、行を返さず
+    /// 位置だけを動かす。BREAKING CHANGE: 公開 enum への variant 追加（網羅 match の更新が必要）。
+    Move {
+        name: String,
+        direction: FetchDirection,
+    },
     Close {
         name: String,
     },
+}
+
+/// `FETCH`／`MOVE` の構文解析を共有するための文の種別（エラー文言の出し分け専用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorMotion {
+    Fetch,
+    Move,
+}
+
+impl CursorMotion {
+    /// エラー文言に埋め込む文名（英語の固定文言）。
+    fn label(self) -> &'static str {
+        match self {
+            CursorMotion::Fetch => "FETCH",
+            CursorMotion::Move => "MOVE",
+        }
+    }
 }
 
 /// カーソル名の識別子検証（テーブル名・列名と同じ [`crate::catalog::
@@ -366,28 +389,55 @@ pub(crate) fn validate_fetch_tokens(
     tokens: &[Token],
     result_limits: &crate::result_limits::ResultLimits,
 ) -> Result<CursorStatement, SqlSurfaceError> {
+    let (name, direction) = parse_motion_tokens(tokens, result_limits, CursorMotion::Fetch)?;
+    Ok(CursorStatement::Fetch { name, direction })
+}
+
+/// `MOVE [ <direction> ] { FROM | IN } <name>`（Issue #3336・WIRE-27・WIRE-15）。
+///
+/// 向きと件数の文法・上限検証・拒否集合は `FETCH` と完全に同一（[`validate_fetch_tokens`] と
+/// 共通の [`parse_motion_tokens`] を呼ぶ薄い入口）。違いはエラー文言が `MOVE` になることだけ。
+/// 先頭トークンが `MOVE`（大小無視）であることは呼び出し元（`core.rs::parse_tokens`）が確認済みの前提。
+pub(crate) fn validate_move_tokens(
+    tokens: &[Token],
+    result_limits: &crate::result_limits::ResultLimits,
+) -> Result<CursorStatement, SqlSurfaceError> {
+    let (name, direction) = parse_motion_tokens(tokens, result_limits, CursorMotion::Move)?;
+    Ok(CursorStatement::Move { name, direction })
+}
+
+/// `FETCH`／`MOVE` が共有する構文解析本体。`kind` はエラー文言の出し分けにだけ使う。
+fn parse_motion_tokens(
+    tokens: &[Token],
+    result_limits: &crate::result_limits::ResultLimits,
+    kind: CursorMotion,
+) -> Result<(String, FetchDirection), SqlSurfaceError> {
     // 末尾の単一 `;` を受理する（Issue #3171）。
     let tokens = crate::sql::lexer::strip_one_trailing_semicolon(tokens);
     let rest = tokens.split_first().map_or(&[][..], |(_, tail)| tail);
-    let (direction, rest) = parse_fetch_direction(rest, result_limits)?;
+    let (direction, rest) = parse_fetch_direction(rest, result_limits, kind)?;
     let rest = match rest.split_first() {
         Some((Token::Keyword(Keyword::From), tail)) => tail,
         Some((Token::Ident(w), tail)) if w.eq_ignore_ascii_case("IN") => tail,
         _ => return Err(SqlSurfaceError::unsupported("expected FROM or IN")),
     };
-    let (name_token, rest) = rest
-        .split_first()
-        .ok_or_else(|| SqlSurfaceError::unsupported("malformed FETCH statement"))?;
+    let (name_token, rest) = rest.split_first().ok_or_else(|| {
+        SqlSurfaceError::unsupported(format!("malformed {} statement", kind.label()))
+    })?;
     let (Token::Ident(raw_name) | Token::QuotedNull(raw_name)) = name_token else {
-        return Err(SqlSurfaceError::unsupported("malformed FETCH statement"));
+        return Err(SqlSurfaceError::unsupported(format!(
+            "malformed {} statement",
+            kind.label()
+        )));
     };
     let name = validate_cursor_name(raw_name)?;
     if !rest.is_empty() {
-        return Err(SqlSurfaceError::unsupported(
-            "unsupported clause after FETCH statement",
-        ));
+        return Err(SqlSurfaceError::unsupported(format!(
+            "unsupported clause after {} statement",
+            kind.label()
+        )));
     }
-    Ok(CursorStatement::Fetch { name, direction })
+    Ok((name, direction))
 }
 
 /// `FROM`／`IN` の直前（向き語の後ろに件数が無い）かどうか。
@@ -401,8 +451,12 @@ fn at_from_or_in(rest: &[Token]) -> bool {
 
 /// 先頭の `+`／`-` 符号（任意）と `u32` に収まる整数を読み、`(負か, 絶対値, 残り)` を返す。
 /// 符号の重複・符号のみ・小数・`u32` 超過はすべて `42601`。
-fn parse_signed_u32(rest: &[Token]) -> Result<(bool, u32, &[Token]), SqlSurfaceError> {
-    let malformed = || SqlSurfaceError::unsupported("malformed FETCH statement");
+fn parse_signed_u32(
+    rest: &[Token],
+    kind: CursorMotion,
+) -> Result<(bool, u32, &[Token]), SqlSurfaceError> {
+    let malformed =
+        || SqlSurfaceError::unsupported(format!("malformed {} statement", kind.label()));
     let (negative, rest) = match rest.split_first() {
         Some((Token::Punct('-'), tail)) => (true, tail),
         Some((Token::Punct('+'), tail)) => (false, tail),
@@ -411,9 +465,9 @@ fn parse_signed_u32(rest: &[Token]) -> Result<(bool, u32, &[Token]), SqlSurfaceE
     let (Token::Number(raw), after) = rest.split_first().ok_or_else(malformed)? else {
         return Err(malformed());
     };
-    let magnitude: u32 = raw
-        .parse()
-        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed FETCH count: {raw}")))?;
+    let magnitude: u32 = raw.parse().map_err(|_| {
+        SqlSurfaceError::unsupported(format!("malformed {} count: {raw}", kind.label()))
+    })?;
     Ok((negative, magnitude, after))
 }
 
@@ -446,8 +500,10 @@ fn rows_direction(
 fn parse_fetch_direction<'a>(
     rest: &'a [Token],
     result_limits: &crate::result_limits::ResultLimits,
+    kind: CursorMotion,
 ) -> Result<(FetchDirection, &'a [Token]), SqlSurfaceError> {
-    let malformed = || SqlSurfaceError::unsupported("malformed FETCH statement");
+    let malformed =
+        || SqlSurfaceError::unsupported(format!("malformed {} statement", kind.label()));
     let next_one = || -> Result<FetchCount, SqlSurfaceError> {
         crate::sql::parser::validate_search_limit_with(1, result_limits).map(FetchCount::Rows)
     };
@@ -478,7 +534,7 @@ fn parse_fetch_direction<'a>(
     }
     if is("ABSOLUTE") || is("RELATIVE") {
         let absolute = is("ABSOLUTE");
-        let (negative, magnitude, after) = parse_signed_u32(tail)?;
+        let (negative, magnitude, after) = parse_signed_u32(tail, kind)?;
         let magnitude = i64::from(magnitude);
         let value = if negative { -magnitude } else { magnitude };
         let direction = if absolute {
@@ -511,14 +567,14 @@ fn parse_fetch_direction<'a>(
                 return Ok((direction, after));
             }
         }
-        let (negative, magnitude, after) = parse_signed_u32(tail)?;
+        let (negative, magnitude, after) = parse_signed_u32(tail, kind)?;
         return Ok((
             rows_direction(backward, negative, magnitude, result_limits)?,
             after,
         ));
     }
     // 件数のみ（`FETCH n`・`FETCH -n`・`FETCH +n`）。
-    let (negative, magnitude, after) = parse_signed_u32(rest)?;
+    let (negative, magnitude, after) = parse_signed_u32(rest, kind)?;
     Ok((
         rows_direction(false, negative, magnitude, result_limits)?,
         after,
@@ -912,6 +968,39 @@ impl CursorRegistry {
         Ok(())
     }
 
+    /// 不在（`34000`）と NO SCROLL での後退走査（`55000`）の共通前段。`fetch`／`move_cursor` が
+    /// 同一の判定順を共有する（拒否時は位置を変えない）。
+    fn checked_cursor_mut(
+        &mut self,
+        name: &str,
+        direction: FetchDirection,
+    ) -> Result<&mut OpenCursor, SqlSurfaceError> {
+        let cursor = self
+            .cursors
+            .get_mut(name)
+            .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
+        if cursor.scroll != CursorScroll::Scroll
+            && cursor.position.requires_backward_scan(direction)
+        {
+            return Err(SqlSurfaceError::CursorCanOnlyScanForward);
+        }
+        Ok(cursor)
+    }
+
+    /// `MOVE`（Issue #3336・WIRE-27）。`fetch` と同じ前段検査・位置計算で位置だけを動かし、
+    /// 同じ向きの `FETCH` が返す行数（`MOVE n` の n）を返す。行は複製しないため `ALL` の
+    /// 行数上限（`54000`）は適用しない（結果メモリが増えない）。拒否時は位置不変。
+    pub(crate) fn move_cursor(
+        &mut self,
+        name: &str,
+        direction: FetchDirection,
+    ) -> Result<u64, SqlSurfaceError> {
+        let cursor = self.checked_cursor_mut(name, direction)?;
+        let planned = cursor.position.plan(direction);
+        cursor.position.apply(&planned);
+        Ok(u64::try_from(planned.range.len()).unwrap_or(u64::MAX))
+    }
+
     /// `name` のカーソルから `direction` の向きに行を払い出し、位置を動かす
     /// （Issue #3335・WIRE-27 (1)(2)。検索本体は再実行しない）。判定順は
     /// (1) 不在は `34000`（他セッション所有・不在を区別しない固定文言。security.md
@@ -932,15 +1021,7 @@ impl CursorRegistry {
         direction: FetchDirection,
         max_rows: usize,
     ) -> Result<QueryResult, SqlSurfaceError> {
-        let cursor = self
-            .cursors
-            .get_mut(name)
-            .ok_or_else(SqlSurfaceError::invalid_cursor_name)?;
-        if cursor.scroll != CursorScroll::Scroll
-            && cursor.position.requires_backward_scan(direction)
-        {
-            return Err(SqlSurfaceError::CursorCanOnlyScanForward);
-        }
+        let cursor = self.checked_cursor_mut(name, direction)?;
         let total_rows = cursor.result.rows.len();
         let over_cap = match direction {
             FetchDirection::Forward(FetchCount::All) => {
@@ -2198,5 +2279,140 @@ mod tests {
             let err = registry.fetch("nope", dir, 10).expect_err("missing");
             assert_eq!(err.wire_code(), "34000", "{dir:?}");
         }
+    }
+
+    /// Issue #3336: `MOVE` の構文は `FETCH` と同じ向き集合を受理し、同じ [`FetchDirection`] になる。
+    #[test]
+    fn move_accepts_same_directions_as_fetch() {
+        for dir in [
+            "",
+            "NEXT ",
+            "PRIOR ",
+            "FIRST ",
+            "LAST ",
+            "ABSOLUTE 3 ",
+            "ABSOLUTE -1 ",
+            "RELATIVE -2 ",
+            "RELATIVE 0 ",
+            "2 ",
+            "-2 ",
+            "0 ",
+            "ALL ",
+            "FORWARD ",
+            "FORWARD 2 ",
+            "FORWARD ALL ",
+            "BACKWARD ",
+            "BACKWARD 2 ",
+            "BACKWARD ALL ",
+        ] {
+            for kw in ["FROM", "IN"] {
+                let fetch = validate_fetch_tokens(
+                    &tokens_of(&format!("FETCH {dir}{kw} c")),
+                    &Default::default(),
+                )
+                .expect("fetch");
+                let mv = validate_move_tokens(
+                    &tokens_of(&format!("MOVE {dir}{kw} c;")),
+                    &Default::default(),
+                )
+                .expect("move");
+                let (
+                    CursorStatement::Fetch { direction: f, .. },
+                    CursorStatement::Move { name, direction: m },
+                ) = (fetch, mv)
+                else {
+                    panic!("unexpected statement kind");
+                };
+                assert_eq!(f, m, "{dir}{kw}");
+                assert_eq!(name, "c");
+            }
+        }
+    }
+
+    /// Issue #3336: 拒否集合も `FETCH` と同じ（`42601`）で、文言だけ `MOVE` になる。
+    #[test]
+    fn move_rejects_malformed_forms_with_42601() {
+        for sql in [
+            "MOVE",
+            "MOVE c",
+            "MOVE NEXT c",
+            "MOVE FROM",
+            "MOVE FROM c extra",
+            "MOVE PRIOR 1 IN c",
+            "MOVE FORWARD --1 IN c",
+            "MOVE 4294967296 IN c",
+            "MOVE ABSOLUTE 4294967296 IN c",
+            "MOVE FROM ALL",
+            "MOVE FROM c; MOVE FROM c",
+        ] {
+            let err = validate_move_tokens(&tokens_of(sql), &Default::default()).expect_err(sql);
+            assert_eq!(err.wire_code(), "42601", "{sql}");
+            assert!(!err.to_string().contains("FETCH"), "{sql}: {err}");
+        }
+    }
+
+    #[test]
+    fn move_row_count_limit_matches_fetch_22000() {
+        let limits = crate::result_limits::ResultLimits::default();
+        let over = limits.max_result_rows().saturating_add(1);
+        let f = validate_fetch_tokens(&tokens_of(&format!("FETCH {over} FROM c")), &limits)
+            .expect_err("fetch");
+        let m = validate_move_tokens(&tokens_of(&format!("MOVE {over} FROM c")), &limits)
+            .expect_err("move");
+        assert_eq!(f.wire_code(), m.wire_code());
+    }
+
+    fn mv(registry: &mut CursorRegistry, dir: FetchDirection) -> u64 {
+        registry.move_cursor("c", dir).expect("move")
+    }
+
+    /// Issue #3336: タグ件数は同じ向きの FETCH が返す行数で、後続 FETCH が移動先から始まる。
+    #[test]
+    fn move_counts_and_following_fetch_start_after_target() {
+        let rows = |r: Result<QueryResult, SqlSurfaceError>| rows_of(&r.expect("fetch"));
+        let mut r = registry_with_scroll(5, CursorScroll::Scroll);
+        assert_eq!(mv(&mut r, FetchDirection::Forward(FetchCount::Rows(2))), 2);
+        assert_eq!(
+            rows(r.fetch("c", FetchDirection::Forward(FetchCount::Rows(1)), 100)),
+            vec![2]
+        );
+        assert_eq!(mv(&mut r, FetchDirection::Backward(FetchCount::Rows(1))), 1);
+        assert_eq!(mv(&mut r, FetchDirection::Absolute(0)), 0);
+        assert_eq!(
+            rows(r.fetch("c", FetchDirection::Forward(FetchCount::Rows(1)), 100)),
+            vec![0]
+        );
+        let mut r = registry_with_scroll(5, CursorScroll::Scroll);
+        assert_eq!(mv(&mut r, FetchDirection::Forward(FetchCount::Rows(10))), 5);
+        assert_eq!(mv(&mut r, FetchDirection::Backward(FetchCount::All)), 5);
+        assert_eq!(mv(&mut r, FetchDirection::Absolute(3)), 1);
+        assert_eq!(mv(&mut r, FetchDirection::Absolute(10)), 0);
+        assert_eq!(mv(&mut r, FetchDirection::Absolute(0)), 0);
+        assert_eq!(mv(&mut r, FetchDirection::Absolute(1)), 1);
+        assert_eq!(mv(&mut r, FetchDirection::Relative(0)), 1);
+    }
+
+    /// Issue #3336: `MOVE ALL` は行を返さないので `max_rows` 超でも `54000` にならない。
+    #[test]
+    fn move_all_is_not_limited_by_row_cap() {
+        let mut r = registry_with_rows(5);
+        assert_eq!(mv(&mut r, FetchDirection::Forward(FetchCount::All)), 5);
+        assert!(r.fwd("c", 1).expect("next").rows.is_empty());
+    }
+
+    /// Issue #3336: 不在は `34000`、NO SCROLL の逆方向は `55000`。いずれも位置不変。
+    #[test]
+    fn move_rejections_keep_position() {
+        let mut r = registry_with_scroll(5, CursorScroll::NoScroll);
+        mv(&mut r, FetchDirection::Forward(FetchCount::Rows(2)));
+        let err = r
+            .move_cursor("c", FetchDirection::Backward(FetchCount::Rows(1)))
+            .expect_err("no scroll");
+        assert_eq!(err.wire_code(), "55000");
+        let err = r
+            .move_cursor("nope", FetchDirection::Backward(FetchCount::All))
+            .expect_err("missing");
+        assert_eq!(err.wire_code(), "34000");
+        assert_eq!(rows_of(&r.fwd("c", 1).expect("next")), vec![2]);
     }
 }
