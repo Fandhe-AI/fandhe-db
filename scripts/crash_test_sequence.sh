@@ -333,8 +333,8 @@ run_savepoint_pause() {
     done
 }
 
-# 進捗の合計（5 モード分 + savepoint の決定的 kill 段 3 点）。各モードが `completed` を加算する。
-total_iterations=$((5 * SETS * ITERATIONS + 3 * SETS))
+# 進捗の合計（6 モード分 + savepoint の決定的 kill 段 3 点）。各モードが `completed` を加算する。
+total_iterations=$((6 * SETS * ITERATIONS + 3 * SETS))
 completed=0
 
 run_mode sequence write verify finish self-check
@@ -350,4 +350,4 @@ if [ "${completed}" -ne "${total_iterations}" ]; then
   exit 1
 fi
 
-echo "crash_test_sequence.sh: OK (5 modes x ${SETS} sets x ${ITERATIONS} iterations + 3 savepoint pause stages x ${SETS} sets = ${completed} SIGKILL reps)"
+echo "crash_test_sequence.sh: OK (6 modes x ${SETS} sets x ${ITERATIONS} iterations + 3 savepoint pause stages x ${SETS} sets = ${completed} SIGKILL reps)"
