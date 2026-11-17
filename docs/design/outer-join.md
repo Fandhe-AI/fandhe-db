@@ -11,6 +11,7 @@ Accepted・実装済み。
   ERR-6（`42702`・`42804`）
 - 前提: `docs/design/inner-join.md`（Issue #925・INNER JOIN）
 - 関連 Issue: #931（JOIN 経路の RLS 境界の網羅検証・対象外）
+- LEFT JOIN LATERAL の実行方式: `docs/design/lateral-derived-table.md`（L16。Issue #3320）
 
 spec 本文はここへ転記しない（`.claude/rules/spec-confidentiality.md`）。以下は本リポの
 実装既定値・設計判断の記録。
