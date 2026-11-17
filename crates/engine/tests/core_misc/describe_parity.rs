@@ -114,6 +114,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DeclareCursor
         | SqlOutcome::Fetch(_)
         | SqlOutcome::CloseCursor
+        | SqlOutcome::Move(_)
         | SqlOutcome::Do
         | SqlOutcome::SetTransaction
         | SqlOutcome::Lock => None,

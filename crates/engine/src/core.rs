@@ -5513,7 +5513,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -5591,7 +5592,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -5666,7 +5668,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Scan"
                                 .to_string(),
@@ -5748,7 +5751,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as SetOperation"
                                 .to_string(),
@@ -5849,7 +5853,8 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::ReleaseSavepoint
                     | crate::sql::SqlOutcome::DeclareCursor
                     | crate::sql::SqlOutcome::Fetch(_)
-                    | crate::sql::SqlOutcome::CloseCursor => {
+                    | crate::sql::SqlOutcome::CloseCursor
+                    | crate::sql::SqlOutcome::Move(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Join"
                                 .to_string(),
@@ -7941,6 +7946,15 @@ impl EngineCore {
         );
         if is_fetch_statement {
             let stmt = crate::sql::cursor::validate_fetch_tokens(&tokens, &self.result_limits)?;
+            return Ok(ParsedSql::Cursor(stmt));
+        }
+
+        let is_move_statement = matches!(
+            tokens.first(),
+            Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("MOVE")
+        );
+        if is_move_statement {
+            let stmt = crate::sql::cursor::validate_move_tokens(&tokens, &self.result_limits)?;
             return Ok(ParsedSql::Cursor(stmt));
         }
 
@@ -10620,6 +10634,7 @@ impl EngineCore {
                     Err(crate::sql::allowlist::SqlSurfaceError::NoActiveSqlTransaction)
                 }
                 crate::sql::cursor::CursorStatement::Fetch { .. }
+                | crate::sql::cursor::CursorStatement::Move { .. }
                 | crate::sql::cursor::CursorStatement::Close { .. } => {
                     Err(crate::sql::allowlist::SqlSurfaceError::invalid_cursor_name())
                 }
@@ -11903,6 +11918,13 @@ impl EngineCore {
                     registry.fetch(name, *direction, self.result_limits.max_result_rows())?;
                 Ok(crate::sql::SqlOutcome::Fetch(result))
             }
+            CursorStatement::Move { name, direction } => {
+                let registry = txn.cursors_mut().ok_or_else(|| SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                })?;
+                let moved = registry.move_cursor(name, *direction)?;
+                Ok(crate::sql::SqlOutcome::Move(moved))
+            }
             CursorStatement::Close { name } => {
                 txn.cursors_mut()
                     .ok_or_else(|| SqlSurfaceError::Internal {
@@ -12102,6 +12124,7 @@ impl EngineCore {
         if let Some(stmt) = cursor {
             return match stmt {
                 crate::sql::cursor::CursorStatement::Declare { .. }
+                | crate::sql::cursor::CursorStatement::Move { .. }
                 | crate::sql::cursor::CursorStatement::Close { .. } => Ok(None),
                 crate::sql::cursor::CursorStatement::Fetch { name, .. } => {
                     // `Failed` 中はカーソルが既に破棄されているが、Execute と同じく

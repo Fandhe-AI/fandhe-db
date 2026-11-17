@@ -1020,6 +1020,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::CloseCursor => OutcomeResponse::Command {
             tag: "CLOSE CURSOR".to_string(),
         },
+        // Issue #3336（WIRE-27）: `MOVE` は行を返さず `CommandComplete` タグ `MOVE <n>` のみ。
+        SqlOutcome::Move(n) => OutcomeResponse::Command {
+            tag: format!("MOVE {n}"),
+        },
         // TASK-202（SQL-23。Issue #900）: `ALTER TABLE ADD COLUMN` の応答を
         // pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を持たない固定
         // タグ）へ整形する（`Truncate` と同じ設計）。

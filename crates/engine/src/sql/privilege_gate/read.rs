@@ -86,7 +86,9 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         ParsedSql::Cursor(c) => match c {
             CursorStatement::Declare { .. } => Select,
             // FETCH／CLOSE は DECLARE の時点で確定した結果を読むだけで、再検査しない（`sql-cursor.md` §1）。
-            CursorStatement::Fetch { .. } | CursorStatement::Close { .. } => NotApplicable,
+            CursorStatement::Fetch { .. }
+            | CursorStatement::Move { .. }
+            | CursorStatement::Close { .. } => NotApplicable,
         },
         // 永続側の文はセッション経由で包まれていても同じ検査を受ける。一時表だけを読む文はセッションの
         // 所有物なので検査しない（混在は振り分けの段で `0A000`）。

@@ -361,6 +361,12 @@ fn extract_at(
                         // 外側の構文解析にだけ使い、実行は #3323 まで `0A000`（`on_true` を保持する）。
                         let after_alias = after.get(consumed..).unwrap_or(&[]);
                         let mut rewrite_join = false;
+                        // `JOIN LATERAL ... USING (...)` は #3323 まで NATURAL 等と同じく fail-closed。
+                        if lateral.is_some() && is_ident(after_alias.first(), "USING") {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "USING with LATERAL is not supported yet",
+                            ));
+                        }
                         if let Some(
                             LateralForm::Inner { on_true } | LateralForm::Left { on_true },
                         ) = lateral.as_mut()
@@ -843,6 +849,8 @@ mod tests {
             "SELECT * FROM t RIGHT JOIN LATERAL (SELECT 1 FROM t) a ON true",
             "SELECT * FROM t FULL OUTER JOIN LATERAL (SELECT 1 FROM t) a ON true",
             "SELECT * FROM t NATURAL JOIN LATERAL (SELECT 1 FROM t) a",
+            "SELECT * FROM t JOIN LATERAL (SELECT 1 AS k FROM t) a USING (k)",
+            "SELECT * FROM t LEFT JOIN LATERAL (SELECT 1 AS k FROM t) a USING (k)",
             "SELECT * FROM t, LATERAL (VALUES (1)) a",
             "SELECT * FROM t, LATERAL (WITH c AS (SELECT 1) SELECT 1) a",
         ] {
