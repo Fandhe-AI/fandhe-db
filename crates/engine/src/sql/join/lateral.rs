@@ -220,7 +220,8 @@ impl LateralRuntime {
             inner_cols,
             outer_cols,
             layer: layer_plan,
-            layer_limit_implicit: layer.limit_implicit,
+            // tail の有無によらず、明示 `LIMIT` でない後処理は結果行数上限で判定する（明示 `LIMIT` は設定値の範囲で検査済み）。
+            layer_limit_implicit: !layer.limit_explicit,
             layered_columns,
             side,
         })

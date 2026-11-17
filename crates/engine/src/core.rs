@@ -14836,8 +14836,9 @@ impl EngineCore {
                 inputs.push(Some(base));
                 continue;
             }
-            let result = self
-                .evaluate_cte_slot(ctx, session, read_txn, cte, *k, limits, &mut cache, budget)?;
+            let result = self.evaluate_cte_slot(
+                ctx, session, read_txn, cte, *k, limits, &mut cache, budget, None,
+            )?;
             let (schema, id_columns) = crate::sql::join::cte_schema(rel.table(), &result.columns)?;
             schemas.insert(rel.table().to_string(), schema);
             cte_ids.insert(rel.table().to_string(), id_columns);
@@ -14902,6 +14903,7 @@ impl EngineCore {
             base_limits,
             cache,
             budget,
+            base_is_scan.then(|| self.join_limits.max_input_rows()),
         )?;
         let plan = crate::sql::view_buffered::plan_rows_layer(
             &base.columns,
@@ -14933,6 +14935,7 @@ impl EngineCore {
         limits: crate::result_limits::ResultLimits,
         cache: &mut Vec<Option<crate::sql::exec::QueryResult>>,
         budget: &mut crate::sql::join::JoinBudget,
+        scan_input_cap: Option<usize>,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
         use crate::sql::allowlist::{CteSlotSource, SqlSurfaceError};
         let slot = cte.slots.get(k).ok_or_else(|| SqlSurfaceError::Internal {
@@ -14948,13 +14951,18 @@ impl EngineCore {
             CteSlotSource::Scan(scan) => {
                 self.count_materialized_cte_eval();
                 let schema = table_schema_in(read_txn, scan.table_name())?;
-                let bound = crate::sql::parser::bind_scan_with_dummy_flags(
+                let mut bound = crate::sql::parser::bind_scan_with_dummy_flags(
                     scan,
                     &schema,
                     session.udfs(),
                     &[],
                     &limits,
                 )?;
+                // 入力上限つきの基底（LATERAL。Issue #3322 設計記録 L11）は、上限＋1 件で取得を止めて
+                // 超過を検出する（上限を超える行を読み込み・確保しない）。
+                if let Some(cap) = scan_input_cap {
+                    bound.limit = cap.saturating_add(1);
+                }
                 let result = crate::sql::scan::execute_scan_with_budget(
                     read_txn,
                     ctx,
@@ -14962,6 +14970,13 @@ impl EngineCore {
                     &bound,
                     budget.remaining(),
                 )?;
+                if let Some(cap) = scan_input_cap {
+                    if result.rows.len() > cap {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "JOIN input exceeds the visible row limit",
+                        ));
+                    }
+                }
                 budget.charge_result(&result)?;
                 result
             }
@@ -14991,6 +15006,7 @@ impl EngineCore {
                     parent_limits,
                     cache,
                     budget,
+                    None,
                 )?;
                 // tail CTE（Issue #1862）の明示 `LIMIT` は設定値の範囲で検査する（構文段は
                 // 設定値を持たない。Scan 側の `bind_scan_with_dummy_flags` と同じ契約）。

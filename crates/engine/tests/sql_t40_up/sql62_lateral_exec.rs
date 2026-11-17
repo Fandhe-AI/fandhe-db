@@ -462,6 +462,16 @@ fn join_size_caps_reject_with_54000() {
     assert_eq!(err_of(&core, "alice", &sql).wire_code(), "54000");
 }
 
+#[test]
+fn tailless_lateral_is_bounded_by_the_result_row_cap() {
+    // tail（ORDER BY・LIMIT）のない相関 LATERAL も、後処理後の行数を結果行数上限で判定する。
+    let sql = "SELECT d.id, s.body FROM docs d, LATERAL \
+        (SELECT body FROM docs WHERE lang = d.lang) s ORDER BY d.id LIMIT 1";
+    let (core, _g) =
+        open_with(|c| c.with_result_limits(engine::result_limits::ResultLimits::new(2)));
+    assert_eq!(err_of(&core, "alice", sql).wire_code(), "54000");
+}
+
 // tracked: #3323
 #[test]
 fn left_and_non_true_on_forms_stay_fail_closed() {
