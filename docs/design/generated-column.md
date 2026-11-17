@@ -100,12 +100,12 @@ SQLSTATE を含む個別の規則は TABLE-50 (1) のポインタとし、本記
 | SQL INSERT（単一行・複数行・`INSERT ... SELECT`） | #3328（結線済み） | 明示値は `428C9`、`DEFAULT` は受理 |
 | UPDATE（リテラル・式・述語形・`UPDATE ... FROM`・分割実行 DML） | #3328（結線済み） | SET の生成列は `428C9`（`DEFAULT` は受理） |
 | UPSERT（挿入側・`DO UPDATE SET`） | #3328（結線済み） | `EXCLUDED.<生成列>` は計算後の提案行の値を参照する。PG17 実機での確認は #3332 |
-| COPY FROM | #3329 | 列リストに生成列を含めると `428C9`（TABLE-50 (2)。PG17 実機の SQLSTATE と突き合わせ。要確認）。列リスト無しの COPY が生成列を除いた並びを期待するかも確認 |
-| NoSQL insert・update・upsert | #3329 | 生成列のキー指定は `428C9`（HTTP 400） |
-| 自動更新可能ビュー・INSTEAD OF トリガ経由の基表書き込み | #3329 | 基表の経路と同じ計算を通る |
-| BEFORE ROW トリガの後・`TriggerWriteHandle`・PL/pgSQL・DO ブロックの DML | #3329 | NEW の生成列への代入は計算で上書き（PG17 実機で確認）。BEFORE トリガの WHEN が NEW の生成列を参照する場合の拒否も確認 |
-| FK の参照アクション（`RowPolicyWrite::Internal`。子表の CASCADE・SET NULL・SET DEFAULT が生成列の参照列を書き換える） | #3329 | Issue 本文に記載が無い。受入条件への追記は承認待ち |
-| ファイル形 INSERT・生の `RowInput` の Rust API | #3329 | 値の列を持たない生の metadata 経路は、生成列を持つ表で `0A000`（fail-closed） |
+| COPY FROM | #3329（結線済み） | 列リストに生成列を含めると `428C9`（CopyInResponse の前）。列リスト省略は生成列を除いた並び。PG17 実機との突き合わせは #3332 |
+| NoSQL insert・update・upsert | #3329（結線済み） | 生成列のキー指定は `428C9`（HTTP 400） |
+| 自動更新可能ビュー・INSTEAD OF トリガ経由の基表書き込み | #3329（結線済み） | 基表の経路と同じ計算を通る |
+| BEFORE ROW トリガの後・`TriggerWriteHandle`（トリガ本体の INSERT・UPDATE）・PL/pgSQL・DO ブロックの DML | #3329（結線済み） | NEW の生成列への代入は計算で上書き。BEFORE トリガの WHEN が NEW の生成列を参照する定義は `42P17`。PG17 実機との突き合わせは #3332（未検証） |
+| FK の参照アクション（`RowPolicyWrite::Internal`。子表の CASCADE・SET NULL・SET DEFAULT が生成列の参照列を書き換える） | #3329（結線済み） | 書き換えた子行の生成列を再計算する。孫の FK が子の生成列を参照する連鎖でも変更列に加える |
+| ファイル形 INSERT・生の `RowInput` の Rust API | 決定: `0A000` のまま（`intentional`） | 値の列を持たない生の metadata 経路は、生成列を持つ表で `0A000`（fail-closed） |
 | `ALTER TABLE ADD COLUMN ... GENERATED` のバックフィル | #3330 | G8 |
 | 参照しない列の `ALTER COLUMN TYPE` の行の書き換え | #3331 | 生成列の値は変わらない。照合段を通ることを確かめる |
 | MERGE | #3355 | 本記録の計算点を使う |
@@ -227,8 +227,8 @@ SQLSTATE を含む個別の規則は TABLE-50 (1) のポインタとし、本記
 | 書き込み元 | 扱い | 担当 |
 | -- | -- | -- |
 | SQL INSERT（単一・複数行・INSERT…SELECT）・UPDATE・UPSERT | 結線済み（Issue #3328）。計算点で計算し、検査点で照合する | #3328 |
-| COPY FROM・NoSQL insert／update／upsert・ビュー経由・INSTEAD OF・BEFORE ROW トリガ・PL/pgSQL・DO の DML・ファイル形 INSERT・生の RowInput | 検査点で停止（各経路が検査点を通る） | #3329 |
-| FK の参照アクション（子表の CASCADE・SET NULL・SET DEFAULT） | 検査点で停止（`Internal` 方針でも通る） | #3329 |
+| COPY FROM・NoSQL insert／update／upsert・ビュー経由・INSTEAD OF・BEFORE ROW トリガ・PL/pgSQL・DO の DML・FK の参照アクション | 結線済み（Issue #3329）。「Issue #3329 で確定した事項」節 | #3329 |
+| ファイル形 INSERT・生の RowInput・結線していない入口 | 検査点で停止（`intentional`。決定済み） | — |
 | DELETE・TRUNCATE | 止めない（生成列の値を書かない） | — |
 | `column_rewrite`・`legacy_id_migration`・レプリカ・PITR の適用 | 止めない（本 Issue の間は生成列を持つ表が常に空。従来方式とは組み合わせられない。レプリカは計算済みの値を適用するだけ） | — |
 
@@ -248,7 +248,7 @@ UPDATE は一致する行が 0 件なら検査点に到達せず成功する（�
 ### ダンプ
 
 - `export_schema_ddl` は `<型> [COLLATE ..] [NOT NULL] GENERATED ALWAYS AS (<正規描画>) STORED` を出し、別 DB への復元後の再ダンプが一致する。
-- データ出力（COPY ヘッダ・COPY 行・INSERT の列リストと値）は生成列を除く。生成列しか持たない表に行があれば固定文言の `Unsupported`（黙って省かない）。行つきのデータ往復は Issue #3328 で INSERT 形式について結合テストを足した（`table50_generated_column_write`。復元先の INSERT が生成列を計算し直し、再ダンプが一致する）。COPY 形式の復元は COPY の結線（#3329）が要る。
+- データ出力（COPY ヘッダ・COPY 行・INSERT の列リストと値）は生成列を除く。生成列しか持たない表に行があれば固定文言の `Unsupported`（黙って省かない）。行つきのデータ往復は Issue #3328 で INSERT 形式について結合テストを足した（`table50_generated_column_write`。復元先の INSERT が生成列を計算し直し、再ダンプが一致する）。COPY 形式の往復は Issue #3329 で結合テストを足した（`table50_generated_column_write`）。
 
 ## Issue #3328 で確定した事項
 
@@ -270,11 +270,38 @@ SQL の INSERT・UPDATE・UPSERT の計算点を結線した。spec は TABLE-50
 - 束縛段: 生成列への値の指定は `reject_generated_always_value` の 1 か所で `428C9`（7 つの束縛経路が共有）。`SET g = DEFAULT` は何も代入せず受理する（式は決定的なので値は同じ）。
 - `RETURNING`: 生成列を持つ表の INSERT は事前投影を省き、write txn 内の収集（計算後の行）の結果を採用する。UPDATE・UPSERT は書いた行から捕捉するため計算後の値になる。
 
-### 残す経路（`tracked: #3329`）
+### 残す経路（Issue #3329 で結線）
 
-COPY FROM・NoSQL・ビュー・INSTEAD OF・トリガ付きの表・トリガ本体の書き込み・FK の参照アクション・ファイル形 INSERT・生の RowInput は `0A000` のまま。MERGE は #3355。式で代入できない列型（NUMERIC 等）と一時表の生成列は `0A000` のままで、受け皿の Issue は未起票。PG17 実機との突き合わせ（`EXCLUDED.<生成列>`・UPDATE の `428C9` の文言差）は #3332。
+Issue #3328 の時点では COPY FROM・NoSQL・ビュー・INSTEAD OF・トリガ付きの表・トリガ本体の書き込み・FK の参照アクションは `0A000` だった。これらは Issue #3329 で結線した（次節）。MERGE は #3355。式で代入できない列型（NUMERIC 等）と一時表の生成列は `0A000` のままで、受け皿の Issue は未起票。PG17 実機との突き合わせ（`EXCLUDED.<生成列>`・UPDATE の `428C9` の文言差）は #3332。
 
-- データ出力（COPY ヘッダ・COPY 行・INSERT の列リストと値）は生成列を除く。生成列しか持たない表に行があれば固定文言の `Unsupported`（黙って省かない）。行つきのデータ往復は、行を書ける #3328 が結線した時点で往復テストを足す（`tracked: #3328`）。本 Issue は列リストの除外を単体テストで固定した。
+- データ出力（COPY ヘッダ・COPY 行・INSERT の列リストと値）は生成列を除く。生成列しか持たない表に行があれば固定文言の `Unsupported`（黙って省かない）。
+
+## Issue #3329 で確定した事項
+
+COPY・NoSQL・ビュー・トリガ・FK の参照アクションの計算点を結線した。spec は TABLE-50 (2)・RECOVER-11・TASK-345・TABLE-43・TABLE-45・NOSQL-6／12／21 のポインタとしてだけ参照する。計算器・検査点の照合段・`XX000` は #3328 と同じ唯一の実装を使う（第 2 の計算経路は作らない）。
+
+### 経路ごとの結線点
+
+| 経路 | 結線点 |
+| -- | -- |
+| COPY FROM（autocommit・明示 Tx・セッション入口・論理ダンプの COPY 形式の復元） | `execute_bound_insert_core` の入口で `GeneratedComputeScope::enter(<表名>)`。列リストの生成列は `CopyInSession::validate_columns_against_schema` が CopyInResponse の前に `428C9`（`bind_copy_record` は多層防御）。NOT NULL の被覆検査は生成列を除く（計算後に書き込み段が検査する） |
+| NoSQL insert・RETURNING・upsert・update（単一・述語形・RETURNING・分割実行） | `execute_bound_*_in_session` の各入口で同じスコープを張る。束縛は `reject_generated_always_value` を共有するため `428C9`（HTTP 400）。HTTP 層に生成列の処理は無い |
+| ビュー経由の INSERT・UPDATE | `write_wired(table)` の条件を「スコープのキーが一致し、ビュー区間の外、または区間の基表が `table`」へ変更（`view_write_scope::current_view_base_table_is`）。別表への書き込み（FK の連鎖）は基表名が一致せず偽のまま。`WITH CHECK OPTION` は計算後の行に働く |
+| BEFORE・AFTER ROW トリガ付きの INSERT・複数行 INSERT・UPDATE（分割実行を含む）・UPSERT | `tenant` のトリガ経路の拒否を外し、`trigger_dml::apply_generated_columns` を BEFORE ROW の連鎖の後（NOT NULL 検査・encode より前）に呼ぶ。BEFORE が無い UPDATE・`DO UPDATE` は SET の対象列に依存する生成列だけ再計算する。AFTER・`RETURNING` は計算後の行を見る。FK の変更列にも再計算した生成列を加える |
+| トリガ本体の INSERT・UPDATE（INSTEAD OF トリガ経由の基表書き込みを含む） | `TriggerWriteHandle::run_write` が `suspend()` ではなく書き込み先の表で `enter(table)` する。本体からの生成列への明示値は `428C9`。全幅の値を受ける生の窓口 `insert_row`（テスト専用）は `suspend()` のまま |
+| FK の参照アクション（子表の ON UPDATE CASCADE・SET NULL・SET DEFAULT） | `apply_referential_action`・`referential_triggers::apply_with_triggers` が、参照列の書き換えに依存する生成列を `recompute_generated_metadata` で再計算してから書く（子に BEFORE があれば BEFORE の後に全生成列）。`PropagatedChange::ColumnsUpdated` へ再計算した位置を加える。検査点は `Internal` の拒否をやめ、照合段だけを通す（計算漏れは `XX000`） |
+
+### 順序（BEFORE → 計算 → NOT NULL → encode）
+
+トリガが NEW の生成列へ代入しても計算結果で上書きされる。計算の後に NOT NULL を検査するため、計算結果が NULL の NOT NULL 生成列は `23502`。計算の失敗（`22012` 等）は文全体の失敗で、行・台帳・トリガの書いた行は残らない。
+
+### BEFORE トリガの WHEN
+
+`validate_trigger_when` が、BEFORE の WHEN が `NEW.<生成列>` を参照する定義を `42P17`（固定文言）で拒否する（評価時点では未計算のため）。SQLSTATE は WHEN の他の定義時検査（`trigger-execution-model.md` D7）に揃えた。AFTER の WHEN・OLD の生成列の参照は通る。PG17 実機との突き合わせは #3332（未検証）。
+
+### 残す経路（`intentional`）
+
+ファイル形 INSERT・生の `RowInput`・結線していない入口は、値の列を持たない生の metadata 経路のため `0A000` のまま（G6 の決定）。COPY TO の出力は変えない。列リスト省略の COPY TO（`SELECT *` と同じ並び）の出力は生成列を含むため、生成列を持つ表に限り列リスト省略の COPY FROM へそのまま流すと列数の不一致で拒否される（fail-closed）。PG17 との突き合わせは #3332。MERGE は #3355、ADD COLUMN ... GENERATED は #3330。
 
 ## Issue #3331 で確定した事項
 

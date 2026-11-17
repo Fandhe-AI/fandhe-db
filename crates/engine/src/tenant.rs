@@ -2195,13 +2195,10 @@ fn insert_typed_row_impl(
         // `WHEN` 付きは `0A000`）。
         let trigger_chain =
             crate::trigger::plan::plan_insert(write_txn, ctx.tenant_id(), table, triggers)?;
-        // 生成列（TABLE-50・Issue #3328）: 結線していない経路・トリガを持つ表は台帳より前に `0A000`
-        // （Issue #3329 が結線する）。束縛は 1 文に 1 回。
+        // 生成列（TABLE-50・Issue #3328）: 結線していない経路は台帳より前に `0A000`。トリガを持つ表は
+        // BEFORE ROW の後に計算する（Issue #3329）。束縛は 1 文に 1 回。
         let generated =
             crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
-        if generated.is_some() && trigger_chain.is_some() {
-            return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
-        }
         // 採番方式の表（TABLE-23・Issue #2199）は呼び出し元の `id` を使わず、内容照合ハッシュの
         // 材料には固定値 0 を使う（rowid は再送前に分からないため。再送判定を決定的に保つ）。
         let allocated = schema.is_allocated();
@@ -2329,6 +2326,7 @@ fn insert_typed_row_impl(
                 chain,
                 &trigger_writes,
                 project,
+                generated.as_ref(),
             )?;
             return finish_trigger_insert(
                 write_txn,
@@ -2828,9 +2826,6 @@ pub(crate) fn insert_typed_rows_unchecked(
             // 生成列（TABLE-50・Issue #3328）: 未結線・トリガ付きは台帳より前に `0A000`。束縛は 1 文に 1 回。
             let generated =
                 crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
-            if generated.is_some() && trigger_chain.is_some() {
-                return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
-            }
             // `id` 省略（Issue #1700。全行一様）は移行済み表だけが受理できる。束縛段の判定を、
             // 書き込み txn 内で取得したスキーマで再確認する（仮値 `id` を書かない fail-closed）。
             if id_omitted && !schema.is_migrated_id() {
@@ -3051,6 +3046,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                     chain,
                     &trigger_writes,
                     project,
+                    generated.as_ref(),
                 )?;
                 return finish_trigger_insert(
                     write_txn,
@@ -3630,9 +3626,6 @@ fn upsert_typed_rows_impl(
             // 生成列（TABLE-50・Issue #3328）: 未結線・トリガ付きは台帳より前に `0A000`。束縛は 1 文に 1 回。
             let generated =
                 crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
-            if generated.is_some() && has_triggers {
-                return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
-            }
             // `RETURNING` 付きの最終値投影はトリガ経路では未結線（INSERT の `RETURNING` と同じ方針）。
             if has_triggers && project.is_some() {
                 return Err(TenantWriteError::TriggerFailed(
@@ -3922,6 +3915,7 @@ fn upsert_typed_rows_impl(
                     insert_plan.as_ref(),
                     update_plan.as_ref(),
                     &trigger_writes,
+                    generated.as_ref(),
                 )?;
                 if triggered.outcome.inserted > 0 || triggered.outcome.updated > 0 {
                     crate::catalog::bump_table_generation_in_txn(write_txn, table)?;
@@ -5535,14 +5529,32 @@ fn merge_row_for_update_set(
     if only.is_empty() {
         return Ok((embedding, metadata));
     }
-    let computed = generated.compute_from_metadata(id, &embedding, &metadata, Some(&only))?;
+    let metadata =
+        recompute_generated_metadata(generated, schema, id, &embedding, &metadata, &only)?;
+    Ok((embedding, metadata))
+}
+
+/// 符号化済みの行 `metadata` の生成列のうち `only` の位置を、通常列から再計算して符号化し直す
+/// （TABLE-50・Issue #3328・#3329）。UPDATE の SET 適用後と、FK の参照アクションが子行の参照列を
+/// 書き換えた後（`constraint::apply_referential_action`）が共有する。評価エラーは
+/// `SetExpressionEvaluationFailed`（文全体の失敗）。
+pub(crate) fn recompute_generated_metadata(
+    generated: &crate::sql::generated_column::CompiledGeneratedColumns,
+    schema: &crate::catalog::TableSchema,
+    id: u64,
+    embedding: &[f32],
+    metadata: &[u8],
+    only: &[usize],
+) -> Result<Vec<u8>, TenantWriteError> {
+    let computed = generated.compute_from_metadata(id, embedding, metadata, Some(only))?;
     let overrides: Vec<(usize, &crate::row_codec::Value)> =
         computed.iter().map(|(i, v)| (*i, v)).collect();
-    let scanned = crate::row_codec::scan_scalar_columns(schema, &metadata)
+    let scanned = crate::row_codec::scan_scalar_columns(schema, metadata)
         .map_err(|e| CatalogError::CorruptSchema(e.to_string()))?;
-    let metadata = crate::row_codec::merge_encode_scalar_columns(schema, &scanned, &overrides)
-        .map_err(|e| CatalogError::Invalid(e.to_string()))?;
-    Ok((embedding, metadata))
+    Ok(
+        crate::row_codec::merge_encode_scalar_columns(schema, &scanned, &overrides)
+            .map_err(|e| CatalogError::Invalid(e.to_string()))?,
+    )
 }
 
 /// UPDATE の SET 項（リテラル・式・行ごとの上書き値）を、更新前の行に対して評価して
@@ -5780,12 +5792,10 @@ fn update_row_columns_impl(
                 &[],
                 triggers,
             )?;
-            // 生成列（TABLE-50・Issue #3328）: 未結線・トリガ付きは台帳より前に `0A000`。
+            // 生成列（TABLE-50・Issue #3328）: 未結線の経路は台帳より前に `0A000`。トリガ付きの表は
+            // BEFORE ROW の後に計算する（Issue #3329。`trigger_dml::update_rows_with_triggers`）。
             let generated =
                 crate::sql::generated_column::CompiledGeneratedColumns::for_write(&schema, table)?;
-            if generated.is_some() && trigger_plan.is_some() {
-                return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
-            }
 
             // `(スキーマ列 index, 列名, 値)` の順で構築し、ハッシュ計算前に列
             // index でソートして宣言順非依存にする（下記コメント参照）。列 index の

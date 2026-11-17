@@ -124,6 +124,33 @@ fn read_row(
     Ok(row)
 }
 
+/// 行 `row`（スキーマ幅の値の列）の生成列を、通常列から計算した値で上書きする（TABLE-50・Issue #3329）。
+/// `generated` が `None`（生成列の無い表）なら何もしない。`only` が `Some` ならその位置だけ再計算する。
+/// BEFORE ROW トリガの連鎖の後（NOT NULL 検査・encode より前）に、トリガ付きの INSERT・UPDATE・UPSERT が
+/// 共有して呼ぶ。トリガが NEW の生成列へ代入していても計算結果で上書きする。評価エラーは
+/// `SetExpressionEvaluationFailed`（文全体の失敗）。
+pub(crate) fn apply_generated_columns(
+    generated: Option<&crate::sql::generated_column::CompiledGeneratedColumns>,
+    schema: &TableSchema,
+    id: u64,
+    row: &mut [Value],
+    only: Option<&[usize]>,
+) -> Result<(), TenantWriteError> {
+    let Some(generated) = generated else {
+        return Ok(());
+    };
+    let embedding: Vec<f32> = match schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, ColumnType::Vector(_)))
+        .and_then(|idx| row.get(idx))
+    {
+        Some(Value::Vector(v)) => v.clone(),
+        _ => Vec::new(),
+    };
+    generated.compute_values(id, &embedding, row, only)
+}
+
 /// BEFORE が返した最終 NEW を検査して `(embedding, metadata)` へ encode する（NOT NULL・VECTOR 次元・
 /// 行 codec）。
 pub(crate) fn encode_final_row(
@@ -183,10 +210,10 @@ pub(super) fn update_rows_with_triggers(
     mut project: Option<&mut ReturningProjectFn<'_>>,
     mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
-    // 生成列（TABLE-50）を持つ表のトリガ付き UPDATE は未結線（Issue #3329）。固定文言の `0A000`。
-    if schema.columns.iter().any(|c| c.generated.is_some()) {
-        return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
-    }
+    // 生成列（TABLE-50・Issue #3329）: 結線していない経路は固定文言の `0A000`。BEFORE ROW の後（BEFORE が
+    // 無ければ SET の対象列に依存するものだけ）に計算する。束縛は 1 文（チャンク）に 1 回。
+    let generated =
+        crate::sql::generated_column::CompiledGeneratedColumns::for_write(schema, table)?;
     // 対象行が 0 件でも `row_security = off` の拒否を文の開始時点で適用する（RLS-13・Issue #2278）。
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
     if spec
@@ -244,7 +271,7 @@ pub(super) fn update_rows_with_triggers(
                 spec.assignments,
                 spec.set_exprs,
                 row_extra,
-                None,
+                generated.as_ref(),
             )?;
             let new_candidate =
                 captured_values_from_parts(schema, merged_embedding.clone(), &merged_metadata)?;
@@ -283,9 +310,11 @@ pub(super) fn update_rows_with_triggers(
                 new_candidate,
             )
             .map_err(TenantWriteError::TriggerFailed)?;
-            let Some(final_row) = fired else {
+            let Some(mut final_row) = fired else {
                 continue;
             };
+            // BEFORE の後に全生成列を計算し直す（NOT NULL 検査・encode より前。Issue #3329）。
+            apply_generated_columns(generated.as_ref(), schema, *id, &mut final_row, None)?;
             let (embedding, metadata) = encode_final_row(schema, &final_row)?;
             (embedding, metadata, final_row)
         };
@@ -360,6 +389,11 @@ pub(super) fn update_rows_with_triggers(
         // 無ければ SET の列だけ。
         let updated_columns: Vec<usize> = if plan.before.is_empty() {
             let mut cols = update_set_columns(spec);
+            // SET の対象列に依存して再計算された生成列も変更列として扱う（Issue #3329）。
+            if let Some(g) = &generated {
+                let extra = g.affected(&cols);
+                cols.extend(extra);
+            }
             cols.sort_unstable();
             cols.dedup();
             cols

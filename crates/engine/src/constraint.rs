@@ -706,16 +706,17 @@ fn enforce_row_constraints_impl(
     fk_mode: FkCheckMode,
     policy: RowPolicyWrite<'_>,
 ) -> Result<crate::key_index::KeyIndexDelta, TenantWriteError> {
-    // 生成列（TABLE-50・Issue #3327・#3328）を持つ表への書き込みは、計算点が結線された SQL 表層の区間
-    // （`sql::generated_column::GeneratedComputeScope`）の外・ビュー経由・FK の参照アクションの連鎖
-    // （`RowPolicyWrite::Internal`）では、固定文言の `0A000` で拒否する（Issue #3329 が経路ごとに結線する。
-    // 黙って NULL を書かない fail-closed）。追加の拒否にしか働かないため RLS の `WITH CHECK` より前に置いても
-    // 境界は緩まない。公開ラッパーと FK の参照アクションの連鎖（`propagate_referential_actions`）の双方が
-    // この関数を通る。`written_ids` が空でも止める（行の無い書き込み文でも一貫した拒否にする）。
+    // 生成列（TABLE-50・Issue #3327・#3328・#3329）を持つ表への書き込みは、計算点が結線された区間
+    // （`sql::generated_column::GeneratedComputeScope`）の外では、固定文言の `0A000` で拒否する（黙って
+    // NULL を書かない fail-closed）。FK の参照アクションの連鎖（`RowPolicyWrite::Internal`）は、書き換えた
+    // 子行の生成列を `apply_referential_action` が再計算してから書くため結線の判定を要さず、照合段だけを通す
+    // （計算漏れは `XX000` で止まる）。追加の拒否にしか働かないため RLS の `WITH CHECK` より前に置いても
+    // 境界は緩まない。公開ラッパーと連鎖（`propagate_referential_actions`）の双方がこの関数を通る。
+    // `written_ids` が空でも止める（行の無い書き込み文でも一貫した拒否にする）。
     // 結線済みなら、書いた行の生成列が式の再計算結果と一致することを確かめる（多層防御。不一致は `XX000`）。
     if schema.columns.iter().any(|c| c.generated.is_some()) {
-        if matches!(policy, RowPolicyWrite::Internal)
-            || !crate::sql::generated_column::write_wired(table_name)
+        if !matches!(policy, RowPolicyWrite::Internal)
+            && !crate::sql::generated_column::write_wired(table_name)
         {
             return Err(TenantWriteError::GeneratedColumnWriteUnsupported);
         }
@@ -5108,6 +5109,15 @@ fn apply_referential_action(
     // `SET NULL`／`SET DEFAULT`／`ON UPDATE CASCADE`: 子行の FK 列を書き換える
     // （read-merge-write。`tenant::merge_row_for_update` を共有する）。
     let fk_indices = child_fk_indices(child_schema, fk)?;
+    // 子表の生成列（TABLE-50・Issue #3329）: 参照列の書き換えに依存する生成列だけを、書き換えた行から再計算する。
+    // 束縛は 1 回（行ループの外）。生成列を参照元に含む FK の参照アクションは定義時に拒否済みのため、
+    // `fk_indices` に生成列は含まれない。
+    let generated =
+        crate::sql::generated_column::CompiledGeneratedColumns::compile_any(child_schema)?;
+    let generated_changed: Vec<usize> = generated
+        .as_ref()
+        .map(|g| g.affected(&fk_indices))
+        .unwrap_or_default();
 
     let mut pre_images = UpdatedKeyPreImages::new();
     {
@@ -5148,6 +5158,19 @@ fn apply_referential_action(
             let (embedding, metadata) =
                 crate::tenant::merge_row_for_update(child_schema, existing, &assignments)
                     .map_err(TenantWriteError::Catalog)?;
+            let metadata = match &generated {
+                Some(g) if !generated_changed.is_empty() => {
+                    crate::tenant::recompute_generated_metadata(
+                        g,
+                        child_schema,
+                        id.legacy_id(),
+                        &embedding,
+                        &metadata,
+                        &generated_changed,
+                    )?
+                }
+                _ => metadata,
+            };
             let row_input = crate::storage::RowInput {
                 tenant_id,
                 visibility,
@@ -5167,10 +5190,12 @@ fn apply_referential_action(
             );
         }
     }
-    Ok((
-        PropagatedChange::ColumnsUpdated(fk_indices),
-        Some(pre_images),
-    ))
+    // 再計算した生成列も孫段へ変更列として渡す（孫の FK が生成列を参照する連鎖を見逃さない）。
+    let mut changed = fk_indices;
+    changed.extend(generated_changed);
+    changed.sort_unstable();
+    changed.dedup();
+    Ok((PropagatedChange::ColumnsUpdated(changed), Some(pre_images)))
 }
 
 #[cfg(test)]

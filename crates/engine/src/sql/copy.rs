@@ -658,6 +658,12 @@ fn bind_copy_record(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        // 多層防御（TABLE-50・Issue #3329）: 列リストの生成列は事前検証が止めるため通常は到達しない。
+        if column.generated.is_some() {
+            return Err(SqlSurfaceError::GeneratedAlways {
+                column: column.name.clone(),
+            });
+        }
         // HALFVEC の COPY は担当 Issue 未定まで未対応（fail-closed。Issue #2014・TABLE-46）。
         // NULL マーカー・空欄でも素通りしないよう、値の有無を見る前に列型で拒否する。
         if matches!(column.ty, ColumnType::HalfVec(_)) {
@@ -1086,11 +1092,22 @@ impl CopyInSession {
             if schema.has_pseudo_id() && name == "id" {
                 continue;
             }
-            if !schema.columns.iter().any(|c| &c.name == name) {
+            let Some(column) = schema.columns.iter().find(|c| &c.name == name) else {
                 return Err(SqlSurfaceError::undefined_column(name));
+            };
+            // 生成列（TABLE-50・Issue #3329）は値を書けない。CopyInResponse の前に `428C9` で拒否する
+            // （IDENTITY ALWAYS 列は COPY が値を書ける既存契約のため、生成列だけを見る）。
+            if column.generated.is_some() {
+                return Err(SqlSurfaceError::GeneratedAlways {
+                    column: column.name.clone(),
+                });
             }
         }
         for column in &schema.columns {
+            // 生成列の NOT NULL は書き込み段が計算後に検査する（列リストの被覆は要求しない）。
+            if column.generated.is_some() {
+                continue;
+            }
             // `DEFAULT`（TABLE-16・TASK-204、Issue #904）を持つ列は列リストに
             // 無くても [`bind_copy_record`]（`fill_omitted_columns` 経由）が
             // 補うため、事前検証の対象から外す。
@@ -1113,11 +1130,22 @@ impl CopyInSession {
     }
 
     /// 列リスト省略の `COPY <t> FROM STDIN` の全列補完（Issue #3252・WIRE-17・WIRE-22・SQL-34）。
-    /// 並びは COPY TO のテーブル形（`SELECT *`）と同じ（疑似列 `id` が先頭、続けて宣言順）で、
-    /// 出力をそのまま取り込める。列を持たない表と、疑似列 `id` と実カラム `id` が衝突する表は、
+    /// 並びは COPY TO のテーブル形（`SELECT *`）から生成列を除いたもの（疑似列 `id` が先頭、続けて宣言順）で、
+    /// 生成列を持たない表では出力をそのまま取り込める（Issue #3329）。列を持たない表と、疑似列 `id` と実カラム `id` が衝突する表は、
     /// 解釈が曖昧になるため 0A000 で拒否する（fail-closed）。`new` からのみ呼ばれる。
     fn expand_all_columns(schema: &TableSchema) -> Result<Vec<String>, SqlSurfaceError> {
-        let columns = crate::catalog::lookup_star_columns_of(schema);
+        // 生成列（TABLE-50・Issue #3329）は列リスト省略の取り込み対象から除く（値は書き込み段が計算する）。
+        // 生成列を持つ表では COPY TO（`SELECT *` と同じ並び）の出力と列数が揃わず、そのまま流すと
+        // 列数の不一致で拒否される（fail-closed。PG17 との突き合わせは #3332）。
+        let columns: Vec<String> = crate::catalog::lookup_star_columns_of(schema)
+            .into_iter()
+            .filter(|name| {
+                !schema
+                    .columns
+                    .iter()
+                    .any(|c| &c.name == name && c.generated.is_some())
+            })
+            .collect();
         if columns.is_empty() {
             return Err(SqlSurfaceError::feature_not_supported(
                 "COPY without a column list requires at least one column",

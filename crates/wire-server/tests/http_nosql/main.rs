@@ -56,6 +56,7 @@ mod nosql3_scan_mapping;
 mod nosql3_scan_wire_parity;
 mod nosql4_5_aggregate_wire_parity;
 mod nosql4_aggregate;
+mod nosql50_generated_column;
 mod nosql5_group_by;
 mod nosql6_insert;
 mod nosql6_tenant_row_id_scope;

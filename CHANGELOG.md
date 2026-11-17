@@ -9,6 +9,7 @@
 
 ### Changed
 
+- 生成列（`GENERATED ALWAYS AS (<式>) STORED`）の計算を COPY FROM・NoSQL（insert・update・upsert）・自動更新可能ビュー経由・BEFORE／AFTER ROW トリガ付きの表・トリガ本体の書き込み・FK の参照アクションの連鎖へ広げた（Issue #3329）。COPY の列リスト・NoSQL のキーに生成列を指定すると `428C9`、BEFORE トリガの WHEN が NEW の生成列を参照する定義は `42P17`。
 - `ALTER TABLE ADD COLUMN ... GENERATED ALWAYS AS (<式>) STORED` を受理した（Issue #3330・TABLE-50・RECOVER-11・TASK-345 ポインタ。判断は [generated-column.md](docs/design/generated-column.md) の「Issue #3330 で確定した事項」節）。既存の全行（全テナント・全可視性）を 1 つの write txn で計算して書き直し、評価エラー・NOT NULL 違反ではカタログも行も変えない。従来方式の表・一時表・明示 Tx は `0A000`。生成列を持つ表への COPY・NoSQL・ビュー・トリガ経由の書き込みは #3329 まで `0A000` のまま。
   BREAKING CHANGE: `sql::allowlist::ValidatedAlterTableAddColumn` に公開フィールド `generated` を追加した（構造体リテラルで生成する外部コードは追随が必要）。
 - 生成列 `GENERATED ALWAYS AS (<式>) STORED` の計算を SQL の INSERT（単一行・複数行・`INSERT ... SELECT`）・UPDATE（式・述語形・`UPDATE ... FROM`・分割実行）・UPSERT（挿入側・`DO UPDATE`）へ結線した（Issue #3328・TABLE-50・RECOVER-11・TASK-345 ポインタ。判断は [generated-column.md](docs/design/generated-column.md) の「Issue #3328 で確定した事項」節）。生成列の値は行の通常列が確定した後に計算し、RETURNING・UNIQUE・CHECK・FK・RLS の `WITH CHECK` は計算後の値を見る。評価エラーは文全体を失敗させ行・台帳を残さない。生成列への値の指定は `428C9`（`DEFAULT` は受理）。**挙動の変更**: これまで `0A000` だった SQL の INSERT・UPDATE・UPSERT が通る。COPY・NoSQL・ビュー・トリガ・FK の参照アクション・ファイル形 INSERT は結線されるまで（Issue #3329）固定文言の `0A000` のまま。依存の追加・unsafe はない。

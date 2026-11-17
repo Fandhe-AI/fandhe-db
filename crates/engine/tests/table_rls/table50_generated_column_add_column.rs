@@ -341,27 +341,26 @@ fn indexes_and_constraints_keep_working() {
 }
 
 #[test]
-fn unwired_paths_stay_unsupported_after_the_add() {
-    // COPY は #3329 まで生成列を持つ表への書き込みを `0A000` で拒否する。
-    // tracked: #3329
+fn copy_computes_the_added_generated_column() {
+    // ADD COLUMN で追加した生成列を持つ表への COPY は、生成値を計算して挿入する（#3329）。
     let (_p, _gd, core) = fixture("gen-add-copy");
     mk(&core);
     ok(&core, TENANT, ADD_G);
     let policy = ctx(TENANT);
     let session = SessionState::default();
-    let copy = core
-        .begin_copy(&policy, &session, "COPY t (a) FROM STDIN")
+    core.begin_copy(&policy, &session, "COPY t (a) FROM STDIN")
         .and_then(|plan| match plan {
             CopyPlan::From(mut s) => {
-                s.feed(b"1\n")?;
+                s.feed(b"7\n")?;
                 let batch = s.finish()?;
                 core.commit_copy_in(&policy, batch)
             }
             CopyPlan::To(..) => panic!("expected COPY FROM plan"),
-        });
+        })
+        .expect("COPY must be accepted");
     assert_eq!(
-        copy.expect_err("COPY must be rejected").wire_code(),
-        "0A000"
+        grid(&core, TENANT, "SELECT g FROM t WHERE a = 7"),
+        g(&[&["14"]])
     );
 }
 

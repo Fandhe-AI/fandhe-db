@@ -520,13 +520,10 @@ fn persists_across_reopen_and_roundtrips_through_schema_dump() {
     ok(&restored, TENANT, "INSERT INTO g (a, name) VALUES (1, 'x')");
 }
 
-/// 計算点が結線されていない経路（ビュー・COPY。SQL の INSERT・UPDATE・UPSERT は Issue #3328 で結線済みで
-/// `table50_generated_column_write` が検証する）は、生成列を持つ表への書き込みを固定文言の `0A000` で拒否し、
-/// 行・台帳が残らない。計算を伴わない文（0 件一致の UPDATE・DELETE・TRUNCATE）は通る。
+/// 計算を伴わない文（0 件一致の UPDATE・DELETE・TRUNCATE）は生成列を持つ表でも通り、ビュー・COPY の
+/// 書き込みは生成列を計算して保存する（Issue #3329。詳細は `table50_generated_column_write`）。
 #[test]
-// ビュー・COPY 等の結線（#3329）。
-// tracked: #3329
-fn unwired_writes_to_generated_tables_are_rejected() {
+fn wired_writes_to_generated_tables_compute_and_no_op_statements_pass() {
     let (_p, _g, core) = fixture("gen-write-stop");
     ok(
         &core,
@@ -534,16 +531,11 @@ fn unwired_writes_to_generated_tables_are_rejected() {
         "CREATE TABLE g (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
     );
     ok(&core, TENANT, "CREATE VIEW gv AS SELECT a FROM g");
-    let sql = "INSERT INTO gv (a) VALUES (1)";
-    assert_eq!(code(&core, TENANT, sql), "0A000", "{sql}");
-    let m = message(&core, TENANT, sql);
-    assert!(!m.contains(TENANT), "{m}");
-    assert!(!m.contains("\"g\""), "{m}");
+    ok(&core, TENANT, "INSERT INTO gv (a) VALUES (1)");
     // COPY FROM STDIN。
     let policy = ctx(TENANT);
     let session = SessionState::default();
-    let copy = core
-        .begin_copy(&policy, &session, "COPY g (a) FROM STDIN")
+    core.begin_copy(&policy, &session, "COPY g (a) FROM STDIN")
         .and_then(|plan| match plan {
             CopyPlan::From(mut s) => {
                 s.feed(b"1\n")?;
@@ -551,14 +543,10 @@ fn unwired_writes_to_generated_tables_are_rejected() {
                 core.commit_copy_in(&policy, batch)
             }
             CopyPlan::To(..) => panic!("expected COPY FROM plan"),
-        });
-    assert_eq!(
-        copy.expect_err("COPY must be rejected").wire_code(),
-        "0A000"
-    );
-    // 行は 1 件も残らない。
-    match run(&core, TENANT, "SELECT a FROM g").expect("select") {
-        SqlOutcome::Query(q) => assert!(q.rows.is_empty()),
+        })
+        .expect("COPY computes the generated column");
+    match run(&core, TENANT, "SELECT b FROM g").expect("select") {
+        SqlOutcome::Query(q) => assert_eq!(q.rows.len(), 2),
         other => panic!("expected rows, got {other:?}"),
     }
     // 計算を伴わない文は通る。

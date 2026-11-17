@@ -183,7 +183,7 @@ type WriteError = crate::tenant::TenantWriteError;
 thread_local! {
     /// 生成列の計算点が結線された SQL 表層の書き込み区間の対象表（`tenant` に渡る表名と同じ文字列）。
     /// `None` は結線済みの区間の外（既定。生成列を持つ表への書き込みは `0A000`）。
-    static WIRED_TABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static WIRED_TABLE: std::cell::RefCell<Option<(String, bool)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 生成列の計算点が結線済みであることを宣言する RAII ガード（Issue #3328）。`core` の SQL 表層の入口
@@ -191,14 +191,23 @@ thread_local! {
 /// 書き込みは張らないため、共有の書き込み関数へ到達しても [`write_wired`] が偽になり `0A000` に倒れる
 /// （`RowPolicyWrite` と違い既定が拒否側。張り忘れは fail-closed）。drop で直前の状態へ戻す。
 pub(crate) struct GeneratedComputeScope {
-    prev: Option<String>,
+    prev: Option<(String, bool)>,
 }
 
 impl GeneratedComputeScope {
     /// 表 `table` への書き込み区間を結線済みとして張る。
     pub(crate) fn enter(table: &str) -> Self {
         Self {
-            prev: WIRED_TABLE.with(|c| c.replace(Some(table.to_string()))),
+            prev: WIRED_TABLE.with(|c| c.replace(Some((table.to_string(), false)))),
+        }
+    }
+
+    /// トリガ本体の書き込み（`TriggerWriteHandle::run_write`）が、本体の書き込み先の表 `table` で張る。
+    /// 外側のビュー経由の書き込み区間が残っていても、本体の書き込み先は基表と無関係なため、ビューの基表
+    /// 照合を免除する（[`write_wired`]）。表名の一致は引き続き要求するので、本体から連鎖した別表は偽のまま。
+    pub(crate) fn enter_trigger_body(table: &str) -> Self {
+        Self {
+            prev: WIRED_TABLE.with(|c| c.replace(Some((table.to_string(), true)))),
         }
     }
 
@@ -218,10 +227,18 @@ impl Drop for GeneratedComputeScope {
 }
 
 /// 表 `table` への書き込みが結線済みの SQL 表層の区間にあるか。結線済みの区間の対象表と一致し、
-/// かつビュー経由の書き込み区間の外であることが条件（ビュー・INSTEAD OF は Issue #3329）。
+/// かつ、ビュー経由の書き込み区間の外か、区間の基表が `table` であること（Issue #3329）が条件。
+/// ビューは基表形の文へ書き換えられて基表の書き込み入口へ流れるため、基表への書き込みは結線済みとして
+/// 扱う。別表への書き込み（FK の連鎖等）は基表名が一致せず偽のまま。
 pub(crate) fn write_wired(table: &str) -> bool {
-    WIRED_TABLE.with(|c| c.borrow().as_deref() == Some(table))
-        && crate::sql::view_write_scope::current_view_name().is_none()
+    let (wired, trigger_body) = WIRED_TABLE.with(|c| match c.borrow().as_ref() {
+        Some((t, body)) => (t == table, *body),
+        None => (false, false),
+    });
+    wired
+        && (trigger_body
+            || crate::sql::view_write_scope::current_view_name().is_none()
+            || crate::sql::view_write_scope::current_view_base_table_is(table))
 }
 
 /// 書き込み先の表の生成列の保存式を束縛した計算器（1 文に 1 回だけ作る。行ループの外）。
