@@ -3,7 +3,8 @@
 //!
 //! 外側参照の無い LATERAL は通常の派生表と同じ結果になり（L6）、左側の列を参照する INNER／CROSS／
 //! コンマの形は #3322 で外側の行ごとに再評価して実行する（結果は `sql62_lateral_exec.rs` が固定。
-//! 本ファイルは束縛を通ったあとの件数で確かめる）。`LEFT JOIN LATERAL` は専用文言の `0A000`（#3323）。
+//! 本ファイルは束縛を通ったあとの件数で確かめる）。`LEFT JOIN LATERAL` は #3323 で実行でき、RIGHT／FULL の
+//! 左側参照の `42P10` は `sql62_lateral_left.rs` が固定する。
 //! 不正な外側参照は束縛段で拒否し、予約内部名をエラー文に出さない。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -119,8 +120,6 @@ fn exec_err(core: &EngineCore, tenant: &str, sql: &str) -> SqlSurfaceError {
     core.execute_sql_in_session(&ctx(tenant), &mut session, sql)
         .expect_err("must be rejected")
 }
-
-const LEFT_MSG: &str = "LEFT JOIN LATERAL is not supported yet";
 
 #[test]
 fn uncorrelated_lateral_matches_plain_derived_table() {
@@ -271,19 +270,21 @@ fn correlated_forms_execute_with_the_expected_row_counts() {
     );
 }
 
-/// `LEFT JOIN LATERAL` は外側参照の有無を問わず専用文言の `0A000`（#3323）。
-// tracked: #3323
+/// 左側を参照する `LEFT JOIN LATERAL ... ON true` は束縛を通って実行され、全外側行が内側に一致する形では
+/// `JOIN LATERAL ... ON true` と同じ結果になる（#3323。NULL 補完の値は `sql62_lateral_left.rs` が固定）。
 #[test]
-fn correlated_left_join_lateral_stays_a_dedicated_0a000() {
+fn correlated_left_join_lateral_executes_like_the_inner_form_when_every_row_matches() {
     let (core, _g) = open();
+    let inner = "SELECT * FROM docs d JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true";
     for sql in [
         "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
         "SELECT * FROM docs d LEFT OUTER JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
     ] {
         for tenant in ["alice", "carol"] {
-            let (c, m) = err_pair(&core, tenant, sql);
-            assert_eq!(c, "0A000", "{sql}");
-            assert!(m.ends_with(LEFT_MSG), "{sql}: {m}");
+            let l = query(&core, tenant, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            let i = query(&core, tenant, inner).expect("inner form");
+            assert!(!l.rows.is_empty(), "{sql}");
+            assert_eq!(l.rows.len(), i.rows.len(), "{tenant}: {sql}");
         }
     }
 }
@@ -316,17 +317,33 @@ fn implicit_id_binds_on_inner_and_left_sides() {
     assert_eq!(r.rows.len(), 6);
 }
 
-// tracked: #3323
+/// 左側を参照しない `LEFT JOIN LATERAL` は通常の派生表の LEFT JOIN として実行され、内側が空なら外側の全行が
+/// NULL 補完で残る（#3323。L6）。
 #[test]
-fn uncorrelated_left_join_lateral_is_a_dedicated_0a000() {
+fn uncorrelated_left_join_lateral_executes_as_a_plain_left_join() {
     let (core, _g) = open();
-    let (c, m) = err_pair(
+    let outer = query(&core, "alice", "SELECT * FROM docs d")
+        .expect("outer")
+        .rows
+        .len();
+    let full = query(
         &core,
         "alice",
         "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs) t ON true",
-    );
-    assert_eq!(c, "0A000");
-    assert!(m.ends_with("LEFT JOIN LATERAL is not supported yet"), "{m}");
+    )
+    .expect("left join");
+    assert_eq!(full.rows.len(), outer * outer);
+    let empty = query(
+        &core,
+        "alice",
+        "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs WHERE lang = 'zz') t ON true",
+    )
+    .expect("empty inner");
+    assert_eq!(empty.rows.len(), outer);
+    assert!(empty
+        .rows
+        .iter()
+        .all(|r| matches!(r.cells.last(), Some(engine::sql::exec::Cell::Null))));
 }
 
 #[test]
@@ -388,7 +405,7 @@ fn binding_errors_are_identical_across_tenants_and_hide_internal_names() {
     for sql in [
         "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang = d.nope) t",
         "SELECT * FROM docs a, LATERAL (SELECT lang FROM docs x WHERE x.lang = z.lang) t",
-        "SELECT * FROM docs d LEFT JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
+        "SELECT * FROM docs d RIGHT JOIN LATERAL (SELECT lang FROM docs x WHERE x.lang = d.lang) t ON true",
     ] {
         let a = err_pair(&core, "alice", sql);
         let c = err_pair(&core, "carol", sql);
@@ -401,7 +418,7 @@ fn binding_errors_are_identical_across_tenants_and_hide_internal_names() {
     }
 }
 
-// tracked: #3323, #3324
+// tracked: #3324
 #[test]
 fn unsupported_lateral_shapes_stay_fail_closed() {
     let (core, _g) = open();
@@ -410,11 +427,8 @@ fn unsupported_lateral_shapes_stay_fail_closed() {
         "SELECT * FROM docs d, LATERAL (SELECT d.lang FROM docs x) t",
         "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x ORDER BY d.lang) t",
         "SELECT * FROM docs d, LATERAL (SELECT lang FROM docs x WHERE x.lang IN (SELECT lang FROM docs y WHERE y.lang = d.lang)) t",
-        // 入れ子の LATERAL・RIGHT／FULL／NATURAL。
+        // 入れ子の LATERAL。
         "SELECT * FROM (SELECT lang FROM docs a, LATERAL (SELECT lang FROM docs) b) t",
-        "SELECT * FROM docs d RIGHT JOIN LATERAL (SELECT lang FROM docs) t ON true",
-        "SELECT * FROM docs d FULL JOIN LATERAL (SELECT lang FROM docs) t ON true",
-        "SELECT * FROM docs d NATURAL JOIN LATERAL (SELECT lang FROM docs) t",
         // 本文が SELECT 以外。
         "SELECT * FROM docs d, LATERAL (VALUES (1)) t",
         "SELECT * FROM docs d, LATERAL (WITH c AS (SELECT lang FROM docs) SELECT lang FROM c) t",

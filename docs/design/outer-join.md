@@ -133,6 +133,7 @@ Full}` の場合に限り、non-strict な述語を検出したら簡約せず `
 ## 対象外（申し送りのみ。Issue は起票しない）
 
 - `CROSS` JOIN・`NATURAL` JOIN・`USING (...)`
+- 補足（Issue #3323）: 結合種別が `LEFT`／`RIGHT`／`FULL` で条件が `Cross` の段は、LATERAL 派生表の `ON true` を `sql::derived_table` が書き換えたときだけ生じる（構文段の `CROSS JOIN` は常に `Inner`。`lateral-derived-table.md`）
 - 外部結合とウィンドウ・`DISTINCT` の組み合わせ（3 テーブル以上の連鎖・集計・`GROUP BY`・
   スカラー `ORDER BY`・WHERE の `OR`／`IN` は Issue #1190〔`multi-way-join.md`〕で受理対象に
   なった）

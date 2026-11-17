@@ -50,19 +50,6 @@ impl Tuples {
     }
 }
 
-impl Tuples {
-    /// フラット配置のスロット列から組み立てる（LATERAL の段。`data` の長さが `n` の倍数でなければ
-    /// 内部エラー＝fail-closed）。
-    pub(super) fn from_parts(n: usize, data: Vec<Option<u32>>) -> Result<Self, SqlSurfaceError> {
-        if n == 0 || !data.len().is_multiple_of(n) {
-            return Err(SqlSurfaceError::Internal {
-                detail: "JOIN tuple buffer length mismatch".to_string(),
-            });
-        }
-        Ok(Self { n, data })
-    }
-}
-
 #[cfg(test)]
 impl Tuples {
     /// フラット配置のスロット列から組み立てる（テスト用）。長さが `n` の倍数でなければ
@@ -94,7 +81,7 @@ pub(super) fn to_u32(v: usize, what: &str) -> Result<u32, SqlSurfaceError> {
 /// 結合キーを持たない（`Ok(None)`）——ビルド・プローブいずれからも除外する
 /// （Issue #925 §2.4。NULL は決して一致しない）。`row` が `None`（NULL 補完された
 /// relation）のときもキーを持たない。
-fn extract_key(
+pub(super) fn extract_key(
     row: Option<&ResultRow>,
     keys: &[StepKey],
     pos_of: impl Fn(&StepKey) -> usize,
@@ -174,15 +161,10 @@ pub(super) fn run_joins_lateral(
         let rt = lateral.get(new_rel).and_then(Option::as_ref);
         match (rt, step.lateral.is_some()) {
             (Some(rt), true) => {
-                let (tuples, arena) =
-                    super::lateral::lateral_step(sides, rt, new_rel, &acc, budget, limits, stop)?;
-                let slot = sides
-                    .get_mut(new_rel)
-                    .ok_or_else(|| SqlSurfaceError::Internal {
-                        detail: "JOIN relation index out of range".to_string(),
-                    })?;
-                *slot = arena;
-                acc = tuples;
+                // 出力領域は `lateral_step` が `sides[new_rel]` へ据える。
+                acc = super::lateral::lateral_step(
+                    sides, rt, step, new_rel, &acc, budget, limits, stop,
+                )?;
             }
             (None, false) => {
                 let new_rows = sides
@@ -315,8 +297,22 @@ fn join_step(
     // 判定に使うのは可視行（RLS・WHERE 適用後）の件数だけで、`LIMIT`／`OFFSET` の値には依存しない。
     if method == JoinMethod::Cross {
         match acc.len().checked_mul(new_rows.len()) {
-            Some(product) if product <= limits.max_output_rows => {
-                if matches!(stop_after_pairs, Some(t) if product > t) {
+            Some(product) => {
+                // 外部結合の保持（LATERAL ... ON true の LEFT／RIGHT／FULL。Issue #3323）では、片側が空で
+                // 積が 0 でも、保存側の NULL 補完行が出力される。その件数も上限判定へ含める。
+                let total = if product == 0 {
+                    let a = if step.preserve_acc { acc.len() } else { 0 };
+                    let b = if step.preserve_new { new_rows.len() } else { 0 };
+                    a.saturating_add(b)
+                } else {
+                    product
+                };
+                if total > limits.max_output_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "JOIN result exceeds the row limit",
+                    ));
+                }
+                if matches!(stop_after_pairs, Some(t) if total > t) {
                     return Err(crate::sql::scan::row_limit_exceeded());
                 }
             }

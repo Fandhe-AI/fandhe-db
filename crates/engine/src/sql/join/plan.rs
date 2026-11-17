@@ -1233,8 +1233,8 @@ pub(super) fn build_plan<'a>(
 }
 
 /// LATERAL の段の外側参照を解決する（Issue #3322）。`validated.cte_inputs.lateral` が `Some` の
-/// relation `i` の段 `i - 1` に、外側参照の列を左側 relation の側投影へ登録した位置を載せる。段の条件が
-/// 直積（`CROSS`）の INNER でなければ `0A000`、参照が左側に無い・列が見つからないのは `Internal`
+/// relation `i` の段 `i - 1` に、外側参照の列を左側 relation の側投影へ登録した位置を載せる。段が
+/// 直積（`CROSS`）または ON 条件の INNER／LEFT でなければ `0A000`、参照が左側に無い・列が見つからないのは `Internal`
 /// （束縛段が先に拒否しているため到達しない不変条件。fail-closed）。段ごとの LATERAL の有無を返す。
 fn bind_lateral_steps(
     b: &mut Binder<'_, '_>,
@@ -1263,7 +1263,11 @@ fn bind_lateral_steps(
             .steps
             .get(k)
             .ok_or_else(|| internal("LATERAL step missing"))?;
-        if !matches!(vstep.condition, JoinCondition::Cross) || vstep.kind != JoinKind::Inner {
+        // 直積（`ON true` の書き換え）か ON 条件の INNER／LEFT だけを再評価できる。RIGHT／FULL は束縛段が
+        // `42P10` で拒否済みで、USING／NATURAL は `derived_table` が固定 `0A000` にするため到達しない（多重防御）。
+        let supported_condition =
+            matches!(vstep.condition, JoinCondition::Cross | JoinCondition::On(_));
+        if !supported_condition || !matches!(vstep.kind, JoinKind::Inner | JoinKind::Left) {
             return Err(SqlSurfaceError::feature_not_supported(
                 "this JOIN form with a LATERAL subquery referencing outer columns is not supported yet",
             ));

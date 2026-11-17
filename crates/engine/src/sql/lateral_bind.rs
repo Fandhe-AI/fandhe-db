@@ -80,6 +80,11 @@ fn is_literal_word(n: &str) -> bool {
         .any(|w| n.eq_ignore_ascii_case(w))
 }
 
+/// 括弧なしで書ける SQL 値関数（`CURRENT_DATE` 等）か。列名ではないので列探索・未知列判定から除外する。
+fn is_value_function_keyword(n: &str) -> bool {
+    crate::sql::lexer::is_value_function_keyword(n)
+}
+
 fn find_col<'a>(cols: &'a [String], name: &str) -> Option<&'a String> {
     cols.iter().find(|c| c.eq_ignore_ascii_case(name))
 }
@@ -201,10 +206,14 @@ fn split_conjuncts(tokens: &[Token], from: usize, to: usize) -> Vec<(usize, usiz
 /// LATERAL の本文 `body`（`SELECT ...`。括弧なし）が参照する左側 relation `left` の列を束縛する。
 /// `columns` は relation の列集合（実表・利用者の CTE・先行の派生表）を返す。`Ok(None)` は列集合を
 /// 返せない relation で、その relation への修飾参照は `0A000`、非修飾名の推定からは外す（fail-closed）。
+/// `reject_left_ref` は RIGHT／FULL JOIN の LATERAL（Issue #3323）で、左側 relation を参照した時点
+/// （列が存在するかを問わない。PostgreSQL と同じ）で `42P10` を返す。内側の未知列（`42703`）・未知の
+/// 修飾子（`42P01`）は本文のテキスト順で先に現れた方が先に返る。
 pub(crate) fn bind_lateral_body<F>(
     body: &[Token],
     left: &[TableRef],
     columns: &mut F,
+    reject_left_ref: bool,
 ) -> Result<BoundBody, SqlSurfaceError>
 where
     F: FnMut(&TableRef) -> Result<Option<Vec<String>>, SqlSurfaceError>,
@@ -243,6 +252,42 @@ where
     // （`WHERE a AND (x = d.k OR ...)` の外側参照は最上位 WHERE の中）。
     let mut parens: Vec<bool> = Vec::new();
     let mut depth = 0usize;
+    // SELECT リスト直下（括弧の外）の項目別名 `AS b` だけを集める（`CAST(x AS t)` やテーブル別名は
+    // 括弧内・FROM 以降なので含めない）。適用は `ORDER BY b` の単独の別名参照だけ（PostgreSQL と同じく
+    // 出力別名は ORDER BY の裸の名前でのみ列より優先して解決される）。
+    let output_aliases: Vec<&str> = {
+        let mut d = 0usize;
+        let mut v = Vec::new();
+        for (j, t) in body.iter().enumerate().take(from_idx) {
+            match t {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => d = d.saturating_sub(1),
+                Token::Ident(a) if d == 0 && a.eq_ignore_ascii_case("AS") => {
+                    if let Some(Token::Ident(n)) = body.get(j.saturating_add(1)) {
+                        v.push(n.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        v
+    };
+    let order_start: Option<usize> = {
+        let mut d = 0usize;
+        let mut found = None;
+        for (j, t) in body.iter().enumerate() {
+            match t {
+                Token::Punct('(') => d = d.saturating_add(1),
+                Token::Punct(')') => d = d.saturating_sub(1),
+                Token::Keyword(Keyword::Order) if d == 0 && j > from_idx => {
+                    found = Some(j);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        found
+    };
     for (i, tok) in body.iter().enumerate() {
         match tok {
             Token::Punct('(') => {
@@ -270,6 +315,16 @@ where
         match tok {
             Token::QualifiedIdent { qualifier, name } => {
                 if inner_ref.matches_qualifier(qualifier) {
+                    // RIGHT／FULL では内側の未知列を、後続の左側参照（`42P10`）より先に出た順で `42703` にする。
+                    if reject_left_ref
+                        && !name.eq_ignore_ascii_case("id")
+                        && !is_non_column_position(body, i)
+                        && inner_cols
+                            .as_deref()
+                            .is_some_and(|ic| find_col(ic, name).is_none())
+                    {
+                        return Err(SqlSurfaceError::undefined_column(name.clone()));
+                    }
                     continue;
                 }
                 let Some(ridx) = left.iter().position(|r| r.matches_qualifier(qualifier)) else {
@@ -287,6 +342,9 @@ where
                         "qualified column reference named like a SQL keyword is not supported",
                     ));
                 }
+                if reject_left_ref {
+                    return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
+                }
                 let Some(cols) = lc.get(ridx)? else {
                     return Err(unresolvable_left_columns());
                 };
@@ -303,7 +361,31 @@ where
                 });
             }
             Token::Ident(n) if depth == 0 => {
-                if is_syntax_word(n) || is_literal_word(n) || is_non_column_position(body, i) {
+                if is_syntax_word(n)
+                    || is_literal_word(n)
+                    || is_value_function_keyword(n)
+                    || is_non_column_position(body, i)
+                {
+                    continue;
+                }
+                // ORDER BY の裸の出力別名は左側・内側の列探索へ進まず確定する。
+                if order_start.is_some_and(|o| i > o)
+                    && parens.is_empty()
+                    && output_aliases.iter().any(|a| a.eq_ignore_ascii_case(n))
+                    && matches!(
+                        i.checked_sub(1).and_then(|p| body.get(p)),
+                        Some(Token::Punct(',')) | Some(Token::Keyword(Keyword::By))
+                    )
+                    && match body.get(i.saturating_add(1)) {
+                        None
+                        | Some(Token::Punct(',' | ';'))
+                        | Some(Token::Keyword(Keyword::Limit)) => true,
+                        Some(Token::Ident(w)) => ["ASC", "DESC", "NULLS", "OFFSET", "FETCH"]
+                            .iter()
+                            .any(|k| w.eq_ignore_ascii_case(k)),
+                        _ => false,
+                    }
+                {
                     continue;
                 }
                 let Some(ic) = inner_cols.as_deref() else {
@@ -313,15 +395,26 @@ where
                     continue;
                 }
                 let mut hit: Option<(usize, String)> = None;
+                let mut all_known = true;
                 for ridx in 0..left.len() {
-                    if let Some(col) = lc.get(ridx)?.and_then(|cols| find_col(cols, n)) {
+                    let cols = lc.get(ridx)?;
+                    all_known &= cols.is_some();
+                    if let Some(col) = cols.and_then(|cols| find_col(cols, n)) {
                         if hit.is_some() {
                             return Err(SqlSurfaceError::AmbiguousColumn { name: n.clone() });
                         }
                         hit = Some((ridx, col.clone()));
                     }
                 }
+                // RIGHT／FULL: どちらの側にも解決できない非修飾名は、後続の左側参照（`42P10`）より
+                // 先に `42703` で確定する（修飾名と同じテキスト順規則）。左側の列が不明なら従来どおり通す。
+                if hit.is_none() && reject_left_ref && all_known && !n.eq_ignore_ascii_case("id") {
+                    return Err(SqlSurfaceError::undefined_column(n.clone()));
+                }
                 if let Some((ridx, col)) = hit {
+                    if reject_left_ref {
+                        return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
+                    }
                     if let Some(slot) = out.get_mut(i) {
                         *slot = Token::Ident(lateral_ref_placeholder(ridx, &col));
                     }
@@ -561,6 +654,7 @@ fn check_dropped_conjunct(
                 if parse_lateral_ref_placeholder(n).is_some()
                     || is_syntax_word(n)
                     || is_literal_word(n)
+                    || is_value_function_keyword(n)
                     || is_non_column_position(toks, i)
                 {
                     continue;
@@ -584,6 +678,7 @@ mod tests {
         Ok(match t.table() {
             "docs" => Some(vec!["id".into(), "lang".into(), "title".into()]),
             "other" => Some(vec!["id".into(), "k".into(), "lang".into()]),
+            "people" => Some(vec!["id".into(), "user".into(), "current_user".into()]),
             "opaque" => None,
             _ => None,
         })
@@ -591,11 +686,61 @@ mod tests {
 
     fn bind(sql: &str, left: &[TableRef]) -> Result<BoundBody, SqlSurfaceError> {
         let toks = tokenize(sql).expect("tokenize");
-        bind_lateral_body(&toks, left, &mut cols_of)
+        bind_lateral_body(&toks, left, &mut cols_of, false)
     }
 
     fn d() -> TableRef {
         TableRef::with_alias("docs", "d")
+    }
+
+    #[test]
+    fn value_function_keywords_are_not_unknown_columns() {
+        let left = [d()];
+        for sql in [
+            "SELECT CURRENT_DATE AS today FROM docs x LIMIT 1",
+            "SELECT current_timestamp AS t FROM docs x LIMIT 1",
+            "SELECT CURRENT_TIMESTAMP(3) AS t, LOCALTIME AS l FROM docs x LIMIT 1",
+        ] {
+            let toks = tokenize(sql).expect("tokenize");
+            for reject in [false, true] {
+                bind_lateral_body(&toks, &left, &mut cols_of, reject).expect(sql);
+            }
+        }
+    }
+
+    #[test]
+    fn right_full_order_by_output_alias_is_not_an_unknown_column() {
+        let toks = tokenize("SELECT title AS b FROM docs x ORDER BY b LIMIT 1").expect("tokenize");
+        let left = [TableRef::with_alias("other", "o")];
+        // 出力別名 `b` は物理列ではないが、RIGHT／FULL（reject_left_ref）でも 42703 にしない。
+        bind_lateral_body(&toks, &left, &mut cols_of, true).expect("alias resolves");
+        let toks = tokenize("SELECT title FROM docs x ORDER BY b LIMIT 1").expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
+    }
+
+    #[test]
+    fn right_full_order_by_alias_wins_over_same_named_left_column() {
+        // 左側 `other` に列 `k` があっても、ORDER BY の別名 `k` は出力別名として解決する。
+        let toks = tokenize("SELECT title AS k FROM docs x ORDER BY k LIMIT 1").expect("tokenize");
+        let left = [TableRef::with_alias("other", "o")];
+        bind_lateral_body(&toks, &left, &mut cols_of, true).expect("alias wins");
+    }
+
+    #[test]
+    fn right_full_alias_does_not_hide_unknown_column_in_where() {
+        let left = [TableRef::with_alias("other", "o")];
+        // CAST の AS やテーブル別名は出力別名ではなく、WHERE の別名は列ではない。
+        let toks = tokenize(
+            "SELECT CAST(title AS t) FROM docs x WHERE t = 'a' AND lang = o.k ORDER BY id",
+        )
+        .expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
+        let toks = tokenize("SELECT title AS t FROM docs x WHERE t = 'a' AND lang = o.k")
+            .expect("tokenize");
+        let err = bind_lateral_body(&toks, &left, &mut cols_of, true).expect_err("42703");
+        assert_eq!(err.wire_code(), "42703");
     }
 
     #[test]
@@ -629,6 +774,17 @@ mod tests {
     }
 
     #[test]
+    fn left_columns_named_like_session_functions_are_bound_as_outer_refs() {
+        // 本エンジンの値関数は日時系 5 種のみ。`user` 等は通常の識別子として外部参照に束縛する。
+        let p = TableRef::with_alias("people", "p");
+        for col in ["user", "current_user"] {
+            let sql = format!("SELECT lang FROM other WHERE k = {col}");
+            let b = bind(&sql, std::slice::from_ref(&p)).expect("bind");
+            assert!(b.binding.is_correlated(), "{col} must bind as outer ref");
+        }
+    }
+
+    #[test]
     fn unqualified_name_only_in_left_is_outer_and_inner_wins_on_tie() {
         let b = bind("SELECT k FROM other WHERE k = title", &[d()]).expect("bind");
         assert!(b.binding.is_correlated());
@@ -647,7 +803,7 @@ mod tests {
                 _ => cols_of(t)?,
             })
         };
-        let err = bind_lateral_body(&toks, &left, &mut cols).expect_err("ambiguous");
+        let err = bind_lateral_body(&toks, &left, &mut cols, false).expect_err("ambiguous");
         assert_eq!(err.wire_code(), "42702");
     }
 

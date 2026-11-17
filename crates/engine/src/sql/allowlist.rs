@@ -1279,6 +1279,9 @@ pub enum SqlSurfaceError {
     /// 一致しない（`42P10`。SQL-49・ERR-6、Issue #1707。`id` と他列の混在・未知列を含む）。
     /// 束縛段（`sql::parser::resolve_conflict_target`）が返す。固定文言で列名・値を含めない。
     InvalidColumnReference,
+    /// RIGHT／FULL JOIN の LATERAL 派生表が左側 relation の列を参照した（`42P10`。SQL-62・Issue #3323）。
+    /// `sql::derived_table` の束縛段が返す。固定文言で入力・列名を含めない。
+    LateralReferenceInvalidJoinType,
     /// ウィンドウのフレーム句のオフセット式に変数（識別子）がある（`42P10`。SQL-64 (2)・
     /// Issue #1887）。列を解決せず一律に返すため、ビューの非公開列か未知列かで応答が変わらない
     /// （存在情報を漏らさない）。`mode` は `ROWS`／`RANGE`／`GROUPS` の固定語で、利用者の入力は含めない。
@@ -2174,6 +2177,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PartitionedJobBusy { .. } => ErrorClass::LockNotAvailable,
             SqlSurfaceError::DuplicateColumn { .. } => ErrorClass::DuplicateColumn,
             SqlSurfaceError::InvalidColumnReference
+            | SqlSurfaceError::LateralReferenceInvalidJoinType
             | SqlSurfaceError::WindowFrameOffsetHasVariables { .. }
             | SqlSurfaceError::CteColumnListTooLong { .. }
             | SqlSurfaceError::DerivedTableColumnListTooLong { .. }
@@ -2511,6 +2515,10 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InvalidColumnReference => write!(
                 f,
                 "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+            ),
+            SqlSurfaceError::LateralReferenceInvalidJoinType => write!(
+                f,
+                "invalid reference to FROM-clause entry: the combining JOIN type must be INNER or LEFT for a LATERAL reference"
             ),
             SqlSurfaceError::WindowFrameOffsetHasVariables { mode } => {
                 write!(f, "argument of {mode} must not contain variables")
@@ -4130,7 +4138,8 @@ pub(crate) enum JoinKind {
 /// 構文段では持たない。束縛段 `sql::join` が両入力のスキーマから共通列名を導出し、`Using` と
 /// 同じ経路で束縛する（共通列が 0 個なら条件なしの直積）。
 /// `Cross`（Issue #1831・SQL-60 ポインタ）は `CROSS JOIN` で、条件を持たない直積。結合種別は
-/// 常に [`JoinKind::Inner`]。束縛段では結合キー・ON 残余ともに空の段になる。
+/// 構文段では常に [`JoinKind::Inner`]（`sql::derived_table` が LATERAL 派生表の `ON true` を
+/// `CROSS JOIN` へ書き換えたときだけ、束縛前に Left／Right／Full へ設定する。Issue #3323）。束縛段では結合キー・ON 残余ともに空の段になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JoinCondition {
     On(JoinWhereExpr),

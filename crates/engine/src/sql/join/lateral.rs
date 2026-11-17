@@ -15,6 +15,12 @@
 //! 3. 外側の文の側スキャン（その relation への投影とプッシュダウン述語）を適用する。
 //! 4. 結果を出力領域（arena）へ追記する。`sides[new_rel]` はこの arena に置き換わり、下流（残余・
 //!    並べ替え・集計・投影）は従来どおり `sides` を読む。順序は「外側タプル順 → 後処理後の行順」（L13）。
+//! 5. （Issue #3323）arena を据えたあと、候補ペアごとに結合キー・ON 残余（`on_new`・`on_mixed`）を
+//!    `residual::eval_all` で評価して一致を決める。ON は内側の `LIMIT`／`OFFSET` の後に効く。
+//!    `LEFT JOIN LATERAL` は後処理・側スキャン・ON をすべて適用した後に一致が 0 件の外側タプルを、
+//!    `exec::materialize_step`（ハッシュ結合・NLJ と共有）で NULL 補完行として残す。外側だけを参照する
+//!    ON 残余（`on_acc`）は外側タプルごとに 1 回だけ評価し、偽のタプルは再評価しない。RIGHT／FULL で
+//!    左側を参照する形は束縛段（`sql::derived_table`）が `42P10` で拒否するため、ここへは来ない。
 //!
 //! 上限（`54000`。可視行だけで判定し `LIMIT`／`OFFSET` の値に依存させない。L7〜L12）: 評価を始める前に
 //! 通過した外側タプル数を再評価予算と、「外側タプル数 × 基底の行数」の見積りを比較予算と照合し、見積り
@@ -34,8 +40,9 @@ use crate::sql::udf_call::UdfRegistry;
 use crate::sql::view_buffered::OuterPlan;
 use crate::sql::where_tree::{BoundConjunction, BoundOrGroup};
 
-use super::exec::{to_u32, Tuples, SLOT_BYTES};
-use super::plan::LateralStepPlan;
+use super::exec::{extract_key, materialize_step, push_charged_pair, to_u32, Tuples, SLOT_BYTES};
+use super::plan::{LateralStepPlan, StepPlan};
+use super::residual::eval_all;
 use super::values::{cell_scalar, cell_scalar_supports};
 use super::{JoinBudget, JoinLimits};
 
@@ -233,25 +240,55 @@ impl LateralRuntime {
     }
 }
 
-/// LATERAL の段 1 つを実行する。`acc` は relation `0..new_rel` の結合結果で、戻りは新しいタプル列と
-/// `sides[new_rel]` に置く出力領域。`stop_after_pairs` は最終段の早期停止の閾値（Issue #1797）。
+/// LATERAL の段 1 つを実行し、新しいタプル列を返す。`acc` は relation `0..new_rel` の結合結果で、出力領域
+/// （arena）は `sides[new_rel]` へ据える（下流の残余・並べ替え・集計・投影は `sides` を読む）。
+/// `stop_after_pairs` は最終段の早期停止の閾値（Issue #1797）。
+///
+/// 2 段で処理する（Issue #3323）。前段は外側タプルごとに「相関述語 → 後処理の層 → 側スキャン」を適用して
+/// 候補ペア `(外側タプル, arena の行)` を作る。後段は `sides[new_rel]` を据えたあと、候補ごとに結合キー・
+/// ON 残余（`on_new`・`on_mixed`）を共有の評価器（`residual::eval_all`）で評価して一致を決め、一致した
+/// 外側タプルを記録する。保存側（LEFT）では、LIMIT／OFFSET・側スキャン・ON をすべて適用した後に一致が 0 件の
+/// 外側タプルを NULL 補完行として残す（`exec::materialize_step` を共有。NULL 補完行も出力上限の対象）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lateral_step(
-    sides: &[Vec<ResultRow>],
+    sides: &mut [Vec<ResultRow>],
     rt: &LateralRuntime,
+    step: &StepPlan,
     new_rel: usize,
     acc: &Tuples,
     budget: &mut JoinBudget,
     limits: &JoinLimits,
     stop_after_pairs: Option<usize>,
-) -> Result<(Tuples, Vec<ResultRow>), SqlSurfaceError> {
+) -> Result<Tuples, SqlSurfaceError> {
     let n = acc.n;
     let outer_count = acc.len();
     let base_len = rt.base_len();
 
-    // L10: 評価・確保の前に、再評価数と比較数の見積り（外側タプル数 × 基底の行数）を照合する。
-    budget.charge_reevaluations(outer_count)?;
-    let estimate = outer_count
+    // 外側だけを参照する ON 残余（`on_acc`）は外側タプルごとに 1 回だけ評価する。偽のタプルは再評価
+    // しない（L7）。評価は外側 relation の `sides` だけを読むため arena を据える前に行える。
+    let mut scratch: Vec<StackValue> = Vec::new();
+    let mut passing: Vec<bool> = Vec::new();
+    let pass_count = if step.on_acc.is_empty() {
+        outer_count
+    } else {
+        budget.charge(outer_count)?;
+        passing.reserve(outer_count);
+        for ti in 0..outer_count {
+            if ti % crate::interrupt::CHECK_STRIDE as usize == 0 {
+                crate::interrupt::check()?;
+            }
+            let tuple = acc
+                .get(ti)
+                .ok_or_else(|| internal("JOIN accumulated tuple index out of range"))?;
+            passing.push(eval_all(&step.on_acc, sides, tuple, &mut scratch)?);
+        }
+        passing.iter().filter(|&&p| p).count()
+    };
+    let passes = |ti: usize| step.on_acc.is_empty() || passing.get(ti).copied().unwrap_or(false);
+
+    // L10: 評価・確保の前に、再評価数と比較数の見積り（通過した外側タプル数 × 基底の行数）を照合する。
+    budget.charge_reevaluations(pass_count)?;
+    let estimate = pass_count
         .checked_mul(base_len)
         .ok_or_else(|| too_large("JOIN comparison count exceeds the limit"))?;
     budget.charge_comparisons(estimate, limits.max_comparisons)?;
@@ -267,105 +304,192 @@ pub(super) fn lateral_step(
         budget.charge(layer_bound)?;
     }
 
-    let mut data: Vec<Option<u32>> = Vec::new();
-    let mut arena: Vec<ResultRow> = Vec::new();
-    let mut matched: Vec<u32> = Vec::new();
-    let mut scratch: Vec<StackValue> = Vec::new();
-    let mut scanned: Vec<Option<ScalarRef<'_>>> = vec![None; rt.width];
-    let mut compared: usize = 0;
-
-    for ti in 0..outer_count {
-        crate::interrupt::check()?;
-        let tuple = acc
-            .get(ti)
-            .ok_or_else(|| internal("JOIN accumulated tuple index out of range"))?;
-        // 外側参照の値（NULL 補完された relation・NULL のセルは NULL）。
-        for (slot_pos, rel, pos, ty) in &rt.outer_cols {
-            let row = tuple
-                .get(*rel)
-                .copied()
-                .flatten()
-                .and_then(|i| sides.get(*rel).and_then(|rows| rows.get(i as usize)));
-            let value = match row {
-                None => None,
-                Some(r) => {
-                    let cell = r
-                        .cells
-                        .get(*pos)
-                        .ok_or_else(|| internal("LATERAL outer cell position out of range"))?;
-                    lateral_scalar(cell, ty)?
-                }
-            };
-            *scanned
-                .get_mut(*slot_pos)
-                .ok_or_else(|| internal("LATERAL outer slot out of range"))? = value;
-        }
-        // 基底の各行へ相関述語をかける。
-        matched.clear();
-        for (bi, row) in rt.base.rows.iter().enumerate() {
-            if bi % crate::interrupt::CHECK_STRIDE as usize == 0 {
-                crate::interrupt::check()?;
+    // 前段。`scanned` は `sides` の外側セルを借用するため、後段で `sides` を更新する前にこの区間で閉じる。
+    let (mut pairs, arena) = {
+        let sides_ro: &[Vec<ResultRow>] = sides;
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        let mut arena: Vec<ResultRow> = Vec::new();
+        let mut matched: Vec<u32> = Vec::new();
+        let mut scanned: Vec<Option<ScalarRef<'_>>> = vec![None; rt.width];
+        let mut compared: usize = 0;
+        for ti in 0..outer_count {
+            crate::interrupt::check()?;
+            if !passes(ti) {
+                continue;
             }
-            compared = compared
-                .checked_add(1)
-                .ok_or_else(|| too_large("JOIN comparison count exceeds the limit"))?;
-            if compared > estimate {
-                return Err(internal(
-                    "LATERAL comparisons exceeded the reserved estimate",
-                ));
-            }
-            for (cell_pos, ty) in &rt.inner_cols {
-                let cell = row
-                    .cells
-                    .get(*cell_pos)
-                    .ok_or_else(|| internal("LATERAL base cell position out of range"))?;
+            let tuple = acc
+                .get(ti)
+                .ok_or_else(|| internal("JOIN accumulated tuple index out of range"))?;
+            // 外側参照の値（NULL 補完された relation・NULL のセルは NULL）。
+            for (slot_pos, rel, pos, ty) in &rt.outer_cols {
+                let row = tuple
+                    .get(*rel)
+                    .copied()
+                    .flatten()
+                    .and_then(|i| sides_ro.get(*rel).and_then(|rows| rows.get(i as usize)));
+                let value = match row {
+                    None => None,
+                    Some(r) => {
+                        let cell = r
+                            .cells
+                            .get(*pos)
+                            .ok_or_else(|| internal("LATERAL outer cell position out of range"))?;
+                        lateral_scalar(cell, ty)?
+                    }
+                };
                 *scanned
-                    .get_mut(*cell_pos)
-                    .ok_or_else(|| internal("LATERAL base slot out of range"))? =
-                    lateral_scalar(cell, ty)?;
+                    .get_mut(*slot_pos)
+                    .ok_or_else(|| internal("LATERAL outer slot out of range"))? = value;
             }
-            if rt.group.matches(&scanned, row.id, &[], 0, &mut scratch)? {
-                matched.push(to_u32(bi, "JOIN row count exceeds limit")?);
+            // 基底の各行へ相関述語をかける。
+            matched.clear();
+            for (bi, row) in rt.base.rows.iter().enumerate() {
+                if bi % crate::interrupt::CHECK_STRIDE as usize == 0 {
+                    crate::interrupt::check()?;
+                }
+                compared = compared
+                    .checked_add(1)
+                    .ok_or_else(|| too_large("JOIN comparison count exceeds the limit"))?;
+                if compared > estimate {
+                    return Err(internal(
+                        "LATERAL comparisons exceeded the reserved estimate",
+                    ));
+                }
+                for (cell_pos, ty) in &rt.inner_cols {
+                    let cell = row
+                        .cells
+                        .get(*cell_pos)
+                        .ok_or_else(|| internal("LATERAL base cell position out of range"))?;
+                    *scanned
+                        .get_mut(*cell_pos)
+                        .ok_or_else(|| internal("LATERAL base slot out of range"))? =
+                        lateral_scalar(cell, ty)?;
+                }
+                if rt.group.matches(&scanned, row.id, &[], 0, &mut scratch)? {
+                    matched.push(to_u32(bi, "JOIN row count exceeds limit")?);
+                }
             }
-        }
-        if matched.is_empty() {
-            continue;
-        }
-        // 一致行へ後処理の層・側スキャンを適用する。
-        let subset = QueryResult {
-            columns: rt.base.columns.clone(),
-            rows: matched
-                .iter()
-                .filter_map(|&i| rt.base.rows.get(i as usize).cloned())
-                .collect(),
-        };
-        let mut layered = crate::sql::view_buffered::apply_rows_layer(subset, &rt.layer)?;
-        if rt.layer_limit_implicit && layered.rows.len() > limits.max_result_rows {
-            return Err(crate::sql::scan::row_limit_exceeded());
-        }
-        layered.columns = rt.layered_columns.clone();
-        // 側スキャンの出力（出力領域へ残る分）は適用の前に計上する。
-        budget.charge_layer_output(&layered, &rt.side)?;
-        let sided = crate::sql::view_buffered::apply_rows_layer(layered, &rt.side)?;
-        for out_row in sided.rows {
-            // L11: 追加の前に出力行数・最終段の停止閾値と照合する。
-            if arena.len() >= limits.max_output_rows {
-                return Err(too_large("JOIN result exceeds the row limit"));
+            if matched.is_empty() {
+                continue;
             }
-            if matches!(stop_after_pairs, Some(t) if arena.len() >= t) {
+            // 一致行へ後処理の層・側スキャンを適用する。
+            let subset = QueryResult {
+                columns: rt.base.columns.clone(),
+                rows: matched
+                    .iter()
+                    .filter_map(|&i| rt.base.rows.get(i as usize).cloned())
+                    .collect(),
+            };
+            let mut layered = crate::sql::view_buffered::apply_rows_layer(subset, &rt.layer)?;
+            if rt.layer_limit_implicit && layered.rows.len() > limits.max_result_rows {
                 return Err(crate::sql::scan::row_limit_exceeded());
             }
-            budget.charge(n.saturating_mul(SLOT_BYTES))?;
-            let idx = to_u32(arena.len(), "JOIN row count exceeds limit")?;
-            for (rel, slot) in tuple.iter().enumerate() {
-                data.push(if rel == new_rel { Some(idx) } else { *slot });
+            layered.columns = rt.layered_columns.clone();
+            // 側スキャンの出力（出力領域へ残る分）は適用の前に計上する。
+            budget.charge_layer_output(&layered, &rt.side)?;
+            let sided = crate::sql::view_buffered::apply_rows_layer(layered, &rt.side)?;
+            let ti_u32 = to_u32(ti, "JOIN row count exceeds limit")?;
+            for out_row in sided.rows {
+                // L11: 候補（ON で落ちるものを含む）を追加の前に出力行数の上限と照合する。
+                if arena.len() >= limits.max_output_rows {
+                    return Err(too_large("JOIN result exceeds the row limit"));
+                }
+                let idx = to_u32(arena.len(), "JOIN row count exceeds limit")?;
+                push_charged_pair(&mut pairs, budget, (ti_u32, idx))?;
+                arena.push(out_row);
             }
-            arena.push(out_row);
+        }
+        (pairs, arena)
+    };
+    *sides
+        .get_mut(new_rel)
+        .ok_or_else(|| internal("JOIN relation index out of range"))? = arena;
+
+    // 後段: 結合キー・ON 残余を評価して一致を決める。
+    budget.charge(outer_count)?;
+    let mut matched_acc: Vec<bool> = vec![false; outer_count];
+    if step.keys.is_empty() && step.on_new.is_empty() && step.on_mixed.is_empty() {
+        for &(ti, _) in &pairs {
+            if let Some(m) = matched_acc.get_mut(ti as usize) {
+                *m = true;
+            }
+        }
+    } else {
+        budget.charge(n.saturating_mul(SLOT_BYTES))?;
+        let mut probe: Vec<Option<u32>> = vec![None; n];
+        let sides_ro: &[Vec<ResultRow>] = sides;
+        let mut kept = 0usize;
+        for r in 0..pairs.len() {
+            if r % crate::interrupt::CHECK_STRIDE as usize == 0 {
+                crate::interrupt::check()?;
+            }
+            let Some((ti, ai)) = pairs.get(r).copied() else {
+                continue;
+            };
+            let tuple = acc
+                .get(ti as usize)
+                .ok_or_else(|| internal("JOIN accumulated tuple index out of range"))?;
+            let arena_row = sides_ro.get(new_rel).and_then(|rows| rows.get(ai as usize));
+            let mut ok = true;
+            for k in &step.keys {
+                let acc_row = tuple.get(k.acc_rel).copied().flatten().and_then(|i| {
+                    sides_ro
+                        .get(k.acc_rel)
+                        .and_then(|rows| rows.get(i as usize))
+                });
+                let left = extract_key(acc_row, std::slice::from_ref(k), |k| k.acc_pos)?;
+                let right = extract_key(arena_row, std::slice::from_ref(k), |k| k.new_pos)?;
+                if left.is_none() || left != right {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && (!step.on_new.is_empty() || !step.on_mixed.is_empty()) {
+                for (j, slot) in probe.iter_mut().enumerate() {
+                    *slot = if j == new_rel {
+                        Some(ai)
+                    } else {
+                        tuple.get(j).copied().flatten()
+                    };
+                }
+                ok = eval_all(&step.on_new, sides_ro, &probe, &mut scratch)?
+                    && eval_all(&step.on_mixed, sides_ro, &probe, &mut scratch)?;
+            }
+            if ok {
+                if let Some(slot) = pairs.get_mut(kept) {
+                    *slot = (ti, ai);
+                }
+                kept = kept.saturating_add(1);
+                if let Some(m) = matched_acc.get_mut(ti as usize) {
+                    *m = true;
+                }
+            }
+        }
+        pairs.truncate(kept);
+    }
+
+    // 最終段の早期停止（Issue #1797）。一致数と、保存側の NULL 補完行を足した件数のどちらも実体化前に判定する。
+    if let Some(t) = stop_after_pairs {
+        let unmatched = if step.preserve_acc {
+            matched_acc.iter().filter(|&&m| !m).count()
+        } else {
+            0
+        };
+        if pairs.len() > t || pairs.len().saturating_add(unmatched) > t {
+            return Err(crate::sql::scan::row_limit_exceeded());
         }
     }
-    Ok((Tuples::from_parts(n, data)?, arena))
+    materialize_step(
+        acc,
+        new_rel,
+        &pairs,
+        &matched_acc,
+        &[],
+        step,
+        budget,
+        limits,
+    )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
