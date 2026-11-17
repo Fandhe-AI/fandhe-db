@@ -278,6 +278,32 @@ fn rejects_forms_with_decided_sqlstates_and_leaves_no_table() {
             "CREATE TABLE t (a TIMESTAMPTZ, g TIME[] GENERATED ALWAYS AS (ARRAY[a]) STORED)",
             "42P17",
         ),
+        // スカラー: 日時から TIME・文字列への代入は代入キャスト自体が無く 42804（判定側も二重に拒否する）。
+        (
+            "CREATE TABLE t (a TIMESTAMPTZ, g TIME GENERATED ALWAYS AS (a) STORED)",
+            "42804",
+        ),
+        (
+            "CREATE TABLE t (a TIMESTAMPTZ, g TEXT GENERATED ALWAYS AS (a) STORED)",
+            "42804",
+        ),
+        (
+            "CREATE TABLE t (a TIMESTAMPTZ, g VARCHAR(40) GENERATED ALWAYS AS (a) STORED)",
+            "42804",
+        ),
+        (
+            "CREATE TABLE t (a DATE, g TEXT GENERATED ALWAYS AS (a) STORED)",
+            "42804",
+        ),
+        // 配列: DATE[] から TEXT[]（DateStyle 依存）。COALESCE で包んだ配列は束縛段で未対応（0A000）のまま拒否される。
+        (
+            "CREATE TABLE t (a DATE[], g TEXT[] GENERATED ALWAYS AS (a) STORED)",
+            "42P17",
+        ),
+        (
+            "CREATE TABLE t (a TIMESTAMP, b TIMESTAMP[], g TIMESTAMPTZ[] GENERATED ALWAYS AS (COALESCE(ARRAY[a], b)) STORED)",
+            "0A000",
+        ),
         // ARRAY[...] 内の後続要素に置いた部分クエリ・集計も拒否される（42P17）。
         (
             "CREATE TABLE r (a INTEGER, b INTEGER[] GENERATED ALWAYS AS (ARRAY[a, (SELECT 1)]) STORED)",

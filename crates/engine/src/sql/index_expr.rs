@@ -793,42 +793,80 @@ pub(crate) fn assignment_cast_is_session_dependent(
 ) -> bool {
     use crate::catalog::ColumnType;
     use crate::sql::udf_call::ExprType;
-    // 配列列への代入は要素ごとの変換になる（`bind_array_assignment`）。変換元・先の要素型が
-    // 別ゾーン種別の日時（`TIMESTAMP`／`DATE` ⇔ `TIMESTAMPTZ`）、または `TIMESTAMPTZ` ⇔ 文字列
-    // （描画・解釈がセッションの TimeZone に依存）なら TZ 依存として扱う（fail-closed）。
+    // 配列列への代入は要素ごとの変換になる（`bind_array_assignment`）。変換元・先の要素型の組が
+    // [`elem_assignment_is_session_dependent`] に該当すれば TZ・書式依存として扱う（fail-closed）。
     if let ColumnType::Array(at) = target {
-        use crate::catalog::ArrayElemType as E;
-        // 文字列系の要素型（`TEXT`／`VARCHAR`／`CHAR(n)`）。`TIMESTAMPTZ` との間の変換は描画・解釈が
-        // セッションの TimeZone に依存する。`TIME` への代入キャスト（`TIMESTAMPTZ` → `TIME`）も同様。
-        let is_stringy = |e: E| matches!(e, E::Text | E::Varchar(_) | E::Bpchar(_));
-        let tz_differs = |src: E| {
-            let dst = at.elem();
-            (dst == E::TimestampTz && (matches!(src, E::Timestamp | E::Date) || is_stringy(src)))
-                || (src == E::TimestampTz
-                    && (matches!(dst, E::Timestamp | E::Date | E::Time) || is_stringy(dst)))
-        };
+        let dst = at.elem();
         if let Expr::ArrayConstructor(items) = expr {
-            return items.iter().any(|i| match static_type_of(i, schema) {
-                Some(ExprType::Timestamp | ExprType::Date) => at.elem() == E::TimestampTz,
-                Some(ExprType::TimestampTz) => {
-                    matches!(at.elem(), E::Timestamp | E::Date | E::Time) || is_stringy(at.elem())
-                }
-                Some(ExprType::Text) => at.elem() == E::TimestampTz,
-                _ => false,
+            return items.iter().any(|i| {
+                static_type_of(i, schema)
+                    .and_then(expr_type_elem)
+                    .is_some_and(|src| elem_assignment_is_session_dependent(src, dst))
             });
         }
-        return array_source_elem(expr, schema).is_some_and(tz_differs);
+        return array_source_elem(expr, schema)
+            .is_some_and(|src| elem_assignment_is_session_dependent(src, dst));
     }
-    matches!(
-        (target, static_type_of(expr, schema)),
-        (
-            ColumnType::TimestampTz,
-            Some(ExprType::Timestamp | ExprType::Date)
-        ) | (
-            ColumnType::Timestamp | ColumnType::Date,
-            Some(ExprType::TimestampTz)
-        )
-    )
+    // スカラー列も配列要素と同じ判定を共有する（`TIMESTAMPTZ` → `TIME`・文字列、日時 → 文字列を含む）。
+    // 文字列 → `TIMESTAMPTZ` は定数リテラルの取り込みと区別できないため、スカラーでは対象外とする。
+    match (column_type_elem(target), static_type_of(expr, schema)) {
+        (Some(dst), Some(src_ty)) => {
+            src_ty != ExprType::Text
+                && expr_type_elem(src_ty)
+                    .is_some_and(|src| elem_assignment_is_session_dependent(src, dst))
+        }
+        _ => false,
+    }
+}
+
+/// 代入キャストの変換元・先の要素型の組が、セッション設定（`TimeZone`・`DateStyle`・`IntervalStyle`）に
+/// 依存して結果が変わる変換か。`TIMESTAMPTZ` と他の日時・文字列との間、および日時・間隔と文字列の間が該当する。
+fn elem_assignment_is_session_dependent(
+    src: crate::catalog::ArrayElemType,
+    dst: crate::catalog::ArrayElemType,
+) -> bool {
+    use crate::catalog::ArrayElemType as E;
+    let is_stringy = |e: E| matches!(e, E::Text | E::Varchar(_) | E::Bpchar(_));
+    let is_datetime = |e: E| matches!(e, E::Date | E::Time | E::Timestamp | E::Interval);
+    if src == dst {
+        return false;
+    }
+    (dst == E::TimestampTz && (matches!(src, E::Timestamp | E::Date) || is_stringy(src)))
+        || (src == E::TimestampTz
+            && (matches!(dst, E::Timestamp | E::Date | E::Time) || is_stringy(dst)))
+        || (is_datetime(src) && is_stringy(dst))
+        || (is_stringy(src) && is_datetime(dst))
+}
+
+/// 式の静的な結果型に対応する要素型（文字列・日時・間隔のみ。他は `None`）。
+fn expr_type_elem(ty: crate::sql::udf_call::ExprType) -> Option<crate::catalog::ArrayElemType> {
+    use crate::catalog::ArrayElemType as E;
+    use crate::sql::udf_call::ExprType;
+    match ty {
+        ExprType::Text => Some(E::Text),
+        ExprType::Date => Some(E::Date),
+        ExprType::Timestamp => Some(E::Timestamp),
+        ExprType::Time => Some(E::Time),
+        ExprType::TimestampTz => Some(E::TimestampTz),
+        ExprType::Interval => Some(E::Interval),
+        _ => None,
+    }
+}
+
+/// スカラー列型に対応する要素型（文字列・日時・間隔のみ。他は `None`）。
+fn column_type_elem(ty: &crate::catalog::ColumnType) -> Option<crate::catalog::ArrayElemType> {
+    use crate::catalog::{ArrayElemType as E, ColumnType};
+    match ty {
+        ColumnType::Text => Some(E::Text),
+        ColumnType::Varchar(n) => Some(E::Varchar(*n)),
+        ColumnType::Bpchar(n) => Some(E::Bpchar(*n)),
+        ColumnType::Date => Some(E::Date),
+        ColumnType::Timestamp => Some(E::Timestamp),
+        ColumnType::Time => Some(E::Time),
+        ColumnType::TimestampTz => Some(E::TimestampTz),
+        ColumnType::Interval => Some(E::Interval),
+        _ => None,
+    }
 }
 
 /// 部分式 `sub` の静的な結果型。束縛できない（文脈依存の型なし `NULL` 等）場合は `None`。
@@ -884,10 +922,18 @@ fn array_source_elem(
             whens.iter().map(|(_, r)| r).chain(else_result.as_deref()),
             schema,
         ),
-        Expr::ArrayConstructor(items) => items
-            .iter()
-            .any(|i| static_type_of(i, schema) == Some(crate::sql::udf_call::ExprType::TimestampTz))
-            .then_some(ArrayElemType::TimestampTz),
+        // 要素の静的型から要素型を決める。`TIMESTAMPTZ` を含めばそれ、無ければ最初に判明した型。
+        Expr::ArrayConstructor(items) => {
+            let mut found = None;
+            for i in items {
+                match static_type_of(i, schema).and_then(expr_type_elem) {
+                    Some(ArrayElemType::TimestampTz) => return Some(ArrayElemType::TimestampTz),
+                    Some(t) if found.is_none() => found = Some(t),
+                    _ => {}
+                }
+            }
+            found
+        }
         // スライス・配列関数（`array_cat` 等）は束縛結果が保持する要素型で判定する（Issue #3233）。
         _ => {
             use crate::sql::array_fn::ArrayFnKind;
