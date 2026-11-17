@@ -518,12 +518,23 @@ fn cursor_fetch_statements_still_parse() {
         "FETCH 1 IN c",
         "FETCH ALL FROM c",
         "FETCH FORWARD ALL FROM c",
+        // 向きの語（Issue #3335）。
+        "FETCH FIRST FROM c",
+        "FETCH PRIOR FROM c",
+        "FETCH LAST IN c",
+        "FETCH ABSOLUTE -1 FROM c",
+        "FETCH RELATIVE 2 FROM c",
+        "FETCH BACKWARD ALL FROM c",
     ] {
         let parsed = core.parse_sql(sql);
         assert!(parsed.is_ok(), "{sql}: {:?}", parsed.err());
     }
-    // カーソル文の文法外（前方向以外の方向指定）は従来どおり構文エラー。
-    for sql in ["FETCH FIRST FROM c", "FETCH PRIOR FROM c"] {
+    // カーソル文の文法外（`FETCH FIRST n ROWS ONLY` 形・`FROM` の省略）は従来どおり構文エラー。
+    for sql in [
+        "FETCH FIRST 2 ROWS ONLY",
+        "FETCH PRIOR c",
+        "FETCH FIRST FROM",
+    ] {
         assert_eq!(
             core.parse_sql(sql).err().map(|e| e.wire_code()),
             Some("42601"),
