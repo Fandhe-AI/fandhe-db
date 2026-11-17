@@ -185,6 +185,13 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   位置だけで判定するため、先頭語を見て弾かないと `DECLARE ... FOR SELECT
   ... WHERE col = $1` のような形が誤って受理されてしまう）。
 
+- **`MOVE`**（Issue #3336・WIRE-27）: `MOVE [<向き>] { FROM | IN } <name>`。向き・件数の文法、
+  上限検証（`22000`）、`42601` の拒否集合は `FETCH` と完全に同一で、`sql::cursor` の共通関数
+  （`parse_motion_tokens`）を `validate_fetch_tokens`／`validate_move_tokens` が呼ぶ。違いは
+  エラー文言の文名だけ。`FROM`／`IN` の省略（`MOVE c`）は `FETCH` と同じく `42601`。
+  PG は任意の大きさの件数を受理するが、本実装は `FETCH` と同じく `u32` と `max_result_rows` で
+  制限する（意図した差。行集合は `DECLARE` 時点で cap 済みなので、上限超の件数は `ALL` で代替でき機能は失われない）。
+
 ### 5. 上限とエラー分類（実装既定値）
 
 | 事象 | `wire_code` | 備考 |
@@ -222,7 +229,8 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
 （`None`）。それ以外の `ParsedSql` は `describe_parsed_in_session` と完全に
 同一の判定へ委譲する。`wire-server::extended_query::handle_describe`／
 `handle_bind` が接続単位の `SessionTransaction` を渡してこの API を呼ぶ
-よう結線した。
+よう結線した。`MOVE` は行を返さないため Describe（Statement／Portal）は `DECLARE`／`CLOSE` と同じく
+NoData、Execute は Command 応答（`MOVE n`）で portal の中断（`Suspended`）は起きない。
 
 `FETCH` の portal を `max_rows` で分割送出する処理は、既存の `Suspended`
 の仕組みにそのまま乗る。カーソル位置は Execute 1 回につき 1 度だけ進み、
@@ -235,8 +243,9 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   `RowDescription`／`DataRow` を伴う（検索 SELECT・`EXPLAIN` と同じエンコード
   を再利用する）。
 - `CLOSE` → `CLOSE CURSOR`（固定タグ）
+- `MOVE` → `MOVE <n>`（行なし。`RowDescription` を送らない）。n は同じ向きの `FETCH` が返す行数。
 
-`sql::statement_splitter::classify_statement` は `DECLARE`／`FETCH`／`CLOSE`
+`sql::statement_splitter::classify_statement` は `DECLARE`／`FETCH`／`MOVE`／`CLOSE`
 を `StatementEffect::ReadOnly` に分類する（redb の commit を伴わないため）。
 
 ### 8. wire-server 拡張クエリの portal 束縛（PR #1049 レビュー指摘対応）
@@ -295,7 +304,7 @@ execute_portal`）で以下の 2 つを portal へ束縛し、再開前に突き
 - `55000`（非 SCROLL への逆方向）・`54000`（`ALL` の行数上限超過）では位置を変えない。
 - メモリ課金は SCROLL／NO SCROLL で同じ（`estimate_result_bytes`）で、16 MiB・16 本の上限に数える。
 - 取得口は `CursorRegistry::fetch(name, FetchDirection, max_rows)` の 1 本（Issue #3335 で前方向・全件・逆方向を
-  統合し、`#[allow(dead_code)]` を外した）。`MOVE`（#3336）は `CursorPosition::plan`／`apply` を行の切り出しなしで再利用する。
+  統合し、`#[allow(dead_code)]` を外した）。`MOVE`（#3336）は `CursorPosition::plan`／`apply` を行の切り出しなしで再利用する（後述）。
 
 #### FETCH の向きの意味（Issue #3335・WIRE-27 (1)(2)）
 
@@ -332,10 +341,32 @@ NO SCROLL のカーソルで `55000`（位置は変えない）にする条件�
   （WIRE-27 (2)）と PG17 は「後ろへ戻る取得」だけを拒否する。前方向の `RELATIVE k`（k>0）や先の位置への
   `ABSOLUTE` は NO SCROLL でも受理する。
 
+#### MOVE（Issue #3336・WIRE-27）
+
+`CursorRegistry::move_cursor(name, FetchDirection) -> u64` が `fetch` と同じ前段（不在 `34000`→
+NO SCROLL の後退走査 `55000`。共通の private 関数）と同じ `plan`／`apply` で位置だけを動かす。
+行は複製しないので `ALL` の行数上限（`54000`）は適用しない（結果メモリが増えない）。いずれの拒否でも位置は変えない。
+NO SCROLL の境界は `FETCH` と同じ判定で、`MOVE` 専用の例外は作らない。
+
+タグの n は「同じ向きの `FETCH` が返す行数」（PG17 の portal 実行の意味論から導いた期待値）。N=5・位置 0 からの例:
+
+| 文 | タグ |
+| -- | ---- |
+| `MOVE FORWARD 2` | `MOVE 2` |
+| `MOVE FORWARD 10` | `MOVE 5` |
+| `MOVE ABSOLUTE 0` | `MOVE 0` |
+| `MOVE ABSOLUTE 3` | `MOVE 1` |
+| `MOVE ABSOLUTE 10` | `MOVE 0` |
+| 位置 2 から `MOVE BACKWARD 1` | `MOVE 1` |
+| 末尾の後から `MOVE BACKWARD ALL` | `MOVE 5` |
+| 行の上で `MOVE RELATIVE 0`（SCROLL） | `MOVE 1` |
+
+- **未検証**: 上のタグ件数と NO SCROLL の境界は PG17 実機では確認していない。突き合わせは #3337 で行う。
+
 ## 対象外・申し送り
 
 - `WITH HOLD`（#3339・#3340）／`FROM`・`IN` 省略の `FETCH`（#3333）／`CLOSE ALL`／
-  `MOVE`（#3336）、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
+  PL/pgSQL 本体内の `MOVE`（範囲外語として `0A000` のまま）、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。
 - 主クエリが tail CTE（本文に `ORDER BY`／`LIMIT`／`OFFSET`）を直接読む単一表の `DECLARE`・

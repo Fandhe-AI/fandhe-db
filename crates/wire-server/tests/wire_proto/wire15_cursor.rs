@@ -1012,3 +1012,68 @@ fn wire27_fetch_backward_on_no_scroll_is_55000_and_unknown_name_is_34000() {
     assert_eq!(read_ready_for_query_status(&mut stream), b'E');
     simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
 }
+// --- MOVE（Issue #3336・WIRE-27） ----------------------------------------------------
+
+/// psql と同じ末尾 `;` 付きの単独送信で、`MOVE` は行なしの CommandComplete `MOVE n` だけを返し
+/// （`simple_ok` が RowDescription の不在も確かめる）、後続 `FETCH` が移動先の次から始まる。
+/// 複数文メッセージ内でも `0A000` にならない（ReadOnly 分類の回帰）。
+#[test]
+fn wire27_move_over_simple_query_returns_tag_only_and_moves_position() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "MOVE FORWARD 2 IN c;", "MOVE 2");
+    send_simple_query(&mut stream, "FETCH NEXT FROM c;");
+    let (page, tag) = read_fetch_page(&mut stream);
+    assert_eq!((page, tag), (vec!["3".to_string()], "FETCH 1".to_string()));
+    simple_ok(&mut stream, "MOVE BACKWARD 1 FROM c;", "MOVE 1");
+    send_simple_query(&mut stream, "FETCH NEXT FROM c;");
+    let (page, _) = read_fetch_page(&mut stream);
+    assert_eq!(page, vec!["3".to_string()]);
+    simple_ok(&mut stream, "MOVE ABSOLUTE 0 IN c;", "MOVE 0");
+    send_simple_query(&mut stream, "FETCH NEXT FROM c;");
+    let (page, _) = read_fetch_page(&mut stream);
+    assert_eq!(page, vec!["1".to_string()]);
+
+    // 複数文メッセージ（MOVE の後に MOVE）。2 つの CommandComplete が続く。
+    send_simple_query(&mut stream, "MOVE ABSOLUTE 0 IN c; MOVE FORWARD 1 IN c;");
+    assert_eq!(read_command_complete(&mut stream), "MOVE 0");
+    assert_eq!(read_command_complete(&mut stream), "MOVE 1");
+    read_ready_for_query(&mut stream);
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
+
+/// NO SCROLL の逆方向は `55000`（Tx は `Failed`）、不在名は `34000`。
+#[test]
+fn wire27_move_backward_on_no_scroll_is_55000_and_unknown_name_is_34000() {
+    let (core, _guard) = new_core_with_rows();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    simple_ok(
+        &mut stream,
+        "DECLARE c NO SCROLL CURSOR FOR SELECT id FROM docs LIMIT 100;",
+        "DECLARE CURSOR",
+    );
+    simple_ok(&mut stream, "MOVE 2 FROM c;", "MOVE 2");
+    send_simple_query(&mut stream, "MOVE BACKWARD 1 FROM c;");
+    expect_error_response_with_sqlstate(&mut stream, "55000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+
+    simple_ok(&mut stream, "BEGIN;", "BEGIN");
+    send_simple_query(&mut stream, "MOVE NEXT FROM missing_cursor;");
+    expect_error_response_with_sqlstate(&mut stream, "34000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'E');
+    simple_ok(&mut stream, "ROLLBACK;", "ROLLBACK");
+}
