@@ -330,13 +330,21 @@ where
                     continue;
                 }
                 let mut hit: Option<(usize, String)> = None;
+                let mut all_known = true;
                 for ridx in 0..left.len() {
-                    if let Some(col) = lc.get(ridx)?.and_then(|cols| find_col(cols, n)) {
+                    let cols = lc.get(ridx)?;
+                    all_known &= cols.is_some();
+                    if let Some(col) = cols.and_then(|cols| find_col(cols, n)) {
                         if hit.is_some() {
                             return Err(SqlSurfaceError::AmbiguousColumn { name: n.clone() });
                         }
                         hit = Some((ridx, col.clone()));
                     }
+                }
+                // RIGHT／FULL: どちらの側にも解決できない非修飾名は、後続の左側参照（`42P10`）より
+                // 先に `42703` で確定する（修飾名と同じテキスト順規則）。左側の列が不明なら従来どおり通す。
+                if hit.is_none() && reject_left_ref && all_known && !n.eq_ignore_ascii_case("id") {
+                    return Err(SqlSurfaceError::undefined_column(n.clone()));
                 }
                 if let Some((ridx, col)) = hit {
                     if reject_left_ref {

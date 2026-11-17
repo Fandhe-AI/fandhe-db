@@ -297,8 +297,22 @@ fn join_step(
     // 判定に使うのは可視行（RLS・WHERE 適用後）の件数だけで、`LIMIT`／`OFFSET` の値には依存しない。
     if method == JoinMethod::Cross {
         match acc.len().checked_mul(new_rows.len()) {
-            Some(product) if product <= limits.max_output_rows => {
-                if matches!(stop_after_pairs, Some(t) if product > t) {
+            Some(product) => {
+                // 外部結合の保持（LATERAL ... ON true の LEFT／RIGHT／FULL。Issue #3323）では、片側が空で
+                // 積が 0 でも、保存側の NULL 補完行が出力される。その件数も上限判定へ含める。
+                let total = if product == 0 {
+                    let a = if step.preserve_acc { acc.len() } else { 0 };
+                    let b = if step.preserve_new { new_rows.len() } else { 0 };
+                    a.saturating_add(b)
+                } else {
+                    product
+                };
+                if total > limits.max_output_rows {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "JOIN result exceeds the row limit",
+                    ));
+                }
+                if matches!(stop_after_pairs, Some(t) if total > t) {
                     return Err(crate::sql::scan::row_limit_exceeded());
                 }
             }

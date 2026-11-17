@@ -346,6 +346,24 @@ fn right_and_full_lateral_referencing_the_left_side_is_42p10() {
         "SELECT d.id FROM docs d RIGHT JOIN LATERAL (SELECT body FROM docs x WHERE x.lang = z.lang) s ON true",
     );
     assert_eq!(c, "42P01");
+    // 非修飾の未知列も、後続の外側参照（42P10）より先に 42703（Issue #3323 の指摘）。
+    for sql in [
+        "SELECT d.id FROM docs d RIGHT JOIN LATERAL (SELECT body FROM docs x WHERE nope = 1 AND x.lang = d.lang) s ON true",
+        "SELECT d.id FROM docs d FULL JOIN LATERAL (SELECT body FROM docs x WHERE nope = 1 AND x.lang = d.lang) s ON true",
+    ] {
+        let (c, _) = err_pair(&core, "alice", sql);
+        assert_eq!(c, "42703", "{sql}");
+    }
+}
+
+#[test]
+fn uncorrelated_outer_preserving_lateral_with_empty_inner_obeys_the_row_cap() {
+    // 非相関で内側が空。結果は NULL 補完の 6 行で、ちょうどは通り 5 行は超過する（積が 0 でも判定する）。
+    let sql = "SELECT d.id, s.body FROM docs d LEFT JOIN LATERAL (SELECT body FROM docs x WHERE x.tag = 'zzz') s ON true";
+    let (core, _g) = open_with(|c| c.with_join_limits(JoinSizeLimits::new(REL, 1_000, 6)));
+    assert_eq!(rows(&core, "alice", sql).len(), 6);
+    let (core, _g) = open_with(|c| c.with_join_limits(JoinSizeLimits::new(REL, 1_000, 5)));
+    assert_eq!(err_pair(&core, "alice", sql).0, "54000");
 }
 
 /// PostgreSQL が受理する相関 LATERAL の USING／NATURAL と行ごとの集計は、本実装では固定文言の `0A000`
