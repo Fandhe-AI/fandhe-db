@@ -184,7 +184,13 @@ fn lateral_form(
         DerivedPosition::CommaList => Ok((LateralForm::Comma, 0)),
         DerivedPosition::Join => {
             let before = |n: usize| i.checked_sub(n).and_then(|p| tokens.get(p));
-            let word = |n: usize, w: &str| is_ident(before(n), w);
+            // 修飾語は直前に FROM／JOIN／`,` が無い位置の語だけ（`FROM left JOIN LATERAL` の `left` は
+            // 左側のテーブル名であり結合修飾子ではない）。
+            let word = |n: usize, w: &str| {
+                is_ident(before(n), w)
+                    && i.checked_sub(n)
+                        .is_none_or(|p| position_before(tokens, p).is_none())
+            };
             let (form, extra): (LateralForm, usize) = if word(2, "INNER") {
                 (LateralForm::Inner { on_true: false }, 1)
             } else if word(2, "CROSS") {
@@ -797,6 +803,27 @@ mod tests {
             .iter()
             .map(|d| d.lateral)
             .collect()
+    }
+
+    #[test]
+    fn table_named_like_join_qualifier_is_not_a_qualifier() {
+        for name in [
+            "left", "inner", "right", "full", "cross", "outer", "natural",
+        ] {
+            assert_eq!(
+                lateral_forms(&format!(
+                    "SELECT * FROM {name} JOIN LATERAL (SELECT 1 FROM t) a ON true"
+                )),
+                vec![Some(LateralForm::Inner { on_true: true })],
+                "{name}"
+            );
+        }
+        let tokens =
+            tokenize("SELECT * FROM left JOIN LATERAL (SELECT 1 FROM t) a ON true").expect("t");
+        let (_, outer) = extract(&tokens, 5).expect("extract").expect("found");
+        assert!(outer
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("left"))));
     }
 
     #[test]
