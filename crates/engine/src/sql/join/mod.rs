@@ -61,6 +61,8 @@ mod dml_residual;
 mod exec;
 mod explain;
 mod lateral;
+mod lateral_unnest;
+pub(crate) use lateral_unnest::unnest_columns_for;
 mod nlj;
 mod on_split;
 mod plan;
@@ -604,6 +606,25 @@ fn execute_with_inputs(
                 let internal = |d: &str| SqlSurfaceError::Internal {
                     detail: d.to_string(),
                 };
+                // `LATERAL unnest(...)`（Issue #3360）は基底の行を持たない。外側タプルの配列セルから行を作る。
+                if let Some(un) = &lat.unnest {
+                    let step = i
+                        .checked_sub(1)
+                        .and_then(|k| plan.steps.get(k))
+                        .and_then(|st| st.lateral.as_ref())
+                        .ok_or_else(|| internal("LATERAL step plan missing"))?;
+                    let scan = plan
+                        .scans
+                        .get(i)
+                        .ok_or_else(|| internal("JOIN side scan missing"))?;
+                    let rt =
+                        lateral_unnest::UnnestRuntime::build(un, step, &plan.schemas, scan, udfs)?;
+                    if let Some(dst) = lateral_rt.get_mut(i) {
+                        *dst = Some(lateral::LateralRuntime::Unnest(rt));
+                    }
+                    sides.push(Vec::new());
+                    continue;
+                }
                 // 基底は `core.rs` が文内で 1 回だけ評価した可視行（評価時に `budget` へ計上済み）。
                 let base = inputs
                     .get_mut(i)
@@ -634,7 +655,7 @@ fn execute_with_inputs(
                     .scans
                     .get(i)
                     .ok_or_else(|| internal("JOIN side scan missing"))?;
-                let rt = lateral::LateralRuntime::build(
+                let rt = lateral::BaseRuntime::build(
                     base,
                     lateral::BuildInput {
                         lat,
@@ -647,7 +668,7 @@ fn execute_with_inputs(
                     },
                 )?;
                 if let Some(dst) = lateral_rt.get_mut(i) {
-                    *dst = Some(rt);
+                    *dst = Some(lateral::LateralRuntime::Base(rt));
                 }
                 sides.push(Vec::new());
                 continue;

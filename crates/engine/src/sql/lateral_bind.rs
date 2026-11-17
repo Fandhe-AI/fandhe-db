@@ -498,6 +498,80 @@ where
     })
 }
 
+/// `LATERAL unnest(<引数>)` の引数トークン列 `arg` を左側 relation の列 1 つへ束縛する（Issue #3360。設計記録
+/// L19）。受理するのは左側 relation の列の裸の参照 1 個（修飾あり、または左側にだけある非修飾名）だけで、
+/// 式・定数・複数引数は固定文言の `0A000`、引数なしは `42883`（PostgreSQL 17.12 と照合済み）。
+/// 修飾子が左側に無いのは `42P01`、列が無いのは `42703`、複数の左側 relation に同名があるのは `42702`
+/// （本文の束縛 [`bind_lateral_body`] と同じ規則）。`reject_left_ref` は RIGHT／FULL で、左側 relation を
+/// 参照した時点で `42P10`。外側の値は SQL 文字列・トークン列へ連結せず、列の位置（[`LateralOuterRef`]）だけを返す。
+pub(crate) fn bind_lateral_unnest_arg<F>(
+    arg: &[Token],
+    left: &[TableRef],
+    columns: &mut F,
+    reject_left_ref: bool,
+) -> Result<LateralOuterRef, SqlSurfaceError>
+where
+    F: FnMut(&TableRef) -> Result<Option<Vec<String>>, SqlSurfaceError>,
+{
+    let mut lc = LeftCols {
+        left,
+        columns,
+        cache: vec![None; left.len()],
+    };
+    match arg {
+        [] => Err(SqlSurfaceError::undefined_function(
+            "function unnest() does not exist",
+        )),
+        [Token::QualifiedIdent { qualifier, name }] => {
+            let ridx = left
+                .iter()
+                .position(|r| r.matches_qualifier(qualifier))
+                .ok_or_else(|| SqlSurfaceError::undefined_table(qualifier))?;
+            if reject_left_ref {
+                return Err(SqlSurfaceError::LateralReferenceInvalidJoinType);
+            }
+            let Some(cols) = lc.get(ridx)? else {
+                return Err(unresolvable_left_columns());
+            };
+            let Some(col) = find_col(cols, name).cloned() else {
+                return Err(SqlSurfaceError::undefined_column(name.clone()));
+            };
+            Ok(LateralOuterRef {
+                rel_index: ridx,
+                column: col,
+            })
+        }
+        [Token::Ident(n)]
+            if !is_syntax_word(n) && !is_literal_word(n) && !is_value_function_keyword(n) =>
+        {
+            let mut hit: Option<LateralOuterRef> = None;
+            let mut all_known = true;
+            for ridx in 0..left.len() {
+                let cols = lc.get(ridx)?;
+                all_known &= cols.is_some();
+                if let Some(col) = cols.and_then(|cols| find_col(cols, n)) {
+                    if hit.is_some() {
+                        return Err(SqlSurfaceError::AmbiguousColumn { name: n.clone() });
+                    }
+                    hit = Some(LateralOuterRef {
+                        rel_index: ridx,
+                        column: col.clone(),
+                    });
+                }
+            }
+            match hit {
+                Some(_) if reject_left_ref => Err(SqlSurfaceError::LateralReferenceInvalidJoinType),
+                Some(r) => Ok(r),
+                None if !all_known => Err(unresolvable_left_columns()),
+                None => Err(SqlSurfaceError::undefined_column(n.clone())),
+            }
+        }
+        _ => Err(SqlSurfaceError::feature_not_supported(
+            "unnest in a LATERAL item supports only a column of a preceding relation as its single argument",
+        )),
+    }
+}
+
 /// 相関 LATERAL の実行形（Issue #3322。設計記録 L2）。内側を「外側参照を含まない基底」と
 /// 「外側タプルごとに適用する後処理」の 2 つの本文へ分ける。
 pub(crate) struct ExecutionBodies {
@@ -695,6 +769,81 @@ mod tests {
 
     fn d() -> TableRef {
         TableRef::with_alias("docs", "d")
+    }
+
+    fn bind_arg(
+        sql: &str,
+        left: &[TableRef],
+        reject: bool,
+    ) -> Result<LateralOuterRef, SqlSurfaceError> {
+        let toks = tokenize(sql).expect("tokenize");
+        bind_lateral_unnest_arg(&toks, left, &mut cols_of, reject)
+    }
+
+    /// Issue #3360: `unnest` の引数は左側の列の裸の参照 1 個だけ。SQLSTATE は本文の束縛と同じ規則。
+    #[test]
+    fn unnest_argument_binds_a_single_left_column() {
+        let left = [d()];
+        let r = bind_arg("d.lang", &left, false).expect("qualified");
+        assert_eq!((r.rel_index, r.column.as_str()), (0, "lang"));
+        let r = bind_arg("title", &left, false).expect("unqualified");
+        assert_eq!((r.rel_index, r.column.as_str()), (0, "title"));
+        assert_eq!(
+            bind_arg("zz.lang", &left, false)
+                .expect_err("q")
+                .wire_code(),
+            "42P01"
+        );
+        assert_eq!(
+            bind_arg("d.nope", &left, false).expect_err("c").wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            bind_arg("nope", &left, false).expect_err("c").wire_code(),
+            "42703"
+        );
+        assert_eq!(
+            bind_arg("", &left, false).expect_err("none").wire_code(),
+            "42883"
+        );
+        for sql in [
+            "d.lang, d.title",
+            "d.lang || d.title",
+            "1",
+            "'x'",
+            "d.lang + 1",
+        ] {
+            assert_eq!(
+                bind_arg(sql, &left, false).expect_err(sql).wire_code(),
+                "0A000",
+                "{sql}"
+            );
+        }
+        // RIGHT／FULL は左側の参照の時点で `42P10`。
+        assert_eq!(
+            bind_arg("d.lang", &left, true).expect_err("r").wire_code(),
+            "42P10"
+        );
+        assert_eq!(
+            bind_arg("lang", &left, true).expect_err("r").wire_code(),
+            "42P10"
+        );
+        // 複数の左側 relation に同名があれば `42702`。列集合を返せない relation は `0A000`。
+        let two = [d(), TableRef::with_alias("other", "o")];
+        assert_eq!(
+            bind_arg("lang", &two, false).expect_err("a").wire_code(),
+            "42702"
+        );
+        assert_eq!(bind_arg("k", &two, false).expect("k").rel_index, 1);
+        let opaque = [TableRef::with_alias("opaque", "q")];
+        assert_eq!(
+            bind_arg("q.x", &opaque, false).expect_err("o").wire_code(),
+            "0A000"
+        );
+        assert_eq!(
+            bind_arg("x", &opaque, false).expect_err("o").wire_code(),
+            "0A000"
+        );
     }
 
     #[test]

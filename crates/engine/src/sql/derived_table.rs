@@ -36,7 +36,6 @@
 //! `42P01`／`42P10` 等はカタログの構造だけで決まり、行やテナントに依存しない。
 
 use crate::nesting_limits::NestingLimits;
-use crate::sql::allowlist::JoinLateral;
 use crate::sql::allowlist::Statement;
 use crate::sql::allowlist::{
     derived_output_names, is_set_operator_ident, join_relations_of, looks_like_join,
@@ -46,9 +45,11 @@ use crate::sql::allowlist::{
     TableLookup,
 };
 use crate::sql::allowlist::{JoinCondition, JoinKind};
+use crate::sql::allowlist::{JoinLateral, LateralUnnest};
 use crate::sql::cte::{CteDef, CteMaterialization};
 use crate::sql::lateral_bind::{
-    bind_lateral_body, split_for_execution, strip_inner_alias, LateralBinding,
+    bind_lateral_body, bind_lateral_unnest_arg, split_for_execution, strip_inner_alias,
+    LateralBinding,
 };
 use crate::sql::lexer::{Keyword, Token};
 use crate::sql::qualified_column::normalize_single_table_qualifiers;
@@ -136,6 +137,17 @@ struct RawDerived {
     /// LATERAL の結合が `USING (...)` または `NATURAL` か（左側を参照する形は束縛後に固定 `0A000`。
     /// 参照しない形は通常の派生表と同じく既存の結合パーサーが処理する。Issue #3323）。
     using_or_natural: bool,
+    /// `LATERAL unnest(<引数>) [WITH ORDINALITY]` の関数形（Issue #3360。`body` は引数のトークン列で、
+    /// 本文の SELECT ではない）。通常の派生表・本文つき LATERAL は `None`。
+    func: Option<RawUnnest>,
+}
+
+/// `LATERAL unnest(...)` の抽出情報（Issue #3360）。
+#[derive(Debug)]
+struct RawUnnest {
+    ordinality: bool,
+    /// 利用者が別名を書いたか（無ければ relation 名・値の列名は PostgreSQL と同じ `unnest`）。
+    alias_given: bool,
 }
 
 /// 抽出結果（派生表の並びと、派生表をプレースホルダへ置き換えた外側のトークン列）。
@@ -266,9 +278,14 @@ fn is_on_true(after: &[Token]) -> bool {
 /// JOIN 本文の受理経路へ進むかの判定。抽出の受理・拒否には依存しない。Issue #3321・#3324）。
 pub(crate) fn contains_lateral(tokens: &[Token]) -> bool {
     tokens.iter().enumerate().any(|(i, t)| {
-        is_ident(Some(t), "LATERAL")
-            && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
-            && position_before(tokens, i).is_some()
+        let next = |n: usize| tokens.get(i.saturating_add(n));
+        // `LATERAL (`・`LATERAL <関数名> (`・`LATERAL ROWS FROM`（Issue #3360）。
+        let item = matches!(next(1), Some(Token::Punct('(')))
+            || (matches!(next(1), Some(Token::Ident(_)))
+                && matches!(next(2), Some(Token::Punct('('))))
+            || (is_ident(next(1), "ROWS")
+                && matches!(next(2), Some(Token::Keyword(Keyword::From))));
+        is_ident(Some(t), "LATERAL") && item && position_before(tokens, i).is_some()
     })
 }
 
@@ -313,6 +330,7 @@ fn extract_at(
     keep_alias: bool,
 ) -> Result<Option<Extracted>, SqlSurfaceError> {
     let mut found: Vec<RawDerived> = Vec::new();
+    let mut placements: Vec<(usize, bool)> = Vec::new();
     let mut outer: Vec<Token> = Vec::new();
     let mut depth: usize = 0;
     let mut in_from = false;
@@ -336,11 +354,53 @@ fn extract_at(
                 in_from = false;
             }
             if in_from {
-                let lateral_kw = is_ident(Some(tok), "LATERAL")
-                    && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
-                    && position_before(tokens, i).is_some();
-                // `LATERAL (` の `(` の位置（LATERAL でなければ `i` 自身）。
-                let paren_at = if lateral_kw { i.saturating_add(1) } else { i };
+                let lateral_item =
+                    is_ident(Some(tok), "LATERAL") && position_before(tokens, i).is_some();
+                let lateral_kw = lateral_item
+                    && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')));
+                // `LATERAL unnest(` の関数形（Issue #3360）。`ROWS FROM (...)`・unnest 以外の関数名は
+                // 固定文言の `0A000`（外側の文の構文より前に拒否する）。
+                let mut func_kw = false;
+                if lateral_item {
+                    if is_ident(tokens.get(i.saturating_add(1)), "ROWS")
+                        && matches!(
+                            tokens.get(i.saturating_add(2)),
+                            Some(Token::Keyword(Keyword::From))
+                        )
+                    {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "ROWS FROM is not supported",
+                        ));
+                    }
+                    if let (Some(Token::Ident(name)), Some(Token::Punct('('))) = (
+                        tokens.get(i.saturating_add(1)),
+                        tokens.get(i.saturating_add(2)),
+                    ) {
+                        if name.eq_ignore_ascii_case("unnest") {
+                            func_kw = true;
+                        } else if !["JOIN", "ON", "USING"]
+                            .iter()
+                            .any(|w| name.eq_ignore_ascii_case(w))
+                        {
+                            return Err(SqlSurfaceError::feature_not_supported(
+                                "only unnest is supported as a set-returning function with LATERAL",
+                            ));
+                        }
+                    }
+                }
+                // `LATERAL (` の `(`、`LATERAL unnest (` の `(` の位置（LATERAL でなければ `i` 自身）。
+                let paren_at = if lateral_kw {
+                    i.saturating_add(1)
+                } else if func_kw {
+                    i.saturating_add(2)
+                } else {
+                    i
+                };
+                if func_kw && depth_level > 1 {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "LATERAL inside a derived table is not supported yet",
+                    ));
+                }
                 if lateral_kw {
                     if !matches!(
                         tokens.get(i.saturating_add(2)),
@@ -357,6 +417,7 @@ fn extract_at(
                     }
                 }
                 if lateral_kw
+                    || func_kw
                     || (matches!(tok, Token::Punct('('))
                         && matches!(
                             tokens.get(i.saturating_add(1)),
@@ -364,14 +425,26 @@ fn extract_at(
                         ))
                 {
                     if let Some(position) = position_before(tokens, i) {
-                        let (mut lateral, lateral_words, natural) = if lateral_kw {
+                        let (mut lateral, lateral_words, natural) = if lateral_kw || func_kw {
                             let (f, w, n) = lateral_form(tokens, i, position)?;
                             (Some(f), w, n)
                         } else {
                             (None, 0, false)
                         };
                         let rest = tokens.get(paren_at..).unwrap_or(&[]);
-                        let (inner, after) = split_parenthesized(rest)?;
+                        let (inner, after_paren) = split_parenthesized(rest)?;
+                        // `unnest(...) WITH ORDINALITY`（Issue #3360）。`WITH` の後が `ORDINALITY` 以外は `42601`。
+                        let mut after = after_paren;
+                        let mut ordinality = false;
+                        if func_kw && is_ident(after.first(), "WITH") {
+                            if !is_ident(after.get(1), "ORDINALITY") {
+                                return Err(SqlSurfaceError::unsupported(
+                                    "expected ORDINALITY after WITH in a FROM function",
+                                ));
+                            }
+                            ordinality = true;
+                            after = after.get(2..).unwrap_or(&[]);
+                        }
                         if inner.iter().any(|t| matches!(t, Token::Punct(';'))) {
                             return Err(SqlSurfaceError::unsupported(
                                 "derived table body must not contain a statement separator",
@@ -390,6 +463,59 @@ fn extract_at(
                         }
                         let (alias, column_aliases, mut consumed) =
                             parse_derived_alias_head(after)?;
+                        // 別名の無い `unnest(...)` の relation 名は PostgreSQL と同じ `unnest`。外側の JOIN
+                        // パーサーが別名なしの派生表を拒否するため、別名を合成して外側へ残す。
+                        let alias_given = alias.is_some();
+                        // 同一 FROM 内の 2 個目以降の別名なし `unnest` は PostgreSQL が許す。公開名は常に `unnest` で、
+                        // 外側のトークン列へ残す内部名（`unnest_<連番>`）は、文全体のどの識別子とも一致しない綴りを選び、
+                        // 明示した別名（`AS unnest_2` 等）と衝突させず、利用者が内部名を参照して解決させることもない。
+                        // 公開名 `unnest` の修飾参照が曖昧になる場合は抽出の最後に `42712` で拒否する。
+                        let alias = if func_kw && alias.is_none() {
+                            let unnamed = found
+                                .iter()
+                                .filter(|d| d.func.as_ref().is_some_and(|f| !f.alias_given))
+                                .count();
+                            if found.iter().any(|d| {
+                                d.func.as_ref().is_none_or(|f| f.alias_given)
+                                    && d.alias
+                                        .as_deref()
+                                        .is_some_and(|o| o.eq_ignore_ascii_case("unnest"))
+                            }) {
+                                return Err(SqlSurfaceError::unsupported(
+                                    "table name specified more than once",
+                                ));
+                            }
+                            if unnamed == 0 {
+                                Some("unnest".to_string())
+                            } else {
+                                let mut seq = unnamed.saturating_add(1);
+                                let name = loop {
+                                    let cand = format!("unnest_{seq}");
+                                    let used = tokens.iter().any(|t| match t {
+                                        Token::Ident(n) => n.eq_ignore_ascii_case(&cand),
+                                        Token::QualifiedIdent { qualifier, name } => {
+                                            qualifier.eq_ignore_ascii_case(&cand)
+                                                || name.eq_ignore_ascii_case(&cand)
+                                        }
+                                        Token::QualifiedStar { qualifier } => {
+                                            qualifier.eq_ignore_ascii_case(&cand)
+                                        }
+                                        _ => false,
+                                    }) || found.iter().any(|d| {
+                                        d.alias
+                                            .as_deref()
+                                            .is_some_and(|o| o.eq_ignore_ascii_case(&cand))
+                                    });
+                                    if !used {
+                                        break cand;
+                                    }
+                                    seq = seq.saturating_add(1);
+                                };
+                                Some(name)
+                            }
+                        } else {
+                            alias
+                        };
                         // `[INNER|LEFT|RIGHT|FULL] JOIN LATERAL (...) t ON true` は `ON true` を落とし、
                         // `CROSS JOIN`（直積）へ書き換えて既存の結合パーサーを変えない。LEFT／RIGHT／FULL の
                         // 種別は `build_statement` が結合段へ設定し直す（`on_true` を保持する。Issue #3323）。
@@ -432,6 +558,8 @@ fn extract_at(
                         }
                         st.count = st.count.saturating_add(1);
                         let number = st.count;
+                        // 別名なし `unnest` の位置を記録する（公開名 `unnest` の曖昧性を参照位置ごとに判定する）。
+                        placements.push((outer.len(), func_kw && !alias_given));
                         outer.push(Token::Ident(format!("{PLACEHOLDER_PREFIX}{number}")));
                         // 別名は暗黙別名の形で外側へ残す（`t.col` の修飾参照を外側の既存の
                         // 修飾列正規化が解決できるようにする。列名リストは合成 CTE が適用する）。
@@ -446,11 +574,16 @@ fn extract_at(
                             position,
                             lateral,
                             using_or_natural,
+                            func: func_kw.then_some(RawUnnest {
+                                ordinality,
+                                alias_given,
+                            }),
                         });
-                        // 本文（`(` 〜 `)`）と別名部を読み飛ばす。
+                        // 本文（`(` 〜 `)`）・`WITH ORDINALITY`・別名部を読み飛ばす。
                         let skipped = rest
                             .len()
-                            .saturating_sub(after.len())
+                            .saturating_sub(after_paren.len())
+                            .saturating_add(if ordinality { 2 } else { 0 })
                             .saturating_add(consumed);
                         i = paren_at.saturating_add(skipped);
                         continue;
@@ -467,10 +600,61 @@ fn extract_at(
         i = i.saturating_add(1);
     }
     if found.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some((found, outer)))
+        return Ok(None);
     }
+    // 公開名 `unnest` による修飾参照（`unnest.col`）は、その参照位置から可視な別名なし `unnest` が 2 個以上
+    // あるときだけ曖昧（`42712`）。可視性は FROM の左から右（ON 条件は直前までの項目、SELECT 句・WHERE 以降は
+    // 全項目、LATERAL 本文は自分より左の項目）で判定する。
+    if keep_alias {
+        let total = placements.iter().filter(|(_, u)| *u).count();
+        let ends_from = |t: &Token| {
+            matches!(t, Token::Ident(n) if ["WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "OFFSET",
+                "UNION", "INTERSECT", "EXCEPT", "WINDOW", "FETCH", "FOR", "RETURNING"]
+                .iter()
+                .any(|k| n.eq_ignore_ascii_case(k)))
+        };
+        let is_ref = |t: &Token| {
+            matches!(
+                t,
+                Token::QualifiedIdent { qualifier, .. } | Token::QualifiedStar { qualifier }
+                    if qualifier.eq_ignore_ascii_case("unnest")
+            )
+        };
+        for (idx, t) in outer.iter().enumerate() {
+            if !is_ref(t) {
+                continue;
+            }
+            let before: Vec<&(usize, bool)> = placements.iter().filter(|(p, _)| *p < idx).collect();
+            let visible = match before.last() {
+                None => total,
+                Some((last, _)) => {
+                    let tail = outer.get(*last..idx).unwrap_or(&[]);
+                    if tail.iter().any(ends_from) {
+                        total
+                    } else {
+                        before.iter().filter(|(_, u)| *u).count()
+                    }
+                }
+            };
+            if visible > 1 {
+                return Err(SqlSurfaceError::duplicate_alias("unnest"));
+            }
+        }
+        for (k, d) in found.iter().enumerate() {
+            if d.lateral.is_none() || !d.body.iter().any(is_ref) {
+                continue;
+            }
+            let visible = found
+                .iter()
+                .take(k)
+                .filter(|e| e.func.as_ref().is_some_and(|f| !f.alias_given))
+                .count();
+            if visible > 1 {
+                return Err(SqlSurfaceError::duplicate_alias("unnest"));
+            }
+        }
+    }
+    Ok(Some((found, outer)))
 }
 
 /// 抽出した派生表を解決する。`ctes` は先行する利用者の CTE で、本文から見える。本文に入れ子の
@@ -542,7 +726,11 @@ fn resolve_level(
     let mut tables: Vec<DerivedTable> = Vec::new();
     for r in raw {
         // 入れ子の派生表は本文の解析より前に切り出す（深さ超過 `54000` が本文の構文 `42601` に先行）。
-        let body_tokens = match extract_at(&r.body, st, depth_level.saturating_add(1), false)? {
+        let body_tokens = match if r.func.is_some() {
+            None
+        } else {
+            extract_at(&r.body, st, depth_level.saturating_add(1), false)?
+        } {
             Some((inner, replaced)) => {
                 resolve_level(
                     inner,
@@ -563,6 +751,8 @@ fn resolve_level(
         let placeholder = format!("{PLACEHOLDER_PREFIX}{}", r.number);
         let mut correlated_body: Option<Vec<Token>> = None;
         let mut inner_columns: Option<Vec<String>> = None;
+        let mut unnest_spec: Option<(LateralUnnest, crate::sql::lateral_bind::LateralOuterRef)> =
+            None;
         let (body_tokens, lateral_binding) = match r.lateral {
             None => (body_tokens, None),
             Some(form) => {
@@ -580,47 +770,88 @@ fn resolve_level(
                 };
                 // 左側 relation の列集合（先行の派生表・利用者の CTE・実表）。
                 let known: Vec<CteDef> = ctes.iter().chain(acc.iter()).cloned().collect();
-                let mut columns = |t: &TableRef| -> Result<Option<Vec<String>>, SqlSurfaceError> {
-                    match known
-                        .iter()
-                        .position(|d| d.name.eq_ignore_ascii_case(t.table()))
-                    {
-                        Some(idx) => Ok(derived_output_names(&known, idx, lookup, limits)?
-                            .into_iter()
-                            .collect::<Option<Vec<String>>>()),
-                        None => {
-                            // 左側（と内側）の relation の存在は束縛より先に判定する（`42P01` が
-                            // `0A000` に先行）。ビューは列集合を返さず参照時に fail-closed。
-                            if !lookup.table_exists(t.table())?
-                                && lookup.view_definition(t.table())?.is_none()
-                            {
-                                return Err(SqlSurfaceError::undefined_table(t.table()));
-                            }
-                            lookup.table_columns(t.table())
-                        }
-                    }
-                };
+                let mut columns = |t: &TableRef| left_relation_columns(t, &known, lookup, limits);
                 // RIGHT／FULL は左側 relation を参照した時点で `42P10`（Issue #3323）。
                 let reject_left =
                     matches!(form, LateralForm::Right { .. } | LateralForm::Full { .. });
-                let bound = bind_lateral_body(&body_tokens, left, &mut columns, reject_left)?;
-                // 内側の別名による修飾（`t.col`）は本文の検証の前に非修飾へ正規化する。
-                let normalized = normalize_single_table_qualifiers(&bound.tokens)?.into_owned();
-                // 取り除いた相関連言の本文も、同じ正規化・別名除去を通す（Issue #3322）。
-                correlated_body = match bound.correlated_body {
-                    Some(t) => Some(strip_inner_alias(
-                        normalize_single_table_qualifiers(&t)?.into_owned(),
-                    )),
-                    None => None,
-                };
-                inner_columns = bound.inner_columns;
-                (strip_inner_alias(normalized), Some(bound.binding))
+                if let Some(f) = &r.func {
+                    // `LATERAL unnest(<左側の配列列>)`（Issue #3360。L18〜L20）。引数を左側の列へ束縛し、
+                    // 合成 CTE は「左側 relation の当該列を出力列数だけ投影する本文」にする（評価はしない。
+                    // 公開列名・relation の解決と既存の検証を通すための足場で、行は外側タプルごとに
+                    // `sql::join::lateral` が配列セルから作る）。
+                    let arg = bind_lateral_unnest_arg(&r.body, left, &mut columns, reject_left)?;
+                    let width = if f.ordinality { 2 } else { 1 };
+                    if r.column_aliases.len() > width {
+                        return Err(SqlSurfaceError::DerivedTableColumnListTooLong {
+                            alias: r.alias.clone().unwrap_or_default(),
+                            available: width,
+                            specified: r.column_aliases.len(),
+                        });
+                    }
+                    let rel = left
+                        .get(arg.rel_index)
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "unnest argument relation out of range".to_string(),
+                        })?;
+                    let mut names: Vec<String> = Vec::with_capacity(width);
+                    names.push(match r.column_aliases.first() {
+                        Some(n) => n.clone(),
+                        None if f.alias_given => r.alias.clone().unwrap_or_default(),
+                        None => "unnest".to_string(),
+                    });
+                    if f.ordinality {
+                        names.push(
+                            r.column_aliases
+                                .get(1)
+                                .cloned()
+                                .unwrap_or_else(|| "ordinality".to_string()),
+                        );
+                    }
+                    let mut scaffold: Vec<Token> = vec![Token::Keyword(Keyword::Select)];
+                    for k in 0..width {
+                        if k > 0 {
+                            scaffold.push(Token::Punct(','));
+                        }
+                        scaffold.push(Token::Ident(arg.column.clone()));
+                    }
+                    scaffold.push(Token::Keyword(Keyword::From));
+                    scaffold.push(Token::Ident(rel.table().to_string()));
+                    unnest_spec = Some((
+                        LateralUnnest {
+                            ordinality: f.ordinality,
+                            column_names: names,
+                        },
+                        arg.clone(),
+                    ));
+                    (
+                        scaffold,
+                        Some(LateralBinding {
+                            outer_refs: vec![arg],
+                        }),
+                    )
+                } else {
+                    let bound = bind_lateral_body(&body_tokens, left, &mut columns, reject_left)?;
+                    // 内側の別名による修飾（`t.col`）は本文の検証の前に非修飾へ正規化する。
+                    let normalized = normalize_single_table_qualifiers(&bound.tokens)?.into_owned();
+                    // 取り除いた相関連言の本文も、同じ正規化・別名除去を通す（Issue #3322）。
+                    correlated_body = match bound.correlated_body {
+                        Some(t) => Some(strip_inner_alias(
+                            normalize_single_table_qualifiers(&t)?.into_owned(),
+                        )),
+                        None => None,
+                    };
+                    inner_columns = bound.inner_columns;
+                    (strip_inner_alias(normalized), Some(bound.binding))
+                }
             }
         };
         let (body, tail) = parse_cte_select_body(&body_tokens, limits)?;
         let mut def = CteDef {
             name: placeholder.clone(),
-            column_aliases: r.column_aliases.clone(),
+            column_aliases: match &unnest_spec {
+                Some((u, _)) => u.column_names.clone(),
+                None => r.column_aliases.clone(),
+            },
             body,
             materialization: CteMaterialization::Default,
             tail,
@@ -637,6 +868,12 @@ fn resolve_level(
                     "USING and NATURAL JOIN with a LATERAL subquery referencing outer columns are not supported yet"
                         .to_string(),
                 );
+            } else if let Some((u, arg)) = unnest_spec.take() {
+                lateral_exec = Some(JoinLateral {
+                    outer_refs: vec![(arg.rel_index, arg.column)],
+                    correlated: Vec::new(),
+                    unnest: Some(u),
+                });
             } else if binding.is_correlated() {
                 match plan_correlated_execution(
                     &placeholder,
@@ -702,6 +939,31 @@ fn resolve_level(
         });
     }
     Ok(tables)
+}
+
+/// 左側 relation `t` の列集合（先行の派生表・利用者の CTE は公開列名、実表は列名）。ビューは列集合を
+/// 返さず（`Ok(None)`。参照時に fail-closed）、左側 relation の存在は束縛より先に判定する（`42P01` が
+/// `0A000` に先行）。`bind_lateral_body`・`bind_lateral_unnest_arg` が共有する。
+fn left_relation_columns(
+    t: &TableRef,
+    known: &[CteDef],
+    lookup: &impl TableLookup,
+    limits: NestingLimits,
+) -> Result<Option<Vec<String>>, SqlSurfaceError> {
+    match known
+        .iter()
+        .position(|d| d.name.eq_ignore_ascii_case(t.table()))
+    {
+        Some(idx) => Ok(derived_output_names(known, idx, lookup, limits)?
+            .into_iter()
+            .collect::<Option<Vec<String>>>()),
+        None => {
+            if !lookup.table_exists(t.table())? && lookup.view_definition(t.table())?.is_none() {
+                return Err(SqlSurfaceError::undefined_table(t.table()));
+            }
+            lookup.table_columns(t.table())
+        }
+    }
 }
 
 /// 左側の列を参照する LATERAL（`def` は外側参照を含む連言を取り除いた単一定義）を、基底と後処理の
@@ -783,6 +1045,7 @@ fn plan_correlated_execution(
             .map(|r| (r.rel_index, r.column.clone()))
             .collect(),
         correlated: corr_select.where_predicates,
+        unnest: None,
     };
     Ok((base, post, exec))
 }
@@ -1150,6 +1413,72 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    /// Issue #3360: `LATERAL unnest(...)` は関数形として抽出され、`WITH ORDINALITY`・別名・列名リストを
+    /// 受理する。別名なしは relation 名 `unnest` を合成する。`ON true` は `CROSS JOIN` へ書き換える。
+    #[test]
+    fn lateral_unnest_is_extracted_as_a_function_item() {
+        let r = found("SELECT * FROM t CROSS JOIN LATERAL unnest(t.a) WITH ORDINALITY AS u(v, n)")
+            .expect("found");
+        let d = r.first().expect("one");
+        assert_eq!(d.lateral, Some(LateralForm::Cross));
+        assert_eq!(d.alias.as_deref(), Some("u"));
+        assert_eq!(d.column_aliases, vec!["v".to_string(), "n".to_string()]);
+        let f = d.func.as_ref().expect("function item");
+        assert!(f.ordinality);
+        assert!(f.alias_given);
+        let r = found("SELECT * FROM t, LATERAL unnest(t.a)").expect("found");
+        let d = r.first().expect("one");
+        assert_eq!(d.alias.as_deref(), Some("unnest"));
+        assert!(!d.func.as_ref().expect("function item").alias_given);
+        assert!(!d.func.as_ref().expect("function item").ordinality);
+        let tokens =
+            tokenize("SELECT * FROM t LEFT JOIN LATERAL unnest(t.a) AS u(v) ON true WHERE 1 = 1")
+                .expect("t");
+        let (r, outer) = extract(&tokens, 8).expect("extract").expect("found");
+        assert_eq!(
+            r.first().map(|d| d.lateral),
+            Some(Some(LateralForm::Left { on_true: true }))
+        );
+        assert!(outer
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.eq_ignore_ascii_case("CROSS"))));
+        assert!(!outer.iter().any(|t| matches!(t, Token::Punct('('))));
+    }
+
+    /// Issue #3360: `ROWS FROM`・`unnest` 以外の関数・`WITH` の後が `ORDINALITY` 以外・入れ子の中の
+    /// 関数形は拒否する。`lateral` という名前の表は誤検出しない。
+    #[test]
+    fn unsupported_lateral_function_shapes_are_rejected() {
+        for (sql, code) in [
+            ("SELECT * FROM t, LATERAL ROWS FROM (unnest(t.a))", "0A000"),
+            (
+                "SELECT * FROM t, LATERAL generate_series(1, t.a) g",
+                "0A000",
+            ),
+            (
+                "SELECT * FROM t, LATERAL unnest(t.a) WITH foo AS u",
+                "42601",
+            ),
+        ] {
+            let tokens = tokenize(sql).expect("t");
+            assert_eq!(
+                extract(&tokens, 8).expect_err(sql).wire_code(),
+                code,
+                "{sql}"
+            );
+        }
+        assert!(found("SELECT * FROM lateral JOIN t ON lateral.a = t.a").is_none());
+        assert!(contains_lateral(
+            &tokenize("SELECT * FROM t, LATERAL unnest(t.a)").expect("t")
+        ));
+        assert!(contains_lateral(
+            &tokenize("SELECT * FROM t, LATERAL ROWS FROM (f(1))").expect("t")
+        ));
+        assert!(!contains_lateral(
+            &tokenize("SELECT * FROM lateral JOIN t ON true").expect("t")
+        ));
     }
 
     // 派生表の本文の中の LATERAL は、JOIN を持つ本文（派生表の本文の FROM が複数の関係）が無いため固定 `0A000`

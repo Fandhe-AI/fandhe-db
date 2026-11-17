@@ -127,6 +127,7 @@ mod sql62_lateral_exec;
 mod sql62_lateral_explain;
 mod sql62_lateral_left;
 mod sql62_lateral_params;
+mod sql62_lateral_unnest;
 mod sql62_lateral_view;
 mod sql63_data_modifying_cte_exec;
 mod sql63_data_modifying_cte_semantics;

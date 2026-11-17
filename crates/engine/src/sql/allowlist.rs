@@ -3728,6 +3728,8 @@ pub struct ValidatedFunctionScan {
     pub(crate) args: Vec<Expr>,
     /// 利用者が書いた別名（`SETOF` の列名の決定に使う）。
     pub(crate) alias: Option<String>,
+    /// `WITH ORDINALITY`（末尾へ 1 始まりの `bigint` 列を足す。Issue #3360）。
+    pub(crate) ordinality: bool,
 }
 
 /// 検証済みの再帰 CTE（[`Statement::RecursiveCte`]。SQL-35・Issue #1870）。フィールドは
@@ -4280,8 +4282,21 @@ pub(crate) struct JoinLateral {
     /// 参照する左側 relation の列 `(結合連鎖の添字, 列名)`。`WherePredicate` 内の予約内部名
     /// （`correlation::lateral_ref_placeholder`）と対応する。
     pub(crate) outer_refs: Vec<(usize, String)>,
-    /// 外側参照を含む連言（基底の行に外側タプルごとにかける相関述語）。
+    /// 外側参照を含む連言（基底の行に外側タプルごとにかける相関述語）。`unnest` が `Some` のときは空。
     pub(crate) correlated: Vec<WherePredicate>,
+    /// 集合を返す組み込み関数 `unnest(<左側の配列列>)` の relation（Issue #3360。L18〜L22）。`Some` のとき
+    /// `outer_refs` は引数の列 1 つだけで、基底の行・後処理の層は持たず、外側タプルの配列セルから要素行を作る。
+    pub(crate) unnest: Option<LateralUnnest>,
+}
+
+/// `LATERAL unnest(<左側の配列列>) [WITH ORDINALITY]` の実行情報（Issue #3360。設計記録 L18〜L22）。
+/// 要素型は実行時に左側 relation のスキーマから決める（Describe と Execute が同じ導出を通す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LateralUnnest {
+    /// `WITH ORDINALITY` が付いたか（末尾へ 1 始まりの `bigint` 列を足す）。
+    pub(crate) ordinality: bool,
+    /// 出力列名（列数は 1 または 2。別名・列名リスト・既定名を抽出段で確定済み）。
+    pub(crate) column_names: Vec<String>,
 }
 
 // 手書きの `Eq`: `slots` が持つ述語は f64 を含みうるため `derive(Eq)` できないが、構築経路が
@@ -30354,6 +30369,7 @@ fn function_scan_statement(
         alias,
         column_aliases,
         outer_tokens,
+        ordinality,
     } = parts;
     let mut args: Vec<Expr> = Vec::with_capacity(arg_tokens.len());
     for toks in &arg_tokens {
@@ -30381,6 +30397,7 @@ fn function_scan_statement(
         name,
         args,
         alias,
+        ordinality,
     }));
     let view_name = main_table_name;
     let stmt = match main {
