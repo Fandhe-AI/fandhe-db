@@ -955,3 +955,60 @@ fn noop_ddl_does_not_mark_the_transaction_as_having_ddl() {
     );
     tx_ok(&core, &mut session, &mut txn, "COMMIT");
 }
+
+/// 全アクションが no-op の `ALTER TABLE`（既存列への `ADD COLUMN IF NOT EXISTS`・既に NOT NULL の列への
+/// `SET NOT NULL`）は印を立てず、後続の UPDATE・DELETE・INSERT・ビュー読み取りが通る。
+#[test]
+fn noop_alter_table_does_not_mark_the_transaction_as_having_ddl() {
+    let (core, _guard) = new_core("sql80-noop-alter");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE VIEW v AS SELECT id FROM t",
+    )
+    .expect("view");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(&core, &mut session, &mut txn, &insert(1, "a"));
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "ALTER TABLE t ADD COLUMN IF NOT EXISTS body TEXT",
+    );
+    tx_ok(&core, &mut session, &mut txn, &insert(2, "b"));
+    tx_ok(&core, &mut session, &mut txn, "DELETE FROM t WHERE id = 1");
+    assert_eq!(
+        tx_rows(&core, &mut session, &mut txn, "SELECT id FROM v"),
+        1
+    );
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+}
+
+/// `ADD COLUMN` の SERIAL・IDENTITY は暗黙 SEQUENCE を作る型で、`CREATE TABLE` と同じく Tx 内でも
+/// `0A000`（DDL の印を立てる前に拒否され、後続の文は通る）。
+#[test]
+fn add_column_serial_and_identity_are_rejected_without_marking_ddl() {
+    let (core, _guard) = new_core("sql80-add-serial");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    for sql in [
+        "ALTER TABLE t ADD COLUMN m SERIAL",
+        "ALTER TABLE t ADD COLUMN m BIGSERIAL",
+        "ALTER TABLE t ADD COLUMN m INTEGER GENERATED ALWAYS AS IDENTITY",
+    ] {
+        let mut t2 = core.new_session_transaction();
+        let mut s2 = ddl_session();
+        begin(&core, &mut s2, &mut t2);
+        assert_eq!(tx_code(&core, &mut s2, &mut t2, sql), "0A000", "{sql}");
+        tx_ok(&core, &mut s2, &mut t2, "ROLLBACK");
+    }
+    tx_ok(&core, &mut session, &mut txn, &insert(1, "a"));
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+}

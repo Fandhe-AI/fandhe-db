@@ -324,18 +324,22 @@ impl EngineCore {
                     return Err(schema_scoped_ddl_unsupported());
                 }
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_started();
+                let snap = txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 // 既に NOT NULL の列への `SET NOT NULL` は走査しない no-op のため、ゲートの対象外にする。
                 if alter_needs_row_scan(write_txn, table_name, stmt) {
                     reject_scan_ddl_on_nonempty_table(write_txn, table_name)?;
                 }
-                let (outcome, evict) = crate::sql::ddl::execute_alter_table_in_txn(
+                let (outcome, evict, changed) = crate::sql::ddl::execute_alter_table_in_txn(
                     &self.storage,
                     write_txn,
                     stmt,
                     &self.schema_limits,
                 )?;
+                if !changed {
+                    // 全アクションが冪等な no-op（`ADD COLUMN IF NOT EXISTS` の既存列等）は印を巻き戻す。
+                    txn.restore_ddl_started(snap);
+                }
                 txn.mark_ddl_done(false, evict);
                 Ok(SqlOutcome::AlterTable(outcome))
             }

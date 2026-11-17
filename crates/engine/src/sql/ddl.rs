@@ -1255,13 +1255,15 @@ pub(crate) fn alter_table_in_txn_target(validated: &ValidatedAlterTable) -> Opti
 /// 複数アクション。適用の本体は複数アクション経路（[`run_alter_actions_in_txn`]）と同じで、スキーマは
 /// 常に write txn 内のもの（同じ Tx で作った表・前の文の変更を含む）を読む。それ以外の形
 /// （制約の追加・削除、型変更、改名、`SET SCHEMA`、行セキュリティ）は `0A000`（何も適用しない）。
-/// 戻り値の第 2 要素は DROP COLUMN が道連れに削除した所有 SEQUENCE の内部 ID（commit 成功後に採番器から捨てる）。
+/// 戻り値の第 2 要素は DROP COLUMN が道連れに削除した所有 SEQUENCE の内部 ID（commit 成功後に採番器から捨てる）、
+/// 第 3 要素は全アクションのうちカタログを変えたものがあったか（`false` は全て冪等な no-op。呼び出し元が
+/// DDL を積んだ印を巻き戻すのに使う）。
 pub(crate) fn execute_alter_table_in_txn(
     storage: &Storage,
     write_txn: &redb::WriteTransaction,
     validated: &ValidatedAlterTable,
     limits: &SchemaLimits,
-) -> Result<(AlterTableOutcome, Vec<u64>), SqlSurfaceError> {
+) -> Result<(AlterTableOutcome, Vec<u64>, bool), SqlSurfaceError> {
     let Some(table_name) = alter_table_in_txn_target(validated) else {
         return Err(SqlSurfaceError::transaction_feature_not_supported(
             "this ALTER TABLE action is not supported inside a transaction block",
@@ -1279,9 +1281,12 @@ pub(crate) fn execute_alter_table_in_txn(
         }
         Err(other) => return Err(map_drop_alter_column_error(other)),
     }
+    let changed = std::cell::Cell::new(false);
     let (results, dropped_sequence_ids) =
         Storage::alter_table_in_shared_txn(write_txn, table_name, |txn| {
-            run_alter_actions_in_txn(storage, txn, table_name, &actions, limits)
+            let applied = run_alter_actions_in_txn(storage, txn, table_name, &actions, limits)?;
+            changed.set(applied.1);
+            Ok(applied)
         })
         .map_err(|e| map_alter_check_error(storage, table_name, e))?;
     let done: Vec<AlterTableAction> = results.into_iter().flatten().collect();
@@ -1300,6 +1305,7 @@ pub(crate) fn execute_alter_table_in_txn(
             action,
         },
         dropped_sequence_ids,
+        changed.get(),
     ))
 }
 

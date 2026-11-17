@@ -529,7 +529,8 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #3171（末尾 `;` 付き Tx 制御文の受理）の行追加でさらに移動（旧: 2600）。書き込み内容・commit の意味は不変。
     // Issue #3313（SQL-80。表・索引の DDL を積んだ Tx の状態 `TxnDdlState` と commit 後の採番器の後始末の追加）の行追加でさらに移動（旧: 2604）。書き込み内容・commit の意味は不変
     // （DDL の世代 bump は共有 txn への書き込みの直後に各 `*_in_shared_txn` が行い、本 commit は Tx の確定口）。
-    ("sql/transaction.rs", 2693),
+    // base（main）取り込みマージの行追加でさらに移動（旧: 2693）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 2719),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が
