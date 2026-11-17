@@ -511,6 +511,37 @@ fn aggregate_distinct_and_star_bodies_stay_fail_closed() {
     assert_eq!(rows(&core, "alice", "SELECT * FROM docs").len(), 6);
 }
 
+/// 内側の関係が利用者の CTE の形でも実行できる。内側の識別子の綴りが列名と異なる（大文字小文字）形は、
+/// LATERAL を使わない問い合わせと同じく `42703` で拒否され、一致しない列を黙って NULL 扱いにして 0 行に
+/// しない。
+#[test]
+fn cte_inner_relation_works_and_mismatched_identifier_case_is_rejected() {
+    let (core, _g) = open();
+    let expected = pairs(&[
+        ("1", "b9"),
+        ("2", "b9"),
+        ("3", "b3"),
+        ("4", "b9"),
+        ("5", "b9"),
+        ("7", "b9"),
+    ]);
+    let sql = "WITH c AS (SELECT lang, body FROM docs) \
+               SELECT d.id, s.body FROM docs d, LATERAL (SELECT body FROM c x \
+               WHERE x.lang = d.lang ORDER BY x.body DESC LIMIT 1) s ORDER BY d.id";
+    assert_eq!(rows(&core, "alice", sql), expected);
+    // 他テナントの private 行は CTE 経由でも見えない。
+    assert!(rows(&core, "carol", sql).iter().all(|r| r[1] != "b9"));
+    assert_eq!(err_pair(&core, "alice", "SELECT LANG FROM docs").0, "42703");
+    // 内側の列の綴りが異なる参照は他の問い合わせと同じく `42703`。外側の列は左側の列の綴りへ正規化される
+    // ため、綴りが異なっても同じ結果になる。
+    let inner_case = "SELECT d.id, s.body FROM docs d, LATERAL (SELECT body FROM docs x \
+         WHERE x.LANG = d.lang ORDER BY x.body DESC LIMIT 1) s ORDER BY d.id";
+    assert_eq!(err_pair(&core, "alice", inner_case).0, "42703");
+    let outer_case = "SELECT d.id, s.body FROM docs d, LATERAL (SELECT body FROM docs x \
+         WHERE x.lang = d.LANG ORDER BY x.body DESC LIMIT 1) s ORDER BY d.id";
+    assert_eq!(rows(&core, "alice", outer_case), expected);
+}
+
 /// Describe（拡張クエリプロトコル）は基底の評価なしに Execute と同じ結果列を導出する（Describe と Execute は
 /// 同じ束縛を通す。設計記録 L17）。
 #[test]

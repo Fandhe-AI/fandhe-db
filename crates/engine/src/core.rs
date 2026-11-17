@@ -14849,9 +14849,9 @@ impl EngineCore {
     /// 外側の行ごとに再評価する LATERAL の slot `k`（後処理）について、基底（`from` の親 slot）の評価済みの
     /// 行と、後処理後の結果列（列名リスト適用後）を返す（Issue #3322。設計記録 L1・L15）。基底は参照者
     /// 自身の `ctx`・呼び出し元と同一の `read_txn` で文内に 1 回だけ評価し、保持分は `budget` へ計上される。
-    /// 基底の暗黙 `LIMIT`（結果行数上限）は、後処理が外側タプルごとに絞るため `Derived` の評価（
-    /// [`Self::evaluate_cte_slot`]）と同じくハード上限まで緩め、入力行数の上限は呼び出し先の JOIN が
-    /// 判定する。明示 `LIMIT` は設定値の範囲を検査する。
+    /// 基底が実表を読む `Scan` のときの暗黙 `LIMIT`（結果行数上限）は、後処理が外側タプルごとに絞るため
+    /// ハード上限まで緩め、入力行数の上限は呼び出し先の JOIN が判定する（利用者の CTE を読む基底は設定値の
+    /// まま）。明示 `LIMIT` は設定値の範囲を検査する。
     #[allow(clippy::too_many_arguments)]
     fn evaluate_lateral_base<R: crate::storage::read_source::ReadSource>(
         &self,
@@ -14882,8 +14882,17 @@ impl EngineCore {
         if layer.limit_explicit {
             crate::sql::parser::validate_search_limit_with(layer.limit, &limits)?;
         }
-        let base_limits =
-            crate::result_limits::ResultLimits::new(crate::result_limits::MAX_RESULT_ROWS_HARD_CAP);
+        // 基底が実表を読む `Scan` のときだけ暗黙上限を緩める。基底が利用者の CTE を読む `Derived` のときは、
+        // 緩めた上限が（共有されうる）親 slot の評価・キャッシュへ伝わらないよう、設定値のまま渡す。
+        let base_is_scan = matches!(
+            cte.slots.get(*from).map(|b| &b.source),
+            Some(CteSlotSource::Scan(_))
+        );
+        let base_limits = if base_is_scan {
+            crate::result_limits::ResultLimits::new(crate::result_limits::MAX_RESULT_ROWS_HARD_CAP)
+        } else {
+            limits
+        };
         let base = self.evaluate_cte_slot(
             ctx,
             session,

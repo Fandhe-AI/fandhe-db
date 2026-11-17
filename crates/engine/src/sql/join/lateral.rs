@@ -119,8 +119,9 @@ fn scrub_reserved_names(e: SqlSurfaceError) -> SqlSurfaceError {
 }
 
 impl LateralRuntime {
-    /// 基底の行 `base` と束縛情報から実行用の入力を組む。相関述語の束縛は行数・テナントに依存しない
-    /// （空の基底・空の外側でも必ず通すため、束縛エラーが可視行の有無で変わらない）。
+    /// 基底の行 `base` と束縛情報から実行用の入力を組む。相関述語の束縛はスキーマだけで決まり行の内容・
+    /// テナントに依存しない。外側タプルの評価の前に行うため、基底や外側が 0 行でも同じ束縛エラーになる
+    /// （Describe は基底を評価しないため相関述語を束縛せず、この束縛エラーは Execute でだけ現れる）。
     pub(super) fn build(base: QueryResult, input: BuildInput<'_>) -> Result<Self, SqlSurfaceError> {
         let BuildInput {
             lat,
