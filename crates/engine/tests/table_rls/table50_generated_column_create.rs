@@ -526,3 +526,41 @@ fn alter_guards_and_surviving_alters_keep_the_expression() {
     ok(&core, TENANT, "ALTER TABLE g2 DROP CONSTRAINT g_a_pos");
     ok(&core, TENANT, "ALTER TABLE g2 DROP COLUMN a");
 }
+
+#[test]
+// intentional: docs/design/generated-column.md
+fn alter_add_foreign_key_applies_the_same_referential_action_guard() {
+    let (_p, _g, core) = fixture("t50-alter-fk");
+    ok(&core, TENANT, "CREATE TABLE par (k INTEGER PRIMARY KEY)");
+    ok(
+        &core,
+        TENANT,
+        "CREATE TABLE ch (a INTEGER, b INTEGER GENERATED ALWAYS AS (a) STORED, c INTEGER)",
+    );
+    // 生成列を参照元に含む FK の禁止アクションは CREATE TABLE と同じ `42601`。拒否後に制約は残らない。
+    for action in [
+        "ON UPDATE CASCADE",
+        "ON UPDATE SET NULL",
+        "ON UPDATE SET DEFAULT",
+        "ON DELETE SET NULL",
+        "ON DELETE SET DEFAULT",
+    ] {
+        let sql = format!(
+            "ALTER TABLE ch ADD CONSTRAINT ch_fk FOREIGN KEY (b) REFERENCES par (k) {action}"
+        );
+        assert_eq!(code(&core, TENANT, &sql), "42601", "{sql}");
+    }
+    // 許可アクション（ON DELETE CASCADE・NO ACTION）は通る。拒否された制約名が残っていれば
+    // 同名の追加が衝突するため、同名で通ること自体が「拒否後に残らない」確認を兼ねる。
+    ok(
+        &core,
+        TENANT,
+        "ALTER TABLE ch ADD CONSTRAINT ch_fk FOREIGN KEY (b) REFERENCES par (k) ON DELETE CASCADE",
+    );
+    // 生成列を含まない FK は従来どおり全アクションを使える。
+    ok(
+        &core,
+        TENANT,
+        "ALTER TABLE ch ADD CONSTRAINT ch_fk3 FOREIGN KEY (c) REFERENCES par (k) ON DELETE SET NULL ON UPDATE CASCADE",
+    );
+}

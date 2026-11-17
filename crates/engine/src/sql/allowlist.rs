@@ -6479,20 +6479,18 @@ pub struct ValidatedCreateTempTable {
 /// `ON UPDATE CASCADE／SET NULL／SET DEFAULT` と `ON DELETE SET NULL／SET DEFAULT` は参照元の生成列の値を
 /// 子表側から直接書き換えるため `42601`（固定文言。列名・表名を載せない）。`ON DELETE CASCADE` は
 /// 行ごと削除するだけなので許す。
-fn reject_generated_fk_referential_actions(
+/// `CREATE TABLE`（本ファイルの構文段）と `ALTER TABLE ADD FOREIGN KEY`（`sql::ddl` の実行段が
+/// カタログの列定義から生成列名を引いて呼ぶ）が共有する。`generated` は生成列の列名集合。
+pub(crate) fn reject_generated_fk_referential_actions(
     foreign_keys: &[crate::catalog::ForeignKeyDef],
-    generated: &[GeneratedColumn],
+    generated: &[&str],
 ) -> Result<(), SqlSurfaceError> {
     use crate::catalog::ReferentialAction;
     if generated.is_empty() {
         return Ok(());
     }
     for fk in foreign_keys {
-        if !fk
-            .columns()
-            .iter()
-            .any(|c| generated.iter().any(|g| &g.column == c))
-        {
+        if !fk.columns().iter().any(|c| generated.contains(&c.as_str())) {
             continue;
         }
         let bad_update = fk.on_update() != ReferentialAction::NoAction;
@@ -17339,7 +17337,11 @@ impl<'a> Parser<'a> {
         // 生成列を参照元に含む FK の参照アクション（`ON UPDATE CASCADE／SET NULL／SET DEFAULT`・
         // `ON DELETE SET NULL／SET DEFAULT`）は生成列の値を直接書き換えるため `42601`（PG17 に合わせる
         // 想定。要確認: Issue #3332）。生成列の集合は文の内部で決まりカタログを引かない。
-        reject_generated_fk_referential_actions(&foreign_keys, &generated_columns)?;
+        let generated_names: Vec<&str> = generated_columns
+            .iter()
+            .map(|g| g.column.as_str())
+            .collect();
+        reject_generated_fk_referential_actions(&foreign_keys, &generated_names)?;
         // 制約名前空間の重複判定（Issue #1428）。主キーの実効名は明示名、無ければ
         // 主キーが実在するときの導出名 `<table>_pkey`。構文エラー（文末の余剰
         // トークン）を優先するため、先に文末検証を済ませてから返す（42P16 と同じ）。

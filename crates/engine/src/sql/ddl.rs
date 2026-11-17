@@ -1410,6 +1410,18 @@ pub(crate) fn execute_alter_table_add_foreign_key(
                 &schema.columns,
                 std::slice::from_ref(&stmt.foreign_key),
             )?;
+            // 生成列を参照元に含む FK の禁止アクションは `CREATE TABLE` と同じ検査・同じ `42601`
+            // （TABLE-50・Issue #3327）。
+            let generated_names: Vec<&str> = schema
+                .columns
+                .iter()
+                .filter(|c| c.generated.is_some())
+                .map(|c| c.name.as_str())
+                .collect();
+            crate::sql::allowlist::reject_generated_fk_referential_actions(
+                std::slice::from_ref(&stmt.foreign_key),
+                &generated_names,
+            )?;
         }
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
