@@ -95,7 +95,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 104;
+    count = 105;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -399,6 +399,10 @@ define_error_classes! {
     /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::
     /// AmbiguousColumn`] の写像。
     AmbiguousColumn => ("42702", "AMBIGUOUS_COLUMN"),
+    /// 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`。SQL-53 (b)・Issue #3297）で、書き込み先と
+    /// FROM／USING の表の公開名が重複した（`42712`。PG の `duplicate_alias`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateAlias`] の写像。
+    DuplicateAlias => ("42712", "DUPLICATE_ALIAS"),
     /// 式評価の 0 除算（`22012`、Issue #1163・SQL-26・ERR-2）。
     /// [`crate::sql::allowlist::SqlSurfaceError::DivisionByZero`] の写像。
     DivisionByZero => ("22012", "DIVISION_BY_ZERO"),

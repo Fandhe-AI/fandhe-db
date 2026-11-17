@@ -8782,37 +8782,13 @@ impl EngineCore {
                 ),
             );
         }
-        // SQL-53 (b)・Issue #1754: `UPDATE ... FROM`／`DELETE ... USING` の `$n` は位置規則の対象外のため、
-        // Parse 段で `42601` として拒否する（fail-closed。`#1750` の WHERE 内サブクエリと同じ扱い）。
-        // Issue #3293: `EXPLAIN [ANALYZE|VERBOSE|(オプション)]` の前置があっても同じ拒否を維持する
-        // （前置を外した本文で判定する。外せない形は生のトークン列のまま判定し、後続の構文段が拒否する）。
-        // `$n` を受理しないまま EXPLAIN 経由でダミー値の文が計画・実行される経路を作らない（fail-closed）。
-        let joined_dml_body: Vec<crate::sql::lexer::Token> = if matches!(
-            tokens.first(),
-            Some(crate::sql::lexer::Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN")
-        ) {
-            match crate::sql::explain_options::extract(tokens.clone()) {
-                Ok((t, _)) => t.get(1..).unwrap_or(&[]).to_vec(),
-                Err(_) => tokens.get(1..).unwrap_or(&[]).to_vec(),
-            }
-        } else {
-            Vec::new()
-        };
-        let joined_dml_probe: &[crate::sql::lexer::Token] = if joined_dml_body.is_empty() {
-            &tokens
-        } else {
-            &joined_dml_body
-        };
-        if (crate::sql::allowlist::looks_like_update_from(joined_dml_probe)
-            || crate::sql::allowlist::looks_like_delete_using(joined_dml_probe))
-            && tokens
-                .iter()
-                .any(|t| matches!(t, crate::sql::lexer::Token::Param(_)))
-        {
-            return Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
-                "bind parameters are not supported in UPDATE ... FROM / DELETE ... USING",
-            ));
-        }
+        // SQL-53 (b)・Issue #3297: `UPDATE ... FROM`／`DELETE ... USING` の `$n` は拡張クエリでも受理する
+        // （旧 #1754 の一律 `42601` を撤去）。受理位置は `sql::params` の位置規則（SET 右辺・WHERE の比較・
+        // `USING OPERATION_ID`）が決め、それ以外（IN・LIKE・RETURNING・FROM 句）は位置検査が `42601` で
+        // 拒否する。Bind は値を型付きリテラルへ置換して再解析するため、Bind 後は同じ値を書いた簡易クエリと
+        // 同じ経路（結合 DML 解析器・束縛・RLS・台帳）を通る。結合 WHERE が受理しない値（数値リテラル）に
+        // なる位置は、Parse の構造検証が簡易クエリと同じ `42601` で拒否する（fail-closed）。
+        // `EXPLAIN [ANALYZE|(オプション)]` 前置の扱いは既存の EXPLAIN 規則（#2054・#2058）のまま。
         // SQL-52・Issue #1678: `CREATE TABLE ... AS` も DDL であり内側の問い合わせは `$n` の位置規則の
         // 対象外のため、`$n` を含む形は位置検査より前に `0A000` で拒否する（fail-closed）。
         if crate::sql::allowlist::is_create_table_as_statement(&tokens)
@@ -8961,8 +8937,13 @@ impl EngineCore {
             param_types.iter().map(|t| t.literal_kind()).collect();
         // 等価述語のダミーフラグは種別確定後に求める（非 String 種別は
         // `WherePredicate::Equality` にならず序数に数えない）。
-        let where_equality_dummy_flags =
-            crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds);
+        // 結合 DML（Issue #3297）は連言分ごとのフラグ（`sql::join::dml_plan` が対象側・source 側へ
+        // 振り分ける）。それ以外は従来どおり等価述語の序数ごと。
+        let where_equality_dummy_flags = if crate::sql::params::is_joined_dml(&tokens) {
+            crate::sql::params::joined_dml_dummy_flags(&tokens, &kinds)
+        } else {
+            crate::sql::params::where_equality_literal_is_param_typed(&tokens, &kinds)
+        };
         // 仮値での定数畳み込みは値依存エラー（0 除算等）を Bind まで遅延する
         // （`VALUES (1, 10 / $1)` の実値を Bind で受けるため。Parse は構造と型だけ検証）。
         let dummy_tokens = crate::sql::params::substitute_dummy_typed(&tokens, &kinds);
@@ -9087,18 +9068,31 @@ impl EngineCore {
         use crate::sql::param_infer::ParamInference;
         use crate::sql::params::{ExprTarget, ParamPosition, PreparedParamType};
 
+        // Issue #3297: 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`）の関係一覧 `(公開名, 表名)`。
+        // 先頭が書き込み先。WHERE の修飾子から表を引き、SET 側は書き込み先で引く。
+        let joined_rels = if crate::sql::params::is_joined_dml(tokens) {
+            crate::sql::params::joined_dml_relations(tokens)
+        } else {
+            None
+        };
         // WHERE 等価位置の列を引くテーブル名（トークン列から）。
-        let where_table: Option<String> = match tokens.first() {
-            Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
-                Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
-                _ => None,
-            },
-            // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
-            // 引く `FROM` は括弧深さ 0 の最初のものに限る。
-            _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
-                Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
-                _ => None,
-            }),
+        let where_table: Option<String> = if let Some((_, target)) =
+            joined_rels.as_ref().and_then(|r| r.first())
+        {
+            Some(target.clone())
+        } else {
+            match tokens.first() {
+                Some(Token::Ident(w)) if w.eq_ignore_ascii_case("UPDATE") => match tokens.get(1) {
+                    Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                    _ => None,
+                },
+                // Issue #1188: `EXTRACT(field FROM src)` は括弧内に `FROM` を持つため、テーブル名を
+                // 引く `FROM` は括弧深さ 0 の最初のものに限る。
+                _ => first_top_level_from_index(tokens).and_then(|i| match tokens.get(i + 1) {
+                    Some(Token::Ident(name) | Token::QuotedNull(name)) => Some(name.clone()),
+                    _ => None,
+                }),
+            }
         };
         // 表スキーマの引き先。再 Parse は `BEGIN` 時点のスナップショット、通常の Parse は最新カタログ。
         let schema_of = |table: &str| -> Option<crate::catalog::TableSchema> {
@@ -9168,6 +9162,26 @@ impl EngineCore {
 
         // 式内 `$n`（パターン 7）の推論結果を、番号ごとに集める。
         let segments = crate::sql::params::expr_param_segments(tokens);
+        // Issue #3297: 結合 DML の SET 右辺の修飾列（`docs.n + $1`）は、推論用の式解析が修飾子を
+        // 解決できない。推論専用に修飾子を落とした列名へ置き換える（添字は不変）。型は書き込み先の
+        // 列で引き、FROM 側の表を指す修飾子は実際の解析（束縛）が `0A000` で拒否する。
+        let infer_tokens: std::borrow::Cow<'_, [Token]> = if joined_rels.is_some() {
+            std::borrow::Cow::Owned(
+                tokens
+                    .iter()
+                    .map(|t| match t {
+                        // 修飾子は区切り文字（`\u{1}`）で名前に畳み込み、下の `lookup` が結合 DML の
+                        // スコープ（書き込み先 + FROM 側）で解決する。
+                        Token::QualifiedIdent { qualifier, name } => {
+                            Token::Ident(format!("{qualifier}\u{1}{name}"))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(tokens)
+        };
         let mut expr_results: Vec<Vec<(ParamInference, Option<ParamContextKind>)>> =
             vec![Vec::new(); usize::from(param_count)];
         for seg in &segments {
@@ -9183,10 +9197,33 @@ impl EngineCore {
                 ),
             };
             let root_type = table.zip(root_col).and_then(|(t, c)| column_type(t, c));
-            let lookup = |name: &str| table.and_then(|t| column_type(t, name));
-            for (n, inferred, kind) in
-                crate::sql::param_infer::infer_segment(tokens, seg, for_set, root_type, &lookup)?
-            {
+            let lookup = |name: &str| -> Option<PreparedParamType> {
+                match joined_rels.as_deref() {
+                    // 結合 DML は修飾列を修飾子が指す表の列で、非修飾列を「その列を持つ表がちょうど
+                    // 1 つ」のときだけその型で引く（0 件・複数件は未解決。束縛段の `42703`／`42702` に委ねる）。
+                    Some(rels) => match name.split_once('\u{1}') {
+                        Some((qualifier, col)) => rels
+                            .iter()
+                            .find(|(exposed, _)| exposed == qualifier)
+                            .and_then(|(_, t)| column_type(t, col)),
+                        None => {
+                            let mut hits = rels.iter().filter_map(|(_, t)| column_type(t, name));
+                            match (hits.next(), hits.next()) {
+                                (Some(t), None) => Some(t),
+                                _ => None,
+                            }
+                        }
+                    },
+                    None => table.and_then(|t| column_type(t, name)),
+                }
+            };
+            for (n, inferred, kind) in crate::sql::param_infer::infer_segment(
+                &infer_tokens,
+                seg,
+                for_set,
+                root_type,
+                &lookup,
+            )? {
                 if let Some(slot) = usize::from(n)
                     .checked_sub(1)
                     .and_then(|k| expr_results.get_mut(k))
@@ -9218,8 +9255,31 @@ impl EngineCore {
                         ),
                         // `USING PLAN`／`USING OPERATION_ID` は本 DB 固有の句で判定対象外。
                         ParamPosition::Text => (Some(PreparedParamType::Text), None),
-                        ParamPosition::WhereColumn(col) => (
-                            where_table.as_deref().and_then(|t| column_type(t, col)),
+                        ParamPosition::WhereColumn(col) => {
+                            // Issue #3297: 結合 DML の非修飾列は、その列を持つ表がちょうど 1 つのときだけ
+                            // その型を使う（0 件・複数件は `Text` へ倒し、束縛段の `42703`／`42702` に委ねる）。
+                            let ty = match joined_rels.as_deref() {
+                                Some(rels) => {
+                                    let mut hits =
+                                        rels.iter().filter_map(|(_, t)| column_type(t, col));
+                                    match (hits.next(), hits.next()) {
+                                        (Some(t), None) => Some(t),
+                                        _ => None,
+                                    }
+                                }
+                                None => where_table.as_deref().and_then(|t| column_type(t, col)),
+                            };
+                            (ty, Some(ParamContextKind::Operator))
+                        }
+                        // Issue #3297: 結合 DML の `<公開名>.<列> = $n`。修飾子が指す表の列で引く
+                        // （引けなければ `Text`。応答コードで表・列の存在を観測させない）。
+                        ParamPosition::WhereQualifiedColumn { qualifier, column } => (
+                            joined_rels
+                                .as_deref()
+                                .and_then(|rels| {
+                                    rels.iter().find(|(exposed, _)| exposed == qualifier)
+                                })
+                                .and_then(|(_, t)| column_type(t, column)),
                             Some(ParamContextKind::Operator),
                         ),
                         ParamPosition::SetColumn(col) => (
@@ -11742,7 +11802,11 @@ impl EngineCore {
         use crate::sql::transaction::TxnReadSource;
 
         match stmt {
-            CursorStatement::Declare { name, query } => {
+            CursorStatement::Declare {
+                name,
+                query,
+                scroll,
+            } => {
                 // 構文解析段（`parse_tokens`）は構造検証のみでカタログを参照
                 // しないため、ここで内側 SELECT を実カタログに対して再検証する
                 // （PR #1049 レビュー指摘 codex P1 対応）。通常の広域取得
@@ -11827,7 +11891,7 @@ impl EngineCore {
                     .ok_or_else(|| SqlSurfaceError::Internal {
                         detail: "internal error".to_string(),
                     })?
-                    .declare(name.clone(), result)?;
+                    .declare(name.clone(), result, *scroll)?;
                 Ok(crate::sql::SqlOutcome::DeclareCursor)
             }
             CursorStatement::Fetch { name, count } => {
@@ -12955,14 +13019,22 @@ impl EngineCore {
             // SQL-53 (b)・Issue #3202・#3204: Execute と同じ準備段（束縛・変換）を通し、
             // エラーコードを揃える。`RETURNING` つきなら Execute の `QueryResult.columns` と同じ列を返す。
             ParsedSql::UpdateFrom(stmt) => {
-                let plan = self.plan_update_from_stmt(stmt, session.udfs())?;
+                let plan = self.plan_update_from_stmt_for_describe(
+                    stmt,
+                    session.udfs(),
+                    dummy_equality_flags,
+                )?;
                 Ok(plan
                     .returning
                     .as_ref()
                     .map(crate::sql::dml_from_returning::column_meta))
             }
             ParsedSql::DeleteUsing(stmt) => {
-                let plan = self.plan_delete_using_stmt(stmt, session.udfs())?;
+                let plan = self.plan_delete_using_stmt_for_describe(
+                    stmt,
+                    session.udfs(),
+                    dummy_equality_flags,
+                )?;
                 Ok(plan
                     .returning
                     .as_ref()
