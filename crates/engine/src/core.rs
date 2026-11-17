@@ -10003,7 +10003,7 @@ impl EngineCore {
             // writer の取得・暗黙 Tx の開始・台帳の照合より前で、行・台帳・世代へ一切触れない
             // （実行は #3353・#3354）。
             ParsedSql::Merge(stmt) => {
-                self.bind_merge_stmt(session, stmt, session.udfs(), &[])?;
+                self.bind_merge_stmt(session, stmt, session.udfs(), &[], None)?;
                 Err(
                     crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                         MERGE_NOT_SUPPORTED_YET,
@@ -11700,7 +11700,7 @@ impl EngineCore {
             // 読み取りスナップショットだけを使い、`mark_written` は呼ばず共有 write txn へ何も書かない
             // （失敗文としての Tx 状態遷移は呼び出し元の既存規約）。
             ParsedSql::Merge(stmt) => {
-                self.bind_merge_stmt(session, stmt, session.udfs(), &[])?;
+                self.bind_merge_stmt(session, stmt, session.udfs(), &[], None)?;
                 Err(
                     crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
                         MERGE_NOT_SUPPORTED_YET,
@@ -13148,7 +13148,7 @@ impl EngineCore {
             // ParameterDescription を返せる）で、実行は Execute の固定文言 `0A000` が担う。`RETURNING` つきは
             // 結果列の束縛（#3356）が未結線のため固定文言の `0A000`（fail-closed）。
             ParsedSql::Merge(stmt) => {
-                self.bind_merge_stmt(session, stmt, session.udfs(), dummy_equality_flags)?;
+                self.bind_merge_stmt(session, stmt, session.udfs(), dummy_equality_flags, snap)?;
                 if stmt.returning.is_some() {
                     return Err(
                         crate::sql::allowlist::SqlSurfaceError::feature_not_supported(

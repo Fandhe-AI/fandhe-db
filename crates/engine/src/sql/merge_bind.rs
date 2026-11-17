@@ -672,7 +672,16 @@ fn bind_insert(
         }
         slots.push(MergeInsertSlot::Column(idx));
     }
-    let id_listed = slots.contains(&MergeInsertSlot::Id);
+    // 移行済みの表で `id` に裸の `DEFAULT` を与えた形は、単発の INSERT と同じく `id` の省略として扱う。
+    let id_defaulted = schema.is_migrated_id()
+        && slots.iter().enumerate().any(|(pos, slot)| {
+            *slot == MergeInsertSlot::Id
+                && matches!(
+                    value_list.get(pos),
+                    Some(DmlFromSetValue::Value(SetValue::Default, _))
+                )
+        });
+    let id_listed = slots.contains(&MergeInsertSlot::Id) && !id_defaulted;
     let id_omitted = has_pseudo_id && !id_listed && schema.is_migrated_id();
     if has_pseudo_id && !id_listed && !id_omitted {
         return Err(SqlSurfaceError::invalid_input(
@@ -707,6 +716,8 @@ fn bind_insert(
                     id_value = Some(MergeIdValue::Source(resolved));
                 }
                 DmlFromSetValue::Value(v, _) if is_dummy(flags, i, v) => {}
+                // 移行済みの表の `id DEFAULT` は省略と等価（束縛済みの値を持たない。実行側が採番する）。
+                DmlFromSetValue::Value(SetValue::Default, _) if schema.is_migrated_id() => {}
                 DmlFromSetValue::Value(SetValue::Literal(InsertLiteral::Number(n)), _) => {
                     let parsed: u64 = n.parse().map_err(|_| {
                         SqlSurfaceError::invalid_input(

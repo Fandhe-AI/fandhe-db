@@ -300,3 +300,25 @@ fn set_left_hand_side_rules_match_update() {
         assert_eq!(code(&sql), want, "{sql}");
     }
 }
+
+/// 移行済みの表では `id` への裸の `DEFAULT` も `id` の省略として束縛される（単発の INSERT と同じ）。
+/// 従来方式の表では省略できないため、固定文言の `0A000` のまま拒否する。
+#[test]
+fn insert_id_bare_default_is_omission_on_migrated_tables() {
+    let sql = format!("{HEAD} WHEN NOT MATCHED THEN INSERT (id, k) VALUES (DEFAULT, s.k)");
+    let src = schema("s", "v");
+    let migrated = schema("t", "x").with_row_identity(RowIdentity::MigratedId);
+    let b = bind_with(&sql, &migrated, &src, &[]).expect("migrated id DEFAULT");
+    let ins = b
+        .clauses
+        .iter()
+        .find_map(|c| match &c.action {
+            BoundMergeAction::Insert(i) => Some(i),
+            _ => None,
+        })
+        .expect("insert clause");
+    assert!(ins.id_omitted);
+    assert!(ins.id_value.is_none());
+    let legacy = bind_with(&sql, &schema("t", "x"), &src, &[]).expect_err("legacy id DEFAULT");
+    assert_eq!(legacy.wire_code(), "0A000");
+}

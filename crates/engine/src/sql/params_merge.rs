@@ -50,9 +50,30 @@ fn depth_zero_positions(tokens: &[Token], from: usize, to: usize) -> Vec<usize> 
     out
 }
 
-/// `WHEN` 句の開始位置（深さ 0 の `WHEN` の直後が `MATCHED` か `NOT`。`CASE WHEN` と区別する）。
+/// [`depth_zero_positions`] から、`CASE ... END`（入れ子可）の内側の位置も除いたもの。`CASE` 内の `WHEN`・
+/// `THEN` を MERGE の句境界と取り違えない（`CASE WHEN matched = 1 THEN ...` の `WHEN matched` 等）。
+/// `CASE` 自身は外側の位置として返し、対応する `END` までの内側を落とす。
+fn clause_level_positions(tokens: &[Token], from: usize, to: usize) -> Vec<usize> {
+    let mut case_depth: usize = 0;
+    let mut out = Vec::new();
+    for i in depth_zero_positions(tokens, from, to) {
+        if ident_is(tokens.get(i), "CASE") {
+            if case_depth == 0 {
+                out.push(i);
+            }
+            case_depth = case_depth.saturating_add(1);
+        } else if ident_is(tokens.get(i), "END") && case_depth > 0 {
+            case_depth = case_depth.saturating_sub(1);
+        } else if case_depth == 0 {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// `WHEN` 句の開始位置（句レベルの `WHEN` の直後が `MATCHED` か `NOT`。`CASE WHEN` と区別する）。
 fn clause_starts(tokens: &[Token]) -> Vec<usize> {
-    depth_zero_positions(tokens, 0, tokens.len())
+    clause_level_positions(tokens, 0, tokens.len())
         .into_iter()
         .filter(|&i| {
             ident_is(tokens.get(i), "WHEN")
@@ -64,7 +85,7 @@ fn clause_starts(tokens: &[Token]) -> Vec<usize> {
 
 /// 最後の `WHEN` 句の終端（深さ 0 の `RETURNING`、`USING OPERATION_ID` の `USING`、文末の `;`。無ければ末尾）。
 fn tail_start(tokens: &[Token], after: usize) -> usize {
-    depth_zero_positions(tokens, after, tokens.len())
+    clause_level_positions(tokens, after, tokens.len())
         .into_iter()
         .find(|&i| {
             ident_is(tokens.get(i), "RETURNING")
@@ -220,7 +241,7 @@ fn parse_clauses(tokens: &[Token]) -> (Vec<Clause>, usize, usize) {
             .copied()
             .unwrap_or(tail)
             .min(tail);
-        let then_idx = depth_zero_positions(tokens, s, end)
+        let then_idx = clause_level_positions(tokens, s, end)
             .into_iter()
             .find(|&i| ident_is(tokens.get(i), "THEN"))
             .unwrap_or(end);
@@ -370,6 +391,24 @@ mod tests {
     }
 
     const HEAD: &str = "MERGE INTO t USING s ON t.k = s.k";
+
+    #[test]
+    fn case_when_inside_a_clause_is_not_a_clause_boundary() {
+        // CASE 内の `WHEN MATCHED` / `WHEN NOT` を句境界と誤認すると、後続の `$n` が許可位置から外れる。
+        for sql in [
+            format!(
+                "{HEAD} WHEN MATCHED THEN UPDATE SET x = CASE WHEN matched = 1 THEN 1 ELSE 2 END, k = $1"
+            ),
+            format!(
+                "{HEAD} WHEN MATCHED THEN UPDATE SET x = CASE WHEN not = 1 THEN CASE WHEN matched = 2 THEN 1 ELSE 3 END ELSE 2 END, k = $1"
+            ),
+            format!(
+                "{HEAD} WHEN MATCHED AND CASE WHEN matched = 1 THEN true ELSE false END THEN UPDATE SET k = $1"
+            ),
+        ] {
+            assert_eq!(check(&sql), Ok(1), "{sql}");
+        }
+    }
 
     #[test]
     fn trailing_semicolon_ends_last_clause() {

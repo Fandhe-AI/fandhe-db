@@ -31,9 +31,20 @@ impl EngineCore {
         stmt: &ValidatedMerge,
         udfs: &UdfRegistry,
         dummy_flags: &[bool],
+        snap: Option<&redb::ReadTransaction>,
     ) -> Result<BoundMerge, SqlSurfaceError> {
-        let read_txn = self.begin_read_txn()?;
-        let snap = crate::catalog::ViewWriteSnapshot::over(&read_txn);
+        // 呼び出し元が読み取り源（明示 Tx の `BEGIN` 時点のスナップショット）を渡したときは、対象・元・
+        // 部分クエリのすべてでそれを使う（最新の確定カタログで束縛すると、BEGIN 後の別セッションの
+        // 列変更で Describe と Execute の見る世界がずれる）。無ければ最新の確定カタログ。
+        let owned;
+        let read_txn = match snap {
+            Some(s) => s,
+            None => {
+                owned = self.begin_read_txn()?;
+                &owned
+            }
+        };
+        let snap = crate::catalog::ViewWriteSnapshot::over(read_txn);
         let schema_of = |name: &str| -> Result<TableSchema, SqlSurfaceError> {
             snap.table_schema(name)
                 .map_err(crate::catalog::table_lookup_error)
@@ -73,7 +84,7 @@ impl EngineCore {
             } => (
                 self.merge_subquery_schema(
                     session,
-                    &read_txn,
+                    read_txn,
                     query,
                     alias,
                     column_aliases.as_deref(),
