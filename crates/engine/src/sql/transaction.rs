@@ -2803,7 +2803,7 @@ fn commit_active(
     // 捨てる（SQL-80・Issue #3313。失敗・ROLLBACK では何も変えない。内部 ID は再利用しないため、
     // permit の解放後に捨てても同じ ID の別の SEQUENCE の状態を壊さない）。
     for id in &ddl.evict_sequences {
-        storage.sequence_allocator().evict(*id);
+        storage.sequence_allocator().evict_dropped(*id);
     }
     // COMMIT 成功: `SET LOCAL hnsw.*` を LOCAL 直前の値へ戻す。
     session.leave_txn_block_on_commit();

@@ -185,6 +185,7 @@ impl EngineCore {
                         "CREATE SCHEMA with schema elements is not supported inside a transaction block yet",
                     ));
                 }
+                crate::sql::ddl::precheck_create_schema_in_txn(ctx.tenant_id(), stmt)?;
                 txn.ensure_writer(ctx)?;
                 let owner = crate::sql::owner_ddl::resolve_schema_owner(
                     &self.storage,
@@ -216,6 +217,7 @@ impl EngineCore {
                         "DROP SCHEMA CASCADE is not supported inside a transaction block yet",
                     ));
                 }
+                crate::sql::ddl::precheck_drop_schema_in_txn(ctx.tenant_id(), stmt)?;
                 txn.ensure_writer(ctx)?;
                 let snap = txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
@@ -236,6 +238,7 @@ impl EngineCore {
             }
             ParsedSql::AlterSchema(stmt) => {
                 let decision = require_ddl_or_owner(session, DdlStatementKind::AlterSchema)?;
+                crate::sql::ddl::precheck_alter_schema_in_txn(ctx.tenant_id(), stmt)?;
                 txn.ensure_writer(ctx)?;
                 txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;

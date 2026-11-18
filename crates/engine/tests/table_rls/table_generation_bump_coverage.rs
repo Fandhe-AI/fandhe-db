@@ -608,13 +608,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // `drop_schema_cascade` の `commit_and_finish`（615）は、表の削除を `drop_tables_collecting_sequences`
     // （各表の `bump_table_generation_in_txn` を同一 txn で呼ぶ）へ委譲しており、SCHEMA 行の削除自体は
     // 世代を持たないため、直前に bump を直接呼ばない（同じ txn・同じ commit で世代は進む）。
-    ("catalog/namespace.rs", 703),
-    ("catalog/namespace.rs", 737),
-    ("catalog/namespace.rs", 880),
-    ("catalog/namespace.rs", 916),
     // Issue #1716: `rename_schema` も `schemas` の 1 行付け替えだけで、行ストア・世代を変えない。
-    ("catalog/namespace.rs", 1183),
-    ("catalog/namespace.rs", 1299),
     // Issue #1645（所有 SEQUENCE の定義 blob 版 3・`commit_and_finish` 経路の追加）と base 取り込みで行が移動したため
     // 全件を現行行へ追随（commit 対象は SEQUENCE 定義・状態表のみで同じ理由により対象外）。
     // Issue #1694（SERIAL の暗黙 SEQUENCE・所有 SEQUENCE の削除と追従）の追加で行番号が移動したための追随
@@ -670,20 +664,6 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // 作成時の適用は作成本体の txn に相乗りし、作成側が世代を進める）。単体テストの `write_txn` ヘルパはテスト専用の commit。
     ("catalog/privilege/default_acl.rs", 479),
     ("catalog/privilege/default_acl/tests.rs", 98),
-    ("catalog/sequence.rs", 1692),
-    ("catalog/sequence.rs", 1710),
-    ("catalog/sequence.rs", 1756),
-    ("catalog/sequence.rs", 1791),
-    ("catalog/sequence.rs", 1812),
-    ("catalog/sequence.rs", 1832),
-    ("catalog/sequence.rs", 1965),
-    ("catalog/sequence.rs", 2239),
-    ("catalog/sequence.rs", 2329),
-    ("catalog/sequence.rs", 2369),
-    ("catalog/sequence.rs", 2422),
-    ("catalog/sequence.rs", 2690),
-    ("catalog/sequence.rs", 2736),
-    ("catalog/sequence.rs", 3003),
     // `Storage::create_function`／`Storage::drop_function`（UDF カタログ・Issue #1919）:
     // UDF 定義は専用の関数カタログ表のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}`
     // のいずれにも触れない（行を持たない定義メタデータのため、世代照合の対象テーブルが
@@ -724,6 +704,25 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // する）の世代は、本体の書き込み経路（`TriggerWriteHandle` 経由の既存の INSERT／UPDATE／DELETE）が同じ
     // txn 内で bump 済み。
     ("core/view_instead_of.rs", 217),
+    ("catalog/namespace.rs", 734),
+    ("catalog/namespace.rs", 769),
+    ("catalog/namespace.rs", 949),
+    ("catalog/namespace.rs", 1216),
+    ("catalog/namespace.rs", 1332),
+    ("catalog/sequence.rs", 1730),
+    ("catalog/sequence.rs", 1748),
+    ("catalog/sequence.rs", 1794),
+    ("catalog/sequence.rs", 1829),
+    ("catalog/sequence.rs", 1850),
+    ("catalog/sequence.rs", 1870),
+    ("catalog/sequence.rs", 2003),
+    ("catalog/sequence.rs", 2277),
+    ("catalog/sequence.rs", 2367),
+    ("catalog/sequence.rs", 2407),
+    ("catalog/sequence.rs", 2460),
+    ("catalog/sequence.rs", 2728),
+    ("catalog/sequence.rs", 2774),
+    ("catalog/sequence.rs", 3041),
 ];
 
 /// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを

@@ -4474,6 +4474,38 @@ pub(crate) fn execute_alter_sequence_in_txn(
     Ok(AlterSequenceOutcome {})
 }
 
+/// Tx 内の SCHEMA DDL が writer を取る前に行う静的検査（識別子・予約名・組み込み名。Issue #3315）。
+/// autocommit と同じく、拒否が writer 競合（`55P03`）や Failed Tx の writer 保持に化けないようにする。
+pub(crate) fn precheck_create_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedCreateSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_create_schema(tenant_id, validated.name())
+        .map_err(|e| map_schema_error(e, "CREATE SCHEMA failed"))
+}
+
+/// [`precheck_create_schema_in_txn`] の `DROP SCHEMA` 版。
+pub(crate) fn precheck_drop_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedDropSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_schema_name_change(tenant_id, validated.name(), None)
+        .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))
+}
+
+/// [`precheck_create_schema_in_txn`] の `ALTER SCHEMA RENAME` 版。
+pub(crate) fn precheck_alter_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedAlterSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_schema_name_change(
+        tenant_id,
+        validated.name(),
+        Some(validated.new_name()),
+    )
+    .map_err(|e| map_schema_error(e, "ALTER SCHEMA failed"))
+}
+
 /// 要素なしの `CREATE SCHEMA` を共有 write txn の中で実行する（Issue #3315）。戻り値の真偽は「新規に作った」
 /// （`IF NOT EXISTS` で既存のときは何も書かず偽）。
 pub(crate) fn execute_create_schema_in_txn(

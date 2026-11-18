@@ -13867,7 +13867,7 @@ impl Storage {
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             for id in &dropped_sequence_ids {
-                allocator.evict(*id);
+                allocator.evict_dropped(*id);
             }
             crate::recovery::commit_boundary::PostCommitResult::Ok
         })
@@ -14158,7 +14158,7 @@ impl Storage {
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             for id in &dropped_sequence_ids {
-                allocator.evict(*id);
+                allocator.evict_dropped(*id);
             }
             crate::recovery::commit_boundary::PostCommitResult::Ok
         })
@@ -14462,7 +14462,7 @@ impl Storage {
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             for id in &dropped_sequence_ids {
-                allocator.evict(*id);
+                allocator.evict_dropped(*id);
             }
             crate::recovery::commit_boundary::PostCommitResult::Ok
         })

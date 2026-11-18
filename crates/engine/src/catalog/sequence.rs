@@ -613,7 +613,11 @@ pub(crate) struct SequenceAllocator {
     cursors: std::sync::Mutex<std::collections::HashMap<(String, u64), SeqCursor>>,
     /// 内部 ID の再利用世代（ID → 再利用で払い出された回数。無いものは 0）。セッションの `currval`／`lastval`
     /// 状態が、ROLLBACK 後に同じ ID を引き継いだ別の SEQUENCE の履歴を読まないための識別子（Issue #3315）。
+    /// 値は単調増加する世代トークン（再利用のたびに新しい値を払い出す）。DROP で該当 ID の行を捨てる
+    /// ため、件数は生存 ID 数（と巻き戻し後の再利用 ID）に収まる。
     generations: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+    /// 世代トークンの払い出し元（単調増加。捨てた ID の古いトークンと再び一致しない）。
+    generation_counter: std::sync::atomic::AtomicU64,
 }
 
 impl SequenceAllocator {
@@ -758,8 +762,21 @@ impl SequenceAllocator {
     /// 内部 ID が（ROLLBACK 等で巻き戻って）払い出し直されたとき世代を進める。
     fn bump_generation(&self, sequence_id: u64) {
         if let Ok(mut g) = self.generations.lock() {
-            let e = g.entry(sequence_id).or_insert(0);
-            *e = e.saturating_add(1);
+            let token = self
+                .generation_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            g.insert(sequence_id, token);
+        }
+    }
+
+    /// `DROP` の commit 成功後に呼ぶ。現在値に加えて世代の行も捨てる（`generations` が DROP の
+    /// 繰り返しで増え続けないようにする）。捨てた後の世代は 0 で、以後の再作成は新しいトークンを
+    /// 得るため、古いセッション履歴は復活しない。
+    pub(crate) fn evict_dropped(&self, sequence_id: u64) {
+        self.evict(sequence_id);
+        if let Ok(mut g) = self.generations.lock() {
+            g.remove(&sequence_id);
         }
     }
 
@@ -1775,7 +1792,7 @@ impl Storage {
         // 残っても害はなく、成功時に残すと全テナント分が滞留する。設計記録 D3）。
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
-            allocator.evict(id);
+            allocator.evict_dropped(id);
             crate::recovery::commit_boundary::PostCommitResult::Ok
         })
         .map_err(super::convert_storage_error)?;

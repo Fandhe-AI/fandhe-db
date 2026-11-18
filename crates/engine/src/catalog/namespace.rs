@@ -501,6 +501,35 @@ pub(crate) fn schema_relation_keys_in_txn<R: ReadSource>(
     Ok(out)
 }
 
+/// `CREATE SCHEMA` の writer を取る前の静的検査（識別子 → 予約名。DB を読まない。Issue #3315）。
+/// autocommit と Tx 内の両方が writer 取得（`55P03`・Failed Tx の writer 保持）より前に呼ぶ。
+pub(crate) fn precheck_create_schema(tenant_id: &str, name: &str) -> Result<()> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_reserved_schema_name(name) {
+        return Err(CatalogError::ReservedSchemaName(name.to_string()));
+    }
+    Ok(())
+}
+
+/// `DROP SCHEMA`・`ALTER SCHEMA RENAME` の旧名について、writer を取る前の静的検査（識別子 → 組み込み名）。
+/// `new` は `ALTER SCHEMA` の新名（識別子だけ検査する）。
+pub(crate) fn precheck_schema_name_change(
+    tenant_id: &str,
+    old: &str,
+    new: Option<&str>,
+) -> Result<()> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(old)?;
+    if let Some(new) = new {
+        validate_identifier(new)?;
+    }
+    if is_builtin_schema_name(old) {
+        return Err(CatalogError::BuiltinSchema(old.to_string()));
+    }
+    Ok(())
+}
+
 /// 組み込み SCHEMA 名、または `tenant_id` に同名の SCHEMA が既にあるか（write txn 内の 1 回の get）。
 fn schema_name_taken_in_txn(
     write_txn: &redb::WriteTransaction,
@@ -687,6 +716,8 @@ impl Storage {
         max_schemas: usize,
         owner: Option<u64>,
     ) -> Result<CreateSchemaResult> {
+        // writer を取る前に静的検査を行う（拒否が writer 競合 `55P03` に化けない）。
+        precheck_create_schema(tenant_id, name)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
@@ -729,6 +760,7 @@ impl Storage {
         if_exists: bool,
         gate: OwnerGate,
     ) -> Result<DropSchemaResult> {
+        precheck_schema_name_change(tenant_id, name, None)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
@@ -879,7 +911,7 @@ impl Storage {
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             for id in &dropped_sequence_ids {
-                allocator.evict(*id);
+                allocator.evict_dropped(*id);
             }
             // CASCADE が配下の関数行も消すため、commit 成功後に UDF カタログの世代を進める
             // （他セッションの refresh が検知する。SQL-66・#1921）。
@@ -909,6 +941,7 @@ impl Storage {
         new: &str,
         gate: OwnerGate,
     ) -> Result<()> {
+        precheck_schema_name_change(tenant_id, old, Some(new))?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
