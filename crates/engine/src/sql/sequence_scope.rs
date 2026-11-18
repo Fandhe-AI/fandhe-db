@@ -121,6 +121,31 @@ impl SessionSequenceState {
         Some((*id, value))
     }
 
+    /// `lastval` の対象が世代の食い違い（DROP で世代が戻った・内部 ID の再利用）で無効になっていれば、
+    /// 呼び出し元テナントの `last` と、その `nextval` 記録時の世代の `currval` エントリを捨てる。
+    /// 破棄済み内部 ID のスロットが接続終了まで残り `MAX_SESSION_SEQUENCES` を使い切るのを防ぐ（Issue #3315）。
+    /// 別の世代（再利用先 SEQUENCE の `setval`）が書いた `currval` は残す。
+    pub(crate) fn reclaim_stale_last(
+        &mut self,
+        tenant_id: &str,
+        generation_of: impl Fn(u64) -> u64,
+    ) {
+        let Some((t, id, last_gen)) = self.last.clone() else {
+            return;
+        };
+        if t != tenant_id || last_gen == generation_of(id) {
+            return;
+        }
+        if self
+            .currval
+            .get(&(t.clone(), id))
+            .is_some_and(|&(_, g)| g == last_gen)
+        {
+            self.currval.remove(&(t, id));
+        }
+        self.last = None;
+    }
+
     /// 消えた SEQUENCE（DROP 済み）のエントリを捨てる（`lastval` が存在確認に失敗したとき。設計記録 D6）。
     pub(crate) fn forget(&mut self, tenant_id: &str, sequence_id: u64) {
         let key = (tenant_id.to_string(), sequence_id);
@@ -302,6 +327,26 @@ mod tests {
         // 同一内部 ID が別の SEQUENCE（世代 2）へ再利用され、setval だけが呼ばれた。
         assert!(s.record_setval("t", 1, 50, 2));
         assert_eq!(s.lastval("t", |_| 2), None);
+    }
+
+    #[test]
+    fn reclaim_stale_last_frees_slot_after_generation_reset() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_nextval("t", 1, 5, 3));
+        // DROP 後は世代が 0 へ戻る。
+        s.reclaim_stale_last("t", |_| 0);
+        assert_eq!(s.lastval("t", |_| 0), None);
+        assert!(s.currval.is_empty());
+    }
+
+    #[test]
+    fn reclaim_stale_last_keeps_currval_written_by_other_generation() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_nextval("t", 1, 5, 1));
+        assert!(s.record_setval("t", 1, 50, 2));
+        s.reclaim_stale_last("t", |_| 2);
+        assert_eq!(s.currval("t", 1, 2), Some(50));
+        assert_eq!(s.last, None);
     }
 
     #[test]

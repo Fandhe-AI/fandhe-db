@@ -235,10 +235,15 @@ fn lastval(
     privileges: impl Fn(u64, u64) -> Result<u16, CatalogError>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     let handle = session.sequences_handle();
-    let target = handle
-        .lock()
-        .map_err(|_| internal("sequence session state unavailable"))?
-        .lastval(tenant_id, |id| storage.sequence_allocator().generation(id));
+    let target = {
+        let mut state = handle
+            .lock()
+            .map_err(|_| internal("sequence session state unavailable"))?;
+        let generation_of = |id| storage.sequence_allocator().generation(id);
+        // 世代不一致（DROP・ID 再利用）のエントリは返す前に回収する（スロット漏れ防止）。
+        state.reclaim_stale_last(tenant_id, generation_of);
+        state.lastval(tenant_id, generation_of)
+    };
     let Some((id, value)) = target else {
         return Err(SqlSurfaceError::LastvalNotYetDefined);
     };
