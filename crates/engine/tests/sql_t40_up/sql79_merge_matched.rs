@@ -4,8 +4,7 @@
 //! 契約: MATCHED の句だけで書かれた MERGE は、autocommit・明示 Tx のどちらでも実行され、行の内容と件数
 //! （UPDATE と DELETE の実変更行数の合計。DO NOTHING は含めない）が決まる。1 つの対象行について UPDATE か
 //! DELETE を選んだ組が 2 つ以上あれば文全体が `21000` になり、行・台帳・世代に何も残らない。対象外の形
-//! （`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー）は固定文言の `0A000` で
-//! 拒否する。他テナントの行は一致・件数・`21000` のどれにも現れない（3 テナントの越境の網羅は #3358）。
+//! （台帳記録）は固定文言の `0A000` で拒否する。`RETURNING` は #3356 から実行される。他テナントの行は一致・件数・`21000` のどれにも現れない（3 テナントの越境の網羅は #3358）。
 //! 期待値は設計記録の決定から導く（PG17 との突き合わせは #3358）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -579,16 +578,6 @@ fn a_subquery_source_does_not_see_other_tenants_private_rows() {
 // 対象外の形（固定文言の 0A000）
 // ---------------------------------------------------------------------
 
-fn expect_fixed_0a000(core: &EngineCore, sql: &str, message: &str) {
-    let before = snapshot(core);
-    for text in with_semicolon(sql) {
-        let (code, msg) = err_code(core, &text);
-        assert_eq!(code, "0A000", "{text}");
-        assert_eq!(msg, message, "{text}");
-        assert_eq!(before, snapshot(core), "{text}");
-    }
-}
-
 // WHEN NOT MATCHED の句を含む形は #3354 から実行される（詳細は `sql79_merge_not_matched.rs`）。
 // ここでは、MATCHED の句と同居しても MATCHED の結果（件数と行）が変わらないことだけを確かめる。
 #[test]
@@ -610,17 +599,28 @@ fn matched_results_are_unchanged_when_not_matched_clauses_are_added() {
     );
 }
 
-// `RETURNING` つきは、応答の列と `merge_action()` を入れる #3356 まで拒否する。
-// tracked: #3356
+// `RETURNING` つきは #3356 から実行され、削除前の値と実変更行数を返す（行の網羅は `sql79_merge_returning.rs`）。
 #[test]
-fn returning_is_rejected_until_its_binding_is_wired() {
-    let (core, _g) = new_core("sql79m-returning");
-    seed(&core);
-    expect_fixed_0a000(
-        &core,
-        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.k",
-        "feature not supported: MERGE with RETURNING is not supported yet",
-    );
+fn returning_returns_the_deleted_rows_and_the_same_count() {
+    // t = {1:a/10, 2:b/20, 3:c/30}、s = {1:a/100, 3:c/300, 4:d/400}。a・c が MATCHED で消える。
+    for text in
+        with_semicolon("MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.k")
+    {
+        let (core, _g) = new_core("sql79m-returning-run");
+        seed(&core);
+        let out = format!(
+            "{:?}",
+            core.execute_sql_in_session(&ctx(), &mut SessionState::default(), &text)
+                .unwrap_or_else(|e| panic!("{text}: {e:?}"))
+        );
+        assert!(out.contains("command: Merge"), "{text}: {out}");
+        assert!(out.contains("rows_affected: 2"), "{text}: {out}");
+        assert!(
+            out.contains("Text(\"a\")") && out.contains("Text(\"c\")"),
+            "{text}: {out}"
+        );
+        assert_eq!(t_rows(&core), "Integer(2):Text(\"b\"):SignedInteger(20)");
+    }
 }
 
 // 台帳へ記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュを入れる #3357 まで拒否する。

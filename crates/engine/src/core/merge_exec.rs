@@ -3,7 +3,7 @@
 //! 責務境界: 構文検証済みの [`ValidatedMerge`] に対し、対象・元のスキーマを**同一の読み取りスナップショット**
 //! から集めて `sql::merge_bind::bind_merge` へ渡すだけを担う。行・台帳・世代・writer・暗黙 Tx には一切触れず、
 //! 束縛エラーは書き込みより前に返る（Execute・明示 Tx・Describe の各腕が同じ入口を通るため、
-//! SQLSTATE がそろう）。実行は #3353・#3354、台帳は #3357、`RETURNING` の束縛は #3356 の担当で、
+//! SQLSTATE がそろう）。実行は #3353・#3354、`RETURNING` は #3356、台帳は #3357 の担当で、
 //! 対象外の形は固定文言の `0A000` で止まる。
 //!
 //! 元が部分クエリの形は、内側の検証済み `Statement` を Describe して列記述だけを取り（**実行しない**）、
@@ -35,8 +35,14 @@
 //! 検査点）、束縛時の指紋と INSTEAD OF の有無を writer 取得後に write txn で照合する。UPDATE 句と INSERT 句を
 //! またぐ子側 FK 検査は先送りして全区間の後に 1 回検査する。
 //!
-//! 対象外の形（`RETURNING`・台帳記録・INSTEAD OF トリガを持つビュー）は固定文言の `0A000` で文全体を拒否する
-//! （受け皿は #3356・#3357。INSTEAD OF は対応しない）。
+//! `RETURNING`（#3356）: 束縛は両側スコープ（`sql::merge_bind`）、計画は元の列を走査投影へ載せ（`plan_merge`）、
+//! 第 1 段が選んだ元の走査位置を記録し、第 3 段の既存の書き込み経路の capturing 版（`project` 引数）が書いた最終行を
+//! `sql::dml_from_returning::MergeReturningSink` へ積む（UPDATE は更新後・DELETE は削除前・INSERT は書いた行）。
+//! 結果行は対象候補の走査順 → 元の走査順の INSERT の順で返す（設計記録 §12）。該当トリガを持つ表との併用は
+//! BEFORE STATEMENT より前に固定文言の `0A000` で拒否する。
+//!
+//! 対象外の形（台帳記録・INSTEAD OF トリガを持つビュー）は固定文言の `0A000` で文全体を拒否する
+//! （受け皿は #3357。INSTEAD OF は対応しない）。
 //!
 //! 呼び出し元: `core.rs` の `ParsedSql::Merge` の腕（autocommit は暗黙 Tx 経由で明示 Tx と同じ腕・Describe）。
 
@@ -322,12 +328,8 @@ impl EngineCore {
             self.bind_merge_stmt_with_schemas(session, stmt, session.udfs(), &[], snap)?
         };
 
-        // 2. 本 Issue で実行しない形は、writer の取得・台帳・行に触れる前に固定文言の `0A000` で拒否する。
-        if stmt.returning.is_some() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "MERGE with RETURNING is not supported yet",
-            ));
-        }
+        // 2. `RETURNING`（Issue #3356）は束縛済み（`bound.returning()`）。束縛エラーは上で返っている。
+        let want_returning = bound.returning().is_some();
         // 台帳を記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュが入る #3357 まで拒否する
         // （記録漏れで再送の冪等性が無いまま受理する経路を作らない）。省略時は台帳へ記録しない（`Omitted`）。
         let ledger_write = self
@@ -438,6 +440,14 @@ impl EngineCore {
             &trigger_runtime,
         )
         .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
+        // `RETURNING` つきの MERGE は、結合形 DML の `RETURNING` とトリガの併用と同じく、該当するトリガ（行・文・
+        // 参照アクション先の子表）が 1 つでもあれば BEFORE STATEMENT の発火より前に固定文言で拒否する
+        // （書いた後に拒否する経路を作らない。設計記録 D14）。
+        if want_returning && stmt_triggers.has_any() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "MERGE with RETURNING on a table with triggers is not supported",
+            ));
+        }
         let stmt_writes =
             crate::tenant::merge_triggers::statement_writes(write_txn, ctx, &trigger_runtime);
         stmt_triggers
@@ -561,7 +571,7 @@ impl EngineCore {
                                 .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
                         }
                     }
-                    Some(Planned::Delete) => {
+                    Some(Planned::Delete(_)) => {
                         if let Some(p) = &using_delete {
                             p.enforce(target_schema, c.id, c.embedding, c.metadata)
                                 .map_err(|e| crate::sql::exec::map_write_error(e, "delete"))?;
@@ -618,7 +628,7 @@ impl EngineCore {
                                     Choice::None | Choice::DoNothing => {}
                                     Choice::Delete => {
                                         charge_planned_row(&mut probe)?;
-                                        chosen = Some(Planned::Delete);
+                                        chosen = Some(Planned::Delete(None));
                                     }
                                     Choice::Update(clause) => {
                                         let values = eval.eval_update(
@@ -629,7 +639,7 @@ impl EngineCore {
                                             target_schema,
                                             &mut |n| probe.charge_bytes(n),
                                         )?;
-                                        chosen = Some(Planned::Update(clause, values));
+                                        chosen = Some(Planned::Update(clause, values, None));
                                     }
                                     Choice::Insert(_) => return Err(merge_plan_mismatch()),
                                 }
@@ -672,7 +682,7 @@ impl EngineCore {
                                 Choice::None | Choice::DoNothing => {}
                                 Choice::Delete => {
                                     charge_planned_row(&mut probe)?;
-                                    chosen = Some(Planned::Delete);
+                                    chosen = Some(Planned::Delete(Some(pos)));
                                 }
                                 Choice::Update(clause) => {
                                     let values = eval.eval_update(
@@ -683,7 +693,7 @@ impl EngineCore {
                                         target_schema,
                                         &mut |n| probe.charge_bytes(n),
                                     )?;
-                                    chosen = Some(Planned::Update(clause, values));
+                                    chosen = Some(Planned::Update(clause, values, Some(pos)));
                                 }
                                 Choice::Insert(_) => return Err(merge_plan_mismatch()),
                             }
@@ -733,7 +743,7 @@ impl EngineCore {
                         rows.try_reserve(1).map_err(|_| {
                             SqlSurfaceError::payload_too_large("MERGE INSERT rows exceed the limit")
                         })?;
-                        rows.push((id, values, provided));
+                        rows.push((id, values, provided, n));
                         insert_total = insert_total.saturating_add(1);
                     }
                     Choice::Delete | Choice::Update(_) => return Err(merge_plan_mismatch()),
@@ -748,13 +758,28 @@ impl EngineCore {
             BTreeMap::new();
         let mut delete_plan: Vec<u64> = Vec::new();
         let mut planned_total: usize = 0;
-        for (id, p) in planned {
+        // `RETURNING` つきのときだけ、対象行 id → (元の走査位置, 結果の並び順) を作る（並び順は候補列挙順）。
+        // 確保前に共有バイト予算へ計上する（D7）。
+        let mut target_info: HashMap<u64, (Option<u32>, usize)> = HashMap::new();
+        for (ord, (id, p)) in planned.into_iter().enumerate() {
             planned_total = planned_total.saturating_add(1);
+            let src = match &p {
+                Planned::Update(_, _, s) | Planned::Delete(s) => *s,
+            };
+            if want_returning {
+                probe.charge_bytes(
+                    std::mem::size_of::<(u64, (Option<u32>, usize))>().saturating_mul(2),
+                )?;
+                target_info.try_reserve(1).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("MERGE RETURNING rows exceed the limit")
+                })?;
+                target_info.insert(id, (src, ord));
+            }
             match p {
-                Planned::Update(clause, values) => {
+                Planned::Update(clause, values, _) => {
                     update_plan.entry(clause).or_default().insert(id, values);
                 }
-                Planned::Delete => delete_plan.push(id),
+                Planned::Delete(_) => delete_plan.push(id),
             }
         }
         // 影響行数の上限は UPDATE・DELETE・INSERT の計画件数の合計で判定する（DO NOTHING は数えない）。
@@ -764,6 +789,8 @@ impl EngineCore {
         )?;
         // INSERT の行数・バッチ上限（INDEX-4）も書き込みの前に判定する。
         let mut insert_bounds: Vec<Vec<BoundInsert>> = Vec::new();
+        // 句ごとの INSERT 行が読む元の走査位置（`insert_bounds` と同じ並び。`RETURNING` 用）。
+        let mut insert_srcs: Vec<Vec<usize>> = Vec::new();
         if insert_total > 0 {
             self.check_insert_row_count_limit(insert_total)?;
             for (clause, rows) in insert_rows {
@@ -790,7 +817,12 @@ impl EngineCore {
                     };
                     default_bytes.push(n);
                 }
-                for (id, values, provided) in rows {
+                let mut srcs: Vec<usize> = Vec::new();
+                srcs.try_reserve_exact(rows.len()).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("MERGE INSERT rows exceed the limit")
+                })?;
+                for (id, values, provided, src) in rows {
+                    srcs.push(src);
                     let mut row_default: usize = 0;
                     for (i, n) in default_bytes.iter().enumerate() {
                         if !provided.get(i).copied().unwrap_or(false) {
@@ -812,6 +844,7 @@ impl EngineCore {
                     )?);
                 }
                 insert_bounds.push(bounds);
+                insert_srcs.push(srcs);
             }
             // 上限は全 INSERT 句の累計で 1 回判定する（句ごとにリセットされない）。
             self.validate_merge_insert_groups_limits(&insert_bounds)?;
@@ -848,10 +881,24 @@ impl EngineCore {
             || insert_bounds.len() > 1)
             .then(|| crate::tenant::MergeFkDeferScope::enter(target_table));
         let mut rows_affected: u64 = 0;
+        // `RETURNING`（Issue #3356）の収集器。3 つの書き込み区間が、既存の書き込み経路の capturing 版
+        // （`project` 引数）を通して書き込み txn の中・commit 前に行ごとに積む。第 2 の書き込み経路は作らない。
+        let mut sink = plan.returning.as_ref().map(|ret| {
+            crate::sql::dml_from_returning::MergeReturningSink::new(
+                ctx,
+                ret,
+                target_schema,
+                target_schema.is_allocated(),
+            )
+        });
         // 適用結果は実際に変更した件数を使う。BEFORE ROW トリガが行を飛ばす（`RETURN NULL`）・別の行を
         // 消すなどの正常な動作で計画より少なくなっても、文は失敗させない（他の書き込み経路と同じ意味論）。
         for (_clause, rows) in update_plan {
             let mut by_id = rows;
+            let mut update_project = |row: &crate::tenant::CapturedRow| match sink.as_mut() {
+                Some(s) => merge_push_existing(s, &target_info, &index, row, "UPDATE"),
+                None => Ok(()),
+            };
             let outcome = crate::tenant::update_rows_joined_unchecked(
                 WriteTarget::InTxn(write_txn),
                 target_table,
@@ -864,7 +911,8 @@ impl EngineCore {
                 max_affected_rows,
                 max_scanned_rows,
                 |c: &DmlCandidate<'_>| Ok::<_, SqlSurfaceError>(by_id.remove(&c.id)),
-                None,
+                want_returning
+                    .then_some(&mut update_project as &mut crate::tenant::ReturningProjectFn<'_>),
                 Some(&self.trigger_runtime.bind(self)),
             )
             .map_err(|e| match e {
@@ -880,21 +928,45 @@ impl EngineCore {
         }
         if !delete_plan.is_empty() {
             let ids: HashSet<u64> = delete_plan.into_iter().collect();
-            let outcome = crate::tenant::delete_rows_where_with_triggers(
-                WriteTarget::InTxn(write_txn),
-                target_table,
-                ctx,
-                ledger_write,
-                &hash,
-                Some(target_schema),
-                false,
-                max_affected_rows,
-                max_scanned_rows,
-                |c: &DmlCandidate<'_>| Ok::<bool, SqlSurfaceError>(ids.contains(&c.id)),
-                Some(&self.trigger_runtime.bind(self)),
-                // 一致の判定で既存行を読む（RLS-13）。
-                true,
-            )
+            let outcome = if want_returning {
+                // `RETURNING` つきは削除前の値を捕捉する経路へ切り替える（トリガとの併用は上で拒否済みなので
+                // 通過証は渡さない。該当トリガが現れたら書き込み側が `0A000` で止める。多層防御）。
+                let mut delete_project = |row: &crate::tenant::CapturedRow| match sink.as_mut() {
+                    Some(s) => merge_push_existing(s, &target_info, &index, row, "DELETE"),
+                    None => Ok(()),
+                };
+                crate::tenant::delete_rows_where_capturing_unchecked(
+                    WriteTarget::InTxn(write_txn),
+                    target_table,
+                    ctx,
+                    ledger_write,
+                    &hash,
+                    Some(target_schema),
+                    false,
+                    max_affected_rows,
+                    max_scanned_rows,
+                    |c: &DmlCandidate<'_>| Ok::<bool, SqlSurfaceError>(ids.contains(&c.id)),
+                    &mut delete_project,
+                    true,
+                    None,
+                )
+            } else {
+                crate::tenant::delete_rows_where_with_triggers(
+                    WriteTarget::InTxn(write_txn),
+                    target_table,
+                    ctx,
+                    ledger_write,
+                    &hash,
+                    Some(target_schema),
+                    false,
+                    max_affected_rows,
+                    max_scanned_rows,
+                    |c: &DmlCandidate<'_>| Ok::<bool, SqlSurfaceError>(ids.contains(&c.id)),
+                    Some(&self.trigger_runtime.bind(self)),
+                    // 一致の判定で既存行を読む（RLS-13）。
+                    true,
+                )
+            }
             .map_err(|e| match e {
                 PredicateDmlError::Predicate(e) => e,
                 PredicateDmlError::Write(e) => crate::sql::exec::map_write_error(e, "delete"),
@@ -906,15 +978,43 @@ impl EngineCore {
                 _ => return Err(merge_plan_mismatch()),
             }
         }
-        for bounds in &insert_bounds {
-            let outcome = crate::sql::exec::execute_insert_batch_with_schema_in(
-                WriteTarget::InTxn(write_txn),
-                ctx,
-                bounds,
-                self.ledger_mode,
-                Some(target_schema),
-                Some(&self.trigger_runtime.bind(self)),
-            )?;
+        for (bounds, srcs) in insert_bounds.iter().zip(insert_srcs.iter()) {
+            if !want_returning {
+                let outcome = crate::sql::exec::execute_insert_batch_with_schema_in(
+                    WriteTarget::InTxn(write_txn),
+                    ctx,
+                    bounds,
+                    self.ledger_mode,
+                    Some(target_schema),
+                    Some(&self.trigger_runtime.bind(self)),
+                )?;
+                rows_affected = rows_affected.saturating_add(outcome.rows_affected);
+                continue;
+            }
+            // `RETURNING` つき: 既存の挿入経路が書いた最終行（DEFAULT・採番・生成列を反映した値）を、束縛行の
+            // 順に commit 前に受け取る。呼び出し回数が束縛行数と食い違えば `XX000`（fail-closed）。
+            let mut called: usize = 0;
+            let mut insert_project = |row: &crate::tenant::CapturedRow| match sink.as_mut() {
+                Some(s) => {
+                    let src = srcs.get(called).copied();
+                    called = called.saturating_add(1);
+                    merge_push_inserted(s, &index, row, src)
+                }
+                None => Ok(()),
+            };
+            let (outcome, _trigger_path) =
+                crate::sql::exec::execute_insert_batch_with_schema_in_projecting(
+                    WriteTarget::InTxn(write_txn),
+                    ctx,
+                    bounds,
+                    self.ledger_mode,
+                    Some(target_schema),
+                    None,
+                    Some(&mut insert_project as &mut crate::tenant::ReturningProjectFn<'_>),
+                )?;
+            if called != bounds.len() {
+                return Err(merge_plan_mismatch());
+            }
             rows_affected = rows_affected.saturating_add(outcome.rows_affected);
         }
         if fk_defer.is_some() {
@@ -950,7 +1050,19 @@ impl EngineCore {
         for table in written {
             txn.mark_written(ctx.tenant_id(), &table);
         }
-        Ok(SqlOutcome::Merge(MergeOutcome { rows_affected }))
+        match (sink, plan.returning.as_ref()) {
+            (Some(sink), Some(ret)) => {
+                Ok(SqlOutcome::Returning(crate::sql::exec::ReturningOutcome {
+                    command: crate::sql::returning::DmlCommand::Merge,
+                    rows_affected,
+                    result: QueryResult {
+                        columns: crate::sql::dml_from_returning::column_meta(ret),
+                        rows: sink.finish(),
+                    },
+                }))
+            }
+            _ => Ok(SqlOutcome::Merge(MergeOutcome { rows_affected })),
+        }
     }
 
     /// 部分クエリの元を、書き込むセッションの `PolicyContext` で既存の読み取り経路に通して実体化し、
@@ -1024,7 +1136,8 @@ impl EngineCore {
 }
 
 /// BY TARGET の `INSERT` が積んだ 1 行（疑似列 id・列ごとの値・列ごとの「値が指定されたか」）。
-type InsertRow = (u64, Vec<crate::row_codec::Value>, Vec<bool>);
+/// 末尾は元の走査位置（`RETURNING` の結果行が読む元の行と並び順に使う。Issue #3356）。
+type InsertRow = (u64, Vec<crate::row_codec::Value>, Vec<bool>, usize);
 
 /// 採った対象行の計画（`(id, Planned)` の蓄積・`delete_plan`・`HashSet` の 3 か所）を確保前に共有バイト予算へ
 /// 計上する（超過は `54000`。D7）。
@@ -1045,9 +1158,62 @@ fn bound_id_omitted(bound: &BoundMerge, clause: &usize) -> bool {
 
 /// 第 1 段が 1 つの対象行について決めた操作。
 enum Planned {
-    /// 選んだ句の添字と評価済みの SET 値。
-    Update(usize, Vec<(usize, crate::row_codec::Value)>),
-    Delete,
+    /// 選んだ句の添字・評価済みの SET 値・採った元の走査位置（BY SOURCE は `None`）。
+    Update(usize, Vec<(usize, crate::row_codec::Value)>, Option<u32>),
+    /// 採った元の走査位置（BY SOURCE は `None`）。位置は `RETURNING` の結果行だけが使う（Issue #3356）。
+    Delete(Option<u32>),
+}
+
+/// UPDATE・DELETE 区間が書いた対象行 1 行を `RETURNING` の収集器へ積む（Issue #3356）。`target_info` は
+/// 第 1 段が記録した対象行 id → (元の走査位置, 並び順)。引けない行は結合と書き込みの食い違いで `XX000`。
+fn merge_push_existing(
+    sink: &mut crate::sql::dml_from_returning::MergeReturningSink<'_>,
+    target_info: &HashMap<u64, (Option<u32>, usize)>,
+    index: &crate::sql::join::dml::SourceIndex,
+    row: &crate::tenant::CapturedRow,
+    action: &str,
+) -> Result<(), crate::tenant::TenantWriteError> {
+    let (src, ord) = target_info.get(&row.id).copied().ok_or_else(|| {
+        crate::tenant::TenantWriteError::ReturningProjectionFailed(
+            "MERGE target row not found in the planned operations".to_string(),
+        )
+    })?;
+    let source = match src {
+        Some(pos) => Some(source_row_ref(index, pos as usize)?),
+        None => None,
+    };
+    sink.push(row, action, (0, ord), source)
+}
+
+/// INSERT 区間が書いた行 1 行を `RETURNING` の収集器へ積む。`src` は束縛行に対応する元の走査位置。
+fn merge_push_inserted(
+    sink: &mut crate::sql::dml_from_returning::MergeReturningSink<'_>,
+    index: &crate::sql::join::dml::SourceIndex,
+    row: &crate::tenant::CapturedRow,
+    src: Option<usize>,
+) -> Result<(), crate::tenant::TenantWriteError> {
+    let pos = src.ok_or_else(|| {
+        crate::tenant::TenantWriteError::ReturningProjectionFailed(
+            "MERGE inserted row count mismatch".to_string(),
+        )
+    })?;
+    sink.push(row, "INSERT", (1, pos), Some(source_row_ref(index, pos)?))
+}
+
+/// 元の走査位置から `RETURNING` 用の行参照を引く（範囲外は `XX000`）。
+fn source_row_ref(
+    index: &crate::sql::join::dml::SourceIndex,
+    pos: usize,
+) -> Result<crate::sql::dml_from_returning::FromRowRef<'_>, crate::tenant::TenantWriteError> {
+    index
+        .rows
+        .get(pos)
+        .map(|r| crate::sql::dml_from_returning::FromRowRef { cells: &r.cells })
+        .ok_or_else(|| {
+            crate::tenant::TenantWriteError::ReturningProjectionFailed(
+                "MERGE source row out of range".to_string(),
+            )
+        })
 }
 
 /// 第 3 段の適用結果が想定外の形（`Applied` 以外）だった。write txn を commit

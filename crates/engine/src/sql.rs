@@ -566,7 +566,7 @@ pub enum SqlOutcome {
     /// （`Insert`・`Truncate` と同じ設計）。
     Delete(exec::DeleteOutcome),
     /// `MERGE`（SQL-79・Issue #3353）が成功したことを示す応答。件数は UPDATE と DELETE の実変更行数の合計で、
-    /// 応答のコマンドタグは `MERGE <n>`（`RETURNING` つきの応答は #3356 が別に結線する）。
+    /// 応答のコマンドタグは `MERGE <n>`（`RETURNING` つきの応答は [`SqlOutcome::Returning`] の `DmlCommand::Merge` で、タグは同じ `MERGE <n>`。Issue #3356）。
     ///
     /// **BREAKING CHANGE**（Issue #3353）: variant を追加した（既存の網羅的 `match` はアームの追加が必要）。
     Merge(exec::MergeOutcome),

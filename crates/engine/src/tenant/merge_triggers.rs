@@ -141,6 +141,12 @@ impl<'a> MergeStatementTriggers<'a> {
         })
     }
 
+    /// いずれかの種類にトリガ（行・文・参照アクション先の子表を含む）の発火計画があるか。`RETURNING` つきの
+    /// MERGE は、トリガとの併用を書き込み前に固定文言で拒否する判定に使う（Issue #3356）。
+    pub(crate) fn has_any(&self) -> bool {
+        self.insert.is_some() || self.update.is_some() || self.delete.is_some()
+    }
+
     /// BEFORE STATEMENT を INSERT → UPDATE → DELETE の順に 1 回ずつ発火する。
     pub(crate) fn fire_before(
         &self,

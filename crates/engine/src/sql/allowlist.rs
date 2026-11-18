@@ -7412,6 +7412,9 @@ struct Parser<'a> {
     /// （SQL-53 (b)、Issue #1754）。式中の修飾列参照のうち対象表の公開名で修飾されたものだけを非修飾へ
     /// 正規化し、FROM 側の表を指す修飾は `0A000`（FROM 表の列を使う式は #1755 以降）にする。
     dml_from_target: Option<String>,
+    /// `MERGE ... RETURNING` の項目を解析している間だけ真（Issue #3356）。`merge_action()` を
+    /// 最上位の項目として受理するか、式の内側・他の文脈で固定文言の拒否にするかの判定に使う。
+    in_merge_returning: bool,
     /// [`Self::dml_from_target`] が `Some` の間に、実際に非修飾で書かれた識別子の名前を集める
     /// （Issue #1754 レビュー対応）。対象表修飾つき列（`t.col`）は束縛まで修飾情報を保てないため
     /// 非修飾の `Expr::Ident` へ正規化するが、曖昧性検査（`42702`）は非修飾で書かれた名前にだけ
@@ -7519,6 +7522,7 @@ impl<'a> Parser<'a> {
             agg_slots_used: 0,
             upsert_table: None,
             dml_from_target: None,
+            in_merge_returning: false,
             dml_from_unqualified: Vec::new(),
             dml_from_set_refs: None,
             legacy_implicit_id: false,
@@ -13674,6 +13678,20 @@ impl<'a> Parser<'a> {
     /// WHERE 式述語・`CREATE FUNCTION` 本体・集計引数のネスト呼び出し）での出現であり、
     /// いずれも許可形状外（`GROUP BY` を持たない集計のみを SQL-13 の受理形とする）。
     fn parse_call_expr(&mut self, name: String, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        // `merge_action()`（SQL-79・Issue #3356）は `MERGE ... RETURNING` の最上位項目だけが受理され、
+        // その経路は `parse_dml_from_returning_clause` が先に横取りする。ここへ来る形は式の内側か
+        // 他の文脈で、未知の関数（`42883`）へ落とさず固定文言で拒否する（PostgreSQL 17 は構文エラー）。
+        if name.eq_ignore_ascii_case("merge_action") {
+            return Err(if self.in_merge_returning {
+                SqlSurfaceError::feature_not_supported(
+                    "merge_action() is only supported as a top-level MERGE RETURNING item",
+                )
+            } else {
+                SqlSurfaceError::unsupported(
+                    "MERGE_ACTION() can only be used in the RETURNING list of a MERGE command",
+                )
+            });
+        }
         // `COALESCE`／`NULLIF`（対象ビヘイビア: SQL-26。Issue #921）は遅延評価の
         // 意味論を持つ専用 AST ノードのため、通常の `Expr::Call`（引数を先に
         // 評価する関数呼び出し）とは別に、名前を大小無視で照合して専用の構文へ
@@ -16284,6 +16302,34 @@ impl<'a> Parser<'a> {
     ///
     /// 呼び出し元は `parse_update_from`／`parse_delete_using`（Issue #3204 で結線）で、項目の束縛は
     /// `sql::dml_from_returning` が行う。
+    /// `MERGE ... RETURNING`（Issue #3356）。[`Self::parse_dml_from_returning_clause`] の共通部を使い、
+    /// 最上位項目の `merge_action()` だけを追加で受理する（解析中の状態フラグはエラー時も戻す）。
+    pub(crate) fn parse_merge_returning_clause(
+        &mut self,
+        target_exposed: &str,
+    ) -> Result<Option<crate::sql::dml_from_returning::DmlFromReturning>, SqlSurfaceError> {
+        let prev = std::mem::replace(&mut self.in_merge_returning, true);
+        let result = self.parse_dml_from_returning_clause(target_exposed);
+        self.in_merge_returning = prev;
+        result
+    }
+
+    /// `merge_action ( )` が項目の先頭にあり、直後が項目の境界であるかの先読み（消費しない）。
+    /// `AS <別名>` は境界に含まれる。
+    fn peek_merge_action_item(&self) -> bool {
+        self.in_merge_returning
+            && self.peek_ident_matches("merge_action")
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(1)),
+                Some(Token::Punct('('))
+            )
+            && matches!(
+                self.tokens.get(self.pos.saturating_add(2)),
+                Some(Token::Punct(')'))
+            )
+            && Self::returning_item_boundary(self.tokens.get(self.pos.saturating_add(3)))
+    }
+
     pub(crate) fn parse_dml_from_returning_clause(
         &mut self,
         target_exposed: &str,
@@ -16315,6 +16361,18 @@ impl<'a> Parser<'a> {
                     let qualifier = qualifier.clone();
                     self.advance();
                     DmlFromReturningItem::QualifiedAll(qualifier)
+                }
+                _ if self.peek_merge_action_item() => {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    let alias = if self.peek_ident_matches("AS") {
+                        self.advance();
+                        Some(self.expect_ident()?)
+                    } else {
+                        None
+                    };
+                    DmlFromReturningItem::MergeAction { alias }
                 }
                 _ if self.peek_dml_returning_single_column()
                     || self.peek_dml_returning_paren_qualified_column() =>
@@ -19209,6 +19267,12 @@ fn parse_data_modifying_cte_body(
 
     let mode = LedgerMode::Optional;
     let (target_table, statement) = match command {
+        // MERGE は先頭語の判定で既に `0A000` を返すため到達しないが、構文経路なので panic にせず fail-closed にする。
+        DmlCommand::Merge => {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "MERGE in a data-modifying CTE is not supported",
+            ));
+        }
         DmlCommand::Insert => {
             match parse_insert_any_shape_tokens_with_limit(inner, mode, max_insert_rows)? {
                 ParsedInsertTokens::Values(v) => (v.table_name.clone(), DmlStatement::Insert(v)),

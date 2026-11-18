@@ -947,6 +947,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
                 engine::sql::returning::DmlCommand::Delete => {
                     format!("DELETE {}", outcome.rows_affected)
                 }
+                // SQL-79（Issue #3356）: `MERGE ... RETURNING` も `RETURNING` なしと同じ `MERGE <n>`。
+                engine::sql::returning::DmlCommand::Merge => {
+                    format!("MERGE {}", outcome.rows_affected)
+                }
             };
             OutcomeResponse::Rows {
                 result: outcome.result,

@@ -4,8 +4,8 @@
 //! 先頭語 `MERGE` を見て [`validate_merge_tokens_with_limits`] を呼び、`ParsedSql::Merge` を返す。
 //! 実行系（`execute_parsed_in_session`・明示 Tx・Describe）は束縛（#3352。`sql::merge_bind`・
 //! `core::merge_exec`）を通して実行する（`WHEN MATCHED` は #3353、`NOT MATCHED [BY TARGET|BY SOURCE]` は #3354）。
-//! 対象外の形は固定文言の `0A000` で止める（副作用ゼロ）。台帳・`OpTag`・`EXPLAIN` は #3357、`RETURNING` の
-//! `merge_action()` は #3356 が担当する。
+//! 対象外の形は固定文言の `0A000` で止める（副作用ゼロ）。台帳・`OpTag`・`EXPLAIN` は #3357 が担当する。
+//! `RETURNING` は #3356 が結線し、最上位項目の `merge_action()` だけを受理する（式の内側・他の文脈は固定文言で拒否）。
 //!
 //! 構文段の保証範囲: 構文（`42601`）、上限（`54000`）、固定文言の未対応形（`0A000`）、対象・元表の存在
 //! （`42P01`）。列解決・型照合は束縛段の責務で、本モジュールは行わない。`$n` の位置規則は
@@ -111,7 +111,7 @@ pub struct ValidatedMerge {
     pub(crate) on: JoinWhereExpr,
     /// `WHEN` 句（宣言順。1..=[`MAX_MERGE_WHEN_CLAUSES`]）。
     pub(crate) when_clauses: Vec<MergeWhenClause>,
-    /// `RETURNING`（構造のみ。束縛は #3356）。
+    /// `RETURNING`（構造のみ。束縛は `sql::merge_bind`。Issue #3356）。
     pub(crate) returning: Option<crate::sql::dml_from_returning::DmlFromReturning>,
     /// 文末の `USING OPERATION_ID`。
     pub(crate) operation_id: Option<OperationId>,
@@ -178,7 +178,7 @@ impl<'a> Parser<'a> {
         self.expect_ident_matching("ON")?;
         let on = parse_join_where_dml(self)?;
         let when_clauses = self.parse_merge_when_clauses(&target)?;
-        let returning = self.parse_dml_from_returning_clause(target.exposed_name())?;
+        let returning = self.parse_merge_returning_clause(target.exposed_name())?;
         self.reject_merge_partitioned()?;
         let operation_id = self.parse_operation_id_clause()?;
         self.reject_merge_partitioned()?;

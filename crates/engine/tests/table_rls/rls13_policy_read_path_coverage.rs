@@ -160,9 +160,9 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "sql/dml_from_returning.rs",
-        1,
+        2,
         Class::NonRead,
-        "UPDATE FROM・DELETE USING の RETURNING 整形。対象行は列挙段でポリシー通過済み",
+        "UPDATE FROM・DELETE USING・MERGE の RETURNING 整形。対象行は列挙段でポリシー通過済みで、収集器は可視性を再判定するだけ（Issue #3356）",
     ),
     (
         "sql/exec.rs",

@@ -75,6 +75,8 @@ pub(crate) struct MergeExecPlan {
     clauses: Vec<MergeClausePlan>,
     /// SET 式が対象行の embedding を参照するか（候補列挙で復号する必要があるか）。
     pub(crate) needs_embedding: bool,
+    /// 束縛済みの `RETURNING`（Issue #3356）。元側の出力列が読むセル位置を [`plan_merge`] が確定済み。
+    pub(crate) returning: Option<crate::sql::dml_from_returning::BoundFromReturning>,
 }
 
 impl MergeExecPlan {
@@ -313,6 +315,26 @@ pub(crate) fn plan_merge(
         clauses.push(MergeClausePlan { kind, cond, action });
     }
 
+    // `RETURNING` が読む元の列（Issue #3356）は SET の式評価ビューへ載せず、走査投影の末尾へだけ追記する
+    // （`UPDATE ... FROM` の `RETURNING` と同じ作法。VECTOR 等の式評価できない型でもセルを複製して返せる）。
+    let mut returning = bound.returning().cloned();
+    let mut returning_columns: Vec<usize> = Vec::new();
+    if let Some(ret) = &returning {
+        for col in &ret.columns {
+            if col.relation == 0 {
+                continue;
+            }
+            match col.slot {
+                ColumnSlot::Id => include_pseudo_id = true,
+                ColumnSlot::Column(i) => {
+                    if !returning_columns.contains(&i) {
+                        returning_columns.push(i);
+                    }
+                }
+            }
+        }
+    }
+
     let joined = JoinedDmlPlan {
         target: JoinedDmlTarget {
             table: target_table.to_string(),
@@ -326,7 +348,7 @@ pub(crate) fn plan_merge(
             schema: source.schema,
             where_predicates: source.view_predicates,
             columns,
-            returning_columns: Vec::new(),
+            returning_columns,
             include_pseudo_id,
             fold: None,
         },
@@ -335,10 +357,15 @@ pub(crate) fn plan_merge(
         update: None,
         returning: None,
     };
+    // 走査投影が確定したので、元側の出力列のセル位置を確定する。
+    if let Some(ret) = returning.as_mut() {
+        ret.assign_source_cells(|_relation, slot| joined.source_cell_position(slot))?;
+    }
     Ok(MergeExecPlan {
         joined,
         clauses,
         needs_embedding,
+        returning,
     })
 }
 

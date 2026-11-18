@@ -52,6 +52,8 @@ pub(crate) enum DmlFromReturningItem {
         item: crate::sql::allowlist::SelectItem,
         unqualified: Vec<String>,
     },
+    /// `merge_action()`（`MERGE ... RETURNING` の最上位項目だけ。Issue #3356。`AS` 別名つき）。
+    MergeAction { alias: Option<String> },
 }
 
 /// 構文段が返す `RETURNING` 句（FROM／USING つき UPDATE／DELETE 専用）。
@@ -71,6 +73,8 @@ pub(crate) struct FromReturningColumn {
     /// FROM／USING 側の列が読む、一致行 `cells` 内の位置。計画段（[`BoundFromReturning::assign_source_cells`]）
     /// が確定する。未確定のまま射影すると `XX000`（fail-closed）。
     source_cell: Option<usize>,
+    /// `merge_action()` の項目か（Issue #3356。`relation`・`slot` は意味を持たず、行ごとの操作名の text セルになる）。
+    merge_action: bool,
 }
 
 /// 束縛済みの `RETURNING`。
@@ -158,6 +162,7 @@ fn push_entry(
         meta,
         target_pos,
         source_cell: None,
+        merge_action: false,
     });
     Ok(())
 }
@@ -250,6 +255,28 @@ pub(crate) fn bind_from_returning(
     scope: &BindingScope<'_>,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundFromReturning, SqlSurfaceError> {
+    bind_returning_items(ret, scope, udfs, false)
+}
+
+/// `MERGE ... RETURNING` の束縛（Issue #3356）。裸の `*` は PostgreSQL 17 と同じく**元の全列に続けて
+/// 対象の全列**を並べ（`UPDATE ... FROM` とは逆順）、`merge_action()` 項目は列名 `merge_action`・型 text。
+/// スコープは relation 0 = 対象・1 = 元（`sql::merge_bind` の規約）。
+pub(crate) fn bind_merge_returning(
+    ret: &DmlFromReturning,
+    scope: &BindingScope<'_>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundFromReturning, SqlSurfaceError> {
+    bind_returning_items(ret, scope, udfs, true)
+}
+
+/// [`bind_from_returning`]・[`bind_merge_returning`] の共有実体。`source_first` は裸の `*` の展開順
+/// （真なら relation 1 以降を先、対象を最後）。
+fn bind_returning_items(
+    ret: &DmlFromReturning,
+    scope: &BindingScope<'_>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    source_first: bool,
+) -> Result<BoundFromReturning, SqlSurfaceError> {
     if ret.items.len() > MAX_DML_FROM_RETURNING_ITEMS {
         return Err(SqlSurfaceError::payload_too_large(
             "too many RETURNING items",
@@ -262,8 +289,24 @@ pub(crate) fn bind_from_returning(
     for item in &ret.items {
         match item {
             DmlFromReturningItem::All => {
-                for relation in 0..scope.len() {
-                    expand_relation(&mut acc, relation, scope)?;
+                if source_first {
+                    for relation in (1..scope.len()).chain(std::iter::once(0)) {
+                        expand_relation(&mut acc, relation, scope)?;
+                    }
+                } else {
+                    for relation in 0..scope.len() {
+                        expand_relation(&mut acc, relation, scope)?;
+                    }
+                }
+            }
+            DmlFromReturningItem::MergeAction { alias } => {
+                let meta = ColumnMeta::Scalar {
+                    name: alias.clone().unwrap_or_else(|| "merge_action".to_string()),
+                    ty: crate::catalog::ColumnType::Text,
+                };
+                push_entry(&mut acc, 0, ColumnSlot::Id, meta, None)?;
+                if let Some(last) = acc.columns.last_mut() {
+                    last.merge_action = true;
                 }
             }
             DmlFromReturningItem::QualifiedAll(qualifier) => {
@@ -389,6 +432,173 @@ pub(crate) fn project_joined_row(
         score: 0.0,
         cells,
     })
+}
+
+/// `MERGE ... RETURNING` の結果行を 1 行組む（Issue #3356）。対象側は `eval` で 1 回投影し、元側は
+/// `source` のセルを複製する（`None` は元の行が無い BY SOURCE の行で、元の列は NULL）。`action` は
+/// `merge_action()` 項目の値（`INSERT`／`UPDATE`／`DELETE`）。範囲外・未確定の位置は `XX000`。
+pub(crate) fn project_merge_row(
+    target_id: u64,
+    target_values: &[Value],
+    source: Option<FromRowRef<'_>>,
+    action: &str,
+    bound: &BoundFromReturning,
+    eval: &mut returning::ReturningProjector<'_>,
+    budget: &mut usize,
+) -> Result<ResultRow, SqlSurfaceError> {
+    let mut cells = Vec::new();
+    cells
+        .try_reserve(bound.columns.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve RETURNING cells: {e}"),
+        })?;
+    let mut target_cells = if bound.target_projection.is_empty() {
+        Vec::new()
+    } else {
+        eval.project_row(target_id, target_values, budget)?.cells
+    };
+    for col in &bound.columns {
+        if col.merge_action {
+            let cell = Cell::Text(action.to_string());
+            let next = budget.saturating_add(crate::sql::join::cell_payload_bytes(&cell));
+            if next > MAX_RETURNING_RESULT_BYTES {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "RETURNING result exceeds capacity",
+                ));
+            }
+            *budget = next;
+            cells.push(cell);
+            continue;
+        }
+        if col.relation == 0 {
+            let pos = col
+                .target_pos
+                .ok_or_else(|| bug("target projection missing"))?;
+            let cell = target_cells
+                .get_mut(pos)
+                .map(|c| std::mem::replace(c, Cell::Null))
+                .ok_or_else(|| bug("empty target projection"))?;
+            cells.push(cell);
+            continue;
+        }
+        let Some(side) = source else {
+            cells.push(Cell::Null);
+            continue;
+        };
+        let pos = col
+            .source_cell
+            .ok_or_else(|| bug("MERGE source cell position unresolved"))?;
+        let cell = side
+            .cells
+            .get(pos)
+            .ok_or_else(|| bug("MERGE source cell index out of range"))?;
+        cells.push(clone_from_cell(cell, budget)?);
+    }
+    Ok(ResultRow {
+        id: target_id,
+        score: 0.0,
+        cells,
+    })
+}
+
+/// 射影のエラーを書き込み側のエラーへ写す（予算超過は `54000`、内部不整合は `XX000`、式の評価エラーは
+/// 元の SQLSTATE のまま透過する）。
+fn map_projection_error(e: SqlSurfaceError) -> TenantWriteError {
+    match e {
+        SqlSurfaceError::PayloadTooLarge { detail } => {
+            TenantWriteError::ReturningProjectionTooLarge(detail)
+        }
+        other @ SqlSurfaceError::Internal { .. } => {
+            TenantWriteError::ReturningProjectionFailed(other.to_string())
+        }
+        other => TenantWriteError::ReturningExpressionFailed(other),
+    }
+}
+
+/// `MERGE ... RETURNING` の結果行の収集器（Issue #3356）。第 3 段の 3 つの書き込み区間（UPDATE・DELETE・
+/// INSERT）が、書き込み txn の中・commit 前に行ごとに [`Self::push`] を呼ぶ。バイト予算は文全体で 1 つを
+/// 共有する（超過は `54000`）。RLS の再判定は `joined_returning_collector` と同じ（不可視の更新・削除行は
+/// 積まず、不可視の挿入行は `XX000`）。並べ替えキーつきで溜め、[`Self::finish`] が安定ソートして返す。
+pub(crate) struct MergeReturningSink<'a> {
+    ctx: &'a PolicyContext,
+    bound: &'a BoundFromReturning,
+    projector: returning::ReturningProjector<'a>,
+    mask_row_id: bool,
+    budget: usize,
+    rows: Vec<((u8, usize), ResultRow)>,
+}
+
+impl<'a> MergeReturningSink<'a> {
+    /// `mask_row_id` は採番方式の表（行 id を結果へ出さない）で真。
+    pub(crate) fn new(
+        ctx: &'a PolicyContext,
+        bound: &'a BoundFromReturning,
+        target_schema: &crate::catalog::TableSchema,
+        mask_row_id: bool,
+    ) -> Self {
+        Self {
+            ctx,
+            bound,
+            projector: bound.projector(target_schema),
+            mask_row_id,
+            budget: 0,
+            rows: Vec::new(),
+        }
+    }
+
+    /// 書いた（または削除した）対象行 1 行を積む。`key` は結果の並び順（第 1 要素が小さい順、同値は
+    /// 第 2 要素の順）、`source` はその行を生んだ元の行（無ければ `None`）。
+    pub(crate) fn push(
+        &mut self,
+        row: &CapturedRow,
+        action: &str,
+        key: (u8, usize),
+        source: Option<FromRowRef<'_>>,
+    ) -> Result<(), TenantWriteError> {
+        if !self.ctx.is_visible(&row.tenant_id, row.visibility) {
+            if row.origin == CapturedRowOrigin::Inserted {
+                return Err(TenantWriteError::ReturningProjectionFailed(
+                    "RETURNING row is not visible under the policy context".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        // 並べ替えキーつきの行の保持分も予算へ計上する（確保前）。
+        self.budget = self
+            .budget
+            .saturating_add(std::mem::size_of::<((u8, usize), ResultRow)>());
+        if self.budget > MAX_RETURNING_RESULT_BYTES {
+            return Err(TenantWriteError::ReturningProjectionTooLarge(
+                "RETURNING result exceeds capacity".to_string(),
+            ));
+        }
+        let mut result = project_merge_row(
+            row.id,
+            &row.values,
+            source,
+            action,
+            self.bound,
+            &mut self.projector,
+            &mut self.budget,
+        )
+        .map_err(map_projection_error)?;
+        if self.mask_row_id {
+            result.id = 0;
+        }
+        self.rows.try_reserve(1).map_err(|e| {
+            TenantWriteError::ReturningProjectionFailed(format!(
+                "failed to reserve RETURNING row buffer: {e}"
+            ))
+        })?;
+        self.rows.push((key, result));
+        Ok(())
+    }
+
+    /// 積んだ行をキーの安定ソートで並べて返す。
+    pub(crate) fn finish(mut self) -> Vec<ResultRow> {
+        self.rows.sort_by_key(|(k, _)| *k);
+        self.rows.into_iter().map(|(_, r)| r).collect()
+    }
 }
 
 /// 書き込み中の対象行ごとに呼ばれる収集コールバックを作る
