@@ -23,7 +23,7 @@
 //! SET の左辺は常に対象の列（疑似列・未知列・`GENERATED ALWAYS`・重複は単独の UPDATE と同じコード）。
 //! `INSERT` は単独の INSERT と同じ規則（列リストの重複は `22000`・未知列は `42703`・従来方式の表で
 //! 疑似列 `id` を省くと `22000`・個数不一致は `42601`・型不一致は `42804`）。NOT NULL・CHECK・UNIQUE・
-//! 外部キーは実行時の検査（#3354 の INSERT は既存の挿入経路が行う）で本モジュールの範囲外。`RETURNING` の束縛は #3356。
+//! 外部キーは実行時の検査（#3354 の INSERT は既存の挿入経路が行う）で本モジュールの範囲外。`RETURNING`（`merge_action()` を含む）は #3356 が両側スコープで束縛する。
 //! 文言は英語の固定文字列と入力された名前だけで、件数・値・他テナントの存在を含めない。
 
 use crate::catalog::TableSchema;
@@ -234,9 +234,16 @@ pub struct BoundMerge {
     on: BoundCondition,
     clauses: Vec<BoundMergeClause>,
     operation_id: Option<OperationId>,
+    /// 束縛済みの `RETURNING`（Issue #3356。relation 0 = 対象・1 = 元。無ければ `None`）。
+    returning: Option<crate::sql::dml_from_returning::BoundFromReturning>,
 }
 
 impl BoundMerge {
+    /// 束縛済みの `RETURNING`（元側のセル位置は計画段 `plan_merge` が確定する）。
+    pub(crate) fn returning(&self) -> Option<&crate::sql::dml_from_returning::BoundFromReturning> {
+        self.returning.as_ref()
+    }
+
     /// 参照の並び（0 = 対象、1 = 元）。
     pub fn relations(&self) -> &[TableRef] {
         &self.relations
@@ -517,12 +524,21 @@ pub(crate) fn bind_merge(
         });
     }
 
+    // `RETURNING`（Issue #3356）は両側スコープで束縛する。未知列・曖昧列・未知の修飾・集計・部分クエリ・
+    // 元の列を式の中で参照する形のエラーは、ここ（書き込みより前）で返る。
+    let returning = stmt
+        .returning
+        .as_ref()
+        .map(|r| crate::sql::dml_from_returning::bind_merge_returning(r, &ctx.full, udfs))
+        .transpose()?;
+
     Ok(BoundMerge {
         relations: vec![stmt.target.clone(), source_rel],
         target_view,
         on,
         clauses,
         operation_id: stmt.operation_id.clone(),
+        returning,
     })
 }
 

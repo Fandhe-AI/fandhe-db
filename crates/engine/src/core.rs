@@ -2161,8 +2161,8 @@ pub enum ParsedSql {
     UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
     /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析を担い、
     /// 実行は束縛（#3352。`sql::merge_bind`）を通してから `core::merge_exec` が行う（`WHEN MATCHED` は
-    /// #3353、`WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 で実行。台帳・`OpTag`・`EXPLAIN` は #3357、
-    /// `RETURNING` は #3356 が結線し、それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
+    /// #3353、`WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 で実行、`RETURNING` と `merge_action()` は #3356。
+    /// 台帳・`OpTag`・`EXPLAIN` は #3357 が結線し、それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
     /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
     Merge(Box<crate::sql::allowlist::ValidatedMerge>),
     /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
@@ -2617,10 +2617,6 @@ fn row_lock_not_supported() -> crate::sql::allowlist::SqlSurfaceError {
         "row-level locking clauses are not supported yet",
     )
 }
-
-/// `MERGE ... RETURNING` の Describe が返す固定文言（SQL-79・Issue #3351。`RETURNING` の結線は #3356）。
-/// 入力断片・件数・他テナントの情報を含めない。
-const MERGE_NOT_SUPPORTED_YET: &str = "MERGE is not supported yet";
 
 /// 暗黙 Tx を通らない経路（ネストした実行等）の `MERGE` が返す固定文言（SQL-79・Issue #3353。
 /// `UPDATE ... FROM` の `JOINED_DML_UNSUPPORTED_HERE` と同じ扱い）。入力断片・件数を含めない。
@@ -7858,7 +7854,7 @@ impl EngineCore {
         }
 
         // SQL-79・Issue #3351: `MERGE` は専用の構文解析器へ回す（既存の単一表 DML の解析器へ落とさない）。
-        // 解析を通った文の実行は固定文言の `0A000`（実行系は #3353〜#3355 で結線済み。残る形は #3356・#3357）。対象・元の存在確認は
+        // 解析を通った文の実行は #3353〜#3356 で結線済み（残る形は #3357 の台帳記録）。対象・元の存在確認は
         // 他の書き込みと同じく書き込み先ビュー・索引の写像（`reclassify_write_to_view_error`）を通す。
         if crate::sql::allowlist::looks_like_merge(&tokens) {
             let stmt = crate::sql::allowlist::validate_merge_tokens_with_limits(
@@ -13350,18 +13346,19 @@ impl EngineCore {
             // SQL-79・Issue #3351・#3352: Describe も Execute と同じ束縛を通し、束縛エラーのコードをそろえる。
             // フラグの並びは「WHEN 句ごとに SET の代入／INSERT の値の宣言順」（`sql::params_merge`）。
             // 束縛に成功した `RETURNING` なしの形は結果列なし（`None`。拡張クエリの Parse／Describe が
-            // ParameterDescription を返せる）で、実行は Execute の固定文言 `0A000` が担う。`RETURNING` つきは
-            // 結果列の束縛（#3356）が未結線のため固定文言の `0A000`（fail-closed）。
+            // ParameterDescription を返せる）。`RETURNING` つき（Issue #3356）は Execute の
+            // `QueryResult.columns` と同じ列（`merge_action()` を含む）を束縛結果から返す。
             ParsedSql::Merge(stmt) => {
-                self.bind_merge_stmt(session, stmt, session.udfs(), dummy_equality_flags, snap)?;
-                if stmt.returning.is_some() {
-                    return Err(
-                        crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                            MERGE_NOT_SUPPORTED_YET,
-                        ),
-                    );
-                }
-                Ok(None)
+                let bound = self.bind_merge_stmt(
+                    session,
+                    stmt,
+                    session.udfs(),
+                    dummy_equality_flags,
+                    snap,
+                )?;
+                Ok(bound
+                    .returning()
+                    .map(crate::sql::dml_from_returning::column_meta))
             }
             // SQL-53 (b)・Issue #3202・#3204: Execute と同じ準備段（束縛・変換）を通し、
             // エラーコードを揃える。`RETURNING` つきなら Execute の `QueryResult.columns` と同じ列を返す。

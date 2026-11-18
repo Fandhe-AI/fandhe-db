@@ -25,11 +25,16 @@ pub(crate) const MAX_RETURNING_RESULT_BYTES: usize = crate::arena::MAX_ARENA_TOT
 /// `RETURNING` を持ちうる DML の種別。`wire-server::simple_query` が
 /// `CommandComplete` タグ（`INSERT 0 <n>`／`DELETE <n>`／`UPDATE <n>`）を
 /// 組み立てる際の接頭辞選択に使う。
+///
+/// BREAKING CHANGE（Issue #3356）: `Merge` variant を追加した（`MERGE ... RETURNING` の応答。SQL-79）。
+/// 網羅的に match している呼び出し元は腕を足す必要がある。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmlCommand {
     Insert,
     Update,
     Delete,
+    /// `MERGE ... RETURNING`（コマンドタグは `MERGE <n>`）。
+    Merge,
 }
 
 impl DmlCommand {
@@ -39,6 +44,7 @@ impl DmlCommand {
             DmlCommand::Insert => "INSERT",
             DmlCommand::Update => "UPDATE",
             DmlCommand::Delete => "DELETE",
+            DmlCommand::Merge => "MERGE",
         }
     }
 }

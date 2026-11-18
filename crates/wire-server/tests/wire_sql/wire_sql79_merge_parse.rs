@@ -2,8 +2,7 @@
 //!
 //! 簡易クエリ（psql 流の末尾 `;` 付き単独送信を含む）と拡張クエリ（Parse／Bind／Execute／Sync と
 //! Parse／Describe／Sync）で、解析を通った MERGE が `CommandComplete MERGE n` で完了し、
-//! 実行に結線されていない形（`RETURNING`）が ErrorResponse `0A000` になり、ReadyForQuery の
-//! 状態が正しいことを固定する。束縛と値位置の `$n` は `wire_sql79_merge_bind.rs`（Issue #3352）、`21000`・
+//! ReadyForQuery の状態が正しいことを固定する（`RETURNING` つきは `wire_sql79_merge_returning.rs`。Issue #3356）。束縛と値位置の `$n` は `wire_sql79_merge_bind.rs`（Issue #3352）、`21000`・
 //! 拡張クエリの `$n` の実行は `wire_sql79_merge_matched.rs`（Issue #3353）。
 //! サーバーはポート 0・一意な一時ディレクトリで独立させ、時間計測は使わない。
 

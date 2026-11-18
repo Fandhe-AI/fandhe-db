@@ -14,6 +14,8 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 **#3355 で MERGE と制約・生成列・トリガ・ビュー・RLS の規則を実装済み**（下の §11）。対象がビュー・対象表に文トリガ・対象表に利用者ポリシーの形は実行される。`RETURNING`・台帳記録・INSTEAD OF トリガを持つビュー（対応しない）は固定文言の `0A000` のまま止まる。
 
+**#3356 で `RETURNING` と `merge_action()`、`RETURNING` 側のコマンドタグを実装済み**（下の §12）。`RETURNING` つきの MERGE は Execute・明示 Tx・Describe で実行され、台帳記録・INSTEAD OF トリガを持つビュー（対応しない）・該当トリガを持つ表との `RETURNING` の併用は固定文言の `0A000` のまま止まる。
+
 **#3352 で束縛を実装済み**（`sql::merge_bind`・`core::merge_exec`。下の「#3352 の束縛」節）。束縛エラー（`42703`・`42702`・`42P01`・`42804`・`22000`・`55000` 等）は書き込みより前に返り、束縛を通った Execute・明示 Tx は固定文言の `0A000` のまま、Describe は `RETURNING` なしなら結果列なしで成功する（`RETURNING` つきは `0A000`）。
 
 `$n` の受理範囲（#3352）: `USING OPERATION_ID $n` に加え、`WHEN ... THEN UPDATE SET <列> = $n` の右辺と `INSERT ... VALUES (...)` の要素の単独の `$n`（括弧で包んだ形を含む）を受理する。`ON`・`WHEN ... AND` の条件内、式の内側（`SET x = $1 + 1`）、`RETURNING` 内、元が部分クエリの形の `$n` は引き続き Parse 段で `42601`（UPDATE FROM の `$n`〔#3297〕と同じ段階的な制限）。
@@ -194,7 +196,9 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | 対象ビューの INSTEAD OF 経由 | `0A000` | 対応しない（#3355 で確定。3 種の操作を INSTEAD OF の行トリガへ振り分ける経路は第 2 の実行器になる。要望が出た時点で別途起票する） |
 | PL/pgSQL 本体・DO の中の MERGE | `0A000` | 受け皿なし |
 | 暗黙 Tx を通らない経路 | `0A000` | fail-closed |
-| 結合 DML の RETURNING とトリガの併用 | `0A000` | `trigger-update-delete.md` の現行の契約 |
+| 結合 DML の RETURNING とトリガの併用（MERGE の `RETURNING` を含む） | `0A000` | `trigger-update-delete.md` の現行の契約。MERGE は該当トリガ（行・文・参照アクション先の子表）が 1 つでもあれば BEFORE STATEMENT の発火より前に固定文言で拒否する（#3356） |
+| `merge_action()` を式の内側に置く形 | `0A000` | 対応しない。操作の種類を式の評価器へ渡す基盤が無い。最上位の項目だけ受理する（#3356） |
+| `RETURNING` で元の列を式の中で参照する形 | `0A000` | 対応しない。既存の結合 DML の `RETURNING`・SET 右辺と同じ境界（#3356） |
 | WHEN 句の数の超過 | `54000` | D7 |
 | 到達できない WHEN 句 | `42601` | D1 |
 
@@ -207,7 +211,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | D3・D5・D6 の MATCHED と `21000`（実装済み。§9。コマンドタグ `MERGE n` と `SqlOutcome::Merge` を前倒しで含む） | #3353 |
 | D3・D6 の BY TARGET の INSERT と BY SOURCE（実装済み。§10） | #3354 |
 | D8・D10・D12（実装済み。§11） | #3355 |
-| D13 の RETURNING・`merge_action()`・タグ | #3356 |
+| D13 の RETURNING・`merge_action()`・タグ（実装済み。§12） | #3356 |
 | D9・D11・D13 の EXPLAIN・crash 耐性の段 | #3357 |
 | PG17 の突き合わせ（D1・D4・D5・D12・D13 の要確認点）・越境・psql の結合試験 | #3358 |
 | D14 の扱わない形（第 6 節の表） | 各形に近い担当（構文段は #3351、それ以外は #3355・#3357） |
@@ -333,11 +337,34 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 | 項目 | 受け皿 |
 | ---- | ------ |
-| `RETURNING`・`merge_action()`、結合形 DML の RETURNING とトリガの併用 | #3356 |
+| `RETURNING`・`merge_action()`（#3356 で実装済み。§12）、結合形 DML の RETURNING とトリガの併用（対応しない。§12） | #3356 |
 | 台帳記録・BEFORE STATEMENT と台帳の事前照合の順序・ビュー経由の台帳ドメイン・EXPLAIN・crash 耐性 | #3357 |
 | PG17 との突き合わせ（上記の確認項目） | #3358 |
 | INSTEAD OF トリガを持つビューを対象にする MERGE | 対応しない（上記） |
 | AFTER ROW を文末にまとめて発火する形・親側 FK の NO ACTION を文末へ回す形 | 対応しない（上記。突き合わせは #3358） |
+
+## 12. #3356 の実装（RETURNING・`merge_action()`・タグ）
+
+PostgreSQL 17 の文書（merge.sgml の output_expression）・ソース（`transformMergeSupportFunc`）・回帰テスト（merge.out）で確認した決定。
+
+- **`*` の展開順**: 元の全列に続けて対象の全列（`UPDATE ... FROM` の「対象 → FROM」とは逆）。`bind_merge_returning` が展開順を切り替える。ビューは公開列だけを展開する
+- **`merge_action()`**: 列名 `merge_action`・型 text。値は `INSERT`／`UPDATE`／`DELETE`。`AS` 別名を付けられる。MERGE の `RETURNING` の外（SELECT・WHERE・単独 DML・UPDATE FROM・DELETE USING の `RETURNING`・MERGE の ON・WHEN の条件・SET 右辺）は `42601`（PG17 の `ERRCODE_SYNTAX_ERROR`。`42883` に落とさない）。MERGE の `RETURNING` の中でも最上位の項目でなければ固定文言の `0A000`
+- **行の内容**: INSERT・UPDATE は書いた後の値（DEFAULT・採番・生成列を反映。既存の書き込み経路の最終行を commit 前に受け取る）、DELETE は削除前の値。元の行が無い BY SOURCE の行では元の列が NULL。採番方式の表は行 id を隠す
+- **行の並び**: 対象候補の走査順（UPDATE・DELETE。テナント内 id 昇順）→ 元の走査順の INSERT。PG17 の出力順は結合の計画に依存して決まらないため、本実装は固定した契約を持つ（merge.out の例と同じ並びになる入力で一致する）。完全な突き合わせは #3358
+- **件数・タグ**: `RETURNING` の有無によらず `MERGE n`（n は UPDATE・DELETE・INSERT の実変更行数の合計。DO NOTHING は含めない）。応答は `SqlOutcome::Returning`（`DmlCommand::Merge`）で、`RETURNING` なしは従来の `SqlOutcome::Merge`
+- **実行**: 第 1 段が選んだ元の走査位置を記録し（確保前に共有バイト予算へ計上）、第 3 段の既存の書き込み経路の capturing 版（UPDATE は `update_rows_joined_unchecked` の `project`、DELETE は `delete_rows_where_capturing_unchecked`、INSERT は `execute_insert_batch_with_schema_in_projecting`）が書き込み txn の中で `MergeReturningSink` へ行を積む。第 2 の書き込み経路は作らない。収集中の失敗（式の評価エラー・`54000`・`XX000`）は commit しないので副作用ゼロ
+- **束縛**: 束縛エラー（`42703`・`42702`・`42P01`・`42601`・`0A000`）は writer・台帳・行より前に返る。Describe は束縛結果から Execute と同じ列を返す
+- **トリガとの併用（対応しない）**: 該当トリガがあれば固定文言の `0A000`（D14）。BEFORE STATEMENT が書いた後に拒否する経路を作らない
+- **テナント境界**: 対象側は既存の候補列挙（所有かつ可視・RLS-13 の SELECT USING）に閉じ、元側は書き込むセッションの `PolicyContext` で走査した行だけ。収集器でも RLS を再判定する（不可視の更新・削除行は積まず、不可視の挿入行は `XX000`）
+
+### 対象外（受け皿）
+
+| 項目 | 受け皿 |
+| ---- | ------ |
+| 台帳記録（`USING OPERATION_ID`）・`for_merge` の材料・EXPLAIN・crash 耐性 | #3357 |
+| PG17 との行順・境界の完全な突き合わせ、psql 経由の越境試験 | #3358 |
+| トリガを持つ表での `RETURNING` の発火 | 対応しない（上記。`trigger-update-delete.md` の現行の契約） |
+| 式の内側の `merge_action()`・元の列を式の中で参照する `RETURNING` | 対応しない（上記。要望が出た時点で別途起票する） |
 
 ## セキュリティ
 
