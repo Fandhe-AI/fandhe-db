@@ -1047,3 +1047,47 @@ fn default_now_columns_share_the_statement_clock_in_an_explicit_transaction() {
         "Integer(1)"
     );
 }
+
+#[test]
+fn self_referencing_foreign_key_is_checked_after_all_insert_clauses() {
+    let (core, _g) = new_core("sql79n-self-fk");
+    ddl(&core, "CREATE SCHEMA s");
+    ddl(
+        &core,
+        "CREATE TABLE s.ft (k INTEGER PRIMARY KEY, p INTEGER REFERENCES s.ft (k))",
+    );
+    ddl(&core, "CREATE TABLE s.fs (k INTEGER, p INTEGER)");
+    // 1 つ目の句の行 (1, 2) が 2 つ目の句の行 (2, NULL) を参照する。文単位の検査と同じく全句の書き込み後に検査する。
+    run(&core, "INSERT INTO s.fs (k, p) VALUES (1, 2), (2, NULL)").expect("seed");
+    assert_eq!(
+        merged(
+            &core,
+            "MERGE INTO s.ft AS d USING s.fs AS e ON d.k = e.k \
+             WHEN NOT MATCHED AND e.k = 1 THEN INSERT (k, p) VALUES (e.k, e.p) \
+             WHEN NOT MATCHED THEN INSERT (k, p) VALUES (e.k, e.p)"
+        ),
+        2
+    );
+    assert_eq!(
+        rows_of(&core, "alice", "SELECT COUNT(*) FROM s.ft"),
+        "Integer(2)"
+    );
+    // 全句の書き込み後も満たされない参照は 23503 で、文は何も書かない。
+    ddl(
+        &core,
+        "CREATE TABLE s.ft2 (k INTEGER PRIMARY KEY, p INTEGER REFERENCES s.ft2 (k))",
+    );
+    ddl(&core, "CREATE TABLE s.fs2 (k INTEGER, p INTEGER)");
+    run(&core, "INSERT INTO s.fs2 (k, p) VALUES (3, 99), (4, NULL)").expect("seed");
+    let (code, _) = err_code(
+        &core,
+        "MERGE INTO s.ft2 AS d USING s.fs2 AS e ON d.k = e.k \
+         WHEN NOT MATCHED AND e.k = 3 THEN INSERT (k, p) VALUES (e.k, e.p) \
+         WHEN NOT MATCHED THEN INSERT (k, p) VALUES (e.k, e.p)",
+    );
+    assert_eq!(code, "23503");
+    assert_eq!(
+        rows_of(&core, "alice", "SELECT COUNT(*) FROM s.ft2"),
+        "Integer(0)"
+    );
+}

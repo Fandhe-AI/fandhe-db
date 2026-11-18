@@ -684,6 +684,10 @@ impl EngineCore {
                 _ => return Err(merge_plan_mismatch()),
             }
         }
+        // 句ごとのバッチ間の FK 参照（自己参照を含む）を文単位の検査と同じ意味にするため、複数バッチのときは
+        // 行ごとの FK 検査を先送りし、全バッチの書き込み後に 1 回検査する（Issue #3354）。
+        let fk_defer = (insert_bounds.len() > 1)
+            .then(|| crate::tenant::InsertFkDeferScope::enter(target_table));
         for bounds in &insert_bounds {
             let outcome = crate::sql::exec::execute_insert_batch_with_schema_in(
                 WriteTarget::InTxn(write_txn),
@@ -694,6 +698,15 @@ impl EngineCore {
                 Some(&self.trigger_runtime.bind(self)),
             )?;
             rows_affected = rows_affected.saturating_add(outcome.rows_affected);
+        }
+        if fk_defer.is_some() {
+            drop(fk_defer);
+            crate::constraint::enforce_immediate_foreign_keys_by_scan_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                target_table,
+            )
+            .map_err(crate::sql::exec::map_insert_write_error)?;
         }
         drop(generated_scope);
         let written = trigger_scope.take();
