@@ -95,6 +95,19 @@ impl EngineCore {
                     ExplainDml::DeleteUsing(v) => {
                         Some(self.plan_delete_using_stmt(v, session.udfs()))
                     }
+                    // `MERGE`（Issue #3357）の `output:` も Describe と同じ列（束縛済み `RETURNING`）。
+                    ExplainDml::Merge(v) => {
+                        let bound = self.bind_merge_stmt(session, v, session.udfs(), &[], None)?;
+                        if let Some(ret) = bound.returning() {
+                            let columns = crate::sql::dml_from_returning::column_meta(ret);
+                            let names: Vec<&str> = columns
+                                .iter()
+                                .map(crate::sql::view_buffered::column_name)
+                                .collect();
+                            lines.extend(output_line(names)?);
+                        }
+                        return Ok(lines);
+                    }
                     _ => None,
                 } {
                     let plan = joined_plan?;
@@ -112,9 +125,9 @@ impl EngineCore {
                     ExplainDml::Delete(v) => (v.table_name(), v.returning()),
                     ExplainDml::Update(v) => (v.table_name(), v.returning()),
                     // 上で処理済み（到達しない）。
-                    ExplainDml::UpdateFrom(_) | ExplainDml::DeleteUsing(_) => {
-                        return Err(internal())
-                    }
+                    ExplainDml::UpdateFrom(_)
+                    | ExplainDml::DeleteUsing(_)
+                    | ExplainDml::Merge(_) => return Err(internal()),
                 };
                 let schema = self.load_table_schema_for_dml(table)?;
                 if let Some(projection) = crate::sql::parser::bind_returning_with_udfs(

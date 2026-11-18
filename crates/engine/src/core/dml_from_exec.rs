@@ -57,7 +57,7 @@ pub(super) fn is_joined_explain_analyze(parsed: &super::ParsedSql) -> bool {
             if matches!(
                 &ea.target,
                 ExplainAnalyzeDmlTarget::Dml(
-                    ExplainDml::UpdateFrom(_) | ExplainDml::DeleteUsing(_)
+                    ExplainDml::UpdateFrom(_) | ExplainDml::DeleteUsing(_) | ExplainDml::Merge(_)
                 )
             )
     )

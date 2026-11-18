@@ -82,6 +82,10 @@ impl ExplainAnalyzeDml {
             ExplainAnalyzeDmlTarget::Dml(ExplainDml::DeleteUsing(v)) => {
                 v.operation_id().map(|id| id.as_str())
             }
+            // `MERGE`（Issue #3357）。ANALYZE は台帳に記録される実行なので内側の値を使う。
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Merge(v)) => {
+                v.operation_id().map(|id| id.as_str())
+            }
             ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
                 ExplainInsertTarget::Values(v) => v.operation_id.as_ref().map(|id| id.as_str()),
                 ExplainInsertTarget::Select { insert, .. } => {

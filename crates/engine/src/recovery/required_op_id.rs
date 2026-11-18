@@ -52,6 +52,16 @@ impl std::fmt::Display for MissingOperationId {
 impl std::error::Error for MissingOperationId {}
 
 impl LedgerMode {
+    /// 1 文の台帳を文全体で 1 エントリへ集約する文（データ変更 CTE・`MERGE`）の、内側の書き込み区間が
+    /// 使う台帳モード。`Ledgered`・`Optional` は `Optional`（区間ごとの `operation_id` 必須判定で `23502` に
+    /// ならず、記録もしない）、`CompareOnlyWithoutLedger` はそのまま。
+    pub(crate) fn substatement_mode(self) -> LedgerMode {
+        match self {
+            LedgerMode::Ledgered | LedgerMode::Optional => LedgerMode::Optional,
+            LedgerMode::CompareOnlyWithoutLedger => LedgerMode::CompareOnlyWithoutLedger,
+        }
+    }
+
     /// `op_id` が `operation_id` 必須化の要件を満たすかを判定する（RECOVER-1）。
     /// 副作用なしの純関数。判定結果は呼び出し元が `wire_code` へ写像する。
     pub fn require(

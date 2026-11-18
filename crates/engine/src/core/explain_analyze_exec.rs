@@ -95,6 +95,8 @@ fn exec_parsed(ea: &ExplainAnalyzeDml) -> ParsedSql {
         ExplainAnalyzeDmlTarget::Dml(ExplainDml::DeleteUsing(v)) => {
             ParsedSql::DeleteUsing(v.clone())
         }
+        // `MERGE`（Issue #3357）。通常の `MERGE` と同じ値で実行する（台帳にも記録される）。
+        ExplainAnalyzeDmlTarget::Dml(ExplainDml::Merge(v)) => ParsedSql::Merge(v.clone()),
         ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
             ExplainInsertTarget::Values(v) => ParsedSql::Insert((**v).clone()),
             ExplainInsertTarget::Select { insert, .. } => {
@@ -138,7 +140,10 @@ impl EngineCore {
         let observe = crate::sql::hnsw_observe::enter();
         let rows = match run(session, &exec)? {
             SqlOutcome::Returning(o) => o.result.rows.len(),
-            SqlOutcome::Insert(_) | SqlOutcome::Update(_) | SqlOutcome::Delete(_) => 0,
+            SqlOutcome::Insert(_)
+            | SqlOutcome::Update(_)
+            | SqlOutcome::Delete(_)
+            | SqlOutcome::Merge(_) => 0,
             _ => return Err(internal()),
         };
         let execution_ms = exec_start.elapsed().as_secs_f64() * 1000.0;

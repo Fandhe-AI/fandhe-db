@@ -468,6 +468,7 @@ fn describe_returns_the_same_columns_as_execute() {
 }
 
 // 束縛エラーと未対応の形は書き込みより前に返り、副作用ゼロ（台帳も消費しない）。
+// intentional: docs/design/sql-merge.md
 #[test]
 fn rejections_keep_their_sqlstate_and_leave_no_side_effects() {
     let (core, _g) = new_core("sql79r-reject");
@@ -488,11 +489,6 @@ fn rejections_keep_their_sqlstate_and_leave_no_side_effects() {
         (format!("{head} RETURNING merge_action() || 'x'"), "0A000"),
         (format!("{head} RETURNING upper(merge_action())"), "0A000"),
         (format!("{head} RETURNING merge_action(1)"), "0A000"),
-        // 台帳記録（#3357）。
-        (
-            format!("{head} RETURNING t.k USING OPERATION_ID 'op-1'"),
-            "0A000",
-        ),
         // データ変更 CTE の中の MERGE。
         (
             format!("WITH m AS ({head} RETURNING t.k) SELECT * FROM m"),
@@ -505,6 +501,28 @@ fn rejections_keep_their_sqlstate_and_leave_no_side_effects() {
             assert_eq!(got, code, "{text}");
             assert_eq!(before, snapshot(&core), "{text}");
         }
+    }
+}
+
+// `RETURNING` つきの台帳記録（#3357）: 行を返し、再送は `23505`、`RETURNING` を外した再送も同じ文として `23505`。
+#[test]
+fn returning_with_an_operation_id_records_once_and_replays_23505() {
+    let (core, _g) = new_core("sql79r-ledger");
+    seed(&core);
+    let head = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE";
+    let with = format!("{head} RETURNING t.k USING OPERATION_ID 'op-1'");
+    let out = format!(
+        "{:?}",
+        run(&core, &with).unwrap_or_else(|e| panic!("{with}: {e:?}"))
+    );
+    assert!(out.starts_with("Returning("), "{out}");
+    assert!(out.contains("Text(\"a\")"), "{out}");
+    let after_first = snapshot(&core);
+    let without = format!("{head} USING OPERATION_ID 'op-1'");
+    for text in [with.clone(), format!("{with};"), without] {
+        let (code, _) = run(&core, &text).expect_err(&text);
+        assert_eq!(code, "23505", "{text}");
+        assert_eq!(after_first, snapshot(&core), "{text}");
     }
 }
 

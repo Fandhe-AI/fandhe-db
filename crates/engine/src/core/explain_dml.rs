@@ -8,6 +8,8 @@
 //! 副作用ゼロ（SQL-75 (3)）: write txn・writer・台帳・ジョブ表・行・シーケンス・トリガ・世代のいずれにも
 //! 触れない。使うのは読み取りのスキーマ取得（`load_table_schema_for_dml`）と純粋な束縛・ハッシュ計算だけ。
 //!
+//! `MERGE`（Issue #3357）も同じ入口で受理し、木は `core/merge_exec.rs` の `merge_explain_outcome` が組む。
+//!
 //! 結合形 `UPDATE ... FROM`／`DELETE ... USING`（Issue #3293）も同じ入口で受理し、実行器
 //! （`sql::join::dml`）と同じ束縛・変換・走査前検証・source 走査の束縛（`source_bound_scan`）で
 //! 木を組む。source 側の行・索引には触れず、読むのはスキーマと GIN 宣言だけ。
@@ -73,6 +75,8 @@ impl EngineCore {
             // `$n` は構文入口（拡張クエリの Parse ゲート）が前置つきでも `42601` で拒否済み。
             ParsedSql::UpdateFrom(v) => Ok(ParsedSql::ExplainDml(ExplainDml::UpdateFrom(v))),
             ParsedSql::DeleteUsing(v) => Ok(ParsedSql::ExplainDml(ExplainDml::DeleteUsing(v))),
+            // `MERGE`（Issue #3357）も同じ。`$n` は構文入口が `42601` で拒否済み。
+            ParsedSql::Merge(v) => Ok(ParsedSql::ExplainDml(ExplainDml::Merge(v))),
             // 一時表（`SessionRouted`）は呼び出し元の振り分けが分類するため、ここへは来ない想定。
             // それ以外は固定文で拒否する（fail-closed）。
             _ => Err(reject(
@@ -134,6 +138,7 @@ impl EngineCore {
                     udfs,
                 );
             }
+            ExplainDml::Merge(stmt) => return self.merge_explain_outcome(session, stmt),
             ExplainDml::DeleteUsing(stmt) => {
                 let (plan, read_txn) = self.plan_delete_using_stmt_with_txn(stmt, udfs)?;
                 return self.joined_explain_outcome(

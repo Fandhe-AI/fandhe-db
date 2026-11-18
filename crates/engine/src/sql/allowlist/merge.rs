@@ -4,7 +4,7 @@
 //! 先頭語 `MERGE` を見て [`validate_merge_tokens_with_limits`] を呼び、`ParsedSql::Merge` を返す。
 //! 実行系（`execute_parsed_in_session`・明示 Tx・Describe）は束縛（#3352。`sql::merge_bind`・
 //! `core::merge_exec`）を通して実行する（`WHEN MATCHED` は #3353、`NOT MATCHED [BY TARGET|BY SOURCE]` は #3354）。
-//! 対象外の形は固定文言の `0A000` で止める（副作用ゼロ）。台帳・`OpTag`・`EXPLAIN` は #3357 が担当する。
+//! 対象外の形は固定文言の `0A000` で止める（副作用ゼロ）。台帳（`OpTag::Merge` の文ハッシュ）は #3357 が結線し、`EXPLAIN` も同 Issue が受理する。
 //! `RETURNING` は #3356 が結線し、最上位項目の `merge_action()` だけを受理する（式の内側・他の文脈は固定文言で拒否）。
 //!
 //! 構文段の保証範囲: 構文（`42601`）、上限（`54000`）、固定文言の未対応形（`0A000`）、対象・元表の存在
@@ -99,7 +99,7 @@ pub enum MergeSource {
     },
 }
 
-/// 構文検証を通過した `MERGE` 文（SQL-79）。台帳の文ハッシュ・`OpTag` は持たない（#3357）。
+/// 構文検証を通過した `MERGE` 文（SQL-79）。
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct ValidatedMerge {
@@ -115,9 +115,17 @@ pub struct ValidatedMerge {
     pub(crate) returning: Option<crate::sql::dml_from_returning::DmlFromReturning>,
     /// 文末の `USING OPERATION_ID`。
     pub(crate) operation_id: Option<OperationId>,
+    /// 台帳の文ハッシュ（Issue #3357。`OpTag::Merge`。`USING OPERATION_ID`・末尾 `;`・最上位の `RETURNING` を
+    /// 除いたトークン列だけが材料）。全検証の後に算出する。
+    pub(crate) statement_hash: crate::recovery::content_hash::ContentHash,
 }
 
 impl ValidatedMerge {
+    /// 台帳の文ハッシュ（再送の事前照合と確定記録に使う）。
+    pub(crate) fn statement_hash(&self) -> &crate::recovery::content_hash::ContentHash {
+        &self.statement_hash
+    }
+
     /// 対象の表名（別名ではなく実表名）。
     pub fn target_table(&self) -> &str {
         self.target.table()
@@ -162,6 +170,8 @@ struct ParsedMerge {
     on: JoinWhereExpr,
     when_clauses: Vec<MergeWhenClause>,
     returning: Option<crate::sql::dml_from_returning::DmlFromReturning>,
+    /// 最上位の `RETURNING` を読み始めたトークン位置（台帳の文ハッシュの材料の終端。Issue #3357）。
+    returning_start: Option<usize>,
     operation_id: Option<OperationId>,
 }
 
@@ -178,6 +188,9 @@ impl<'a> Parser<'a> {
         self.expect_ident_matching("ON")?;
         let on = parse_join_where_dml(self)?;
         let when_clauses = self.parse_merge_when_clauses(&target)?;
+        let returning_start = self
+            .peek_contextual_keyword("RETURNING")
+            .then_some(self.pos);
         let returning = self.parse_merge_returning_clause(target.exposed_name())?;
         self.reject_merge_partitioned()?;
         let operation_id = self.parse_operation_id_clause()?;
@@ -188,6 +201,7 @@ impl<'a> Parser<'a> {
             on,
             when_clauses,
             returning,
+            returning_start,
             operation_id,
         })
     }
@@ -602,6 +616,17 @@ pub(crate) fn validate_merge_tokens_with_limits(
             }
         }
     };
+    // 台帳の文ハッシュ（Issue #3357。SQL-79・設計記録 D11）。全検証の後に算出し、検証順とエラーコードは
+    // 変えない。`RETURNING` 以降には `USING OPERATION_ID` と `;` しか来ないため、位置があればそこまでを材料にする。
+    let material = match parsed.returning_start.and_then(|n| tokens.get(..n)) {
+        Some(head) => head,
+        None => crate::recovery::content_hash::strip_operation_id_clause(tokens),
+    };
+    let statement_hash = crate::recovery::content_hash::for_merge(material).map_err(|_| {
+        SqlSurfaceError::Internal {
+            detail: "internal error".to_string(),
+        }
+    })?;
     Ok(ValidatedMerge {
         target: parsed.target,
         source,
@@ -609,6 +634,7 @@ pub(crate) fn validate_merge_tokens_with_limits(
         when_clauses: parsed.when_clauses,
         returning: parsed.returning,
         operation_id: parsed.operation_id,
+        statement_hash,
     })
 }
 
@@ -692,6 +718,26 @@ mod tests {
         .expect("returning + operation_id");
         assert!(v.returning.is_some());
         assert!(v.operation_id().is_some());
+    }
+
+    #[test]
+    fn statement_hash_ignores_returning_operation_id_and_semicolon() {
+        let head = format!("{HEAD} WHEN MATCHED THEN DELETE");
+        let base = parse(&head).expect("base").statement_hash;
+        for text in [
+            format!("{head};"),
+            format!("{head} USING OPERATION_ID 'x'"),
+            format!("{head} RETURNING t.id"),
+            format!("{head} RETURNING t.id, t.k USING OPERATION_ID 'y';"),
+        ] {
+            assert_eq!(base, parse(&text).expect(&text).statement_hash, "{text}");
+        }
+        for other in [
+            format!("{HEAD} WHEN MATCHED THEN DO NOTHING"),
+            format!("{head} WHEN NOT MATCHED THEN DO NOTHING"),
+        ] {
+            assert_ne!(base, parse(&other).expect(&other).statement_hash, "{other}");
+        }
     }
 
     #[test]
