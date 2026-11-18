@@ -147,11 +147,14 @@ struct SetItem {
     src_cols: Vec<usize>,
 }
 
-/// 元の列の単純コピー項（対象列型と元の列型は一致を確認済み）。
+/// 元の列の単純コピー項。`UPDATE SET` は対象列型と元の列型の一致を確認済み。`INSERT` は型が異なっても
+/// 代入できる組（`assignable`。例: 整数 → NUMERIC）を受け、評価時に `INSERT ... SELECT` と同じ代入変換
+/// （`sql::insert_select::ConversionPlan`）で運ぶ。
 #[derive(Debug, Clone)]
 struct CopyItem {
     column_index: usize,
     source_column: usize,
+    source_ty: ColumnType,
     target_ty: ColumnType,
     nullable: bool,
     column_name: String,
@@ -238,7 +241,7 @@ pub(crate) fn plan_merge(
         let by_target = kind == MergeMatchKind::NotMatchedByTarget;
         let action = match clause.action() {
             BoundMergeAction::Update(a) if !by_target => {
-                let set = plan_set(a, target_schema, source_schema)?;
+                let set = plan_set(a, target_schema, source_schema, false)?;
                 for it in &set.items {
                     for &i in &it.src_cols {
                         push_col(&mut columns, i);
@@ -308,13 +311,14 @@ pub(crate) fn plan_merge(
 }
 
 /// `INSERT` 句を [`InsertPlan`] へ写す。値の 4 種は `UPDATE SET` と同じ [`plan_set`] を通す（`BoundAssignments` が
-/// 同じ形のため。元の疑似列 `id` を通常の列へ入れる形は `plan_set` が固定文言の `0A000` で拒否する）。
+/// 同じ形のため。型が異なる列参照のコピーは代入できる組だけ受ける。元の疑似列 `id` を通常の列へ入れる形は
+/// `plan_set` が固定文言の `0A000` で拒否する）。
 fn plan_insert(
     ins: &BoundMergeInsert,
     target_schema: &TableSchema,
     source_schema: &TableSchema,
 ) -> Result<InsertPlan, SqlSurfaceError> {
-    let set = plan_set(ins.values(), target_schema, source_schema)?;
+    let set = plan_set(ins.values(), target_schema, source_schema, true)?;
     let id_value = match ins.id_value() {
         None => None,
         Some(MergeIdValue::Literal(n)) => Some(IdPlan::Literal(*n)),
@@ -337,6 +341,7 @@ fn plan_set(
     a: &BoundAssignments,
     target_schema: &TableSchema,
     source_schema: &TableSchema,
+    convert_copies: bool,
 ) -> Result<SetPlan, SqlSurfaceError> {
     let mut set = SetPlan {
         literals: a.literals().to_vec(),
@@ -381,7 +386,7 @@ fn plan_set(
                 let src_idx = match resolved.slot() {
                     ColumnSlot::Id => {
                         return Err(SqlSurfaceError::feature_not_supported(
-                            "MERGE: the pseudo column id of the USING source cannot be used in SET",
+                            "MERGE: the pseudo column id of the USING source can be used only as the id value of an INSERT",
                         ));
                     }
                     ColumnSlot::Column(i) => i,
@@ -416,8 +421,10 @@ fn plan_set(
                     });
                 } else {
                     // 式経路が受理しない代入先の型（JSONB・UUID・BYTEA・NUMERIC・ENUM 等）。型が一致する
-                    // 組だけを単純コピーで運ぶ。
-                    if src_col.ty != target_col.ty {
+                    // 組を単純コピーで運ぶ。INSERT（`convert_copies`）は代入できる組を代入変換で運ぶ。
+                    let convertible = convert_copies
+                        && crate::sql::insert_select::assignable(&src_col.ty, &target_col.ty);
+                    if src_col.ty != target_col.ty && !convertible {
                         return Err(SqlSurfaceError::datatype_mismatch(format!(
                             "column {:?} cannot be assigned a value of a different type",
                             target_col.name
@@ -426,6 +433,7 @@ fn plan_set(
                     set.copies.push(CopyItem {
                         column_index: *idx,
                         source_column: src_idx,
+                        source_ty: src_col.ty.clone(),
                         target_ty: target_col.ty.clone(),
                         nullable: target_col.nullable,
                         column_name: target_col.name.clone(),
@@ -480,6 +488,8 @@ struct SetEval<'p> {
     items: Vec<Vec<(usize, ColumnType)>>,
     /// コピー項ごとのセル位置。
     copies: Vec<usize>,
+    /// コピー項ごとの代入変換（元の列型と対象列型が異なる項だけ。INSERT のみ）。
+    copy_conversions: Vec<Option<crate::sql::insert_select::ConversionPlan>>,
 }
 
 impl<'p> MergeEval<'p> {
@@ -547,15 +557,31 @@ impl<'p> MergeEval<'p> {
                         items.push(cells);
                     }
                     let mut copies = Vec::with_capacity(sp.copies.len());
+                    let mut copy_conversions = Vec::with_capacity(sp.copies.len());
                     for cp in &sp.copies {
                         copies.push(
                             joined.source_cell_position(ColumnSlot::Column(cp.source_column))?,
                         );
+                        copy_conversions.push(if cp.source_ty == cp.target_ty {
+                            None
+                        } else {
+                            Some(crate::sql::insert_select::ConversionPlan::build(
+                                &joined.target.schema,
+                                &[crate::sql::insert_select::TargetColumn::Column(
+                                    cp.column_index,
+                                )],
+                                &[crate::sql::exec::ColumnMeta::Scalar {
+                                    name: cp.column_name.clone(),
+                                    ty: cp.source_ty.clone(),
+                                }],
+                            )?)
+                        });
                     }
                     Some(SetEval {
                         plan: sp,
                         items,
                         copies,
+                        copy_conversions,
                     })
                 }
                 None => None,
@@ -756,7 +782,7 @@ impl<'p> MergeEval<'p> {
         for (idx, v) in &sp.literals {
             push_value(&mut out, *idx, v.clone(), target_schema, charge)?;
         }
-        for (cp, &pos) in sp.copies.iter().zip(&se.copies) {
+        for ((cp, &pos), conv) in sp.copies.iter().zip(&se.copies).zip(&se.copy_conversions) {
             let cell = row
                 .cells
                 .get(pos)
@@ -764,7 +790,16 @@ impl<'p> MergeEval<'p> {
             if matches!(cell, Cell::Null) && !cp.nullable {
                 return Err(SqlSurfaceError::not_null_violation(&cp.column_name));
             }
-            let value = copy_cell_to_value(cell.clone(), &cp.target_ty)?;
+            let value = match conv {
+                None => copy_cell_to_value(cell.clone(), &cp.target_ty)?,
+                Some(plan) => {
+                    let column = target_schema
+                        .columns
+                        .get(cp.column_index)
+                        .ok_or_else(|| internal("target column out of range"))?;
+                    plan.convert_single(cell.clone(), column)?
+                }
+            };
             push_value(&mut out, cp.column_index, value, target_schema, charge)?;
         }
         for (it, cells) in sp.items.iter().zip(&se.items) {
@@ -867,3 +902,7 @@ impl CondEval {
         Ok(true)
     }
 }
+
+#[cfg(test)]
+#[path = "merge_plan_tests.rs"]
+mod tests;

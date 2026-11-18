@@ -539,7 +539,7 @@ fn pt_rows(core: &EngineCore) -> String {
 }
 
 #[test]
-fn an_omitted_id_is_assigned_by_the_write_path_for_migrated_tables() {
+fn ids_are_allocated_by_the_write_path_for_tables_without_a_pseudo_id() {
     for text in with_semicolon(
         "MERGE INTO s.pt AS d USING s.ps AS e ON d.k = e.k \
          WHEN NOT MATCHED THEN INSERT (k, x) VALUES (e.k, e.v)",
@@ -893,6 +893,8 @@ fn another_tenants_private_rows_are_neither_deleted_updated_nor_inserted() {
     );
 }
 
+// 対象表に INSERT 側の利用者ポリシーが適用されると、ポリシーの合成を入れる #3355 まで拒否する。行は書かない。
+// tracked: #3355
 #[test]
 fn an_insert_policy_on_the_target_is_rejected_without_writing() {
     let (core, _g) = new_core("sql79n-policy");
@@ -949,4 +951,99 @@ fn the_insert_privilege_is_required_for_a_merge_with_an_insert_clause() {
     );
     operator("GRANT INSERT ON tx TO bob");
     assert_eq!(as_bob(ins), "ok");
+}
+
+// ---------------------------------------------------------------------
+// 列参照のコピー（型が異なる代入・疑似列 id）と DEFAULT 時刻
+// ---------------------------------------------------------------------
+
+#[test]
+fn column_copies_convert_assignable_types_like_insert_select() {
+    let (core, _g) = new_core("sql79n-convert");
+    ddl(&core, "CREATE SCHEMA s");
+    ddl(&core, "CREATE TABLE s.cn (k TEXT, n NUMERIC(10,2))");
+    ddl(&core, "CREATE TABLE s.cs (k TEXT, i INTEGER)");
+    run(
+        &core,
+        "INSERT INTO s.cs (k, i) VALUES ('p', 5), ('q', NULL)",
+    )
+    .expect("seed");
+    // 整数 → NUMERIC は式経路が受けない代入先の型だが、INSERT ... SELECT と同じ代入変換で運ぶ。
+    assert_eq!(
+        merged(
+            &core,
+            "MERGE INTO s.cn AS d USING s.cs AS e ON d.k = e.k \
+             WHEN NOT MATCHED THEN INSERT (k, n) VALUES (e.k, e.i)"
+        ),
+        2
+    );
+    assert_eq!(
+        rows_of(&core, "alice", "SELECT k, n FROM s.cn ORDER BY k LIMIT 10"),
+        rows_of(
+            &core,
+            "alice",
+            "SELECT k, CAST(i AS NUMERIC(10,2)) FROM s.cs ORDER BY k LIMIT 10"
+        )
+    );
+}
+
+#[test]
+fn the_source_pseudo_id_is_only_usable_as_the_insert_id() {
+    let (core, _g) = new_core("sql79n-pseudo-id");
+    seed(&core);
+    let before = snapshot(&core);
+    let (code, msg) = err_code(
+        &core,
+        "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN \
+         INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.id)",
+    );
+    assert_eq!(code, "0A000");
+    assert_eq!(
+        msg,
+        "feature not supported: MERGE: the pseudo column id of the USING source can be used only as the id value of an INSERT"
+    );
+    assert_eq!(before, snapshot(&core));
+}
+
+#[test]
+fn a_null_or_negative_source_id_is_rejected_without_side_effects() {
+    let (core, _g) = new_core("sql79n-bad-id");
+    seed(&core);
+    insert_s(&core, "alice", &[(5, "e", None)]);
+    let before = snapshot(&core);
+    // 疑似列 id へ NULL の元の列を流す形は `22000`（INSERT ... SELECT と同じ規則）。文全体が無効になる。
+    let (code, _) = err_code(
+        &core,
+        "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN \
+         INSERT (id, embedding, k, x) VALUES (s.v, s.embedding, s.k, 1)",
+    );
+    assert_eq!(code, "22000");
+    assert_eq!(before, snapshot(&core));
+}
+
+#[test]
+fn default_now_columns_share_the_statement_clock_in_an_explicit_transaction() {
+    let (core, _g) = new_core("sql79n-clock");
+    ddl(&core, "CREATE SCHEMA s");
+    ddl(
+        &core,
+        "CREATE TABLE s.ck (k TEXT, at TIMESTAMP DEFAULT now())",
+    );
+    ddl(&core, "CREATE TABLE s.cks (k TEXT)");
+    run(&core, "INSERT INTO s.cks (k) VALUES ('p'), ('q')").expect("seed");
+    let out = in_txn(
+        &core,
+        &[
+            "BEGIN",
+            "MERGE INTO s.ck AS d USING s.cks AS e ON d.k = e.k WHEN NOT MATCHED THEN INSERT (k) VALUES (e.k)",
+            "INSERT INTO s.ck (k) VALUES ('plain')",
+            "COMMIT",
+        ],
+    );
+    assert!(out.iter().all(Result::is_ok), "{out:?}");
+    // 同じ Tx 内の MERGE の INSERT と単独の INSERT は、DEFAULT now() に同じ（トランザクション開始）時刻を書く。
+    assert_eq!(
+        rows_of(&core, "alice", "SELECT COUNT(DISTINCT at) FROM s.ck"),
+        "Integer(1)"
+    );
 }

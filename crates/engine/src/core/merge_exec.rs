@@ -499,7 +499,9 @@ impl EngineCore {
         let mut insert_rows: BTreeMap<usize, Vec<InsertRow>> = BTreeMap::new();
         let mut insert_total: usize = 0;
         if by_target_clauses > 0 {
-            probe.charge_comparisons(index.rows.len().saturating_mul(by_target_clauses))?;
+            // 条件評価は一致しなかった行だけが受けるため、その行数だけを計上する（一致した行は評価しない）。
+            let unmatched = matched_flags.iter().filter(|m| !**m).count();
+            probe.charge_comparisons(unmatched.saturating_mul(by_target_clauses))?;
             for (n, row) in index.rows.iter().enumerate() {
                 if n % 1024 == 0 {
                     crate::interrupt::check()?;

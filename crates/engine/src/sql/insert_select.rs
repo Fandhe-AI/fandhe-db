@@ -329,6 +329,30 @@ impl ConversionPlan {
         })
     }
 
+    /// 1 列だけの計画（`targets`・`source` が 1 要素）で、セル 1 つを挿入先の列の値へ変換する
+    /// （`MERGE ... WHEN NOT MATCHED THEN INSERT` の列参照コピー。Issue #3354）。`INSERT ... SELECT` の
+    /// [`rows_to_bound_inserts`] の行内ループと同じ規則（代入変換 → 直接変換。NULL は非 nullable 列で `23502`）。
+    pub(crate) fn convert_single(
+        &self,
+        cell: Cell,
+        column: &ColumnDef,
+    ) -> Result<Value, SqlSurfaceError> {
+        let mut assigned = if self.has_assign() {
+            self.convert_assigned(std::slice::from_ref(&cell))?
+        } else {
+            Vec::new()
+        };
+        match assigned.get_mut(0).and_then(Option::take) {
+            Some(v) => {
+                if matches!(v, Value::Null) && !column.nullable {
+                    return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                }
+                Ok(v)
+            }
+            None => cell_to_insert_value(cell, column),
+        }
+    }
+
     /// 代入変換が 1 列でもあるか（無ければ行ごとの encode を省く）。
     fn has_assign(&self) -> bool {
         self.src_schema.is_some()

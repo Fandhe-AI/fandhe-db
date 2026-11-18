@@ -281,6 +281,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 ### INSERT 句の評価と書き込み
 
 - 値の 4 種（列参照・リテラル・定数式・元の列を含む式）は `UPDATE SET` と同じ計画と評価関数を共有する。裸の `DEFAULT`・列リストにない列は「省略列」として `finish_bound_insert`（`fill_omitted_columns`）が補完する（DEFAULT・生成列・IDENTITY／`DEFAULT nextval` の印）。`DEFAULT nextval` と IDENTITY の採番は複数行 VALUES と同じく書き込み段が文の中で行う
+- 列参照のコピー: 式経路が受けない代入先の型（NUMERIC・ENUM・JSONB 等）への、型が異なる列参照（`assignable` な組。例: 整数 → NUMERIC）は、`INSERT ... SELECT` と同じ代入変換（`sql::insert_select::ConversionPlan::convert_single`）で運ぶ。`UPDATE SET` は従来どおり型が一致する組だけ（異なる組は `42804`）
 - 疑似列 `id`: 元の整数列・疑似列 `id` は `INSERT ... SELECT` と同じ規則（NULL・負数は `22000`）、リテラルはその値、移行済み表の省略は書き込み段が採番する
 - 影響行数の上限は UPDATE・DELETE・INSERT の計画件数の合計で判定する（DO NOTHING は数えない）。INSERT の行数上限とバッチの上限（INDEX-4）も第 3 段より前に判定する。いずれも超過は `54000` で副作用ゼロ
 - 書き込みは句ごとに `sql::exec::execute_insert_batch_with_schema_in`（共有 write txn）へ渡す。バッチは `id` 省略の一様性を要求し、句ごとに列リストが異なるため。挿入は対象を走査し直さないので、句数（構文段の上限）× 行数のコストにはならない。台帳は記録しない（`operation_id` は渡さない。#3357）
@@ -303,6 +304,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | ビュー対象・文トリガ・利用者ポリシー（INSERT ポリシーを含む）・行トリガ順の再判断 | #3355 |
 | PG17 との突き合わせ・3 テナントの越境の網羅 | #3358 |
 | ON の片側 conjunct の押し下げ | 対応しない（上記） |
+| 元の疑似列 `id` を `id` 以外の列の値にする形（`INSERT (id, x) VALUES (s.id, s.id)` 等） | 対応しない（現行の制限として固定する。固定文言の `0A000`。要望が出た時点で別途起票する）。UPDATE の SET の同じ形と同じ制限 |
 
 ## セキュリティ
 
