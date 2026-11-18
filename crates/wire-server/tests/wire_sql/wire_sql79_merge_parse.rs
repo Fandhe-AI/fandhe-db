@@ -1,8 +1,8 @@
 //! `MERGE` 文の構文解析と実行（SQL-79・Issue #3351・#3353）の pg wire 結合テスト。
 //!
 //! 簡易クエリ（psql 流の末尾 `;` 付き単独送信を含む）と拡張クエリ（Parse／Bind／Execute／Sync と
-//! Parse／Describe／Sync）で、解析を通った `WHEN MATCHED` だけの MERGE が `CommandComplete MERGE n` で完了し、
-//! 実行に結線されていない形（NOT MATCHED・`RETURNING`）が ErrorResponse `0A000` になり、ReadyForQuery の
+//! Parse／Describe／Sync）で、解析を通った MERGE が `CommandComplete MERGE n` で完了し、
+//! 実行に結線されていない形（`RETURNING`）が ErrorResponse `0A000` になり、ReadyForQuery の
 //! 状態が正しいことを固定する。束縛と値位置の `$n` は `wire_sql79_merge_bind.rs`（Issue #3352）、`21000`・
 //! 拡張クエリの `$n` の実行は `wire_sql79_merge_matched.rs`（Issue #3353）。
 //! サーバーはポート 0・一意な一時ディレクトリで独立させ、時間計測は使わない。
@@ -139,18 +139,24 @@ fn simple_query_merge_alone_with_semicolon_runs_and_ready_idle() {
     assert_eq!(count_t(&mut s), "1");
 }
 
-// NOT MATCHED を含む形は、実行を入れる #3354 まで固定文言の `0A000` で拒否する。行は変わらない。
-// tracked: #3354
+// NOT MATCHED を含む形は #3354 から実行される。元だけにある行（k = 2）を 1 回目で挿入し（`MERGE 1`）、
+// 2 回目（末尾 `;` 付き）は一致するので何もしない（`MERGE 0`）。
 #[test]
-fn simple_query_not_matched_alone_with_semicolon_is_0a000_and_ready_idle() {
+fn simple_query_not_matched_alone_with_semicolon_runs_and_ready_idle() {
     let (addr, _g) = start();
     let mut s = client(addr);
-    for sql in [NOT_MATCHED_SQL.to_string(), format!("{NOT_MATCHED_SQL};")] {
+    send_simple_query(&mut s, "INSERT INTO s (k, v) VALUES (2, 200)");
+    assert_eq!(read_command_complete(&mut s), "INSERT 0 1");
+    read_ready_for_query(&mut s);
+    for (sql, want) in [
+        (NOT_MATCHED_SQL.to_string(), "MERGE 1"),
+        (format!("{NOT_MATCHED_SQL};"), "MERGE 0"),
+    ] {
         send_simple_query(&mut s, &sql);
-        expect_error_response_with_sqlstate(&mut s, "0A000");
+        assert_eq!(read_command_complete(&mut s), want, "{sql}");
         assert_eq!(read_ready_for_query_status(&mut s), b'I');
+        assert_eq!(count_t(&mut s), "2", "{sql}");
     }
-    assert_eq!(count_t(&mut s), "1");
 }
 
 #[test]

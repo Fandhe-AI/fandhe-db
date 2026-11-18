@@ -1,5 +1,5 @@
-//! `MERGE ... WHEN MATCHED` の実行計画と、組ごとの WHEN 選択・SET 評価（SQL-79・Issue #3353。親 #3349、
-//! 設計記録は `docs/design/sql-merge.md` の D3・D4・D5）。
+//! `MERGE` の実行計画と、組ごとの WHEN 選択・SET／INSERT 値の評価（SQL-79・Issue #3353・#3354。親 #3349、
+//! 設計記録は `docs/design/sql-merge.md` の D3・D4・D5・§10）。
 //!
 //! 責務境界: 束縛済みの [`BoundMerge`]（#3352。relation 添字は 0 = 対象、1 = 元）を、既存の結合 DML の実行入力
 //! （[`JoinedDmlPlan`]。`UPDATE ... FROM` の probe・ハッシュ結合をそのまま使う。第 2 の結合実行器は作らない）と、
@@ -17,8 +17,16 @@
 //! 振り分けている。両方を評価しないと条件が黙って広がるため、[`CondPlan`] は両方を持つ。キーの比較は
 //! `ON` の結合と同じ正準バイト列（`encode_key_component`）の一致で行い、どちらかが NULL なら真にしない。
 //!
-//! 押し下げ（D3）は本 Issue では行わない: `ON` の等値キー以外はすべて残余に残す。正しさが押し下げの有無に
-//! 依存しないため。BY TARGET／BY SOURCE の有無を見て最適化する判断は #3354 が担う。
+//! 押し下げ（D3）は行わない（#3353・#3354 とも）: `ON` の等値キー以外はすべて残余に残す。正しさが押し下げの
+//! 有無に依存しないうえ、片側だけを参照する conjunct を押し下げると BY TARGET／BY SOURCE の「未一致」になる行
+//! の集合が変わるため（最適化のみで対応しない。理由は `sql-merge.md` §10）。
+//!
+//! 句の種類（#3354）: 評価は種類ごとに分ける。`WHEN MATCHED` は対象行 ++ 元行のビュー（[`MergeEval::choose_matched`]）、
+//! `WHEN NOT MATCHED BY SOURCE` は対象行だけ（元の列は空。[`MergeEval::choose_by_source`]）、
+//! `WHEN NOT MATCHED [BY TARGET]` は元の行だけ（対象の列はすべて NULL の位置埋め。[`MergeEval::choose_by_target`]）。
+//! 束縛段（`merge_bind`）が各句の可視範囲を片側に限っているため、反対側の列を参照する計画は存在しない。
+//! INSERT 句の値（[`MergeEval::eval_insert`]）は `UPDATE SET` と同じ 4 種（列参照・リテラル・定数式・元の列を
+//! 含む式）で、同じ [`SetPlan`] と評価関数を共有する（第 2 の評価器を作らない）。
 //!
 //! テナント境界（P0）: 対象側の候補（所有かつ可視）は呼び出し元が `tenant` の列挙で渡す。本モジュールは
 //! 他テナントの行を引く経路を持たない。エラー文言は固定文言と入力された名前だけで、値・件数を含めない。
@@ -27,7 +35,9 @@ use crate::catalog::{ColumnType, TableSchema};
 use crate::row_codec::{ScalarRef, Value};
 use crate::sql::allowlist::{MergeMatchKind, SqlSurfaceError, WherePredicate};
 use crate::sql::exec::{Cell, ResultRow};
-use crate::sql::merge_bind::{BoundAssignments, BoundMerge, BoundMergeAction};
+use crate::sql::merge_bind::{
+    BoundAssignments, BoundMerge, BoundMergeAction, BoundMergeInsert, MergeIdValue,
+};
 use crate::sql::relation::ColumnSlot;
 use crate::sql::set_expr::BoundSetExpr;
 use crate::sql::udf_call::Expr;
@@ -57,7 +67,7 @@ pub(crate) struct MergeSourceInput {
     pub(crate) view_predicates: Vec<WherePredicate>,
 }
 
-/// `WHEN MATCHED` だけで書かれた `MERGE` の実行計画。
+/// `MERGE` の実行計画（`WHEN MATCHED`・`NOT MATCHED BY SOURCE`・`NOT MATCHED [BY TARGET]` の句を宣言順に持つ）。
 #[derive(Debug, Clone)]
 pub(crate) struct MergeExecPlan {
     /// 結合の実行入力（`update`・`returning` は `None`。対象側の述語は空）。
@@ -69,6 +79,7 @@ pub(crate) struct MergeExecPlan {
 
 #[derive(Debug, Clone)]
 struct MergeClausePlan {
+    kind: MergeMatchKind,
     cond: Option<CondPlan>,
     action: ActionPlan,
 }
@@ -77,7 +88,28 @@ struct MergeClausePlan {
 enum ActionPlan {
     Update(SetPlan),
     Delete,
+    Insert(InsertPlan),
     DoNothing,
+}
+
+/// 1 句分の `INSERT`（BY TARGET 専用。値の 4 種は [`SetPlan`] を共有する）。
+#[derive(Debug, Clone)]
+struct InsertPlan {
+    /// 列リストの値。`DEFAULT` の裸の指定・省略列は含まない（書き込み段が省略列として補完する）。
+    set: SetPlan,
+    /// 疑似列 `id` を省略したか（移行済み表。採番は書き込み段）。
+    id_omitted: bool,
+    /// 疑似列 `id` へ与える値（省略なら `None`）。
+    id_value: Option<IdPlan>,
+}
+
+/// 疑似列 `id` へ与える値の出所。
+#[derive(Debug, Clone)]
+enum IdPlan {
+    /// 非負整数のリテラル。
+    Literal(u64),
+    /// 元の列（`None` は元の疑似列 `id`）。
+    Source(Option<usize>),
 }
 
 /// `WHEN ... AND` 条件。対象と元をまたぐ列同士の等値（キー）と、それ以外（残余）の両方を持つ。
@@ -115,11 +147,14 @@ struct SetItem {
     src_cols: Vec<usize>,
 }
 
-/// 元の列の単純コピー項（対象列型と元の列型は一致を確認済み）。
+/// 元の列の単純コピー項。`UPDATE SET` は対象列型と元の列型の一致を確認済み。`INSERT` は型が異なっても
+/// 代入できる組（`assignable`。例: 整数 → NUMERIC）を受け、評価時に `INSERT ... SELECT` と同じ代入変換
+/// （`sql::insert_select::ConversionPlan`）で運ぶ。
 #[derive(Debug, Clone)]
 struct CopyItem {
     column_index: usize,
     source_column: usize,
+    source_ty: ColumnType,
     target_ty: ColumnType,
     nullable: bool,
     column_name: String,
@@ -139,8 +174,9 @@ fn slot_column(slot: ColumnSlot) -> Option<usize> {
     }
 }
 
-/// 束縛済みの `MERGE`（MATCHED の句だけ）を実行計画へ変換する。MATCHED 以外の句・INSERT は呼び出し元が
-/// 先に拒否する前提だが、本関数も固定文言の `0A000` で fail-closed にする。
+/// 束縛済みの `MERGE` を実行計画へ変換する。句の種類と操作の組（MATCHED・BY SOURCE は UPDATE／DELETE／
+/// DO NOTHING、BY TARGET は INSERT／DO NOTHING）は構文段が保証済みだが、本関数も固定文言の `0A000` で
+/// fail-closed にする（多層防御）。
 pub(crate) fn plan_merge(
     bound: &BoundMerge,
     target_table: &str,
@@ -167,11 +203,7 @@ pub(crate) fn plan_merge(
     let mut clauses: Vec<MergeClausePlan> = Vec::with_capacity(bound.clauses().len());
     let mut needs_embedding = false;
     for clause in bound.clauses() {
-        if clause.kind() != MergeMatchKind::Matched {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "MERGE WHEN NOT MATCHED is not supported yet",
-            ));
-        }
+        let kind = clause.kind();
         let cond = match clause.condition() {
             None => None,
             Some(c) => {
@@ -206,9 +238,10 @@ pub(crate) fn plan_merge(
                 })
             }
         };
+        let by_target = kind == MergeMatchKind::NotMatchedByTarget;
         let action = match clause.action() {
-            BoundMergeAction::Update(a) => {
-                let set = plan_set(a, target_schema, source_schema)?;
+            BoundMergeAction::Update(a) if !by_target => {
+                let set = plan_set(a, target_schema, source_schema, false)?;
                 for it in &set.items {
                     for &i in &it.src_cols {
                         push_col(&mut columns, i);
@@ -220,15 +253,32 @@ pub(crate) fn plan_merge(
                 }
                 ActionPlan::Update(set)
             }
-            BoundMergeAction::Delete => ActionPlan::Delete,
+            BoundMergeAction::Delete if !by_target => ActionPlan::Delete,
             BoundMergeAction::DoNothing => ActionPlan::DoNothing,
+            BoundMergeAction::Insert(ins) if by_target => {
+                let plan = plan_insert(ins, target_schema, source_schema)?;
+                for it in &plan.set.items {
+                    for &i in &it.src_cols {
+                        push_col(&mut columns, i);
+                    }
+                }
+                for cp in &plan.set.copies {
+                    push_col(&mut columns, cp.source_column);
+                }
+                match &plan.id_value {
+                    Some(IdPlan::Source(Some(i))) => push_col(&mut columns, *i),
+                    Some(IdPlan::Source(None)) => include_pseudo_id = true,
+                    _ => {}
+                }
+                ActionPlan::Insert(plan)
+            }
             _ => {
                 return Err(SqlSurfaceError::feature_not_supported(
-                    "MERGE WHEN MATCHED supports only UPDATE, DELETE and DO NOTHING",
+                    "MERGE WHEN clause does not support this action",
                 ));
             }
         };
-        clauses.push(MergeClausePlan { cond, action });
+        clauses.push(MergeClausePlan { kind, cond, action });
     }
 
     let joined = JoinedDmlPlan {
@@ -260,11 +310,38 @@ pub(crate) fn plan_merge(
     })
 }
 
+/// `INSERT` 句を [`InsertPlan`] へ写す。値の 4 種は `UPDATE SET` と同じ [`plan_set`] を通す（`BoundAssignments` が
+/// 同じ形のため。型が異なる列参照のコピーは代入できる組だけ受ける。元の疑似列 `id` を通常の列へ入れる形は
+/// `plan_set` が固定文言の `0A000` で拒否する）。
+fn plan_insert(
+    ins: &BoundMergeInsert,
+    target_schema: &TableSchema,
+    source_schema: &TableSchema,
+) -> Result<InsertPlan, SqlSurfaceError> {
+    let set = plan_set(ins.values(), target_schema, source_schema, true)?;
+    let id_value = match ins.id_value() {
+        None => None,
+        Some(MergeIdValue::Literal(n)) => Some(IdPlan::Literal(*n)),
+        Some(MergeIdValue::Source(r)) => {
+            if r.relation() != 1 {
+                return Err(internal("MERGE INSERT id must come from the source"));
+            }
+            Some(IdPlan::Source(slot_column(r.slot())))
+        }
+    };
+    Ok(InsertPlan {
+        set,
+        id_omitted: ins.id_omitted(),
+        id_value,
+    })
+}
+
 /// `UPDATE SET` の 4 種（列参照・リテラル・対象だけの式・元の列を含む式）を [`SetPlan`] へ写す。
 fn plan_set(
     a: &BoundAssignments,
     target_schema: &TableSchema,
     source_schema: &TableSchema,
+    convert_copies: bool,
 ) -> Result<SetPlan, SqlSurfaceError> {
     let mut set = SetPlan {
         literals: a.literals().to_vec(),
@@ -309,7 +386,7 @@ fn plan_set(
                 let src_idx = match resolved.slot() {
                     ColumnSlot::Id => {
                         return Err(SqlSurfaceError::feature_not_supported(
-                            "MERGE: the pseudo column id of the USING source cannot be used in SET",
+                            "MERGE: the pseudo column id of the USING source can be used only as the id value of an INSERT",
                         ));
                     }
                     ColumnSlot::Column(i) => i,
@@ -344,8 +421,10 @@ fn plan_set(
                     });
                 } else {
                     // 式経路が受理しない代入先の型（JSONB・UUID・BYTEA・NUMERIC・ENUM 等）。型が一致する
-                    // 組だけを単純コピーで運ぶ。
-                    if src_col.ty != target_col.ty {
+                    // 組を単純コピーで運ぶ。INSERT（`convert_copies`）は代入できる組を代入変換で運ぶ。
+                    let convertible = convert_copies
+                        && crate::sql::insert_select::assignable(&src_col.ty, &target_col.ty);
+                    if src_col.ty != target_col.ty && !convertible {
                         return Err(SqlSurfaceError::datatype_mismatch(format!(
                             "column {:?} cannot be assigned a value of a different type",
                             target_col.name
@@ -354,6 +433,7 @@ fn plan_set(
                     set.copies.push(CopyItem {
                         column_index: *idx,
                         source_column: src_idx,
+                        source_ty: src_col.ty.clone(),
                         target_ty: target_col.ty.clone(),
                         nullable: target_col.nullable,
                         column_name: target_col.name.clone(),
@@ -377,17 +457,23 @@ pub(crate) enum Choice {
     Delete,
     /// `UPDATE` の句が選ばれた（句の添字）。
     Update(usize),
+    /// `INSERT` の句が選ばれた（句の添字。BY TARGET だけ）。
+    Insert(usize),
 }
 
 /// 実行時の評価器（残余の評価器・セル位置を解決済み）。計画 1 つにつき 1 つ作る。
 pub(crate) struct MergeEval<'p> {
     plan: &'p MergeExecPlan,
     clauses: Vec<ClauseEval<'p>>,
+    /// 対象表の列数（BY TARGET の評価ビューの対象側を NULL で埋める長さ）。
+    target_columns: usize,
 }
 
 struct ClauseEval<'p> {
     cond: Option<CondEval>,
     set: Option<SetEval<'p>>,
+    /// INSERT 句の `id` の出所の元セル位置（元の列・疑似列 `id` のとき）。
+    id_pos: Option<usize>,
 }
 
 struct CondEval {
@@ -402,6 +488,8 @@ struct SetEval<'p> {
     items: Vec<Vec<(usize, ColumnType)>>,
     /// コピー項ごとのセル位置。
     copies: Vec<usize>,
+    /// コピー項ごとの代入変換（元の列型と対象列型が異なる項だけ。INSERT のみ）。
+    copy_conversions: Vec<Option<crate::sql::insert_select::ConversionPlan>>,
 }
 
 impl<'p> MergeEval<'p> {
@@ -440,8 +528,23 @@ impl<'p> MergeEval<'p> {
                     Some(CondEval { keys, residual })
                 }
             };
-            let set = match &c.action {
-                ActionPlan::Update(sp) => {
+            let set_plan = match &c.action {
+                ActionPlan::Update(sp) => Some(sp),
+                ActionPlan::Insert(ip) => Some(&ip.set),
+                _ => None,
+            };
+            let id_pos = match &c.action {
+                ActionPlan::Insert(InsertPlan {
+                    id_value: Some(IdPlan::Source(col)),
+                    ..
+                }) => Some(joined.source_cell_position(match col {
+                    Some(i) => ColumnSlot::Column(*i),
+                    None => ColumnSlot::Id,
+                })?),
+                _ => None,
+            };
+            let set = match set_plan {
+                Some(sp) => {
                     let mut items = Vec::with_capacity(sp.items.len());
                     for it in &sp.items {
                         let mut cells = Vec::with_capacity(it.src_cols.len());
@@ -454,58 +557,107 @@ impl<'p> MergeEval<'p> {
                         items.push(cells);
                     }
                     let mut copies = Vec::with_capacity(sp.copies.len());
+                    let mut copy_conversions = Vec::with_capacity(sp.copies.len());
                     for cp in &sp.copies {
                         copies.push(
                             joined.source_cell_position(ColumnSlot::Column(cp.source_column))?,
                         );
+                        copy_conversions.push(if cp.source_ty == cp.target_ty {
+                            None
+                        } else {
+                            Some(crate::sql::insert_select::ConversionPlan::build(
+                                &joined.target.schema,
+                                &[crate::sql::insert_select::TargetColumn::Column(
+                                    cp.column_index,
+                                )],
+                                &[crate::sql::exec::ColumnMeta::Scalar {
+                                    name: cp.column_name.clone(),
+                                    ty: cp.source_ty.clone(),
+                                }],
+                            )?)
+                        });
                     }
                     Some(SetEval {
                         plan: sp,
                         items,
                         copies,
+                        copy_conversions,
                     })
                 }
-                _ => None,
+                None => None,
             };
-            clauses.push(ClauseEval { cond, set });
+            clauses.push(ClauseEval { cond, set, id_pos });
         }
-        Ok(Self { plan, clauses })
+        Ok(Self {
+            plan,
+            clauses,
+            target_columns: joined.target.schema.columns.len(),
+        })
     }
 
-    /// 句の数（1 組あたりの条件評価回数の上限。比較回数の計上に使う）。
-    pub(crate) fn clause_count(&self) -> usize {
-        self.clauses.len()
-    }
-
-    /// 対象行（`scanned`・`c`）と元の 1 行 `row` の組について、宣言順に条件を評価し、最初に真になった句の
-    /// 操作を返す（真になる句が無ければ [`Choice::None`]。D4）。
-    pub(crate) fn choose(
+    /// 対象行（`scanned`・`c`）と元の 1 行 `row` の組について、`WHEN MATCHED` の句だけを宣言順に評価し、
+    /// 最初に真になった句の操作を返す（真になる句が無ければ [`Choice::None`]。D4）。
+    pub(crate) fn choose_matched(
         &mut self,
         scanned: &[Option<ScalarRef<'_>>],
         c: &DmlCandidate<'_>,
         row: &ResultRow,
     ) -> Result<Choice, SqlSurfaceError> {
+        self.choose_in(MergeMatchKind::Matched, scanned, c.id, row)
+    }
+
+    /// 元に一致する行が無かった対象行（`scanned`・`c`）について、`WHEN NOT MATCHED BY SOURCE` の句だけを
+    /// 宣言順に評価する（#3354）。条件は対象の列だけを参照できる（束縛段が保証）ため、元の行は空で評価する。
+    pub(crate) fn choose_by_source(
+        &mut self,
+        scanned: &[Option<ScalarRef<'_>>],
+        c: &DmlCandidate<'_>,
+    ) -> Result<Choice, SqlSurfaceError> {
+        let empty = ResultRow {
+            id: 0,
+            score: 0.0,
+            cells: Vec::new(),
+        };
+        self.choose_in(MergeMatchKind::NotMatchedBySource, scanned, c.id, &empty)
+    }
+
+    /// 対象に一致する行が無かった元の 1 行 `row` について、`WHEN NOT MATCHED [BY TARGET]` の句だけを宣言順に
+    /// 評価する（#3354）。条件は元の列だけを参照できる（束縛段が保証）ため、対象側は全列 NULL で評価する。
+    pub(crate) fn choose_by_target(&mut self, row: &ResultRow) -> Result<Choice, SqlSurfaceError> {
+        let scanned: Vec<Option<ScalarRef<'_>>> = vec![None; self.target_columns];
+        self.choose_in(MergeMatchKind::NotMatchedByTarget, &scanned, 0, row)
+    }
+
+    /// `kind` の句だけを宣言順に評価して、最初に条件が真になった句の操作を返す。
+    fn choose_in(
+        &mut self,
+        kind: MergeMatchKind,
+        scanned: &[Option<ScalarRef<'_>>],
+        id: u64,
+        row: &ResultRow,
+    ) -> Result<Choice, SqlSurfaceError> {
         for (i, clause) in self.clauses.iter_mut().enumerate() {
+            let cp = self
+                .plan
+                .clauses
+                .get(i)
+                .ok_or_else(|| internal("MERGE clause out of range"))?;
+            if cp.kind != kind {
+                continue;
+            }
             let hit = match clause.cond.as_mut() {
                 None => true,
-                Some(cond) => cond.matches(scanned, c, row)?,
+                Some(cond) => cond.matches(scanned, id, row)?,
             };
             if !hit {
                 continue;
             }
-            return Ok(
-                match self
-                    .plan
-                    .clauses
-                    .get(i)
-                    .map(|cp| &cp.action)
-                    .ok_or_else(|| internal("MERGE clause out of range"))?
-                {
-                    ActionPlan::Update(_) => Choice::Update(i),
-                    ActionPlan::Delete => Choice::Delete,
-                    ActionPlan::DoNothing => Choice::DoNothing,
-                },
-            );
+            return Ok(match &cp.action {
+                ActionPlan::Update(_) => Choice::Update(i),
+                ActionPlan::Delete => Choice::Delete,
+                ActionPlan::Insert(_) => Choice::Insert(i),
+                ActionPlan::DoNothing => Choice::DoNothing,
+            });
         }
         Ok(Choice::None)
     }
@@ -517,6 +669,95 @@ impl<'p> MergeEval<'p> {
         clause: usize,
         scanned: &[Option<ScalarRef<'_>>],
         c: &DmlCandidate<'_>,
+        row: &ResultRow,
+        target_schema: &TableSchema,
+        charge: &mut dyn FnMut(usize) -> Result<(), SqlSurfaceError>,
+    ) -> Result<Vec<(usize, Value)>, SqlSurfaceError> {
+        self.eval_set(
+            clause,
+            scanned,
+            c.id,
+            c.embedding,
+            row,
+            target_schema,
+            charge,
+        )
+    }
+
+    /// 句 `clause`（BY TARGET の `INSERT`）の挿入行を元の 1 行 `row` から評価する（#3354）。戻り値は
+    /// `(疑似列 id, 列ごとの値〔未指定は NULL の仮値〕, 列ごとの「値が指定されたか」)`。省略列の `DEFAULT` 補完と
+    /// 採番の印は書き込み段へ渡す前に `sql::insert_select::finish_bound_insert` が行う。疑似列 `id` が元の列なら
+    /// `cell_to_row_id` と同じ規則（NULL・負数は `22000`）で求める。保持する値は `charge` で共有予算へ計上する。
+    pub(crate) fn eval_insert(
+        &self,
+        clause: usize,
+        row: &ResultRow,
+        target_schema: &TableSchema,
+        charge: &mut dyn FnMut(usize) -> Result<(), SqlSurfaceError>,
+    ) -> Result<(u64, Vec<Value>, Vec<bool>), SqlSurfaceError> {
+        let ip = match self.plan.clauses.get(clause).map(|c| &c.action) {
+            Some(ActionPlan::Insert(ip)) => ip,
+            _ => return Err(internal("MERGE clause is not an INSERT")),
+        };
+        let ce = self
+            .clauses
+            .get(clause)
+            .ok_or_else(|| internal("MERGE clause out of range"))?;
+        let scanned: Vec<Option<ScalarRef<'_>>> = vec![None; self.target_columns];
+        let pairs = self.eval_set(clause, &scanned, 0, &[], row, target_schema, charge)?;
+        let ncols = target_schema.columns.len();
+        charge(
+            std::mem::size_of::<Value>()
+                .saturating_add(1)
+                .saturating_mul(ncols),
+        )?;
+        let mut values: Vec<Value> = Vec::new();
+        values.try_reserve_exact(ncols).map_err(|_| {
+            SqlSurfaceError::payload_too_large("MERGE INSERT values exceed the limit")
+        })?;
+        values.resize(ncols, Value::Null);
+        let mut provided = vec![false; ncols];
+        for (idx, v) in pairs {
+            if let (Some(slot), Some(flag)) = (values.get_mut(idx), provided.get_mut(idx)) {
+                *slot = v;
+                *flag = true;
+            } else {
+                return Err(internal("MERGE INSERT column out of range"));
+            }
+        }
+        let id = match &ip.id_value {
+            None => {
+                if ip.id_omitted || !target_schema.has_pseudo_id() {
+                    0
+                } else {
+                    return Err(internal("MERGE INSERT id is missing"));
+                }
+            }
+            Some(IdPlan::Literal(n)) => *n,
+            Some(IdPlan::Source(_)) => {
+                let pos = ce
+                    .id_pos
+                    .ok_or_else(|| internal("MERGE INSERT id position is missing"))?;
+                let cell = row
+                    .cells
+                    .get(pos)
+                    .ok_or_else(|| internal("source cell out of range"))?;
+                crate::sql::insert_select::cell_to_row_id(cell.clone())?
+            }
+        };
+        Ok((id, values, provided))
+    }
+
+    /// 句 `clause` の代入群（`UPDATE SET` と `INSERT` の値で共通）を `(列, 値)` の列へ評価する。ビューは
+    /// 「`scanned` ++ 項ごとの元の列」。保持する値のバイト数は `charge` で共有予算へ計上する（超過は `54000`）。
+    /// NULL を NOT NULL 列へ入れる組は `23502`。
+    #[allow(clippy::too_many_arguments)]
+    fn eval_set(
+        &self,
+        clause: usize,
+        scanned: &[Option<ScalarRef<'_>>],
+        id: u64,
+        embedding: &[f32],
         row: &ResultRow,
         target_schema: &TableSchema,
         charge: &mut dyn FnMut(usize) -> Result<(), SqlSurfaceError>,
@@ -541,7 +782,7 @@ impl<'p> MergeEval<'p> {
         for (idx, v) in &sp.literals {
             push_value(&mut out, *idx, v.clone(), target_schema, charge)?;
         }
-        for (cp, &pos) in sp.copies.iter().zip(&se.copies) {
+        for ((cp, &pos), conv) in sp.copies.iter().zip(&se.copies).zip(&se.copy_conversions) {
             let cell = row
                 .cells
                 .get(pos)
@@ -549,7 +790,16 @@ impl<'p> MergeEval<'p> {
             if matches!(cell, Cell::Null) && !cp.nullable {
                 return Err(SqlSurfaceError::not_null_violation(&cp.column_name));
             }
-            let value = copy_cell_to_value(cell.clone(), &cp.target_ty)?;
+            let value = match conv {
+                None => copy_cell_to_value(cell.clone(), &cp.target_ty)?,
+                Some(plan) => {
+                    let column = target_schema
+                        .columns
+                        .get(cp.column_index)
+                        .ok_or_else(|| internal("target column out of range"))?;
+                    plan.convert_single(cell.clone(), column)?
+                }
+            };
             push_value(&mut out, cp.column_index, value, target_schema, charge)?;
         }
         for (it, cells) in sp.items.iter().zip(&se.items) {
@@ -582,7 +832,7 @@ impl<'p> MergeEval<'p> {
                 view.push(source_scalar(cell, ty, payload.as_deref())?);
             }
             let value =
-                crate::sql::set_expr::eval_set_expr_to_value(&it.set, c.id, c.embedding, &view)?;
+                crate::sql::set_expr::eval_set_expr_to_value(&it.set, id, embedding, &view)?;
             push_value(&mut out, it.column_index, value, target_schema, charge)?;
         }
         Ok(out)
@@ -615,12 +865,12 @@ impl CondEval {
     fn matches(
         &mut self,
         scanned: &[Option<ScalarRef<'_>>],
-        c: &DmlCandidate<'_>,
+        id: u64,
         row: &ResultRow,
     ) -> Result<bool, SqlSurfaceError> {
         for (target_column, source_pos, class) in &self.keys {
             let target_cell = match target_column {
-                None => Cell::Integer(c.id),
+                None => Cell::Integer(id),
                 Some(i) => match scanned.get(*i) {
                     Some(Some(sr)) => key_cell_from_scalar(sr, class)?,
                     // NULL との等値は真にならない。
@@ -645,10 +895,14 @@ impl CondEval {
             }
         }
         if let Some(res) = self.residual.as_mut() {
-            if !res.matches_row(scanned, c.id, row)? {
+            if !res.matches_row(scanned, id, row)? {
                 return Ok(false);
             }
         }
         Ok(true)
     }
 }
+
+#[cfg(test)]
+#[path = "merge_plan_tests.rs"]
+mod tests;

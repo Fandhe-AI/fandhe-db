@@ -4,7 +4,7 @@
 //! 契約: MATCHED の句だけで書かれた MERGE は、autocommit・明示 Tx のどちらでも実行され、行の内容と件数
 //! （UPDATE と DELETE の実変更行数の合計。DO NOTHING は含めない）が決まる。1 つの対象行について UPDATE か
 //! DELETE を選んだ組が 2 つ以上あれば文全体が `21000` になり、行・台帳・世代に何も残らない。対象外の形
-//! （`WHEN NOT MATCHED`・`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー）は固定文言の `0A000` で
+//! （`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー）は固定文言の `0A000` で
 //! 拒否する。他テナントの行は一致・件数・`21000` のどれにも現れない（3 テナントの越境の網羅は #3358）。
 //! 期待値は設計記録の決定から導く（PG17 との突き合わせは #3358）。
 
@@ -589,22 +589,25 @@ fn expect_fixed_0a000(core: &EngineCore, sql: &str, message: &str) {
     }
 }
 
-// WHEN NOT MATCHED の句を 1 つでも含む形は、実行を入れる #3354 まで拒否する。
-// tracked: #3354
+// WHEN NOT MATCHED の句を含む形は #3354 から実行される（詳細は `sql79_merge_not_matched.rs`）。
+// ここでは、MATCHED の句と同居しても MATCHED の結果（件数と行）が変わらないことだけを確かめる。
 #[test]
-fn not_matched_clauses_are_rejected_until_the_insert_and_by_source_work() {
+fn matched_results_are_unchanged_when_not_matched_clauses_are_added() {
     let (core, _g) = new_core("sql79m-notmatched");
     seed(&core);
-    let message = "feature not supported: MERGE WHEN NOT MATCHED is not supported yet";
-    for sql in [
+    // t = {1:a/10, 2:b/20, 3:c/30}、s = {1:a/100, 3:c/300, 4:d/400}。
+    // MATCHED は a・c を DELETE、BY TARGET は d を INSERT、BY SOURCE は b を DO NOTHING。
+    let n = merged(
+        &core,
         "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE \
-         WHEN NOT MATCHED THEN INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v)",
-        "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN DO NOTHING",
-        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DO NOTHING \
-         WHEN NOT MATCHED BY SOURCE THEN DELETE",
-    ] {
-        expect_fixed_0a000(&core, sql, message);
-    }
+         WHEN NOT MATCHED THEN INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v) \
+         WHEN NOT MATCHED BY SOURCE THEN DO NOTHING",
+    );
+    assert_eq!(n, 3);
+    assert_eq!(
+        t_rows(&core),
+        "Integer(2):Text(\"b\"):SignedInteger(20) | Integer(4):Text(\"d\"):SignedInteger(400)"
+    );
 }
 
 // `RETURNING` つきは、応答の列と `merge_action()` を入れる #3356 まで拒否する。
