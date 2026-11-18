@@ -84,35 +84,70 @@ fn ddl_after_the_duration_limit_is_54000_and_leaves_nothing() {
 
 #[test]
 fn scan_ddl_hits_the_transaction_deadline_mid_scan() {
-    // BEGIN の直後に上限が来るよう極小にし、行数の多い表への一意索引の走査が確認点で打ち切られるようにする。
-    // 文の開始時点の検査・走査中の確認点のどちらで当たっても `54000`・復帰不可の `Failed`・痕跡なしになる。
-    let (core, _g) = new_core("sql80-deadline-scan", Duration::from_millis(3));
-    let mut session = ddl_session();
-    auto(
-        &core,
-        &mut session,
-        "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT)",
-    );
-    for chunk in 0..20u64 {
-        let values: Vec<String> = (0..1000u64)
-            .map(|i| {
-                let n = chunk * 1000 + i + 1;
-                format!("({n}, {n})")
-            })
-            .collect();
+    // 走査 DDL（既存行への一意索引）の所要時間 T を計測し、上限を T/2 にした Tx で同じ DDL を流す。
+    // BEGIN の直後の DDL は文の開始時点の検査を通り、走査ループの確認点で期限に当たる。
+    // 開始時点の検査で終わったケースと区別するため、DDL 呼び出しが上限の半分以上かかった（走査へ到達した）
+    // ことも確認する。どちらの段でも `54000`・復帰不可の `Failed`・痕跡なしは変わらない。
+    let path = unique_db_path("sql80-deadline-scan");
+    let _guard = CleanupGuard(path.clone());
+    let scan_time = {
+        let storage = Storage::open(&path).expect("open storage");
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_transaction_limits(TransactionLimits {
+                max_duration: Duration::from_secs(600),
+                max_statements: 1000,
+            });
+        let mut session = ddl_session();
         auto(
             &core,
             &mut session,
-            &format!(
-                "INSERT INTO t (id, k) VALUES {} USING OPERATION_ID 'seed-{chunk}'",
-                values.join(", ")
-            ),
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, k BIGINT)",
         );
-    }
+        for chunk in 0..200u64 {
+            let values: Vec<String> = (0..1000u64)
+                .map(|i| {
+                    let n = chunk * 1000 + i + 1;
+                    format!("({n}, {n})")
+                })
+                .collect();
+            auto(
+                &core,
+                &mut session,
+                &format!(
+                    "INSERT INTO t (id, k) VALUES {} USING OPERATION_ID 'seed-{chunk}'",
+                    values.join(", ")
+                ),
+            );
+        }
+        let mut txn = core.new_session_transaction();
+        tx(&core, &mut session, &mut txn, "BEGIN").expect("begin");
+        let started = Instant::now();
+        tx(
+            &core,
+            &mut session,
+            &mut txn,
+            "CREATE UNIQUE INDEX t_k_u ON t (k)",
+        )
+        .expect("calibration scan");
+        let elapsed = started.elapsed();
+        tx(&core, &mut session, &mut txn, "ROLLBACK").expect("rollback");
+        elapsed
+    };
+    assert!(
+        scan_time >= Duration::from_millis(20),
+        "calibration scan too short to hit mid-scan: {scan_time:?}"
+    );
+    let max_duration = scan_time / 2;
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_transaction_limits(TransactionLimits {
+            max_duration,
+            max_statements: 1000,
+        });
+    let mut session = ddl_session();
     let mut txn = core.new_session_transaction();
     tx(&core, &mut session, &mut txn, "BEGIN").expect("begin");
-    // 実行速度に依存せず必ず上限を超えるよう、上限（3ms）より十分長く待ってから走査 DDL を流す。
-    std::thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
     let err = tx(
         &core,
         &mut session,
@@ -120,8 +155,14 @@ fn scan_ddl_hits_the_transaction_deadline_mid_scan() {
         "CREATE UNIQUE INDEX t_k_u ON t (k)",
     )
     .expect_err("deadline during the scan");
+    let call_elapsed = started.elapsed();
     assert_eq!(err.wire_code(), "54000");
     assert_eq!(txn.status(), TransactionStatus::Failed);
+    // 走査へ到達してから打ち切られた（開始時点の検査なら即座に返る）。
+    assert!(
+        call_elapsed >= max_duration / 2,
+        "statement did not reach the scan loop: {call_elapsed:?} (limit {max_duration:?})"
+    );
     // 復帰不可の失敗状態は ROLLBACK で戻り、何も確定しない。
     tx(&core, &mut session, &mut txn, "ROLLBACK").expect("rollback");
     assert_eq!(txn.status(), TransactionStatus::Idle);
