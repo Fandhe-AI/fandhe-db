@@ -240,6 +240,20 @@ fn insert_select_bits(v: &crate::sql::allowlist::ValidatedInsertSelect) -> u16 {
     b
 }
 
+/// `MERGE` の対象表に課す権限ビット。WHEN 句に現れた操作の和（INSERT／UPDATE／DELETE。`DO NOTHING` は
+/// 足さない）に SELECT を加える。非 EXPLAIN の `MERGE` と `EXPLAIN [ANALYZE] MERGE` が同じ関数を使い、
+/// EXPLAIN を権限の抜け道にしない（SQL-40・Issue #3357）。
+fn merge_bits(v: &crate::sql::allowlist::ValidatedMerge) -> u16 {
+    v.when_clauses
+        .iter()
+        .fold(PRIV_SELECT, |acc, w| match &w.action {
+            crate::sql::allowlist::MergeAction::Update { .. } => acc | PRIV_UPDATE,
+            crate::sql::allowlist::MergeAction::Delete => acc | PRIV_DELETE,
+            crate::sql::allowlist::MergeAction::Insert { .. } => acc | PRIV_INSERT,
+            crate::sql::allowlist::MergeAction::DoNothing => acc,
+        })
+}
+
 /// 検証済みの文を書き込みの要求に分類する。ワイルドカード腕を置かない網羅 `match` で、`ParsedSql` に
 /// variant が足されたときに分類の更新（書き込みか否か）をコンパイラが強制する。
 pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
@@ -278,18 +292,7 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         // （`DO NOTHING` は操作ビットを足さない）。実行が `0A000` の間も権限の無い主体は `42501` で止め、
         // `na()` で素通りさせない。元側の読み取り（元の表・ビュー・部分クエリの中の表）は、本関数の対象外で、
         // `build_wants` が参照トークンから対象表を差し引いた残りに SELECT を課す（Issue #3355 で検証済み）。
-        ParsedSql::Merge(v) => {
-            let bits = v
-                .when_clauses
-                .iter()
-                .fold(PRIV_SELECT, |acc, w| match &w.action {
-                    crate::sql::allowlist::MergeAction::Update { .. } => acc | PRIV_UPDATE,
-                    crate::sql::allowlist::MergeAction::Delete => acc | PRIV_DELETE,
-                    crate::sql::allowlist::MergeAction::Insert { .. } => acc | PRIV_INSERT,
-                    crate::sql::allowlist::MergeAction::DoNothing => acc,
-                });
-            WriteRequirement::one(v.target.table(), bits)
-        }
+        ParsedSql::Merge(v) => WriteRequirement::one(v.target.table(), merge_bits(v)),
         ParsedSql::Truncate(v) => WriteRequirement {
             targets: v
                 .table_names
@@ -334,6 +337,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
             ExplainDml::DeleteUsing(v) => {
                 WriteRequirement::one(v.target.table(), PRIV_DELETE | PRIV_SELECT)
             }
+            // Issue #3357: 非 EXPLAIN の `MERGE` と同じビット（EXPLAIN を抜け道にしない。SQL-40）。
+            ExplainDml::Merge(v) => WriteRequirement::one(v.target.table(), merge_bits(v)),
         },
         // Issue #2055: ANALYZE は実際に書き込むため、内側の DML と同じ権限ビットを実行前に要求する（SQL-40）。
         ParsedSql::ExplainAnalyzeDml(ea) => match &ea.target {
@@ -350,6 +355,9 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
             }
             ExplainAnalyzeDmlTarget::Dml(ExplainDml::DeleteUsing(v)) => {
                 WriteRequirement::one(v.target.table(), PRIV_DELETE | PRIV_SELECT)
+            }
+            ExplainAnalyzeDmlTarget::Dml(ExplainDml::Merge(v)) => {
+                WriteRequirement::one(v.target.table(), merge_bits(v))
             }
             ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
                 crate::sql::insert_explain::ExplainInsertTarget::Values(v) => {

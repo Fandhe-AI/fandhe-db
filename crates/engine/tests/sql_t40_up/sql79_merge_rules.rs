@@ -11,7 +11,7 @@
 //! - 生成列・CHECK・UNIQUE・FK は単独の DML と同じ結果。UPDATE 句と INSERT 句をまたぐ自己参照 FK は文単位の検査と同じ意味。
 //! - 3 テナントの越境で、他テナントの行は一致・件数・エラーのどれの引き金にもならない。
 //!
-//! 期待値は設計記録の決定から導く（PG17 との突き合わせは #3358）。
+//! 期待値は設計記録の決定から導く（PG17 との突き合わせは `sql79_merge_pg17_parity.rs`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;

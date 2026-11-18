@@ -3381,3 +3381,149 @@ fn three_clients_confirm_explicit_transaction_outcome_by_resend_in_new_begin() {
         eprintln!("[e2e-record] {record}");
     }
 }
+/// `mt (k INTEGER, x INTEGER)`・`ms (k INTEGER, v INTEGER)` を持つ一時 DB。3 テナントへ同じ初期行を
+/// 投入する（`merge_when_pg17.tsv` の `base` 世界。NULL キーの行は psql／psycopg／node pg の NULL 表記の
+/// 差を避けるため除く）。`EngineCore` は返す前に drop し、redb のロックを解放する。
+fn seed_merge_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-merge");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    let sys = PolicyContext::with_visibilities("sys", [Visibility::Public, Visibility::Private])
+        .expect("tenant");
+    for ddl in [
+        "CREATE TABLE mt (k INTEGER, x INTEGER)",
+        "CREATE TABLE ms (k INTEGER, v INTEGER)",
+    ] {
+        core.execute_sql_in_session(&sys, &mut session, ddl)
+            .expect("create table");
+    }
+    for tenant in ["tenant-a", "tenant-b", "tenant-c"] {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("tenant");
+        for sql in [
+            "INSERT INTO mt (k, x) VALUES (1,10),(2,20),(3,30),(5,50)",
+            "INSERT INTO ms (k, v) VALUES (1,100),(2,200),(4,400),(6,600)",
+        ] {
+            core.execute_sql_in_session(&ctx, &mut session, sql)
+                .expect("seed");
+        }
+    }
+    drop(core);
+    (path, guard)
+}
+
+/// `MERGE`（SQL-79・Issue #3358）を 3 クライアントで実行する。psql の `-c "MERGE ...;"`（末尾 `;` つき
+/// 単独送信）・コマンドタグ `MERGE n`・`RETURNING` の行・読み戻し・拒否の SQLSTATE が無改造クライアントへ
+/// 届くこと、他テナントの行が変わらないことを検証する。件数・行は PostgreSQL 17 の実測
+/// （`crates/engine/tests/data/merge_when_pg17.tsv` の同形のケース）と同じ。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_run_merge_across_three_tenants() {
+    let users_dir = temp_db::TempDir::new("three-client-e2e-merge-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+    let body = "MERGE INTO mt USING ms ON mt.k = ms.k \
+                WHEN MATCHED THEN UPDATE SET x = ms.v \
+                WHEN NOT MATCHED THEN INSERT (k, x) VALUES (ms.k, ms.v) \
+                WHEN NOT MATCHED BY SOURCE THEN DELETE";
+    let read = "SELECT k, x FROM mt ORDER BY k LIMIT 100";
+    let seeded: Vec<String> = ["1|10", "2|20", "3|30", "5|50"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let merged: Vec<String> = ["1|100", "2|200", "4|400", "6|600"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    for client in [Client::Psql, Client::Psycopg, Client::Pg] {
+        let name = client.name();
+        let (db, _guard) = seed_merge_db();
+        let server = spawn_wire_server(&users_path, &db, &[]);
+        let port = server.port;
+
+        // 1. alice の MERGE（末尾 `;` つき単独送信）。タグは `MERGE 6`（更新 2・挿入 2・削除 2）。
+        let tag = client.command_tag(port, "alice", &format!("{body};"));
+        assert_eq!(tag, "MERGE 6", "{name}: merge tag");
+        assert_eq!(
+            client.rows(port, "alice", &[], read),
+            merged,
+            "{name}: alice"
+        );
+        // 2. 他テナントの行は変わらない（RLS）。
+        for other in ["bob", "carol"] {
+            assert_eq!(
+                client.rows(port, other, &[], read),
+                seeded,
+                "{name}: {other} must be untouched"
+            );
+        }
+
+        // 3. bob の RETURNING つき MERGE。行（ソート済み）とタグを 1 回の実行で観測する。
+        let (rows, tag) = client.rows_and_tag(
+            port,
+            "bob",
+            &format!("{body} RETURNING merge_action(), mt.x;"),
+        );
+        assert_eq!(tag, "MERGE 6", "{name}: returning tag");
+        assert_eq!(
+            sorted_lines(rows),
+            vec![
+                "DELETE|30",
+                "DELETE|50",
+                "INSERT|400",
+                "INSERT|600",
+                "UPDATE|100",
+                "UPDATE|200"
+            ],
+            "{name}: returning rows"
+        );
+        assert_eq!(client.rows(port, "bob", &[], read), merged, "{name}: bob");
+        assert_eq!(
+            client.rows(port, "carol", &[], read),
+            seeded,
+            "{name}: carol still untouched"
+        );
+
+        // 4. 拒否: 条件なしの MATCHED の後の同種の句（42601）・MERGE の外の merge_action()（42601）・
+        //    反対側の参照（42P01）。いずれも carol の行は変わらない。
+        for (sql, code) in [
+            (
+                "MERGE INTO mt USING ms ON mt.k = ms.k WHEN MATCHED THEN DELETE \
+                 WHEN MATCHED THEN UPDATE SET x = ms.v;",
+                "42601",
+            ),
+            ("SELECT merge_action() FROM mt;", "42601"),
+            (
+                "MERGE INTO mt USING ms ON mt.k = ms.k \
+                 WHEN NOT MATCHED AND mt.x > 1 THEN DO NOTHING;",
+                "42P01",
+            ),
+        ] {
+            client.expect_error(port, "carol", &[], sql, code, &[]);
+        }
+        assert_eq!(
+            client.rows(port, "carol", &[], read),
+            seeded,
+            "{name}: carol after rejections"
+        );
+        drop(server);
+
+        let record = format!(
+            "three_clients_merge: client={name} version={} tag=MERGE_6 trailing_semicolon=ok \
+             returning_rows=6 other_tenants=untouched rejections=42601,42601,42P01",
+            client_version(client)
+        );
+        for secret in ["alice", "bob", "carol", "pw-", "tenant-", "correct-horse"] {
+            assert!(
+                !record.contains(secret),
+                "record must not contain `{secret}`"
+            );
+        }
+        eprintln!("[e2e-record] {record}");
+    }
+}

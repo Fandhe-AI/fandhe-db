@@ -211,6 +211,10 @@ enum OpTag {
     /// （全副文と主クエリ）を 1 つの台帳エントリで扱うため、送られた文のトークン列だけを材料にし、
     /// 単独の DML や [`OpTag::InsertSelect`] とは別ドメインに分離する。
     DataModifyingCte = 29,
+    /// `MERGE`（Issue #3357・SQL-79・RECOVER-10/11。設計記録 `docs/design/sql-merge.md` D11）。文全体
+    /// （全 WHEN 句）を 1 つの台帳エントリで扱うため、送られた文のトークン列だけを材料にし、
+    /// [`OpTag::UpdateFrom`] 等の単独の DML とは別ドメインに分離する。
+    Merge = 30,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -1568,6 +1572,18 @@ pub(crate) fn for_data_modifying_cte(
     statement_tokens: &[crate::sql::lexer::Token],
 ) -> Result<ContentHash, StorageError> {
     token_statement_hash(OpTag::DataModifyingCte, statement_tokens)
+}
+
+/// `MERGE` の台帳照合ハッシュ（Issue #3357。ポインタ: SQL-79・RECOVER-10・RECOVER-11・設計記録 D11）。
+///
+/// 材料は呼び出し元が渡す文のトークン列**だけ**で、`USING OPERATION_ID` 句・末尾 `;`・最上位の
+/// `RETURNING` 句は含めない（除去は `sql::allowlist::merge` の検証入口が解析器の記録した位置で行う）。
+/// 行・結合結果の値は材料にしないため、再送時にデータが変わっていても同一文なら同一ハッシュになる
+/// （`23505`）。未束縛の [`Token::Param`] が残っていれば `Err`（fail-closed）。
+pub(crate) fn for_merge(
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    token_statement_hash(OpTag::Merge, statement_tokens)
 }
 
 /// 文のトークン列を長さプレフィクス付きで直列化したハッシュ（結合形 DML 用の共通本体）。
@@ -8020,6 +8036,53 @@ mod tests {
         let mut toks = crate::sql::lexer::tokenize(DM_CTE).expect("tokenize");
         toks.push(crate::sql::lexer::Token::Param(1));
         assert!(for_data_modifying_cte(&toks).is_err());
+    }
+
+    // ---- Issue #3357: MERGE の content_hash（SQL-79・RECOVER-10/11）----
+
+    const MERGE_SQL: &str = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE";
+
+    fn merge_hash(sql: &str) -> ContentHash {
+        let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        for_merge(strip_operation_id_clause(&toks)).expect("hash")
+    }
+
+    #[test]
+    fn merge_hash_ignores_operation_id_whitespace_and_comments() {
+        let base = merge_hash(MERGE_SQL);
+        assert_eq!(
+            base,
+            merge_hash(&format!("{MERGE_SQL} USING OPERATION_ID 'a';"))
+        );
+        assert_eq!(
+            base,
+            merge_hash(
+                "MERGE  INTO t /* c */ USING s ON t.k = s.k\nWHEN MATCHED THEN DELETE USING OPERATION_ID 'b'"
+            )
+        );
+    }
+
+    #[test]
+    fn merge_hash_is_sensitive_to_statement_and_domain() {
+        let base = merge_hash(MERGE_SQL);
+        for other in [
+            "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DO NOTHING",
+            "MERGE INTO t USING s ON t.k = s.k AND s.k = 'a' WHEN MATCHED THEN DELETE",
+            "MERGE INTO t USING u ON t.k = u.k WHEN MATCHED THEN DELETE",
+        ] {
+            assert_ne!(base, merge_hash(other), "{other}");
+        }
+        // 同じトークン列でも `UPDATE ... FROM` のドメインとは別（タグが違う）。
+        let toks = crate::sql::lexer::tokenize(MERGE_SQL).expect("tokenize");
+        assert_ne!(base, for_update_from(&toks).expect("hash"));
+        assert_ne!(base, for_data_modifying_cte(&toks).expect("hash"));
+    }
+
+    #[test]
+    fn merge_hash_rejects_unbound_param() {
+        let mut toks = crate::sql::lexer::tokenize(MERGE_SQL).expect("tokenize");
+        toks.push(crate::sql::lexer::Token::Param(1));
+        assert!(for_merge(&toks).is_err());
     }
 
     const SEL: &str = "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x' LIMIT 3";

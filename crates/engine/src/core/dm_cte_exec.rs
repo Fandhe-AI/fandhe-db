@@ -74,10 +74,7 @@ impl SubstatementLedgerScope {
     /// 副文用の台帳モード（`Ledgered`・`Optional` は `Optional`、`CompareOnlyWithoutLedger` はそのまま）
     /// へ切り替える。
     pub(super) fn enter(engine_mode: LedgerMode) -> Self {
-        let mode = match engine_mode {
-            LedgerMode::Ledgered | LedgerMode::Optional => LedgerMode::Optional,
-            LedgerMode::CompareOnlyWithoutLedger => LedgerMode::CompareOnlyWithoutLedger,
-        };
+        let mode = engine_mode.substatement_mode();
         let prev = SUBSTATEMENT_LEDGER.with(|c| c.replace(Some(mode)));
         SubstatementLedgerScope { prev }
     }

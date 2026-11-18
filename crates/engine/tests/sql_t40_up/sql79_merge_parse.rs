@@ -1,11 +1,11 @@
-//! `MERGE` 文の構文解析と、実行に結線されていない形の固定文言 `0A000`（SQL-79・Issue #3351・#3353・#3354。
+//! `MERGE` 文の構文解析と、結線されていない形の固定文言 `0A000`（SQL-79・Issue #3351・#3353・#3354。
 //! 親 #3349、設計記録 `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
 //!
 //! 契約: 構文解析と束縛（#3352。`sql79_merge_bind.rs`）を通った MERGE のうち、`WHEN MATCHED` は #3353 から、
-//! `WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 から実行される（行・件数は `sql79_merge_matched.rs`・
-//! `sql79_merge_not_matched.rs`）。`RETURNING`・台帳記録の形は固定文言の `0A000` で止まり、行・台帳・世代に
-//! 一切触れない（`USING OPERATION_ID` 付きを再送しても `23505` にならない）。構文エラーは `42601`、
-//! 上限超過は `54000`、権限は書き込みゲートの `42501`。受け皿は #3356（RETURNING）・#3357（台帳）。
+//! `WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 から、`RETURNING` は #3356 から実行される（行・件数は
+//! `sql79_merge_matched.rs`・`sql79_merge_not_matched.rs`・`sql79_merge_returning.rs`）。台帳記録（`USING OPERATION_ID`。#3357）は
+//! 1 回目を実行し、再送は `23505`（`sql79_merge_ledger.rs` が網羅）。
+//! 構文エラーは `42601`、上限超過は `54000`、権限は書き込みゲートの `42501`。受け皿は #3357（台帳）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, ParsedSql};
@@ -16,8 +16,6 @@ use engine::storage::{Storage, Visibility};
 
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
-
-const FIXED_MESSAGE: &str = "feature not supported: MERGE is not supported yet";
 
 fn new_core(label: &str) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path(label);
@@ -108,11 +106,9 @@ const NOT_MATCHED_SHAPES: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// `RETURNING` つきの形（受け皿 #3356）。
+/// `RETURNING` つきの形（#3356 から実行される）。
 const RETURNING_SHAPE: &str =
     "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.k";
-
-const RETURNING_MESSAGE: &str = "feature not supported: MERGE with RETURNING is not supported yet";
 
 #[test]
 fn sql79_matched_only_shapes_parse_and_run() {
@@ -159,41 +155,38 @@ fn sql79_not_matched_shapes_parse_and_run() {
     }
 }
 
-// `RETURNING` つきは、応答の列の束縛を入れる #3356 まで固定文言で拒否する。
-// tracked: #3356
+// `RETURNING` つきは #3356 から実行され、変更した行を返す（末尾 `;` 付きも同じ）。
 #[test]
-fn sql79_returning_stops_with_fixed_0a000_and_no_side_effects() {
-    let (core, _g) = new_core("sql79-returning");
-    seed(&core);
-    let before = snapshot(&core);
+fn sql79_returning_runs_and_returns_the_changed_rows() {
     for text in [RETURNING_SHAPE.to_string(), format!("{RETURNING_SHAPE};")] {
-        let (code, msg) = run(&core, &text).expect_err(&text);
-        assert_eq!(
-            (code.as_str(), msg.as_str()),
-            ("0A000", RETURNING_MESSAGE),
-            "{text}"
-        );
-        assert_eq!(before, snapshot(&core), "{text}");
+        let (core, _g) = new_core("sql79-returning");
+        seed(&core);
+        let out = run(&core, &text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+        assert!(out.starts_with("Returning("), "{text}: {out}");
+        assert!(out.contains("command: Merge"), "{text}: {out}");
+        assert!(out.contains("rows_affected: 1"), "{text}: {out}");
+        assert!(out.contains("Text(\"a\")"), "{text}: {out}");
+        let t = run(&core, "SELECT id, k, x FROM t ORDER BY id LIMIT 100").expect("scan t");
+        assert_eq!(t.matches("ResultRow").count(), 1, "{text}: {t}");
     }
 }
 
-// 台帳へ記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュを入れる #3357 まで拒否する。
-// tracked: #3357
+// 台帳へ記録する構成（`USING OPERATION_ID` つき）は #3357 から実行され、再送は `23505` で行を変えない。
 #[test]
-fn sql79_operation_id_is_not_consumed_by_the_fixed_rejection() {
+fn sql79_operation_id_records_and_replays_23505() {
     let (core, _g) = new_core("sql79-opid");
     seed(&core);
-    let before = snapshot(&core);
     let sql = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE USING OPERATION_ID 'merge-op-1'";
+    let out = run(&core, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    assert!(out.starts_with("Merge("), "{out}");
+    let after_first = snapshot(&core);
     for _ in 0..2 {
         let (code, _) = run(&core, sql).expect_err(sql);
-        assert_eq!(code, "0A000");
+        assert_eq!(code, "23505");
     }
-    assert_eq!(before, snapshot(&core));
+    assert_eq!(after_first, snapshot(&core));
 }
 
-// Describe の `RETURNING` つきは、結果列の束縛を入れる #3356 まで固定文言で拒否する。
-// tracked: #3356
 #[test]
 fn sql79_explicit_transaction_runs_and_describe_binds() {
     let (core, _g) = new_core("sql79-txn");
@@ -214,7 +207,7 @@ fn sql79_explicit_transaction_runs_and_describe_binds() {
     assert_eq!(before, snapshot(&core));
 
     // Describe は Execute と同じ束縛を通る。`RETURNING` なしは結果列なし（拡張クエリの Parse／Describe が
-    // ParameterDescription を返せる）、`RETURNING` つきは結果列の束縛（#3356）が未結線のため固定文言の `0A000`。
+    // ParameterDescription を返せる）、`RETURNING` つきは Execute の結果列と同じ列（#3356）。
     let parsed = core.parse_sql(sql).expect("parse");
     assert_eq!(
         core.describe_parsed_in_session(&SessionState::default(), &parsed)
@@ -222,11 +215,11 @@ fn sql79_explicit_transaction_runs_and_describe_binds() {
         None
     );
     let parsed = core.parse_sql(RETURNING_SHAPE).expect("parse");
-    let err = core
+    let cols = core
         .describe_parsed_in_session(&SessionState::default(), &parsed)
-        .expect_err("describe with RETURNING");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(err.client_message(), FIXED_MESSAGE);
+        .expect("describe with RETURNING")
+        .expect("RETURNING columns");
+    assert_eq!(cols.len(), 1);
 }
 
 #[test]
