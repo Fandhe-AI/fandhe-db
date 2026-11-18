@@ -6,7 +6,7 @@
 //! `merge_action()` は `INSERT`／`UPDATE`／`DELETE`（列名 `merge_action`・型 text）。結果行の並びは対象候補の
 //! 走査順（UPDATE・DELETE）→ 元の走査順の INSERT。件数（`rows_affected`）は `RETURNING` の有無によらず実変更
 //! 行数の合計（DO NOTHING は数えない）。束縛エラー・未対応の形は書き込みより前に返り、副作用ゼロ。
-//! 期待値は PostgreSQL 17 の意味論（merge.sgml・回帰テスト merge.out）から導く（完全な突き合わせは #3358）。
+//! 期待値は PostgreSQL 17 の意味論（merge.sgml・回帰テスト merge.out）から導く（WHEN の組み合わせ・境界の突き合わせは `sql79_merge_pg17_parity.rs`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;

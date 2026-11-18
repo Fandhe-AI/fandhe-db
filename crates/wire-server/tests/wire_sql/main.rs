@@ -103,6 +103,7 @@ mod wire_sql79_merge_ledger;
 mod wire_sql79_merge_matched;
 mod wire_sql79_merge_not_matched;
 mod wire_sql79_merge_parse;
+mod wire_sql79_merge_pg17_parity;
 mod wire_sql79_merge_returning;
 mod wire_sql79_merge_rules;
 mod wire_statement_timeout_setting;

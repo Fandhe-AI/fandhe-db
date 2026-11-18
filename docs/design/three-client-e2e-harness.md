@@ -1274,3 +1274,10 @@ API 越しに観測できることを、簡易・拡張の両方で固定する�
 - 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-db-wire-server --test three_client_txn_retry_e2e --
   --ignored --nocapture --test-threads=1` の `[e2e-record]` 行（クライアント版を含む。資格情報・テナント id・
   SQL 本文は出力しない）を PR 本文へ転記する。
+
+## MERGE の 3 クライアント検証（Issue #3358・SQL-79）
+
+- 対象: `crates/wire-server/tests/three_client_e2e.rs` の `three_clients_run_merge_across_three_tenants`（`#[ignore]`・`make e2e-three-client`）。層 A は `wire_sql79_merge_pg17_parity.rs`（常時 `make ci`）。設計記録は [sql-merge.md](sql-merge.md) の §14
+- 内容: psql の `-c "MERGE ...;"`（末尾 `;` つき単独送信）・コマンドタグ `MERGE 6`・`RETURNING merge_action(), mt.x` の行・3 テナントでの読み戻し（他テナント不変）・拒否の SQLSTATE（`42601`・`42601`・`42P01`）。件数と行は PostgreSQL 17 の同形のケースの実測と同じ
+- 環境: クライアントごとに新しいサーバーと DB。ツールが無ければ panic（silent skip しない）
+- 記録: `NODE_PATH=<pg の node_modules> cargo test -p fandhe-db-wire-server --features fault-injection --test three_client_e2e three_clients_run_merge -- --ignored --nocapture --test-threads=1` の `[e2e-record]` 行（資格情報・テナント id・SQL 本文は出力しない）。ローカル実行: psql 18.6・psycopg 3.3.6・node pg 8.23.1 で 3 クライアントとも通過

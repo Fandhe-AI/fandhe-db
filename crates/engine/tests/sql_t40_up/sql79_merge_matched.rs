@@ -4,8 +4,8 @@
 //! 契約: MATCHED の句だけで書かれた MERGE は、autocommit・明示 Tx のどちらでも実行され、行の内容と件数
 //! （UPDATE と DELETE の実変更行数の合計。DO NOTHING は含めない）が決まる。1 つの対象行について UPDATE か
 //! DELETE を選んだ組が 2 つ以上あれば文全体が `21000` になり、行・台帳・世代に何も残らない。台帳記録（#3357）は
-//! `sql79_merge_ledger.rs` で固定する。`RETURNING` は #3356 から実行される。他テナントの行は一致・件数・`21000` のどれにも現れない（3 テナントの越境の網羅は #3358）。
-//! 期待値は設計記録の決定から導く（PG17 との突き合わせは #3358）。
+//! `sql79_merge_ledger.rs` で固定する。`RETURNING` は #3356 から実行される。他テナントの行は一致・件数・`21000` のどれにも現れない（3 テナントの越境の網羅は `sql79_merge_cross_tenant.rs`）。
+//! 期待値は設計記録の決定から導く（PG17 との突き合わせは `sql79_merge_pg17_parity.rs`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;

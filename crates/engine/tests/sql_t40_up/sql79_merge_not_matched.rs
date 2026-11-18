@@ -7,8 +7,8 @@
 //! MATCHED の句がどれも発火しない対象行は BY SOURCE を受けない。INSERT は既存の挿入経路（採番・DEFAULT・
 //! 生成列・制約・トリガ）を通り、件数は UPDATE・DELETE・INSERT の実変更行数の合計（DO NOTHING は含めない）。
 //! 上限（走査・影響行数・INSERT の行数・元の可視行数）は `54000` で、超過した文は何も書かない。他テナントの
-//! Private 行は BY SOURCE の DELETE・UPDATE も INSERT の材料も受けない（3 テナントの網羅は #3358）。
-//! 期待値は設計記録の決定から導く（PG17 との突き合わせは #3358）。
+//! Private 行は BY SOURCE の DELETE・UPDATE も INSERT の材料も受けない（3 テナントの網羅は `sql79_merge_cross_tenant.rs`）。
+//! 期待値は設計記録の決定から導く（PG17 との突き合わせは `sql79_merge_pg17_parity.rs`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
