@@ -4119,6 +4119,32 @@ pub(crate) fn enforce_deferred_foreign_keys_in_txn(
     Ok(())
 }
 
+/// `table` を子とする即時（`INITIALLY DEFERRED` でない）`FOREIGN KEY` を、事後状態の全件走査で検査する
+/// （MERGE の INSERT 句をまたぐ参照のため、[`crate::tenant::InsertFkDeferScope`] で先送りした検査を
+/// 全バッチの書き込み後に 1 回補う。Issue #3354）。遅延 FK は COMMIT 時検査の対象のためここでは見ない。
+pub(crate) fn enforce_immediate_foreign_keys_by_scan_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    table: &str,
+) -> Result<(), TenantWriteError> {
+    let schema = crate::catalog::require_table_schema_write_any_identity(write_txn, table)?;
+    for fk in schema.foreign_keys() {
+        if fk.is_initially_deferred() {
+            continue;
+        }
+        let parent = parent_schema_for(write_txn, table, fk)?;
+        enforce_referencing_rows_by_scan_for_fk(
+            write_txn,
+            fk.parent_table(),
+            parent.as_ref().unwrap_or(&schema),
+            &schema,
+            fk,
+            tenant_id,
+        )?;
+    }
+    Ok(())
+}
+
 /// 連鎖の対象子行 1 件分: `(子行 id, ON UPDATE CASCADE の新しい参照先キー値。
 /// それ以外のアクションでは `None`)`。[`collect_action_targets`] の戻り値・
 /// [`apply_referential_action`] の入力で共有する（Issue #1076）。

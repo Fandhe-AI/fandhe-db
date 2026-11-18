@@ -588,7 +588,7 @@ fn index_source_rows(
     })
 }
 
-pub(super) fn value_bytes(v: &Value) -> usize {
+pub(crate) fn value_bytes(v: &Value) -> usize {
     match v {
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),

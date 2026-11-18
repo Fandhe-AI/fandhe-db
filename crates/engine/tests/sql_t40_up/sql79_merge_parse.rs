@@ -1,11 +1,11 @@
-//! `MERGE` 文の構文解析と、実行に結線されていない形の固定文言 `0A000`（SQL-79・Issue #3351・#3353。親 #3349、
-//! 設計記録 `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
+//! `MERGE` 文の構文解析と、実行に結線されていない形の固定文言 `0A000`（SQL-79・Issue #3351・#3353・#3354。
+//! 親 #3349、設計記録 `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
 //!
-//! 契約: 構文解析と束縛（#3352。`sql79_merge_bind.rs`）を通った MERGE のうち、`WHEN MATCHED` だけの形は
-//! #3353 から実行される（行・件数は `sql79_merge_matched.rs`）。`WHEN NOT MATCHED`・`RETURNING`・台帳記録の
-//! 形は固定文言の `0A000` で止まり、行・台帳・世代に一切触れない（`USING OPERATION_ID` 付きを再送しても
-//! `23505` にならない）。構文エラーは `42601`、上限超過は `54000`、権限は書き込みゲートの `42501`。
-//! 受け皿は #3354（NOT MATCHED）・#3356（RETURNING）・#3357（台帳）。
+//! 契約: 構文解析と束縛（#3352。`sql79_merge_bind.rs`）を通った MERGE のうち、`WHEN MATCHED` は #3353 から、
+//! `WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 から実行される（行・件数は `sql79_merge_matched.rs`・
+//! `sql79_merge_not_matched.rs`）。`RETURNING`・台帳記録の形は固定文言の `0A000` で止まり、行・台帳・世代に
+//! 一切触れない（`USING OPERATION_ID` 付きを再送しても `23505` にならない）。構文エラーは `42601`、
+//! 上限超過は `54000`、権限は書き込みゲートの `42501`。受け皿は #3356（RETURNING）・#3357（台帳）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, ParsedSql};
@@ -83,21 +83,35 @@ const EXECUTED: &[&str] = &[
     "MERGE INTO t USING (SELECT k, v FROM s) AS q (k, v) ON t.k = q.k WHEN MATCHED THEN DO NOTHING",
 ];
 
-/// 構文を通るが実行に結線されていない形（NOT MATCHED を含む形。受け皿 #3354）。
-const NOT_MATCHED_SHAPES: &[&str] = &[
-    "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN \
-     INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v)",
-    "MERGE INTO t AS d USING s AS x ON d.k = x.k WHEN MATCHED AND x.v > 1 THEN UPDATE SET x = x.v + 1 \
-     WHEN NOT MATCHED THEN INSERT (id, embedding, k) VALUES (x.id, x.embedding, x.k) \
-     WHEN NOT MATCHED BY SOURCE THEN DELETE",
+/// 構文を通り、#3354 から実行される NOT MATCHED を含む形と、実行後の対象表の内容・件数
+/// （初期状態は `seed`: t = {1:a/10, 2:b/20}、s = {1:a/100, 3:c/300}）。
+const NOT_MATCHED_SHAPES: &[(&str, &str, &[&str])] = &[
+    (
+        "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN \
+         INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v)",
+        "Merge(MergeOutcome { rows_affected: 1 })",
+        &[
+            "Integer(1), Text(\"a\"), SignedInteger(10)",
+            "Integer(2), Text(\"b\"), SignedInteger(20)",
+            "Integer(3), Text(\"c\"), SignedInteger(300)",
+        ],
+    ),
+    (
+        "MERGE INTO t AS d USING s AS x ON d.k = x.k WHEN MATCHED AND x.v > 1 THEN UPDATE SET x = x.v + 1 \
+         WHEN NOT MATCHED THEN INSERT (id, embedding, k) VALUES (x.id, x.embedding, x.k) \
+         WHEN NOT MATCHED BY SOURCE THEN DELETE",
+        "Merge(MergeOutcome { rows_affected: 3 })",
+        &[
+            "Integer(1), Text(\"a\"), SignedInteger(101)",
+            "Integer(3), Text(\"c\"), Null",
+        ],
+    ),
 ];
 
 /// `RETURNING` つきの形（受け皿 #3356）。
 const RETURNING_SHAPE: &str =
     "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.k";
 
-const NOT_MATCHED_MESSAGE: &str =
-    "feature not supported: MERGE WHEN NOT MATCHED is not supported yet";
 const RETURNING_MESSAGE: &str = "feature not supported: MERGE with RETURNING is not supported yet";
 
 #[test]
@@ -118,23 +132,26 @@ fn sql79_matched_only_shapes_parse_and_run() {
     }
 }
 
-// NOT MATCHED を含む形は、INSERT と BY SOURCE の実行を入れる #3354 まで固定文言で拒否する。
-// tracked: #3354
+// NOT MATCHED を含む形は #3354 から実行され、件数と実行後の行が決まる（末尾 `;` 付きも同じ）。
 #[test]
-fn sql79_not_matched_shapes_stop_with_fixed_0a000_and_no_side_effects() {
-    let (core, _g) = new_core("sql79-fixed");
-    seed(&core);
-    let before = snapshot(&core);
-    for sql in NOT_MATCHED_SHAPES {
+fn sql79_not_matched_shapes_parse_and_run() {
+    for (sql, outcome, rows) in NOT_MATCHED_SHAPES {
         for text in [sql.to_string(), format!("{sql};")] {
-            let (code, msg) = run(&core, &text).expect_err(&text);
-            assert_eq!(
-                (code.as_str(), msg.as_str()),
-                ("0A000", NOT_MATCHED_MESSAGE),
-                "{text}"
-            );
-            assert_eq!(before, snapshot(&core), "{text}");
+            let (core, _g) = new_core("sql79-nm-run");
+            seed(&core);
+            let out = run(&core, &text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert_eq!(out, *outcome, "{text}");
+            let t = run(&core, "SELECT id, k, x FROM t ORDER BY id LIMIT 100").expect("scan t");
+            for r in *rows {
+                assert!(
+                    t.contains(&format!("cells: [{r}]")),
+                    "{text}: missing {r} in {t}"
+                );
+            }
+            // 期待した行数と一致する（余計な行が残っていない）。
+            assert_eq!(t.matches("ResultRow").count(), rows.len(), "{text}: {t}");
         }
+        let (core, _g) = new_core("sql79-nm-parse");
         assert!(matches!(
             core.parse_sql(sql).expect("parse"),
             ParsedSql::Merge(_)
@@ -342,9 +359,7 @@ fn sql79_require_operation_id_matches_other_dml() {
 }
 
 /// 権限: 書き込みゲートは WHEN に現れた操作の和と SELECT を対象表に課す。足りない主体は `42501`、
-/// 満たす主体は構文段を通って実行される（NOT MATCHED を含む形は固定の `0A000`）。
-// 権限を満たす NOT MATCHED を含む形の拒否は、実行を入れる #3354 まで続く。
-// tracked: #3354
+/// 満たす主体は構文段を通って実行される（INSERT を含む形も INSERT 権限があれば実行される）。
 #[test]
 fn sql79_privilege_bits_follow_the_when_actions() {
     let (core, _g) = new_core("sql79-priv");
@@ -392,15 +407,13 @@ fn sql79_privilege_bits_follow_the_when_actions() {
     operator("GRANT INSERT ON tx TO bob");
     assert_eq!(
         as_bob(both),
-        "0A000",
-        "NOT MATCHED を含む形は実行を入れる #3354 まで拒否する"
+        "ok",
+        "権限を満たす主体は NOT MATCHED の INSERT を含む形も実行できる"
     );
 }
 
 /// SET 右辺・VALUES の先頭が `CASE WHEN` の式でも列 `CASE` と誤認されず構文解析を通る
-/// （UPDATE は実行され、NOT MATCHED の INSERT は 0A000 で止まる）。
-// INSERT の形は実行を入れる #3354 まで拒否する。
-// tracked: #3354
+/// （UPDATE も NOT MATCHED の INSERT も実行される）。
 #[test]
 fn sql79_case_when_expression_in_set_and_values_parses() {
     let (core, _g) = new_core("sql79-case-when");
@@ -413,11 +426,13 @@ fn sql79_case_when_expression_in_set_and_values_parses() {
         ParsedSql::Merge(_)
     ));
     let insert = "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, embedding, k, x) VALUES (s.id, '[0.1,0.2]', s.k, CASE WHEN s.v > 1 THEN 1 ELSE 2 END)";
-    let (code, msg) = run(&core, insert).expect_err(insert);
-    assert_eq!(
-        (code.as_str(), msg.as_str()),
-        ("0A000", NOT_MATCHED_MESSAGE),
-        "{insert}"
+    // 更新で s.id = 1 は一致し、s.id = 3 だけが未一致（x = CASE WHEN 300 > 1 THEN 1 ...）として挿入される。
+    let out = run(&core, insert).unwrap_or_else(|e| panic!("{insert}: {e:?}"));
+    assert_eq!(out, "Merge(MergeOutcome { rows_affected: 1 })", "{insert}");
+    let t = run(&core, "SELECT id, x FROM t ORDER BY id LIMIT 100").expect("scan");
+    assert!(
+        t.contains("Integer(3)") && t.contains("SignedInteger(1)"),
+        "{t}"
     );
     assert!(matches!(
         core.parse_sql(insert).expect("parse"),

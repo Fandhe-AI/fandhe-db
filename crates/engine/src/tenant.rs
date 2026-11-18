@@ -731,6 +731,50 @@ impl<'a> WriteTarget<'a> {
             WriteTarget::InTxn(_) => crate::constraint::FkCheckMode::ImmediateOnly,
         }
     }
+
+    /// INSERT 経路用の [`Self::fk_check_mode`]。`table` が [`InsertFkDeferScope`] の対象なら
+    /// `Skip`（行ごとの検査を省く）を返す。省いた検査は区間の持ち主が全バッチの書き込み後に
+    /// 1 回行う契約（MERGE の INSERT 句をまたぐ自己参照 FK。Issue #3354）。
+    pub(crate) fn insert_fk_check_mode(&self, table: &str) -> crate::constraint::FkCheckMode {
+        if InsertFkDeferScope::is_deferred(table) {
+            crate::constraint::FkCheckMode::Skip
+        } else {
+            self.fk_check_mode()
+        }
+    }
+}
+
+thread_local! {
+    /// FK の INSERT 時検査を先送りしている表名（区間が無ければ `None`）。
+    static INSERT_FK_DEFERRED_TABLE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 指定表への INSERT 経路の FK 検査（子側）を、区間が続く間だけ先送りする RAII ガード。
+/// MERGE が INSERT 句ごとに `execute_insert_batch_with_schema_in` を呼ぶため、句をまたぐ参照を
+/// 文単位の検査と同じ意味で通すために使う。区間の持ち主は drop 後に
+/// `constraint::enforce_immediate_foreign_keys_by_scan_in_txn` で検査を必ず補う（省き忘れは fail-open）。
+/// 対象は INSERT 経路の子側検査だけで、UPDATE・DELETE・他表の検査には影響しない。drop で直前の状態へ戻す。
+pub(crate) struct InsertFkDeferScope {
+    prev: Option<String>,
+}
+
+impl InsertFkDeferScope {
+    pub(crate) fn enter(table: &str) -> Self {
+        let prev = INSERT_FK_DEFERRED_TABLE.with(|t| t.borrow_mut().replace(table.to_string()));
+        Self { prev }
+    }
+
+    fn is_deferred(table: &str) -> bool {
+        INSERT_FK_DEFERRED_TABLE.with(|t| t.borrow().as_deref() == Some(table))
+    }
+}
+
+impl Drop for InsertFkDeferScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        INSERT_FK_DEFERRED_TABLE.with(|t| *t.borrow_mut() = prev);
+    }
 }
 
 /// [`WriteTarget::with_txn`] の冒頭で呼ぶ、ビュー経由の書き込み区間の指紋照合
@@ -2387,7 +2431,7 @@ fn insert_typed_row_impl(
             &schema,
             ctx.tenant_id(),
             &[row_id],
-            target.fk_check_mode(),
+            target.insert_fk_check_mode(table),
             crate::constraint::RowPolicyWrite::Insert,
         )?;
         // 呼び出し元が事前投影を省いた後に最後の INSERT トリガが DROP されると、この非トリガ経路へ来る
@@ -3127,7 +3171,7 @@ pub(crate) fn insert_typed_rows_unchecked(
                 &schema_for_pk,
                 ctx.tenant_id(),
                 &ids,
-                target.fk_check_mode(),
+                target.insert_fk_check_mode(table),
                 crate::constraint::RowPolicyWrite::Insert,
             )?;
         }
@@ -7252,6 +7296,7 @@ fn enumerate_dml_candidates_with<E, T>(
 /// - `row_security = off`（`42501`。RLS-13）
 /// - 対象表に利用者ポリシーが適用される（UPDATE 用・DELETE 用のどちらでも固定文言の `0A000`。操作ごとに
 ///   行集合が変わり、第 1 段の列挙と第 3 段の列挙が一致する保証を作れないため。担当 #3355）
+/// - INSERT 句があり、INSERT 側の利用者ポリシーが適用される（固定文言の `0A000`。Issue #3354。担当 #3355）
 /// - 対象表に文トリガがある（固定文言の `0A000`。MERGE の文トリガは操作の種類ごとに 1 回の契約で、既存の
 ///   書き込み経路は呼び出しごとに発火するため。担当 #3355）
 pub(crate) fn merge_target_preflight(
@@ -7259,6 +7304,7 @@ pub(crate) fn merge_target_preflight(
     ctx: &PolicyContext,
     table: &str,
     expected_schema: &crate::catalog::TableSchema,
+    has_insert_clause: bool,
 ) -> Result<(), TenantWriteError> {
     validate_relation_key(table)?;
     let schema = require_table_schema_write_any_identity(write_txn, table)?;
@@ -7286,6 +7332,23 @@ pub(crate) fn merge_target_preflight(
                 "MERGE into a table with row-level security policies is not supported yet",
             ));
         }
+    }
+    // `WHEN NOT MATCHED ... THEN INSERT` があるときは INSERT 側の利用者ポリシー（`WITH CHECK`）も同じく
+    // 未対応で拒否する（RLS 相当を緩めない fail-closed の多層防御。書き込み段も挿入時に同じ検査を持つ。
+    // 担当 #3355）。
+    if has_insert_clause
+        && crate::sql::policy_eval::compile_in_txn(
+            write_txn,
+            ctx.tenant_id(),
+            table,
+            &schema,
+            crate::sql::policy_eval::PolicyCheckKind::InsertCheck,
+        )?
+        .is_some()
+    {
+        return Err(unsupported(
+            "MERGE into a table with row-level security policies is not supported yet",
+        ));
     }
     let triggers =
         crate::catalog::trigger::list_triggers_in_txn(write_txn, ctx.tenant_id(), table)?;

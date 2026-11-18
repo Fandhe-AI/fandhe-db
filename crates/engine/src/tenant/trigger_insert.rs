@@ -191,7 +191,7 @@ pub(super) fn write_rows_with_triggers(
             schema,
             ctx.tenant_id(),
             &written,
-            target.fk_check_mode(),
+            target.insert_fk_check_mode(table),
         )?;
     }
     // AFTER ROW（段 6）。変更の順（書いた順）× トリガ名のバイト順。

@@ -120,19 +120,26 @@ fn bound_matched_only_shapes_run() {
     }
 }
 
-// NOT MATCHED を含む形は束縛を通っても、実行を入れる #3354 まで固定文言で拒否する。
-// tracked: #3354
+// NOT MATCHED を含む形は束縛を通って #3354 から実行される（t = {1:a/10, 2:b/20}、s = {1:a/100, 3:c/300}。
+// a は一致して DELETE、c は未一致で INSERT、b は元に無く BY SOURCE の UPDATE）。
 #[test]
-fn bound_not_matched_shapes_stop_with_the_fixed_0a000() {
+fn bound_not_matched_shapes_run() {
     let (core, _g) = new_core("sql79b-notmatched");
     seed(&core);
-    expect_code(
+    let out = run(
         &core,
         "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v > 5 AND t.x < 100 THEN DELETE \
          WHEN NOT MATCHED AND s.v > 1 THEN INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v) \
          WHEN NOT MATCHED BY SOURCE AND t.x > 1 THEN UPDATE SET x = t.x + 1",
-        "0A000",
+    )
+    .expect("runs");
+    assert_eq!(out, "Merge(MergeOutcome { rows_affected: 3 })");
+    let t = run(&core, "SELECT id, k, x FROM t ORDER BY id LIMIT 100").expect("scan t");
+    assert!(
+        t.contains("SignedInteger(21)") && t.contains("SignedInteger(300)"),
+        "{t}"
     );
+    assert!(!t.contains("SignedInteger(10)"), "{t}");
 }
 
 #[test]
@@ -390,8 +397,6 @@ fn explicit_transaction_binds_against_the_begin_snapshot() {
     assert_eq!(code, "42703", "{msg}");
 }
 
-// 権限を満たす NOT MATCHED の INSERT の形は束縛を通っても、実行を入れる #3354 まで拒否する。
-// tracked: #3354
 #[test]
 fn the_privilege_gate_runs_before_binding() {
     let (core, _g) = new_core("sql79b-priv");
@@ -449,12 +454,12 @@ fn the_privilege_gate_runs_before_binding() {
         as_bob(
             "MERGE INTO tx USING sy ON tx.k = sy.k WHEN NOT MATCHED THEN INSERT (k, v) VALUES (sy.k, sy.w)"
         ),
-        "0A000",
-        "移行済みの表は疑似列 id を省いてよい（束縛は通り、実行の拒否は 0A000）"
+        "ok",
+        "移行済みの表は疑似列 id を省いてよい（束縛を通り、権限を満たす主体は実行できる）"
     );
     assert_eq!(
         as_bob("MERGE INTO tx USING sy ON tx.k = sy.k WHEN NOT MATCHED THEN INSERT DEFAULT VALUES"),
-        "0A000"
+        "ok"
     );
 }
 
