@@ -348,6 +348,13 @@ impl EngineCore {
                 // SQL-80・Issue #3316: 行セキュリティだけのアクションは権限・ポリシーの DDL と同じ入口へ回す
                 // （他のアクションと混ぜた形は下の `0A000`）。
                 if let crate::sql::allowlist::ValidatedAlterTable::RowSecurity(rs) = stmt {
+                    // RLS-13（Issue #2275）: 自動コミット側と同じく、同名の一時表が永続表を隠しているときは
+                    // 永続表の有効化状態を黙って変えない（fail-closed の `0A000`）。
+                    if session.temp_tables().contains(&rs.table_name) {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            "ROW LEVEL SECURITY is not supported for temporary tables",
+                        ));
+                    }
                     return self.execute_row_security_in_txn(ctx, txn, rs);
                 }
                 let Some(table_name) = crate::sql::ddl::alter_table_in_txn_target(stmt) else {

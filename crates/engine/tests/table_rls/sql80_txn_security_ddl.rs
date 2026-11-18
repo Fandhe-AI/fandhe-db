@@ -542,3 +542,24 @@ fn trigger_and_function_ddl_commit_and_rollback() {
     let e = f.tx_code("t1", &mut alice, &mut txn, "CREATE FUNCTION g2(x) AS x");
     assert_eq!(e.wire_code(), "0A000");
 }
+
+/// RLS-13（Issue #2275）: 同名の一時表が永続表を隠しているとき、Tx 内の行セキュリティ変更も自動コミットと
+/// 同じ `0A000` で拒否し、永続表の有効化状態を黙って変えない（fail-open の防止）。
+#[test]
+fn row_security_in_txn_rejects_when_temp_table_shadows() {
+    let f = fx("sql80-txn-rls-temp");
+    let mut op = operator();
+    f.ok("t1", &mut op, "CREATE TABLE tt (a TEXT)");
+    f.ok("t1", &mut op, "CREATE TEMP TABLE tt (a TEXT)");
+    for sql in [
+        "ALTER TABLE tt ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE tt DISABLE ROW LEVEL SECURITY",
+        "ALTER TABLE tt FORCE ROW LEVEL SECURITY",
+        "ALTER TABLE tt NO FORCE ROW LEVEL SECURITY",
+    ] {
+        let mut txn = f.begin("t1", &mut op);
+        let e = f.tx_code("t1", &mut op, &mut txn, sql);
+        assert_eq!(e.wire_code(), "0A000", "{sql}");
+        f.tx_ok("t1", &mut op, &mut txn, "ROLLBACK");
+    }
+}
