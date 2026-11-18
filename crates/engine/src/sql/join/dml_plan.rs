@@ -618,7 +618,7 @@ fn resolve_returning(
 }
 /// source 列が SET 式の入力として結合ビューへ写像できる型か（`sql::join::dml::source_scalar` が
 /// 扱う型と一致させる。写像できない型は実行時の `XX000` にせず変換の段階で拒否する）。
-fn source_type_supported(ty: &ColumnType) -> bool {
+pub(super) fn source_type_supported(ty: &ColumnType) -> bool {
     cell_scalar_supports(ty)
         || matches!(
             ty,
@@ -632,7 +632,7 @@ fn source_type_supported(ty: &ColumnType) -> bool {
 
 /// 式としての SET 代入（`bind_set_expr`）が受理する代入先の列型か。受理しない型（JSONB／JSON／
 /// UUID／BYTEA／NUMERIC／ENUM 等）への source 列の単純コピーは式を経由せず [`JoinedCopyItem`] で運ぶ。
-fn set_expr_accepts_target(ty: &ColumnType) -> bool {
+pub(super) fn set_expr_accepts_target(ty: &ColumnType) -> bool {
     matches!(
         ty,
         ColumnType::SmallInt

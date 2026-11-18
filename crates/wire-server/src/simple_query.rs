@@ -925,6 +925,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::Delete(outcome) => OutcomeResponse::Command {
             tag: format!("DELETE {}", outcome.rows_affected),
         },
+        // SQL-79（Issue #3353）: `MERGE` は UPDATE と DELETE の実変更行数の合計を `MERGE <n>` で返す。
+        SqlOutcome::Merge(outcome) => OutcomeResponse::Command {
+            tag: format!("MERGE {}", outcome.rows_affected),
+        },
         // Issue #873（SQL-21）: `RETURNING` 句付き `INSERT`／`DELETE` の応答。
         // `RowDescription`／`DataRow`* は通常の検索 SELECT・`EXPLAIN` と同じ
         // 経路で組み立てるが、`CommandComplete` タグの件数は

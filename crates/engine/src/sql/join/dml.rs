@@ -524,11 +524,25 @@ fn build_source_index(
     budget: &mut JoinBudget,
 ) -> Result<SourceIndex, SqlSurfaceError> {
     let columns = plan.scan_columns();
-    let id_offset = usize::from(plan.source_id_in_cells());
     let result = match &plan.source.fold {
         Some(fold) => scan_folded_source(read_txn, ctx, fold, &columns, udfs, limits, budget)?,
         None => scan_single_source(read_txn, ctx, plan, udfs, limits, budget)?,
     };
+    index_source_rows(plan, classes, limits, budget, result)
+}
+
+/// 走査（または呼び出し元が実体化した）結果をハッシュ表にする。可視行数の上限・共有バイト予算・NULL を含む
+/// キーの除外は走査した場合と同じ（`MERGE` の部分クエリの元が実体化した行も同じ関数を通る。SQL-79）。
+/// `result.rows` の各行は [`JoinedDmlPlan::scan_columns`] の並び（先頭に疑似列 `id`〔必要なときだけ〕）。
+fn index_source_rows(
+    plan: &JoinedDmlPlan,
+    classes: &[JoinKeyClass],
+    limits: &JoinLimits,
+    budget: &mut JoinBudget,
+    result: crate::sql::exec::QueryResult,
+) -> Result<SourceIndex, SqlSurfaceError> {
+    let columns = plan.scan_columns();
+    let id_offset = usize::from(plan.source_id_in_cells());
     if result.rows.len() > limits.max_input_rows {
         return Err(SqlSurfaceError::payload_too_large(
             "JOIN input exceeds the visible row limit",
@@ -574,7 +588,7 @@ fn build_source_index(
     })
 }
 
-fn value_bytes(v: &Value) -> usize {
+pub(super) fn value_bytes(v: &Value) -> usize {
     match v {
         Value::Text(s) => s.len(),
         Value::Bytes(b) => b.len(),
@@ -611,11 +625,78 @@ pub(crate) struct JoinedProbe<'a> {
 }
 
 /// 残余述語の実行時の評価器。
-struct ResidualEval {
+pub(super) struct ResidualEval {
     conj: BoundConjunction,
     /// 残余が参照する source 列の（走査結果のセル位置, 列型）。ビューへの追記順。
     cells: Vec<(usize, ColumnType)>,
     scratch: Vec<StackValue>,
+}
+
+impl ResidualEval {
+    /// 残余 `r` の評価器を作る。ビューの並びは「対象行の走査結果 ++ `r.source_columns`（その残余自身の並び）」。
+    /// `ON` の残余（[`JoinedProbe`]）と `MERGE` の `WHEN ... AND` の条件（`merge_plan`）が共有する。
+    pub(super) fn new(plan: &JoinedDmlPlan, r: &JoinedResidual) -> Result<Self, SqlSurfaceError> {
+        let mut cells = Vec::with_capacity(r.source_columns.len());
+        for &c in &r.source_columns {
+            let pos = plan.source_cell_position(ColumnSlot::Column(c))?;
+            let ty = plan
+                .source
+                .schema
+                .columns
+                .get(c)
+                .ok_or_else(|| internal("source column out of range"))?
+                .ty
+                .clone();
+            cells.push((pos, ty));
+        }
+        Ok(Self {
+            conj: BoundConjunction::new(
+                r.metadata_filters.clone(),
+                r.expr_filters.clone(),
+                r.or_filters.clone(),
+            ),
+            cells,
+            scratch: Vec::new(),
+        })
+    }
+
+    /// 対象行（`scanned`・`id`）と source の 1 行の組で残余が真か（NULL は偽）。
+    pub(super) fn matches_row(
+        &mut self,
+        scanned: &[Option<ScalarRef<'_>>],
+        id: u64,
+        row: &ResultRow,
+    ) -> Result<bool, SqlSurfaceError> {
+        // 配列セルは借用形が正準ペイロードを要するため、先に所有バッファへ書き出す（ビューが借用する。
+        // `MERGE` の SET 評価と同じ扱い）。配列を含まない残余では確保しない。
+        let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(self.cells.len());
+        for (cell_pos, _) in &self.cells {
+            let cell = row
+                .cells
+                .get(*cell_pos)
+                .ok_or_else(|| internal("source cell out of range"))?;
+            payloads.push(match cell {
+                Cell::Array(a) => {
+                    let mut buf = Vec::new();
+                    crate::row_codec::write_array_elements_payload(&mut buf, a)
+                        .map_err(|_| internal("source array column could not be re-encoded"))?;
+                    Some(buf)
+                }
+                _ => None,
+            });
+        }
+        let mut view: Vec<Option<ScalarRef<'_>>> =
+            Vec::with_capacity(scanned.len().saturating_add(self.cells.len()));
+        view.extend(scanned.iter().copied());
+        for ((cell_pos, ty), payload) in self.cells.iter().zip(&payloads) {
+            let cell = row
+                .cells
+                .get(*cell_pos)
+                .ok_or_else(|| internal("source cell out of range"))?;
+            view.push(source_scalar(cell, ty, payload.as_deref())?);
+        }
+        self.conj.matches(&view, id, &[], 0, &mut self.scratch)
+    }
 }
 
 impl<'a> JoinedProbe<'a> {
@@ -628,38 +709,44 @@ impl<'a> JoinedProbe<'a> {
         udfs: &UdfRegistry,
         limits: &JoinLimits,
     ) -> Result<Self, SqlSurfaceError> {
+        Self::build(plan, limits, |classes, budget| {
+            build_source_index(read_txn, ctx, plan, classes, udfs, limits, budget)
+        })
+    }
+
+    /// 呼び出し元が実体化済みの行を元にする版（`MERGE` の部分クエリの元。SQL-79・Issue #3353）。
+    /// `result` の各行は [`JoinedDmlPlan::scan_columns`] の並びへ射影済みで、疑似列 `id` は持たない
+    /// （`plan.source_id_in_cells()` が偽）こと。可視行数・共有バイト予算・キー化は [`Self::new`] と同じ。
+    pub(crate) fn new_with_rows(
+        plan: &'a JoinedDmlPlan,
+        limits: &JoinLimits,
+        result: crate::sql::exec::QueryResult,
+    ) -> Result<Self, SqlSurfaceError> {
+        if plan.source_id_in_cells() {
+            return Err(internal("materialized source cannot carry a pseudo id"));
+        }
+        Self::build(plan, limits, |classes, budget| {
+            index_source_rows(plan, classes, limits, budget, result)
+        })
+    }
+
+    fn build(
+        plan: &'a JoinedDmlPlan,
+        limits: &JoinLimits,
+        make_index: impl FnOnce(
+            &[JoinKeyClass],
+            &mut JoinBudget,
+        ) -> Result<SourceIndex, SqlSurfaceError>,
+    ) -> Result<Self, SqlSurfaceError> {
         plan.validate(limits)?;
         let classes = plan.key_classes()?;
         let mut budget = JoinBudget::new(limits.budget_cap);
-        let index = build_source_index(read_txn, ctx, plan, &classes, udfs, limits, &mut budget)?;
+        let index = make_index(&classes, &mut budget)?;
         let source_columns = plan.source_columns();
         let cell_offset = usize::from(plan.source_id_in_cells());
         let residual = match &plan.residual {
             None => None,
-            Some(r) => {
-                let mut cells = Vec::with_capacity(r.source_columns.len());
-                for &c in &r.source_columns {
-                    let pos = plan.source_cell_position(ColumnSlot::Column(c))?;
-                    let ty = plan
-                        .source
-                        .schema
-                        .columns
-                        .get(c)
-                        .ok_or_else(|| internal("source column out of range"))?
-                        .ty
-                        .clone();
-                    cells.push((pos, ty));
-                }
-                Some(ResidualEval {
-                    conj: BoundConjunction::new(
-                        r.metadata_filters.clone(),
-                        r.expr_filters.clone(),
-                        r.or_filters.clone(),
-                    ),
-                    cells,
-                    scratch: Vec::new(),
-                })
-            }
+            Some(r) => Some(ResidualEval::new(plan, r)?),
         };
         Ok(Self {
             plan,
@@ -707,12 +794,17 @@ impl<'a> JoinedProbe<'a> {
         Ok(out)
     }
 
-    /// 一致した source 行の走査位置の先頭（決定的）を返す。一致なしは `None`。
-    fn first_match(
+    /// 一致した source 行の走査位置を `out` へ追加する（走査位置の昇順＝決定的）。`all` が偽なら先頭 1 件だけ。
+    /// 一致ペアの累計（`max_output_rows`。一意化の前）・残余の比較回数・共有バイト予算・1024 件ごとの協調的
+    /// 中断は `all` の値によらず同一に計上する（`UPDATE ... FROM` と `MERGE` で `54000`・`57014` の判定を
+    /// 揃えるため）。
+    fn walk_matches(
         &mut self,
         c: &DmlCandidate<'_>,
         scanned: &[Option<ScalarRef<'_>>],
-    ) -> Result<Option<u32>, SqlSurfaceError> {
+        all: bool,
+        out: &mut Vec<u32>,
+    ) -> Result<(), SqlSurfaceError> {
         let mut key: Vec<u8> = Vec::new();
         for (k, class) in self.plan.keys.iter().zip(&self.classes) {
             let cell = match k.target_column {
@@ -721,7 +813,7 @@ impl<'a> JoinedProbe<'a> {
                 Some(i) => match scanned.get(i) {
                     Some(Some(sr)) => key_cell_from_scalar(sr, class)?,
                     // NULL を含むキーは一致しない。
-                    Some(None) => return Ok(None),
+                    Some(None) => return Ok(()),
                     None => return Err(internal("join key column missing from the target row")),
                 },
             };
@@ -730,9 +822,9 @@ impl<'a> JoinedProbe<'a> {
         // 走査結果を所有する `Rc` を手元へ複製し、`self` の他フィールドの可変借用と衝突させない。
         let index = Rc::clone(&self.index);
         let Some(matched) = index.table.get(&key) else {
-            return Ok(None);
+            return Ok(());
         };
-        let first = match self.residual.as_mut() {
+        match self.residual.as_mut() {
             None => {
                 // 一意化の前に一致ペアを数え、上限超過は何も確保せずに拒否する。
                 self.pairs = self.pairs.saturating_add(matched.len());
@@ -741,7 +833,14 @@ impl<'a> JoinedProbe<'a> {
                         "JOIN result exceeds the row limit",
                     ));
                 }
-                matched.first().copied()
+                if all {
+                    out.try_reserve(matched.len()).map_err(|_| {
+                        SqlSurfaceError::payload_too_large("JOIN result exceeds the row limit")
+                    })?;
+                    out.extend_from_slice(matched);
+                } else if let Some(&first) = matched.first() {
+                    out.push(first);
+                }
             }
             Some(res) => {
                 // 残余の評価は候補（等値キーの一致バケット。キー無しなら source の全行）ごとの
@@ -754,7 +853,7 @@ impl<'a> JoinedProbe<'a> {
                 let mut view: Vec<Option<ScalarRef<'_>>> =
                     Vec::with_capacity(base.saturating_add(res.cells.len()));
                 view.extend(scanned.iter().copied());
-                let mut first: Option<u32> = None;
+                let start_len = out.len();
                 for (n, &pos) in matched.iter().enumerate() {
                     if n % 1024 == 0 {
                         crate::interrupt::check()?;
@@ -779,14 +878,43 @@ impl<'a> JoinedProbe<'a> {
                                 "JOIN result exceeds the row limit",
                             ));
                         }
-                        if first.is_none() {
-                            first = Some(pos);
+                        if all {
+                            out.try_reserve(1).map_err(|_| {
+                                SqlSurfaceError::payload_too_large(
+                                    "JOIN result exceeds the row limit",
+                                )
+                            })?;
+                            out.push(pos);
+                        } else if out.len() == start_len {
+                            out.push(pos);
                         }
                     }
                 }
-                first
             }
-        };
+        }
+        Ok(())
+    }
+
+    /// 対象行に一致した source 行の走査位置を、走査位置の昇順で `out`（呼び出し元が空にしてから渡す）へ
+    /// 全件入れる（`MERGE` の第 1 段。SQL-79・Issue #3353）。一意化せず、`RETURNING` の一致記録も残さない。
+    pub(crate) fn matches_of(
+        &mut self,
+        c: &DmlCandidate<'_>,
+        scanned: &[Option<ScalarRef<'_>>],
+        out: &mut Vec<u32>,
+    ) -> Result<(), SqlSurfaceError> {
+        self.walk_matches(c, scanned, true, out)
+    }
+
+    /// 一致した source 行の走査位置の先頭（決定的）を返す。一致なしは `None`。
+    fn first_match(
+        &mut self,
+        c: &DmlCandidate<'_>,
+        scanned: &[Option<ScalarRef<'_>>],
+    ) -> Result<Option<u32>, SqlSurfaceError> {
+        let mut found: Vec<u32> = Vec::new();
+        self.walk_matches(c, scanned, false, &mut found)?;
+        let first = found.first().copied();
         if let Some(pos) = first {
             self.budget.charge(std::mem::size_of::<(u64, u32)>())?;
             let mut log = self
@@ -799,6 +927,17 @@ impl<'a> JoinedProbe<'a> {
             log.insert(c.id, pos);
         }
         Ok(first)
+    }
+
+    /// 文全体で共有する比較回数の上限へ `n` 回分を計上する（超過は `54000`。`MERGE` の `WHEN ... AND` の
+    /// 条件評価が、`ON` の残余と同じ上限を共有するために使う）。
+    pub(crate) fn charge_comparisons(&mut self, n: usize) -> Result<(), SqlSurfaceError> {
+        self.budget.charge_comparisons(n, self.max_comparisons)
+    }
+
+    /// 文全体で共有する予算へ、呼び出し元が保持する値のバイト数を計上する（超過は `54000`）。
+    pub(crate) fn charge_bytes(&mut self, n: usize) -> Result<(), SqlSurfaceError> {
+        self.budget.charge(n)
     }
 
     /// `DELETE ... USING` 用。対象行が一致すれば真（削除対象）。
@@ -907,7 +1046,7 @@ impl<'a> JoinedProbe<'a> {
 /// 単純コピーのセルを対象列型の行値へ変換する。`matview::cell_to_value` は ENUM のセルを扱わないため、
 /// ここで語彙検証して `Value::Enum` にする（語彙外は `22P02`。行の値は固定文言に含めない）。
 /// それ以外の型は `matview::cell_to_value` に委ねる。
-fn copy_cell_to_value(cell: Cell, ty: &ColumnType) -> Result<Value, SqlSurfaceError> {
+pub(super) fn copy_cell_to_value(cell: Cell, ty: &ColumnType) -> Result<Value, SqlSurfaceError> {
     match (ty, cell) {
         (ColumnType::Enum(def), Cell::Text(label)) => {
             if def.validate_label(&label).is_err() {

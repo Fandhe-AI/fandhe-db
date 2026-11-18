@@ -1,10 +1,11 @@
 //! `MERGE` の束縛（対象と元の列解決・型照合。SQL-79・Issue #3352。親 #3349、設計記録
 //! `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
 //!
-//! 契約: 束縛を通る形は固定文言の `0A000`（実行は #3353 以降）で止まり、束縛エラーはそれより前に
-//! 列解決（`42703`・`42702`・`42P01`）・型照合（`42804`）・INSERT の規則（`22000`）・ビューの形（`55000`）の
-//! SQLSTATE で返る。どちらも行・台帳・世代に触れない。Execute・明示 Tx・Describe は同じコードを返す。
-//! 末尾 `;` 付きの単独送信（psql 流）も同じ結果になる。
+//! 契約: 束縛エラーは書き込みより前に列解決（`42703`・`42702`・`42P01`）・型照合（`42804`）・INSERT の規則
+//! （`22000`）・ビューの形（`55000`）の SQLSTATE で返り、行・台帳・世代に触れない。束縛を通る形のうち
+//! `WHEN MATCHED` だけの形は #3353 から実行され、実行に結線されていない形（NOT MATCHED・ビュー対象）は
+//! 固定文言の `0A000` で止まる。Execute・明示 Tx・Describe は同じ束縛エラーを返す。末尾 `;` 付きの単独送信
+//! （psql 流）も同じ結果になる。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -15,8 +16,6 @@ use engine::storage::{Storage, Visibility};
 
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
-
-const FIXED_MESSAGE: &str = "feature not supported: MERGE is not supported yet";
 
 fn new_core(label: &str) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path(label);
@@ -88,16 +87,17 @@ fn expect_code(core: &EngineCore, sql: &str, want: &str) {
         let (code, msg) = run(core, &text).expect_err(&text);
         assert_eq!(code, want, "{text}: {msg}");
         if want == "0A000" {
-            assert_eq!(msg, FIXED_MESSAGE, "{text}");
+            assert!(
+                msg.starts_with("feature not supported: MERGE"),
+                "{text}: {msg}"
+            );
         }
         assert_eq!(before, snapshot(core), "{text}");
     }
 }
 
 #[test]
-fn bound_shapes_stop_with_the_fixed_0a000() {
-    let (core, _g) = new_core("sql79b-ok");
-    seed(&core);
+fn bound_matched_only_shapes_run() {
     for sql in [
         // 結合キー（型クラス一致）・SET の列参照と式。
         "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v",
@@ -105,16 +105,34 @@ fn bound_shapes_stop_with_the_fixed_0a000() {
         // `ON t.id = s.id` は結合キーとして受理する。
         "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
         // 片側だけの条件。
-        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v > 5 AND t.x < 100 THEN DELETE \
-         WHEN NOT MATCHED AND s.v > 1 THEN INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v) \
-         WHEN NOT MATCHED BY SOURCE AND t.x > 1 THEN UPDATE SET x = t.x + 1",
+        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v > 5 AND t.x < 100 THEN DELETE",
         // 部分クエリの元。
         "MERGE INTO t USING (SELECT k, v FROM s) AS q (k, v) ON t.k = q.k WHEN MATCHED THEN UPDATE SET x = q.v",
         // 別名どうし。
         "MERGE INTO t AS d USING s AS e ON d.k = e.k WHEN MATCHED THEN DO NOTHING",
     ] {
-        expect_code(&core, sql, "0A000");
+        for text in [sql.to_string(), format!("{sql};")] {
+            let (core, _g) = new_core("sql79b-ok");
+            seed(&core);
+            let out = run(&core, &text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert!(out.starts_with("Merge("), "{text}: {out}");
+        }
     }
+}
+
+// NOT MATCHED を含む形は束縛を通っても、実行を入れる #3354 まで固定文言で拒否する。
+// tracked: #3354
+#[test]
+fn bound_not_matched_shapes_stop_with_the_fixed_0a000() {
+    let (core, _g) = new_core("sql79b-notmatched");
+    seed(&core);
+    expect_code(
+        &core,
+        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v > 5 AND t.x < 100 THEN DELETE \
+         WHEN NOT MATCHED AND s.v > 1 THEN INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v) \
+         WHEN NOT MATCHED BY SOURCE AND t.x > 1 THEN UPDATE SET x = t.x + 1",
+        "0A000",
+    );
 }
 
 #[test]
@@ -223,10 +241,6 @@ fn subquery_source_columns_come_from_describe_without_running_the_inner_query() 
             "MERGE INTO t USING (SELECT k, v FROM s) AS q (a, b) ON t.k = q.k WHEN MATCHED THEN DELETE",
             "42703",
         ),
-        (
-            "MERGE INTO t USING (SELECT k, v FROM s) AS q (a, b) ON t.k = q.a WHEN MATCHED THEN UPDATE SET x = q.b",
-            "0A000",
-        ),
         // 内側から対象を相関参照することはできない。
         (
             "MERGE INTO t USING (SELECT k FROM s WHERE s.k = t.k) AS q ON t.k = q.k WHEN MATCHED THEN DELETE",
@@ -241,8 +255,17 @@ fn subquery_source_columns_come_from_describe_without_running_the_inner_query() 
         expect_code(&core, sql, want);
     }
     assert_eq!(before, snapshot(&core));
+    // 列別名で改名した部分クエリの元は、別名の列で ON・SET を書けば実行される。
+    let out = run(
+        &core,
+        "MERGE INTO t USING (SELECT k, v FROM s) AS q (a, b) ON t.k = q.a WHEN MATCHED THEN UPDATE SET x = q.b",
+    )
+    .expect("renamed columns run");
+    assert!(out.starts_with("Merge("), "{out}");
 }
 
+// 自動更新できるビューを対象にする形は束縛を通っても、ビュー書き込みとの結線を入れる #3355 まで拒否する。
+// tracked: #3355
 #[test]
 fn view_targets_follow_the_single_view_write_rules() {
     let (core, _g) = new_core("sql79b-view");
@@ -356,7 +379,9 @@ fn explicit_transaction_binds_against_the_begin_snapshot() {
     let err = core
         .execute_sql_in_txn(&ctx(), &mut session, &mut txn, merge)
         .expect_err("merge in txn");
-    assert_eq!(err.wire_code(), "0A000", "{}", err.client_message());
+    // 束縛は通る（BEGIN 時点の列がある）。実行は writer 取得時の世代検査で、BEGIN 後の別セッションの
+    // DDL を `40001` として拒否する（束縛を通らないことで 42703 にはならない）。
+    assert_eq!(err.wire_code(), "40001", "{}", err.client_message());
     core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
 
@@ -365,6 +390,8 @@ fn explicit_transaction_binds_against_the_begin_snapshot() {
     assert_eq!(code, "42703", "{msg}");
 }
 
+// 権限を満たす NOT MATCHED の INSERT の形は束縛を通っても、実行を入れる #3354 まで拒否する。
+// tracked: #3354
 #[test]
 fn the_privilege_gate_runs_before_binding() {
     let (core, _g) = new_core("sql79b-priv");
@@ -412,10 +439,10 @@ fn the_privilege_gate_runs_before_binding() {
         as_bob("MERGE INTO tx USING sy ON tx.nope = sy.k WHEN MATCHED THEN DELETE"),
         "42703"
     );
-    // 採番方式（疑似列 id を持たない）の表は列リストの `id` 省略を受理する。
+    // 権限を満たす主体は MATCHED だけの形を実行できる。
     assert_eq!(
         as_bob("MERGE INTO tx USING sy ON tx.k = sy.k WHEN MATCHED THEN DELETE"),
-        "0A000"
+        "ok"
     );
     operator("GRANT INSERT ON tx TO bob");
     assert_eq!(
@@ -423,7 +450,7 @@ fn the_privilege_gate_runs_before_binding() {
             "MERGE INTO tx USING sy ON tx.k = sy.k WHEN NOT MATCHED THEN INSERT (k, v) VALUES (sy.k, sy.w)"
         ),
         "0A000",
-        "移行済みの表は疑似列 id を省いてよい"
+        "移行済みの表は疑似列 id を省いてよい（束縛は通り、実行の拒否は 0A000）"
     );
     assert_eq!(
         as_bob("MERGE INTO tx USING sy ON tx.k = sy.k WHEN NOT MATCHED THEN INSERT DEFAULT VALUES"),
@@ -458,7 +485,11 @@ fn binding_does_not_depend_on_other_tenants_rows() {
         .map(|n| (run_as(n, sql), run_as(n, bad)))
         .collect();
     assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
-    assert_eq!(answers[0].0.as_ref().expect_err("fixed").0, "0A000");
+    // 元が空なので、どのテナントでも件数 0 で成功する（他テナントの行の有無に依存しない）。
+    assert_eq!(
+        answers[0].0.as_ref().expect("runs"),
+        "Merge(MergeOutcome { rows_affected: 0 })"
+    );
     assert_eq!(answers[0].1.as_ref().expect_err("bad").0, "42703");
     // エラー文言は件数・値を含まない。
     assert!(!answers[0].1.as_ref().expect_err("bad").1.contains("10"));

@@ -1423,6 +1423,15 @@ crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モー
 - ランダム段（`crash_test_cross_table.sh` の txn 段）は最後の進行行で kill 位置を分類し、`rows <= acked + 4` の上限検査を足し、txn 段全体で `IN_TXN` を 1 度も観測しなければ失敗にする。判定を段全体にするのは遅い runner での不安定化を避けるため（3 点の網羅は決定的段が担う）。
 - 実行場所: 既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。DDL の道具は #2417、kill 位置の分類は #2418、DDL エラー・`55P03` は #2419。
 
+## DDL を含む明示トランザクションの crash テスト（Issue #3318・SQL-80・SQL-31・SQL-23・SQL-52・TABLE-22・TABLE-36・TABLE-44・TASK-349 ポインタ）
+
+- 道具は `crates/engine/examples/crash_tool_txn_ddl.rs`（`write`・`write-pause`・`verify`・`self-check`）。engine の本番コードは変えず、公開 API の `execute_sql_in_txn` だけで Tx を組む。
+- 文列（Tx k）: `CREATE TABLE td_<k>`・空の表への `CREATE UNIQUE INDEX`・行の `INSERT`（in-txn 点）・スカラー `CREATE INDEX`・既存の台帳 `td_log` への `INSERT`（before-commit 点）・`COMMIT`（after-commit 点）。
+- 期待: in-txn・before-commit では当該 Tx のカタログ・行・索引宣言・物理構造・台帳行が全く残らず、after-commit では全部残る。`verify` は表集合が連続した通番であること・索引宣言が各 Tx の 2 件ちょうどであること・行と台帳行の完全一致・一意索引の読み取り専用検証と重複拒否・スカラー索引の読み出し一致・未 commit の Tx の物理表の残骸なし・別テナントから行が見えないことを fail-closed で確かめる。`self-check` が負の対照を持つ。
+- ランダム段: `write` が `IN_TXN`・`COMMIT_SENT`（`COMMIT` の直前。間に待機なし）・`COMMITTED` を出し、最後の進行行が `COMMIT_SENT` なら Tx 数は ack 済み n か n+1、それ以外は n と完全一致。`IN_TXN` を 1 度も観測しなければ失敗。`COMMIT_SENT` の観測は必須にしない（COMMIT は短く遅い runner で不安定になるため。redb commit の前後は決定的段が毎回検査する）。
+- 対応しない: `commit_active` の redb commit 前後への同期点の追加。本番コードの変更と feature 付きの別ビルドが要るため。
+- 実行場所: `scripts/crash_test_txn_kill_points.sh` の段 B（決定的）・段 C（ランダム）。既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。
+
 ## 失敗時の台帳非記録と読み取り文の `USING OPERATION_ID`（Issue #2068・RECOVER-12・RECOVER-9・SQL-10 ポインタ）
 
 - 台帳エントリは `COMMIT` と同じ redb の write txn に載る。`ROLLBACK`・接続断・事前拒否（`23502`・`42601`）の後には何も残らず、新しい `BEGIN` の内側で同じ `operation_id` を（別の内容でも）使える。この性質は共有 write txn の abort で台帳も同時に消える既存の仕組みから出るもので、追加のコードは無い（本番コードの変更なし）。

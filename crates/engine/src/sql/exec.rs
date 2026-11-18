@@ -584,6 +584,13 @@ pub struct UpdateOutcome {
     pub rows_affected: u64,
 }
 
+/// `MERGE`（SQL-79・Issue #3353）の実行結果。`rows_affected` は UPDATE と DELETE で実際に変更した行数の合計
+/// （DO NOTHING・どの WHEN 句にも当たらなかった組は含めない）。応答のコマンドタグは `MERGE <n>`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeOutcome {
+    pub rows_affected: u64,
+}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
