@@ -724,7 +724,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 - 判定順: READ ONLY（`25006`）→ DDL 権限（`42501`）→ 作成先の検査 → 未対応の形の `0A000`（writer を取る前・
   カタログを読む前）→ writer の取得（`55P03`・`40001`）→ DDL 本体。本体が失敗した Tx は復帰不可の `Failed`
   （`SessionTransaction::mark_ddl_started` が印を立て、`is_recoverable` を偽にする）
-- Tx の DDL 状態（`TxnDdlState`）: `started`（読み取り源を常に writer にする・`ROLLBACK TO` を `0A000` にする）、
+- Tx の DDL 状態（`TxnDdlState`）: `started`（読み取り源を常に writer にする。改訂 #3317: `ROLLBACK TO` の拒否と復帰不可の判定からは外した）、
   `removed`（DROP 済み）、`evict_sequences`（DROP TABLE・DROP COLUMN が道連れに削除した SEQUENCE の内部 ID）。
   採番器の現在値は commit 成功後にだけ捨てる。`ActiveTxn` と一緒に捨てるため ROLLBACK・失敗・期限切れでは何も
   実行されない。遅延 FK 検査は同じ Tx で DROP した表を対象から外す
@@ -748,8 +748,8 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 - 世代を鍵にするキャッシュ（V4）: write txn から読んだ内容をキャッシュへ載せない。DDL を積んだ Tx の読み取りは
   常に writer から読み、ROLLBACK 後の世代の再利用でも別セッションの検索へ漏れないことをテスト
   （`sql80_txn_table_ddl.rs`）で固定した
-- `ROLLBACK TO`: DDL を積んだ Tx の `restore_at` は `0A000`（名前付き・PL/pgSQL の内部 savepoint の両方）。
-  DDL 後の `SAVEPOINT` は巻き戻し不能として登録する（受け皿は #3317）
+- `ROLLBACK TO`: 本 Issue では暫定で `0A000`（名前付き・PL/pgSQL の内部 savepoint の両方）、DDL 後の `SAVEPOINT` は
+  巻き戻し不能として登録していた。改訂 #3317: 下の「#3317 の実装記録」で巻き戻せるようにした
 - 未対応のまま残した形（`0A000`）: `ALTER TABLE` の制約の追加・削除・`RENAME`・`ALTER COLUMN TYPE`・`SET SCHEMA`・
   行セキュリティ、`CREATE TABLE ... AS`、SERIAL/IDENTITY 列（暗黙 SEQUENCE の採番状態が ROLLBACK で戻らず、再利用される
   内部 ID と食い違うため）、SCHEMA 配下の表・索引、一時表の DDL（既存行を処理する DDL の期限の検査点は #3314 で結線した）
@@ -788,6 +788,27 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   残すため結線していない。結線するときは writer を取った後で write txn 上で再判定する。束縛ロールの DDL 後の DML の権限は、DML を結線した時点で検証する。
 - 単独のテストバイナリ `tests/sql80_txn_ddl_deadline.rs`（時間依存のため束ねない）。時間の揺らぎでは結果が変わらない形にしてある。
 
+### #3317 の実装記録（`ROLLBACK TO`・失敗からの復帰・接続断）
+
+- 水位: `WriteMarks`（`sql/savepoint.rs`）に DDL 状態の水位（`ddl_started`・`ddl_removed`・`ddl_evict_len`）を足し、
+  `SAVEPOINT` 時点で複製、`ROLLBACK TO`（`restore_at`）が redb の復元・差分の再適用・世代の突き合わせがすべて成功した
+  後にだけ戻す（失敗した経路ではメモリ上の状態を変えない）。`evict_sequences` は追記専用の列なので長さで切り詰める。
+  これを戻さないと、取り消した `DROP TABLE` が所有していた生きている SEQUENCE の現在値を COMMIT 後に捨て、採番が
+  重複する
+- DDL 後の `SAVEPOINT`: 行と同じ差分方式（`table_image`）で捕捉する。`restore_at` の DDL ゲートと `plan_savepoint` の
+  DDL ゲートを外した。差分を取れない場合（未知の型・multimap・上限超過・期限超過）は従来どおり `Unrestorable`
+  （`ROLLBACK TO` は `0A000`）
+- 失敗からの復帰: `is_recoverable` から DDL の条件を外した。失敗した DDL は、それより前の savepoint への
+  `ROLLBACK TO` でだけ取り消せる（差分は redb の実内容から取るため部分的な書き込みも時点へ戻る）。savepoint が無ければ
+  従来どおり復帰不可。`XX000`・`40001`・上限超過は従来どおり復帰不可
+- PL/pgSQL・`DO` の内部 savepoint: DDL 後は `pl_rollback_to` が `0A000`（設計 D6。対応しない）
+- 戻さないもの: commit 記録の足跡（`note_ddl`。余分に残るだけで偽陰性を生まない。#1945 節と同じ）、採番状態
+  （非トランザクショナル）。`function_scopes` は暗黙 Tx 専用で savepoint と交わらないが、明示 Tx の関数 DDL を入れる
+  #3316 で同じ水位方式へ含める必要がある（申し送り）
+- 破棄: `25P02` からの `ROLLBACK`・drop（接続断）は既存の abort 経路で成立し、テストで固定した
+- テスト: `sql80_txn_ddl_savepoint.rs`（engine）、`sql80_txn_table_ddl.rs`（wire。文末 `;` の psql 形・失敗からの復帰・
+  ソケット切断）
+
 ### 子 Issue への割り当て（申し送り）
 
 | 子 | 内容 |
@@ -796,7 +817,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | #3314 | 上限の期限検査（実装済み）、`25001` の判定順（実装済み）。V1・V5・V7 の結線と権限の再判定は、追跡の結果を下の記録に残し、残りは #3311 |
 | #3315 | VIEW・マテビュー・SEQUENCE・SCHEMA・型 |
 | #3316 | 関数・トリガ・ポリシー・権限・ロール |
-| #3317 | `ROLLBACK TO`・接続断・commit 後フックの巻き戻し |
+| #3317 | `ROLLBACK TO`・接続断・commit 後フックの巻き戻し（実装済み。「#3317 の実装記録」） |
 | #3318 | Tx の途中・COMMIT の途中の SIGKILL で部分 commit が 0 件であること（`crash-test-cross-table` の道具 #2417・#2418 を拡張） |
 
 - 拒否を固定している既存テスト（`sql_named/*` などの `0A000` のアサーション）は、各子の実装時に新しい挙動へ更新する。期待値は弱めない

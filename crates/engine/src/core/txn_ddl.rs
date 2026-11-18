@@ -11,8 +11,9 @@
 //!
 //! 判定順（autocommit の腕と同じ前段を同じ順で通す。権限の無い主体へ対象の有無を返さない）:
 //! DDL 権限（`42501`）→ 作成先の検査 → 未対応の形の拒否（`0A000`。writer を取る前・カタログを読む前）→
-//! writer の取得（`55P03`・`40001`）→ DDL 本体。本体が失敗した Tx は復帰不可の `Failed` になる
-//! （`SessionTransaction::mark_ddl_started`）ため、部分的な DDL を COMMIT する経路は無い。
+//! writer の取得（`55P03`・`40001`）→ DDL 本体。本体が失敗した Tx は `Failed` になり、COMMIT できない
+//! （`SessionTransaction::mark_ddl_started`）ため、部分的な DDL を COMMIT する経路は無い。前の savepoint が
+//! あれば `ROLLBACK TO` で、その時点（DDL 状態の印・commit 後の採番器の後始末の列を含む）へ戻れる（Issue #3317）。
 //!
 //! 暫定の規則（受け皿は #3311。V1・V5・V7）: DDL を積んだ後に同じ Tx で実行できる文は、結線を済ませた最小の
 //! 種類だけにする（[`check_post_ddl_statement`]）。`search_path` の解決・ビュー展開・権限ゲートが読む確定済み

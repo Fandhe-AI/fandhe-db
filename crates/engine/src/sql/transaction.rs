@@ -578,8 +578,10 @@ impl SeenOperationIds {
 /// `ActiveTxn` と一緒に捨てるため、ROLLBACK・失敗・期限切れ・drop では何も実行されない。
 #[derive(Default)]
 struct TxnDdlState {
-    /// DDL を 1 度でも積み始めたか。途中で失敗しても立てたままにし、部分的な DDL を持つ Tx を
-    /// `ROLLBACK TO` で復帰させない・読み取り源を常に writer にする判定に使う。
+    /// DDL を 1 度でも積み始めたか。途中で失敗しても立てたままにし、読み取り源を常に writer にする
+    /// 判定に使う。失敗した DDL は、それより前の savepoint への `ROLLBACK TO` でだけ取り消せる
+    /// （差分は redb の実内容から取るので部分的な書き込みも時点へ戻る。印も `WriteMarks` の水位で戻る。
+    /// Issue #3317）。
     started: bool,
     /// 表・索引を DROP した（名前が消えた）か。確定済みカタログで行う後続文の解析・ビュー展開が古い名前を
     /// 見るため、この間は DDL 以外の文を `0A000` にする（暫定。受け皿は #3311）。
@@ -1377,11 +1379,7 @@ impl<'e> SessionTransaction<'e> {
                     let wm = active.cursors.next_id();
                     let op_wm = active.seen_operation_ids.len();
                     // 巻き戻せる savepoint だけ書き込み記録を複製する（ROLLBACK TO で復元。Issue #1945）。
-                    let marks = crate::sql::savepoint::WriteMarks {
-                        has_writes: active.has_writes,
-                        written_tables: active.written_tables.clone(),
-                        written_by_tenant: active.written_by_tenant.clone(),
-                    };
+                    let marks = Self::capture_write_marks(active);
                     match plan {
                         SavepointPlan::Restorable => active.savepoints.push(
                             name,
@@ -1414,6 +1412,19 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// `SAVEPOINT` 時点の書き込み記録と DDL 状態の水位を複製する（`ROLLBACK TO` が復元する。
+    /// Issue #1945・SQL-80・Issue #3317）。
+    fn capture_write_marks(active: &ActiveTxn<'_>) -> crate::sql::savepoint::WriteMarks {
+        crate::sql::savepoint::WriteMarks {
+            has_writes: active.has_writes,
+            written_tables: active.written_tables.clone(),
+            written_by_tenant: active.written_by_tenant.clone(),
+            ddl_started: active.ddl.started,
+            ddl_removed: active.ddl.removed,
+            ddl_evict_len: active.ddl.evict_sequences.len(),
+        }
+    }
+
     /// `SAVEPOINT` 時点の巻き戻し方を決める（Issue #2879）。永続側（writer）と一時側（TABLE-44）の
     /// 両方を調べ、どちらかが書き込み済みなら確定済み状態との差分を [`StateImage`] に保存する。
     /// 差分は redb の実内容から取る（`storage::table_image`）。上限（savepoint 1 個・Tx 全体）と
@@ -1426,11 +1437,8 @@ impl<'e> SessionTransaction<'e> {
         use crate::storage::table_image::{
             capture, Capture, Meter, MAX_IMAGE_BYTES_PER_SAVEPOINT, MAX_IMAGE_BYTES_PER_TXN,
         };
-        // DDL を積んだ後は行の差分だけではカタログ・世代・メモリ上の状態を戻せないため、捕捉せず
-        // 巻き戻し不能として登録する（`ROLLBACK TO` は `0A000`。SQL-80・Issue #3313。受け皿は #3317）。
-        if active.ddl.started {
-            return Ok(SavepointPlan::Unrestorable);
-        }
+        // DDL を積んだ後でも、カタログは redb の表なので行と同じ差分方式で捕捉する（SQL-80・Issue #3317）。
+        // 差分を取れない場合（未知の型・上限超過・期限超過）は下で `Unrestorable` になり fail-closed。
         let limit = MAX_IMAGE_BYTES_PER_SAVEPOINT
             .min(MAX_IMAGE_BYTES_PER_TXN.saturating_sub(active.savepoints.image_bytes_total()));
         let mut meter = Meter::new(limit, active.started_at.checked_add(max_duration));
@@ -1660,14 +1668,6 @@ impl<'e> SessionTransaction<'e> {
         session: &mut SessionState,
     ) -> Result<(), SqlSurfaceError> {
         use crate::sql::savepoint::SavepointKind;
-        // DDL を積んだ Tx は、redb の savepoint を復元しても採番器・キャッシュ・世代などのメモリ上の状態が
-        // 戻らないため巻き戻さない。名前付き・PL/pgSQL 内部の savepoint の両方がここを通る（SQL-80・
-        // Issue #3313。受け皿は #3317）。呼び出し元が Tx を復帰不可の `Failed` にする。
-        if active.ddl.started {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "ROLLBACK TO SAVEPOINT is not supported after DDL in the transaction",
-            ));
-        }
         match active.savepoints.kind_at(pos) {
             Some(SavepointKind::Restorable | SavepointKind::Imaged) => {}
             Some(SavepointKind::Unrestorable) => {
@@ -1749,6 +1749,11 @@ impl<'e> SessionTransaction<'e> {
         active.has_writes = marks.has_writes;
         active.written_tables = marks.written_tables;
         active.written_by_tenant = marks.written_by_tenant;
+        // DDL 状態の印も savepoint 時点へ戻す（SQL-80・Issue #3317）。取り消した DROP TABLE が道連れにした
+        // 所有 SEQUENCE を commit 後に捨てると採番が重複するため、列も水位まで切り詰める。
+        active.ddl.started = marks.ddl_started;
+        active.ddl.removed = marks.ddl_removed;
+        active.ddl.evict_sequences.truncate(marks.ddl_evict_len);
         // 巻き戻した範囲の operation_id を取り消し、同一 Tx 内で再利用できるようにする。
         // 水位は truncate_after の前に読む（Issue #1944）。
         let Some(op_wm) = active.savepoints.op_id_watermark_at(pos) else {
@@ -1785,13 +1790,8 @@ impl<'e> SessionTransaction<'e> {
             return Err(internal_error());
         };
         let wm = active.cursors.next_id();
-        let marks = (kind == crate::sql::savepoint::SavepointKind::Restorable).then(|| {
-            crate::sql::savepoint::WriteMarks {
-                has_writes: active.has_writes,
-                written_tables: active.written_tables.clone(),
-                written_by_tenant: active.written_by_tenant.clone(),
-            }
-        });
+        let marks = (kind == crate::sql::savepoint::SavepointKind::Restorable)
+            .then(|| Self::capture_write_marks(active));
         let op_wm = active.seen_operation_ids.len();
         active
             .savepoints
@@ -1815,7 +1815,13 @@ impl<'e> SessionTransaction<'e> {
     ) -> Result<(), SqlSurfaceError> {
         let result = match &mut self.state {
             TxnState::Active(active) => {
-                if active.savepoints.kind_at(pos)
+                if active.ddl.started {
+                    // DO・PL/pgSQL 内の DDL は対応しない（設計 D6）。内部 savepoint は差分方式の対象外
+                    // （SQL-80・Issue #3317）。構造上は dirty のため `Unrestorable` で先に弾かれる保険。
+                    Err(SqlSurfaceError::feature_not_supported(
+                        "an EXCEPTION block cannot catch errors after DDL in the transaction",
+                    ))
+                } else if active.savepoints.kind_at(pos)
                     == Some(crate::sql::savepoint::SavepointKind::Unrestorable)
                 {
                     Err(SqlSurfaceError::feature_not_supported(
@@ -2007,7 +2013,7 @@ impl<'e> SessionTransaction<'e> {
     }
 
     /// 表・索引の DDL を共有 write txn へ積み始めることを記録する（SQL-80・Issue #3313）。writer を取った後、
-    /// DDL 本体を実行する**前**に呼ぶ（本体が途中で失敗しても印を残し、部分的な DDL を持つ Tx を復帰させない）。
+    /// DDL 本体を実行する**前**に呼ぶ（本体が途中で失敗しても印を残す。取り消せるのは `ROLLBACK TO` だけ）。
     /// `has_writes` も立てる（立てないと COMMIT が書き込み txn を破棄してカタログの書き込みが落ちる）。
     ///
     /// 戻り値は印を立てる前の状態（[`Self::restore_ddl_started`] へ渡す）。本体が「何も変えない成功」
@@ -2469,7 +2475,6 @@ impl<'e> SessionTransaction<'e> {
     /// 従来どおり即時に writer を解放する。
     fn is_recoverable(active: &ActiveTxn<'_>) -> bool {
         active.origin == TxnOrigin::Explicit
-            && !active.ddl.started
             && active.savepoints.has_rollbackable()
             && (active.writer.is_none() || active.savepoint_base.is_some())
             && active.temp.as_ref().is_none_or(|t| t.base.is_some())
