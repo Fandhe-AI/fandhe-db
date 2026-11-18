@@ -77,6 +77,7 @@ mod row_lock_exec;
 mod schema_elements;
 // 明示・暗黙トランザクション内の表・索引の DDL（SQL-80・Issue #3313）。
 mod txn_ddl;
+mod txn_security_ddl;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
@@ -11714,95 +11715,28 @@ impl EngineCore {
                 | Statement::SetHnswScanSetting { .. }
                 | Statement::ShowHnswScanSetting(_)),
             ) => self.execute_validated_in_session(ctx, session, stmt.clone()),
-            // SQL-66（Issue #1920・#1922）: `CREATE [OR REPLACE] FUNCTION` は DDL 権限が無ければ `42501` で
-            // 拒否する（fail-closed）。権限のあるセッションでも、明示トランザクションの中では UDF カタログへ
-            // 書く永続 DDL が独立した write txn で commit され ROLLBACK で取り消せないため行わない（`0A000`。
-            // SAVEPOINT との整理が済むまで据え置き）。一方、複数文メッセージの暗黙トランザクション
-            // （WIRE-16・RECOVER-12。Issue #2882）では共有 write txn へ書く。commit するのはメッセージ末尾の
-            // 1 回だけで、後続文が失敗すればカタログごと巻き戻る。世代は commit 成功後に進める（遷移側）。
-            ParsedSql::Statement(stmt @ Statement::CreateFunction { .. }) => {
-                crate::sql::privilege_gate::require_ddl(
-                    session,
-                    crate::sql::privilege_gate::DdlStatementKind::CreateFunction,
-                )?;
-                if !txn.is_implicit_active() {
-                    return Err(SqlSurfaceError::feature_not_supported(
-                        "CREATE [OR REPLACE] FUNCTION is not supported inside a transaction block",
-                    ));
-                }
-                let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
-                    detail: "internal error".to_string(),
-                })?;
-                let outcome = self.execute_create_function_stmt(
-                    ctx,
-                    session,
-                    stmt.clone(),
-                    crate::sql::udf_ddl::CatalogWrite::InTxn(write_txn),
-                )?;
-                // 全 scope に印を付ける（漏れると commit 後の世代 bump が落ち、他セッションが新定義を読めない）。
-                txn.mark_function_written(ctx.tenant_id());
-                Ok(outcome)
-            }
-            ParsedSql::DropFunction(_) => {
-                // 所有者（束縛ロール）も `0A000` まで進める（Issue #2236。未束縛は `42501`）。
-                crate::sql::privilege_gate::require_ddl_or_owner(
-                    session,
-                    crate::sql::privilege_gate::DdlStatementKind::DropFunction,
-                )?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "DROP FUNCTION is not supported inside a transaction block",
-                ))
-            }
-            // RLS-13（Issue #2274）: ポリシー DDL は独立した write txn で commit され ROLLBACK で取り消せない
-            // ため明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
-            ParsedSql::CreatePolicy(_) | ParsedSql::AlterPolicy(_) | ParsedSql::DropPolicy(_) => {
-                crate::sql::privilege_gate::require_server_ddl(session)?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "policy DDL is not supported inside a transaction block",
-                ))
-            }
-            // SQL-40（Issue #1965）: ACL の書き込みは独立した write txn で commit され ROLLBACK で取り消せない
-            // ため明示トランザクション内では行わない。現在ロール未束縛のセッションには存在を問わず `42501`
-            // （自動コミットの腕と同じゲートを同じ位置〔カタログ照会・`0A000` より前〕に置く）。
-            ParsedSql::GrantRevoke(_) => {
-                crate::sql::grant_ddl::require_grant_principal(session)?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "GRANT/REVOKE is not supported inside a transaction block",
-                ))
-            }
-            // SQL-40（Issue #2237）: 既定権限の書き込みも独立した write txn で commit され ROLLBACK で取り消せない
-            // ため明示トランザクション内では行わない。未束縛は存在を問わず `42501`（`0A000` より前）。
-            ParsedSql::AlterDefaultPrivileges(_) => {
-                crate::sql::grant_ddl::require_grant_principal(session)?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "ALTER DEFAULT PRIVILEGES is not supported inside a transaction block",
-                ))
-            }
-            // SQL-40（Issue #2236）: 所有者の変更も独立した write txn で commit され ROLLBACK で取り消せない
-            // ため明示トランザクション内では行わない。未束縛は存在を問わず `42501`（ゲートを `0A000` より前に置く）。
-            ParsedSql::AlterOwner(_) => {
-                // 自動コミット（`execute_alter_owner`）と同じく、運用者権限があっても現在ロールが未束縛なら
-                // `0A000` より前に `42501` で拒否する（O8）。
-                crate::sql::privilege_gate::bound_principal(session)?;
-                crate::sql::privilege_gate::require_ddl_or_owner(
-                    session,
-                    crate::sql::privilege_gate::DdlStatementKind::AlterOwner,
-                )?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "ALTER ... OWNER TO is not supported inside a transaction block",
-                ))
-            }
-            // SQL-39（Issue #1962）: ロール DDL も独立した write txn で commit され ROLLBACK で取り消せないため
-            // 明示トランザクション内では行わない。権限の無いセッションには存在を問わず `42501`（fail-closed）。
-            ParsedSql::CreateRole(_) | ParsedSql::DropRole(_) | ParsedSql::AlterRole(_) => {
-                crate::sql::privilege_gate::require_server_ddl(session)?;
-                Err(SqlSurfaceError::feature_not_supported(
-                    "role DDL is not supported inside a transaction block",
-                ))
+            // SQL-80・Issue #3316: 関数・ポリシー・権限・所有者・ロール・トリガの DDL は共有 write txn へ積み、
+            // COMMIT で原子的に確定する（`core/txn_security_ddl.rs`。権限ゲート・未対応の形の拒否は autocommit の
+            // 腕と同じ順。積んだ後の後続文は `core/txn_ddl.rs::check_post_ddl_statement` が制限する）。
+            ParsedSql::Statement(Statement::CreateFunction { .. })
+            | ParsedSql::DropFunction(_)
+            | ParsedSql::CreateTrigger(_)
+            | ParsedSql::DropTrigger(_)
+            | ParsedSql::CreatePolicy(_)
+            | ParsedSql::AlterPolicy(_)
+            | ParsedSql::DropPolicy(_)
+            | ParsedSql::GrantRevoke(_)
+            | ParsedSql::AlterDefaultPrivileges(_)
+            | ParsedSql::AlterOwner(_)
+            | ParsedSql::CreateRole(_)
+            | ParsedSql::DropRole(_)
+            | ParsedSql::AlterRole(_) => {
+                self.execute_security_ddl_in_txn(ctx, session, txn, parsed)
             }
             // SQL-39（Issue #1963）: `SET ROLE`／`RESET ROLE` はセッション変数だけを変えるため明示 Tx 内でも
             // 実行できる（`session_at_begin` の復元により ROLLBACK・abort で元に戻る）。ロールカタログは
-            // Tx 内で変わらない（ロール DDL は上で `0A000`）ため、名前解決は独立した読み取りで行う。
+            // Tx 内で変わらない（ロール・権限の DDL を積んだ後の `SET ROLE` は `check_post_ddl_statement` が
+            // `0A000` にする。Issue #3316）ため、名前解決は独立した読み取りで行う。
             ParsedSql::SetRole(stmt) => {
                 crate::sql::role_ddl::execute_set_role(
                     &self.storage,

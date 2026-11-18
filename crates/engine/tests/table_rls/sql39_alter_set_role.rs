@@ -146,27 +146,45 @@ fn rename_of_the_session_role_is_rejected() {
     ok(&core, "alice", &mut s, "ALTER ROLE me NOLOGIN");
 }
 
+/// SQL-80・Issue #3316: `ALTER ROLE` は明示 Tx 内で共有 write txn へ積まれ、ROLLBACK では何も残らず
+/// COMMIT で確定する。権限の無いセッションは `42501`（writer を取る前）。
 #[test]
-fn alter_role_is_rejected_inside_explicit_transactions() {
+fn alter_role_is_applied_at_commit_inside_explicit_transactions() {
     let (_g, _p, core) = open_core("sql39-alter-txn");
     let mut setup = allowed_session();
     ok(&core, "alice", &mut setup, "CREATE ROLE r1");
-    for (allowed, expected) in [(false, "42501"), (true, "0A000")] {
-        let mut s = if allowed {
-            allowed_session()
-        } else {
-            SessionState::default()
-        };
-        let mut txn = core.new_session_transaction();
-        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
-            .expect("begin");
-        let e = core
-            .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ALTER ROLE r1 LOGIN")
-            .expect_err("rejected");
-        assert_eq!(e.wire_code(), expected);
-        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
-            .expect("rollback");
+    // 権限なしは 42501。
+    let mut denied = SessionState::default();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut denied, &mut txn, "BEGIN")
+        .expect("begin");
+    let e = core
+        .execute_sql_in_txn(&ctx("alice"), &mut denied, &mut txn, "ALTER ROLE r1 LOGIN")
+        .expect_err("rejected");
+    assert_eq!(e.wire_code(), "42501");
+    core.execute_sql_in_txn(&ctx("alice"), &mut denied, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    // ROLLBACK: 改名は残らない。
+    let mut s = allowed_session();
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        "ALTER ROLE r1 LOGIN",
+        "ALTER ROLE r1 RENAME TO r2",
+        "ROLLBACK",
+    ] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
+    assert_eq!(code(&core, "alice", &mut s, "ALTER ROLE r2 LOGIN"), "42704");
+    // COMMIT: 改名が確定する。
+    let mut txn = core.new_session_transaction();
+    for sql in ["BEGIN", "ALTER ROLE r1 RENAME TO r2", "COMMIT"] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(code(&core, "alice", &mut s, "ALTER ROLE r1 LOGIN"), "42704");
+    ok(&core, "alice", &mut s, "ALTER ROLE r2 LOGIN");
 }
 
 #[test]

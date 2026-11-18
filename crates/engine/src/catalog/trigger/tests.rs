@@ -79,6 +79,7 @@ fn tdef(name: &str, fkey: &str) -> TriggerDef {
 
 fn create(s: &Storage, scope: &str, table: &str, def: &TriggerDef) -> Result<u64> {
     s.create_trigger_inner(
+        None,
         scope,
         table,
         def,
@@ -377,6 +378,7 @@ fn or_replace_is_atomic_and_keeps_id() {
     d.tg_args.clear();
     let id2 = s
         .create_trigger_inner(
+            None,
             "t1",
             "docs",
             &d,
@@ -400,6 +402,7 @@ fn per_table_limit_is_enforced_and_ids_are_not_reused() {
     setup(&s, "t1", "docs", "f");
     for i in 0..2 {
         s.create_trigger_inner(
+            None,
             "t1",
             "docs",
             &tdef(&format!("t{i}"), "f"),
@@ -412,6 +415,7 @@ fn per_table_limit_is_enforced_and_ids_are_not_reused() {
     }
     assert!(matches!(
         s.create_trigger_inner(
+            None,
             "t1",
             "docs",
             &tdef("t9", "f"),
@@ -425,6 +429,7 @@ fn per_table_limit_is_enforced_and_ids_are_not_reused() {
     assert!(s.drop_trigger("t1", "docs", "t0").expect("drop"));
     let id = s
         .create_trigger_inner(
+            None,
             "t1",
             "docs",
             &tdef("t3", "f"),

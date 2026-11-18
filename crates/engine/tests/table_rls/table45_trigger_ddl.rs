@@ -150,21 +150,36 @@ fn unsupported_and_malformed_forms_are_rejected_before_the_catalog() {
     }
 }
 
+/// SQL-80・Issue #3316: 明示 Tx 内のトリガ DDL は autocommit と同じ判定を共有 write txn の上で行い、
+/// 積んだ後の INSERT は古いトリガで発火させず固定の `0A000` にする。ROLLBACK の後は何も残らない。
 #[test]
-fn explicit_transaction_rejects_trigger_ddl() {
+fn explicit_transaction_applies_trigger_ddl_at_commit_and_guards_followers() {
     let (_g, core) = open_fixture("trg-tx");
     let mut s = allowed_session();
-    for sql in [CREATE, "DROP TRIGGER g ON t"] {
-        let mut txn = core.new_session_transaction();
-        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
-            .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
-            .expect_err("trigger DDL inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
-            .expect("rollback");
-    }
+    // 関数が無いため、作成は autocommit と同じ `42883`（`0A000` ではない）。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, CREATE)
+        .expect_err("missing trigger function");
+    assert_eq!(
+        err.wire_code(),
+        code_as(&core, "alice", &mut s, CREATE),
+        "{CREATE}"
+    );
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    // 存在しないトリガの DROP も autocommit と同じ `42704`。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "DROP TRIGGER g ON t")
+        .expect_err("missing trigger");
+    assert_eq!(err.wire_code(), "42704");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
 }
 
 /// 判定順: 表の不在 `42P01`・列の不在 `42703`・関数の不在 `42883`（対象は SCHEMA 配下の表）。

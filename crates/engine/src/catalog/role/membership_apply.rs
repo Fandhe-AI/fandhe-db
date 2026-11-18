@@ -268,52 +268,61 @@ impl Storage {
         def: &RoleDef,
         m: &NewRoleMemberships<'_>,
     ) -> Result<u64> {
+        self.create_role_with_memberships_in(None, tenant, def, m)
+    }
+
+    /// [`Self::create_role_with_memberships`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有
+    /// write txn の上で実行し commit しない。SQL-80・Issue #3316）。
+    pub(crate) fn create_role_with_memberships_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        def: &RoleDef,
+        m: &NewRoleMemberships<'_>,
+    ) -> Result<u64> {
         validate_tenant(tenant)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(crate::catalog::convert_storage_error)?;
-        let w: &redb::WriteTransaction = &write_txn;
-        let id = super::create_role_in_txn(w, tenant, def)?;
-        let me = [MemberSpec::Name(def.name.clone())];
-        let me_role = [def.name.clone()];
-        let base = MembershipRequest {
-            is_grant: true,
-            actor_id: m.actor_id,
-            owner_equivalent: m.owner_equivalent,
-            roles: &[],
-            members: &[],
-            with_options: &[],
-            option_for: None,
-            cascade: false,
-        };
-        // IN ROLE: 新しいロールを各ロールのメンバーにする。
-        if !m.in_roles.is_empty() {
-            let req = MembershipRequest {
-                roles: m.in_roles,
-                members: &me,
-                ..base.clone()
+        self.run_catalog_write(target, |w| {
+            let id = super::create_role_in_txn(w, tenant, def)?;
+            let me = [MemberSpec::Name(def.name.clone())];
+            let me_role = [def.name.clone()];
+            let base = MembershipRequest {
+                is_grant: true,
+                actor_id: m.actor_id,
+                owner_equivalent: m.owner_equivalent,
+                roles: &[],
+                members: &[],
+                with_options: &[],
+                option_for: None,
+                cascade: false,
             };
-            apply_in_txn(w, tenant, &req)?;
-        }
-        // ROLE／ADMIN: 各ロールを新しいロールのメンバーにする（ADMIN は ADMIN 付き）。
-        let admin_on = [(MembershipOpt::Admin, true)];
-        for (names, with_options) in [(m.member_roles, &[][..]), (m.admin_roles, &admin_on[..])] {
-            if names.is_empty() {
-                continue;
+            // IN ROLE: 新しいロールを各ロールのメンバーにする。
+            if !m.in_roles.is_empty() {
+                let req = MembershipRequest {
+                    roles: m.in_roles,
+                    members: &me,
+                    ..base.clone()
+                };
+                apply_in_txn(w, tenant, &req)?;
             }
-            let members: Vec<MemberSpec> =
-                names.iter().map(|n| MemberSpec::Name(n.clone())).collect();
-            let req = MembershipRequest {
-                roles: &me_role,
-                members: &members,
-                with_options,
-                ..base.clone()
-            };
-            apply_in_txn(w, tenant, &req)?;
-        }
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(crate::catalog::convert_storage_error)?;
-        Ok(id)
+            // ROLE／ADMIN: 各ロールを新しいロールのメンバーにする（ADMIN は ADMIN 付き）。
+            let admin_on = [(MembershipOpt::Admin, true)];
+            for (names, with_options) in [(m.member_roles, &[][..]), (m.admin_roles, &admin_on[..])]
+            {
+                if names.is_empty() {
+                    continue;
+                }
+                let members: Vec<MemberSpec> =
+                    names.iter().map(|n| MemberSpec::Name(n.clone())).collect();
+                let req = MembershipRequest {
+                    roles: &me_role,
+                    members: &members,
+                    with_options,
+                    ..base.clone()
+                };
+                apply_in_txn(w, tenant, &req)?;
+            }
+            Ok((id, true))
+        })
     }
 
     /// `tenant` のメンバーシップへロール形の `GRANT`／`REVOKE` を単一 write txn・1 回の commit で反映する。
@@ -326,21 +335,28 @@ impl Storage {
         tenant: &str,
         req: &MembershipRequest<'_>,
     ) -> Result<MembershipOutcome> {
+        self.apply_membership_changes_in(None, tenant, req)
+    }
+
+    /// [`Self::apply_membership_changes`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write
+    /// txn の上で実行し commit しない。SQL-80・Issue #3316）。
+    pub(crate) fn apply_membership_changes_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        req: &MembershipRequest<'_>,
+    ) -> Result<MembershipOutcome> {
         validate_tenant(tenant)?;
         if req.actor_id == 0 {
             return Err(MembershipChangeError::PermissionDenied);
         }
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(crate::catalog::convert_storage_error)?;
-        let w: &redb::WriteTransaction = &write_txn;
-        let rows = apply_in_txn(w, tenant, req)?;
-        if rows == 0 {
-            return Ok(MembershipOutcome::default());
-        }
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(crate::catalog::convert_storage_error)?;
-        Ok(MembershipOutcome { rows_changed: rows })
+        self.run_catalog_write(target, |w| {
+            let rows = apply_in_txn(w, tenant, req)?;
+            if rows == 0 {
+                return Ok((MembershipOutcome::default(), false));
+            }
+            Ok((MembershipOutcome { rows_changed: rows }, true))
+        })
     }
 }
 

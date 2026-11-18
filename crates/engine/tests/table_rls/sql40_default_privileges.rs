@@ -5,7 +5,7 @@
 //! SEQUENCE・関数・SCHEMA）の初期 ACL にだけ効き既存には効かない・全体と `IN SCHEMA` の合成・
 //! `CREATE OR REPLACE` では適用しない・`FOR ROLE` は SET 経路（運用者権限は免除）・存在オラクルにならない
 //! （他テナントのロールは不在と同じ `42704`、他テナントの SCHEMA は `3F000`、未束縛はカタログ照会より前に
-//! `42501`）・1 文の失敗で何も保存しない・明示 Tx 内は `0A000`・`DROP ROLE` は既定権限の対象を `2BP01` で拒否し
+//! `42501`）・1 文の失敗で何も保存しない・明示 Tx 内は共有 write txn の上で同じ判定（Issue #3316）・`DROP ROLE` は既定権限の対象を `2BP01` で拒否し
 //! `DROP SCHEMA` は当該 SCHEMA の既定権限を消す。ロールは `CREATE ROLE` で作り、ID は作成順の 1〜。
 
 use engine::core::EngineCore;
@@ -358,7 +358,8 @@ fn bootstrap_role_cannot_bypass_for_role_set_path() {
 }
 
 /// テナント境界（RLS-12）: 他テナントのロール・SCHEMA は不在と同じ応答、未束縛はカタログ照会より前に `42501`、
-/// 明示 Tx 内は `0A000`。
+/// 明示 Tx 内は autocommit と同じ判定（SQL-80・Issue #3316）。積んだ後の読み取りは固定の拒否で、結線は #3311。
+// tracked: #3311
 #[test]
 fn tenant_boundary_and_gates() {
     let f = fx("sql40_dp_tenant");
@@ -395,8 +396,9 @@ fn tenant_boundary_and_gates() {
             assert_eq!(f.code("t1", &mut s, sql), "42501", "{sql}");
         }
     }
-    // 明示 Tx 内: 束縛済みは `0A000`、未束縛は `42501`。
-    for (is_bound, expected) in [(true, "0A000"), (false, "42501")] {
+    // 明示 Tx 内: 未束縛は `42501`（writer を取る前）、束縛済みは Tx の ROLLBACK の後に何も残らず、
+    // 続く autocommit と同じ判定になる。
+    for (is_bound, expected) in [(true, "ok"), (false, "42501")] {
         let mut s = SessionState::default();
         if is_bound {
             s.bind_role_ids(ALICE, ALICE);
@@ -405,7 +407,7 @@ fn tenant_boundary_and_gates() {
         f.core
             .execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        let e = f
+        let got = f
             .core
             .execute_sql_in_txn(
                 &ctx("t1"),
@@ -413,12 +415,25 @@ fn tenant_boundary_and_gates() {
                 &mut txn,
                 "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO bob",
             )
-            .expect_err("rejected");
-        assert_eq!(e.wire_code(), expected);
+            .map(|_| "ok")
+            .unwrap_or_else(|e| e.wire_code());
+        assert_eq!(got, expected);
+        if is_bound {
+            // 受理した場合でも、後続の読み書きは固定の拒否（古い判定で通さない）。
+            let e = f
+                .core
+                .execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, "SELECT 1")
+                .expect_err("follower after default privileges DDL must be rejected");
+            assert_eq!(e.wire_code(), "0A000");
+        }
         f.core
             .execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, "ROLLBACK")
             .expect("rollback");
     }
+    // ROLLBACK の後に既定権限は何も残らない: 後から作る表に bob の権限は付かない。
+    f.ok("t1", &mut alice, "CREATE TABLE after_tx (a TEXT)");
+    let mut bob = bound(BOB, false);
+    assert_eq!(f.code("t1", &mut bob, "SELECT a FROM after_tx"), "42501");
 }
 
 /// t1 の既定権限は t2 の作成に作用しない。

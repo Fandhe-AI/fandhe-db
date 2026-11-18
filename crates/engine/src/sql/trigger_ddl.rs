@@ -4,8 +4,8 @@
 //! 役割: 構造検証済みの文（`sql::allowlist::{ValidatedCreateTrigger, ValidatedDropTrigger}`）を TRIGGER
 //! カタログ（`catalog::trigger`）への書き込みへ写し、[`CatalogError`] を SQLSTATE の契約へ写像する。
 //! 呼び出し元は `core.rs` の `ParsedSql::CreateTrigger`／`DropTrigger` 腕で、DDL 権限ゲート
-//! （`sql::ddl::require_ddl_permission`。権限なしは対象の有無を問わず `42501`）と明示トランザクション内の
-//! `0A000` を通過した後にだけ来る。
+//! （`sql::ddl::require_ddl_permission`。権限なしは対象の有無を問わず `42501`）を通過した後にだけ来る（明示トランザクション内は共有 write txn の上で
+//! 同じ本体を実行する。Issue #3316）。
 //!
 //! 判定順（決定的・fail-closed）: 構文（`allowlist`）→ 権限 → 明示 Tx → カタログの単一 write txn 内で
 //! 対象の種別（ビュー等は `42809`）→ 表の存在（`42P01`）→ 共有 `public` 表（`0A000`。Issue #3361）→
@@ -53,6 +53,17 @@ pub(crate) fn execute_create_trigger(
     tenant_id: &str,
     stmt: &ValidatedCreateTrigger,
 ) -> Result<CreateTriggerOutcome, SqlSurfaceError> {
+    execute_create_trigger_in(storage, None, tenant_id, stmt)
+}
+
+/// [`execute_create_trigger`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn。
+/// SQL-80・Issue #3316）。
+pub(crate) fn execute_create_trigger_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &ValidatedCreateTrigger,
+) -> Result<CreateTriggerOutcome, SqlSurfaceError> {
     let def = TriggerDef {
         id: 0,
         name: stmt.name.clone(),
@@ -66,7 +77,7 @@ pub(crate) fn execute_create_trigger(
         when_sql: stmt.when_sql.clone(),
     };
     storage
-        .create_trigger(tenant_id, &stmt.table, &def, stmt.or_replace)
+        .create_trigger_in(target, tenant_id, &stmt.table, &def, stmt.or_replace)
         .map_err(|e| map_trigger_error(e, &stmt.name))?;
     Ok(CreateTriggerOutcome {})
 }
@@ -78,7 +89,17 @@ pub(crate) fn execute_drop_trigger(
     tenant_id: &str,
     stmt: &ValidatedDropTrigger,
 ) -> Result<DropTriggerOutcome, SqlSurfaceError> {
-    match storage.drop_trigger(tenant_id, &stmt.table, &stmt.name) {
+    execute_drop_trigger_in(storage, None, tenant_id, stmt)
+}
+
+/// [`execute_drop_trigger`] の書き込み先を選べる版（`target` の扱いは [`execute_create_trigger_in`] と同じ）。
+pub(crate) fn execute_drop_trigger_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &ValidatedDropTrigger,
+) -> Result<DropTriggerOutcome, SqlSurfaceError> {
+    match storage.drop_trigger_in(target, tenant_id, &stmt.table, &stmt.name) {
         Ok(true) => Ok(DropTriggerOutcome { skipped: false }),
         Ok(false) | Err(CatalogError::TableNotFound(_)) if stmt.if_exists => {
             Ok(DropTriggerOutcome { skipped: true })

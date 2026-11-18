@@ -89,7 +89,7 @@ function_key / TG_ARGV リスト / WHEN の有無 + 正規化テキスト`。文
    `TRUNCATE` の行トリガ・`INSTEAD OF` の ROW 以外／TRUNCATE／`UPDATE OF`〔`INSTEAD OF` はビューへの
    FOR EACH ROW だけ受理。[trigger-instead-of.md](trigger-instead-of.md)〕。`WHEN` は Issue #3190 で受理し、条件の検査は実行モデル D7 の実装記録のとおり。`42601`: 構文違反・トリガ名の SCHEMA 修飾・イベント重複）
 2. DDL 権限（`42501`。カタログ照会より前。対象の有無を問わない）
-3. 明示トランザクション内は `0A000`（既存 DDL と同じ）
+3. 明示トランザクション内は `0A000`（既存 DDL と同じ）（改訂: Issue #3316 で、明示 Tx 内は共有 write txn へ積む形に変更した（`explicit-transaction.md`「#3316 の実装記録」）。）
 4. 以降は txn 内: SCHEMA の現存 → 対象の種別（索引・SEQUENCE・マテリアライズドビューは `42809`。BEFORE／AFTER のビューと
    INSTEAD OF の表も `42809`。INSTEAD OF の対象はビュー。Issue #3193）→
    表の存在（`42P01`）→ `UPDATE OF` の列（`42703`）→ 関数（不在 `42883`・トリガ関数でない `42P17`）→

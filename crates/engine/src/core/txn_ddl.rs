@@ -45,6 +45,53 @@ fn is_schema_key(name: &str) -> bool {
     name.starts_with('#')
 }
 
+/// 本体が write txn だけを読む、権限・ポリシー・ロール・トリガ・関数削除の DDL か（SQL-80・Issue #3316）。
+/// `CREATE [OR REPLACE] FUNCTION` は関数本体の束縛が確定済みカタログを読むため含めない。
+fn is_security_ddl(parsed: &ParsedSql) -> bool {
+    matches!(
+        parsed,
+        ParsedSql::DropFunction(_)
+            | ParsedSql::CreatePolicy(_)
+            | ParsedSql::AlterPolicy(_)
+            | ParsedSql::DropPolicy(_)
+            | ParsedSql::GrantRevoke(_)
+            | ParsedSql::AlterDefaultPrivileges(_)
+            | ParsedSql::AlterOwner(_)
+            | ParsedSql::CreateRole(_)
+            | ParsedSql::DropRole(_)
+            | ParsedSql::AlterRole(_)
+            | ParsedSql::CreateTrigger(_)
+            | ParsedSql::DropTrigger(_)
+    )
+}
+
+/// セッション変数だけを変える・読む文か（DDL 後でも読み取り源に影響しない）。
+fn is_session_variable_statement(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::SetSearchMode { .. }
+            | Statement::SetTimeZone { .. }
+            | Statement::ShowTimeZone
+            | Statement::SetSearchPath { .. }
+            | Statement::ShowSearchPath
+            | Statement::SetRowSecurity { .. }
+            | Statement::ShowRowSecurity
+            | Statement::ShowRestoreGeneration
+            | Statement::SetStatementTimeout { .. }
+            | Statement::ShowStatementTimeout
+            | Statement::SetHnswEfSearch { .. }
+            | Statement::ShowHnswEfSearch
+            | Statement::SetHnswScanSetting { .. }
+            | Statement::ShowHnswScanSetting(_)
+    )
+}
+
+fn after_guarded_ddl_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::transaction_feature_not_supported(
+        "this statement is not supported after privilege, policy, role or trigger DDL inside a transaction block yet",
+    )
+}
+
 fn schema_scoped_ddl_unsupported() -> SqlSurfaceError {
     SqlSurfaceError::transaction_feature_not_supported(
         "DDL on relations inside a schema is not supported inside a transaction block yet",
@@ -68,12 +115,34 @@ pub(super) fn check_post_ddl_statement(
     let removed = txn.ddl_removed();
     // 一時カタログ・`search_path` の振り分けの包みは中身で判定する（包んだままだと許可対象の文も拒否される）。
     let parsed = parsed.peel_session_route();
+    // SQL-80・Issue #3316: 権限・ポリシー・ロール・トリガ・関数削除の DDL を積んだ Tx は、権限ゲート・ポリシー
+    // 適用・トリガの発火・関数の解決が確定済みカタログを読むため、古い判定で後続文を通さない（fail-closed）。
+    // DDL・Tx 制御・セッション変数の `SET`/`SHOW` だけを許す。文言は文の種類だけで、名前・存在を含めない。
+    if txn.has_guarded_ddl() {
+        let allowed = match parsed {
+            ParsedSql::CreateTable(_)
+            | ParsedSql::DropTable(_)
+            | ParsedSql::AlterTable(_)
+            | ParsedSql::CreateIndex(_)
+            | ParsedSql::DropIndex(_)
+            | ParsedSql::Transaction(_)
+            | ParsedSql::SetTransaction(_) => true,
+            ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
+            other => is_security_ddl(other),
+        };
+        return if allowed {
+            Ok(())
+        } else {
+            Err(after_guarded_ddl_unsupported())
+        };
+    }
     let allowed = match parsed {
         ParsedSql::CreateTable(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_) => true,
+        other if is_security_ddl(other) => true,
         // `INSERT ... SELECT` は挿入先スキーマを確定済みカタログから取得する（束縛・実行とも）ため、同じ Tx で
         // 作った表・追加した列を解決できない。overlay 結線までは fail-closed で拒否する（受け皿は #3311）。
         ParsedSql::Insert(_) => !removed,
@@ -141,24 +210,8 @@ pub(super) fn check_extended_execute_after_ddl(
         | ParsedSql::DropIndex(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::SetTransaction(_) => true,
-        ParsedSql::Statement(stmt) => matches!(
-            stmt,
-            Statement::SetSearchMode { .. }
-                | Statement::SetTimeZone { .. }
-                | Statement::ShowTimeZone
-                | Statement::SetSearchPath { .. }
-                | Statement::ShowSearchPath
-                | Statement::SetRowSecurity { .. }
-                | Statement::ShowRowSecurity
-                | Statement::ShowRestoreGeneration
-                | Statement::SetStatementTimeout { .. }
-                | Statement::ShowStatementTimeout
-                | Statement::SetHnswEfSearch { .. }
-                | Statement::ShowHnswEfSearch
-                | Statement::SetHnswScanSetting { .. }
-                | Statement::ShowHnswScanSetting(_)
-        ),
-        _ => false,
+        ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
+        other => is_security_ddl(other),
     };
     if allowed {
         Ok(())
@@ -292,6 +345,11 @@ impl EngineCore {
             ParsedSql::AlterTable(stmt) => {
                 require_ddl(session, DdlStatementKind::AlterTable)?;
                 crate::sql::schema_dependency::check_alter_table(stmt)?;
+                // SQL-80・Issue #3316: 行セキュリティだけのアクションは権限・ポリシーの DDL と同じ入口へ回す
+                // （他のアクションと混ぜた形は下の `0A000`）。
+                if let crate::sql::allowlist::ValidatedAlterTable::RowSecurity(rs) = stmt {
+                    return self.execute_row_security_in_txn(ctx, txn, rs);
+                }
                 let Some(table_name) = crate::sql::ddl::alter_table_in_txn_target(stmt) else {
                     return Err(SqlSurfaceError::transaction_feature_not_supported(
                         "this ALTER TABLE action is not supported inside a transaction block yet",

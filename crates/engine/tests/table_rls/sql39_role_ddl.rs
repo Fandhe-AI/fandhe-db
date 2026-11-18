@@ -3,7 +3,7 @@
 //!
 //! 固定する契約: 権限ゲートが対象の有無より前にあること（`42501`）、`42710`・`42704`・`42939`・`42601`・
 //! `0A000` の分類、テナント境界（同名のロールをテナントごとに独立に持てる・他テナントのロールは不在と
-//! 同じ応答）、明示トランザクション内の拒否、複数名の `DROP` の原子性、パスワードの平文が応答にもデータ
+//! 同じ応答）、明示トランザクション内の受理（SQL-80・Issue #3316）、複数名の `DROP` の原子性、パスワードの平文が応答にもデータ
 //! ベースファイルにも出ないこと。検証子の中身・メンバーシップ・ACL 依存は crate 内テスト
 //! （`sql::role_ddl::tests`）が担う。
 
@@ -168,21 +168,14 @@ fn rejected_forms_map_to_documented_sqlstates() {
     ok(&core, "alice", &mut s, "CREATE ROLE r");
 }
 
+/// SQL-80・Issue #3316: 明示 Tx 内のロール DDL は COMMIT まで効かず、ROLLBACK では何も残らない。
+/// 権限の無いセッションは対象の有無を問わず `42501`（writer を取らない）。積んだ後の読み書きは固定の `0A000`。
+// tracked: #3311
 #[test]
-fn explicit_transaction_rejects_role_ddl() {
+fn explicit_transaction_applies_role_ddl_only_at_commit() {
     let (_g, _p, core) = open_core("sql39-tx");
     let mut allowed = allowed_session();
     for sql in ["CREATE ROLE r", "DROP ROLE r"] {
-        let mut txn = core.new_session_transaction();
-        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "BEGIN")
-            .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, sql)
-            .expect_err("role DDL inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "ROLLBACK")
-            .expect("rollback");
-
         let mut denied = SessionState::default();
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx("alice"), &mut denied, &mut txn, "BEGIN")
@@ -194,9 +187,33 @@ fn explicit_transaction_rejects_role_ddl() {
         core.execute_sql_in_txn(&ctx("alice"), &mut denied, &mut txn, "ROLLBACK")
             .expect("rollback");
     }
-    // Tx 内の試行は何も作っていない。
-    let mut s = allowed_session();
-    ok(&core, "alice", &mut s, "CREATE ROLE r");
+    // ROLLBACK: Tx 内の作成は何も残さない。
+    let mut txn = core.new_session_transaction();
+    for sql in ["BEGIN", "CREATE ROLE r", "ROLLBACK"] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(code(&core, "alice", &mut allowed, "DROP ROLE r"), "42704");
+    // 積んだ後の読み書きは `0A000`（古い判定で通さない）。
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "CREATE ROLE r")
+        .expect("create in tx");
+    let err = core
+        .execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "SELECT 1")
+        .expect_err("follower rejected");
+    assert_eq!(err.wire_code(), "0A000");
+    core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    // COMMIT: 作成が確定し、同じ Tx の DROP と合わせて原子的。
+    let mut txn = core.new_session_transaction();
+    for sql in ["BEGIN", "CREATE ROLE r", "COMMIT"] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(code(&core, "alice", &mut allowed, "CREATE ROLE r"), "42710");
+    ok(&core, "alice", &mut allowed, "DROP ROLE r");
 }
 
 #[test]

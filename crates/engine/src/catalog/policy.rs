@@ -568,6 +568,7 @@ impl Storage {
     /// 既存（`Invalid(POLICY_ALREADY_EXISTS_MESSAGE)`）→ 件数上限（`ViewLimitExceeded`）。`def` の式・参照列・
     /// ID は無視され、`bind` の返す [`PolicyExprs`] と払い出した ID が保存される。成功時は対象表の世代を進める。
     /// 呼び出し元は `sql::policy_ddl`。
+    #[cfg(test)]
     pub(crate) fn create_policy<E, B>(
         &self,
         scope: &str,
@@ -579,12 +580,30 @@ impl Storage {
         E: From<CatalogError>,
         B: FnOnce(&TableSchema) -> std::result::Result<PolicyExprs, E>,
     {
-        self.create_policy_inner(scope, table_key, def, bind, MAX_POLICIES_PER_TABLE)
+        self.create_policy_in(None, scope, table_key, def, bind)
+    }
+
+    /// [`Self::create_policy`] の書き込み先を選べる版。`target` が `Some` なら Tx の共有 write txn の上で実行し、
+    /// commit しない（明示 Tx の DDL。SQL-80・Issue #3316）。
+    pub(crate) fn create_policy_in<E, B>(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        scope: &str,
+        table_key: &str,
+        def: &PolicyDef,
+        bind: B,
+    ) -> std::result::Result<u64, E>
+    where
+        E: From<CatalogError>,
+        B: FnOnce(&TableSchema) -> std::result::Result<PolicyExprs, E>,
+    {
+        self.create_policy_inner(target, scope, table_key, def, bind, MAX_POLICIES_PER_TABLE)
     }
 
     /// [`Self::create_policy`] の本体。件数上限を引数にし、テストが小さい上限を注入できるようにする。
     fn create_policy_inner<E, B>(
         &self,
+        target: Option<&redb::WriteTransaction>,
         scope: &str,
         table_key: &str,
         def: &PolicyDef,
@@ -603,46 +622,62 @@ impl Storage {
         stored.check_sql = None;
         stored.referenced_columns = Vec::new();
         validate_shape(&stored)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        require_policy_target_in_txn(&write_txn, scope, table_key)?;
-        let schema = require_table_schema_write_any_identity(&write_txn, table_key)?;
-        let exprs = bind(&schema)?;
-        stored.using_sql = exprs.using_sql;
-        stored.check_sql = exprs.check_sql;
-        stored.referenced_columns = exprs.referenced_columns;
-        validate_shape(&stored)?;
-        if get_in_txn(&*write_txn, table_key, scope, &stored.name)?.is_some() {
-            return Err(invalid(POLICY_ALREADY_EXISTS_MESSAGE).into());
-        }
-        if list_in_txn(&*write_txn, table_key, scope)?.len() >= max_policies {
-            return Err(CatalogError::ViewLimitExceeded(POLICY_LIMIT_MESSAGE.to_string()).into());
-        }
-        stored.id = allocate_id_in_txn(&write_txn)?;
-        let blob = encode_policy_def(&stored)?;
-        {
-            let mut table = write_txn
-                .open_table_logged(POLICIES_TABLE)
-                .map_err(CatalogError::from)?;
-            table
-                .insert((table_key, scope, stored.name.as_str()), blob.as_slice())
-                .map_err(CatalogError::from)?;
-        }
-        bump_table_generation_in_txn(&write_txn, table_key)?;
-        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, table_key);
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(stored.id)
+        self.run_catalog_write(target, |write_txn| {
+            require_policy_target_in_txn(write_txn, scope, table_key)?;
+            let schema = require_table_schema_write_any_identity(write_txn, table_key)?;
+            let exprs = bind(&schema)?;
+            stored.using_sql = exprs.using_sql;
+            stored.check_sql = exprs.check_sql;
+            stored.referenced_columns = exprs.referenced_columns;
+            validate_shape(&stored)?;
+            if get_in_txn(write_txn, table_key, scope, &stored.name)?.is_some() {
+                return Err(invalid(POLICY_ALREADY_EXISTS_MESSAGE).into());
+            }
+            if list_in_txn(write_txn, table_key, scope)?.len() >= max_policies {
+                return Err(
+                    CatalogError::ViewLimitExceeded(POLICY_LIMIT_MESSAGE.to_string()).into(),
+                );
+            }
+            stored.id = allocate_id_in_txn(write_txn)?;
+            let blob = encode_policy_def(&stored)?;
+            {
+                let mut table = write_txn
+                    .open_table_logged(POLICIES_TABLE)
+                    .map_err(CatalogError::from)?;
+                table
+                    .insert((table_key, scope, stored.name.as_str()), blob.as_slice())
+                    .map_err(CatalogError::from)?;
+            }
+            bump_table_generation_in_txn(write_txn, table_key)?;
+            // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, table_key);
+            Ok((stored.id, true))
+        })
     }
 
     /// `scope` のポリシー `name` を `modify` の返す定義へ置き換える（`ALTER POLICY ... [TO] [USING] [WITH CHECK]`）。
     /// 判定順: 形状 → SCHEMA の現存 → 種別 → 表の存在 → 既存の取得（無ければ `Invalid(POLICY_NOT_FOUND_MESSAGE)`。
     /// 他テナントにしか無い場合も同じ）→ `modify`（現行の定義と同じ txn のスキーマを受け取り、新しい定義を返す。
     /// 名前は変えられず、ID は引き継がれる）。成功時は対象表の世代を進める。
+    #[cfg(test)]
     pub(crate) fn alter_policy<E, M>(
         &self,
+        scope: &str,
+        table_key: &str,
+        name: &str,
+        modify: M,
+    ) -> std::result::Result<(), E>
+    where
+        E: From<CatalogError>,
+        M: FnOnce(&TableSchema, &PolicyDef) -> std::result::Result<PolicyDef, E>,
+    {
+        self.alter_policy_in(None, scope, table_key, name, modify)
+    }
+
+    /// [`Self::alter_policy`] の書き込み先を選べる版（`target` の扱いは [`Self::create_policy_in`] と同じ）。
+    pub(crate) fn alter_policy_in<E, M>(
+        &self,
+        target: Option<&redb::WriteTransaction>,
         scope: &str,
         table_key: &str,
         name: &str,
@@ -655,39 +690,49 @@ impl Storage {
         validate_scope(scope)?;
         validate_relation_key(table_key)?;
         validate_identifier(name)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        require_policy_target_in_txn(&write_txn, scope, table_key)?;
-        let Some(current) = get_in_txn(&*write_txn, table_key, scope, name)? else {
-            return Err(invalid(POLICY_NOT_FOUND_MESSAGE).into());
-        };
-        let schema = require_table_schema_write_any_identity(&write_txn, table_key)?;
-        let mut next = modify(&schema, &current)?;
-        next.id = current.id;
-        next.name = current.name.clone();
-        let blob = encode_policy_def(&next)?;
-        {
-            let mut table = write_txn
-                .open_table_logged(POLICIES_TABLE)
-                .map_err(CatalogError::from)?;
-            table
-                .insert((table_key, scope, name), blob.as_slice())
-                .map_err(CatalogError::from)?;
-        }
-        bump_table_generation_in_txn(&write_txn, table_key)?;
-        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, table_key);
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(())
+        self.run_catalog_write(target, |write_txn| {
+            require_policy_target_in_txn(write_txn, scope, table_key)?;
+            let Some(current) = get_in_txn(write_txn, table_key, scope, name)? else {
+                return Err(invalid(POLICY_NOT_FOUND_MESSAGE).into());
+            };
+            let schema = require_table_schema_write_any_identity(write_txn, table_key)?;
+            let mut next = modify(&schema, &current)?;
+            next.id = current.id;
+            next.name = current.name.clone();
+            let blob = encode_policy_def(&next)?;
+            {
+                let mut table = write_txn
+                    .open_table_logged(POLICIES_TABLE)
+                    .map_err(CatalogError::from)?;
+                table
+                    .insert((table_key, scope, name), blob.as_slice())
+                    .map_err(CatalogError::from)?;
+            }
+            bump_table_generation_in_txn(write_txn, table_key)?;
+            // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, table_key);
+            Ok(((), true))
+        })
     }
 
     /// `scope` のポリシー `name` を `new_name` へ改名する（`ALTER POLICY ... RENAME TO`）。無ければ
     /// `Invalid(POLICY_NOT_FOUND_MESSAGE)`、改名先が既にあれば `Invalid(POLICY_ALREADY_EXISTS_MESSAGE)`。
     /// 内部 ID は引き継ぐ。削除と挿入と世代更新は同一 write txn。
+    #[cfg(test)]
     pub(crate) fn rename_policy(
         &self,
+        scope: &str,
+        table_key: &str,
+        name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        self.rename_policy_in(None, scope, table_key, name, new_name)
+    }
+
+    /// [`Self::rename_policy`] の書き込み先を選べる版（`target` の扱いは [`Self::create_policy_in`] と同じ）。
+    pub(crate) fn rename_policy_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
         scope: &str,
         table_key: &str,
         name: &str,
@@ -697,55 +742,61 @@ impl Storage {
         validate_relation_key(table_key)?;
         validate_identifier(name)?;
         validate_identifier(new_name)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        require_policy_target_in_txn(&write_txn, scope, table_key)?;
-        let Some(mut current) = get_in_txn(&*write_txn, table_key, scope, name)? else {
-            return Err(invalid(POLICY_NOT_FOUND_MESSAGE));
-        };
-        if name != new_name && get_in_txn(&*write_txn, table_key, scope, new_name)?.is_some() {
-            return Err(invalid(POLICY_ALREADY_EXISTS_MESSAGE));
-        }
-        current.name = new_name.to_string();
-        let blob = encode_policy_def(&current)?;
-        {
-            let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
-            table.remove((table_key, scope, name))?;
-            table.insert((table_key, scope, new_name), blob.as_slice())?;
-        }
-        bump_table_generation_in_txn(&write_txn, table_key)?;
-        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, table_key);
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(())
+        self.run_catalog_write(target, |write_txn| {
+            require_policy_target_in_txn(write_txn, scope, table_key)?;
+            let Some(mut current) = get_in_txn(write_txn, table_key, scope, name)? else {
+                return Err(invalid(POLICY_NOT_FOUND_MESSAGE));
+            };
+            if name != new_name && get_in_txn(write_txn, table_key, scope, new_name)?.is_some() {
+                return Err(invalid(POLICY_ALREADY_EXISTS_MESSAGE));
+            }
+            current.name = new_name.to_string();
+            let blob = encode_policy_def(&current)?;
+            {
+                let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
+                table.remove((table_key, scope, name))?;
+                table.insert((table_key, scope, new_name), blob.as_slice())?;
+            }
+            bump_table_generation_in_txn(write_txn, table_key)?;
+            // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, table_key);
+            Ok(((), true))
+        })
     }
 
     /// `scope` のポリシー `name` を削除し、存在して削除したら `true`。対象が表でなければ `WrongObjectKind`、表が無ければ `TableNotFound`、ポリシーが
     /// 無ければ（他テナントにしか無い場合を含む）`Ok(false)`。削除と対象表の世代更新は同一 write txn。
+    #[cfg(test)]
     pub(crate) fn drop_policy(&self, scope: &str, table_key: &str, name: &str) -> Result<bool> {
+        self.drop_policy_in(None, scope, table_key, name)
+    }
+
+    /// [`Self::drop_policy`] の書き込み先を選べる版（`target` の扱いは [`Self::create_policy_in`] と同じ）。
+    pub(crate) fn drop_policy_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        scope: &str,
+        table_key: &str,
+        name: &str,
+    ) -> Result<bool> {
         validate_scope(scope)?;
         validate_relation_key(table_key)?;
         validate_identifier(name)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        // CREATE／ALTER と同じ対象検査（ビュー・索引・SEQUENCE 等は `WrongObjectKind`、無ければ `TableNotFound`）。
-        require_policy_target_in_txn(&write_txn, scope, table_key)?;
-        if get_in_txn(&*write_txn, table_key, scope, name)?.is_none() {
-            return Ok(false);
-        }
-        {
-            let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
-            table.remove((table_key, scope, name))?;
-        }
-        bump_table_generation_in_txn(&write_txn, table_key)?;
-        // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, table_key);
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(true)
+        self.run_catalog_write(target, |write_txn| {
+            // CREATE／ALTER と同じ対象検査（ビュー・索引・SEQUENCE 等は `WrongObjectKind`、無ければ `TableNotFound`）。
+            require_policy_target_in_txn(write_txn, scope, table_key)?;
+            if get_in_txn(write_txn, table_key, scope, name)?.is_none() {
+                return Ok((false, false));
+            }
+            {
+                let mut table = write_txn.open_table_logged(POLICIES_TABLE)?;
+                table.remove((table_key, scope, name))?;
+            }
+            bump_table_generation_in_txn(write_txn, table_key)?;
+            // commit 記録（SQL-38・Issue #2404）: ポリシー DDL は表世代の更新と同じ txn で DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, table_key);
+            Ok((true, true))
+        })
     }
 
     /// `scope` の表 `table_key` のポリシーを名前の昇順で返す（読み取り専用。適用側が引く入口）。

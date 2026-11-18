@@ -6,7 +6,7 @@
 //! write txn で行う）への要求へ写し、`AclChangeError` を SQLSTATE の契約へ写像する（写像は `GRANT`／`REVOKE`
 //! と共有の [`crate::sql::grant_ddl::map_acl_error`]）。呼び出し元は `core.rs` の
 //! `ParsedSql::AlterDefaultPrivileges` 腕で、現在ロールの束縛（未束縛は対象・ロールの有無を問わず `42501`）と
-//! 明示トランザクション内の `0A000` を通過した後にだけ来る。DDL 権限ゲートは置かない（`GRANT` と同じ。
+//! 通過した後にだけ来る（明示トランザクション内は共有 write txn の上で同じ本体を実行する。Issue #3316）。DDL 権限ゲートは置かない（`GRANT` と同じ。
 //! `FOR ROLE` の認可は対象ロールへの SET 経路で行い、運用者権限は免除）。
 //!
 //! テナント境界（P0）: scope は呼び出し元が渡す検証済みの `tenant_id` だけ。他テナントのロールは不在と同じ
@@ -37,6 +37,18 @@ impl AlterDefaultPrivilegesOutcome {
 /// `ALTER DEFAULT PRIVILEGES` を実行する（現在ロールの束縛・明示 Tx のゲートは呼び出し元で通過済み）。
 pub(crate) fn execute_alter_default_privileges(
     storage: &Storage,
+    tenant_id: &str,
+    session: &SessionState,
+    stmt: &ValidatedAlterDefaultPrivileges,
+) -> Result<AlterDefaultPrivilegesOutcome, SqlSurfaceError> {
+    execute_alter_default_privileges_in(storage, None, tenant_id, session, stmt)
+}
+
+/// [`execute_alter_default_privileges`] の書き込み先を選べる版（`target` の扱いは
+/// [`crate::sql::grant_ddl::execute_grant_revoke_in`] と同じ。SQL-80・Issue #3316）。
+pub(crate) fn execute_alter_default_privileges_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
     tenant_id: &str,
     session: &SessionState,
     stmt: &ValidatedAlterDefaultPrivileges,
@@ -72,7 +84,7 @@ pub(crate) fn execute_alter_default_privileges(
         grant_option: stmt.grant_option,
     };
     storage
-        .apply_default_acl_changes(tenant_id, &req)
+        .apply_default_acl_changes_in(target, tenant_id, &req)
         .map_err(crate::sql::grant_ddl::map_acl_error)?;
     Ok(AlterDefaultPrivilegesOutcome {
         is_revoke: !stmt.is_grant,

@@ -144,17 +144,27 @@ fn sqlstate_contract() {
     }
 }
 
-/// 明示 Tx 内は `0A000` で、ROLLBACK の後も状態は変わらない。
+/// SQL-80・Issue #3316: 明示 Tx 内の行セキュリティの切り替えは ROLLBACK の後に状態を変えない（COMMIT で確定する形は
+/// `sql80_txn_security_ddl.rs`）。積んだ後の読み取りは固定の拒否で、結線は #3311。
+// tracked: #3311
 #[test]
-fn explicit_transaction_rejects_and_leaves_state_unchanged() {
+fn explicit_transaction_applies_row_security_only_at_commit() {
     let (_g, path, core) = open_fixture("rls13-tx");
     let mut s = allowed_session();
     let mut txn = core.new_session_transaction();
-    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
-        .expect("begin");
+    for sql in ["BEGIN", FOUR[0], "ROLLBACK"] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let mut txn = core.new_session_transaction();
+    for sql in ["BEGIN", FOUR[0]] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // 切り替えの後の後続の読み書きは固定の `0A000`（古い判定で通さない。fail-closed）。
     let err = core
-        .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, FOUR[0])
-        .expect_err("DDL inside a transaction must be rejected");
+        .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "SELECT * FROM t")
+        .expect_err("read after RLS DDL must be rejected");
     assert_eq!(err.wire_code(), "0A000");
     core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");

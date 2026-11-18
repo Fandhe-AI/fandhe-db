@@ -660,11 +660,11 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | SEQUENCE | `CREATE`／`ALTER`／`DROP SEQUENCE`・RENAME | 自前。`create_sequence_in_txn`・`drop_sequence_in_txn` あり | 積む | #3315 | メモリ上の採番値は非トランザクション性（sequence-namespace-and-ledger.md D4）。同名で作り直した場合の扱いを実装時に固定する |
 | SCHEMA | `CREATE`／`DROP [CASCADE]`／`ALTER SCHEMA`・`ALTER TABLE ... SET SCHEMA` | 自前（`namespace.rs` の `*_gated`）。`_in_txn` 本体なし | 積む（本体を分離する） | #3315 | `namespace.rs` が進める関数世代は commit 後に回す。`search_path` の刻印は #3314 と連携する |
 | 型 | `CREATE TYPE`（ENUM）・`DROP TYPE` | 自前（`create_enum_type`・`drop_enum_type`） | 積む | #3315 | `ALTER TYPE ... ADD VALUE` は SQL に未公開（`42601` のまま） |
-| 関数 | `CREATE [OR REPLACE] FUNCTION`・`DROP FUNCTION` | 自前。`create_function_in_txn` あり。暗黙 Tx は #2882 で実施済み | 積む | #3316 | `function_generations` は commit 後に進める。ROLLBACK 時はセッションの UDF キャッシュを再読込する |
-| トリガ | `CREATE [OR REPLACE] TRIGGER`・`DROP TRIGGER` | 自前（`create_trigger_inner`・`drop_trigger`） | 積む | #3316 | 共有の public 表への作成を拒否する既存の `0A000`（#3382）は維持する |
-| ポリシー | `CREATE`／`ALTER`／`DROP POLICY`・`ALTER TABLE ... ROW LEVEL SECURITY` | 自前（`policy.rs`・`row_security.rs`） | 積む | #3316 | 同じ Tx の後続文の RLS 判定は write txn 側の定義で行う（V2） |
-| 権限 | `GRANT`／`REVOKE`・`ALTER DEFAULT PRIVILEGES`・`ALTER ... OWNER TO` | 自前（`privilege/apply.rs`・`default_acl.rs`・`owner_change.rs`） | 積む | #3316 | 同じ Tx の後続文の権限判定は write txn 側で行う（V2） |
-| ロール | `CREATE`／`ALTER`／`DROP ROLE` | 自前。`*_in_txn` あり | 積む | #3316 | ログイン名の対応表も同じ write txn に入れる。Tx 内の `SET ROLE` はロール DDL の後なら write txn で解決する |
+| 関数 | `CREATE [OR REPLACE] FUNCTION`・`DROP FUNCTION` | 自前。`create_function_in_txn` あり。暗黙 Tx は #2882 で実施済み | 積む（実装済み） | #3316 | `function_generations` は commit 後に進める。ROLLBACK 時はセッションの UDF キャッシュを再読込する |
+| トリガ | `CREATE [OR REPLACE] TRIGGER`・`DROP TRIGGER` | 自前（`create_trigger_inner`・`drop_trigger`） | 積む（実装済み） | #3316 | 共有の public 表への作成を拒否する既存の `0A000`（#3382）は維持する |
+| ポリシー | `CREATE`／`ALTER`／`DROP POLICY`・`ALTER TABLE ... ROW LEVEL SECURITY` | 自前（`policy.rs`・`row_security.rs`） | 積む（実装済み） | #3316 | 積んだ後の後続文は `0A000`（下の「#3316 の実装記録」。結線は #3311） |
+| 権限 | `GRANT`／`REVOKE`・`ALTER DEFAULT PRIVILEGES`・`ALTER ... OWNER TO` | 自前（`privilege/apply.rs`・`default_acl.rs`・`owner_change.rs`） | 積む（実装済み） | #3316 | 同上 |
+| ロール | `CREATE`／`ALTER`／`DROP ROLE` | 自前。`*_in_txn` あり | 積む（実装済み） | #3316 | ログイン名の対応表も同じ write txn に入る。ロール DDL の後の `SET ROLE` は `0A000`（結線は #3311） |
 | 拒否を維持 | `PARTITIONED` 付きの書き込み（分割実行。SQL-32 ポインタ） | — | `25001`（既存の `PartitionedDmlInTransaction`） | — | 変えない |
 | 拒否を維持 | PL/pgSQL 本体・`DO` の中の DDL | — | `0A000` | 受け皿なし | D6 |
 | 拒否を維持 | D3 に当たる本体と、どの子でも結線していない DDL | — | `0A000` | 各子 | fail-closed の既定 |
@@ -804,10 +804,63 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 - PL/pgSQL・`DO` の内部 savepoint: DDL 後は `pl_rollback_to` が `0A000`（設計 D6。対応しない）
 - 戻さないもの: commit 記録の足跡（`note_ddl`。余分に残るだけで偽陰性を生まない。#1945 節と同じ）、採番状態
   （非トランザクショナル）。`function_scopes` は暗黙 Tx 専用で savepoint と交わらないが、明示 Tx の関数 DDL を入れる
-  #3316 で同じ水位方式へ含める必要がある（申し送り）
+  #3316 で同じ水位方式へ含める必要がある（申し送り。#3316 の判断: 戻さなくても余分な世代 bump になるだけで安全。
+  「#3316 の実装記録」の S8）
 - 破棄: `25P02` からの `ROLLBACK`・drop（接続断）は既存の abort 経路で成立し、テストで固定した
 - テスト: `sql80_txn_ddl_savepoint.rs`（engine）、`sql80_txn_table_ddl.rs`（wire。文末 `;` の psql 形・失敗からの復帰・
   ソケット切断）
+
+### #3316 の実装記録（関数・ポリシー・権限・ロール・トリガ）
+
+ポインタ: SQL-80・SQL-31・SQL-23・SQL-52・TABLE-22・TABLE-36・TABLE-44・TASK-349。
+
+- **入口**: `core/txn_security_ddl.rs`（`execute_in_active_txn_inner` の関数・ポリシー・権限・所有者・ロール・トリガの腕と、
+  `core/txn_ddl.rs` の `ALTER TABLE ... ROW LEVEL SECURITY` の腕から呼ぶ）。明示 Tx と暗黙 Tx が同じ入口を通る。実行本体は
+  autocommit と同じ `sql/*_ddl.rs` の `execute_*_in`（書き込み先 `Option<&WriteTransaction>` を受ける。`None` が autocommit）で、
+  第 2 の実行器は作らない。Tx の持続時間の期限（`DeadlineScope`）と `54000` の扱いは表・索引の DDL と同じ。
+- **本体の分割（D1）**: `catalog/txn_target.rs` の `Storage::run_catalog_write(target, body)` が「自前の write txn を開いて
+  変更があれば commit」と「共有 write txn へ相乗り（commit も abort もしない）」を 1 つの本体で表す。ポリシー・行セキュリティ・
+  トリガ・ACL・既定権限・所有者・ロール・メンバーシップ・関数の削除の各本体は 1 回の write txn で完結していたため（D3 に当たる
+  ものは無かった）、`*_in` 版へ移した。autocommit の判定順・エラー・no-op で commit しない挙動は変えない。表世代の bump と
+  `note_ddl` は本体が共有 txn の上で行う。関数の世代だけは commit 後に回す（autocommit は呼び出し側が commit 後に進め、Tx は
+  `mark_function_written` が COMMIT 成功後に進める）。
+- **判定順**: READ ONLY（`25006`）→ 権限ゲート（`42501`。autocommit の腕と同じ位置・順。writer を取る前）→ 未対応の形の
+  `0A000`（一時表への `OWNER TO`・共有 public 表への `CREATE TRIGGER`〔本体の判定〕）→ writer の取得（`55P03`・`40001`）→
+  DDL を積んだ印 → 本体。付与者の権限（grant option）・所有者・依存の判定は本体が write txn の上で行うため、writer を取った後の
+  再判定は構造的に満たされる（`BEGIN` の後に他セッションが commit した変更も見る）。セッションだけで決まるゲートは
+  カタログを読まないので再判定の意味が無い（V2）。no-op（`IF EXISTS` の skip・所有者が変わらない・状態が変わらない行セキュリティ）は
+  印を巻き戻す。
+- **後続文の制限（P0。暫定。受け皿は #3311）**: ポリシー・行セキュリティ・GRANT/REVOKE・既定権限・所有者・ロール・トリガ・
+  `DROP FUNCTION` を積んだ Tx は `TxnDdlState::guarded` を立て（`started` も立つ）、`check_post_ddl_statement` が DDL・Tx 制御・
+  セッション変数の `SET`/`SHOW` 以外を固定文言の `0A000` にする。権限判定・ポリシー適用・トリガの発火・関数の解決は確定済みの
+  カタログを読むため、同じ Tx で変えた内容を見ずに通す fail-open を作らない（SELECT・INSERT・`SET ROLE`・ルーチン呼び出し・
+  カーソル・`EXPLAIN`・`COPY` などは `0A000`）。文言は文の種類だけで名前・存在を含まない。`CREATE [OR REPLACE] FUNCTION` は従来
+  （暗黙 Tx。#2882）どおり印を立てず、セッションのレジストリ経由で後続の呼び出しが新定義を見る。表の DDL の後の
+  `CREATE FUNCTION` は関数本体の束縛が確定済みカタログを読むため `0A000` のまま。本種別の DDL は表・索引の DDL の後でも
+  受理する（本体が write txn だけを読む）。拡張クエリの Execute の許可リストにも足した。
+- **SCHEMA 配下の対象と名前解決の食い違い（P0）**: 名前解決は文ごとに確定済みのカタログで行われるため、同じ Tx で作った
+  public の表・関数は、`search_path` で見える SCHEMA 配下の同名の関係・関数へ誤って解決されうる（実測: `search_path = public, s`
+  で `s.t` がある状態の `BEGIN; CREATE TABLE t ...; GRANT SELECT ON t TO bob` が `s.t` へ付与された。テストで再現し修正）。
+  そこで、表・索引の DDL（`relations_changed`）または関数の DDL を積んだ後は、内部キー（`#<id>.<name>`）に解決された対象を
+  固定の `0A000` で拒否する（`reject_schema_keys_after_shape_change`。関係と関数を混ぜない。トリガ関数を同じ Tx で作って
+  トリガを張る形を通すため。受け皿は #3315）。何も積んでいない間は解決が確定済みの状態と一致するので受理する（共有 public 表には
+  トリガを持てない〔#3361〕ため、トリガの対象は SCHEMA 配下の表に限られる）。ポリシー・行セキュリティは未修飾の名前を
+  `search_path` で解決せず public の表として扱うため、この食い違いは起きない。SCHEMA の作成・削除・改名と SCHEMA 配下の表の DDL は
+  Tx 内で受理しない（#3315）。#3315 が受理するときはこの前提を見直す。
+- **commit 後の副作用の監査（S8）**: 共有 txn の本体は redb の外の状態を変えない。関数の世代は `function_scopes`（COMMIT 成功後
+  にだけ bump）、セッションの UDF レジストリは ROLLBACK／`ROLLBACK TO` が `SessionState` の複製で戻す。採番器・ログイン名の
+  対応表（`roles` と同じ write txn）・キャッシュ（世代を鍵にするものは write txn の内容を載せない）は対象外または変更なし。
+  `function_scopes` は `ROLLBACK TO` で戻さない（取り消した関数 DDL の scope を COMMIT 後に余分に bump するだけで、他セッションの
+  refresh が再読込するだけ。偽陰性を生まない）。
+- **`ROLLBACK TO`**: `WriteMarks` に `ddl_guarded` の水位を足し、`restore_at` の成功後にだけ戻す。権限・ポリシー・トリガ・
+  ACL・所有者・ロール・メンバーシップ・ログイン名・関数の各カタログ表の型は `table_image::SHAPES` に含まれるため差分方式で戻る。
+- **変更ログ・PITR**: 1 commit = 1 レコード（既存）。表の足跡を持たないロール DDL だけの Tx も COMMIT できる。
+- **受理しない形（`0A000`）**: PL/pgSQL 本体・`DO`・動的 `EXECUTE` の中の本種別の DDL（D6。`plpgsql_host::classify` が DML と SELECT 系
+  以外を拒否する。注記 `intentional: docs/design/explicit-transaction.md`）、共有 public 表への `CREATE TRIGGER`（#3382）、
+  一時表への `OWNER TO`、積んだ後の後続文（受け皿は #3311。専用の Issue は未起票で、起票はユーザー承認待ち）。
+- テスト: `table_rls/sql80_txn_security_ddl.rs`（COMMIT・ROLLBACK・越境〔同じテナント・別テナント〕・後続文の `0A000`・組み合わせ・
+  `ROLLBACK TO`・判定順・`DO`・トリガと関数）、`sql_t40_up/sql66_udf_*`（Tx 内の関数 DDL）、`rls13_*`・`sql39_*`・`sql40_*`・
+  `table45_trigger_ddl`（旧 `0A000` の固定を新しい挙動へ更新）、wire は `wire_proto/sql80_txn_table_ddl.rs`（psql 形・接続断）。
 
 ### 子 Issue への割り当て（申し送り）
 
@@ -816,7 +869,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | #3313 | 表・索引・制約・CTAS・一時表、変更ログのオラクル試験 |
 | #3314 | 上限の期限検査（実装済み）、`25001` の判定順（実装済み）。V1・V5・V7 の結線と権限の再判定は、追跡の結果を下の記録に残し、残りは #3311 |
 | #3315 | VIEW・マテビュー・SEQUENCE・SCHEMA・型 |
-| #3316 | 関数・トリガ・ポリシー・権限・ロール |
+| #3316 | 関数・トリガ・ポリシー・権限・ロール（実装済み。「#3316 の実装記録」。積んだ後の後続文の結線は #3311） |
 | #3317 | `ROLLBACK TO`・接続断・commit 後フックの巻き戻し（実装済み。「#3317 の実装記録」） |
 | #3318 | Tx の途中・COMMIT の途中の SIGKILL で部分 commit が 0 件であること（`crash-test-cross-table` の道具 #2417・#2418 を拡張） |
 

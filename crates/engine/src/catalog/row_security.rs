@@ -235,58 +235,68 @@ impl Storage {
     /// `WrongObjectKind`）→ 表の存在（`TableNotFound`）→ 遷移の計算。状態が変わらなければ commit も世代更新も
     /// せず [`AlterApply::Unchanged`]（PostgreSQL も再指定は成功する）。変わったら書き込み、対象表の世代を進めて
     /// [`AlterApply::Applied`]（後続のキャッシュが失効できるようにする）。呼び出し元は `sql::ddl`。
+    #[cfg(test)]
     pub(crate) fn alter_table_row_security(
         &self,
         scope: &str,
         table_key: &str,
         action: RowSecurityAction,
     ) -> Result<AlterApply> {
+        self.alter_table_row_security_in(None, scope, table_key, action)
+    }
+
+    /// [`Self::alter_table_row_security`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有
+    /// write txn の上で実行し commit しない。SQL-80・Issue #3316）。
+    pub(crate) fn alter_table_row_security_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        scope: &str,
+        table_key: &str,
+        action: RowSecurityAction,
+    ) -> Result<AlterApply> {
         validate_scope(scope)?;
         validate_relation_key(table_key)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        // 名前解決後に `DROP SCHEMA` が完了しても、削除済み ID 配下の表へ状態を残さない。
-        super::namespace::ensure_tenant_key_schema_alive_in_txn(&*write_txn, scope, table_key)?;
-        let in_views = match ReadSource::open_table(&*write_txn, VIEWS_TABLE) {
-            Ok(t) => t.get(table_key)?.is_some(),
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if in_views
-            || index_name_exists_in_txn(&write_txn, table_key)?
-            || materialized_view_exists_in_txn(&write_txn, table_key)?
-            || super::sequence::sequence_exists_in_txn(&write_txn, table_key)?
-        {
-            return Err(CatalogError::WrongObjectKind(table_key.to_string()));
-        }
-        let table_exists = match ReadSource::open_table(&*write_txn, CATALOG_TABLE) {
-            Ok(t) => t.get(table_key)?.is_some(),
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !table_exists {
-            return Err(CatalogError::TableNotFound(table_key.to_string()));
-        }
-        let current = get_in_txn(&*write_txn, table_key, scope)?;
-        let next = current.apply(action);
-        if next == current {
-            return Ok(AlterApply::Unchanged);
-        }
-        {
-            let mut table = write_txn.open_table_logged(ROW_SECURITY_TABLE)?;
-            if next.is_default() {
-                table.remove((table_key, scope))?;
-            } else {
-                table.insert((table_key, scope), next.encode().as_slice())?;
+        self.run_catalog_write(target, |write_txn| {
+            // 名前解決後に `DROP SCHEMA` が完了しても、削除済み ID 配下の表へ状態を残さない。
+            super::namespace::ensure_tenant_key_schema_alive_in_txn(write_txn, scope, table_key)?;
+            let in_views = match ReadSource::open_table(write_txn, VIEWS_TABLE) {
+                Ok(t) => t.get(table_key)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            if in_views
+                || index_name_exists_in_txn(write_txn, table_key)?
+                || materialized_view_exists_in_txn(write_txn, table_key)?
+                || super::sequence::sequence_exists_in_txn(write_txn, table_key)?
+            {
+                return Err(CatalogError::WrongObjectKind(table_key.to_string()));
             }
-        }
-        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, table_key);
-        bump_table_generation_in_txn(&write_txn, table_key)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(AlterApply::Applied)
+            let table_exists = match ReadSource::open_table(write_txn, CATALOG_TABLE) {
+                Ok(t) => t.get(table_key)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            if !table_exists {
+                return Err(CatalogError::TableNotFound(table_key.to_string()));
+            }
+            let current = get_in_txn(write_txn, table_key, scope)?;
+            let next = current.apply(action);
+            if next == current {
+                return Ok((AlterApply::Unchanged, false));
+            }
+            {
+                let mut table = write_txn.open_table_logged(ROW_SECURITY_TABLE)?;
+                if next.is_default() {
+                    table.remove((table_key, scope))?;
+                } else {
+                    table.insert((table_key, scope), next.encode().as_slice())?;
+                }
+            }
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, table_key);
+            bump_table_generation_in_txn(write_txn, table_key)?;
+            Ok((AlterApply::Applied, true))
+        })
     }
 
     /// `scope` の表 `table_key` の行セキュリティ有効化状態を返す（読み取り専用。無ければ既定の両方 false）。
