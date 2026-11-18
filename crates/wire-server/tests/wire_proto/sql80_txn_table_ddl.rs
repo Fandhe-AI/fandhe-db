@@ -7,7 +7,7 @@
 //! ROLLBACK・失敗では表も索引も残らないことを固定する。複数文メッセージの暗黙トランザクションでも
 //! 同じ DDL が受理され、後続の文の失敗でメッセージ全体（表を含む）がロールバックされる。
 //! DDL 後に実行できる文は暫定の許可リストに限り、拡張クエリで送る DDL 後の SELECT は `0A000`
-//! （受け皿は #3314）。`sql31_trailing_semicolon.rs` と同じ流儀。
+//! （受け皿は #3311）。`sql31_trailing_semicolon.rs` と同じ流儀。
 
 use crate::common;
 use crate::temp_db;
@@ -169,7 +169,7 @@ fn implicit_transaction_message_rolls_back_the_table_when_a_later_statement_fail
 }
 
 #[test]
-// tracked: #3314
+// tracked: #3311
 fn statements_not_yet_wired_after_ddl_fail_the_transaction_with_0a000() {
     // DDL 後の UPDATE・DELETE 等は未対応。Tx は失敗状態になり ROLLBACK で戻る。
     let (core, _guard) = new_core();
@@ -184,6 +184,113 @@ fn statements_not_yet_wired_after_ddl_fail_the_transaction_with_0a000() {
     );
     expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
     expect_error(&mut stream, "SELECT id FROM t LIMIT 1;", "42P01", b'I');
+}
+
+#[test]
+fn psql_style_scan_ddl_on_a_populated_table_commits() {
+    // Issue #3314: 行のある表への一意索引・SET NOT NULL（既存行の走査を伴う DDL）が、Tx の期限の確認点つきで
+    // 文末 `;` の単独送信でも通り、COMMIT で確定する。
+    let (core, _guard) = new_core();
+    let mut stream = connect(core);
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, CREATE_T, "CREATE TABLE", b'T');
+    expect_tag(
+        &mut stream,
+        "INSERT INTO t (id, body) VALUES (1, 'a') USING OPERATION_ID 'scan-1';",
+        "INSERT 0 1",
+        b'T',
+    );
+    expect_tag(
+        &mut stream,
+        "CREATE UNIQUE INDEX t_body_u ON t (body);",
+        "CREATE INDEX",
+        b'T',
+    );
+    expect_tag(
+        &mut stream,
+        "ALTER TABLE t ALTER COLUMN body SET NOT NULL;",
+        "ALTER TABLE",
+        b'T',
+    );
+    expect_tag(&mut stream, "COMMIT;", "COMMIT", b'I');
+    expect_error(
+        &mut stream,
+        "INSERT INTO t (id, body) VALUES (2, 'a') USING OPERATION_ID 'scan-2';",
+        "23505",
+        b'I',
+    );
+}
+
+#[test]
+fn partitioned_dml_after_ddl_is_25001_and_leaves_nothing() {
+    // Issue #3314: Tx 内で禁じる分割実行は DDL 後でも `25001`（`0A000` ではない）。Tx は失敗状態で、
+    // ROLLBACK 後に表は残らない。
+    let (core, _guard) = new_core();
+    let mut stream = connect(core);
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, CREATE_T, "CREATE TABLE", b'T');
+    expect_error(
+        &mut stream,
+        "DELETE FROM t WHERE id > 0 USING OPERATION_ID 'p-1' PARTITIONED;",
+        "25001",
+        b'E',
+    );
+    expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
+    expect_error(&mut stream, "SELECT id FROM t LIMIT 1;", "42P01", b'I');
+}
+
+#[test]
+fn partitioned_dml_in_a_ddl_message_is_rejected_before_any_statement_runs() {
+    let (core, _guard) = new_core();
+    let mut stream = connect(core);
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, body TEXT); \
+         DELETE FROM a WHERE id > 0 USING OPERATION_ID 'p-2' PARTITIONED",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "25001");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    expect_error(&mut stream, "SELECT id FROM a LIMIT 1;", "42P01", b'I');
+}
+
+#[test]
+fn statement_limit_applies_to_ddl_in_explicit_and_implicit_transactions() {
+    use engine::sql::transaction::TransactionLimits;
+    let path = temp_db::unique_db_path("sql80-txn-ddl-limit-wire");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_transaction_limits(
+            TransactionLimits {
+                max_duration: std::time::Duration::from_secs(20),
+                max_statements: 2,
+            },
+        ),
+    );
+    let mut stream = connect(core);
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, CREATE_T, "CREATE TABLE", b'T');
+    expect_tag(
+        &mut stream,
+        "CREATE INDEX t_body ON t (body);",
+        "CREATE INDEX",
+        b'T',
+    );
+    expect_error(&mut stream, "DROP INDEX t_body;", "54000", b'E');
+    expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
+    expect_error(&mut stream, "SELECT id FROM t LIMIT 1;", "42P01", b'I');
+    // 暗黙 Tx（複数文メッセージ）。超過したメッセージ全体が残らない。
+    send_simple_query(
+        &mut stream,
+        "CREATE TABLE a (id BIGINT PRIMARY KEY); \
+         CREATE INDEX a_id ON a (id); \
+         DROP INDEX a_id",
+    );
+    let _ = read_command_complete(&mut stream);
+    let _ = read_command_complete(&mut stream);
+    expect_error_response_with_sqlstate(&mut stream, "54000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    expect_error(&mut stream, "SELECT id FROM a LIMIT 1;", "42P01", b'I');
 }
 
 #[test]

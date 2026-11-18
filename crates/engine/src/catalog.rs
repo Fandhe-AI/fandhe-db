@@ -4203,6 +4203,10 @@ const CREATE_ONLY_RESERVED_TYPE_NAMES: &[&str] = &[
 pub enum CatalogError {
     /// `redb` 側で発生したエラー（I/O・トランザクション競合等）。
     Backend(redb::Error),
+    /// 既存行を走査する DDL のループが、文の期限・切断検出（`interrupt::check`）で打ち切られた
+    /// （Issue #3314）。commit 前の `Err` としてのみ返り、表層では `57014`（Tx の期限超過は `54000`）へ写す。
+    /// **BREAKING CHANGE**: variant を追加した。`CatalogError` を網羅的に `match` するクレート外のコードは追随が必要。
+    Interrupted(crate::interrupt::InterruptReason),
     /// 識別子・型・次元数のフォーマットが不正（TABLE-6）。呼び出し側（ユーザー入力の
     /// 識別子・スキーマ定義）が渡した値そのものの検証失敗であり、`detail` は
     /// 呼び出し元が把握済みの情報のみを含む。
@@ -4393,6 +4397,7 @@ impl fmt::Display for CatalogError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CatalogError::Backend(e) => write!(f, "catalog backend error: {e}"),
+            CatalogError::Interrupted(_) => write!(f, "catalog operation interrupted"),
             CatalogError::Invalid(msg) => write!(f, "invalid catalog data: {msg}"),
             CatalogError::AmbiguousColumn(name) => {
                 write!(f, "column reference is ambiguous: {name}")
@@ -4510,7 +4515,8 @@ impl std::error::Error for CatalogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             CatalogError::Backend(e) => Some(e),
-            CatalogError::Invalid(_)
+            CatalogError::Interrupted(_)
+            | CatalogError::Invalid(_)
             | CatalogError::CorruptSchema(_)
             | CatalogError::TableNotFound(_)
             | CatalogError::TableAlreadyExists(_)
@@ -18552,24 +18558,6 @@ impl Storage {
     }
 }
 
-/// 共有 write txn 上で `table_name` の行ストアに 1 行以上あるかを返す（Issue #3313。Tx 内 DDL の
-/// 走査を伴う形を、期限の結線までの間 `0A000` にするための判定。読み取り集合へは記録しない）。
-/// 行ストア未作成は 0 行。
-pub(crate) fn table_has_rows_in_txn(
-    write_txn: &redb::WriteTransaction,
-    table_name: &str,
-) -> Result<bool> {
-    let row_table_name = user_rows_physical_name(table_name);
-    match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
-        Ok(t) => {
-            let mut it = t.iter().map_err(|e| CatalogError::Invalid(e.to_string()))?;
-            Ok(it.next().is_some())
-        }
-        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
-        Err(e) => Err(map_row_table_error(e)),
-    }
-}
-
 /// `sql::allowlist::validate_statement`（TASK-74・SQL-8 参照）から FROM テーブルの
 /// カタログ存在確認に使われる橋渡し実装。`get_table_schema` が返す `CatalogError`
 /// を SQL 表層のエラー契約へ分類し直し、識別子形式不正のみ拒否側（構文エラー）へ
@@ -18592,7 +18580,7 @@ impl TableLookup for Storage {
     fn view_definition(&self, name: &str) -> std::result::Result<Option<ViewDef>, SqlSurfaceError> {
         let def = Storage::view_definition(self, name).map_err(table_lookup_error)?;
         // SQL-80・Issue #3313: DDL を積んだ Tx の区間では、ビュー本体（確定済みカタログ）が Tx 内の表の形と
-        // 食い違いうるため、ビュー経由の読みは受け皿（#3314）まで `0A000`（fail-closed。文言に名前を含めない）。
+        // 食い違いうるため、ビュー経由の読みは受け皿（#3311）まで `0A000`（fail-closed。文言に名前を含めない）。
         if def.is_some() && crate::sql::txn_overlay::overlay_active(self) {
             return Err(SqlSurfaceError::transaction_feature_not_supported(
                 "reading a view after DDL inside a transaction block is not supported yet",
@@ -18766,6 +18754,7 @@ pub(crate) fn table_lookup_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::Invalid(detail) => {
             SqlSurfaceError::unsupported(format!("malformed table reference: {detail}"))
         }
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::TableNotFound(_)
         | CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)

@@ -309,6 +309,8 @@ pub(crate) fn backfill_generated_column_in_txn(
         let full = keys.len() >= REWRITE_BATCH_KEYS;
 
         for (tenant, id) in &keys {
+            // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`。副作用ゼロ）。
+            crate::interrupt::check_reason().map_err(CatalogError::Interrupted)?;
             let raw: Vec<u8> = match row_table.get((tenant.as_str(), *id))? {
                 Some(g) => g.value().to_vec(),
                 None => return Err(corrupt("row vanished during column rewrite")),
