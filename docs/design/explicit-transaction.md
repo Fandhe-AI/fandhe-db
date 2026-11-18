@@ -700,7 +700,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 ### 上限
 
 - DDL も 1 文として `check_and_register_statement` で数える。文数の上限 `max_statements` に入り、超えたら `54000` で `Failed` にする。持続時間の上限 `max_duration` は `BEGIN` から数える（不変）
-- 既存の行を処理する DDL（`CREATE INDEX` の構築・制約の追加時の既存行の検証・`ALTER COLUMN TYPE` の書き換え・CTAS）は、ループの中で期限を検査する。期限は文の期限と Tx の残り時間の小さい方とし、超えたらその DDL は `54000` で `Failed` にする。検査点が無い経路は、結線するまで Tx 内では受理しない（#3314）
+- 既存の行を処理する DDL（`CREATE INDEX` の構築・制約の追加時の既存行の検証・`ALTER COLUMN TYPE` の書き換え・CTAS）は、ループの中で期限を検査する。期限は文の期限と Tx の残り時間の小さい方とし、超えたらその DDL は `54000` で `Failed` にする。走査ループの検査点は #3314 で結線した（「#3314 の実装記録」）
 - 1 commit あたりの足跡の上限（`MAX_FOOTPRINT_ELEMENTS_PER_COMMIT`）は従来どおり適用する。DDL はフラグで表すため要素数には数えない
 
 ### 破棄
@@ -731,12 +731,12 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 - 受理する形: `CREATE TABLE`（列制約・PK・UNIQUE・CHECK・FK を含む。public）・`DROP TABLE [IF EXISTS] a, b
   [RESTRICT|CASCADE]`（永続表のみ）・`ALTER TABLE` の `ADD COLUMN`・`DROP COLUMN`・`ALTER COLUMN SET/DROP NOT NULL`・
   `SET/DROP DEFAULT` とそれらの複数アクション・`CREATE [UNIQUE] INDEX`（式・部分・GIN・HNSW の宣言）・`DROP INDEX`
-- DDL 後の文（暫定の許可リスト。受け皿は #3314）: 受理するのは DDL・Tx 制御・`SET`/`SHOW`・`INSERT`
+- DDL 後の文（暫定の許可リスト。受け皿は #3311）: 受理するのは DDL・Tx 制御・`SET`/`SHOW`・`INSERT`
   （単一行・複数行・`ON CONFLICT`・`RETURNING`）・`SELECT`/集計/スキャン/JOIN/集合演算/定数 SELECT
   （`USING PLAN`・ルーチン呼び出し・ビュー展開を除く）。表・索引を DROP した後は DDL 以外を `0A000` にする。
   それ以外（`UPDATE`・`DELETE`・`TRUNCATE`・`EXPLAIN`・`COPY`・カーソル・`LOCK`・`DO`・`SET ROLE` など）は `0A000`。
   拡張クエリの Execute（Parse・Bind 済みの文）は、確定済みカタログで束縛した文を実行しないため、DDL・Tx 制御・
-  `SET`/`SHOW` 以外を `0A000` にする（`execute_parsed_in_txn_unscrubbed`。V7。受け皿は #3314）。`COPY` は
+  `SET`/`SHOW` 以外を `0A000` にする（`execute_parsed_in_txn_unscrubbed`。V7。受け皿は #3311）。`COPY` は
   `begin_copy_in_txn` が同じく `0A000`。同じ Tx で作った表への SELECT・INSERT を Parse 時点で解決できない
   拡張クエリは `42P01` になる
 - 確定済みカタログを読む解析の表スキーマの引き当て（`impl TableLookup for Storage`・INSERT の
@@ -744,7 +744,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   （`sql::txn_overlay`。スレッドローカルの RAII。重ねるのは張った `Storage` だけで、一時表用の別 `Storage`
   には効かない）。実行本体は write txn を直接読む。確定済みカタログ側の権限（ACL）は重ねないため、
   束縛ロールのセッションが同じ Tx で作った表へ触れる経路は `42501` になる想定（fail-closed。**未検証**。
-  結線は #3314 の V2）
+  検証は #3314 の記録）
 - 世代を鍵にするキャッシュ（V4）: write txn から読んだ内容をキャッシュへ載せない。DDL を積んだ Tx の読み取りは
   常に writer から読み、ROLLBACK 後の世代の再利用でも別セッションの検索へ漏れないことをテスト
   （`sql80_txn_table_ddl.rs`）で固定した
@@ -752,10 +752,41 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   巻き戻し不能として登録していた。改訂 #3317: 下の「#3317 の実装記録」で巻き戻せるようにした
 - 未対応のまま残した形（`0A000`）: `ALTER TABLE` の制約の追加・削除・`RENAME`・`ALTER COLUMN TYPE`・`SET SCHEMA`・
   行セキュリティ、`CREATE TABLE ... AS`、SERIAL/IDENTITY 列（暗黙 SEQUENCE の採番状態が ROLLBACK で戻らず、再利用される
-  内部 ID と食い違うため）、SCHEMA 配下の表・索引、一時表の DDL、既存行を処理する DDL の期限の検査点
-  （`CREATE INDEX` の構築ループなどは文の期限だけ。Tx の残り時間との小さい方は #3314）
+  内部 ID と食い違うため）、SCHEMA 配下の表・索引、一時表の DDL（既存行を処理する DDL の期限の検査点は #3314 で結線した）
 - 変更ログのオラクル試験: `FANDHE_CHANGE_LOG_ORACLE=1`（`--all-features`）で `sql_t40_up`・`sql_named`・`table_rls`・
   `sql_t01_39` を流して緑（DDL と DML が混ざる commit を含む）。`make change-log-oracle` の全体（2 段）は未検証
+
+### #3314 の実装記録（上限・`25001`・可視性の固定）
+
+ポインタ: SQL-80・SQL-31・SQL-23・SQL-52・TABLE-22・TABLE-36・TABLE-44・TASK-349（関連: SQL-32・SQL-71）。
+
+- **Tx の持続時間の期限を走査 DDL へ結線**: `execute_table_ddl_in_txn` の先頭で `DeadlineScope::install` により
+  `SessionTransaction::duration_deadline`（`started_at + max_duration`。加算があふれたら `54000`）を張る。writer の待機
+  （`effective_lock_wait`）と、下記の走査ループの確認点が、`statement_timeout` の期限との早い方で打ち切る。
+  打ち切りが `StatementTimeout` で、かつ Tx の持続時間を過ぎていれば、`fail_duration_exceeded` が復帰不可の `Failed`
+  にして `54000` を返す（文の開始時点の上限超過と同じ契約）。過ぎていなければ `57014`。
+- **確認点**（commit より前。`CatalogError::Interrupted` で返し、表層で `QueryCanceled` へ写す。文言は固定で名前・件数を含めない）:
+  一意制約の重複走査・`SET NOT NULL` の NULL 検査・部分索引と式索引の既存行検証・式/部分 UNIQUE の重複走査・
+  GIN の初回構築・生成列の `ADD COLUMN` の全行計算・実体化ビューの一意索引の実体走査。
+  これに伴い、行のある表で `0A000` にしていた走査 DDL のゲート（`reject_scan_ddl_on_nonempty_table`）を撤去した。
+- **autocommit への副作用**: 同じ本体を通る autocommit の走査 DDL も `statement_timeout`・切断検出で中断できるようになった。
+  確認点は commit より前なので副作用は残らず、1 文の DDL の原子性は保たれる。
+- **`25001` の判定順**: 拡張クエリの Execute で、DDL 後の分割実行（`PARTITIONED` 付き `UPDATE`/`DELETE`・`CANCEL PARTITIONED DML`）は
+  `check_extended_execute_after_ddl` を素通りさせ、`execute_parsed_in_txn_inner` の `25001` に先に到達させる（従来は `0A000` が先だった）。
+- **固定したテスト（変更なしで成り立っていた性質）**: 他セッションからの COMMIT 前の表は、一度も作られていない名前と
+  エラーの種類・文言が一致する（同じテナント・別テナント）。別セッションの DDL は名前にかかわらず writer の待機で `55P03`。
+  読んだ表への他セッションの commit の後の DDL は `40001` で、DDL の印は立たず何も残らない（読んでいない表では `40001` にならない）。
+  DDL も文数の上限に数えられ、暗黙 Tx（複数文メッセージ）でも超過でメッセージ全体が残らない。
+- **追跡の結果（DDL 後の文の結線）**: `UPDATE`・`DELETE` の実行本体は `WriteTarget::InTxn` を受け取るが、表スキーマを
+  確定済みカタログ（`Storage::get_table_schema`）から取って束縛する経路があり、同じ Tx で作った表・追加した列を解決できない。
+  索引カタログ・一意の強制・FK・生成列・世代キャッシュについても write txn を読むことを示せていない。規則（束縛と実行の両方が
+  write txn を読むことを追跡で示せた種類だけを許可リストへ入れる）に従い、`UPDATE`・`DELETE`・`TRUNCATE`・`INSERT ... SELECT`・
+  `ON CONFLICT ON CONSTRAINT`・DROP 後の参照・`EXPLAIN`・`USING PLAN`・拡張クエリの Execute（`25001` の順序を除く）は `0A000` のまま残し、
+  受け皿は #3311（要起票）とした。
+- **権限の再判定（V2）**: 表・索引の DDL の権限ゲート（`require_ddl`）はセッションの主体だけで決まりカタログを読まないため、
+  write txn 上で再判定する意味がない。カタログに依存する `require_creation_target`（SCHEMA の権限）は、SCHEMA 配下の DDL を `0A000` のまま
+  残すため結線していない。結線するときは writer を取った後で write txn 上で再判定する。束縛ロールの DDL 後の DML の権限は、DML を結線した時点で検証する。
+- 単独のテストバイナリ `tests/sql80_txn_ddl_deadline.rs`（時間依存のため束ねない）。時間の揺らぎでは結果が変わらない形にしてある。
 
 ### #3317 の実装記録（`ROLLBACK TO`・失敗からの復帰・接続断）
 
@@ -783,7 +814,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | 子 | 内容 |
 | --- | --- |
 | #3313 | 表・索引・制約・CTAS・一時表、変更ログのオラクル試験 |
-| #3314 | V1・V5・V7 の結線、権限の再判定、上限の期限検査 |
+| #3314 | 上限の期限検査（実装済み）、`25001` の判定順（実装済み）。V1・V5・V7 の結線と権限の再判定は、追跡の結果を下の記録に残し、残りは #3311 |
 | #3315 | VIEW・マテビュー・SEQUENCE・SCHEMA・型 |
 | #3316 | 関数・トリガ・ポリシー・権限・ロール |
 | #3317 | `ROLLBACK TO`・接続断・commit 後フックの巻き戻し（実装済み。「#3317 の実装記録」） |

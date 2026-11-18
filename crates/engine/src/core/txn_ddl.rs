@@ -15,11 +15,13 @@
 //! （`SessionTransaction::mark_ddl_started`）ため、部分的な DDL を COMMIT する経路は無い。前の savepoint が
 //! あれば `ROLLBACK TO` で、その時点（DDL 状態の印・commit 後の採番器の後始末の列を含む）へ戻れる（Issue #3317）。
 //!
-//! 暫定の規則（受け皿は #3314。V1・V5・V7）: DDL を積んだ後に同じ Tx で実行できる文は、結線を済ませた最小の
+//! 暫定の規則（受け皿は #3311。V1・V5・V7）: DDL を積んだ後に同じ Tx で実行できる文は、結線を済ませた最小の
 //! 種類だけにする（[`check_post_ddl_statement`]）。`search_path` の解決・ビュー展開・権限ゲートが読む確定済み
 //! カタログと、write txn 上の内容が食い違う経路を作らないため、それ以外は `0A000` で拒否する（fail-closed）。
 //! ビュー経由の読みは `catalog.rs` の `TableLookup::view_definition` が重ね見の区間で `0A000` にする。
-//! 既存行の走査を伴う `CREATE INDEX`（一意・式・述語つき・GIN）・`SET NOT NULL` は、期限の結線まで対象表に行がある間 `0A000` にする。
+//! 既存行の走査を伴う DDL（一意・式・述語つき・GIN の `CREATE INDEX`・`SET NOT NULL`・生成列の `ADD COLUMN`）は、
+//! Tx の持続時間上限の期限（`SessionTransaction::duration_deadline`）を走査ループの確認点が見て打ち切る
+//! （Issue #3314。超過は復帰不可の `Failed` と `54000`）。
 //! 確定済みカタログで行う解析の表スキーマの引き当ては、Tx が変更した表の write txn 上のスキーマを重ねて
 //! 見る（`sql::txn_overlay`）。
 
@@ -38,7 +40,7 @@ fn internal() -> SqlSurfaceError {
 }
 
 /// 内部キー（`#<id>.<name>`）で表す SCHEMA 配下の関係か。SCHEMA 配下の DDL は、後続の文の `search_path` の
-/// 解決が確定済みカタログを読むため DDL 後に別の表へ解決されうる。結線（#3314）までは `0A000`。
+/// 解決が確定済みカタログを読むため DDL 後に別の表へ解決されうる。結線（#3311）までは `0A000`。
 fn is_schema_key(name: &str) -> bool {
     name.starts_with('#')
 }
@@ -49,91 +51,7 @@ fn schema_scoped_ddl_unsupported() -> SqlSurfaceError {
     )
 }
 
-/// 既存行の走査を伴う DDL（`CREATE INDEX`・`SET NOT NULL`・生成列の `ADD COLUMN`）は、走査ループに Tx の残り時間
-/// （`remaining_duration`）の期限が結線されていないため、対象表に行がある間は `0A000` にする
-/// （共有 writer を持続時間上限を越えて保持しない。fail-closed。受け皿は #3314）。
-fn reject_scan_ddl_on_nonempty_table(
-    write_txn: &redb::WriteTransaction,
-    table: &str,
-) -> Result<(), SqlSurfaceError> {
-    let has_rows = crate::catalog::table_has_rows_in_txn(write_txn, table)
-        .map_err(|_| internal())?
-        // 実体化ビューの行は別の行表にあるため、そちらも見る（既存行の走査が期限なしで走るのを防ぐ）。
-        || crate::catalog::materialized::matview_has_rows_in_txn(write_txn, table)
-            .map_err(|_| internal())?;
-    if has_rows {
-        return Err(SqlSurfaceError::transaction_feature_not_supported(
-            "this DDL scans existing rows and is not supported on a non-empty table inside a transaction block yet",
-        ));
-    }
-    Ok(())
-}
-
-/// `ALTER TABLE` が実際に既存行を走査しうるか。生成列の `ADD COLUMN`（既存列への `IF NOT EXISTS` を除く）と、`SET NOT NULL` のうち、対象列が現在すでに NOT NULL で、
-/// かつ同じ文の他アクション（`DROP NOT NULL`・`DROP/ADD COLUMN`）が同列を変えないものは no-op のため走査しない。
-/// 表・列が見つからない場合は実行側がエラーで返す（走査前）ので、ここでは走査なし扱いにする。
-fn alter_needs_row_scan(
-    write_txn: &redb::WriteTransaction,
-    table: &str,
-    stmt: &crate::sql::allowlist::ValidatedAlterTable,
-) -> bool {
-    use crate::sql::allowlist::ValidatedAlterTable as V;
-    if !alter_scans_rows(stmt) {
-        return false;
-    }
-    let Ok(schema) = crate::catalog::get_table_schema_in_txn_impl(write_txn, table, false) else {
-        return false;
-    };
-    let actions: Vec<&V> = match stmt {
-        V::Multiple(m) => m.actions.iter().collect(),
-        other => vec![other],
-    };
-    actions.iter().any(|a| {
-        if let V::AddColumn(x) = a {
-            if x.generated.is_none() {
-                return false;
-            }
-            // `ADD COLUMN IF NOT EXISTS` で既存列がある no-op は走査しない（同じ文で先に外す場合は走査あり）。
-            let exists = schema.columns.iter().any(|c| c.name == x.column_name);
-            let dropped_in_stmt = actions
-                .iter()
-                .any(|o| matches!(o, V::DropColumn(d) if d.column_name == x.column_name));
-            return !(x.if_not_exists && exists && !dropped_in_stmt);
-        }
-        let V::AlterColumnSetNotNull(s) = a else {
-            return false;
-        };
-        let Some(col) = schema.columns.iter().find(|c| c.name == s.column_name) else {
-            // 現スキーマに無い列は、同じ文の ADD COLUMN で現れうるため走査ありとして扱う。
-            return actions
-                .iter()
-                .any(|o| matches!(o, V::AddColumn(x) if x.column_name == s.column_name));
-        };
-        if col.nullable {
-            return true;
-        }
-        actions.iter().any(|o| match o {
-            V::AlterColumnDropNotNull(x) => x.column_name == s.column_name,
-            V::DropColumn(x) => x.column_name == s.column_name,
-            V::AddColumn(x) => x.column_name == s.column_name,
-            _ => false,
-        })
-    })
-}
-
-/// `ALTER TABLE` のアクションに既存行を走査する `SET NOT NULL`・生成列の `ADD COLUMN` が含まれるか。
-fn alter_scans_rows(stmt: &crate::sql::allowlist::ValidatedAlterTable) -> bool {
-    use crate::sql::allowlist::ValidatedAlterTable as V;
-    match stmt {
-        V::AlterColumnSetNotNull(_) => true,
-        // 生成列の追加は全テナントの既存行を計算して書き直す（`backfill_generated_column_in_txn`）。
-        V::AddColumn(a) => a.generated.is_some(),
-        V::Multiple(m) => m.actions.iter().any(alter_scans_rows),
-        _ => false,
-    }
-}
-
-/// DDL を積んだ Tx に対し、`parsed` を実行してよいか判定する（暫定の許可リスト。受け皿は #3314。V1・V5・V7）。
+/// DDL を積んだ Tx に対し、`parsed` を実行してよいか判定する（暫定の許可リスト。受け皿は #3311。V1・V5・V7）。
 ///
 /// 許可するのは、本モジュールが受理する DDL・Tx 制御・セッション変数の `SET`/`SHOW`・結線を済ませた
 /// `INSERT ... VALUES`・読み取り（`INSERT ... SELECT` は結線まで拒否）（`USING PLAN`・`EXPLAIN`・ルーチン呼び出し・集合返却関数・ビュー展開を伴う形は `view_definition` 側で拒否）。
@@ -157,7 +75,7 @@ pub(super) fn check_post_ddl_statement(
         | ParsedSql::CreateIndex(_)
         | ParsedSql::DropIndex(_) => true,
         // `INSERT ... SELECT` は挿入先スキーマを確定済みカタログから取得する（束縛・実行とも）ため、同じ Tx で
-        // 作った表・追加した列を解決できない。overlay 結線までは fail-closed で拒否する（受け皿は #3314）。
+        // 作った表・追加した列を解決できない。overlay 結線までは fail-closed で拒否する（受け皿は #3311）。
         ParsedSql::Insert(_) => !removed,
         ParsedSql::Statement(stmt) => match stmt {
             Statement::SetSearchMode { .. }
@@ -196,7 +114,7 @@ pub(super) fn check_post_ddl_statement(
 }
 
 /// 拡張クエリの Execute（Parse・Bind 済みの [`ParsedSql`] を実行する入口）で、DDL を積んだ Tx に実行してよいか
-/// 判定する（SQL-80・Issue #3313。V7。受け皿は #3314）。Parse・Bind は確定済みカタログで文を束縛・検証して
+/// 判定する（SQL-80・Issue #3313。V7。受け皿は #3311）。Parse・Bind は確定済みカタログで文を束縛・検証して
 /// おり、同じ Tx で変更した表のスキーマと食い違いうるため、DDL・Tx 制御・`SET`/`SHOW` だけを許す。
 /// DDL を積んでいない Tx では何もしない。永続側を包んだ文（`SessionRouted`）は中身で判定する。
 pub(super) fn check_extended_execute_after_ddl(
@@ -204,6 +122,11 @@ pub(super) fn check_extended_execute_after_ddl(
     parsed: &ParsedSql,
 ) -> Result<(), SqlSurfaceError> {
     if !txn.has_ddl() {
+        return Ok(());
+    }
+    // Issue #3314: Tx 内で禁じる文（分割実行。SQL-32）の `25001` は、DDL 後の `0A000` より先に返す。
+    // ここでは素通りさせ、`execute_parsed_in_txn_inner` の既存の `25001` 判定へ到達させる。
+    if super::is_partitioned_write(parsed) {
         return Ok(());
     }
     let inner = match parsed {
@@ -250,7 +173,37 @@ impl EngineCore {
     /// 明示・暗黙 Tx の表・索引の DDL を、Tx の共有 write txn へ積む（`execute_in_active_txn_inner` の
     /// `CreateTable`・`DropTable`・`AlterTable`・`CreateIndex`・`DropIndex` の腕から呼ばれる）。
     /// 判定順・失敗時の Tx の遷移はモジュールドキュメントのとおり。呼び出し元が `Err` で Tx を `Failed` にする。
+    ///
+    /// Issue #3314: 本体の前に Tx の持続時間上限の期限を張り（writer の待機と既存行の走査ループの確認点が
+    /// 打ち切る。`statement_timeout` との早い方が勝つ）、Tx の期限で打ち切られた場合は復帰不可の `Failed` と
+    /// `54000` にする（文の開始時点の上限超過と同じ契約）。確認点はすべて commit 前にあるため副作用は残らない。
     pub(super) fn execute_table_ddl_in_txn<'e>(
+        &'e self,
+        ctx: &PolicyContext,
+        session: &mut SessionState,
+        txn: &mut SessionTransaction<'e>,
+        parsed: &ParsedSql,
+    ) -> Result<SqlOutcome, SqlSurfaceError> {
+        let deadline = match txn.duration_deadline() {
+            Ok(d) => d,
+            Err(e) => {
+                txn.fail_unrecoverable();
+                return Err(e);
+            }
+        };
+        let guard = deadline.map(crate::interrupt::DeadlineScope::install);
+        let result = self.execute_table_ddl_in_txn_inner(ctx, session, txn, parsed);
+        drop(guard);
+        match result {
+            Err(SqlSurfaceError::QueryCanceled {
+                reason: crate::interrupt::InterruptReason::StatementTimeout,
+            }) if txn.duration_exceeded() => Err(txn.fail_duration_exceeded()),
+            other => other,
+        }
+    }
+
+    /// [`Self::execute_table_ddl_in_txn`] の本体（期限を張った区間の内側で実行される）。
+    fn execute_table_ddl_in_txn_inner<'e>(
         &'e self,
         ctx: &PolicyContext,
         session: &mut SessionState,
@@ -348,12 +301,6 @@ impl EngineCore {
                     return Err(schema_scoped_ddl_unsupported());
                 }
                 txn.ensure_writer(ctx)?;
-                let write_txn = txn.write_txn().ok_or_else(internal)?;
-                // 既に NOT NULL の列への `SET NOT NULL`・既存列への `ADD COLUMN IF NOT EXISTS` は走査しない
-                // no-op のため、ゲートの対象外にする。何も書かない拒否は、DDL を積んだ印を立てる前に返す。
-                if alter_needs_row_scan(write_txn, table_name, stmt) {
-                    reject_scan_ddl_on_nonempty_table(write_txn, table_name)?;
-                }
                 let snap = txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 let (outcome, evict, changed) = crate::sql::ddl::execute_alter_table_in_txn(
@@ -391,23 +338,15 @@ impl EngineCore {
                 }
                 txn.ensure_writer(ctx)?;
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                // 既存行を走査する形（一意・式・述語つき・GIN）だけが対象。列の宣言だけの索引は走査しない。
                 // 同名の relation が既にある場合は構築（走査）に入る前に結果が決まる（`IF NOT EXISTS` の
-                // no-op 成功・名前衝突のエラー）ため、ゲートの対象外にする。
+                // no-op 成功・名前衝突のエラー）。既存行の走査（一意・式・述語つき・GIN）は走査ループの
+                // 確認点が Tx の残り時間で打ち切る（Issue #3314）。
                 let name_taken = crate::catalog::namespace::sibling_key(stmt.table(), stmt.name())
                     .ok()
                     .and_then(|key| {
                         crate::catalog::relation_name_exists_in_txn(write_txn, &key).ok()
                     })
                     .unwrap_or(false);
-                if !name_taken
-                    && (stmt.is_unique()
-                        || stmt.predicate().is_some()
-                        || stmt.gin_opclass().is_some()
-                        || stmt.expression_keys().iter().any(Option::is_some))
-                {
-                    reject_scan_ddl_on_nonempty_table(write_txn, stmt.table())?;
-                }
                 // 同名の relation があり `IF NOT EXISTS` なら何も変えない成功のため、印を立てない。
                 if !(name_taken && stmt.if_not_exists()) {
                     txn.mark_ddl_started();

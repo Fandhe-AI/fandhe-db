@@ -1117,6 +1117,9 @@ where
         .iter()
         .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
     {
+        // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`。副作用ゼロ）。
+        crate::interrupt::check_reason()
+            .map_err(|r| TenantWriteError::Catalog(CatalogError::Interrupted(r)))?;
         let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
         let (key_tenant, id) = k.value();
         let buf = v.value();
@@ -1158,6 +1161,9 @@ where
         .iter()
         .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
     {
+        // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`。副作用ゼロ）。
+        crate::interrupt::check_reason()
+            .map_err(|r| TenantWriteError::Catalog(CatalogError::Interrupted(r)))?;
         let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
         let (key_tenant, id) = k.value();
         let buf = v.value();
@@ -1847,6 +1853,8 @@ where
     let mut current_tenant: Option<String> = None;
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     for entry in row_table.iter()? {
+        // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`。副作用ゼロ）。
+        crate::interrupt::check_reason().map_err(CatalogError::Interrupted)?;
         let (k, v) = entry?;
         let (key_tenant, _id) = k.value();
         if current_tenant.as_deref() != Some(key_tenant) {
@@ -1900,6 +1908,9 @@ where
         .iter()
         .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
     {
+        // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`）。
+        crate::interrupt::check_reason()
+            .map_err(|r| TenantWriteError::Catalog(CatalogError::Interrupted(r)))?;
         let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
         let (key_tenant, id) = k.value();
         if current_tenant.as_deref() != Some(key_tenant) {
@@ -1949,6 +1960,9 @@ where
         .iter()
         .map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?
     {
+        // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`）。
+        crate::interrupt::check_reason()
+            .map_err(|r| TenantWriteError::Catalog(CatalogError::Interrupted(r)))?;
         let (k, v) = entry.map_err(|e| TenantWriteError::Catalog(CatalogError::from(e)))?;
         let (key_tenant, id) = k.value();
         if current_tenant.as_deref() != Some(key_tenant) {
@@ -2015,6 +2029,8 @@ where
         }
     }
     for entry in row_table.iter()? {
+        // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`。副作用ゼロ）。
+        crate::interrupt::check_reason().map_err(CatalogError::Interrupted)?;
         let (k, v) = entry?;
         let (key_tenant, _id) = k.value();
         let buf = v.value();

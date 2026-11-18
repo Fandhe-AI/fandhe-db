@@ -660,6 +660,9 @@ pub(crate) fn build_all_tenants_in_txn(
     let marker = marker_value(&sig);
     let mut current_tenant: Option<String> = None;
     for entry in row_table.iter().map_err(storage_error)? {
+        // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`。副作用ゼロ）。
+        crate::interrupt::check_reason()
+            .map_err(|r| TenantWriteError::Catalog(crate::catalog::CatalogError::Interrupted(r)))?;
         let (k, v) = entry.map_err(storage_error)?;
         let (tenant, id) = split_row_key(k.value());
         if current_tenant.as_deref() != Some(tenant) {

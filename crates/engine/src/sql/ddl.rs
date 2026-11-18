@@ -438,6 +438,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         // ENUM 列が参照する型が解決後〜書き込みトランザクションまでの間に削除された
         // 場合（Issue #1348）。事前解決の未登録と同じ `42704` に揃える（Issue #2306）。
         CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedType { name },
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::ColumnAlreadyExists(_)
@@ -1851,6 +1852,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         // variant はいずれも詳細を露出しない `Internal`（`XX000`）へ丸める
         // （fail-closed。ワイルドカード腕を置かず全 variant を明示列挙する
         // ことで、将来の追加 variant をコンパイラに検出させる）。
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableAlreadyExists(_)
@@ -2507,6 +2509,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
             detail: "commit footprint limit exceeded".to_string(),
         },
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableAlreadyExists(_)
@@ -3231,6 +3234,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // variant はいずれも詳細を露出しない `Internal`（`XX000`）へ丸める
         // （fail-closed。ワイルドカード腕を置かず全 variant を明示列挙する
         // ことで、将来の追加 variant をコンパイラに検出させる）。
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableAlreadyExists(_)
@@ -3857,6 +3861,7 @@ pub(crate) fn execute_drop_index_in_txn(
 /// テナント・行内容・redb 内部詳細は含めない（security.md P0）。
 fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
     match e {
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::IndexAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
