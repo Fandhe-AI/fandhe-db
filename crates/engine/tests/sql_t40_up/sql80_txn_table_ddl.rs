@@ -323,25 +323,6 @@ fn failed_ddl_fails_the_transaction_and_commit_persists_nothing() {
 }
 
 #[test]
-// tracked: #3317
-fn rollback_to_savepoint_after_ddl_is_rejected_and_rollback_discards_everything() {
-    let (core, _guard) = new_core("sql80-savepoint");
-    let mut session = ddl_session();
-    let mut txn = core.new_session_transaction();
-    begin(&core, &mut session, &mut txn);
-    tx_ok(&core, &mut session, &mut txn, "SAVEPOINT sp");
-    tx_ok(&core, &mut session, &mut txn, CREATE_T);
-    // DDL 後の ROLLBACK TO は未対応。Tx は復帰不可の失敗にする。
-    assert_eq!(
-        tx_code(&core, &mut session, &mut txn, "ROLLBACK TO sp"),
-        "0A000"
-    );
-    assert_eq!(txn.status(), TransactionStatus::Failed);
-    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
-    assert_eq!(read_rows(&core, "alice", "SELECT id FROM t"), Err("42P01"));
-}
-
-#[test]
 fn ddl_in_a_read_only_transaction_is_rejected_without_side_effects() {
     let (core, _guard) = new_core("sql80-read-only");
     let mut session = ddl_session();

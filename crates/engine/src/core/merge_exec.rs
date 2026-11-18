@@ -371,7 +371,15 @@ impl EngineCore {
                     }
                     match choice {
                         Choice::None | Choice::DoNothing => {}
-                        Choice::Delete => chosen = Some(Planned::Delete),
+                        Choice::Delete => {
+                            // 採った対象行の計画（`(id, Planned)` の蓄積・`delete_plan`・`HashSet` の 3 か所）を
+                            // 確保前に共有バイト予算へ計上する（超過は `54000`。D7）。
+                            probe.charge_bytes(
+                                std::mem::size_of::<(u64, Planned)>()
+                                    .saturating_add(std::mem::size_of::<u64>().saturating_mul(3)),
+                            )?;
+                            chosen = Some(Planned::Delete);
+                        }
                         Choice::Update(clause) => {
                             let values = eval.eval_update(
                                 clause,
