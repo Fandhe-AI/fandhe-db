@@ -240,8 +240,6 @@ fn insert_select_bits(v: &crate::sql::allowlist::ValidatedInsertSelect) -> u16 {
     b
 }
 
-/// 検証済みの文を書き込みの要求に分類する。ワイルドカード腕を置かない網羅 `match` で、`ParsedSql` に
-/// variant が足されたときに分類の更新（書き込みか否か）をコンパイラが強制する。
 /// `MERGE` の対象表に課す権限ビット。WHEN 句に現れた操作の和（INSERT／UPDATE／DELETE。`DO NOTHING` は
 /// 足さない）に SELECT を加える。非 EXPLAIN の `MERGE` と `EXPLAIN [ANALYZE] MERGE` が同じ関数を使い、
 /// EXPLAIN を権限の抜け道にしない（SQL-40・Issue #3357）。
@@ -256,6 +254,8 @@ fn merge_bits(v: &crate::sql::allowlist::ValidatedMerge) -> u16 {
         })
 }
 
+/// 検証済みの文を書き込みの要求に分類する。ワイルドカード腕を置かない網羅 `match` で、`ParsedSql` に
+/// variant が足されたときに分類の更新（書き込みか否か）をコンパイラが強制する。
 pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
     use crate::sql::partitioned::PartitionedControl;
     let na = WriteRequirement::default;
