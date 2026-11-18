@@ -2159,9 +2159,9 @@ pub enum ParsedSql {
     /// マッチするクレート外コードは追随が必要。
     UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
     /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析を担い、
-    /// 実行は束縛（#3352。`sql::merge_bind`）を通してから `core::merge_exec` が行う（`WHEN MATCHED` だけの形は
-    /// #3353 で実行。NOT MATCHED は #3354、台帳・`OpTag`・`EXPLAIN` は #3357、`RETURNING` は #3356 が結線し、
-    /// それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
+    /// 実行は束縛（#3352。`sql::merge_bind`）を通してから `core::merge_exec` が行う（`WHEN MATCHED` は
+    /// #3353、`WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 で実行。台帳・`OpTag`・`EXPLAIN` は #3357、
+    /// `RETURNING` は #3356 が結線し、それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
     /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
     Merge(Box<crate::sql::allowlist::ValidatedMerge>),
     /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
@@ -2734,6 +2734,14 @@ fn insert_sequence_scope(
         }
         ParsedSql::ExplainJson(inner) => return insert_sequence_scope(storage, session, inner),
         ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
+        // SQL-79・Issue #3354: `WHEN NOT MATCHED ... THEN INSERT` を含む MERGE だけが、INSERT 句の採番・
+        // DEFAULT 時刻の文脈を要する（UPDATE・DELETE だけの MERGE は採番も DEFAULT 時刻も使わない）。
+        ParsedSql::Merge(v) => v.when_clauses.iter().any(|c| {
+            matches!(
+                c.action,
+                crate::sql::allowlist::MergeAction::Insert { .. }
+            )
+        }),
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
         ParsedSql::DataModifyingCte(v) => v
             .dm_ctes
@@ -2748,8 +2756,6 @@ fn insert_sequence_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
-        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
-        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -2831,6 +2837,14 @@ fn insert_default_clock_scope(
         | ParsedSql::InsertSelect(_)
         | ParsedSql::ViewInsert(_)
         | ParsedSql::ExplainInsert(_) => true,
+        // SQL-79・Issue #3354: `WHEN NOT MATCHED ... THEN INSERT` を含む MERGE だけが、INSERT 句の採番・
+        // DEFAULT 時刻の文脈を要する（UPDATE・DELETE だけの MERGE は採番も DEFAULT 時刻も使わない）。
+        ParsedSql::Merge(v) => v.when_clauses.iter().any(|c| {
+            matches!(
+                c.action,
+                crate::sql::allowlist::MergeAction::Insert { .. }
+            )
+        }),
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
         ParsedSql::DataModifyingCte(v) => v
             .dm_ctes
@@ -2843,8 +2857,6 @@ fn insert_default_clock_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
-        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
-        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -7845,7 +7857,7 @@ impl EngineCore {
         }
 
         // SQL-79・Issue #3351: `MERGE` は専用の構文解析器へ回す（既存の単一表 DML の解析器へ落とさない）。
-        // 解析を通った文の実行は固定文言の `0A000`（実行系の結線は #3353・#3354）。対象・元の存在確認は
+        // 解析を通った文の実行は固定文言の `0A000`（実行系は #3353・#3354 で結線済み。残る形は #3355〜#3357）。対象・元の存在確認は
         // 他の書き込みと同じく書き込み先ビュー・索引の写像（`reclassify_write_to_view_error`）を通す。
         if crate::sql::allowlist::looks_like_merge(&tokens) {
             let stmt = crate::sql::allowlist::validate_merge_tokens_with_limits(
@@ -20255,6 +20267,15 @@ impl EngineCore {
     /// 同一の判定（[`Self::validate_insert_batch_byte_and_chunk_limits`] への委譲）を
     /// 行う重複を解消する（codex-review Low 指摘・PR #873）。①（`max_files_per_batch`）
     /// は行の形には掛けない（Issue #3308）。
+    fn validate_merge_insert_groups_limits(
+        &self,
+        groups: &[Vec<crate::sql::parser::BoundInsert>],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let slices: Vec<&[crate::sql::parser::BoundInsert]> =
+            groups.iter().map(|g| g.as_slice()).collect();
+        self.validate_insert_batch_groups_limits(&slices)
+    }
+
     fn validate_insert_row_batch_limits(
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
@@ -20277,13 +20298,24 @@ impl EngineCore {
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        self.validate_insert_batch_groups_limits(&[bounds])
+    }
+
+    /// 複数の書き込みバッチ（MERGE の INSERT 句ごとの束縛結果）を 1 つの文として扱い、
+    /// 行別・バッチ合計バイト量とチャンク総量の上限を全グループの累計で検証する
+    /// （Issue #3354。句ごとに上限がリセットされて INDEX-4 を迂回するのを防ぐ）。
+    fn validate_insert_batch_groups_limits(
+        &self,
+        groups: &[&[crate::sql::parser::BoundInsert]],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let total_rows: usize = groups.iter().fold(0usize, |a, g| a.saturating_add(g.len()));
         let mut shapes: Vec<(usize, usize)> = Vec::new();
-        shapes.try_reserve_exact(bounds.len()).map_err(|_| {
+        shapes.try_reserve_exact(total_rows).map_err(|_| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "failed to reserve batch shape buffer".to_string(),
             }
         })?;
-        for bound in bounds {
+        for bound in groups.iter().flat_map(|g| g.iter()) {
             let mut row_bytes: usize = 0;
             for value in &bound.values {
                 let value_len = match value {
@@ -20388,9 +20420,9 @@ impl EngineCore {
         crate::batch_limits::validate_row_batch_shape(&shapes, &self.batch_limits).map_err(
             |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
         )?;
-        crate::batch_limits::validate_chunk_total(bounds.len(), &self.batch_limits).map_err(
-            |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
-        )?;
+        crate::batch_limits::validate_chunk_total(total_rows, &self.batch_limits).map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
+        })?;
         Ok(())
     }
 
