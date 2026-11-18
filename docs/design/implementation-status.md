@@ -2279,3 +2279,5 @@ Issue #3278（親 #3275・SQL-42 のポインタ）: `||` の非 text オペラ�
 **Issue #3332（test(engine): 生成列と台帳の内容照合・crash 耐性・越境の検証。TABLE-50 (5)・RECOVER-11・TABLE-24 (3)・TASK-345 ポインタ。詳細は [generated-column.md](generated-column.md) の「Issue #3332 で確定した事項」）**: 依存・unsafe・production コードの変更なし。台帳マトリクス・3 テナントの越境・wire の psql 形・crash（`crash_test_sequence.sh` の `generated` 段）の試験を追加した。PG17 実機との突き合わせは未実施。
 
 **Issue #3317（feat(engine): Tx 内 DDL と SAVEPOINT・ROLLBACK TO・接続断の整合。SQL-80・SQL-31・SQL-69・TABLE-22・TASK-349 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md)「#3317 の実装記録」）**: 依存・unsafe の追加なし。`WriteMarks` に DDL 状態の水位を持たせ、DDL を積んだ Tx の `SAVEPOINT`・`ROLLBACK TO` を行と同じ差分方式で巻き戻せるようにした（`evict_sequences` も水位で戻す）。失敗した DDL は前の savepoint への `ROLLBACK TO` で復帰できる。PL/pgSQL の内部 savepoint・差分を取れない savepoint は `0A000` のまま。接続断・`25P02` からの `ROLLBACK` はテストで固定。テストは `sql80_txn_ddl_savepoint.rs`（engine）と wire の `sql80_txn_table_ddl.rs`。未検証: `make ci` 全体・`make change-log-oracle`。
+
+**Issue #3318（test(scripts): Tx 内 DDL の crash テスト。SQL-80・SQL-31・SQL-23・TABLE-22・TASK-349 ポインタ。詳細は [explicit-transaction.md](explicit-transaction.md)「DDL を含む明示トランザクションの crash テスト」）**: 依存・unsafe・production コードの追加なし。
