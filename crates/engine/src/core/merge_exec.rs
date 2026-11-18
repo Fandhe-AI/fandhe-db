@@ -350,8 +350,10 @@ impl EngineCore {
         // 2 つ目になった時点で `21000`（DO NOTHING と、どの句も真にならなかった組は数えない。D5）。
         // 時刻は文の先頭で 1 度だけ確定し、SET・VALUES の `now()` と省略列の `DEFAULT now()` で共有する
         // （`INSERT ... SELECT` と同じ。SQL-37）。外側の式スコープが確定済みならそれを使う。
+        // 文レベルの default clock（明示 Tx では実トランザクション開始時刻を持つ）があれば継承し、
+        // 無いときに限り新規に確定する（開始時刻を現在時刻で捏造して Tx 内の他の INSERT と食い違わせない）。
         let outer_clock = crate::sql::time_fn::current_clock();
-        let clock = match outer_clock {
+        let clock = match outer_clock.or_else(crate::sql::time_fn::current_default_clock) {
             Some(c) => c,
             None => {
                 let now = crate::sql::time_fn::now_micros()?;
@@ -567,7 +569,34 @@ impl EngineCore {
                     SqlSurfaceError::payload_too_large("MERGE INSERT rows exceed the limit")
                 })?;
                 let id_omitted = bound_id_omitted(&bound, &clause);
+                // 省略列の DEFAULT 値は行ごとに複製されるため、列ごとの 1 値のサイズを 1 度だけ束縛して測り、
+                // 確保前（`finish_bound_insert` の前）に行数分を共有バイト予算へ計上する（超過は `54000`）。
+                let mut default_bytes: Vec<usize> = Vec::new();
+                for column in &target_schema.columns {
+                    let n = match &column.default_expr {
+                        Some(
+                            d @ (crate::catalog::ColumnDefault::Text(_)
+                            | crate::catalog::ColumnDefault::Number(_)
+                            | crate::catalog::ColumnDefault::Bool(_)),
+                        ) if column.generated.is_none() => {
+                            crate::sql::parser::bind_column_default(column, d)
+                                .map(|v| crate::sql::join::dml::value_bytes(&v))
+                                .unwrap_or(0)
+                        }
+                        _ => 0,
+                    };
+                    default_bytes.push(n);
+                }
                 for (id, values, provided) in rows {
+                    let mut row_default: usize = 0;
+                    for (i, n) in default_bytes.iter().enumerate() {
+                        if !provided.get(i).copied().unwrap_or(false) {
+                            row_default = row_default.saturating_add(*n);
+                        }
+                    }
+                    if row_default > 0 {
+                        probe.charge_bytes(row_default)?;
+                    }
                     bounds.push(crate::sql::insert_select::finish_bound_insert(
                         target_table,
                         target_schema,
