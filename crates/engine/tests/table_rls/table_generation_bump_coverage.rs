@@ -266,7 +266,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1651（式索引の UNIQUE・列変更への追随。`catalog.rs` に行が追加）で一括追随（旧: 10597／12994／13075／13184／13257／13779）。
     // Issue #1651（式索引の UNIQUE・失効管理。`catalog.rs` に行が追加）で一括追随（旧: 13274／13355／13464／13537／14080／10874）。
     // Issue #2206（GIN 相当索引の宣言。`catalog.rs` に行が追加）で catalog.rs 全エントリを追随。
-    ("catalog.rs", 16858),
+    ("catalog.rs", 16909),
     // `Storage::drop_enum_type`（同上）: 削除前に依存列（当該型を参照する
     // `ColumnType::Enum` 列）が 1 つも無いことを `dependent_tables_in_txn`
     // で検証済みのため、こちらも `CATALOG_TABLE`／`user_rows/{table_name}`
@@ -333,7 +333,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+101 行。旧: 11250）。
-    ("catalog.rs", 16941),
+    ("catalog.rs", 16992),
     // `Storage::create_view`（TABLE-18・SQL-23・TASK-205、Issue #909）: ビューは
     // `[VIEWS_TABLE]` のみを書き、`CATALOG_TABLE`／`user_rows/{table_name}` の
     // いずれにも触れない（行を持たない非マテリアライズド定義のため対象
@@ -393,7 +393,7 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1639（DROP TABLE の複数指定。`catalog.rs` に行が追加）で追随（+118 行）。
     // Issue #1624（RENAME TO の索引・FK・制約追随。`catalog.rs` に行が追加）で一括追随（+79 行。旧: 11412/11493/11632/11665）。
     // Issue #1659（CREATE VIEW の列別名。`catalog.rs` に行が追加）で追随（+131 行。旧: 11389）。
-    ("catalog.rs", 17016),
+    ("catalog.rs", 17067),
     // `Storage::drop_view`（同上）: 削除前に依存するビューが 1 つも無いことを
     // `views_depending_on_in_txn` で検証済みのうえで `[VIEWS_TABLE]` のみを
     // 書く。同じ理由でバンプ対象がない。PR #1048 レビュー対応（同上）で
@@ -462,11 +462,11 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1644（TRUNCATE CASCADE／RESTRICT）で catalog.rs 全エントリ +1・tenant.rs 506→516 に追随。
     // Issue #1663（MATERIALIZED VIEW のカタログ追加）の base 取り込みで追随（旧: 13013）。
     // Issue #1671（ビュー INSERT 書き換えで `catalog.rs` に行が追加）で全エントリを追随。
-    ("catalog.rs", 17192),
+    ("catalog.rs", 17243),
     // `Storage::create_or_replace_view_checked`（TABLE-41 (2)、Issue #1660。`create_or_replace_view` の本体）: `create_view` と同じく
     // `[VIEWS_TABLE]` のみを書く（上書き）。ビューは行ストア・世代を持たないためバンプ対象がない。
     // Issue #1737（`is_unique_index_of_table` の追加。`catalog.rs` に +22 行）で追随（旧: 15666）。
-    ("catalog.rs", 17916),
+    ("catalog.rs", 18026),
     // `Storage::drop_tables`（Issue #1684 で本体を `drop_tables_in_txn` へ切り出した）: 世代 bump は
     // 同一 write txn で先に呼ばれる `drop_tables_in_txn` 内（削除する各表と FK を外した参照元表）で
     // 行われ、本呼び出しはその結果（`dropped > 0`）を単一 commit で確定させるだけ。`bump` が
@@ -487,12 +487,12 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // LATERAL の EXPLAIN・`$n`・ビュー内 LATERAL（Issue #3324）で catalog.rs の前方に +18 行、catalog.rs 全エントリを +18 追随。
     // Issue #3331（生成列の依存検査: DROP CASCADE・DROP EXPRESSION の追加。catalog.rs の前方に行を追加）で
     // catalog.rs の全エントリを行番号の差分だけ追随。
-    ("catalog.rs", 13844),
+    ("catalog.rs", 13862),
     // `Storage::alter_table_rename`／`Storage::alter_table_set_schema`（Issue #3198）: 世代 bump は同一 write txn で
     // 先に呼ばれる共有実装 `rename_table_key_in_txn`（旧名・新名・FK 参照元表の世代を進める）が行い、
     // 本呼び出しはその結果を単一 commit で確定させるだけ（`alter_table_rename` は #3198 で本体を切り出した）。
-    ("catalog.rs", 14942),
-    ("catalog.rs", 15137),
+    ("catalog.rs", 14993),
+    ("catalog.rs", 15188),
     // 上記 `drop_tables_in_txn` 切り出し（+18 行）に伴い、以降の catalog.rs エントリ（12419／12500／12609／12681／13063）を追随（旧: 12401／12482／12591／12663／13045）。
     // `sql::transaction::SessionTransaction::commit`（SQL-31・TASK-221）:
     // ここで commit する共有 `write_txn` に対象テーブルの `user_rows/{table}`
@@ -530,7 +530,10 @@ const ALLOWLIST: &[(&str, u32)] = &[
     // Issue #1947（失敗状態からの ROLLBACK TO 復帰）の行追加でさらに移動（旧: 2060）。書き込み内容・commit の意味は不変。
     // Issue #2231（`SKIP LOCKED` の取得入口 `try_ensure_writer`・`try_begin_implicit` と取得方針 `WriterAcquire` の追加）の行追加でさらに移動（旧: 2230）。書き込み内容・commit の意味は不変。
     // Issue #3171（末尾 `;` 付き Tx 制御文の受理）の行追加でさらに移動（旧: 2600）。書き込み内容・commit の意味は不変。
-    ("sql/transaction.rs", 2604),
+    // Issue #3313（SQL-80。表・索引の DDL を積んだ Tx の状態 `TxnDdlState` と commit 後の採番器の後始末の追加）の行追加でさらに移動（旧: 2604）。書き込み内容・commit の意味は不変
+    // （DDL の世代 bump は共有 txn への書き込みの直後に各 `*_in_shared_txn` が行い、本 commit は Tx の確定口）。
+    // base（main）取り込みマージの行追加でさらに移動（旧: 2693）。書き込み内容・commit の意味は不変。
+    ("sql/transaction.rs", 2719),
     // TABLE-44・Issue #1684: 一時表ストア（セッション専用のインメモリ DB。永続 DB とは別インスタンス）の
     // 書き込みトランザクションの確定口（`TempRowStore::commit`）。確定するのは、一時コアの書き込み本体
     // （`tenant::*`・`catalog::*`。いずれも自分の DB の表世代を `bump_table_generation_in_txn` で進める）が

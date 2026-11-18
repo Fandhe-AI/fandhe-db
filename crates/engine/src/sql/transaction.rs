@@ -569,6 +569,26 @@ impl SeenOperationIds {
     }
 }
 
+/// 明示・暗黙 Tx の共有 write txn へ表・索引の DDL を積んだ印と、commit 成功後にだけ行う副作用
+/// （SQL-80・Issue #3313。設計記録は `docs/design/explicit-transaction.md`）。
+///
+/// DDL 本体は autocommit と同じ `_in_txn` 本体へ共有 write txn を渡して実行する（カタログの書き込みは
+/// redb の txn に載るため ROLLBACK で行・索引と一緒に消える）。一方で、メモリ上の状態（採番器の現在値）は
+/// commit 成功後にだけ変える（書き込み中に共有のインメモリ状態を変えない。#1179 と同じ監査観点）。
+/// `ActiveTxn` と一緒に捨てるため、ROLLBACK・失敗・期限切れ・drop では何も実行されない。
+#[derive(Default)]
+struct TxnDdlState {
+    /// DDL を 1 度でも積み始めたか。途中で失敗しても立てたままにし、部分的な DDL を持つ Tx を
+    /// `ROLLBACK TO` で復帰させない・読み取り源を常に writer にする判定に使う。
+    started: bool,
+    /// 表・索引を DROP した（名前が消えた）か。確定済みカタログで行う後続文の解析・ビュー展開が古い名前を
+    /// 見るため、この間は DDL 以外の文を `0A000` にする（暫定。受け皿は #3314）。
+    removed: bool,
+    /// commit 成功後にメモリ上の現在値を捨てる SEQUENCE の内部 ID（DROP TABLE・DROP COLUMN が道連れに
+    /// 削除した所有 SEQUENCE。内部 ID は再利用しないため、commit の後に捨てても害はない）。
+    evict_sequences: Vec<u64>,
+}
+
 /// トランザクション中の状態。`BEGIN` 時点の読み取りスナップショット（`read_snapshot`）と、
 /// 取得済み／未取得を表せる共有書き込みトランザクション（`writer`）、およびその付随状態を持つ
 /// （SQL-31・PERSIST-4・TASK-333、Issue #2399。設計記録は `docs/design/explicit-transaction.md`）。
@@ -633,6 +653,9 @@ struct ActiveTxn<'e> {
     /// ではなく [`commit_active`] が永続側の commit 成功の直後にこの集合へ対して bump する
     /// （失敗・abort では bump せず、他セッションから途中の状態を見せない）。
     function_scopes: std::collections::BTreeSet<String>,
+    /// 表・索引の DDL をこの Tx の共有 write txn へ積んだ状態（SQL-80・Issue #3313。設計記録は
+    /// `docs/design/explicit-transaction.md`「明示トランザクション内の DDL の方式」）。
+    ddl: TxnDdlState,
     session_at_begin: SessionState,
     /// `DECLARE`/`FETCH`/`CLOSE`（WIRE-15・TASK-218）が開いたカーソルの集合。
     /// `ActiveTxn` に埋め込まれているため、トランザクションの終了（`commit`／
@@ -672,6 +695,13 @@ impl TempTxn {
         drop(base);
         store.commit(txn)
     }
+}
+
+/// [`SessionTransaction::mark_ddl_started`] 直前の状態（no-op の DDL で巻き戻す用）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DdlMarkSnapshot {
+    has_writes: bool,
+    started: bool,
 }
 
 enum TxnState<'e> {
@@ -1010,6 +1040,7 @@ impl<'e> SessionTransaction<'e> {
                     started_at,
                     has_writes,
                     function_scopes,
+                    ddl,
                     session_at_begin,
                     written_by_tenant,
                     written_tables,
@@ -1029,6 +1060,7 @@ impl<'e> SessionTransaction<'e> {
                     &written_by_tenant,
                     &written_tables,
                     &function_scopes,
+                    &ddl,
                     session_at_begin,
                     session,
                 )
@@ -1176,6 +1208,7 @@ impl<'e> SessionTransaction<'e> {
                     written_by_tenant: std::collections::BTreeSet::new(),
                     has_writes: false,
                     function_scopes: std::collections::BTreeSet::new(),
+                    ddl: TxnDdlState::default(),
                     session_at_begin: session.clone(),
                     cursors: crate::sql::cursor::CursorRegistry::new(),
                     savepoints: crate::sql::savepoint::SavepointStack::new(),
@@ -1228,6 +1261,7 @@ impl<'e> SessionTransaction<'e> {
                     started_at,
                     has_writes,
                     function_scopes,
+                    ddl,
                     session_at_begin,
                     written_by_tenant,
                     written_tables,
@@ -1256,6 +1290,7 @@ impl<'e> SessionTransaction<'e> {
                     &written_by_tenant,
                     &written_tables,
                     &function_scopes,
+                    &ddl,
                     session_at_begin,
                     session,
                 )
@@ -1391,6 +1426,11 @@ impl<'e> SessionTransaction<'e> {
         use crate::storage::table_image::{
             capture, Capture, Meter, MAX_IMAGE_BYTES_PER_SAVEPOINT, MAX_IMAGE_BYTES_PER_TXN,
         };
+        // DDL を積んだ後は行の差分だけではカタログ・世代・メモリ上の状態を戻せないため、捕捉せず
+        // 巻き戻し不能として登録する（`ROLLBACK TO` は `0A000`。SQL-80・Issue #3313。受け皿は #3317）。
+        if active.ddl.started {
+            return Ok(SavepointPlan::Unrestorable);
+        }
         let limit = MAX_IMAGE_BYTES_PER_SAVEPOINT
             .min(MAX_IMAGE_BYTES_PER_TXN.saturating_sub(active.savepoints.image_bytes_total()));
         let mut meter = Meter::new(limit, active.started_at.checked_add(max_duration));
@@ -1620,6 +1660,14 @@ impl<'e> SessionTransaction<'e> {
         session: &mut SessionState,
     ) -> Result<(), SqlSurfaceError> {
         use crate::sql::savepoint::SavepointKind;
+        // DDL を積んだ Tx は、redb の savepoint を復元しても採番器・キャッシュ・世代などのメモリ上の状態が
+        // 戻らないため巻き戻さない。名前付き・PL/pgSQL 内部の savepoint の両方がここを通る（SQL-80・
+        // Issue #3313。受け皿は #3317）。呼び出し元が Tx を復帰不可の `Failed` にする。
+        if active.ddl.started {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "ROLLBACK TO SAVEPOINT is not supported after DDL in the transaction",
+            ));
+        }
         match active.savepoints.kind_at(pos) {
             Some(SavepointKind::Restorable | SavepointKind::Imaged) => {}
             Some(SavepointKind::Unrestorable) => {
@@ -1958,6 +2006,56 @@ impl<'e> SessionTransaction<'e> {
         }
     }
 
+    /// 表・索引の DDL を共有 write txn へ積み始めることを記録する（SQL-80・Issue #3313）。writer を取った後、
+    /// DDL 本体を実行する**前**に呼ぶ（本体が途中で失敗しても印を残し、部分的な DDL を持つ Tx を復帰させない）。
+    /// `has_writes` も立てる（立てないと COMMIT が書き込み txn を破棄してカタログの書き込みが落ちる）。
+    ///
+    /// 戻り値は印を立てる前の状態（[`Self::restore_ddl_started`] へ渡す）。本体が「何も変えない成功」
+    /// （`IF EXISTS` / `IF NOT EXISTS` の no-op）だったときに印を巻き戻すために使う。
+    pub(crate) fn mark_ddl_started(&mut self) -> DdlMarkSnapshot {
+        if let TxnState::Active(active) = &mut self.state {
+            let snap = DdlMarkSnapshot {
+                has_writes: active.has_writes,
+                started: active.ddl.started,
+            };
+            active.has_writes = true;
+            active.ddl.started = true;
+            snap
+        } else {
+            DdlMarkSnapshot::default()
+        }
+    }
+
+    /// [`Self::mark_ddl_started`] の印を巻き戻す。DDL 本体がカタログを変えずに成功した場合だけ呼ぶ
+    /// （no-op の DDL で後続文の拒否・savepoint の復元不能を起こさない。失敗時は巻き戻さない）。
+    pub(crate) fn restore_ddl_started(&mut self, snap: DdlMarkSnapshot) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.has_writes = snap.has_writes;
+            active.ddl.started = snap.started;
+        }
+    }
+
+    /// DDL 本体の成功を記録する（[`Self::mark_ddl_started`] の後に呼ぶ）。`removed` は表・索引を DROP した
+    /// こと、`evict_sequences` は commit 成功後に採番器から捨てる SEQUENCE の内部 ID
+    /// （[`TxnDdlState::evict_sequences`]）。
+    pub(crate) fn mark_ddl_done(&mut self, removed: bool, evict_sequences: Vec<u64>) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.ddl.removed |= removed;
+            active.ddl.evict_sequences.extend(evict_sequences);
+        }
+    }
+
+    /// この Tx が表・索引の DDL を積み始めているか（SQL-80・Issue #3313）。`core.rs` の DDL 後の許可リストの
+    /// ゲートと INSERT のスキーマの読み取り源の切り替えが使う。`Active` 以外では `false`。
+    pub(crate) fn has_ddl(&self) -> bool {
+        matches!(&self.state, TxnState::Active(a) if a.ddl.started)
+    }
+
+    /// この Tx が表・索引を DROP 済みか（[`TxnDdlState::removed`]）。`Active` 以外では `false`。
+    pub(crate) fn ddl_removed(&self) -> bool {
+        matches!(&self.state, TxnState::Active(a) if a.ddl.removed)
+    }
+
     /// 対象テーブルへの書き込みを記録する（読み取りの `written_tables` 判定用に
     /// 加え、`tenant_id` を伴う `written_by_tenant` へも記録する。TABLE-17・
     /// TASK-205、Issue #1077。COMMIT 時の遅延 `FOREIGN KEY` 検査の走査範囲は
@@ -2224,7 +2322,9 @@ impl<'e> SessionTransaction<'e> {
             None if active.has_writes => Err(internal_error()),
             None => Ok(TxnReadSource::BeginSnapshot(&active.read_snapshot)),
             Some(w) => {
-                if self.dirty_tables()?.is_empty() {
+                // DDL を積んだ Tx は、確定済みカタログと内容が食い違いうるため常に writer から読む
+                // （SQL-80・Issue #3313。表世代を進めない経路があっても取りこぼさない）。
+                if !active.ddl.started && self.dirty_tables()?.is_empty() {
                     Ok(TxnReadSource::Committed)
                 } else {
                     Ok(TxnReadSource::Writer(w))
@@ -2369,6 +2469,7 @@ impl<'e> SessionTransaction<'e> {
     /// 従来どおり即時に writer を解放する。
     fn is_recoverable(active: &ActiveTxn<'_>) -> bool {
         active.origin == TxnOrigin::Explicit
+            && !active.ddl.started
             && active.savepoints.has_rollbackable()
             && (active.writer.is_none() || active.savepoint_base.is_some())
             && active.temp.as_ref().is_none_or(|t| t.base.is_some())
@@ -2556,6 +2657,7 @@ fn commit_active(
     written_by_tenant: &std::collections::BTreeSet<(String, String)>,
     written_tables: &HashSet<String>,
     function_scopes: &std::collections::BTreeSet<String>,
+    ddl: &TxnDdlState,
     session_at_begin: SessionState,
     session: &mut SessionState,
 ) -> Result<(), SqlSurfaceError> {
@@ -2587,6 +2689,19 @@ fn commit_active(
             .iter()
             .flat_map(|tenant| dirty.iter().map(move |table| (*tenant, table)));
         for (tenant_id, table) in pairs {
+            // 同じ Tx で DROP した表は検査の対象にならない（スキーマが無く `TableNotFound` で commit が
+            // 落ちるのを防ぐ。SQL-80・Issue #3313）。DDL を積んでいない Tx の挙動は従来どおり。
+            if ddl.started {
+                match crate::catalog::get_table_schema_in_txn_impl(write_txn, table, false) {
+                    Ok(_) => {}
+                    Err(crate::catalog::CatalogError::TableNotFound(_)) => continue,
+                    Err(_) => {
+                        drop(writer);
+                        *session = session_at_begin;
+                        return Err(internal_error());
+                    }
+                }
+            }
             if let Err(e) =
                 crate::constraint::enforce_deferred_foreign_keys_in_txn(write_txn, tenant_id, table)
             {
@@ -2625,6 +2740,12 @@ fn commit_active(
     // 確定済みの定義を読み直す。ここへ来るのは commit 成功時だけで、失敗・ROLLBACK では bump しない）。
     for scope in function_scopes {
         storage.bump_function_generation(scope);
+    }
+    // DROP TABLE・DROP COLUMN が道連れに削除した所有 SEQUENCE のメモリ上の現在値を、commit 成功後にだけ
+    // 捨てる（SQL-80・Issue #3313。失敗・ROLLBACK では何も変えない。内部 ID は再利用しないため、
+    // permit の解放後に捨てても同じ ID の別の SEQUENCE の状態を壊さない）。
+    for id in &ddl.evict_sequences {
+        storage.sequence_allocator().evict(*id);
     }
     // COMMIT 成功: `SET LOCAL hnsw.*` を LOCAL 直前の値へ戻す。
     session.leave_txn_block_on_commit();

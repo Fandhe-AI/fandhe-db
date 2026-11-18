@@ -333,16 +333,15 @@ fn existence_permission_and_transaction_gates() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&owner, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(
-            &owner,
-            &mut session,
-            &mut txn,
-            "ALTER TABLE docs ALTER COLUMN a SET DEFAULT 'x'",
-        )
-        .expect_err("explicit transaction must reject DDL");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
+    // SQL-80・Issue #3313: 明示トランザクション内でも受理され、ROLLBACK で取り消せる。
+    core.execute_sql_in_txn(
+        &owner,
+        &mut session,
+        &mut txn,
+        "ALTER TABLE docs ALTER COLUMN a SET DEFAULT 'x'",
+    )
+    .expect("DDL is accepted inside an explicit transaction");
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
     core.execute_sql_in_txn(&owner, &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
     insert(&core, &mut session, 1, "", "");

@@ -205,16 +205,18 @@ fn upsert_returning_in_implicit_transaction_is_accepted_and_committed() {
     assert_eq!(visible_ids(&mut alice), vec!["1", "2", "3", "61", "62"]);
 }
 
-/// 暗黙トランザクション内で対応できない文（`DROP TABLE`。`UPDATE ... RETURNING` は
-/// Issue #1272 で対応済み）は `0A000`。先行する書き込みは残らず、接続は `'I'`。
+/// 暗黙トランザクション内で対応できない文（`CREATE SEQUENCE`。表・索引の DDL は SQL-80・Issue #3313 で
+/// 対応済み。`UPDATE ... RETURNING` は Issue #1272 で対応済み）は `0A000`。先行する書き込みは残らず、
+/// 接続は `'I'`。
 #[test]
+// tracked: #3315
 fn unsupported_statement_in_implicit_transaction_rolls_back_with_0a000() {
     let (core, _guard) = new_core_three_tenant_docs();
     let (mut alice, _bob) = spawn_both(core);
 
     send_simple_query(
         &mut alice,
-        &format!("{}; DROP TABLE docs", insert_sql(61, "imp-1")),
+        &format!("{}; CREATE SEQUENCE s_pinned", insert_sql(61, "imp-1")),
     );
     assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
     expect_error_response_with_sqlstate(&mut alice, "0A000");

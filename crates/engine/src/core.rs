@@ -75,6 +75,8 @@ mod ctas_exec;
 mod matview_exec;
 mod row_lock_exec;
 mod schema_elements;
+// 明示・暗黙トランザクション内の表・索引の DDL（SQL-80・Issue #3313）。
+mod txn_ddl;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
@@ -3394,6 +3396,14 @@ impl<'a> InsertSchemaLookup<'a> {
     /// `table_exists` が最後に取得したスキーマを、要求されたテーブル名と
     /// 一致する場合にのみ返す（消費型。1 回取り出したら空になる）。
     fn take_schema(&self, table_name: &str) -> Option<TableSchema> {
+        // DDL を積んだ明示・暗黙 Tx は、変更した表のスキーマを write txn 上のもので重ねて見る
+        // （確定済みカタログは同じ Tx で作った表・変更した列を知らない。SQL-80・Issue #3313）。
+        if let Some(Some(schema)) =
+            crate::sql::txn_overlay::overlay_schema(self.storage, table_name)
+        {
+            *self.cached.borrow_mut() = None;
+            return Some(schema);
+        }
         let mut cached = self.cached.borrow_mut();
         match cached.take() {
             Some((name, schema)) if name == table_name => Some(schema),
@@ -3410,7 +3420,9 @@ impl<'a> InsertSchemaLookup<'a> {
 
 impl crate::sql::allowlist::TableLookup for InsertSchemaLookup<'_> {
     fn table_exists(&self, name: &str) -> Result<bool, crate::sql::allowlist::SqlSurfaceError> {
-        match self.storage.get_table_schema(name) {
+        // DDL を積んだ Tx では、同じ Tx で作った表・変更した表を write txn 上のスキーマで見る（重ね見。
+        // SQL-80・Issue #3313）。それ以外は確定済みカタログ。
+        match crate::sql::txn_overlay::table_schema_overlaid(self.storage, name) {
             Ok(schema) => {
                 *self.cached.borrow_mut() = Some((name.to_string(), schema));
                 Ok(true)
@@ -7277,6 +7289,13 @@ impl EngineCore {
                 return Err(e);
             }
         }
+        // SQL-80・Issue #3313（V7。受け皿は #3314）: DDL を積んだ Tx では、拡張クエリで Parse 済みの文
+        // （確定済みカタログで束縛・検証した文）をそのまま実行しない。DDL・Tx 制御・`SET`/`SHOW` 以外は
+        // `0A000` で Tx を失敗にする（簡易クエリは文ごとに write txn 上のスキーマで解析し直す）。
+        if let Err(e) = txn_ddl::check_extended_execute_after_ddl(txn, parsed) {
+            txn.fail();
+            return Err(e);
+        }
         self.execute_parsed_in_txn_inner(ctx, session, txn, parsed)
     }
 
@@ -11105,6 +11124,16 @@ impl EngineCore {
         {
             return Err(txn.take_failed_error());
         }
+        // SQL-80・Issue #3313: DDL を積んだ Tx では、確定済みカタログを読む解析（INSERT の存在確認）が
+        // 同じ Tx で作った表を見落とさないよう、write txn 上のスキーマを文の区間だけ重ねて見る。
+        let _overlay_scope =
+            match crate::sql::txn_overlay::TxnCatalogOverlayScope::enter(&self.storage, txn) {
+                Ok(scope) => scope,
+                Err(e) => {
+                    txn.fail();
+                    return Err(e);
+                }
+            };
         // 構文・許可リスト検証のエラーも、明示トランザクション中なら種類を問わず
         // `Failed` へ遷移させる（PostgreSQL と同じ。`Active` のまま残すと後続の
         // `COMMIT` が先行する書き込みを永続化してしまう。PR #1041 レビュー指摘）。
@@ -11364,6 +11393,9 @@ impl EngineCore {
         {
             return Err(SqlSurfaceError::ReadOnlySqlTransaction);
         }
+        // SQL-80・Issue #3313: 表・索引の DDL を積んだ Tx は、結線を済ませた種類の文だけを実行する
+        // （暫定の許可リスト。受け皿は #3314）。writer・台帳・採番・カタログへ触れる前に拒否する。
+        txn_ddl::check_post_ddl_statement(session, txn, parsed)?;
 
         // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
         // （`Active` なのに開始時刻が無い場合は fail-closed の `Internal`）。
@@ -11979,6 +12011,13 @@ impl EngineCore {
             ParsedSql::LockingSelect(locking) => {
                 self.execute_locking_select_in_active_txn(ctx, session, txn, locking)
             }
+            // SQL-80・Issue #3313: 表・索引の DDL は共有 write txn へ積み、COMMIT で原子的に確定する
+            // （`core/txn_ddl.rs`。権限・作成先・未対応の形の拒否は autocommit の腕と同じ順）。
+            ParsedSql::CreateTable(_)
+            | ParsedSql::DropTable(_)
+            | ParsedSql::AlterTable(_)
+            | ParsedSql::CreateIndex(_)
+            | ParsedSql::DropIndex(_) => self.execute_table_ddl_in_txn(ctx, session, txn, parsed),
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),
@@ -18907,6 +18946,14 @@ impl EngineCore {
             TransactionStatus::Idle => self.begin_copy_unscrubbed(ctx, session, sql, pin),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
+                // SQL-80・Issue #3313（受け皿は #3314）: DDL を積んだ Tx の `COPY` は、確定済みカタログと
+                // write txn の食い違いを避けるため結線までは `0A000`（Tx は失敗状態）。
+                if txn.has_ddl() {
+                    txn.fail();
+                    return Err(crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                        "this statement is not supported after DDL inside a transaction block yet",
+                    ));
+                }
                 let result = self.begin_copy_active(ctx, session, txn, sql, pin);
                 if let Err(e) = &result {
                     txn.fail_for(e);
@@ -21252,6 +21299,16 @@ impl EngineCore {
         else {
             return Ok(());
         };
+        // SQL-80・Issue #3313: 重ね見の区間（DDL を積んだ Tx）では、確定済みの索引カタログに同じ Tx で作った
+        // 一意索引が無いため `CREATE UNIQUE INDEX` 由来かを判定できない。誤って制約として受理（fail-open）
+        // しないよう、write txn の索引カタログを引く結線（#3314）まで `0A000` で拒否する。
+        if crate::sql::txn_overlay::overlay_active(&self.storage) {
+            return Err(
+                crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                    "ON CONFLICT ON CONSTRAINT is not supported after DDL inside a transaction block yet",
+                ),
+            );
+        }
         match self.storage.is_unique_index_of_table(table_name, name) {
             Ok(false) => Ok(()),
             Ok(true) => {
@@ -21347,6 +21404,15 @@ impl EngineCore {
                 )
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
+                // SQL-80・Issue #3313: ファイル形のチャンク化は確定済みカタログからスキーマを引くため、
+                // 同じ Tx で作った表・追加した列を解決できない。結線（#3314）まで `0A000` で拒否する。
+                if crate::sql::txn_overlay::overlay_active(&self.storage) {
+                    return Err(
+                        crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
+                            "file-form INSERT is not supported after DDL inside a transaction block yet",
+                        ),
+                    );
+                }
                 // 明示トランザクション内でも受理する（Issue #1353）。埋め込み I/O は BEGIN
                 // 時点で保持済みの単一ライタの下・セッションの `max_duration` の範囲で行う。
                 crate::sql::exec::execute_file_insert(

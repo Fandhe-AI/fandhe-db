@@ -137,8 +137,11 @@ commit は高々 1 回という既存の不変条件を維持するため）。
   （Issue #1179 で拡大済み）。`INSERT`（単一行・複数行・UPSERT）・`UPDATE`・`DELETE`・
   `TRUNCATE` と、全 DML の `RETURNING`（`UPDATE`・`DELETE` は Issue #1272、UPSERT は
   Issue #1273）を受理する。ファイル形 `INSERT` も Issue #1353 で受理に変わった（文の実行ディスパッチは
-  起源を区別しない。`explicit-transaction.md`）。（#3312: 明示 Tx の DDL の受理に合わせ、暗黙 Tx でも同じ規則で積む。実装は #3313〜#3316、それまでは現行の `0A000`。`explicit-transaction.md` D5）DDL は `0A000` で暗黙トランザクション
-  全体をロールバックする（fail-closed。許可リストが広がれば自動的に広がる）。
+  起源を区別しない。`explicit-transaction.md`）。表・索引の DDL（`CREATE TABLE`・`DROP TABLE`・`ALTER TABLE` の一部・`CREATE INDEX`・`DROP INDEX`）は Issue #3313 で
+  受理に変わった（明示 Tx と同じ入口を通る。`explicit-transaction.md`「#3313 の実装記録」）。後続の文が失敗すれば表・索引ごと
+  メッセージ全体をロールバックする。他種別の DDL（VIEW・SEQUENCE・SCHEMA・型・関数以外のカタログ）と、表・索引の DDL の
+  未対応の形は `0A000` で暗黙トランザクション全体をロールバックする（fail-closed。許可リストが広がれば自動的に広がる。
+  受け皿は #3315・#3316）。
 - **書き込み済みテーブルの読み取り**: Issue #1179 で解消済み（未 commit 変更を反映して
   読む。キャッシュ・HNSW は使わず brute-force。`explicit-transaction.md` §6）。
   例: `INSERT INTO t ...; SELECT ... FROM t` は書き込み結果を読める。
@@ -218,7 +221,7 @@ SQL-31（`BEGIN`/`COMMIT`/`ROLLBACK`）・RECOVER-12（複数文単位の
   対象外であり、HTTP への射影変更もない。
 - 3 クライアント e2e（`three_client_e2e.rs` 等）への追加は opt-in の任意
   追加に留め、本 Issue では必須にしない。
-- 暗黙トランザクション内での DDL（#3312: 明示 Tx の DDL の受理に合わせ、暗黙 Tx でも同じ規則で積む。実装は #3313〜#3316、それまでは現行の `0A000`。`explicit-transaction.md` D5）（`CREATE [OR REPLACE] FUNCTION` は Issue #2882 で対応済み。`udf-catalog.md`。COPY は Issue #1773 で対応済み。ファイル形 `INSERT` と書き込み済みテーブルの読み取りは
+- 暗黙トランザクション内での表・索引以外の DDL（表・索引は #3313 で対応済み。他種別は #3315・#3316 が積む。`explicit-transaction.md` D5。それまでは現行の `0A000`）（`CREATE [OR REPLACE] FUNCTION` は Issue #2882 で対応済み。`udf-catalog.md`。COPY は Issue #1773 で対応済み。ファイル形 `INSERT` と書き込み済みテーブルの読み取りは
   #1179・#1353 の成果を自動的に引き継いで受理済み）。`BEGIN` より前の書き込みを明示ブロックへ昇格させる PostgreSQL の
   意味論（`INSERT; BEGIN; ...`）、lexer でのコメント・二重引用符識別子・ドル引用・
   E 文字列の受理、拡張クエリプロトコルでの暗黙トランザクション（Sync 単位）も対象外。
