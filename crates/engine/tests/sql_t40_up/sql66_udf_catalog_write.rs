@@ -180,10 +180,10 @@ fn session_without_ddl_permission_is_rejected_and_does_not_touch_the_catalog() {
     );
 }
 
-/// DDL 権限ありの明示トランザクション内の CREATE／DROP FUNCTION は 0A000（取り消せない永続書き込みを
-/// しない）。カタログは変わらない。
+/// DDL 権限ありの明示トランザクション内の CREATE／DROP FUNCTION は共有 write txn へ積まれ（SQL-80・
+/// Issue #3316）、ROLLBACK ではカタログに何も残らない。
 #[test]
-fn ddl_inside_explicit_transaction_is_rejected() {
+fn ddl_inside_explicit_transaction_is_rolled_back() {
     let path = unique_db_path("sql66-write-txn");
     let _g = CleanupGuard(path.clone());
     {
@@ -195,10 +195,8 @@ fn ddl_inside_explicit_transaction_is_rejected() {
             let mut txn = core.new_session_transaction();
             core.execute_sql_in_txn(&alice, &mut s, &mut txn, "BEGIN")
                 .expect("begin");
-            let err = core
-                .execute_sql_in_txn(&alice, &mut s, &mut txn, sql)
-                .expect_err("persistent DDL inside a transaction must be rejected");
-            assert_eq!(err.wire_code(), "0A000", "{sql}");
+            core.execute_sql_in_txn(&alice, &mut s, &mut txn, sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
             core.execute_sql_in_txn(&alice, &mut s, &mut txn, "ROLLBACK")
                 .expect("rollback");
         }
@@ -446,10 +444,11 @@ fn failed_message_keeps_old_body_on_create_or_replace() {
     assert_ne!(value(&core), before);
 }
 
-/// 明示トランザクション内の DDL セッションの CREATE FUNCTION は従来どおり 0A000。暗黙 Tx 内の
-/// DROP FUNCTION も 0A000 で、同じメッセージの先行する CREATE FUNCTION も残らない（fail-closed）。
+/// 明示トランザクション内の DDL セッションの CREATE FUNCTION は共有 write txn へ積まれ、ROLLBACK で何も
+/// 残らない。暗黙 Tx 内の DROP FUNCTION は先行する CREATE FUNCTION と同じ Tx で原子的に確定する
+/// （SQL-80・Issue #3316。後続文が失敗すれば両方とも残らない）。
 #[test]
-fn explicit_txn_create_and_implicit_txn_drop_stay_unsupported() {
+fn explicit_txn_create_rolls_back_and_implicit_txn_drop_is_atomic() {
     let path = unique_db_path("sql66-implicit-unsupported");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
@@ -458,25 +457,30 @@ fn explicit_txn_create_and_implicit_txn_drop_stay_unsupported() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
         .expect("begin");
-    let e = core
-        .execute_sql_in_txn(
-            &ctx("alice"),
-            &mut s,
-            &mut txn,
-            "CREATE FUNCTION dbl(x) AS x * 2",
-        )
-        .expect_err("explicit txn");
-    assert_eq!(e.wire_code(), "0A000");
+    core.execute_sql_in_txn(
+        &ctx("alice"),
+        &mut s,
+        &mut txn,
+        "CREATE FUNCTION dbl(x) AS x * 2",
+    )
+    .expect("explicit txn");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
     let mut s = ddl_session();
     ok(&core, "alice", &mut s, "CREATE FUNCTION keep(x) AS x");
+    // 後続文が失敗すれば、先行する CREATE FUNCTION も DROP FUNCTION も残らない。
     let err = run_message(
         &core,
         "alice",
         &mut s,
-        &["CREATE FUNCTION dbl(x) AS x * 2", "DROP FUNCTION keep"],
+        &[
+            "CREATE FUNCTION dbl(x) AS x * 2",
+            "DROP FUNCTION keep",
+            "DROP FUNCTION nosuch",
+        ],
     )
-    .expect_err("drop in implicit txn");
-    assert_eq!(err, "0A000");
+    .expect_err("failing message");
+    assert_eq!(err, "42883");
     let mut other = fresh_loaded(&core, "alice");
     assert_eq!(code(&core, "alice", &mut other, CALL_DBL), "42883");
     ok(&core, "alice", &mut other, "CREATE FUNCTION dbl(x) AS x");
@@ -484,6 +488,21 @@ fn explicit_txn_create_and_implicit_txn_drop_stay_unsupported() {
         code(&core, "alice", &mut other, "CREATE FUNCTION keep(x) AS x"),
         "42723"
     );
+    // 成功するメッセージは両方を確定する。
+    let mut s = ddl_session();
+    run_message(
+        &core,
+        "alice",
+        &mut s,
+        &["CREATE FUNCTION neu(x) AS x", "DROP FUNCTION keep"],
+    )
+    .expect("atomic message");
+    let mut other = fresh_loaded(&core, "alice");
+    assert_eq!(
+        code(&core, "alice", &mut other, "CREATE FUNCTION neu(x) AS x"),
+        "42723"
+    );
+    ok(&core, "alice", &mut other, "CREATE FUNCTION keep(x) AS x");
 }
 
 /// テナント境界（P0）: alice の成功したメッセージの定義は bob から見えず、bob は同名を独立に作れる。

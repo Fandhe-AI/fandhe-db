@@ -416,26 +416,54 @@ fn table_lifecycle_is_followed() {
     ok_as(&core, "alice", &mut s, "CREATE POLICY p ON t2");
 }
 
+/// SQL-80・Issue #3316: 明示 Tx 内のポリシー DDL は COMMIT まで効かず、ROLLBACK では何も残らない。
+/// 権限の無いセッションは対象の有無を問わず `42501`（writer を取らない）。
 #[test]
-fn explicit_transaction_rejects_policy_ddl() {
+fn explicit_transaction_applies_policy_ddl_only_at_commit() {
     let (_g, core) = open_fixture("pol-tx");
     let mut allowed = allowed_session();
+    // ROLLBACK: Tx 内の作成・改名・削除は何も残さない。
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        "CREATE POLICY p ON t",
+        "ALTER POLICY p ON t RENAME TO q",
+        "ROLLBACK",
+    ] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        code_as(&core, "alice", &mut allowed, "DROP POLICY p ON t"),
+        "42704"
+    );
+    assert_eq!(
+        code_as(&core, "alice", &mut allowed, "DROP POLICY q ON t"),
+        "42704"
+    );
+    // COMMIT: 積んだ DDL が原子的に確定する。
+    let mut txn = core.new_session_transaction();
+    for sql in [
+        "BEGIN",
+        "CREATE POLICY p ON t",
+        "ALTER POLICY p ON t RENAME TO q",
+        "COMMIT",
+    ] {
+        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(
+        code_as(&core, "alice", &mut allowed, "CREATE POLICY q ON t"),
+        "42710"
+    );
+    ok_as(&core, "alice", &mut allowed, "DROP POLICY q ON t");
+    // 権限なしは 42501（対象の有無を問わない）。
     for sql in [
         "CREATE POLICY p ON t",
         "ALTER POLICY p ON t RENAME TO q",
         "DROP POLICY p ON t",
+        "DROP POLICY p ON nosuch",
     ] {
-        // 権限ありは 0A000。
-        let mut txn = core.new_session_transaction();
-        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "BEGIN")
-            .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, sql)
-            .expect_err("policy DDL inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        core.execute_sql_in_txn(&ctx("alice"), &mut allowed, &mut txn, "ROLLBACK")
-            .expect("rollback");
-        // 権限なしは 42501（対象の有無を問わない）。
         let mut denied = SessionState::default();
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx("alice"), &mut denied, &mut txn, "BEGIN")

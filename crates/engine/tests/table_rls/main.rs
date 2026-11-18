@@ -88,6 +88,7 @@ mod sql40_grant_revoke;
 mod sql40_object_owner;
 mod sql40_schema_grant;
 mod sql40_sequence_function_grant;
+mod sql80_txn_security_ddl;
 mod table15_hnsw_invalidation;
 mod table16_check_constraint;
 mod table16_primary_key;

@@ -341,144 +341,156 @@ impl Storage {
         tenant: &str,
         req: &DefaultAclRequest<'_>,
     ) -> std::result::Result<usize, AclChangeError> {
+        self.apply_default_acl_changes_in(None, tenant, req)
+    }
+
+    /// [`Self::apply_default_acl_changes`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write
+    /// txn の上で実行し commit しない。SQL-80・Issue #3316）。
+    pub(crate) fn apply_default_acl_changes_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        req: &DefaultAclRequest<'_>,
+    ) -> std::result::Result<usize, AclChangeError> {
         validate_tenant(tenant)?;
         if req.actor_id == 0 {
             return Err(AclChangeError::PermissionDenied);
         }
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(crate::catalog::convert_storage_error)?;
-        if get_role_by_id_in_txn(&*write_txn, tenant, req.actor_id)?.is_none() {
-            return Err(AclChangeError::PermissionDenied);
-        }
-        // 付与先。
-        let mut grantee_ids: Vec<u64> = Vec::new();
-        for g in req.grantees {
-            let id = match g {
-                GranteeSpec::Public => PUBLIC_GRANTEE_ID,
-                GranteeSpec::Id(id) => {
-                    if get_role_by_id_in_txn(&*write_txn, tenant, *id)?.is_none() {
+        self.run_catalog_write(target, |write_txn| {
+            if get_role_by_id_in_txn(write_txn, tenant, req.actor_id)?.is_none() {
+                return Err(AclChangeError::PermissionDenied);
+            }
+            // 付与先。
+            let mut grantee_ids: Vec<u64> = Vec::new();
+            for g in req.grantees {
+                let id = match g {
+                    GranteeSpec::Public => PUBLIC_GRANTEE_ID,
+                    GranteeSpec::Id(id) => {
+                        if get_role_by_id_in_txn(write_txn, tenant, *id)?.is_none() {
+                            return Err(AclChangeError::PermissionDenied);
+                        }
+                        *id
+                    }
+                    GranteeSpec::Name(n) => get_role_in_txn(write_txn, tenant, n)?
+                        .map(|r| r.id)
+                        .ok_or_else(|| AclChangeError::GranteeNotFound(n.clone()))?,
+                };
+                if !grantee_ids.contains(&id) {
+                    grantee_ids.push(id);
+                }
+            }
+            // 対象ロール（省略時は実行者）。
+            let mut role_ids: Vec<u64> = Vec::new();
+            if req.for_roles.is_empty() {
+                role_ids.push(req.actor_id);
+            }
+            for n in req.for_roles {
+                let id = get_role_in_txn(write_txn, tenant, n)?
+                    .map(|r| r.id)
+                    .ok_or_else(|| AclChangeError::GranteeNotFound(n.clone()))?;
+                if !role_ids.contains(&id) {
+                    role_ids.push(id);
+                }
+            }
+            // 対象ロールへの SET 経路（PostgreSQL 16 以降の `check_can_set_role`）。運用者権限は免除する。
+            if !req.operator {
+                for r in &role_ids {
+                    if !can_set_role(write_txn, tenant, req.actor_id, *r)? {
                         return Err(AclChangeError::PermissionDenied);
                     }
-                    *id
-                }
-                GranteeSpec::Name(n) => get_role_in_txn(&*write_txn, tenant, n)?
-                    .map(|r| r.id)
-                    .ok_or_else(|| AclChangeError::GranteeNotFound(n.clone()))?,
-            };
-            if !grantee_ids.contains(&id) {
-                grantee_ids.push(id);
-            }
-        }
-        // 対象ロール（省略時は実行者）。
-        let mut role_ids: Vec<u64> = Vec::new();
-        if req.for_roles.is_empty() {
-            role_ids.push(req.actor_id);
-        }
-        for n in req.for_roles {
-            let id = get_role_in_txn(&*write_txn, tenant, n)?
-                .map(|r| r.id)
-                .ok_or_else(|| AclChangeError::GranteeNotFound(n.clone()))?;
-            if !role_ids.contains(&id) {
-                role_ids.push(id);
-            }
-        }
-        // 対象ロールへの SET 経路（PostgreSQL 16 以降の `check_can_set_role`）。運用者権限は免除する。
-        if !req.operator {
-            for r in &role_ids {
-                if !can_set_role(&*write_txn, tenant, req.actor_id, *r)? {
-                    return Err(AclChangeError::PermissionDenied);
                 }
             }
-        }
-        // SCHEMA（0 は全体）。
-        let mut scopes: Vec<u64> = Vec::new();
-        if req.schemas.is_empty() {
-            scopes.push(0);
-        }
-        for name in req.schemas {
-            let id = super::super::namespace::schema_id_in_txn(&*write_txn, tenant, name)?
-                .ok_or_else(|| AclChangeError::SchemaNotFound(name.clone()))?;
-            if !scopes.contains(&id) {
-                scopes.push(id);
+            // SCHEMA（0 は全体）。
+            let mut scopes: Vec<u64> = Vec::new();
+            if req.schemas.is_empty() {
+                scopes.push(0);
             }
-        }
-        let combos = role_ids
-            .len()
-            .checked_mul(scopes.len())
-            .and_then(|n| n.checked_mul(grantee_ids.len().max(1)))
-            .ok_or(AclChangeError::LimitExceeded)?;
-        if combos > MAX_DEFAULT_ACL_COMBINATIONS {
-            return Err(AclChangeError::LimitExceeded);
-        }
-        let kind = req.kind;
-        let mut changed = 0usize;
-        for role in &role_ids {
-            for scope in &scopes {
-                let before = sorted(effective_state(&*write_txn, tenant, *role, *scope, kind)?);
-                let mut work = before.clone();
-                for g in &grantee_ids {
-                    // 所有者自身への付与は保存しない（所有者は暗黙に全権限を持つ）。
-                    if *g != PUBLIC_GRANTEE_ID && g == role {
+            for name in req.schemas {
+                let id = super::super::namespace::schema_id_in_txn(write_txn, tenant, name)?
+                    .ok_or_else(|| AclChangeError::SchemaNotFound(name.clone()))?;
+                if !scopes.contains(&id) {
+                    scopes.push(id);
+                }
+            }
+            let combos = role_ids
+                .len()
+                .checked_mul(scopes.len())
+                .and_then(|n| n.checked_mul(grantee_ids.len().max(1)))
+                .ok_or(AclChangeError::LimitExceeded)?;
+            if combos > MAX_DEFAULT_ACL_COMBINATIONS {
+                return Err(AclChangeError::LimitExceeded);
+            }
+            let kind = req.kind;
+            let mut changed = 0usize;
+            for role in &role_ids {
+                for scope in &scopes {
+                    let before = sorted(effective_state(write_txn, tenant, *role, *scope, kind)?);
+                    let mut work = before.clone();
+                    for g in &grantee_ids {
+                        // 所有者自身への付与は保存しない（所有者は暗黙に全権限を持つ）。
+                        if *g != PUBLIC_GRANTEE_ID && g == role {
+                            continue;
+                        }
+                        let pos = work.iter().position(|e| e.grantee_id == *g);
+                        if req.is_grant {
+                            match pos.and_then(|i| work.get_mut(i)) {
+                                Some(e) => {
+                                    e.privileges |= req.privileges;
+                                    if req.grant_option {
+                                        e.grant_options |= req.privileges;
+                                    }
+                                }
+                                None => work.push(DefaultEntry {
+                                    grantee_id: *g,
+                                    privileges: req.privileges,
+                                    grant_options: if req.grant_option {
+                                        req.privileges
+                                    } else {
+                                        0
+                                    },
+                                }),
+                            }
+                        } else if let Some(e) = pos.and_then(|i| work.get_mut(i)) {
+                            if req.grant_option {
+                                e.grant_options &= !req.privileges;
+                            } else {
+                                e.privileges &= !req.privileges;
+                                e.grant_options &= e.privileges;
+                            }
+                        }
+                    }
+                    work.retain(|e| e.privileges != 0);
+                    let work = sorted(work);
+                    if work == before {
                         continue;
                     }
-                    let pos = work.iter().position(|e| e.grantee_id == *g);
-                    if req.is_grant {
-                        match pos.and_then(|i| work.get_mut(i)) {
-                            Some(e) => {
-                                e.privileges |= req.privileges;
-                                if req.grant_option {
-                                    e.grant_options |= req.privileges;
-                                }
-                            }
-                            None => work.push(DefaultEntry {
-                                grantee_id: *g,
-                                privileges: req.privileges,
-                                grant_options: if req.grant_option { req.privileges } else { 0 },
-                            }),
-                        }
-                    } else if let Some(e) = pos.and_then(|i| work.get_mut(i)) {
-                        if req.grant_option {
-                            e.grant_options &= !req.privileges;
-                        } else {
-                            e.privileges &= !req.privileges;
-                            e.grant_options &= e.privileges;
+                    let is_global_functions = kind == DefaultAclKind::Functions && *scope == 0;
+                    if is_global_functions && work == builtin_default(kind) {
+                        // 組み込みの既定へ戻った: 行と印を消す。
+                        replace_entries_in_txn(write_txn, tenant, *role, *scope, kind, &[])?;
+                        set_init_marker_in_txn(write_txn, tenant, *role, false)?;
+                    } else {
+                        replace_entries_in_txn(write_txn, tenant, *role, *scope, kind, &work)?;
+                        if is_global_functions {
+                            set_init_marker_in_txn(write_txn, tenant, *role, true)?;
                         }
                     }
+                    changed += 1;
                 }
-                work.retain(|e| e.privileges != 0);
-                let work = sorted(work);
-                if work == before {
-                    continue;
-                }
-                let is_global_functions = kind == DefaultAclKind::Functions && *scope == 0;
-                if is_global_functions && work == builtin_default(kind) {
-                    // 組み込みの既定へ戻った: 行と印を消す。
-                    replace_entries_in_txn(&write_txn, tenant, *role, *scope, kind, &[])?;
-                    set_init_marker_in_txn(&write_txn, tenant, *role, false)?;
-                } else {
-                    replace_entries_in_txn(&write_txn, tenant, *role, *scope, kind, &work)?;
-                    if is_global_functions {
-                        set_init_marker_in_txn(&write_txn, tenant, *role, true)?;
-                    }
-                }
-                changed += 1;
             }
-        }
-        if changed == 0 {
-            return Ok(0);
-        }
-        if count_tenant_entries(
-            &*write_txn,
-            tenant,
-            MAX_DEFAULT_ACL_ENTRIES_PER_TENANT.saturating_add(1),
-        )? > MAX_DEFAULT_ACL_ENTRIES_PER_TENANT
-        {
-            return Err(AclChangeError::LimitExceeded);
-        }
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(crate::catalog::convert_storage_error)?;
-        Ok(changed)
+            if changed == 0 {
+                return Ok((0, false));
+            }
+            if count_tenant_entries(
+                write_txn,
+                tenant,
+                MAX_DEFAULT_ACL_ENTRIES_PER_TENANT.saturating_add(1),
+            )? > MAX_DEFAULT_ACL_ENTRIES_PER_TENANT
+            {
+                return Err(AclChangeError::LimitExceeded);
+            }
+            Ok((changed, true))
+        })
     }
 
     /// `tenant` の既定権限の全行を `(role_id, schema_id, kind, grantee_id)` の順に返す（確認用の読み取り専用 API。
