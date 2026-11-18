@@ -185,3 +185,68 @@ fn statements_not_yet_wired_after_ddl_fail_the_transaction_with_0a000() {
     expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
     expect_error(&mut stream, "SELECT id FROM t LIMIT 1;", "42P01", b'I');
 }
+
+#[test]
+fn psql_style_rollback_to_discards_only_the_ddl_after_the_savepoint() {
+    // Issue #3317: 文末 `;` の `SAVEPOINT`・`ROLLBACK TO` が DDL の後でも通り、savepoint より前の DDL だけが残る。
+    let (core, _guard) = new_core();
+    let mut stream = connect(core);
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, CREATE_T, "CREATE TABLE", b'T');
+    expect_tag(&mut stream, "SAVEPOINT s;", "SAVEPOINT", b'T');
+    expect_tag(
+        &mut stream,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY, body TEXT);",
+        "CREATE TABLE",
+        b'T',
+    );
+    expect_tag(&mut stream, "ROLLBACK TO s;", "ROLLBACK", b'T');
+    expect_tag(&mut stream, "COMMIT;", "COMMIT", b'I');
+    assert_eq!(count_rows(&mut stream, "t"), 0);
+    expect_error(&mut stream, "SELECT id FROM u LIMIT 1;", "42P01", b'I');
+}
+
+#[test]
+fn psql_style_failed_ddl_recovers_with_rollback_to() {
+    let (core, _guard) = new_core();
+    let mut stream = connect(core);
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, CREATE_T, "CREATE TABLE", b'T');
+    expect_tag(&mut stream, "SAVEPOINT s;", "SAVEPOINT", b'T');
+    expect_error(&mut stream, CREATE_T, "42P07", b'E');
+    expect_tag(&mut stream, "ROLLBACK TO s;", "ROLLBACK", b'T');
+    expect_tag(&mut stream, "COMMIT;", "COMMIT", b'I');
+    assert_eq!(count_rows(&mut stream, "t"), 0);
+}
+
+#[test]
+fn connection_drop_after_ddl_and_savepoint_leaves_nothing_and_frees_the_writer() {
+    let (core, _guard) = new_core();
+    let mut first = connect(Arc::clone(&core));
+    expect_tag(&mut first, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut first, CREATE_T, "CREATE TABLE", b'T');
+    expect_tag(&mut first, "SAVEPOINT s;", "SAVEPOINT", b'T');
+    expect_tag(
+        &mut first,
+        "CREATE TABLE u (id BIGINT PRIMARY KEY);",
+        "CREATE TABLE",
+        b'T',
+    );
+    // 接続断（ソケットを閉じる）。
+    drop(first);
+    let mut second = connect(core);
+    // writer が解放され、表は残っていない（同名の再作成が通る。解放は非同期のため短く再試行する）。
+    let mut created = false;
+    for _ in 0..50 {
+        send_simple_query(&mut second, CREATE_T);
+        let (kind, _) = read_message(&mut second);
+        let _ = read_ready_for_query_status(&mut second);
+        if kind == b'C' {
+            created = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(created, "writer was not released after the connection drop");
+    expect_error(&mut second, "SELECT id FROM u LIMIT 1;", "42P01", b'I');
+}

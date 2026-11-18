@@ -44,6 +44,13 @@ pub(crate) struct WriteMarks {
     pub(crate) has_writes: bool,
     pub(crate) written_tables: HashSet<String>,
     pub(crate) written_by_tenant: BTreeSet<(String, String)>,
+    /// 表・索引の DDL を積み始めていたか（SQL-80・Issue #3317）。`ROLLBACK TO` が DDL 状態の印を
+    /// 時点へ戻すための水位で、dirty テーブルからは導出しない（表世代を進めない DDL もあるため）。
+    pub(crate) ddl_started: bool,
+    /// 表・索引を DROP 済みだったか（同上）。
+    pub(crate) ddl_removed: bool,
+    /// commit 後に採番器から捨てる SEQUENCE の列の長さ（追記専用の列なので長さが水位になる）。
+    pub(crate) ddl_evict_len: usize,
 }
 
 /// `SAVEPOINT` 時点の書き込み済み内容の差分（Issue #2879）。永続側と一時側（TABLE-44）を別々に
@@ -380,6 +387,7 @@ mod tests {
             has_writes: true,
             written_tables: HashSet::from(["t".to_string()]),
             written_by_tenant: BTreeSet::from([("x".to_string(), "t".to_string())]),
+            ..WriteMarks::default()
         };
         s.push("a", R, &SessionState::default(), 0, 0, Some(marks));
         s.push(
