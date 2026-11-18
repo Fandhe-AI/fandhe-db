@@ -111,6 +111,8 @@ fn scan_ddl_hits_the_transaction_deadline_mid_scan() {
     }
     let mut txn = core.new_session_transaction();
     tx(&core, &mut session, &mut txn, "BEGIN").expect("begin");
+    // 実行速度に依存せず必ず上限を超えるよう、上限（3ms）より十分長く待ってから走査 DDL を流す。
+    std::thread::sleep(Duration::from_millis(50));
     let err = tx(
         &core,
         &mut session,
