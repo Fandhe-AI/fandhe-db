@@ -86,6 +86,7 @@ impl MergeExecPlan {
             match &c.action {
                 ActionPlan::Update(set) => {
                     kinds.update = true;
+                    kinds.update_columns.extend(set.declared.iter().copied());
                     kinds
                         .update_columns
                         .extend(set.literals.iter().map(|(i, _)| *i));
@@ -164,6 +165,9 @@ struct SetPlan {
     items: Vec<SetItem>,
     /// 式を経由できない代入先の型への、元の列の単純コピー。
     copies: Vec<CopyItem>,
+    /// 構文上 SET に挙げられた全列（代入計画から除かれる生成列への `DEFAULT` を含む）。文トリガの
+    /// `UPDATE OF` 判定用（Issue #3355）。
+    declared: Vec<usize>,
 }
 
 /// 式項。`set` の列参照は「対象列 ++ `src_cols`（この項自身の並び）」のビューの添字で解決済み。
@@ -373,6 +377,7 @@ fn plan_set(
 ) -> Result<SetPlan, SqlSurfaceError> {
     let mut set = SetPlan {
         literals: a.literals().to_vec(),
+        declared: a.declared_columns().to_vec(),
         ..SetPlan::default()
     };
     for (idx, e) in a.exprs() {

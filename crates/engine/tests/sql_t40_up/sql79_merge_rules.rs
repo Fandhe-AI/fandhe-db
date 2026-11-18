@@ -311,6 +311,43 @@ fn update_of_statement_triggers_use_the_union_of_all_update_clauses() {
 }
 
 #[test]
+fn update_of_statement_triggers_see_a_generated_column_set_to_default() {
+    let (core, _g) = new_core("sql79r-update-of-gen");
+    ok(&core, "CREATE SCHEMA s");
+    ok(
+        &core,
+        "CREATE TABLE s.pt (k TEXT, a INTEGER, g INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
+    );
+    ok(&core, "CREATE TABLE s.ps (k TEXT, v INTEGER)");
+    ok(&core, "CREATE TABLE audit (lv TEXT)");
+    ok(&core, "INSERT INTO s.pt (k, a) VALUES ('a', 1)");
+    ok(&core, "INSERT INTO s.ps (k, v) VALUES ('a', 5)");
+    for (n, timing) in [("bg", "BEFORE"), ("ag", "AFTER")] {
+        ok(
+            &core,
+            &format!(
+                "CREATE FUNCTION f_{n}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO audit (lv) VALUES ('{n}'); RETURN NULL; END $$"
+            ),
+        );
+        ok(
+            &core,
+            &format!(
+                "CREATE TRIGGER g_{n} {timing} UPDATE OF g ON s.pt FOR EACH STATEMENT EXECUTE FUNCTION f_{n}()"
+            ),
+        );
+    }
+    // `SET g = DEFAULT` は代入計画から除かれるが、構文上 g を挙げたので UPDATE OF g が発火する。
+    assert_eq!(
+        merged(
+            &core,
+            "MERGE INTO s.pt AS d USING s.ps AS e ON d.k = e.k WHEN MATCHED THEN UPDATE SET g = DEFAULT"
+        ),
+        1
+    );
+    assert_eq!(audit(&core), lv(&["bg", "ag"]));
+}
+
+#[test]
 fn statement_trigger_writes_follow_the_transaction() {
     let (core, _g) = private_world("sql79r-stmt-tx");
     all_six_triggers(&core);
