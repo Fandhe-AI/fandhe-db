@@ -12,6 +12,8 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 **#3354 で `WHEN NOT MATCHED [BY TARGET]` の INSERT と `WHEN NOT MATCHED BY SOURCE` の実行を実装済み**（下の §10）。外部保持の列挙は第 1 段の対象候補の列挙に一致フラグを足して行い、適用順は UPDATE → DELETE → INSERT。`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー（INSERT 側を含む）の形は固定文言の `0A000` のまま止まる。
 
+**#3355 で MERGE と制約・生成列・トリガ・ビュー・RLS の規則を実装済み**（下の §11）。対象がビュー・対象表に文トリガ・対象表に利用者ポリシーの形は実行される。`RETURNING`・台帳記録・INSTEAD OF トリガを持つビュー（対応しない）は固定文言の `0A000` のまま止まる。
+
 **#3352 で束縛を実装済み**（`sql::merge_bind`・`core::merge_exec`。下の「#3352 の束縛」節）。束縛エラー（`42703`・`42702`・`42P01`・`42804`・`22000`・`55000` 等）は書き込みより前に返り、束縛を通った Execute・明示 Tx は固定文言の `0A000` のまま、Describe は `RETURNING` なしなら結果列なしで成功する（`RETURNING` つきは `0A000`）。
 
 `$n` の受理範囲（#3352）: `USING OPERATION_ID $n` に加え、`WHEN ... THEN UPDATE SET <列> = $n` の右辺と `INSERT ... VALUES (...)` の要素の単独の `$n`（括弧で包んだ形を含む）を受理する。`ON`・`WHEN ... AND` の条件内、式の内側（`SET x = $1 + 1`）、`RETURNING` 内、元が部分クエリの形の `$n` は引き続き Parse 段で `42601`（UPDATE FROM の `$n`〔#3297〕と同じ段階的な制限）。
@@ -154,11 +156,11 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 - 行トリガは、各操作が既存の書き込み経路を通ることで、操作ごとの種類のトリガとして発火する
 - 文トリガは、MERGE の入口が WHEN 句に現れた操作の種類ごとに 1 回ずつ発火し、各区間の書き込み呼び出しでは抑止する
-  - BEFORE は INSERT → UPDATE → DELETE、AFTER は UPDATE → DELETE → INSERT（PG17 の順。#3358 で実機確認）
-  - #3355 の本文は「実行した操作の種類ごと」と読めるが、PG17 は実行の有無を問わないため、本記録では PG17 側を決定とし、#3355 で確認する
+  - BEFORE は INSERT → UPDATE → DELETE、AFTER は DELETE → UPDATE → INSERT（#3355 で訂正。当初の記述は AFTER を UPDATE → DELETE → INSERT としていたが、PG のソースの `fireASTriggers` の MERGE の腕に合わせて BEFORE の逆順にした。#3358 で実機確認）
+  - 発火の単位は WHEN 句に現れた操作の種類ごと（DO NOTHING は数えない）で、実際に行を書いたかは問わない。#3355 の本文は「実行した操作の種類ごと」と読めるが、PG17 との互換を優先して前者を決定とした（§11）
 - 結合形 DML の `RETURNING` とトリガの併用は、`trigger-update-delete.md` の現行の契約（`0A000`）に従う
-- 対象ビューの INSTEAD OF トリガを経由する MERGE は `0A000`（結線しない形）
-- 生成列は、#3326（TABLE-50）の設計記録が定める「符号化直前の単一計算点」を各書き込み経路が通る。MERGE で別の計算点は作らない（担当 #3355）
+- 対象ビューの INSTEAD OF トリガを経由する MERGE は `0A000`（対応しない形。#3355 で確定。§11）
+- 生成列は、#3326（TABLE-50）の設計記録が定める「符号化直前の単一計算点」を各書き込み経路が通る。MERGE で別の計算点は作らない（#3355 で結線済み。`GeneratedComputeScope` は基底表名で張る）
 - CHECK・UNIQUE・FK（`23514`・`23505`・`23503`）は単独 DML と同じ検査点を通る
 - 対象が自動更新可能なビューのときは、ビュー DML（`create-view.md`）と同じく基底表とビュー述語へ書き換え、単独のビュー書き込みと同じ規則と SQLSTATE に従う（#3352）
 - 一時表の関与と更新不可のビューは D14（第 6 節の表）に従う
@@ -189,7 +191,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | 元が JOIN の連鎖・複数表 | `0A000` | 部分クエリで代替できる。受け皿なし |
 | 元の LATERAL・対象への相関参照 | `0A000`／`42P01` | lateral-derived-table（#3320）は DML を対象外にしている |
 | 元のベクトル順位付け | `42601` | SQL-28 と同じ |
-| 対象ビューの INSTEAD OF 経由 | `0A000` | 受け皿なし（#3355 で再判断） |
+| 対象ビューの INSTEAD OF 経由 | `0A000` | 対応しない（#3355 で確定。3 種の操作を INSTEAD OF の行トリガへ振り分ける経路は第 2 の実行器になる。要望が出た時点で別途起票する） |
 | PL/pgSQL 本体・DO の中の MERGE | `0A000` | 受け皿なし |
 | 暗黙 Tx を通らない経路 | `0A000` | fail-closed |
 | 結合 DML の RETURNING とトリガの併用 | `0A000` | `trigger-update-delete.md` の現行の契約 |
@@ -204,7 +206,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | D2・D4 の束縛と参照できる側・ビュー対象・`$n` | #3352 |
 | D3・D5・D6 の MATCHED と `21000`（実装済み。§9。コマンドタグ `MERGE n` と `SqlOutcome::Merge` を前倒しで含む） | #3353 |
 | D3・D6 の BY TARGET の INSERT と BY SOURCE（実装済み。§10） | #3354 |
-| D8・D10・D12 | #3355 |
+| D8・D10・D12（実装済み。§11） | #3355 |
 | D13 の RETURNING・`merge_action()`・タグ | #3356 |
 | D9・D11・D13 の EXPLAIN・crash 耐性の段 | #3357 |
 | PG17 の突き合わせ（D1・D4・D5・D12・D13 の要確認点）・越境・psql の結合試験 | #3358 |
@@ -240,9 +242,9 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | `WHEN NOT MATCHED [BY TARGET]`・`BY SOURCE` の句を 1 つでも含む（#3354 で実行する形になった。§10） | 実装済み | — |
 | `RETURNING` つき | #3356 | 同上 |
 | 台帳へ記録する構成（`USING OPERATION_ID` つき） | #3357 | 同上 |
-| 対象がビュー | #3355 | 同上 |
-| 対象表に文トリガがある | #3355 | write txn 内の事前判定 |
-| 対象表に利用者ポリシーが適用される | #3355 | write txn 内の事前判定 |
+| 対象がビュー | 実装済み（#3355。§11） | — |
+| 対象表に文トリガがある | 実装済み（#3355。§11） | — |
+| 対象表に利用者ポリシーが適用される | 実装済み（#3355。§11） | — |
 
 - 台帳: `OpTag` と文ハッシュは #3357 が入れる。それまで `Ledgered` 構成の MERGE は `operation_id` を欠くため `23502`、`USING OPERATION_ID` つきは `0A000`。台帳なし構成（`CompareOnlyWithoutLedger`）と `Optional` 構成の省略形は実行でき、台帳へ記録しない。第 3 段へ渡す文ハッシュは記録に使われない（#3357 が `for_merge` に置き換える）
 - 文トリガのある表を拒否する理由: DELETE の経路は呼び出しごとに文トリガを発火し、D12 の「操作の種類ごとに 1 回」と合わない。UPDATE の経路は結合形で既に文トリガを `0A000` で拒否している
@@ -292,7 +294,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 - **適用順（D6 からの変更）**: UPDATE の句ごと → DELETE の最大 1 回 → INSERT の句ごと（句の添字の昇順。各句の中は元の走査順）。PG17 の元の行順の逐次適用と異なり、即時の UNIQUE などの検査が適用順に依存する形（同じキーを DELETE と INSERT が触れる等）は結果が異なり得る。D6 が「PG17 でも計画依存」と認める範囲で、突き合わせは順序に依存しない入力で行う（#3358）
 - **押し下げ（D3）は対応しない**: 片側だけを参照する `ON` の conjunct を押し下げると、BY TARGET／BY SOURCE で「未一致」になる行の集合が変わる。残余に残せば、BY TARGET／BY SOURCE の有無によらず正しい。最適化のみで正しさに影響しないため、実装しない
-- **INSERT 側の利用者ポリシー**: 対象表に INSERT 側のポリシーが適用される（RLS 有効）場合は、INSERT 句があるとき `tenant::merge_target_preflight` が固定文言の `0A000`（既存の「row-level security policies is not supported yet」と同じ文言）で拒否する。書き込み段も挿入時に同じ検査を持つが、MERGE 全体のポリシーの合成は #3355 が担うため、RLS 相当を緩めない fail-closed の多層防御にした
+- **INSERT 側の利用者ポリシー（#3355 で撤去。§11）**: 対象表に INSERT 側のポリシーが適用される（RLS 有効）場合は、INSERT 句があるとき `tenant::merge_target_preflight` が固定文言の `0A000`（既存の「row-level security policies is not supported yet」と同じ文言）で拒否する。書き込み段も挿入時に同じ検査を持つが、MERGE 全体のポリシーの合成は #3355 が担うため、RLS 相当を緩めない fail-closed の多層防御にした
 - **PG17 との突き合わせ（#3358 の確認項目に加える）**: 適用順の差、未一致の元行が重複するときの挙動（両方挿入・UNIQUE があれば `23505`）、NULL キーの扱い、`MERGE n` の件数（INSERT を含む）
 
 ### 対象外（受け皿）
@@ -301,10 +303,41 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | ---- | ------ |
 | `RETURNING`・`merge_action()` | #3356 |
 | 台帳記録（`USING OPERATION_ID`）・`OpTag`・`EXPLAIN MERGE`・crash 耐性 | #3357 |
-| ビュー対象・文トリガ・利用者ポリシー（INSERT ポリシーを含む）・行トリガ順の再判断 | #3355 |
+| ビュー対象・文トリガ・利用者ポリシー（INSERT ポリシーを含む）・行トリガ順の再判断 | 実装済み（#3355。§11） |
 | PG17 との突き合わせ・3 テナントの越境の網羅 | #3358 |
 | ON の片側 conjunct の押し下げ | 対応しない（上記） |
 | 元の疑似列 `id` を `id` 以外の列の値にする形（`INSERT (id, x) VALUES (s.id, s.id)` 等） | 対応しない（現行の制限として固定する。固定文言の `0A000`。要望が出た時点で別途起票する）。UPDATE の SET の同じ形と同じ制限 |
+
+## 11. #3355 の実装（制約・生成列・トリガ・ビュー・RLS の規則）
+
+実装は `core::merge_exec`（結線）・`tenant::merge_triggers`（文トリガの計画・発火・抑止）・`trigger::plan::plan_row_triggers`（抑止の唯一の点）・`sql::policy_eval`（既存行の DELETE 側の USING）・`tenant`（SELECT 側の USING で絞る候補列挙・子側 FK 検査の先送り）・`catalog::view_write_fingerprint_in_read_txn`（束縛と同じスナップショットの指紋）。第 2 の書き込み経路は作らない。
+
+### 決定
+
+- **文トリガ**（D12 の確定）: WHEN 句に現れた操作の種類ごとに 1 回。DO NOTHING は種類に数えず、書いた行が 0 件でも発火する。BEFORE は INSERT → UPDATE → DELETE、AFTER は DELETE → UPDATE → INSERT。入口（事前判定の後・元の走査より前）で BEFORE、全区間の書き込みと先送りした FK の補完検査の後で AFTER を発火する。第 3 段の間は `MergeStatementTriggerScope`（表名とトリガの深さが鍵）が `plan_row_triggers` に対象表の文トリガ群を空で返させる。トリガ本体が同じ表へ書く入れ子の DML は深さが違うので抑止されない（fail-open の防止）。`UPDATE OF` の文トリガは全 UPDATE 句の SET 列の和集合で判定する。`TriggerWrittenTablesScope` は BEFORE の前に張り、文トリガが書いた表も `mark_written` する
+- **利用者ポリシー**（D8 の具体化。RLS-13）: 第 1 段の候補列挙は SELECT 側の USING で対象を絞る（隠れた行は一致にも BY SOURCE にも入らない）。UPDATE か DELETE を選んだ行（MATCHED・BY SOURCE の両方）には UPDATE 側または DELETE 側の USING を評価し、満たさなければ行を黙って飛ばさず文全体を `42501` で拒否する（行を書く前なので副作用ゼロ。`ON CONFLICT DO UPDATE` の既存行検査と同じ規則）。新しい行の WITH CHECK は第 3 段の既存の検査点。公開 enum に variant は足さず、既存の `RowSecurityPolicyViolation`（USING 側の文言）を使う。`row_security = off` の `42501` は従来どおり事前判定が担う
+- **ビュー対象**（TABLE-43）: 基底表へ書き換えて実行する。ビュー述語は第 1 段の対象候補の絞り込みとして評価し、`ON` の残余には入れない（入れると BY SOURCE の DELETE・UPDATE がビューの外の基底行に及ぶ）。`WITH CHECK OPTION` は第 3 段を `ViewWriteScope` で包み、既存の検査点が `44000` にする。束縛と同じ読み取りスナップショットで指紋を取り、writer 取得後・第 1 段より前に write txn で照合する（0 行の MERGE でも並行 DDL を検出する）。列別名つき・利用者列を `id` として公開するビューは従来どおり `0A000`
+- **INSTEAD OF トリガを持つビュー**（D14 の再判断の結論）: 対応しない。WHEN 句に現れたイベントのどれか 1 つでも INSTEAD OF の行トリガがあれば固定文言の `0A000`。束縛時（自動更新可能性の判定より前）と write txn 内（writer 取得後）の両方で判定する
+- **生成列・CHECK・UNIQUE・FK**: 各操作が既存の書き込み経路の検査点を通る。UPDATE 句と INSERT 句が両方ある（または INSERT 句が 2 つ以上ある）ときは、子側の FK 検査を `MergeFkDeferScope`（#3354 の `InsertFkDeferScope` を一般化）で先送りし、全区間の後に走査で 1 回検査する。先送りの対象は子側の検査だけで、参照先側の検査は区間ごとの即時検査のまま
+- **権限**（D10 の検証）: 元の表・ビュー・部分クエリの中の表の SELECT は、既存の write ゲート（対象表を差し引いた残りの参照へ SELECT を課す）が判定することを結合テストで確かめた。ゲートの変更は不要だった
+
+### 意図的な差・対応しない形（#3358 の確認項目に加える）
+
+- AFTER STATEMENT の順（DELETE → UPDATE → INSERT）と `UPDATE OF` の文トリガの和集合判定
+- 行トリガは今の区間方式（UPDATE の句ごと → DELETE → INSERT。AFTER ROW は各区間の終わりに発火）を維持する。PG17 は AFTER ROW を文の終わりにまとめて発火するが、適用順そのものが §9・§10 のとおり PG17 と異なり、同じ部類の差のため変えない（対応しない）
+- 親側 FK の NO ACTION の区間差（DELETE した親と同じキーを INSERT で作り直す形）は扱わない。参照先側の検査は区間ごとの即時検査で、文末へ回す仕組みが無い（対応しない）
+- RLS の USING 違反の文言は「new row violates ... (USING expression)」で、PG17 の「target row ...」と異なる（SQLSTATE は同じ `42501`）
+- ビュー対象のエラー: 指紋の不一致は固定文言（`invalid_input`）で書き込まずに拒否する
+
+### 対象外（受け皿）
+
+| 項目 | 受け皿 |
+| ---- | ------ |
+| `RETURNING`・`merge_action()`、結合形 DML の RETURNING とトリガの併用 | #3356 |
+| 台帳記録・BEFORE STATEMENT と台帳の事前照合の順序・ビュー経由の台帳ドメイン・EXPLAIN・crash 耐性 | #3357 |
+| PG17 との突き合わせ（上記の確認項目） | #3358 |
+| INSTEAD OF トリガを持つビューを対象にする MERGE | 対応しない（上記） |
+| AFTER ROW を文末にまとめて発火する形・親側 FK の NO ACTION を文末へ回す形 | 対応しない（上記。突き合わせは #3358） |
 
 ## セキュリティ
 

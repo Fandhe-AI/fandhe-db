@@ -202,5 +202,6 @@ mod sql79_merge_bind;
 mod sql79_merge_matched;
 mod sql79_merge_not_matched;
 mod sql79_merge_parse;
+mod sql79_merge_rules;
 mod sql80_txn_ddl_savepoint;
 mod sql80_txn_table_ddl;

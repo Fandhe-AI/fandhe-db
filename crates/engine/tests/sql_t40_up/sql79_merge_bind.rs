@@ -271,8 +271,7 @@ fn subquery_source_columns_come_from_describe_without_running_the_inner_query() 
     assert!(out.starts_with("Merge("), "{out}");
 }
 
-// 自動更新できるビューを対象にする形は束縛を通っても、ビュー書き込みとの結線を入れる #3355 まで拒否する。
-// tracked: #3355
+// 自動更新できるビューを対象にする形は、単独のビュー書き込みと同じ規則で束縛され、実行される（#3355）。
 #[test]
 fn view_targets_follow_the_single_view_write_rules() {
     let (core, _g) = new_core("sql79b-view");
@@ -287,12 +286,14 @@ fn view_targets_follow_the_single_view_write_rules() {
         &core,
         "CREATE VIEW va (id, embedding, key, x) AS SELECT id, embedding, k, x FROM t",
     );
+    // 自動更新できるビューは束縛を通り、実行される（a だけが一致して更新される）。
+    let out = run(
+        &core,
+        "MERGE INTO vt USING s ON vt.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v",
+    )
+    .expect("view target runs");
+    assert_eq!(out, "Merge(MergeOutcome { rows_affected: 1 })");
     for (sql, want) in [
-        // 自動更新できるビューは束縛を通る。
-        (
-            "MERGE INTO vt USING s ON vt.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v",
-            "0A000",
-        ),
         // 公開していない基底列は 42703。
         (
             "MERGE INTO vk USING s ON vk.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v",

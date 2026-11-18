@@ -7858,7 +7858,7 @@ impl EngineCore {
         }
 
         // SQL-79・Issue #3351: `MERGE` は専用の構文解析器へ回す（既存の単一表 DML の解析器へ落とさない）。
-        // 解析を通った文の実行は固定文言の `0A000`（実行系は #3353・#3354 で結線済み。残る形は #3355〜#3357）。対象・元の存在確認は
+        // 解析を通った文の実行は固定文言の `0A000`（実行系は #3353〜#3355 で結線済み。残る形は #3356・#3357）。対象・元の存在確認は
         // 他の書き込みと同じく書き込み先ビュー・索引の写像（`reclassify_write_to_view_error`）を通す。
         if crate::sql::allowlist::looks_like_merge(&tokens) {
             let stmt = crate::sql::allowlist::validate_merge_tokens_with_limits(

@@ -108,7 +108,7 @@ SQLSTATE を含む個別の規則は TABLE-50 (1) のポインタとし、本記
 | ファイル形 INSERT・生の `RowInput` の Rust API | 決定: `0A000` のまま（`intentional`） | 値の列を持たない生の metadata 経路は、生成列を持つ表で `0A000`（fail-closed） |
 | `ALTER TABLE ADD COLUMN ... GENERATED` のバックフィル | #3330 | G8 |
 | 参照しない列の `ALTER COLUMN TYPE` の行の書き換え | #3331 | 生成列の値は変わらない。照合段を通ることを確かめる |
-| MERGE | #3355 | 本記録の計算点を使う |
+| MERGE | #3355（結線済み） | 本記録の計算点を使う。`GeneratedComputeScope` を基底表名で張り、UPDATE・INSERT の各区間が通る（ビュー対象を含む）。設計記録は `sql-merge.md` §11 |
 
 暫定の状態: #3327 は、生成列を持つ表へのすべての書き込みを固定文言の `0A000` で拒否する（黙って NULL を書かない）。経路ごとに、担当の子 Issue が結線した時点でこの拒否を外す。結線漏れは G5 の照合段が `XX000` で止める。
 
@@ -272,7 +272,7 @@ SQL の INSERT・UPDATE・UPSERT の計算点を結線した。spec は TABLE-50
 
 ### 残す経路（Issue #3329 で結線）
 
-Issue #3328 の時点では COPY FROM・NoSQL・ビュー・INSTEAD OF・トリガ付きの表・トリガ本体の書き込み・FK の参照アクションは `0A000` だった。これらは Issue #3329 で結線した（次節）。MERGE は #3355。式で代入できない列型（NUMERIC 等）と一時表の生成列は `0A000` のままで、受け皿の Issue は未起票。PG17 実機との突き合わせ（`EXCLUDED.<生成列>`・UPDATE の `428C9` の文言差）は #3332。
+Issue #3328 の時点では COPY FROM・NoSQL・ビュー・INSTEAD OF・トリガ付きの表・トリガ本体の書き込み・FK の参照アクションは `0A000` だった。これらは Issue #3329 で結線した（次節）。MERGE は #3355 で結線済み。式で代入できない列型（NUMERIC 等）と一時表の生成列は `0A000` のままで、受け皿の Issue は未起票。PG17 実機との突き合わせ（`EXCLUDED.<生成列>`・UPDATE の `428C9` の文言差）は #3332。
 
 - データ出力（COPY ヘッダ・COPY 行・INSERT の列リストと値）は生成列を除く。生成列しか持たない表に行があれば固定文言の `Unsupported`（黙って省かない）。
 

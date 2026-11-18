@@ -112,7 +112,7 @@ pub(crate) fn classify(parsed: &ParsedSql) -> ReadRequirement {
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
-        // SQL-79・Issue #3351: MERGE の権限は write ゲート（`write.rs`）が判定する（元側の読み取りは #3355）。
+        // SQL-79・Issue #3351: MERGE の権限は write ゲート（`write.rs`）が判定する（元の表・ビュー・部分クエリの中の表の SELECT も、対象表を差し引いた残りの参照として課す。Issue #3355 で結合テストにより検証済み）。
         | ParsedSql::Merge(_)
         | ParsedSql::Partitioned(_)
         // Issue #2051: INSERT 権限と元表の SELECT は書き込みゲート（`write.rs`）が判定する。

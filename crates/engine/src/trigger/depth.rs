@@ -40,8 +40,7 @@ pub(crate) fn enter(max: usize) -> Result<DepthGuard, SqlSurfaceError> {
     })
 }
 
-/// テスト用: 現在のスレッドの深さ。
-#[cfg(test)]
+/// 現在のスレッドの深さ（`MERGE` の文トリガ抑止区間が、入れ子の DML を区別するために読む）。
 pub(crate) fn current_depth() -> usize {
     CURRENT_DEPTH.with(|d| d.get())
 }
