@@ -440,15 +440,17 @@ pub(crate) fn rows_to_bound_inserts(
                 }
             }
         }
-        let volatile_default_columns: Vec<VolatileColumn> =
-            crate::sql::parser::fill_omitted_columns(
-                &schema.columns,
-                &mut values,
-                &provided,
-                Some(clock),
-                false,
-            )?;
-        if volatile_default_columns.iter().any(|c| {
+        let bound = finish_bound_insert(
+            table_name,
+            schema,
+            id,
+            values,
+            &provided,
+            id_omitted,
+            operation_id,
+            clock,
+        )?;
+        if bound.volatile_default_columns.iter().any(|c| {
             matches!(
                 c,
                 VolatileColumn::DefaultSequence(_) | VolatileColumn::Sequence(..)
@@ -456,20 +458,46 @@ pub(crate) fn rows_to_bound_inserts(
         }) {
             return Err(crate::sql::parser::reject_sequence_call_literal());
         }
-        out.push(BoundInsert {
-            table: table_name.to_string(),
-            id,
-            values,
-            operation_id: operation_id.cloned(),
-            volatile_default_columns,
-            id_omitted,
-        });
+        out.push(bound);
     }
     Ok(out)
 }
 
+/// 1 行分の値（`provided` が真の列だけが呼び出し元の値）から `BoundInsert` を組み立てる。省略列へ
+/// `DEFAULT` を補完し、採番・時刻の印（[`VolatileColumn`]）を載せる（SQL-51・SQL-79）。
+/// `INSERT ... SELECT`（[`rows_to_bound_inserts`]）と `MERGE ... WHEN NOT MATCHED THEN INSERT`
+/// （`core::merge_exec`。Issue #3354）が共有し、第 2 の挿入経路を作らない。`DefaultSequence`／`Sequence` の
+/// 印をどう扱うか（拒否するか、書き込み段へ運ぶか）は呼び出し元が決める。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_bound_insert(
+    table_name: &str,
+    schema: &TableSchema,
+    id: u64,
+    mut values: Vec<Value>,
+    provided: &[bool],
+    id_omitted: bool,
+    operation_id: Option<&OperationId>,
+    clock: crate::sql::time_fn::StatementClock,
+) -> Result<BoundInsert, SqlSurfaceError> {
+    let volatile_default_columns: Vec<VolatileColumn> = crate::sql::parser::fill_omitted_columns(
+        &schema.columns,
+        &mut values,
+        provided,
+        Some(clock),
+        false,
+    )?;
+    Ok(BoundInsert {
+        table: table_name.to_string(),
+        id,
+        values,
+        operation_id: operation_id.cloned(),
+        volatile_default_columns,
+        id_omitted,
+    })
+}
+
 /// 疑似列 `id` へ流すセルを `u64` にする（非負整数のみ。NULL・負数は `22000`、他の型は `0A000`）。
-fn cell_to_row_id(cell: Cell) -> Result<u64, SqlSurfaceError> {
+pub(crate) fn cell_to_row_id(cell: Cell) -> Result<u64, SqlSurfaceError> {
     match cell {
         Cell::Integer(u) => Ok(u),
         Cell::SignedInteger(i) => u64::try_from(i).map_err(|_| {

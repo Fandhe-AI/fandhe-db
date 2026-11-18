@@ -2159,9 +2159,9 @@ pub enum ParsedSql {
     /// マッチするクレート外コードは追随が必要。
     UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
     /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析を担い、
-    /// 実行は束縛（#3352。`sql::merge_bind`）を通してから `core::merge_exec` が行う（`WHEN MATCHED` だけの形は
-    /// #3353 で実行。NOT MATCHED は #3354、台帳・`OpTag`・`EXPLAIN` は #3357、`RETURNING` は #3356 が結線し、
-    /// それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
+    /// 実行は束縛（#3352。`sql::merge_bind`）を通してから `core::merge_exec` が行う（`WHEN MATCHED` は
+    /// #3353、`WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 で実行。台帳・`OpTag`・`EXPLAIN` は #3357、
+    /// `RETURNING` は #3356 が結線し、それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
     /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
     Merge(Box<crate::sql::allowlist::ValidatedMerge>),
     /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
@@ -2734,6 +2734,14 @@ fn insert_sequence_scope(
         }
         ParsedSql::ExplainJson(inner) => return insert_sequence_scope(storage, session, inner),
         ParsedSql::Insert(_) | ParsedSql::InsertSelect(_) | ParsedSql::ViewInsert(_) => true,
+        // SQL-79・Issue #3354: `WHEN NOT MATCHED ... THEN INSERT` を含む MERGE だけが、INSERT 句の採番・
+        // DEFAULT 時刻の文脈を要する（UPDATE・DELETE だけの MERGE は採番も DEFAULT 時刻も使わない）。
+        ParsedSql::Merge(v) => v.when_clauses.iter().any(|c| {
+            matches!(
+                c.action,
+                crate::sql::allowlist::MergeAction::Insert { .. }
+            )
+        }),
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
         ParsedSql::DataModifyingCte(v) => v
             .dm_ctes
@@ -2748,8 +2756,6 @@ fn insert_sequence_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
-        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
-        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -2831,6 +2837,14 @@ fn insert_default_clock_scope(
         | ParsedSql::InsertSelect(_)
         | ParsedSql::ViewInsert(_)
         | ParsedSql::ExplainInsert(_) => true,
+        // SQL-79・Issue #3354: `WHEN NOT MATCHED ... THEN INSERT` を含む MERGE だけが、INSERT 句の採番・
+        // DEFAULT 時刻の文脈を要する（UPDATE・DELETE だけの MERGE は採番も DEFAULT 時刻も使わない）。
+        ParsedSql::Merge(v) => v.when_clauses.iter().any(|c| {
+            matches!(
+                c.action,
+                crate::sql::allowlist::MergeAction::Insert { .. }
+            )
+        }),
         // SQL-63・Issue #1876: 副文に `INSERT` を含むときだけ採番・既定時刻の文脈を張る。
         ParsedSql::DataModifyingCte(v) => v
             .dm_ctes
@@ -2843,8 +2857,6 @@ fn insert_default_clock_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
-        // SQL-79・Issue #3351: 採番・DEFAULT 時刻の文脈は実行を結線する #3354 で再確認する（現状は `0A000`）。
-        | ParsedSql::Merge(_)
         | ParsedSql::ViewDelete(_)
         | ParsedSql::ViewUpdate(_)
         | ParsedSql::Transaction(_)
@@ -7845,7 +7857,7 @@ impl EngineCore {
         }
 
         // SQL-79・Issue #3351: `MERGE` は専用の構文解析器へ回す（既存の単一表 DML の解析器へ落とさない）。
-        // 解析を通った文の実行は固定文言の `0A000`（実行系の結線は #3353・#3354）。対象・元の存在確認は
+        // 解析を通った文の実行は固定文言の `0A000`（実行系は #3353・#3354 で結線済み。残る形は #3355〜#3357）。対象・元の存在確認は
         // 他の書き込みと同じく書き込み先ビュー・索引の写像（`reclassify_write_to_view_error`）を通す。
         if crate::sql::allowlist::looks_like_merge(&tokens) {
             let stmt = crate::sql::allowlist::validate_merge_tokens_with_limits(

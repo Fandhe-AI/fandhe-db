@@ -3,8 +3,9 @@
 //! 役割: トークン列から構文木 [`ValidatedMerge`] を作る。`core.rs` の文解析（`parse_tokens_in_impl`）が
 //! 先頭語 `MERGE` を見て [`validate_merge_tokens_with_limits`] を呼び、`ParsedSql::Merge` を返す。
 //! 実行系（`execute_parsed_in_session`・明示 Tx・Describe）は束縛（#3352。`sql::merge_bind`・
-//! `core::merge_exec`）を通してから固定文言の `0A000` で止める（副作用ゼロ）。実行は #3353・#3354、
-//! 台帳・`OpTag`・`EXPLAIN` は #3357、`RETURNING` の `merge_action()` は #3356 が担当する。
+//! `core::merge_exec`）を通して実行する（`WHEN MATCHED` は #3353、`NOT MATCHED [BY TARGET|BY SOURCE]` は #3354）。
+//! 対象外の形は固定文言の `0A000` で止める（副作用ゼロ）。台帳・`OpTag`・`EXPLAIN` は #3357、`RETURNING` の
+//! `merge_action()` は #3356 が担当する。
 //!
 //! 構文段の保証範囲: 構文（`42601`）、上限（`54000`）、固定文言の未対応形（`0A000`）、対象・元表の存在
 //! （`42P01`）。列解決・型照合は束縛段の責務で、本モジュールは行わない。`$n` の位置規則は

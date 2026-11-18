@@ -8,7 +8,7 @@
 //! 行・RLS・台帳・書き込みトランザクションには触れない（束縛は読み取りスキーマだけを見る。テナント境界を
 //! 緩める経路を作らない）。
 //!
-//! 呼び出し元: `sql::merge_bind::bind_merge` のみ。実行（押し下げ・結合キーの確定）は #3353・#3354 が
+//! 呼び出し元: `sql::merge_bind::bind_merge` のみ。実行（結合キーの確定。押し下げは行わない）は #3353・#3354 が
 //! この束縛結果（[`BoundCondition`]）を消費する。
 //!
 //! 結合キー候補（対象と元をまたぐ列同士の等値）は型クラス（`values::cmp_class`）が一致するか確認し、
@@ -47,7 +47,7 @@ pub(crate) struct BoundCondition {
 
 impl BoundCondition {
     /// 修飾済みの論理木。
-    #[allow(dead_code)] // 押し下げ（D3）を入れる #3354 が消費するまでは単体テストのみが呼び出し元
+    #[allow(dead_code)] // 押し下げ（D3）は入れない（`sql-merge.md` §10）ため、呼び出し元は単体テストのみ
     pub(crate) fn expr(&self) -> &JoinWhereExpr {
         &self.expr
     }

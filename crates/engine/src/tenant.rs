@@ -7252,6 +7252,7 @@ fn enumerate_dml_candidates_with<E, T>(
 /// - `row_security = off`（`42501`。RLS-13）
 /// - 対象表に利用者ポリシーが適用される（UPDATE 用・DELETE 用のどちらでも固定文言の `0A000`。操作ごとに
 ///   行集合が変わり、第 1 段の列挙と第 3 段の列挙が一致する保証を作れないため。担当 #3355）
+/// - INSERT 句があり、INSERT 側の利用者ポリシーが適用される（固定文言の `0A000`。Issue #3354。担当 #3355）
 /// - 対象表に文トリガがある（固定文言の `0A000`。MERGE の文トリガは操作の種類ごとに 1 回の契約で、既存の
 ///   書き込み経路は呼び出しごとに発火するため。担当 #3355）
 pub(crate) fn merge_target_preflight(
@@ -7259,6 +7260,7 @@ pub(crate) fn merge_target_preflight(
     ctx: &PolicyContext,
     table: &str,
     expected_schema: &crate::catalog::TableSchema,
+    has_insert_clause: bool,
 ) -> Result<(), TenantWriteError> {
     validate_relation_key(table)?;
     let schema = require_table_schema_write_any_identity(write_txn, table)?;
@@ -7286,6 +7288,23 @@ pub(crate) fn merge_target_preflight(
                 "MERGE into a table with row-level security policies is not supported yet",
             ));
         }
+    }
+    // `WHEN NOT MATCHED ... THEN INSERT` があるときは INSERT 側の利用者ポリシー（`WITH CHECK`）も同じく
+    // 未対応で拒否する（RLS 相当を緩めない fail-closed の多層防御。書き込み段も挿入時に同じ検査を持つ。
+    // 担当 #3355）。
+    if has_insert_clause
+        && crate::sql::policy_eval::compile_in_txn(
+            write_txn,
+            ctx.tenant_id(),
+            table,
+            &schema,
+            crate::sql::policy_eval::PolicyCheckKind::InsertCheck,
+        )?
+        .is_some()
+    {
+        return Err(unsupported(
+            "MERGE into a table with row-level security policies is not supported yet",
+        ));
     }
     let triggers =
         crate::catalog::trigger::list_triggers_in_txn(write_txn, ctx.tenant_id(), table)?;

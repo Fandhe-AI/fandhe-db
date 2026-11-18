@@ -3,22 +3,33 @@
 //! 責務境界: 構文検証済みの [`ValidatedMerge`] に対し、対象・元のスキーマを**同一の読み取りスナップショット**
 //! から集めて `sql::merge_bind::bind_merge` へ渡すだけを担う。行・台帳・世代・writer・暗黙 Tx には一切触れず、
 //! 束縛エラーは書き込みより前に返る（Execute・明示 Tx・Describe の各腕が同じ入口を通るため、
-//! SQLSTATE がそろう）。実行（押し下げ・書き込み・台帳）は #3353・#3354、`RETURNING` の束縛は #3356 の担当で、
-//! 束縛に成功した文は従来どおり固定文言の `0A000` で止まる。
+//! SQLSTATE がそろう）。実行は #3353・#3354、台帳は #3357、`RETURNING` の束縛は #3356 の担当で、
+//! 対象外の形は固定文言の `0A000` で止まる。
 //!
 //! 元が部分クエリの形は、内側の検証済み `Statement` を Describe して列記述だけを取り（**実行しない**）、
 //! 疑似列 `id` を持たない採番方式の合成スキーマへ写す。内側の表の RLS は実行時（#3353 以降）に書き込む
 //! セッションの `PolicyContext` で読み取り経路が適用するため、本モジュールはテナント情報を持たず、
 //! 他テナントの存在・件数を観測させる経路を作らない。
 //!
-//! 実行（#3353）: `WHEN MATCHED`（UPDATE・DELETE・DO NOTHING）だけの MERGE は [`EngineCore::execute_merge_in_txn`]
-//! が 3 段で実行する。第 1 段で全組の操作を決めて操作列を作り（行は書かない。`tenant::
-//! enumerate_merge_candidates_readonly`）、第 2 段で `21000` と各上限を判定し、第 3 段で操作列を既存の書き込み経路
-//! （`tenant::update_rows_joined_unchecked`・`delete_rows_where_with_triggers`）へ渡す。第 3 段より前の失敗は
-//! write txn を commit しないため副作用ゼロ（台帳も消費しない）。結合・一意化・上限は `sql::join::dml` の
-//! `UPDATE ... FROM` と同じ実行器を使い、第 2 の結合実行器・第 2 の書き込み経路は作らない。
-//! 対象外の形（`WHEN NOT MATCHED`・`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー）は固定文言の
-//! `0A000` で文全体を拒否する（受け皿は #3354〜#3357）。
+//! 実行（#3353・#3354）: `WHEN MATCHED`・`WHEN NOT MATCHED BY SOURCE`・`WHEN NOT MATCHED [BY TARGET]` の MERGE は
+//! [`EngineCore::execute_merge_in_txn`] が 3 段で実行する。第 1 段で全組の操作を決めて操作列を作り（行は書かない。
+//! `tenant::enumerate_merge_candidates_readonly`）、第 2 段で `21000` と各上限を判定し、第 3 段で操作列を既存の
+//! 書き込み経路（`tenant::update_rows_joined_unchecked`・`delete_rows_where_with_triggers`・
+//! `sql::exec::execute_insert_batch_with_schema_in`）へ渡す。第 3 段より前の失敗は write txn を commit しないため
+//! 副作用ゼロ（台帳も消費しない）。結合・一意化・上限は `sql::join::dml` の `UPDATE ... FROM` と同じ実行器を使い、
+//! 第 2 の結合実行器・第 2 の書き込み経路は作らない。
+//!
+//! 外部保持の列挙（#3354）: 第 1 段の対象候補の列挙は、元の各行に「どれかの対象行に ON が真で一致したか」の
+//! フラグを立てる（句の選択結果や DO NOTHING に関係なく、一致の定義は ON だけ）。一致 0 件の対象行は
+//! `WHEN NOT MATCHED BY SOURCE` の句で、一致があるのに MATCHED の句がどれも発火しない対象行は何も受けない。
+//! 列挙の後、フラグの立っていない元の行（結合キーが NULL の行を含む）を走査順に `WHEN NOT MATCHED [BY TARGET]`
+//! の句で評価する。BY SOURCE は対象表の全候補を走査し得るため、走査行数の上限（`54000`）は第 1 段の列挙で数える。
+//! 第 3 段の適用順は UPDATE の句ごと → DELETE → INSERT の句ごと（PostgreSQL の元の行順の逐次適用との差は
+//! `docs/design/sql-merge.md` §10）。
+//!
+//! 対象外の形（`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー）は固定文言の `0A000` で文全体を
+//! 拒否する（受け皿は #3355〜#3357）。INSERT 句があるとき、INSERT 側の利用者ポリシー（RLS 有効の表）も
+//! `merge_target_preflight` が `0A000` で拒否する（#3355）。
 //!
 //! 呼び出し元: `core.rs` の `ParsedSql::Merge` の腕（autocommit は暗黙 Tx 経由で明示 Tx と同じ腕・Describe）。
 
@@ -31,8 +42,9 @@ use crate::sql::allowlist::{
 use crate::sql::exec::{MergeOutcome, QueryResult};
 use crate::sql::join::dml::JoinedProbe;
 use crate::sql::join::merge_plan::{plan_merge, Choice, MergeEval, MergeSourceInput};
-use crate::sql::merge_bind::{bind_merge, BoundMerge, MergeBindInput};
+use crate::sql::merge_bind::{bind_merge, BoundMerge, BoundMergeAction, MergeBindInput};
 use crate::sql::mode::SessionState;
+use crate::sql::parser::BoundInsert;
 use crate::sql::transaction::SessionTransaction;
 use crate::sql::udf_call::UdfRegistry;
 use crate::sql::view::{resolve_from, Resolved};
@@ -212,7 +224,7 @@ impl EngineCore {
         Ok(TableSchema::new(alias, defs).with_row_identity(RowIdentity::Allocated))
     }
 
-    /// `WHEN MATCHED` だけの `MERGE` を共有 write txn 上で実行する（autocommit は暗黙 Tx 経由で同じ腕に入る）。
+    /// `MERGE`（`WHEN MATCHED`・`NOT MATCHED BY SOURCE`・`NOT MATCHED [BY TARGET]`）を共有 write txn 上で実行する（autocommit は暗黙 Tx 経由で同じ腕に入る）。
     /// 手順は先頭の `//!` を参照。失敗時は呼び出し元が明示 Tx を `Failed` へ遷移させる（他の失敗文と同じ契約）。
     /// 書いた表（対象表・トリガが書いた表）へ `mark_written` する（漏れると COMMIT が write txn を破棄し、
     /// 遅延 FK 検査も取りこぼす。P0）。
@@ -233,15 +245,6 @@ impl EngineCore {
         if stmt.returning.is_some() {
             return Err(SqlSurfaceError::feature_not_supported(
                 "MERGE with RETURNING is not supported yet",
-            ));
-        }
-        if bound
-            .clauses()
-            .iter()
-            .any(|c| c.kind() != MergeMatchKind::Matched)
-        {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "MERGE WHEN NOT MATCHED is not supported yet",
             ));
         }
         if bound.target_view().is_some() {
@@ -290,8 +293,18 @@ impl EngineCore {
         let plan = plan_merge(&bound, target_table, target_schema, source_input)?;
 
         // 5. 対象表の事前判定（行は読まず書かない）と、元の実表のスキーマ照合。
-        crate::tenant::merge_target_preflight(write_txn, ctx, target_table, target_schema)
-            .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
+        let has_insert = bound
+            .clauses()
+            .iter()
+            .any(|c| matches!(c.action(), BoundMergeAction::Insert(_)));
+        crate::tenant::merge_target_preflight(
+            write_txn,
+            ctx,
+            target_table,
+            target_schema,
+            has_insert,
+        )
+        .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
         if matches!(stmt.source, MergeSource::Table(_)) {
             let live = crate::catalog::require_table_schema_write_any_identity(
                 write_txn,
@@ -335,9 +348,54 @@ impl EngineCore {
 
         // 7. 第 1 段: 全組の操作を決める（行は書かない）。1 つの対象行について UPDATE か DELETE を選んだ組が
         // 2 つ目になった時点で `21000`（DO NOTHING と、どの句も真にならなかった組は数えない。D5）。
+        // 時刻は文の先頭で 1 度だけ確定し、SET・VALUES の `now()` と省略列の `DEFAULT now()` で共有する
+        // （`INSERT ... SELECT` と同じ。SQL-37）。外側の式スコープが確定済みならそれを使う。
+        let outer_clock = crate::sql::time_fn::current_clock();
+        let clock = match outer_clock {
+            Some(c) => c,
+            None => {
+                let now = crate::sql::time_fn::now_micros()?;
+                crate::sql::time_fn::StatementClock {
+                    txn_start_micros: now,
+                    stmt_start_micros: now,
+                }
+            }
+        };
+        let _expr_clock = if has_insert && outer_clock.is_none() {
+            Some(crate::sql::time_fn::ClockScope::enter(clock))
+        } else {
+            None
+        };
+        let _default_clock = if has_insert {
+            Some(crate::sql::time_fn::DefaultClockScope::enter(clock))
+        } else {
+            None
+        };
         let mut eval = MergeEval::new(&plan)?;
-        let clause_count = eval.clause_count();
+        // 句の種類ごとの数（条件評価の比較回数の計上に使う）。
+        let count_of =
+            |kind: MergeMatchKind| bound.clauses().iter().filter(|c| c.kind() == kind).count();
+        let matched_clauses = count_of(MergeMatchKind::Matched);
+        let by_source_clauses = count_of(MergeMatchKind::NotMatchedBySource);
+        let by_target_clauses = count_of(MergeMatchKind::NotMatchedByTarget);
         let index = probe.index_handle();
+        // 元の各行が、どれかの対象行に `ON` が真で一致したか（BY TARGET の句があるときだけ確保する。
+        // 確保前に共有バイト予算へ計上する。D7）。
+        let mut matched_flags: Vec<bool> = Vec::new();
+        if by_target_clauses > 0 {
+            probe.charge_bytes(index.rows.len())?;
+            matched_flags
+                .try_reserve_exact(index.rows.len())
+                .map_err(|_| {
+                    SqlSurfaceError::payload_too_large("MERGE source exceeds the row limit")
+                })?;
+            matched_flags.resize(index.rows.len(), false);
+        }
+        let no_source_row = crate::sql::exec::ResultRow {
+            id: 0,
+            score: 0.0,
+            cells: Vec::new(),
+        };
         let mut positions: Vec<u32> = Vec::new();
         let planned = crate::tenant::enumerate_merge_candidates_readonly(
             write_txn,
@@ -351,9 +409,48 @@ impl EngineCore {
                 positions.clear();
                 probe.matches_of(c, &scanned, &mut positions)?;
                 let mut chosen: Option<Planned> = None;
+                if positions.is_empty() {
+                    // 元に一致する行が無い対象行（結合キーが NULL の行を含む）: `WHEN NOT MATCHED BY SOURCE`。
+                    // 一致 0 件なので `21000` は起きない。
+                    if by_source_clauses > 0 {
+                        probe.charge_comparisons(by_source_clauses)?;
+                        match eval.choose_by_source(&scanned, c)? {
+                            Choice::None | Choice::DoNothing => {}
+                            Choice::Delete => {
+                                charge_planned_row(&mut probe)?;
+                                chosen = Some(Planned::Delete);
+                            }
+                            Choice::Update(clause) => {
+                                let values = eval.eval_update(
+                                    clause,
+                                    &scanned,
+                                    c,
+                                    &no_source_row,
+                                    target_schema,
+                                    &mut |n| probe.charge_bytes(n),
+                                )?;
+                                chosen = Some(Planned::Update(clause, values));
+                            }
+                            Choice::Insert(_) => return Err(merge_plan_mismatch()),
+                        }
+                    }
+                    return Ok(chosen);
+                }
+                // 一致の記録は、どの句が選ばれたか（DO NOTHING・どの句も真にならない場合を含む）に関係なく
+                // `ON` が真であることだけで立てる。一致があるのに MATCHED の句がどれも発火しない対象行は
+                // BY SOURCE の句を受けない。
+                if by_target_clauses > 0 {
+                    for &pos in &positions {
+                        *matched_flags.get_mut(pos as usize).ok_or_else(|| {
+                            SqlSurfaceError::Internal {
+                                detail: "matched source row out of range".to_string(),
+                            }
+                        })? = true;
+                    }
+                }
                 // 句の条件評価（`WHEN ... AND`）は組ごとのネストループ。`ON` の残余と同じ比較回数の上限へ
                 // 計上し（超過は `54000`）、一定間隔で中断要求（`57014`）を確認する。
-                probe.charge_comparisons(positions.len().saturating_mul(clause_count))?;
+                probe.charge_comparisons(positions.len().saturating_mul(matched_clauses))?;
                 for (n, &pos) in positions.iter().enumerate() {
                     if n % 1024 == 0 {
                         crate::interrupt::check()?;
@@ -365,19 +462,14 @@ impl EngineCore {
                             .ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "matched source row out of range".to_string(),
                             })?;
-                    let choice = eval.choose(&scanned, c, row)?;
+                    let choice = eval.choose_matched(&scanned, c, row)?;
                     if matches!(choice, Choice::Delete | Choice::Update(_)) && chosen.is_some() {
                         return Err(SqlSurfaceError::merge_cardinality_violation());
                     }
                     match choice {
                         Choice::None | Choice::DoNothing => {}
                         Choice::Delete => {
-                            // 採った対象行の計画（`(id, Planned)` の蓄積・`delete_plan`・`HashSet` の 3 か所）を
-                            // 確保前に共有バイト予算へ計上する（超過は `54000`。D7）。
-                            probe.charge_bytes(
-                                std::mem::size_of::<(u64, Planned)>()
-                                    .saturating_add(std::mem::size_of::<u64>().saturating_mul(3)),
-                            )?;
+                            charge_planned_row(&mut probe)?;
                             chosen = Some(Planned::Delete);
                         }
                         Choice::Update(clause) => {
@@ -391,6 +483,7 @@ impl EngineCore {
                             )?;
                             chosen = Some(Planned::Update(clause, values));
                         }
+                        Choice::Insert(_) => return Err(merge_plan_mismatch()),
                     }
                 }
                 Ok(chosen)
@@ -400,6 +493,46 @@ impl EngineCore {
             PredicateDmlError::Predicate(e) => e,
             PredicateDmlError::Write(e) => crate::sql::exec::map_write_error(e, "update"),
         })?;
+
+        // 7b. 元だけにある行（どの対象行にも一致しなかった行。結合キーが NULL の行を含む）を走査順に
+        // `WHEN NOT MATCHED [BY TARGET]` の句で評価し、INSERT の行を句ごとに積む（行は書かない）。
+        let mut insert_rows: BTreeMap<usize, Vec<InsertRow>> = BTreeMap::new();
+        let mut insert_total: usize = 0;
+        if by_target_clauses > 0 {
+            probe.charge_comparisons(index.rows.len().saturating_mul(by_target_clauses))?;
+            for (n, row) in index.rows.iter().enumerate() {
+                if n % 1024 == 0 {
+                    crate::interrupt::check()?;
+                }
+                let matched =
+                    matched_flags
+                        .get(n)
+                        .copied()
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "source row flag out of range".to_string(),
+                        })?;
+                if matched {
+                    continue;
+                }
+                match eval.choose_by_target(row)? {
+                    Choice::None | Choice::DoNothing => {}
+                    Choice::Insert(clause) => {
+                        let (id, values, provided) =
+                            eval.eval_insert(clause, row, target_schema, &mut |n| {
+                                probe.charge_bytes(n)
+                            })?;
+                        probe.charge_bytes(std::mem::size_of::<InsertRow>())?;
+                        let rows = insert_rows.entry(clause).or_default();
+                        rows.try_reserve(1).map_err(|_| {
+                            SqlSurfaceError::payload_too_large("MERGE INSERT rows exceed the limit")
+                        })?;
+                        rows.push((id, values, provided));
+                        insert_total = insert_total.saturating_add(1);
+                    }
+                    Choice::Delete | Choice::Update(_) => return Err(merge_plan_mismatch()),
+                }
+            }
+        }
 
         // 8. 第 2 段: 上限の判定（一致ペア・比較回数・予算は第 1 段の中で判定済み）。
         // UPDATE は選んだ句ごとに分ける（`UPDATE OF` トリガの発火判定は 1 回の適用の SET 列の和集合で
@@ -417,14 +550,45 @@ impl EngineCore {
                 Planned::Delete => delete_plan.push(id),
             }
         }
-        crate::sql::parser::check_dml_affected_rows_with_limit(planned_total, max_affected_rows)?;
+        // 影響行数の上限は UPDATE・DELETE・INSERT の計画件数の合計で判定する（DO NOTHING は数えない）。
+        crate::sql::parser::check_dml_affected_rows_with_limit(
+            planned_total.saturating_add(insert_total),
+            max_affected_rows,
+        )?;
+        // INSERT の行数・バッチ上限（INDEX-4）も書き込みの前に判定する。
+        let mut insert_bounds: Vec<Vec<BoundInsert>> = Vec::new();
+        if insert_total > 0 {
+            self.check_insert_row_count_limit(insert_total)?;
+            for (clause, rows) in insert_rows {
+                let mut bounds: Vec<BoundInsert> = Vec::new();
+                bounds.try_reserve_exact(rows.len()).map_err(|_| {
+                    SqlSurfaceError::payload_too_large("MERGE INSERT rows exceed the limit")
+                })?;
+                let id_omitted = bound_id_omitted(&bound, &clause);
+                for (id, values, provided) in rows {
+                    bounds.push(crate::sql::insert_select::finish_bound_insert(
+                        target_table,
+                        target_schema,
+                        id,
+                        values,
+                        &provided,
+                        id_omitted,
+                        None,
+                        clock,
+                    )?);
+                }
+                self.validate_insert_row_batch_limits(&bounds)?;
+                insert_bounds.push(bounds);
+            }
+        }
         drop(eval);
         drop(probe);
 
         // 9. 第 3 段: 既存の書き込み経路へ適用する。台帳は記録しない（`Omitted`／`Disabled`）ため、文ハッシュは
-        // 記録に使われない（#3357 が MERGE 用の `for_merge` に置き換える）。適用は UPDATE の句ごと → DELETE の
-        // 順（走査し直す回数は UPDATE 句数 + 1 で、句数は構文段の上限で抑えられ行数に比例しない。UPDATE と
-        // DELETE の対象行は `21000` の判定により互いに素）。
+        // 記録に使われない（#3357 が MERGE 用の `for_merge` に置き換える）。適用は UPDATE の句ごと → DELETE →
+        // INSERT の句ごとの順（走査し直す回数は UPDATE 句数 + 1 で、句数は構文段の上限で抑えられ行数に比例
+        // しない。UPDATE と DELETE の対象行は `21000` の判定と一致 0 件の振り分けにより互いに素）。INSERT は
+        // 対象を走査し直さず、句ごとに `id` 省略の一様性（バッチの制約）を保つ。
         debug_assert!(ledger_write.op_id().is_none());
         let hash = crate::recovery::content_hash::for_delete(0);
         let generated_scope =
@@ -488,6 +652,17 @@ impl EngineCore {
                 }
                 _ => return Err(merge_plan_mismatch()),
             }
+        }
+        for bounds in &insert_bounds {
+            let outcome = crate::sql::exec::execute_insert_batch_with_schema_in(
+                WriteTarget::InTxn(write_txn),
+                ctx,
+                bounds,
+                self.ledger_mode,
+                Some(target_schema),
+                Some(&self.trigger_runtime.bind(self)),
+            )?;
+            rows_affected = rows_affected.saturating_add(outcome.rows_affected);
         }
         drop(generated_scope);
         let written = trigger_scope.take();
@@ -569,6 +744,26 @@ impl EngineCore {
             rows: projected,
         })
     }
+}
+
+/// BY TARGET の `INSERT` が積んだ 1 行（疑似列 id・列ごとの値・列ごとの「値が指定されたか」）。
+type InsertRow = (u64, Vec<crate::row_codec::Value>, Vec<bool>);
+
+/// 採った対象行の計画（`(id, Planned)` の蓄積・`delete_plan`・`HashSet` の 3 か所）を確保前に共有バイト予算へ
+/// 計上する（超過は `54000`。D7）。
+fn charge_planned_row(probe: &mut JoinedProbe<'_>) -> Result<(), SqlSurfaceError> {
+    probe.charge_bytes(
+        std::mem::size_of::<(u64, Planned)>()
+            .saturating_add(std::mem::size_of::<u64>().saturating_mul(3)),
+    )
+}
+
+/// 句 `clause` の INSERT が疑似列 `id` を省略するか（移行済み表の採番。`BoundInsert::id_omitted`）。
+fn bound_id_omitted(bound: &BoundMerge, clause: &usize) -> bool {
+    matches!(
+        bound.clauses().get(*clause).map(|c| c.action()),
+        Some(BoundMergeAction::Insert(ins)) if ins.id_omitted()
+    )
 }
 
 /// 第 1 段が 1 つの対象行について決めた操作。

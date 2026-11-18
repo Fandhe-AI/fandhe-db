@@ -8,7 +8,9 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 方式は決定済み・実装は進行中（#3351〜#3358）。**#3351 で構文解析を実装済み**（`sql::allowlist::merge`・`ParsedSql::Merge`）。解析を通った MERGE は Execute・Describe・明示 Tx のいずれも固定文言の `0A000`（`MERGE is not supported yet`）で止まり、行・台帳・writer・世代に触れない（`USING OPERATION_ID` も台帳に参加させない）。従来 `42601` だった形のうち、構文を通るものが `0A000` に変わる。束縛は #3352 で入った（下の §8）。実行・`RETURNING`・台帳・`EXPLAIN` は後続（#3353〜#3357）が入れる。
 
-**#3353 で `WHEN MATCHED`（UPDATE・DELETE・DO NOTHING）の実行と多重一致の `21000` を実装済み**（下の §9）。`WHEN NOT MATCHED`・`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシーの形は固定文言の `0A000` のまま止まる。
+**#3353 で `WHEN MATCHED`（UPDATE・DELETE・DO NOTHING）の実行と多重一致の `21000` を実装済み**（下の §9）。`WHEN NOT MATCHED`・`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシーの形は固定文言の `0A000` のまま止まる（#3354 で NOT MATCHED は実行される。次の段落）。
+
+**#3354 で `WHEN NOT MATCHED [BY TARGET]` の INSERT と `WHEN NOT MATCHED BY SOURCE` の実行を実装済み**（下の §10）。外部保持の列挙は第 1 段の対象候補の列挙に一致フラグを足して行い、適用順は UPDATE → DELETE → INSERT。`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー（INSERT 側を含む）の形は固定文言の `0A000` のまま止まる。
 
 **#3352 で束縛を実装済み**（`sql::merge_bind`・`core::merge_exec`。下の「#3352 の束縛」節）。束縛エラー（`42703`・`42702`・`42P01`・`42804`・`22000`・`55000` 等）は書き込みより前に返り、束縛を通った Execute・明示 Tx は固定文言の `0A000` のまま、Describe は `RETURNING` なしなら結果列なしで成功する（`RETURNING` つきは `0A000`）。
 
@@ -201,7 +203,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 | D1・D7 の構文段 | #3351 |
 | D2・D4 の束縛と参照できる側・ビュー対象・`$n` | #3352 |
 | D3・D5・D6 の MATCHED と `21000`（実装済み。§9。コマンドタグ `MERGE n` と `SqlOutcome::Merge` を前倒しで含む） | #3353 |
-| D3・D6 の BY TARGET の INSERT と BY SOURCE | #3354 |
+| D3・D6 の BY TARGET の INSERT と BY SOURCE（実装済み。§10） | #3354 |
 | D8・D10・D12 | #3355 |
 | D13 の RETURNING・`merge_action()`・タグ | #3356 |
 | D9・D11・D13 の EXPLAIN・crash 耐性の段 | #3357 |
@@ -235,7 +237,7 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 | 形 | 受け皿 | 判定の位置 |
 | -- | ------ | ---------- |
-| `WHEN NOT MATCHED [BY TARGET]`・`BY SOURCE` の句を 1 つでも含む | #3354 | 束縛の後、writer の取得の前 |
+| `WHEN NOT MATCHED [BY TARGET]`・`BY SOURCE` の句を 1 つでも含む（#3354 で実行する形になった。§10） | 実装済み | — |
 | `RETURNING` つき | #3356 | 同上 |
 | 台帳へ記録する構成（`USING OPERATION_ID` つき） | #3357 | 同上 |
 | 対象がビュー | #3355 | 同上 |
@@ -256,12 +258,51 @@ spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/
 
 ### 意図的な変更・見送り（後続への申し送り）
 
-- **適用順（D6 からの変更）**: D6 は「同じ種類が続く区間ごと」に渡すとしていたが、本実装は UPDATE の選択句ごと → DELETE の最大 1 回（UPDATE 句数 + 1 回以内。`UPDATE OF` トリガの発火判定が SET 列の和集合で行われるため句ごとに分ける）にする。各区間は対象表を候補列挙で走査し直すため、区間ごとに呼ぶと区間数 × 走査行数の計算量になり（UPDATE と DELETE が交互なら DoS になる）、`21000` の判定により UPDATE と DELETE の対象行は互いに素になるため。即時の UNIQUE などの検査が適用順に依存することは、D6 自体が「PG17 でも計画依存」と認めている。#3354 の INSERT 区間・#3355 の行トリガ順の再判断に申し送る
-- **押し下げ（D3）の見送り**: `ON` の等値キー以外（片側だけを参照する conjunct を含む）はすべて残余に残す。正しさが押し下げの有無に依存しないため。BY TARGET／BY SOURCE の有無を見て最適化を判断するのは #3354
+- **適用順（D6 からの変更）**: D6 は「同じ種類が続く区間ごと」に渡すとしていたが、本実装は UPDATE の選択句ごと → DELETE の最大 1 回（UPDATE 句数 + 1 回以内。`UPDATE OF` トリガの発火判定が SET 列の和集合で行われるため句ごとに分ける）にする。各区間は対象表を候補列挙で走査し直すため、区間ごとに呼ぶと区間数 × 走査行数の計算量になり（UPDATE と DELETE が交互なら DoS になる）、`21000` の判定により UPDATE と DELETE の対象行は互いに素になるため。即時の UNIQUE などの検査が適用順に依存することは、D6 自体が「PG17 でも計画依存」と認めている。#3354 の INSERT 区間は §10（UPDATE → DELETE → INSERT）、#3355 の行トリガ順の再判断に申し送る
+- **押し下げ（D3）の見送り**: `ON` の等値キー以外（片側だけを参照する conjunct を含む）はすべて残余に残す。正しさが押し下げの有無に依存しないため。BY TARGET／BY SOURCE の有無を見ても押し下げは入れない（#3354 の判断は §10）
 - **条件内の結合キー**: `WHEN ... AND` の条件で束縛器が結合キーへ振り分けた「対象と元をまたぐ列同士の等値」は、残余と別に評価する（`ON` と同じ正準バイト列の一致。どちらかが NULL なら真にしない）。落とすと条件が黙って広がるため
 - **評価ビューの並び**: 各条件の残余と各 SET 式の元の列リストは独自の並びを持つため、評価ビューは評価単位ごとに「対象の走査結果 ++ その単位が参照する元の列」を組み立てる。走査の投影は全評価単位の参照列の和集合
 - **コマンドタグの前倒し**: D13 の担当は #3356 だが、件数（`MERGE n`）を観測するために `SqlOutcome::Merge` と wire のタグ写像を本 Issue で先に入れた。#3356 は `RETURNING` 側のタグと `merge_action()` を担う
 - **PG17 との突き合わせ（#3358 の確認項目に加える）**: `21000` の文言、UPDATE → DELETE の適用順が即時の UNIQUE／FK 検査に与える差（入力は順序に依存しないものを使う）、行トリガの発火順（#3355 が再判断）、コマンドタグ `MERGE n`（拡張クエリを含む）
+
+## 10. #3354 の実行（`WHEN NOT MATCHED [BY TARGET]` の INSERT と `BY SOURCE`）
+
+実装は `core::merge_exec`（外部保持の列挙と INSERT 区間）・`sql::join::merge_plan`（句の種類ごとの評価・INSERT 値の評価）・`sql::insert_select::finish_bound_insert`（INSERT ... SELECT と共有する `BoundInsert` の組み立て）・`tenant::merge_target_preflight`（INSERT ポリシーの拒否）。第 2 の結合実行器・第 2 の挿入経路は作らない。
+
+### 外部保持の列挙（D3・D4 の具体化）
+
+- 第 1 段の対象候補の述語の中で、`matches_of` が返した全位置に「元の行が一致した」フラグを立てる。一致の定義は `ON`（等値キーと残余）が真であることだけで、どの句が選ばれたか（DO NOTHING・どの句も真にならない場合を含む）には依存しない。フラグは BY TARGET の句があるときだけ確保し、確保前に共有バイト予算へ計上する
+- 対象候補ごとの振り分け: 一致が 1 件以上なら MATCHED の句だけを評価する（従来どおり。`21000` の判定もここ）。一致が 0 件なら BY SOURCE の句だけを評価する。対象の結合キーが NULL の行は一致 0 件になり BY SOURCE 側へ入る。一致があるのに MATCHED の句がどれも発火しない行は BY SOURCE を受けない
+- BY SOURCE の句は宣言順で最初に条件が真になった句を採る（UPDATE は SET を評価して保持、DELETE は id を保持）。一致 0 件なので `21000` は起きない。MATCHED の対象行と BY SOURCE の対象行は互いに素なので、第 3 段の UPDATE・DELETE の区間をそのまま共有する
+- 対象候補の列挙が終わった後、フラグの立っていない元の行（結合キーが NULL の行を含む）を走査順に辿り、BY TARGET の句を宣言順に評価する。INSERT が選ばれたら値を評価して句ごとに保持する。1024 行ごとに中断要求（`57014`）を確認し、条件評価の回数（行数 × BY TARGET の句数）・保持する値は既存の比較回数・共有バイト予算へ計上する
+- 対象の走査は省略しない。BY TARGET だけの MERGE でも一致フラグのために対象候補を列挙し、走査行数の上限（`54000`）は BY SOURCE の有無によらず同じ列挙で数える
+- 評価ビュー: BY SOURCE は対象行だけ（元の列は空）、BY TARGET は対象側を全列 NULL で埋めた「対象 ++ 元の列」。束縛段が各句の可視範囲を片側に限っているので、反対側を参照する計画は存在しない
+
+### INSERT 句の評価と書き込み
+
+- 値の 4 種（列参照・リテラル・定数式・元の列を含む式）は `UPDATE SET` と同じ計画と評価関数を共有する。裸の `DEFAULT`・列リストにない列は「省略列」として `finish_bound_insert`（`fill_omitted_columns`）が補完する（DEFAULT・生成列・IDENTITY／`DEFAULT nextval` の印）。`DEFAULT nextval` と IDENTITY の採番は複数行 VALUES と同じく書き込み段が文の中で行う
+- 疑似列 `id`: 元の整数列・疑似列 `id` は `INSERT ... SELECT` と同じ規則（NULL・負数は `22000`）、リテラルはその値、移行済み表の省略は書き込み段が採番する
+- 影響行数の上限は UPDATE・DELETE・INSERT の計画件数の合計で判定する（DO NOTHING は数えない）。INSERT の行数上限とバッチの上限（INDEX-4）も第 3 段より前に判定する。いずれも超過は `54000` で副作用ゼロ
+- 書き込みは句ごとに `sql::exec::execute_insert_batch_with_schema_in`（共有 write txn）へ渡す。バッチは `id` 省略の一様性を要求し、句ごとに列リストが異なるため。挿入は対象を走査し直さないので、句数（構文段の上限）× 行数のコストにはならない。台帳は記録しない（`operation_id` は渡さない。#3357）
+- `rows_affected` は UPDATE・DELETE の実変更行数に挿入行数を足した値（DO NOTHING は含めない）
+- 採番・DEFAULT 時刻のスコープ（`core.rs` の `insert_sequence_scope`・`insert_default_clock_scope`）: INSERT 句を含む MERGE だけが許可リストに入る（UPDATE・DELETE だけの MERGE は張らない）。文の時刻は先頭で 1 度だけ確定し、SET・VALUES の時刻関数と省略列の `DEFAULT now()` で共有する（`INSERT ... SELECT` と同じ）
+
+### 意図的な変更・見送り（後続への申し送り）
+
+- **適用順（D6 からの変更）**: UPDATE の句ごと → DELETE の最大 1 回 → INSERT の句ごと（句の添字の昇順。各句の中は元の走査順）。PG17 の元の行順の逐次適用と異なり、即時の UNIQUE などの検査が適用順に依存する形（同じキーを DELETE と INSERT が触れる等）は結果が異なり得る。D6 が「PG17 でも計画依存」と認める範囲で、突き合わせは順序に依存しない入力で行う（#3358）
+- **押し下げ（D3）は対応しない**: 片側だけを参照する `ON` の conjunct を押し下げると、BY TARGET／BY SOURCE で「未一致」になる行の集合が変わる。残余に残せば、BY TARGET／BY SOURCE の有無によらず正しい。最適化のみで正しさに影響しないため、実装しない
+- **INSERT 側の利用者ポリシー**: 対象表に INSERT 側のポリシーが適用される（RLS 有効）場合は、INSERT 句があるとき `tenant::merge_target_preflight` が固定文言の `0A000`（既存の「row-level security policies is not supported yet」と同じ文言）で拒否する。書き込み段も挿入時に同じ検査を持つが、MERGE 全体のポリシーの合成は #3355 が担うため、RLS 相当を緩めない fail-closed の多層防御にした
+- **PG17 との突き合わせ（#3358 の確認項目に加える）**: 適用順の差、未一致の元行が重複するときの挙動（両方挿入・UNIQUE があれば `23505`）、NULL キーの扱い、`MERGE n` の件数（INSERT を含む）
+
+### 対象外（受け皿）
+
+| 項目 | 受け皿 |
+| ---- | ------ |
+| `RETURNING`・`merge_action()` | #3356 |
+| 台帳記録（`USING OPERATION_ID`）・`OpTag`・`EXPLAIN MERGE`・crash 耐性 | #3357 |
+| ビュー対象・文トリガ・利用者ポリシー（INSERT ポリシーを含む）・行トリガ順の再判断 | #3355 |
+| PG17 との突き合わせ・3 テナントの越境の網羅 | #3358 |
+| ON の片側 conjunct の押し下げ | 対応しない（上記） |
 
 ## セキュリティ
 
