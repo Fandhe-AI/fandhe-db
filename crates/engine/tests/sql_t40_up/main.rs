@@ -199,6 +199,8 @@ mod sql76_explain_verbose;
 mod sql78_predicate_dml_noneq_between_params;
 mod sql78_where_noneq_between_params;
 mod sql79_merge_bind;
+mod sql79_merge_explain;
+mod sql79_merge_ledger;
 mod sql79_merge_matched;
 mod sql79_merge_not_matched;
 mod sql79_merge_parse;

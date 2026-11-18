@@ -3,8 +3,8 @@
 //!
 //! 契約: MATCHED の句だけで書かれた MERGE は、autocommit・明示 Tx のどちらでも実行され、行の内容と件数
 //! （UPDATE と DELETE の実変更行数の合計。DO NOTHING は含めない）が決まる。1 つの対象行について UPDATE か
-//! DELETE を選んだ組が 2 つ以上あれば文全体が `21000` になり、行・台帳・世代に何も残らない。対象外の形
-//! （台帳記録）は固定文言の `0A000` で拒否する。`RETURNING` は #3356 から実行される。他テナントの行は一致・件数・`21000` のどれにも現れない（3 テナントの越境の網羅は #3358）。
+//! DELETE を選んだ組が 2 つ以上あれば文全体が `21000` になり、行・台帳・世代に何も残らない。台帳記録（#3357）は
+//! `sql79_merge_ledger.rs` で固定する。`RETURNING` は #3356 から実行される。他テナントの行は一致・件数・`21000` のどれにも現れない（3 テナントの越境の網羅は #3358）。
 //! 期待値は設計記録の決定から導く（PG17 との突き合わせは #3358）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -623,24 +623,22 @@ fn returning_returns_the_deleted_rows_and_the_same_count() {
     }
 }
 
-// 台帳へ記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュを入れる #3357 まで拒否する。
-// 再送しても台帳を消費しない。
-// tracked: #3357
+// 台帳へ記録する構成（`USING OPERATION_ID` つき。#3357）: 1 回目は実行して台帳へ 1 エントリ記録し、同一内容の
+// 再送は `23505`（行・世代は不変）、別内容への再利用は `22023`。
 #[test]
-fn a_ledger_recorded_operation_id_is_rejected_until_the_ledger_is_wired() {
+fn a_ledger_recorded_operation_id_records_once_and_replays_23505() {
     let (core, _g) = new_core("sql79m-opid");
     seed(&core);
-    let before = snapshot(&core);
     let sql = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE USING OPERATION_ID 'merge-op-1'";
+    assert_eq!(merged(&core, sql), 2);
+    let after_first = snapshot(&core);
     for _ in 0..2 {
-        let (code, msg) = err_code(&core, sql);
-        assert_eq!(code, "0A000");
-        assert_eq!(
-            msg,
-            "feature not supported: MERGE with a ledger-recorded operation_id is not supported yet"
-        );
-        assert_eq!(before, snapshot(&core));
+        assert_eq!(err_code(&core, sql).0, "23505");
+        assert_eq!(after_first, snapshot(&core));
     }
+    let other = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DO NOTHING USING OPERATION_ID 'merge-op-1'";
+    assert_eq!(err_code(&core, other).0, "22023");
+    assert_eq!(after_first, snapshot(&core));
 }
 
 // ビューを対象にする MERGE は、基底表へ書き換えて実行する（#3355）。ビュー述語の外の基底行は一致しない。
@@ -966,7 +964,7 @@ fn the_target_scan_limit_applies_and_leaves_nothing() {
 }
 
 /// 台帳の構成: 台帳を持たない構成は実行でき、台帳必須の構成は `operation_id` を欠くと `23502`
-/// （`USING OPERATION_ID` を付けた形は #3357 まで固定文言の `0A000`。上のテスト）。
+/// （`USING OPERATION_ID` を付けた形の記録・再送は上のテストと `sql79_merge_ledger.rs`）。
 #[test]
 fn ledger_modes_without_a_recording_path_follow_the_fail_closed_rules() {
     let (core, _g) = limited_core("sql79m-ledger-compare", |c| {

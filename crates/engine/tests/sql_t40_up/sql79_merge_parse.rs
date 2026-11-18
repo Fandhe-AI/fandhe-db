@@ -1,10 +1,10 @@
-//! `MERGE` 文の構文解析と、実行に結線されていない形の固定文言 `0A000`（SQL-79・Issue #3351・#3353・#3354。
+//! `MERGE` 文の構文解析と、結線されていない形の固定文言 `0A000`（SQL-79・Issue #3351・#3353・#3354。
 //! 親 #3349、設計記録 `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
 //!
 //! 契約: 構文解析と束縛（#3352。`sql79_merge_bind.rs`）を通った MERGE のうち、`WHEN MATCHED` は #3353 から、
 //! `WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 から、`RETURNING` は #3356 から実行される（行・件数は
-//! `sql79_merge_matched.rs`・`sql79_merge_not_matched.rs`・`sql79_merge_returning.rs`）。台帳記録の形は固定文言の
-//! `0A000` で止まり、行・台帳・世代に一切触れない（`USING OPERATION_ID` 付きを再送しても `23505` にならない）。
+//! `sql79_merge_matched.rs`・`sql79_merge_not_matched.rs`・`sql79_merge_returning.rs`）。台帳記録（`USING OPERATION_ID`。#3357）は
+//! 1 回目を実行し、再送は `23505`（`sql79_merge_ledger.rs` が網羅）。
 //! 構文エラーは `42601`、上限超過は `54000`、権限は書き込みゲートの `42501`。受け皿は #3357（台帳）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -171,19 +171,20 @@ fn sql79_returning_runs_and_returns_the_changed_rows() {
     }
 }
 
-// 台帳へ記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュを入れる #3357 まで拒否する。
-// tracked: #3357
+// 台帳へ記録する構成（`USING OPERATION_ID` つき）は #3357 から実行され、再送は `23505` で行を変えない。
 #[test]
-fn sql79_operation_id_is_not_consumed_by_the_fixed_rejection() {
+fn sql79_operation_id_records_and_replays_23505() {
     let (core, _g) = new_core("sql79-opid");
     seed(&core);
-    let before = snapshot(&core);
     let sql = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE USING OPERATION_ID 'merge-op-1'";
+    let out = run(&core, sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    assert!(out.starts_with("Merge("), "{out}");
+    let after_first = snapshot(&core);
     for _ in 0..2 {
         let (code, _) = run(&core, sql).expect_err(sql);
-        assert_eq!(code, "0A000");
+        assert_eq!(code, "23505");
     }
-    assert_eq!(before, snapshot(&core));
+    assert_eq!(after_first, snapshot(&core));
 }
 
 #[test]

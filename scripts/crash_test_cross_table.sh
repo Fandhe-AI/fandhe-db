@@ -22,6 +22,12 @@
 # のは遅い runner での不安定化を避けるため（アサーションの弱体化ではない）。実行中・COMMIT
 # 直前・直後の 3 点は scripts/crash_test_txn_kill_points.sh がセットごとに決定的に検証する。
 #
+# Issue #3357: merge モード（1 文の MERGE が DELETE・UPDATE・INSERT の 3 区間を書く。SQL-79・TABLE-43・
+# RECOVER-10/11）を同じ骨格で実行する。write.log の最後の行が IN_MERGE なら「MERGE の途中に kill が当たった」
+# と分類し、再起動後の適用済みラウンド数は ack 済みの n か n+1（全区間が残るか全く残らないか）に限る。
+# txn と merge は別々に「途中の kill を 1 度も観測しなければ失敗」を判定する（空虚な成功の拒否）。台帳と行の
+# 一致・再送の 23505 は道具側の verify が検査する。
+#
 # 使い方: scripts/crash_test_cross_table.sh [セット数（既定 2）] [反復回数（既定 10）]
 
 set -u
@@ -199,6 +205,26 @@ run_mode() {
           exit 1
         fi
       fi
+      if [ "${mode}" = "merge" ]; then
+        # 道具側の rows は適用済みラウンド数。1 文は全区間が残るか全く残らないかなので、ack 済みの n か n+1。
+        last_line="$(grep -E '^(IN_MERGE batch=[0-9]+|COMMITTED batch=[0-9]+ rows=[0-9]+)$' "${WRITE_LOG}" | tail -1)"
+        acked_n="${acked:-0}"
+        max_rows=$((acked_n + 1))
+        if [ "${rows}" -gt "${max_rows}" ]; then
+          echo "ERROR: applied rounds ${rows} exceed acked ${acked_n} + one statement, phantom apply suspected (set ${set_no} iteration ${i})" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+        if [[ "${last_line}" == IN_MERGE* ]]; then
+          saw_in_merge=true
+        elif [ "${rows}" -ne "${acked_n}" ]; then
+          echo "ERROR: applied rounds ${rows} differ from acked ${acked_n} although no statement was in flight (set ${set_no} iteration ${i})" >&2
+          rm -rf "${WORKDIR}"
+          trap - EXIT
+          exit 1
+        fi
+      fi
       last_rows="${rows}"
       completed=$((completed + 1))
     done
@@ -216,19 +242,23 @@ run_mode() {
   done
 }
 
-# txn モードの検査オラクルが空振りしないこと（部分コミット・空 DB を検出できること）を先に確かめる。
-SELF_CHECK_DIR="$(mktemp -d)"
-if ! "${BIN}" self-check "${SELF_CHECK_DIR}" txn; then
-  echo "ERROR: txn mode self-check failed" >&2
+# txn・merge モードの検査オラクルが空振りしないこと（部分コミット・混在・台帳欠落・空 DB を検出できること）
+# を先に確かめる。
+for self_check_mode in txn merge; do
+  SELF_CHECK_DIR="$(mktemp -d)"
+  if ! "${BIN}" self-check "${SELF_CHECK_DIR}" "${self_check_mode}"; then
+    echo "ERROR: ${self_check_mode} mode self-check failed" >&2
+    rm -rf "${SELF_CHECK_DIR}"
+    exit 1
+  fi
   rm -rf "${SELF_CHECK_DIR}"
-  exit 1
-fi
-rm -rf "${SELF_CHECK_DIR}"
+done
 
 total_iterations=$((SETS * ITERATIONS))
 total_completed=0
 saw_in_flight=false
-for run_mode_name in batch txn; do
+saw_in_merge=false
+for run_mode_name in batch txn merge; do
   completed=0
   run_mode "${run_mode_name}"
   if [ "${completed}" -ne "${total_iterations}" ]; then
@@ -240,6 +270,10 @@ for run_mode_name in batch txn; do
     echo "ERROR: txn mode never observed an in-flight transaction (SIGKILL always landed outside a transaction)" >&2
     exit 1
   fi
+  if [ "${run_mode_name}" = "merge" ] && [ "${saw_in_merge}" != "true" ]; then
+    echo "ERROR: merge mode never observed an in-flight MERGE (SIGKILL always landed outside a statement)" >&2
+    exit 1
+  fi
 done
 
-echo "crash_test_cross_table.sh: OK (${SETS} sets x ${ITERATIONS} iterations x 2 modes (batch, txn) = ${total_completed} SIGKILL reps)"
+echo "crash_test_cross_table.sh: OK (${SETS} sets x ${ITERATIONS} iterations x 3 modes (batch, txn, merge) = ${total_completed} SIGKILL reps)"

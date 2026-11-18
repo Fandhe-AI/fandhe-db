@@ -3,7 +3,7 @@
 //! 責務境界: 構文検証済みの [`ValidatedMerge`] に対し、対象・元のスキーマを**同一の読み取りスナップショット**
 //! から集めて `sql::merge_bind::bind_merge` へ渡すだけを担う。行・台帳・世代・writer・暗黙 Tx には一切触れず、
 //! 束縛エラーは書き込みより前に返る（Execute・明示 Tx・Describe の各腕が同じ入口を通るため、
-//! SQLSTATE がそろう）。実行は #3353・#3354、`RETURNING` は #3356、台帳は #3357 の担当で、
+//! SQLSTATE がそろう）。実行は #3353・#3354、`RETURNING` は #3356、台帳・`EXPLAIN` は #3357 の担当で、
 //! 対象外の形は固定文言の `0A000` で止まる。
 //!
 //! 元が部分クエリの形は、内側の検証済み `Statement` を Describe して列記述だけを取り（**実行しない**）、
@@ -41,8 +41,9 @@
 //! 結果行は対象候補の走査順 → 元の走査順の INSERT の順で返す（設計記録 §12）。該当トリガを持つ表との併用は
 //! BEFORE STATEMENT より前に固定文言の `0A000` で拒否する。
 //!
-//! 対象外の形（台帳記録・INSTEAD OF トリガを持つビュー）は固定文言の `0A000` で文全体を拒否する
-//! （受け皿は #3357。INSTEAD OF は対応しない）。
+//! 台帳（#3357）: `USING OPERATION_ID` つきは writer 取得直後に事前照合（再送は `23505`／`22023`。トリガ・走査より前）、
+//! 全区間と AFTER STATEMENT の後に文全体で 1 エントリだけ記録する（区間ごとの記録は抑止。ビュー対象は
+//! `for_view_write` のドメイン）。INSTEAD OF トリガを持つビューは固定文言の `0A000` で文全体を拒否する（対応しない）。
 //!
 //! 呼び出し元: `core.rs` の `ParsedSql::Merge` の腕（autocommit は暗黙 Tx 経由で明示 Tx と同じ腕・Describe）。
 
@@ -114,7 +115,73 @@ fn merge_trigger_events(stmt: &ValidatedMerge) -> Vec<u8> {
 const INSTEAD_OF_TARGET_UNSUPPORTED: &str =
     "MERGE into a view with INSTEAD OF triggers is not supported";
 
+/// 束縛に使った元のスキーマから、計画変換の入力（元の表名・スキーマ・ビュー述語）を作る
+/// （実行段と `EXPLAIN MERGE` が共有する。第 2 の変換を持たない）。
+fn merge_source_input(stmt: &ValidatedMerge, schemas: &MergeBindSchemas) -> MergeSourceInput {
+    match (&stmt.source, &schemas.source_view) {
+        (MergeSource::Table(_), Some((base, preds))) => MergeSourceInput {
+            table: base.clone(),
+            schema: schemas.source_schema.clone(),
+            view_predicates: preds.clone(),
+        },
+        (MergeSource::Table(rel), None) => MergeSourceInput {
+            table: rel.table().to_string(),
+            schema: schemas.source_schema.clone(),
+            view_predicates: Vec::new(),
+        },
+        (MergeSource::Subquery { .. }, _) => MergeSourceInput {
+            table: String::new(),
+            schema: schemas.source_schema.clone(),
+            view_predicates: Vec::new(),
+        },
+    }
+}
+
 impl EngineCore {
+    /// `EXPLAIN MERGE` の木を組む（Issue #3357・設計記録 D13）。実行時と同じ順序（束縛 → 計画変換 → 走査前の
+    /// 形検証・キー型クラス → 元の走査の束縛）で検証するため、拒否の `wire_code` は実行と一致する。読むのは
+    /// 同一の読み取りスナップショットのスキーマと GIN 宣言だけで、行・台帳・writer・世代・トリガには触れない。
+    /// 元が部分クエリの形は実行せず、固定の分類行（`source_kind: subquery`）にする。
+    pub(super) fn merge_explain_outcome(
+        &self,
+        session: &SessionState,
+        stmt: &ValidatedMerge,
+    ) -> Result<SqlOutcome, SqlSurfaceError> {
+        let read_txn = self.begin_read_txn()?;
+        let udfs = session.udfs();
+        let (bound, schemas) =
+            self.bind_merge_stmt_with_schemas(session, stmt, udfs, &[], Some(&read_txn))?;
+        let target_table: &str = match &schemas.target_view {
+            Some(v) => v.base_table.as_str(),
+            None => stmt.target_table(),
+        };
+        let plan = plan_merge(
+            &bound,
+            target_table,
+            &schemas.target_schema,
+            merge_source_input(stmt, &schemas),
+        )?;
+        let limits = self.joined_dml_limits();
+        plan.joined.validate(&limits)?;
+        plan.joined.key_classes()?;
+        let source_lines = match &stmt.source {
+            MergeSource::Table(_) => {
+                let scan = crate::sql::join::dml::source_bound_scan(&plan.joined, udfs, &limits)?;
+                let gins = Self::gin_decls_for_explain(&read_txn, &scan)?;
+                Self::scan_explain_lines(&plan.joined.source.schema, &scan, &gins)
+            }
+            MergeSource::Subquery { .. } => vec!["source_kind: subquery".to_string()],
+        };
+        let shape = crate::sql::explain_dml::MergeExplainShape::from_stmt(
+            stmt,
+            plan.joined.keys.len(),
+            plan.joined.residual.is_some(),
+        );
+        let node = crate::sql::explain_dml::merge_explain_tree(&shape, source_lines)
+            .map_err(|e| e.into_surface_error())?;
+        Ok(SqlOutcome::Explain(node.into_query_result()))
+    }
+
     /// `MERGE` を束縛する（Execute・Describe 共通）。`dummy_flags` は Describe の `$n` ダミーフラグ
     /// （Execute は空）。権限ゲート（`42501`）は呼び出し元が済ませている前提で、本関数は読み取りスナップショット
     /// だけを使う。
@@ -330,17 +397,11 @@ impl EngineCore {
 
         // 2. `RETURNING`（Issue #3356）は束縛済み（`bound.returning()`）。束縛エラーは上で返っている。
         let want_returning = bound.returning().is_some();
-        // 台帳を記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュが入る #3357 まで拒否する
-        // （記録漏れで再送の冪等性が無いまま受理する経路を作らない）。省略時は台帳へ記録しない（`Omitted`）。
-        let ledger_write = self
-            .ledger_mode
+        // 台帳の構成判定（`Ledgered` で `operation_id` 省略は `23502`）。記録・照合は writer 取得後に文全体で
+        // 1 回だけ行い（Issue #3357。設計記録 D10・D11）、区間ごとには記録しない。
+        self.ledger_mode
             .resolve(stmt.operation_id())
             .map_err(|_| SqlSurfaceError::MissingOperationId)?;
-        if ledger_write.op_id().is_some() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "MERGE with a ledger-recorded operation_id is not supported yet",
-            ));
-        }
 
         // 3. writer 取得（待機超過は `55P03`。`READ ONLY` Tx は呼び出し元のゲートが `25006`）。
         txn.ensure_writer(ctx)?;
@@ -354,6 +415,24 @@ impl EngineCore {
             None => stmt.target_table(),
         };
         let target_schema = &schemas.target_schema;
+        // 台帳の文ハッシュ。ビュー対象は単独のビュー書き込みと同じく、ビュー名のドメインを被せる（TABLE-43）。
+        // 台帳のキー（表名）は基底表のまま。事前照合と確定記録の両方に同じ値を使う。
+        let ledger_hash = match &schemas.target_view {
+            Some(v) => {
+                crate::recovery::content_hash::for_view_write(&v.name, stmt.statement_hash())
+            }
+            None => *stmt.statement_hash(),
+        };
+        // 台帳の事前照合（SQL-79・Issue #3357）。再送は BEFORE STATEMENT の発火・元の走査・部分クエリの
+        // 実体化より前に `23505`（同一文）／`22023`（別文）で拒否する（トリガ 0 回・採番なし・走査なし）。
+        crate::sql::exec::precheck_insert_select_ledger(
+            &WriteTarget::InTxn(write_txn),
+            ctx,
+            target_table,
+            stmt.operation_id(),
+            self.ledger_mode,
+            &ledger_hash,
+        )?;
         if let Some(v) = &schemas.target_view {
             // 束縛時のスナップショットで取った指紋を、writer 取得後の最新カタログで照合する。第 1 段より前に
             // 行うので、0 行の MERGE（書き込み経路に到達しない）でも並行 DDL を検出する。不一致は書き込まない。
@@ -379,24 +458,12 @@ impl EngineCore {
         }
 
         // 4. 計画への変換（純関数）。
-        let source_input = match (&stmt.source, &schemas.source_view) {
-            (MergeSource::Table(_), Some((base, preds))) => MergeSourceInput {
-                table: base.clone(),
-                schema: schemas.source_schema.clone(),
-                view_predicates: preds.clone(),
-            },
-            (MergeSource::Table(rel), None) => MergeSourceInput {
-                table: rel.table().to_string(),
-                schema: schemas.source_schema.clone(),
-                view_predicates: Vec::new(),
-            },
-            (MergeSource::Subquery { .. }, _) => MergeSourceInput {
-                table: String::new(),
-                schema: schemas.source_schema.clone(),
-                view_predicates: Vec::new(),
-            },
-        };
-        let plan = plan_merge(&bound, target_table, target_schema, source_input)?;
+        let plan = plan_merge(
+            &bound,
+            target_table,
+            target_schema,
+            merge_source_input(stmt, &schemas),
+        )?;
 
         // 5. 対象表の事前判定（行は読まず書かない）と、元の実表のスキーマ照合。
         let has_insert = bound
@@ -852,13 +919,18 @@ impl EngineCore {
         drop(eval);
         drop(probe);
 
-        // 9. 第 3 段: 既存の書き込み経路へ適用する。台帳は記録しない（`Omitted`／`Disabled`）ため、文ハッシュは
-        // 記録に使われない（#3357 が MERGE 用の `for_merge` に置き換える）。適用は UPDATE の句ごと → DELETE →
+        // 9. 第 3 段: 既存の書き込み経路へ適用する。区間ごとには台帳を記録せず（`Omitted`／`Disabled`）、文全体の
+        // 1 エントリを AFTER STATEMENT の後に記録する（Issue #3357。区間ごとに記録すると 2 つ目の区間が
+        // `23505`／`22023` になる）。適用は UPDATE の句ごと → DELETE →
         // INSERT の句ごとの順（走査し直す回数は UPDATE 句数 + 1 で、句数は構文段の上限で抑えられ行数に比例
         // しない。UPDATE と DELETE の対象行は `21000` の判定と一致 0 件の振り分けにより互いに素）。INSERT は
         // 対象を走査し直さず、句ごとに `id` 省略の一様性（バッチの制約）を保つ。
-        debug_assert!(ledger_write.op_id().is_none());
-        let hash = crate::recovery::content_hash::for_delete(0);
+        let segment_mode = self.ledger_mode.substatement_mode();
+        let ledger_write = segment_mode
+            .resolve(None)
+            .map_err(|_| SqlSurfaceError::MissingOperationId)?;
+        // 区間へ渡す文ハッシュは台帳を記録しないため使われない。
+        let hash = &ledger_hash;
         let generated_scope =
             crate::sql::generated_column::GeneratedComputeScope::enter(target_table);
         // 文トリガは入口・出口で種類ごとに 1 回だけ発火するため、第 3 段の既存経路が呼ぶ分類器には対象表の
@@ -904,7 +976,7 @@ impl EngineCore {
                 target_table,
                 ctx,
                 ledger_write,
-                &hash,
+                hash,
                 Some(target_schema),
                 &[],
                 false,
@@ -940,7 +1012,7 @@ impl EngineCore {
                     target_table,
                     ctx,
                     ledger_write,
-                    &hash,
+                    hash,
                     Some(target_schema),
                     false,
                     max_affected_rows,
@@ -956,7 +1028,7 @@ impl EngineCore {
                     target_table,
                     ctx,
                     ledger_write,
-                    &hash,
+                    hash,
                     Some(target_schema),
                     false,
                     max_affected_rows,
@@ -984,7 +1056,7 @@ impl EngineCore {
                     WriteTarget::InTxn(write_txn),
                     ctx,
                     bounds,
-                    self.ledger_mode,
+                    segment_mode,
                     Some(target_schema),
                     Some(&self.trigger_runtime.bind(self)),
                 )?;
@@ -1007,7 +1079,7 @@ impl EngineCore {
                     WriteTarget::InTxn(write_txn),
                     ctx,
                     bounds,
-                    self.ledger_mode,
+                    segment_mode,
                     Some(target_schema),
                     None,
                     Some(&mut insert_project as &mut crate::tenant::ReturningProjectFn<'_>),
@@ -1042,6 +1114,18 @@ impl EngineCore {
                 crate::tenant::merge_triggers::settle_statement_writes(write_txn, ctx, &stmt_writes)
             })
             .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
+        // 台帳の確定記録（Issue #3357）。全区間と AFTER STATEMENT の後に、同じ write txn で 1 回だけ記録する
+        // （単一 commit で原子的。失敗した文は commit されず台帳を消費しない。0 行の MERGE も記録する）。
+        // `view_scope` は上で drop 済みなので、ビュー名のドメインは `ledger_hash` が持つ（二重に包まない）。
+        crate::sql::exec::record_insert_select_ledger_only(
+            WriteTarget::InTxn(write_txn),
+            ctx,
+            target_table,
+            stmt.operation_id(),
+            self.ledger_mode,
+            &ledger_hash,
+            crate::tenant::LedgerOnlyTriggers::Skip,
+        )?;
         let written = trigger_scope.take();
         drop(trigger_scope);
 

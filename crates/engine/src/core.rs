@@ -2162,7 +2162,7 @@ pub enum ParsedSql {
     /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析を担い、
     /// 実行は束縛（#3352。`sql::merge_bind`）を通してから `core::merge_exec` が行う（`WHEN MATCHED` は
     /// #3353、`WHEN NOT MATCHED [BY TARGET|BY SOURCE]` は #3354 で実行、`RETURNING` と `merge_action()` は #3356。
-    /// 台帳・`OpTag`・`EXPLAIN` は #3357 が結線し、それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
+    /// 台帳（`OpTag::Merge`）・`EXPLAIN` は #3357 で結線済み）。既存 variant にフィールドを足さず別 variant にしているのは、
     /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
     Merge(Box<crate::sql::allowlist::ValidatedMerge>),
     /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
@@ -3073,9 +3073,9 @@ fn parsed_operation_id(parsed: &ParsedSql) -> Option<&str> {
         // （`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体の各ゲートも operation_id 付きを拒否側に倒す）。
         ParsedSql::UpdateFrom(stmt) => stmt.operation_id().map(|id| id.as_str()),
         ParsedSql::DeleteUsing(stmt) => stmt.operation_id().map(|id| id.as_str()),
-        // SQL-79・Issue #3351: 台帳・Tx 内の再利用判定には参加させない（`None`）。実行は `0A000` で、台帳との
-        // 結線は #3357。`USING OPERATION_ID` 付きでも `23505` 等が `0A000` より先に出る経路を作らない。
-        ParsedSql::Merge(_) => None,
+        // SQL-79・Issue #3357: 台帳結線済み。同一トランザクション内の再利用検査にも実値を渡す
+        // （`READ ONLY` Tx・一時表ルーティング・PL/pgSQL 本体の各ゲートも operation_id 付きを拒否側に倒す）。
+        ParsedSql::Merge(stmt) => stmt.operation_id().map(|id| id.as_str()),
         // Issue #2050: `EXPLAIN UPDATE|DELETE` は台帳に記録せず operation_id もトランザクションへ
         // 登録しない（登録すると同じ operation_id の本実行が誤って再利用扱いになる）。
         ParsedSql::ExplainDml(_) | ParsedSql::ExplainJson(_) => None,
@@ -7742,7 +7742,9 @@ impl EngineCore {
             }
             // Issue #2050: 分割実行でない述語形 `EXPLAIN UPDATE|DELETE`（SQL-75）。
             if head.eq_ignore_ascii_case("EXPLAIN")
-                && (second.eq_ignore_ascii_case("DELETE") || second.eq_ignore_ascii_case("UPDATE"))
+                && (second.eq_ignore_ascii_case("DELETE")
+                    || second.eq_ignore_ascii_case("UPDATE")
+                    || second.eq_ignore_ascii_case("MERGE"))
             {
                 return self.parse_explain_dml(&tokens, temp, hits, ledger_mode, read_snap);
             }
@@ -7854,7 +7856,7 @@ impl EngineCore {
         }
 
         // SQL-79・Issue #3351: `MERGE` は専用の構文解析器へ回す（既存の単一表 DML の解析器へ落とさない）。
-        // 解析を通った文の実行は #3353〜#3356 で結線済み（残る形は #3357 の台帳記録）。対象・元の存在確認は
+        // 解析を通った文の実行は #3353〜#3357 で結線済み。対象・元の存在確認は
         // 他の書き込みと同じく書き込み先ビュー・索引の写像（`reclassify_write_to_view_error`）を通す。
         if crate::sql::allowlist::looks_like_merge(&tokens) {
             let stmt = crate::sql::allowlist::validate_merge_tokens_with_limits(

@@ -36,6 +36,15 @@
 //! `UPDATE` の `WHERE` に畳み込む。どの文でも `55P03`・`40001` 等が起こりうる前提で扱う。
 //! DDL の kill 制御は #2417／#2418 の担当。
 //!
+//! MERGE モード（Issue #3357。親 #3349。ビヘイビア: SQL-79・TABLE-43・RECOVER-10/11）:
+//! `write <db_path> merge` は 1 文の `MERGE`（DELETE・UPDATE・INSERT の 3 区間を 1 文で書く。
+//! autocommit・`USING OPERATION_ID` つき）を繰り返し、文の直前に `IN_MERGE batch=<g>`、commit 後に
+//! `COMMITTED batch=<g> rows=<g+1>` を出す。`verify <db_path> merge` は再オープン後に「全区間が残るか
+//! 全く残らないか」（対象表のキーがちょうど `[g, g+W)` で全行の世代が `g`）と、台帳の有無が行の状態と
+//! 一致すること（`merge-(g-1)` が記録済み・`merge-g` が未記録）、記録済みの文の再送が `23505` で
+//! 状態を変えないこと、別テナントから 0 行に見えることを確かめる。`self-check <workdir> merge` は
+//! 世代の混在・行の欠け・台帳の欠落を作ってオラクルが失敗することを確かめる（空振り防止）。
+//!
 //! kill 位置の制御（Issue #2416。ビヘイビア: PERSIST-1・SQL-31・TABLE-10）:
 //! - `write <db_path> txn` は台帳 `UPDATE` の直後に `IN_TXN batch=<k>` を出す。スクリプトは
 //!   最後の行が `IN_TXN` なら「Tx の途中に kill が当たった」と分類し、全反復で 1 度も観測
@@ -51,6 +60,8 @@ use std::io::Write as _;
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::recovery::ledger::LedgerLookup;
+use engine::recovery::required_op_id::OperationId;
 use engine::sql::exec::Cell;
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
@@ -87,12 +98,14 @@ const MAX_BATCHES: u64 = 500_000;
 enum Mode {
     Batch,
     Txn,
+    Merge,
 }
 
 fn parse_mode(s: &str) -> Option<Mode> {
     match s {
         "batch" => Some(Mode::Batch),
         "txn" => Some(Mode::Txn),
+        "merge" => Some(Mode::Merge),
         _ => None,
     }
 }
@@ -106,15 +119,18 @@ fn main() {
         ["write", path, mode] => match parse_mode(mode) {
             Some(Mode::Batch) => run_write(path),
             Some(Mode::Txn) => run_write_txn(path),
+            Some(Mode::Merge) => run_write_merge(path),
             None => usage(),
         },
         ["verify", path, mode] => match parse_mode(mode) {
             Some(Mode::Batch) => run_verify(path),
             Some(Mode::Txn) => run_verify_txn(path),
+            Some(Mode::Merge) => run_verify_merge(path),
             None => usage(),
         },
         ["write-pause", path, point, warmup] => run_write_pause(path, point, warmup),
         ["self-check", workdir, "txn"] => run_self_check_txn(workdir),
+        ["self-check", workdir, "merge"] => run_self_check_merge(workdir),
         _ => usage(),
     };
     std::process::exit(exit_code);
@@ -122,9 +138,9 @@ fn main() {
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: crash_tool_cross_table <write|verify> <db_path> [batch|txn] | \
+        "usage: crash_tool_cross_table <write|verify> <db_path> [batch|txn|merge] | \
          write-pause <db_path> <in-txn|before-commit|after-commit> <warmup> | \
-         self-check <workdir> txn"
+         self-check <workdir> <txn|merge>"
     );
     2
 }
@@ -937,6 +953,262 @@ fn self_check_txn(workdir: &str) -> Res<()> {
     ensure_txn_schema(&core)?;
     drop(core);
     if verify_txn_inner(&db).is_ok() {
+        return Err("empty database was accepted".to_string());
+    }
+    Ok(())
+}
+// ======================================================================
+// merge モード（Issue #3357）: 1 文の MERGE が 3 区間（DELETE・UPDATE・INSERT）を書く
+// ======================================================================
+
+/// merge モードで固定して使うテナント。
+const MERGE_TENANT: &str = "crash-tool-merge-tenant";
+/// 別テナント（verify が境界の非漏えいを軽く確かめる）。
+const MERGE_OTHER_TENANT: &str = "crash-tool-merge-other";
+/// 対象表が常に持つ行数（キーは `[g, g+W)`）。
+const MERGE_W: i64 = 300;
+/// 走査できるラウンド数の上限（元表 `mm_s` はキー `0..MERGE_MAX_ROUNDS + W` を持つ）。
+const MERGE_MAX_ROUNDS: i64 = 1_000;
+/// 元表を入れるときの 1 文あたりの行数。
+const MERGE_SEED_CHUNK: i64 = 100;
+
+fn merge_sql(g: i64) -> String {
+    format!(
+        "MERGE INTO mm_t USING mm_s ON mm_t.k = mm_s.k \
+         WHEN MATCHED AND mm_s.k = {g} THEN DELETE \
+         WHEN MATCHED THEN UPDATE SET gen = {next} \
+         WHEN NOT MATCHED AND mm_s.k = {ins} THEN INSERT (id, k, gen) VALUES (mm_s.k, mm_s.k, {next}) \
+         USING OPERATION_ID 'merge-{g}'",
+        next = g + 1,
+        ins = g + MERGE_W
+    )
+}
+
+/// 表・初期行・準備完了の印を（無ければ）作る。冪等。印は最後に入れるので、途中で止まった初期化は
+/// 再実行で完了する（書き込みの kill は準備完了後にだけ行われる）。
+fn ensure_merge_schema(core: &EngineCore) -> Res<()> {
+    for ddl in [
+        "CREATE TABLE mm_t (k BIGINT, gen BIGINT)",
+        "CREATE TABLE mm_s (k BIGINT)",
+        "CREATE TABLE mm_ready (flag BIGINT)",
+    ] {
+        match txn_exec(core, MERGE_TENANT, ddl) {
+            Ok(_) => {}
+            Err(e) if e.contains("(42P07)") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if !select_rows(core, MERGE_TENANT, "SELECT id, flag FROM mm_ready")?.is_empty() {
+        return Ok(());
+    }
+    let total = MERGE_MAX_ROUNDS + MERGE_W;
+    let mut start = 0;
+    while start < total {
+        let end = (start + MERGE_SEED_CHUNK).min(total);
+        let values: Vec<String> = (start..end).map(|k| format!("({k}, {k})")).collect();
+        txn_exec(
+            core,
+            MERGE_TENANT,
+            &format!("INSERT INTO mm_s (id, k) VALUES {}", values.join(", ")),
+        )?;
+        start = end;
+    }
+    let values: Vec<String> = (0..MERGE_W).map(|k| format!("({k}, {k}, 0)")).collect();
+    txn_exec(
+        core,
+        MERGE_TENANT,
+        &format!("INSERT INTO mm_t (id, k, gen) VALUES {}", values.join(", ")),
+    )?;
+    txn_exec(
+        core,
+        MERGE_TENANT,
+        "INSERT INTO mm_ready (id, flag) VALUES (0, 1)",
+    )?;
+    Ok(())
+}
+
+/// 対象表の `(k, gen)` を読む。
+fn read_merge_rows(core: &EngineCore, tenant: &str) -> Res<Vec<(i64, i64)>> {
+    select_rows(core, tenant, "SELECT id, k, gen FROM mm_t")?
+        .into_iter()
+        .map(|(_, cells)| {
+            let v = bigints_of(&cells);
+            match (v.first(), v.get(1)) {
+                (Some(k), Some(g)) => Ok((*k, *g)),
+                _ => Err("unexpected mm_t row".to_string()),
+            }
+        })
+        .collect()
+}
+
+/// 対象表の状態から適用済みラウンド数 `g` を求める。キーがちょうど `[g, g+W)` で全行の世代が `g`
+/// でなければ（半端な区間・世代の混在）`Err`。
+fn merge_generation(rows: &[(i64, i64)]) -> Res<i64> {
+    let mut sorted: Vec<(i64, i64)> = rows.to_vec();
+    sorted.sort_unstable();
+    let Some((first, _)) = sorted.first().copied() else {
+        return Err("target table is empty".to_string());
+    };
+    if sorted.len() as i64 != MERGE_W {
+        return Err(format!(
+            "target row count {} is not {MERGE_W}, partial segment suspected",
+            sorted.len()
+        ));
+    }
+    for (i, (k, gen)) in sorted.iter().enumerate() {
+        if *k != first + i as i64 {
+            return Err(format!("key gap or duplicate at index {i}"));
+        }
+        if *gen != first {
+            return Err(format!(
+                "generation mix: key={k} gen={gen} expected={first} (segments partially applied)"
+            ));
+        }
+    }
+    Ok(first)
+}
+
+fn merge_recorded(core: &EngineCore, g: i64) -> Res<bool> {
+    let op = OperationId::parse(&format!("merge-{g}"))
+        .map_err(|_| "invalid operation id".to_string())?;
+    match core
+        .operation_recorded(&txn_ctx(MERGE_TENANT)?, "mm_t", &op)
+        .map_err(|e| format!("ledger lookup failed: {e}"))?
+    {
+        LedgerLookup::Recorded => Ok(true),
+        LedgerLookup::NotRecorded => Ok(false),
+        _ => Err("ledger is unavailable".to_string()),
+    }
+}
+
+fn run_write_merge(path: &str) -> i32 {
+    match write_merge_inner(path) {
+        Ok(()) => 0,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            1
+        }
+    }
+}
+
+fn write_merge_inner(path: &str) -> Res<()> {
+    let core = open_txn_core(path)?;
+    ensure_merge_schema(&core)?;
+    let mut g = merge_generation(&read_merge_rows(&core, MERGE_TENANT)?)
+        .map_err(|e| format!("inconsistent state on resume: {e}"))?;
+    while g < MERGE_MAX_ROUNDS {
+        // 文の外で kill が当たる窓と、文の途中で当たる窓の両方を作る（行数の増加速度も抑える）。
+        std::thread::sleep(std::time::Duration::from_millis(STMT_PAUSE_MS));
+        emit_line(&format!("IN_MERGE batch={g}"))?;
+        match txn_exec(&core, MERGE_TENANT, &merge_sql(g))? {
+            SqlOutcome::Merge(o) if o.rows_affected as i64 == MERGE_W + 1 => {}
+            _ => return Err("merge did not touch the expected rows".to_string()),
+        }
+        emit_line(&format!("COMMITTED batch={g} rows={}", g + 1))?;
+        g += 1;
+    }
+    Ok(())
+}
+
+fn run_verify_merge(path: &str) -> i32 {
+    match verify_merge_inner(path) {
+        Ok(g) => {
+            println!("RESULT ok=true rows={g} batches={g}");
+            0
+        }
+        Err(reason) => {
+            println!("RESULT ok=false reason={reason}");
+            1
+        }
+    }
+}
+
+fn verify_merge_inner(path: &str) -> Res<i64> {
+    let core = open_txn_core(path)?;
+    if select_rows(&core, MERGE_TENANT, "SELECT id, flag FROM mm_ready")?.is_empty() {
+        return Err("setup marker is missing".to_string());
+    }
+    let g = merge_generation(&read_merge_rows(&core, MERGE_TENANT)?)?;
+    if g == 0 {
+        return Err("no committed merge found".to_string());
+    }
+    // 行と台帳が運命を共にしている（適用済みなら記録済み、未適用なら未記録）。
+    if !merge_recorded(&core, g - 1)? {
+        return Err("ledger entry of the last applied merge is missing".to_string());
+    }
+    if merge_recorded(&core, g)? {
+        return Err("ledger entry exists for a merge that left no rows".to_string());
+    }
+    // 記録済みの文の再送は `23505` で、状態を変えない。
+    let before = read_merge_rows(&core, MERGE_TENANT)?;
+    match txn_exec(&core, MERGE_TENANT, &merge_sql(g - 1)) {
+        Err(e) if e.contains("(23505)") => {}
+        Err(e) => return Err(format!("resend failed with an unexpected error: {e}")),
+        Ok(_) => return Err("resend of a recorded merge was applied again".to_string()),
+    }
+    if read_merge_rows(&core, MERGE_TENANT)? != before {
+        return Err("resend changed the rows".to_string());
+    }
+    if !read_merge_rows(&core, MERGE_OTHER_TENANT)?.is_empty() {
+        return Err("tenant boundary violated: foreign rows visible".to_string());
+    }
+    Ok(g)
+}
+
+fn run_self_check_merge(workdir: &str) -> i32 {
+    match self_check_merge(workdir) {
+        Ok(()) => {
+            println!("SELF-CHECK ok");
+            0
+        }
+        Err(reason) => {
+            eprintln!("ERROR: self-check failed: {reason}");
+            1
+        }
+    }
+}
+
+/// オラクルの空振り防止。正常な状態は ok、世代の混在・行の欠け・台帳の欠落は ng、空の状態は拒否される。
+fn self_check_merge(workdir: &str) -> Res<()> {
+    // (名前, 改ざん, 期待: verify が ok か)
+    let cases: [(&str, &str, bool); 4] = [
+        ("complete", "", true),
+        (
+            "generation-mix",
+            "UPDATE mm_t SET gen = 0 WHERE k = 2",
+            false,
+        ),
+        ("missing-row", "DELETE FROM mm_t WHERE k = 2", false),
+        ("missing-ledger", "NO_LEDGER", false),
+    ];
+    for (i, (name, tamper, want_ok)) in cases.iter().enumerate() {
+        let db = format!("{workdir}/self_check_merge_{i}.redb");
+        let core = open_txn_core(&db)?;
+        ensure_merge_schema(&core)?;
+        // 先に完全な 2 ラウンドを積む。台帳欠落ケースは最後のラウンドを op id なしで適用する。
+        for g in 0..2 {
+            let sql = merge_sql(g);
+            let sql = if *tamper == "NO_LEDGER" && g == 1 {
+                sql.replace(" USING OPERATION_ID 'merge-1'", "")
+            } else {
+                sql
+            };
+            txn_exec(&core, MERGE_TENANT, &sql)?;
+        }
+        if !tamper.is_empty() && *tamper != "NO_LEDGER" {
+            txn_exec(&core, MERGE_TENANT, tamper)?;
+        }
+        drop(core);
+        let got = verify_merge_inner(&db).is_ok();
+        if got != *want_ok {
+            return Err(format!("case {name}: verify ok={got}, expected {want_ok}"));
+        }
+    }
+    let db = format!("{workdir}/self_check_merge_empty.redb");
+    let core = open_txn_core(&db)?;
+    ensure_merge_schema(&core)?;
+    drop(core);
+    if verify_merge_inner(&db).is_ok() {
         return Err("empty database was accepted".to_string());
     }
     Ok(())

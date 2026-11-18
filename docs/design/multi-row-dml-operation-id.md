@@ -759,3 +759,7 @@ SQL-53 (5)・RECOVER-10/11 ポインタ。結合形 DML の `USING OPERATION_ID`
 - `docs/design/delete-predicate-form.md`（Issue #870）
 - `docs/design/sql-multi-row-insert.md`（TASK-190・SQL-16）
 - `docs/design/scalar-secondary-index.md`（Issue #472。ADR 判断記録の書式先例）
+
+## Issue #3357 追記（MERGE）
+
+`OpTag::Merge = 30` を足した（`for_merge`。ポインタ: SQL-79・RECOVER-10/11）。材料は `USING OPERATION_ID`・末尾 `;`・最上位の `RETURNING` を除いたトークン列。`UPDATE ... FROM` は `RETURNING` を材料に含めるが、MERGE は含めない点が異なる。詳細は [sql-merge.md](sql-merge.md) の §13。
