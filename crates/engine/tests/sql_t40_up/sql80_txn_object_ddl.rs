@@ -717,3 +717,44 @@ fn savepoint_rollback_undoes_object_ddl() {
     assert_eq!(auto_code(&core, "alice", "DROP SEQUENCE dropme"), "42P01");
     assert_eq!(auto_code(&core, "alice", "DROP TYPE mood"), "42704");
 }
+
+/// Issue #3315: 保護対象 DDL（ロール等）を積んだ後も、VIEW・SEQUENCE・ENUM 型・SCHEMA の DDL を受理する
+/// （simple-query 経路の許可リストが拡張 Execute 経路と同じ結果になる）。
+#[test]
+fn object_ddl_is_accepted_after_guarded_ddl() {
+    let (core, _g) = new_core("sql3315-guarded");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(&core, &mut session, &mut txn, "CREATE ROLE r3315");
+    tx_ok(&core, &mut session, &mut txn, "CREATE SEQUENCE gs");
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE TYPE gmood AS ENUM ('a', 'b')",
+    );
+    tx_ok(&core, &mut session, &mut txn, "DROP SEQUENCE gs");
+    tx_ok(&core, &mut session, &mut txn, "CREATE SCHEMA gsch");
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    rollback(&core, &mut session, &mut txn);
+}
+
+/// Issue #3315: Tx 内 `CREATE TYPE` の予約名の違反は writer 取得前に拒否される。Tx は Failed になるが
+/// writer を保持せず、別の autocommit の DDL が ROLLBACK を待たずに通る。
+#[test]
+fn create_type_validation_failure_does_not_hold_the_writer() {
+    let (core, _g) = new_core("sql3315-type-precheck");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    let _ = tx_code(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE TYPE int4 AS ENUM ('a')",
+    );
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    auto_ok(&core, "alice", "CREATE SEQUENCE after_bad");
+    rollback(&core, &mut session, &mut txn);
+}

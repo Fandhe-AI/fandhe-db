@@ -4589,6 +4589,20 @@ pub(crate) fn execute_drop_schema_in_txn(
     ))
 }
 
+/// Tx 内 `CREATE TYPE` の事前検査（Issue #3315）。ラベル数の上限と予約名・ラベルの検証だけを行い何も書かない。
+/// writer 取得・DDL 印より前に呼び、失敗しても Tx を継続できるようにする。
+pub(crate) fn precheck_create_type_in_txn(
+    validated: &ValidatedCreateType,
+    limits: &SchemaLimits,
+) -> Result<(), SqlSurfaceError> {
+    if validated.labels().len() > limits.max_enum_labels() {
+        return Err(SqlSurfaceError::payload_too_large("too many enum labels"));
+    }
+    Storage::prepare_create_enum_type(validated.name(), validated.labels())
+        .map_err(map_create_type_error)?;
+    Ok(())
+}
+
 /// `CREATE TYPE ... AS ENUM` を共有 write txn の中で実行する（Issue #3315）。ラベル数の上限と予約名は
 /// [`execute_create_type`] と同じ判定を write txn を使う前に行う。
 pub(crate) fn execute_create_type_in_txn(

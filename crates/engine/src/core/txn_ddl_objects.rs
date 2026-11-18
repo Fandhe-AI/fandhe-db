@@ -258,6 +258,8 @@ impl EngineCore {
                 if is_schema_key(stmt.name()) {
                     return Err(schema_scoped_unsupported());
                 }
+                // 予約名・ラベル数の上限は writer 取得・印の前に検査する（失敗しても Tx を継続できる）。
+                crate::sql::ddl::precheck_create_type_in_txn(stmt, &self.schema_limits)?;
                 txn.ensure_writer(ctx)?;
                 self.require_creation_target(ctx, session, stmt.public_qualified, stmt.name())?;
                 txn.mark_ddl_started();

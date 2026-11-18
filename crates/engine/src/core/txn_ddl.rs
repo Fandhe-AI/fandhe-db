@@ -132,6 +132,18 @@ pub(super) fn check_post_ddl_statement(
             | ParsedSql::DropIndex(_)
             | ParsedSql::Transaction(_)
             | ParsedSql::SetTransaction(_) => true,
+            // Issue #3315: SCHEMA の DDL は常に、VIEW・SEQUENCE・ENUM 型の DDL は SCHEMA の DDL を積む前なら、
+            // 保護対象 DDL の後も受理する（拡張 Execute 経路と同じ結果にそろえる）。
+            ParsedSql::CreateSchema(_) | ParsedSql::DropSchema(_) | ParsedSql::AlterSchema(_) => {
+                true
+            }
+            ParsedSql::CreateView(_)
+            | ParsedSql::DropView(_)
+            | ParsedSql::CreateSequence(_)
+            | ParsedSql::DropSequence(_)
+            | ParsedSql::AlterSequence(_)
+            | ParsedSql::CreateType(_)
+            | ParsedSql::DropType(_) => !schema_changed,
             ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
             other => is_security_ddl(other),
         };
