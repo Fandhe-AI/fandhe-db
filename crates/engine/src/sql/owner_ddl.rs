@@ -4,7 +4,7 @@
 //! 役割: 構造検証済みの文（`sql::allowlist::ValidatedAlterOwner`）を権限カタログの所有者変更
 //! （`Storage::alter_object_owner`。解決・判定・書き込みを単一の write txn で行う）へ写し、`AclChangeError`
 //! を SQLSTATE の契約へ写像する。呼び出し元は `core.rs` の `ParsedSql::AlterOwner` 腕で、権限ゲート
-//! （`privilege_gate` の `AlterOwner`）と現在ロールの束縛・明示トランザクション内の `0A000` を通過した
+//! （`privilege_gate` の `AlterOwner`）と現在ロールの束縛・（明示トランザクション内は共有 write txn の上で同じ本体を実行する。Issue #3316）を通過した
 //! 後にだけ来る。
 //!
 //! 順序の契約: 現在ロールの束縛（未束縛は対象・ロールの有無を問わず `42501`。カタログ照会より前）→
@@ -38,6 +38,18 @@ pub(crate) fn execute_alter_owner(
     session: &SessionState,
     stmt: &ValidatedAlterOwner,
 ) -> Result<AlterOwnerOutcome, SqlSurfaceError> {
+    execute_alter_owner_in(storage, None, tenant_id, session, stmt).map(|(o, _)| o)
+}
+
+/// [`execute_alter_owner`] の書き込み先を選べる版。第 2 要素は所有者を実際に変えたか（変わらない指定は
+/// `false`。明示 Tx の呼び出し元が印を巻き戻すのに使う。SQL-80・Issue #3316）。
+pub(crate) fn execute_alter_owner_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    session: &SessionState,
+    stmt: &ValidatedAlterOwner,
+) -> Result<(AlterOwnerOutcome, bool), SqlSurfaceError> {
     // 現在ロールの束縛（カタログ照会・名前解決より前。運用者権限があっても束縛が要る）。
     let actor = crate::sql::privilege_gate::bound_principal(session)?;
     // ALTER OWNER の運用者判定は DDL 権限（`ddl_allowed`）のまま（初期ロールの全権限では所有権を奪えない。Issue #2238）。
@@ -50,10 +62,12 @@ pub(crate) fn execute_alter_owner(
             _ => return Err(SqlSurfaceError::InsufficientPrivilege),
         },
     };
-    storage
-        .alter_object_owner(tenant_id, stmt.kind, &stmt.name, actor, operator, new_owner)
+    let changed = storage
+        .alter_object_owner_in(
+            target, tenant_id, stmt.kind, &stmt.name, actor, operator, new_owner,
+        )
         .map_err(crate::sql::grant_ddl::map_acl_error)?;
-    Ok(AlterOwnerOutcome { kind: stmt.kind })
+    Ok((AlterOwnerOutcome { kind: stmt.kind }, changed))
 }
 
 /// `CREATE SCHEMA` が記録する所有者のロール ID を決める。`AUTHORIZATION <ロール>` があればそのロール

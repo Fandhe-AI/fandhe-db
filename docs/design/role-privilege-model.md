@@ -327,7 +327,7 @@ PostgreSQL 17 の公開挙動と本 ADR の D5・D8・D9・D10 に従い、spec 
 | J6 | 表と列で許す権限は `PrivilegeObject::allowed_privileges` と一致させる。対象に許されない権限（`USAGE ON TABLE` 等）と PUBLIC への GRANT OPTION は `0LP01`（`ErrorClass::InvalidGrantOperation` を追加。HTTP 射影は 400・NoSQL 表層からは到達不能） | PostgreSQL 17 と同じ SQLSTATE |
 | J7 | 付与先ロールは自テナントのカタログだけで引く。不在と「他テナントにだけ在る」は同じ `42704`・同じ文言形式（`SqlSurfaceError::UndefinedRole`。利用者が書いた名前だけを含む） | D10 |
 | J8 | 範囲外の形は構文段で固定の `0A000`（`ON SCHEMA`・`ON ALL TABLES IN SCHEMA` は #2234 で解禁。§10）: `ON SCHEMA`・`ON SEQUENCE`・`ON FUNCTION`・`ON DATABASE` などの対象種別・`ALL ... IN SCHEMA`（#2234・#2235）、`GRANTED BY`（`ALTER DEFAULT PRIVILEGES` は #2237 で解禁。§19） | 状態に依存しない拒否なので存在オラクルにならない |
-| J9 | 明示トランザクション内は J1 のゲートの後で `0A000` | ACL の書き込みは独立した write txn で commit され、ROLLBACK で取り消せない |
+| J9 | 明示トランザクション内は J1 のゲートの後で `0A000` | ACL の書き込みは独立した write txn で commit され、ROLLBACK で取り消せない（改訂: Issue #3316 で、明示 Tx 内は共有 write txn へ積む形に変更した（`explicit-transaction.md`「#3316 の実装記録」）。） |
 | J10 | ビュー・matview への表単位の GRANT／REVOKE は受理する。列リストはベース表だけで、ビュー・matview は `0A000` | ビューの列の解決（別名・式列）が未整備。fail-closed |
 | J11 | 一時表は一時カタログの振り分け（`parse_tokens_gated`）で `0A000`。ACL のキーは共有カタログの relation キーで、セッション内の一時表とは名前空間が違う | 既存の混在拒否に乗る |
 | J12 | PostgreSQL の警告（`01006`／`01007` 相当）は `GrantRevokeOutcome` に積むだけで wire へは出さない | NoticeResponse の仕組みが無い（ポリシー DDL と同じ扱い） |
@@ -388,7 +388,7 @@ Issue #1962 は決定 D1・D2 のうち、`CREATE ROLE`／`CREATE USER`／`DROP 
 
 - **42501 の判定は DDL 権限ゲート**: `CREATEROLE`／`ADMIN OPTION` による判定はセッションにロールが束縛される #1966・#1971 の担当で、ポリシー DDL と同じく `require_ddl_permission` で代替する。
 - **ログイン名対応表へは登録しない**: テナント修飾子の提供経路がまだ無く、カタログのロールで認証する経路（#2233）も無いため、`LOGIN` はロール blob に保存するだけでログインはできない（fail-closed）。修飾子の提供と既存 LOGIN ロールの後追い登録は #2233 の担当。
-- **明示トランザクション内は `0A000`**: ロールの write txn は独立に commit され ROLLBACK で取り消せないため（他の DDL と同じ）。権限が無ければ `42501` を先に返す。
+- **明示トランザクション内は `0A000`**: ロールの write txn は独立に commit され ROLLBACK で取り消せないため（他の DDL と同じ）。権限が無ければ `42501` を先に返す。（改訂: Issue #3316 で、明示 Tx 内は共有 write txn へ積む形に変更した（`explicit-transaction.md`「#3316 の実装記録」）。）
 
 ### 対象外
 
@@ -563,7 +563,7 @@ SQL-40 (1)(2)(3)(6)・RLS-12 ポインタ。読み取り系の文が参照する
 | K10 | `DROP SCHEMA` の同じ txn で ACL 行を掃除（commit 呼び出しは増やさない） | `DROP ROLE` の依存検査・件数上限の消費を防ぐ |
 | K11 | ビュー本文（保存済みの解決済みキー）経由の参照は USAGE を再検査しない | PostgreSQL はビューの所有者の権限で参照する。所有者の機構（#2236）まで対象外 |
 | K12 | 準備済み文は Bind でトークン列の `#<id>.` キーから SCHEMA ID を集めて USAGE を再検査 | Parse 後の `REVOKE` を Execute に反映する |
-| K13 | 明示トランザクション内は現在ロールのゲート（`42501`）の後で `0A000`（J9 と同じ） | ACL の書き込みは独立した write txn で ROLLBACK で取り消せない |
+| K13 | 明示トランザクション内は現在ロールのゲート（`42501`）の後で `0A000`（J9 と同じ） | ACL の書き込みは独立した write txn で ROLLBACK で取り消せない（改訂: Issue #3316 で、明示 Tx 内は共有 write txn へ積む形に変更した（`explicit-transaction.md`「#3316 の実装記録」）。） |
 
 ### 既知の差・対象外
 
@@ -667,7 +667,7 @@ DROP・ALTER・GRANT を実装した。
 | O13 | 運用者権限の無い所有者の `DROP SCHEMA ... CASCADE` は、配下に共有カタログの relation（表・ビュー・SEQUENCE）があれば `42501` | D6。PostgreSQL との意図的な差 |
 | O14 | `REASSIGN OWNED`・`DROP OWNED` は構文段で固定の `0A000` | 状態に依存しない拒否は存在オラクルにならない |
 | O15 | PUBLIC への既定付与（関数の EXECUTE など）は入れない | 関数の EXECUTE は #2235、既定権限は #2237 の担当 |
-| O16 | 明示トランザクション内の `OWNER TO` と `DROP FUNCTION` は、ゲート（`42501`）の後で `0A000` | 独立した write txn で commit され ROLLBACK で取り消せない（J9・K13 と同じ） |
+| O16 | 明示トランザクション内の `OWNER TO` と `DROP FUNCTION` は、ゲート（`42501`）の後で `0A000` | 独立した write txn で commit され ROLLBACK で取り消せない（J9・K13 と同じ）（改訂: Issue #3316 で、明示 Tx 内は共有 write txn へ積む形に変更した（`explicit-transaction.md`「#3316 の実装記録」）。） |
 | O17 | `DROP ROLE` の依存検査（`role_has_dependents_in_txn`）に所有者を加える | §9 の拡張点 |
 
 ### PUBLIC の境界

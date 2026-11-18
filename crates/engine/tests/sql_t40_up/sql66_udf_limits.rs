@@ -269,9 +269,10 @@ fn typed_and_returns_definitions_are_persisted_with_limit_and_drop() {
     assert!(r.udfs().get("t3").is_some());
 }
 
-/// T6: 権限ありの明示トランザクション内の CREATE FUNCTION は上限の設定に関係なく 0A000。
+/// T6: 権限ありの明示トランザクション内の CREATE FUNCTION も上限（設定値）が効き、超過は `54000`
+/// （SQL-80・Issue #3316。件数は共有 write txn の内容で数える）。ROLLBACK では何も残らない。
 #[test]
-fn create_in_explicit_transaction_stays_rejected() {
+fn create_in_explicit_transaction_respects_the_limit() {
     let path = unique_db_path("sql66-limit-txn");
     let _g = CleanupGuard(path.clone());
     let core = open(&path, 2);
@@ -280,10 +281,20 @@ fn create_in_explicit_transaction_stays_rejected() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&alice, &mut s, &mut txn, "BEGIN")
         .expect("begin");
+    for n in 1..=2 {
+        core.execute_sql_in_txn(&alice, &mut s, &mut txn, &create(n))
+            .unwrap_or_else(|e| panic!("create {n}: {e}"));
+    }
     let err = core
-        .execute_sql_in_txn(&alice, &mut s, &mut txn, &create(1))
-        .expect_err("rejected");
-    assert_eq!(err.wire_code(), "0A000");
+        .execute_sql_in_txn(&alice, &mut s, &mut txn, &create(3))
+        .expect_err("over the limit");
+    assert_eq!(err.wire_code(), "54000");
+    core.execute_sql_in_txn(&alice, &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    let mut fresh = session(true);
+    core.load_session_udfs(&alice, &mut fresh)
+        .expect("load session udfs");
+    assert!(fresh.udfs().get("f1").is_none());
 }
 
 /// T7: 既存関数の置換は設定上限を下げた DB でも通り（件数が増えない）、新規作成だけが 54000 になる。
@@ -476,24 +487,26 @@ fn persistent_function_dependency_follows_call_time_name_resolution() {
     }
 }
 
-/// 明示トランザクション（BEGIN → `sql` → ROLLBACK）で `sql` を実行し、エラーの wire_code を返す。
+/// 明示トランザクション（BEGIN → `sql` → ROLLBACK）で `sql` を実行し、成功なら `"ok"`、エラーなら wire_code を返す。
 fn code_in_txn(core: &EngineCore, tenant: &str, s: &mut SessionState, sql: &str) -> String {
     let c = ctx(tenant);
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, s, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
+    let got = core
         .execute_sql_in_txn(&c, s, &mut txn, sql)
-        .expect_err("persistent function DDL inside a transaction must be rejected");
+        .map(|_| "ok".to_string())
+        .unwrap_or_else(|e| e.wire_code().to_string());
     core.execute_sql_in_txn(&c, s, &mut txn, "ROLLBACK")
         .expect("rollback");
-    err.wire_code().to_string()
+    got
 }
 
-/// T9: 明示トランザクション内の永続 DDL は、型注釈・RETURNS の有無によらず 0A000（権限なしは 42501 が先）。
-/// ROLLBACK 後も別セッション・再起動後に関数は存在せず、OR REPLACE も取り消し不要（変更されない）。
+/// T9: 明示トランザクション内の永続 DDL は、型注釈・RETURNS の有無によらず共有 write txn へ積まれる
+/// （SQL-80・Issue #3316。権限なしは 42501 が先）。ROLLBACK 後は別セッション・再起動後に新しい関数は存在せず、
+/// OR REPLACE・DROP も取り消される（`keep` は元のまま）。
 #[test]
-fn persistent_function_ddl_in_explicit_transaction_is_rejected() {
+fn persistent_function_ddl_in_explicit_transaction_is_rolled_back() {
     let path = unique_db_path("sql66-txn-ddl");
     let _g = CleanupGuard(path.clone());
     let sqls = [
@@ -509,7 +522,13 @@ fn persistent_function_ddl_in_explicit_transaction_is_rejected() {
         let mut s = session(true);
         ok(&core, "alice", &mut s, "CREATE FUNCTION keep(x) AS x + 1");
         for sql in sqls {
-            assert_eq!(code_in_txn(&core, "alice", &mut s, sql), "0A000", "{sql}");
+            // 型付きの `keep` の置換は autocommit と同じく、既存の型なしの定義とシグネチャが違うため `42723`。
+            let want = if sql.contains("REPLACE FUNCTION keep") {
+                "42723"
+            } else {
+                "ok"
+            };
+            assert_eq!(code_in_txn(&core, "alice", &mut s, sql), want, "{sql}");
         }
         // 権限なしは 42501 が先。
         let mut nd = session(false);

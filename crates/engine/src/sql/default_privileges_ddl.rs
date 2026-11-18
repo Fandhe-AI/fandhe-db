@@ -6,7 +6,7 @@
 //! write txn で行う）への要求へ写し、`AclChangeError` を SQLSTATE の契約へ写像する（写像は `GRANT`／`REVOKE`
 //! と共有の [`crate::sql::grant_ddl::map_acl_error`]）。呼び出し元は `core.rs` の
 //! `ParsedSql::AlterDefaultPrivileges` 腕で、現在ロールの束縛（未束縛は対象・ロールの有無を問わず `42501`）と
-//! 明示トランザクション内の `0A000` を通過した後にだけ来る。DDL 権限ゲートは置かない（`GRANT` と同じ。
+//! 通過した後にだけ来る（明示トランザクション内は共有 write txn の上で同じ本体を実行する。Issue #3316）。DDL 権限ゲートは置かない（`GRANT` と同じ。
 //! `FOR ROLE` の認可は対象ロールへの SET 経路で行い、運用者権限は免除）。
 //!
 //! テナント境界（P0）: scope は呼び出し元が渡す検証済みの `tenant_id` だけ。他テナントのロールは不在と同じ
@@ -41,6 +41,20 @@ pub(crate) fn execute_alter_default_privileges(
     session: &SessionState,
     stmt: &ValidatedAlterDefaultPrivileges,
 ) -> Result<AlterDefaultPrivilegesOutcome, SqlSurfaceError> {
+    execute_alter_default_privileges_in(storage, None, tenant_id, session, stmt)
+        .map(|(outcome, _)| outcome)
+}
+
+/// [`execute_alter_default_privileges`] の書き込み先を選べる版（`target` の扱いは
+/// [`crate::sql::grant_ddl::execute_grant_revoke_in`] と同じ。SQL-80・Issue #3316）。
+pub(crate) fn execute_alter_default_privileges_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    session: &SessionState,
+    stmt: &ValidatedAlterDefaultPrivileges,
+) -> Result<(AlterDefaultPrivilegesOutcome, bool), SqlSurfaceError> {
+    // 第 2 要素は既定権限の行を実際に変更したか（既に反映済みの再実行は偽。明示 Tx が guard 印を巻き戻す）。
     let actor_id = crate::sql::grant_ddl::require_grant_principal(session)?;
     let mut grantees = Vec::with_capacity(stmt.grantees.len());
     for g in &stmt.grantees {
@@ -71,10 +85,13 @@ pub(crate) fn execute_alter_default_privileges(
         grantees: &grantees,
         grant_option: stmt.grant_option,
     };
-    storage
-        .apply_default_acl_changes(tenant_id, &req)
+    let changed = storage
+        .apply_default_acl_changes_in(target, tenant_id, &req)
         .map_err(crate::sql::grant_ddl::map_acl_error)?;
-    Ok(AlterDefaultPrivilegesOutcome {
-        is_revoke: !stmt.is_grant,
-    })
+    Ok((
+        AlterDefaultPrivilegesOutcome {
+            is_revoke: !stmt.is_grant,
+        },
+        changed > 0,
+    ))
 }

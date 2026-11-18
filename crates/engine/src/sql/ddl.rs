@@ -1991,18 +1991,33 @@ pub(crate) fn execute_alter_table_row_security(
     tenant_id: &str,
     stmt: &crate::sql::allowlist::ValidatedAlterTableRowSecurity,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
-    storage
-        .alter_table_row_security(tenant_id, &stmt.table_name, stmt.action)
+    execute_alter_table_row_security_in(storage, None, tenant_id, stmt).map(|(o, _)| o)
+}
+
+/// [`execute_alter_table_row_security`] の書き込み先を選べる版。第 2 要素は状態が変わったか
+/// （再指定の no-op は `false`。明示 Tx の呼び出し元が DDL を積んだ印を巻き戻すのに使う。SQL-80・Issue #3316）。
+pub(crate) fn execute_alter_table_row_security_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &crate::sql::allowlist::ValidatedAlterTableRowSecurity,
+) -> Result<(AlterTableOutcome, bool), SqlSurfaceError> {
+    let applied = storage
+        .alter_table_row_security_in(target, tenant_id, &stmt.table_name, stmt.action)
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
             other => map_drop_alter_column_error(other),
         })?;
-    Ok(AlterTableOutcome {
-        table_name: stmt.table_name.clone(),
-        action: AlterTableAction::RowSecurity {
-            action: stmt.action,
+    let changed = matches!(applied, crate::catalog::AlterApply::Applied);
+    Ok((
+        AlterTableOutcome {
+            table_name: stmt.table_name.clone(),
+            action: AlterTableAction::RowSecurity {
+                action: stmt.action,
+            },
         },
-    })
+        changed,
+    ))
 }
 
 /// `ALTER TABLE <table> SET SCHEMA <schema>` の実行本体（TABLE-27 (7) のポインタ、Issue #1716・#3198。
