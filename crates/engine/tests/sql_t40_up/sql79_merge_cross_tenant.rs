@@ -93,6 +93,8 @@ fn seeds(shape: Shape) -> Vec<Seed> {
         v.extend([
             s("bob", "t", 12, "c", 78, true),
             s("bob", "s", 22, "d", 901, true),
+            // 元に一致しない Public の対象行（BY SOURCE 側の検証対象）。
+            s("bob", "t", 15, "y", 80, true),
         ]);
     }
     v
@@ -339,8 +341,8 @@ fn alices_merge_is_unaffected_by_other_tenants_private_rows() {
                 let (core_f, _g1) = world(full);
                 let (core_a, _g2) = world(alone);
                 // 世界がおとりを持つこと（vacuous でない）。
-                assert_ne!(view(&core_f, "bob"), "||");
-                assert_ne!(view(&core_f, "carol"), "||");
+                assert_ne!(view(&core_f, "bob"), " || ");
+                assert_ne!(view(&core_f, "carol"), " || ");
                 let bob_before = view(&core_f, "bob");
                 let carol_before = view(&core_f, "carol");
                 let got = run_flavor(&core_f, "alice", &sql, explicit);
@@ -399,15 +401,26 @@ fn each_tenant_only_changes_its_own_rows_and_rejections_are_byte_identical() {
         "bob's rejected MERGE moved alice"
     );
     assert_eq!(view(&core, "carol"), before[2]);
-    // 同じ拒否（carol の元には a が 1 行・bob と別の値）。文言は他テナントの値を含まない。
-    let carol = render(run_auto(&core, "carol", &upd));
-    for (who, text) in [("bob", &bob), ("carol", &carol)] {
+    // 同じ拒否: 3 テナントとも BY SOURCE の対象行を WITH CHECK に反する値へ更新しようとする（元の
+    // 件数に依らない）。SQLSTATE と文言が 3 者でバイト一致し、他テナントの値・id を含まない。
+    let rej =
+        format!("{ON} WHEN NOT MATCHED BY SOURCE AND t.x < 100 THEN UPDATE SET x = t.x + 1000");
+    let rejected = ["alice", "bob", "carol"].map(|t| render(run_auto(&core, t, &rej)));
+    for r in &rejected {
+        assert!(r.starts_with("err:42501:"), "not a 42501 rejection: {r}");
+    }
+    assert_eq!(rejected[0], rejected[1], "alice vs bob rejection differs");
+    assert_eq!(rejected[1], rejected[2], "bob vs carol rejection differs");
+    for (who, text) in [("bob", &bob), ("carol", &rejected[2])] {
         for other in ["alice", "bob", "carol"] {
             if other != who {
                 assert!(!text.contains(other), "{who}: {text}");
             }
         }
     }
+    assert_eq!(view(&core, "alice"), before[0]);
+    assert_eq!(view(&core, "bob"), before[1]);
+    assert_eq!(view(&core, "carol"), before[2]);
     // alice の成功は alice の行だけを変える。
     assert_eq!(render(run_auto(&core, "alice", &upd)), "n=2");
     assert_eq!(view(&core, "bob"), before[1]);
@@ -423,29 +436,44 @@ fn another_tenants_public_target_rows_are_never_written() {
         public_decoys: true,
         alice_dup: false,
     };
+    // 更新値は WITH CHECK（x < 500）を満たす値にして、文が成功することを確かめる（拒否のロールバックで
+    // 「不変」が成り立つ空虚な検証にしない）。
     for (sql, explicit) in flavors(&format!(
         "{ON} WHEN MATCHED THEN UPDATE SET x = s.v \
-         WHEN NOT MATCHED BY SOURCE THEN UPDATE SET x = t.x + 1000"
+         WHEN NOT MATCHED BY SOURCE THEN UPDATE SET x = t.x + 1"
     )) {
         let (core, _g) = world(shape);
-        let bob_t_before =
-            match run_auto(&core, "bob", "SELECT id, k, x FROM t ORDER BY id LIMIT 100")
-                .expect("bob t")
-            {
-                SqlOutcome::Query(r) => rows_text(&r),
-                other => panic!("{other:?}"),
-            };
+        let bob_t = |core: &EngineCore| match run_auto(
+            core,
+            "bob",
+            "SELECT id, k, x FROM t ORDER BY id LIMIT 100",
+        )
+        .expect("bob t")
+        {
+            SqlOutcome::Query(r) => rows_text(&r),
+            other => panic!("{other:?}"),
+        };
+        let bob_t_before = bob_t(&core);
         let out = run_flavor(&core, "alice", &sql, explicit);
-        assert!(!out.contains("leak"), "{out}");
-        // bob の Public の対象行 (12,c,78) は alice の MERGE で変わらない。
-        let bob_t_after =
-            match run_auto(&core, "bob", "SELECT id, k, x FROM t ORDER BY id LIMIT 100")
-                .expect("bob t")
-            {
-                SqlOutcome::Query(r) => rows_text(&r),
-                other => panic!("{other:?}"),
-            };
+        // alice の対象 3 行（a・c は一致、b は BY SOURCE）だけが変わる。
+        assert_eq!(out, "n=3", "{sql}");
+        let alice_t = match run_auto(
+            &core,
+            "alice",
+            "SELECT id, k, x FROM t ORDER BY id LIMIT 100",
+        )
+        .expect("alice t")
+        {
+            SqlOutcome::Query(r) => rows_text(&r),
+            other => panic!("{other:?}"),
+        };
+        for want in ["1,a,100", "2,b,21", "3,c,300"] {
+            assert!(alice_t.contains(want), "{want} missing: {alice_t}");
+        }
+        // bob の Public の対象行（一致する (12,c,78)・一致しない (15,y,80)）は変わらない。
+        let bob_t_after = bob_t(&core);
         assert_eq!(bob_t_before, bob_t_after, "{sql}: {out}");
         assert!(bob_t_after.contains("12,c,78"), "{bob_t_after}");
+        assert!(bob_t_after.contains("15,y,80"), "{bob_t_after}");
     }
 }
