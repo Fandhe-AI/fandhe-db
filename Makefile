@@ -130,7 +130,7 @@ crash-test-cross-table: ## 2 テーブル横断トランザクション（storag
 crash-test-ddl: ## 1 文の DDL（CREATE/ALTER ADD COLUMN/CREATE INDEX/DROP TABLE）の crash 耐性回帰テスト
 	scripts/crash_test_ddl.sh
 
-# 明示トランザクションの実行中・COMMIT 直前・直後の決定的 SIGKILL 回帰テスト（Issue #2416・PERSIST-1/SQL-31/TABLE-10。scripts/crash_test_txn_kill_points.sh を実行）
+# 明示トランザクションの実行中・COMMIT 直前・直後の決定的 SIGKILL 回帰テスト（Issue #2416・PERSIST-1/SQL-31/TABLE-10。Issue #3318 の DDL を含む Tx の段を含む。scripts/crash_test_txn_kill_points.sh を実行）
 .PHONY: crash-test-txn-kill-points
 crash-test-txn-kill-points: ## 明示トランザクションの実行中・COMMIT 直前・直後の SIGKILL 回帰テスト
 	scripts/crash_test_txn_kill_points.sh
