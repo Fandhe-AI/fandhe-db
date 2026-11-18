@@ -1,10 +1,11 @@
-//! `MERGE` 文の構文解析と実行の固定文言 `0A000`（SQL-79・Issue #3351。親 #3349、設計記録
-//! `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
+//! `MERGE` 文の構文解析と、実行に結線されていない形の固定文言 `0A000`（SQL-79・Issue #3351・#3353。親 #3349、
+//! 設計記録 `docs/design/sql-merge.md`）の SQL 経由の結合テスト。
 //!
-//! 契約: 構文解析と束縛（#3352。`sql79_merge_bind.rs`）を通った MERGE は、autocommit・明示 Tx・Describe の
-//! いずれでも固定文言の `0A000` で止まり、行・台帳・世代に一切触れない（`USING OPERATION_ID` 付きを再送しても
-//! `23505` にならない）。従来の `42601` だった形が `0A000` になる。構文エラーは `42601`、上限超過は `54000`、
-//! 権限は書き込みゲートの `42501`。実行は #3353〜#3357 の担当（本ファイルは対象外）。
+//! 契約: 構文解析と束縛（#3352。`sql79_merge_bind.rs`）を通った MERGE のうち、`WHEN MATCHED` だけの形は
+//! #3353 から実行される（行・件数は `sql79_merge_matched.rs`）。`WHEN NOT MATCHED`・`RETURNING`・台帳記録の
+//! 形は固定文言の `0A000` で止まり、行・台帳・世代に一切触れない（`USING OPERATION_ID` 付きを再送しても
+//! `23505` にならない）。構文エラーは `42601`、上限超過は `54000`、権限は書き込みゲートの `42501`。
+//! 受け皿は #3354（NOT MATCHED）・#3356（RETURNING）・#3357（台帳）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, ParsedSql};
@@ -74,31 +75,62 @@ fn snapshot(core: &EngineCore) -> String {
     format!("{t}\n{s}")
 }
 
-/// 構文を通る代表形（従来はいずれも `42601`）。
-const ACCEPTED: &[&str] = &[
+/// 構文を通り、#3353 から実行される代表形（従来はいずれも `42601`。`WHEN MATCHED` だけ）。
+const EXECUTED: &[&str] = &[
     "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v",
     "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE",
+    "MERGE INTO t AS d USING s AS x ON d.k = x.k WHEN MATCHED AND x.v > 1 THEN UPDATE SET x = x.v + 1",
+    "MERGE INTO t USING (SELECT k, v FROM s) AS q (k, v) ON t.k = q.k WHEN MATCHED THEN DO NOTHING",
+];
+
+/// 構文を通るが実行に結線されていない形（NOT MATCHED を含む形。受け皿 #3354）。
+const NOT_MATCHED_SHAPES: &[&str] = &[
     "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN \
      INSERT (id, embedding, k, x) VALUES (s.id, s.embedding, s.k, s.v)",
     "MERGE INTO t AS d USING s AS x ON d.k = x.k WHEN MATCHED AND x.v > 1 THEN UPDATE SET x = x.v + 1 \
      WHEN NOT MATCHED THEN INSERT (id, embedding, k) VALUES (x.id, x.embedding, x.k) \
      WHEN NOT MATCHED BY SOURCE THEN DELETE",
-    "MERGE INTO t USING (SELECT k, v FROM s) AS q (k, v) ON t.k = q.k WHEN MATCHED THEN DO NOTHING",
-    "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.k",
 ];
 
+/// `RETURNING` つきの形（受け皿 #3356）。
+const RETURNING_SHAPE: &str =
+    "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.k";
+
+const NOT_MATCHED_MESSAGE: &str =
+    "feature not supported: MERGE WHEN NOT MATCHED is not supported yet";
+const RETURNING_MESSAGE: &str = "feature not supported: MERGE with RETURNING is not supported yet";
+
 #[test]
-fn sql79_accepted_shapes_stop_with_fixed_0a000_and_no_side_effects() {
+fn sql79_matched_only_shapes_parse_and_run() {
+    for sql in EXECUTED {
+        // psql 流の末尾 `;` 付きも同じ。
+        for text in [sql.to_string(), format!("{sql};")] {
+            let (core, _g) = new_core("sql79-run");
+            seed(&core);
+            let out = run(&core, &text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert!(out.starts_with("Merge("), "{text}: {out}");
+        }
+        let (core, _g) = new_core("sql79-parse");
+        assert!(matches!(
+            core.parse_sql(sql).expect("parse"),
+            ParsedSql::Merge(_)
+        ));
+    }
+}
+
+// NOT MATCHED を含む形は、INSERT と BY SOURCE の実行を入れる #3354 まで固定文言で拒否する。
+// tracked: #3354
+#[test]
+fn sql79_not_matched_shapes_stop_with_fixed_0a000_and_no_side_effects() {
     let (core, _g) = new_core("sql79-fixed");
     seed(&core);
     let before = snapshot(&core);
-    for sql in ACCEPTED {
-        // psql 流の末尾 `;` 付きも同じ。
+    for sql in NOT_MATCHED_SHAPES {
         for text in [sql.to_string(), format!("{sql};")] {
             let (code, msg) = run(&core, &text).expect_err(&text);
             assert_eq!(
                 (code.as_str(), msg.as_str()),
-                ("0A000", FIXED_MESSAGE),
+                ("0A000", NOT_MATCHED_MESSAGE),
                 "{text}"
             );
             assert_eq!(before, snapshot(&core), "{text}");
@@ -110,6 +142,26 @@ fn sql79_accepted_shapes_stop_with_fixed_0a000_and_no_side_effects() {
     }
 }
 
+// `RETURNING` つきは、応答の列の束縛を入れる #3356 まで固定文言で拒否する。
+// tracked: #3356
+#[test]
+fn sql79_returning_stops_with_fixed_0a000_and_no_side_effects() {
+    let (core, _g) = new_core("sql79-returning");
+    seed(&core);
+    let before = snapshot(&core);
+    for text in [RETURNING_SHAPE.to_string(), format!("{RETURNING_SHAPE};")] {
+        let (code, msg) = run(&core, &text).expect_err(&text);
+        assert_eq!(
+            (code.as_str(), msg.as_str()),
+            ("0A000", RETURNING_MESSAGE),
+            "{text}"
+        );
+        assert_eq!(before, snapshot(&core), "{text}");
+    }
+}
+
+// 台帳へ記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュを入れる #3357 まで拒否する。
+// tracked: #3357
 #[test]
 fn sql79_operation_id_is_not_consumed_by_the_fixed_rejection() {
     let (core, _g) = new_core("sql79-opid");
@@ -123,36 +175,36 @@ fn sql79_operation_id_is_not_consumed_by_the_fixed_rejection() {
     assert_eq!(before, snapshot(&core));
 }
 
+// Describe の `RETURNING` つきは、結果列の束縛を入れる #3356 まで固定文言で拒否する。
+// tracked: #3356
 #[test]
-fn sql79_explicit_transaction_is_fixed_0a000_and_describe_binds() {
+fn sql79_explicit_transaction_runs_and_describe_binds() {
     let (core, _g) = new_core("sql79-txn");
     seed(&core);
     let before = snapshot(&core);
-    let sql = ACCEPTED[1];
+    let sql = EXECUTED[1];
 
     let mut session = SessionState::default();
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
+    let out = core
         .execute_sql_in_txn(&ctx(), &mut session, &mut txn, sql)
-        .expect_err("merge in txn");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(err.client_message(), FIXED_MESSAGE);
+        .expect("merge in txn");
+    assert!(format!("{out:?}").starts_with("Merge("), "{out:?}");
     core.execute_sql_in_txn(&ctx(), &mut session, &mut txn, "ROLLBACK")
         .expect("rollback");
     assert_eq!(before, snapshot(&core));
 
-    // Describe は Execute と同じ束縛を通る。`RETURNING` なしは結果列なし（実行は Execute の `0A000`）、
-    // `RETURNING` つきは結果列の束縛（#3356）が未結線のため固定文言の `0A000`。
+    // Describe は Execute と同じ束縛を通る。`RETURNING` なしは結果列なし（拡張クエリの Parse／Describe が
+    // ParameterDescription を返せる）、`RETURNING` つきは結果列の束縛（#3356）が未結線のため固定文言の `0A000`。
     let parsed = core.parse_sql(sql).expect("parse");
     assert_eq!(
         core.describe_parsed_in_session(&SessionState::default(), &parsed)
             .expect("describe without RETURNING"),
         None
     );
-    let returning = ACCEPTED.last().expect("returning form");
-    let parsed = core.parse_sql(returning).expect("parse");
+    let parsed = core.parse_sql(RETURNING_SHAPE).expect("parse");
     let err = core
         .describe_parsed_in_session(&SessionState::default(), &parsed)
         .expect_err("describe with RETURNING");
@@ -290,7 +342,9 @@ fn sql79_require_operation_id_matches_other_dml() {
 }
 
 /// 権限: 書き込みゲートは WHEN に現れた操作の和と SELECT を対象表に課す。足りない主体は `42501`、
-/// 満たす主体は構文段を通って固定の `0A000`。
+/// 満たす主体は構文段を通って実行される（NOT MATCHED を含む形は固定の `0A000`）。
+// 権限を満たす NOT MATCHED を含む形の拒否は、実行を入れる #3354 まで続く。
+// tracked: #3354
 #[test]
 fn sql79_privilege_bits_follow_the_when_actions() {
     let (core, _g) = new_core("sql79-priv");
@@ -329,25 +383,46 @@ fn sql79_privilege_bits_follow_the_when_actions() {
         "SELECT だけでは DELETE を含む MERGE を通さない"
     );
     operator("GRANT DELETE ON tx TO bob");
-    assert_eq!(as_bob(del), "0A000");
+    assert_eq!(
+        as_bob(del),
+        "ok",
+        "権限を満たす主体は MATCHED だけの形を実行できる"
+    );
     assert_eq!(as_bob(both), "42501", "INSERT を含む形は INSERT 権限も要る");
     operator("GRANT INSERT ON tx TO bob");
-    assert_eq!(as_bob(both), "0A000");
+    assert_eq!(
+        as_bob(both),
+        "0A000",
+        "NOT MATCHED を含む形は実行を入れる #3354 まで拒否する"
+    );
 }
 
-/// SET 右辺・VALUES の先頭が `CASE WHEN` の式でも列 `CASE` と誤認されず構文解析を通る（0A000 で止まる）。
+/// SET 右辺・VALUES の先頭が `CASE WHEN` の式でも列 `CASE` と誤認されず構文解析を通る
+/// （UPDATE は実行され、NOT MATCHED の INSERT は 0A000 で止まる）。
+// INSERT の形は実行を入れる #3354 まで拒否する。
+// tracked: #3354
 #[test]
 fn sql79_case_when_expression_in_set_and_values_parses() {
     let (core, _g) = new_core("sql79-case-when");
     seed(&core);
-    for sql in [
-        "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = CASE WHEN s.v > 1 THEN 1 ELSE 2 END",
-        "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, embedding, k, x) VALUES (s.id, '[0.1,0.2]', s.k, CASE WHEN s.v > 1 THEN 1 ELSE 2 END)",
-    ] {
-        let (code, msg) = run(&core, sql).expect_err(sql);
-        assert_eq!((code.as_str(), msg.as_str()), ("0A000", FIXED_MESSAGE), "{sql}");
-        assert!(matches!(core.parse_sql(sql).expect("parse"), ParsedSql::Merge(_)));
-    }
+    let update = "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = CASE WHEN s.v > 1 THEN 1 ELSE 2 END";
+    let out = run(&core, update).expect("update with CASE WHEN");
+    assert!(out.starts_with("Merge("), "{out}");
+    assert!(matches!(
+        core.parse_sql(update).expect("parse"),
+        ParsedSql::Merge(_)
+    ));
+    let insert = "MERGE INTO t USING s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, embedding, k, x) VALUES (s.id, '[0.1,0.2]', s.k, CASE WHEN s.v > 1 THEN 1 ELSE 2 END)";
+    let (code, msg) = run(&core, insert).expect_err(insert);
+    assert_eq!(
+        (code.as_str(), msg.as_str()),
+        ("0A000", NOT_MATCHED_MESSAGE),
+        "{insert}"
+    );
+    assert!(matches!(
+        core.parse_sql(insert).expect("parse"),
+        ParsedSql::Merge(_)
+    ));
 }
 
 /// 既存の `UPDATE ... FROM` の SET 右辺が `CASE WHEN` で始まる式でも受理される。

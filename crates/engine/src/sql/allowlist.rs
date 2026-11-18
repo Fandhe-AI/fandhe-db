@@ -1001,6 +1001,11 @@ pub enum SqlSurfaceError {
     /// `ON CONFLICT DO UPDATE command cannot affect row a second time` と同じ分類で、文全体を
     /// 拒否する。固定文言のため衝突キーの値・行の内容・他テナントの情報は含まない。
     UpsertCardinalityViolation,
+    /// `MERGE` の 1 つの対象行に対し、UPDATE か DELETE を選んだ組が 2 つ以上あった（`21000`。
+    /// SQL-79・Issue #3353。設計記録 `docs/design/sql-merge.md` の D5）。文全体を拒否し、行・台帳・世代へ
+    /// 何も残さない。固定文言のため行の値・件数・他テナントの情報は含まない。判定に使うのは自テナントの
+    /// 所有かつ可視の対象行と、書き込むセッションから見える元の行だけ。
+    MergeCardinalityViolation,
     /// untrusted 入力のサイズがアロケーション前の上限を超過した（ベクトルリテラル
     /// 64 KiB 超過、候補集合の容量上限超過等。ERR-2: `54000`）。
     PayloadTooLarge { detail: String },
@@ -1867,6 +1872,11 @@ impl SqlSurfaceError {
         SqlSurfaceError::UpsertCardinalityViolation
     }
 
+    /// `pub(crate)`: `core::merge_exec` が `MERGE` の多重一致（`21000`。Issue #3353）を報告するために使う。
+    pub(crate) fn merge_cardinality_violation() -> Self {
+        SqlSurfaceError::MergeCardinalityViolation
+    }
+
     /// `pub(crate)`: `sql::parser::bind`・`sql::exec`（TASK-75）がアロケーション前の
     /// サイズ上限超過を報告するために使う。
     pub(crate) fn payload_too_large(detail: impl Into<String>) -> Self {
@@ -2084,9 +2094,9 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::StringDataRightTruncation { .. } => {
                 ErrorClass::StringDataRightTruncation
             }
-            SqlSurfaceError::CardinalityViolation | SqlSurfaceError::UpsertCardinalityViolation => {
-                ErrorClass::CardinalityViolation
-            }
+            SqlSurfaceError::CardinalityViolation
+            | SqlSurfaceError::UpsertCardinalityViolation
+            | SqlSurfaceError::MergeCardinalityViolation => ErrorClass::CardinalityViolation,
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
@@ -2272,6 +2282,9 @@ impl std::fmt::Display for SqlSurfaceError {
                 f,
                 "ON CONFLICT DO UPDATE command cannot affect row a second time"
             ),
+            SqlSurfaceError::MergeCardinalityViolation => {
+                write!(f, "MERGE command cannot affect row a second time")
+            }
             SqlSurfaceError::PayloadTooLarge { detail } => {
                 write!(f, "payload too large: {detail}")
             }

@@ -7244,6 +7244,103 @@ fn enumerate_dml_candidates_with<E, T>(
     Ok(candidate_ids)
 }
 
+/// `MERGE`（SQL-79・Issue #3353）が対象表を書く前に行う、カタログだけで決まる事前判定。行は読まず書かない。
+///
+/// 責務境界: `core::merge_exec` が write txn を得た直後（元の走査・候補列挙より前）に呼ぶ。次のいずれかなら
+/// 拒否し、呼び出し元は write txn を commit しない（副作用ゼロ）。
+/// - 束縛時のスキーマと実行時のスキーマが違う（並行 `ALTER TABLE`。`22000`）
+/// - `row_security = off`（`42501`。RLS-13）
+/// - 対象表に利用者ポリシーが適用される（UPDATE 用・DELETE 用のどちらでも固定文言の `0A000`。操作ごとに
+///   行集合が変わり、第 1 段の列挙と第 3 段の列挙が一致する保証を作れないため。担当 #3355）
+/// - 対象表に文トリガがある（固定文言の `0A000`。MERGE の文トリガは操作の種類ごとに 1 回の契約で、既存の
+///   書き込み経路は呼び出しごとに発火するため。担当 #3355）
+pub(crate) fn merge_target_preflight(
+    write_txn: &redb::WriteTransaction,
+    ctx: &PolicyContext,
+    table: &str,
+    expected_schema: &crate::catalog::TableSchema,
+) -> Result<(), TenantWriteError> {
+    validate_relation_key(table)?;
+    let schema = require_table_schema_write_any_identity(write_txn, table)?;
+    if &schema != expected_schema {
+        return Err(TenantWriteError::from(CatalogError::Invalid(
+            "table schema changed after the statement was bound".to_string(),
+        )));
+    }
+    crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
+    let unsupported = |detail: &str| {
+        TenantWriteError::TriggerFailed(SqlSurfaceError::FeatureNotSupported {
+            detail: detail.to_string(),
+        })
+    };
+    for cmd in [
+        crate::sql::row_policy::PolicyCmd::Update {
+            reads_existing: true,
+        },
+        crate::sql::row_policy::PolicyCmd::Delete {
+            reads_existing: true,
+        },
+    ] {
+        if resolve_dml_row_policy(write_txn, ctx, &schema, table, cmd)?.is_some() {
+            return Err(unsupported(
+                "MERGE into a table with row-level security policies is not supported yet",
+            ));
+        }
+    }
+    let triggers =
+        crate::catalog::trigger::list_triggers_in_txn(write_txn, ctx.tenant_id(), table)?;
+    if triggers
+        .iter()
+        .any(|t| t.level == crate::catalog::trigger::TriggerLevel::Statement)
+    {
+        return Err(unsupported(
+            "MERGE into a table with statement-level triggers is not supported yet",
+        ));
+    }
+    Ok(())
+}
+
+/// `MERGE` の第 1 段（操作列の決定。SQL-79・Issue #3353）が使う、読み取り専用の対象候補列挙。
+///
+/// 責務境界: 既存の候補列挙本体（[`enumerate_dml_candidates_with`]）をそのまま呼ぶだけで、テナントのキー範囲・
+/// 総走査上限・「所有かつ可視」の選定・協調的中断は UPDATE／DELETE と完全に同一。台帳・トリガ・世代・行の
+/// 書き込みには一切触れない（第 2 の書き込み経路ではない）。利用者ポリシーが無いことは
+/// [`merge_target_preflight`] が保証済みの前提で、ポリシーは `None` で渡す。呼び出し元は `core::merge_exec`。
+/// `predicate` は候補ごとに 1 回呼ばれ、`Some(t)` が採用（`(id, t)` を候補列挙順で返す）。
+pub(crate) fn enumerate_merge_candidates_readonly<E, T>(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    expected_schema: &crate::catalog::TableSchema,
+    needs_embedding: bool,
+    max_scanned_rows: usize,
+    predicate: &mut impl FnMut(&DmlCandidate<'_>) -> Result<Option<T>, E>,
+) -> Result<Vec<(u64, T)>, PredicateDmlError<E>> {
+    validate_relation_key(table).map_err(dml_write_err)?;
+    let schema =
+        require_table_schema_write_any_identity(write_txn, table).map_err(dml_write_err)?;
+    if &schema != expected_schema {
+        return Err(dml_write_err(CatalogError::Invalid(
+            "table schema changed after the statement was bound".to_string(),
+        )));
+    }
+    let row_table_name = user_rows_table_name(table);
+    let row_table = write_txn
+        .open_table_logged(user_rows_table_def(&row_table_name))
+        .map_err(|e| dml_write_err(map_row_table_error(e)))?;
+    enumerate_dml_candidates_with(
+        table,
+        &row_table,
+        ctx,
+        &schema,
+        None,
+        needs_embedding,
+        None,
+        max_scanned_rows,
+        predicate,
+    )
+}
+
 /// 述語つき `DELETE FROM <table> WHERE ... USING OPERATION_ID '<id>'`
 /// （SQL-19・TASK-192、Issue #871）の実体。唯一の到達経路は
 /// `sql::exec::execute_predicate_delete`。

@@ -2158,10 +2158,10 @@ pub enum ParsedSql {
     /// **BREAKING CHANGE**（Issue #1754）: 本 variant の追加により `ParsedSql` を網羅的に
     /// マッチするクレート外コードは追随が必要。
     UpdateFrom(Box<crate::sql::allowlist::ValidatedUpdateFrom>),
-    /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析までを
-    /// 担い、Execute・Describe・明示 Tx の各腕は束縛（#3352。`sql::merge_bind`）を通してから固定文言の
-    /// `0A000`（[`MERGE_NOT_SUPPORTED_YET`]）で副作用なしに止める。実行は #3353・#3354、台帳・`OpTag`・`EXPLAIN` は #3357、
-    /// `RETURNING` は #3356 が結線する。既存 variant にフィールドを足さず別 variant にしているのは、
+    /// `MERGE INTO <対象> USING <元> ON <条件> WHEN ... THEN ...`（SQL-79・Issue #3351）。構文解析を担い、
+    /// 実行は束縛（#3352。`sql::merge_bind`）を通してから `core::merge_exec` が行う（`WHEN MATCHED` だけの形は
+    /// #3353 で実行。NOT MATCHED は #3354、台帳・`OpTag`・`EXPLAIN` は #3357、`RETURNING` は #3356 が結線し、
+    /// それまでは固定文言の `0A000` で副作用なしに止める）。既存 variant にフィールドを足さず別 variant にしているのは、
     /// MERGE を他の DML として黙って実行する経路（fail-open）を作らないため。
     Merge(Box<crate::sql::allowlist::ValidatedMerge>),
     /// `DELETE FROM <表> [[AS] <別名>] USING <表の並び> [WHERE ...]`（SQL-53 (b)・Issue #1754）。
@@ -2617,9 +2617,13 @@ fn row_lock_not_supported() -> crate::sql::allowlist::SqlSurfaceError {
     )
 }
 
-/// `MERGE` の実行・Describe が返す固定文言（SQL-79・Issue #3351。構文解析のみで、実行は #3353・#3354）。
+/// `MERGE ... RETURNING` の Describe が返す固定文言（SQL-79・Issue #3351。`RETURNING` の結線は #3356）。
 /// 入力断片・件数・他テナントの情報を含めない。
 const MERGE_NOT_SUPPORTED_YET: &str = "MERGE is not supported yet";
+
+/// 暗黙 Tx を通らない経路（ネストした実行等）の `MERGE` が返す固定文言（SQL-79・Issue #3353。
+/// `UPDATE ... FROM` の `JOINED_DML_UNSUPPORTED_HERE` と同じ扱い）。入力断片・件数を含めない。
+const MERGE_NOT_SUPPORTED_HERE: &str = "MERGE is not supported for this statement";
 
 fn statement_clock_scope(
     parsed: &ParsedSql,
@@ -2645,8 +2649,7 @@ fn statement_clock_scope(
         | ParsedSql::Update(_)
         | ParsedSql::UpdateFrom(_)
         | ParsedSql::DeleteUsing(_)
-        // SQL-79・Issue #3351: MERGE の SET・INSERT 値も文の開始時刻を共有する想定（実行は #3354 で結線。
-        // 現状は `0A000` のため影響しない）。
+        // SQL-79・Issue #3351・#3353: MERGE の SET 値（`DEFAULT now()` 等）も文の開始時刻を共有する。
         | ParsedSql::Merge(_)
         // Issue #2051: `EXPLAIN INSERT` の束縛は `DEFAULT now()` 等の評価に文の開始時刻を要する。
         | ParsedSql::ExplainInsert(_)
@@ -5622,6 +5625,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Merge(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
@@ -5701,6 +5705,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Merge(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
@@ -5777,6 +5782,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Merge(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
@@ -5860,6 +5866,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Merge(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
@@ -5962,6 +5969,7 @@ impl EngineCore {
                     | crate::sql::SqlOutcome::Delete(_)
                     | crate::sql::SqlOutcome::Returning(_)
                     | crate::sql::SqlOutcome::Update(_)
+                    | crate::sql::SqlOutcome::Merge(_)
                     | crate::sql::SqlOutcome::CreateTable(_)
                     | crate::sql::SqlOutcome::CreateTableAs(_)
                     | crate::sql::SqlOutcome::DropTable(_)
@@ -9982,6 +9990,7 @@ impl EngineCore {
         // SQL-53 (b)・Issue #3202: `UPDATE ... FROM`／`DELETE ... USING` も同じ暗黙トランザクションで実行する。
         if Self::is_subquery_predicate_dml(parsed)
             || dml_from_exec::is_joined_dml(parsed)
+            || matches!(parsed, ParsedSql::Merge(_))
             || dml_from_exec::is_joined_explain_analyze(parsed)
             || matches!(parsed, ParsedSql::DataModifyingCte(_) | ParsedSql::Do(_))
             || Self::calls_session_routine(session, parsed)
@@ -10232,14 +10241,14 @@ impl EngineCore {
                     dml_from_exec::JOINED_DML_UNSUPPORTED_HERE,
                 ),
             ),
-            // SQL-79・Issue #3351・#3352: 束縛（列解決・型照合）を通してから固定文言の `0A000` で返す。
-            // writer の取得・暗黙 Tx の開始・台帳の照合より前で、行・台帳・世代へ一切触れない
-            // （実行は #3353・#3354）。
+            // SQL-79・Issue #3351・#3352・#3353: 暗黙 Tx を通らない経路（ネストした実行等）の MERGE は、束縛
+            // （列解決・型照合）を通してから固定文言の `0A000` で返す。writer の取得・台帳の照合より前で、
+            // 行・台帳・世代へ一切触れない（実行は `execute_merge_in_txn`。autocommit は暗黙 Tx 経由）。
             ParsedSql::Merge(stmt) => {
                 self.bind_merge_stmt(session, stmt, session.udfs(), &[], None)?;
                 Err(
                     crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                        MERGE_NOT_SUPPORTED_YET,
+                        MERGE_NOT_SUPPORTED_HERE,
                     ),
                 )
             }
@@ -11945,17 +11954,7 @@ impl EngineCore {
             // SQL-79・Issue #3351・#3352: 明示 Tx 内の MERGE も束縛を通してから固定文言の `0A000`。束縛は
             // 読み取りスナップショットだけを使い、`mark_written` は呼ばず共有 write txn へ何も書かない
             // （失敗文としての Tx 状態遷移は呼び出し元の既存規約）。
-            ParsedSql::Merge(stmt) => {
-                // writer 取得前は `BEGIN` 時点のスナップショットで束縛し、Describe（`describe_snapshot`）と
-                // 読み取り源をそろえる（並行 DDL 後も SQLSTATE が食い違わない）。
-                let snap = Self::describe_snapshot(txn)?;
-                self.bind_merge_stmt(session, stmt, session.udfs(), &[], snap)?;
-                Err(
-                    crate::sql::allowlist::SqlSurfaceError::feature_not_supported(
-                        MERGE_NOT_SUPPORTED_YET,
-                    ),
-                )
-            }
+            ParsedSql::Merge(stmt) => self.execute_merge_in_txn(ctx, session, txn, stmt),
             ParsedSql::DeleteUsing(stmt) => {
                 self.execute_delete_using_in_txn(ctx, session, txn, stmt)
             }
