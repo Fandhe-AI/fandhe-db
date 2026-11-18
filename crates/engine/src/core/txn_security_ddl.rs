@@ -226,23 +226,27 @@ impl EngineCore {
                     )?;
                 }
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_guarded();
+                let snap = txn.mark_ddl_guarded();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                let outcome = crate::sql::grant_ddl::execute_grant_revoke_in(
+                let (outcome, changed) = crate::sql::grant_ddl::execute_grant_revoke_in(
                     &self.storage,
                     Some(write_txn),
                     tenant,
                     session,
                     stmt,
                 )?;
+                if !changed {
+                    // 既に反映済みの再実行（何も書かない no-op）は印を巻き戻す。
+                    txn.restore_ddl_started(snap);
+                }
                 Ok(SqlOutcome::GrantRevoke(outcome))
             }
             ParsedSql::AlterDefaultPrivileges(stmt) => {
                 crate::sql::grant_ddl::require_grant_principal(session)?;
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_guarded();
+                let snap = txn.mark_ddl_guarded();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                let outcome =
+                let (outcome, changed) =
                     crate::sql::default_privileges_ddl::execute_alter_default_privileges_in(
                         &self.storage,
                         Some(write_txn),
@@ -250,6 +254,9 @@ impl EngineCore {
                         session,
                         stmt,
                     )?;
+                if !changed {
+                    txn.restore_ddl_started(snap);
+                }
                 Ok(SqlOutcome::AlterDefaultPrivileges(outcome))
             }
             ParsedSql::AlterOwner(stmt) => {
@@ -302,14 +309,14 @@ impl EngineCore {
                 txn.ensure_writer(ctx)?;
                 let snap = txn.mark_ddl_guarded();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                let outcome = crate::sql::role_ddl::execute_drop_role_in(
+                let (outcome, removed) = crate::sql::role_ddl::execute_drop_role_in(
                     &self.storage,
                     Some(write_txn),
                     tenant,
                     stmt,
                 )?;
-                if outcome.skipped() && stmt.names.len() == 1 {
-                    // 単一名の `IF EXISTS` で対象が無い no-op は印を巻き戻す（複数名は一部が消えうるため残す）。
+                if !removed {
+                    // 何も削除しなかった `IF EXISTS` の no-op は印を巻き戻す（一部でも消えたら残す）。
                     txn.restore_ddl_started(snap);
                 }
                 Ok(SqlOutcome::DropRole(outcome))
@@ -317,15 +324,19 @@ impl EngineCore {
             ParsedSql::AlterRole(stmt) => {
                 crate::sql::ddl::require_ddl_permission(session)?;
                 txn.ensure_writer(ctx)?;
-                txn.mark_ddl_guarded();
+                let snap = txn.mark_ddl_guarded();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
-                let outcome = crate::sql::role_ddl::execute_alter_role_in(
+                let (outcome, wrote) = crate::sql::role_ddl::execute_alter_role_in(
                     &self.storage,
                     Some(write_txn),
                     tenant,
                     session,
                     stmt,
                 )?;
+                if !wrote {
+                    // オプション指定なしの存在確認だけ（何も書かない）は印を巻き戻す。
+                    txn.restore_ddl_started(snap);
+                }
                 Ok(SqlOutcome::AlterRole(outcome))
             }
             ParsedSql::CreateTrigger(stmt) => {

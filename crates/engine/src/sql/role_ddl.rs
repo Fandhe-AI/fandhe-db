@@ -228,7 +228,7 @@ pub(crate) fn execute_drop_role(
     tenant_id: &str,
     stmt: &ValidatedDropRole,
 ) -> Result<DropRoleOutcome, SqlSurfaceError> {
-    execute_drop_role_in(storage, None, tenant_id, stmt)
+    execute_drop_role_in(storage, None, tenant_id, stmt).map(|(outcome, _)| outcome)
 }
 
 /// [`execute_drop_role`] の書き込み先を選べる版（`target` の扱いは [`execute_create_role_in`] と同じ）。
@@ -237,11 +237,15 @@ pub(crate) fn execute_drop_role_in(
     target: Option<&redb::WriteTransaction>,
     tenant_id: &str,
     stmt: &ValidatedDropRole,
-) -> Result<DropRoleOutcome, SqlSurfaceError> {
+) -> Result<(DropRoleOutcome, bool), SqlSurfaceError> {
     match storage.drop_roles_in(target, tenant_id, &stmt.names, stmt.if_exists) {
-        Ok(removed) => Ok(DropRoleOutcome {
-            skipped: removed < stmt.names.len(),
-        }),
+        // 第 2 要素は 1 件以上を実際に削除したか（明示 Tx が no-op の guard 印を巻き戻す判定に使う）。
+        Ok(removed) => Ok((
+            DropRoleOutcome {
+                skipped: removed < stmt.names.len(),
+            },
+            removed > 0,
+        )),
         Err(DropRolesError::NotFound(name)) => Err(SqlSurfaceError::UndefinedRole { name }),
         Err(DropRolesError::HasDependents(name)) => {
             Err(SqlSurfaceError::RoleHasDependents { name })
@@ -267,7 +271,7 @@ pub(crate) fn execute_alter_role(
     session: &SessionState,
     stmt: &ValidatedAlterRole,
 ) -> Result<AlterRoleOutcome, SqlSurfaceError> {
-    execute_alter_role_in(storage, None, tenant_id, session, stmt)
+    execute_alter_role_in(storage, None, tenant_id, session, stmt).map(|(outcome, _)| outcome)
 }
 
 /// [`execute_alter_role`] の書き込み先を選べる版（`target` の扱いは [`execute_create_role_in`] と同じ）。
@@ -277,7 +281,8 @@ pub(crate) fn execute_alter_role_in(
     tenant_id: &str,
     session: &SessionState,
     stmt: &ValidatedAlterRole,
-) -> Result<AlterRoleOutcome, SqlSurfaceError> {
+) -> Result<(AlterRoleOutcome, bool), SqlSurfaceError> {
+    // 第 2 要素は何かを書き込んだか（指定なしの存在確認だけなら偽。明示 Tx が guard 印を巻き戻す判定に使う）。
     match &stmt.action {
         AlterRoleAction::Options(patch) => {
             let new_verifier = match &patch.password {
@@ -305,7 +310,7 @@ pub(crate) fn execute_alter_role_in(
                     None => storage.get_role(tenant_id, &stmt.name),
                 };
                 return match found {
-                    Ok(Some(_)) => Ok(AlterRoleOutcome {}),
+                    Ok(Some(_)) => Ok((AlterRoleOutcome {}, false)),
                     Ok(None) => Err(SqlSurfaceError::UndefinedRole {
                         name: stmt.name.clone(),
                     }),
@@ -340,7 +345,7 @@ pub(crate) fn execute_alter_role_in(
                     }
                 })
                 .map_err(|e| map_role_error(e, &stmt.name))?;
-            Ok(AlterRoleOutcome {})
+            Ok((AlterRoleOutcome {}, true))
         }
         AlterRoleAction::Rename { new_name } => {
             let protected: Vec<u64> = [session.session_role_id(), session.current_role_id()]
@@ -348,7 +353,7 @@ pub(crate) fn execute_alter_role_in(
                 .flatten()
                 .collect();
             match storage.rename_role_in(target, tenant_id, &stmt.name, new_name, &protected) {
-                Ok(()) => Ok(AlterRoleOutcome {}),
+                Ok(()) => Ok((AlterRoleOutcome {}, true)),
                 Err(CatalogError::Invalid(m)) if m == ROLE_ALREADY_EXISTS_MESSAGE => {
                     Err(SqlSurfaceError::DuplicateRole {
                         name: new_name.clone(),

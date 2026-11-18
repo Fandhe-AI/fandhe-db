@@ -42,6 +42,7 @@ pub(crate) fn execute_alter_default_privileges(
     stmt: &ValidatedAlterDefaultPrivileges,
 ) -> Result<AlterDefaultPrivilegesOutcome, SqlSurfaceError> {
     execute_alter_default_privileges_in(storage, None, tenant_id, session, stmt)
+        .map(|(outcome, _)| outcome)
 }
 
 /// [`execute_alter_default_privileges`] の書き込み先を選べる版（`target` の扱いは
@@ -52,7 +53,8 @@ pub(crate) fn execute_alter_default_privileges_in(
     tenant_id: &str,
     session: &SessionState,
     stmt: &ValidatedAlterDefaultPrivileges,
-) -> Result<AlterDefaultPrivilegesOutcome, SqlSurfaceError> {
+) -> Result<(AlterDefaultPrivilegesOutcome, bool), SqlSurfaceError> {
+    // 第 2 要素は既定権限の行を実際に変更したか（既に反映済みの再実行は偽。明示 Tx が guard 印を巻き戻す）。
     let actor_id = crate::sql::grant_ddl::require_grant_principal(session)?;
     let mut grantees = Vec::with_capacity(stmt.grantees.len());
     for g in &stmt.grantees {
@@ -83,10 +85,13 @@ pub(crate) fn execute_alter_default_privileges_in(
         grantees: &grantees,
         grant_option: stmt.grant_option,
     };
-    storage
+    let changed = storage
         .apply_default_acl_changes_in(target, tenant_id, &req)
         .map_err(crate::sql::grant_ddl::map_acl_error)?;
-    Ok(AlterDefaultPrivilegesOutcome {
-        is_revoke: !stmt.is_grant,
-    })
+    Ok((
+        AlterDefaultPrivilegesOutcome {
+            is_revoke: !stmt.is_grant,
+        },
+        changed > 0,
+    ))
 }

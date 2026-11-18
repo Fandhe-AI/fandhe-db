@@ -73,7 +73,7 @@ pub(crate) fn execute_grant_revoke(
     session: &SessionState,
     stmt: &ValidatedGrantRevoke,
 ) -> Result<GrantRevokeOutcome, SqlSurfaceError> {
-    execute_grant_revoke_in(storage, None, tenant_id, session, stmt)
+    execute_grant_revoke_in(storage, None, tenant_id, session, stmt).map(|(outcome, _)| outcome)
 }
 
 /// [`execute_grant_revoke`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn の上で
@@ -85,7 +85,9 @@ pub(crate) fn execute_grant_revoke_in(
     tenant_id: &str,
     session: &SessionState,
     stmt: &ValidatedGrantRevoke,
-) -> Result<GrantRevokeOutcome, SqlSurfaceError> {
+) -> Result<(GrantRevokeOutcome, bool), SqlSurfaceError> {
+    // 第 2 要素は ACL・メンバーシップの行を実際に変更したか（既に反映済みの再実行は偽。明示 Tx が
+    // no-op の guard 印を巻き戻す判定に使う）。
     let grantor_id = require_grant_principal(session)?;
     let objects = match &stmt.target {
         GrantTarget::Roles(r) => {
@@ -119,14 +121,17 @@ pub(crate) fn execute_grant_revoke_in(
                 option_for: r.option_for.map(conv),
                 cascade: r.cascade,
             };
-            storage
+            let applied = storage
                 .apply_membership_changes_in(target, tenant_id, &req)
                 .map_err(map_membership_error)?;
-            return Ok(GrantRevokeOutcome {
-                is_revoke: !stmt.is_grant,
-                is_role: true,
-                warning: None,
-            });
+            return Ok((
+                GrantRevokeOutcome {
+                    is_revoke: !stmt.is_grant,
+                    is_role: true,
+                    warning: None,
+                },
+                applied.rows_changed > 0,
+            ));
         }
         GrantTarget::Objects(o) => o,
     };
@@ -181,11 +186,14 @@ pub(crate) fn execute_grant_revoke_in(
     let applied = storage
         .apply_acl_changes_in(target, tenant_id, &req)
         .map_err(map_acl_error)?;
-    Ok(GrantRevokeOutcome {
-        is_revoke: !stmt.is_grant,
-        is_role: false,
-        warning: applied.warning,
-    })
+    Ok((
+        GrantRevokeOutcome {
+            is_revoke: !stmt.is_grant,
+            is_role: false,
+            warning: applied.warning,
+        },
+        applied.rows_changed > 0,
+    ))
 }
 
 /// メンバーシップ適用の失敗を SQL 表層の契約へ写像する（ロール不在 `42704`・権限なし `42501`・依存する付与

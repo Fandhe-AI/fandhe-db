@@ -320,6 +320,41 @@ fn followers_after_guarded_ddl_are_rejected_with_a_fixed_message() {
     f.tx_ok("t1", &mut alice, &mut txn, "ROLLBACK");
 }
 
+/// 何も書き込まない no-op のセキュリティ DDL（オプションなしの `ALTER ROLE`・全名不在の
+/// `DROP ROLE IF EXISTS`・反映済みの GRANT／REVOKE／`ALTER DEFAULT PRIVILEGES` の再実行）は guard 印を残さず、
+/// 同じ Tx の後続の SELECT・INSERT が `0A000` にならない（Issue #3316 の Bugbot 指摘）。
+#[test]
+fn noop_security_ddl_does_not_block_followers() {
+    let f = fx("sql80_sec_noop");
+    let mut alice = bound(ALICE, true);
+    f.ok("t1", &mut alice, "CREATE TABLE docs (a TEXT)");
+    f.ok("t1", &mut alice, "GRANT SELECT ON docs TO bob");
+    f.ok(
+        "t1",
+        &mut alice,
+        "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO bob",
+    );
+    for noop in [
+        "ALTER ROLE bob",
+        "DROP ROLE IF EXISTS nosuch1, nosuch2",
+        "GRANT SELECT ON docs TO bob",
+        "REVOKE INSERT ON docs FROM bob",
+        "ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO bob",
+        "ALTER DEFAULT PRIVILEGES REVOKE INSERT ON TABLES FROM bob",
+    ] {
+        let mut txn = f.begin("t1", &mut alice);
+        f.tx_ok("t1", &mut alice, &mut txn, noop);
+        f.tx_ok("t1", &mut alice, &mut txn, "SELECT a FROM docs");
+        f.tx_ok(
+            "t1",
+            &mut alice,
+            &mut txn,
+            "INSERT INTO docs (a) VALUES ('x')",
+        );
+        f.tx_ok("t1", &mut alice, &mut txn, "ROLLBACK");
+    }
+}
+
 /// 1 つの Tx で表・ポリシー・行セキュリティ・GRANT を積み、原子的に効く。既定権限は同じ Tx で作る表に付く。
 #[test]
 fn combined_ddl_commits_atomically() {
