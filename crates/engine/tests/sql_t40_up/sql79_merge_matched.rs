@@ -743,6 +743,63 @@ fn row_triggers_fire_through_the_existing_write_paths() {
     );
 }
 
+/// BEFORE ROW トリガが行を飛ばす（`RETURN NULL`）のは正常な動作で、MERGE は失敗せず実変更件数を返す。
+#[test]
+fn a_before_row_trigger_skipping_a_row_does_not_fail_the_merge() {
+    let (core, _g) = new_core("sql79m-trigger-skip");
+    private_tables(&core);
+    trigger_fn(&core);
+    ddl(
+        &core,
+        "CREATE TRIGGER tskip BEFORE UPDATE ON s.pt FOR EACH ROW EXECUTE FUNCTION noop()",
+    );
+    let before = private_snapshot(&core);
+    let n = merged(
+        &core,
+        "MERGE INTO s.pt AS d USING s.ps AS e ON d.k = e.k WHEN MATCHED THEN UPDATE SET x = e.v",
+    );
+    assert_eq!(n, 0);
+    assert_eq!(before, private_snapshot(&core));
+}
+
+/// `UPDATE OF` トリガは、各行で選ばれた句の SET 列だけで判定する（別の句の列では発火しない）。
+#[test]
+fn update_of_triggers_use_the_set_columns_of_the_chosen_clause() {
+    let (core, _g) = new_core("sql79m-update-of");
+    ddl(&core, "CREATE SCHEMA s");
+    ddl(&core, "CREATE TABLE s.q (k TEXT, x INTEGER, y INTEGER)");
+    ddl(&core, "CREATE TABLE s.qs (k TEXT, v INTEGER)");
+    run(
+        &core,
+        "INSERT INTO s.q (k, x, y) VALUES ('a', 1, 1), ('b', 2, 2)",
+    )
+    .expect("seed q");
+    run(
+        &core,
+        "INSERT INTO s.qs (k, v) VALUES ('a', 100), ('b', 10)",
+    )
+    .expect("seed qs");
+    ddl(
+        &core,
+        "CREATE FUNCTION bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.x := NEW.x + 1000; RETURN NEW; END $$",
+    );
+    ddl(
+        &core,
+        "CREATE TRIGGER tx BEFORE UPDATE OF x ON s.q FOR EACH ROW EXECUTE FUNCTION bump()",
+    );
+    let n = merged(
+        &core,
+        "MERGE INTO s.q AS d USING s.qs AS e ON d.k = e.k \
+         WHEN MATCHED AND e.v > 50 THEN UPDATE SET x = e.v \
+         WHEN MATCHED THEN UPDATE SET y = e.v",
+    );
+    assert_eq!(n, 2);
+    assert_eq!(
+        rows_of(&core, "alice", "SELECT k, x, y FROM s.q ORDER BY k LIMIT 10"),
+        "Text(\"a\"):SignedInteger(1100):SignedInteger(1) | Text(\"b\"):SignedInteger(2):SignedInteger(10)"
+    );
+}
+
 #[test]
 fn generated_columns_are_recomputed_by_a_matched_update() {
     let (core, _g) = new_core("sql79m-generated");
@@ -1011,4 +1068,22 @@ fn a_uuid_column_is_copied_without_going_through_an_expression() {
         rows_of(&core, "alice", "SELECT k, u FROM ct ORDER BY k LIMIT 10"),
         rows_of(&core, "alice", "SELECT k, u FROM cs ORDER BY k LIMIT 10")
     );
+}
+
+/// 部分クエリの元が結果行数の上限を超えると `54000`（黙って切り詰めず、書き込み前に拒否する）。
+#[test]
+fn a_subquery_source_over_the_result_row_cap_is_54000_without_side_effects() {
+    let (core, _g) = limited_core("sql79m-lim-subq-cap", |c| {
+        c.with_result_limits(engine::result_limits::ResultLimits::new(100))
+    });
+    seed(&core);
+    insert_s(
+        &core,
+        "alice",
+        &(10u64..120).map(|i| (i, "z", Some(1))).collect::<Vec<_>>(),
+    );
+    let before = snapshot(&core);
+    let sql = "MERGE INTO t USING (SELECT k FROM s) AS q ON t.k = q.k WHEN MATCHED THEN DELETE";
+    assert_eq!(err_code(&core, sql).0, "54000");
+    assert_eq!(before, snapshot(&core));
 }

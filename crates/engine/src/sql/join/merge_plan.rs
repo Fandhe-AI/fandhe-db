@@ -472,6 +472,11 @@ impl<'p> MergeEval<'p> {
         Ok(Self { plan, clauses })
     }
 
+    /// 句の数（1 組あたりの条件評価回数の上限。比較回数の計上に使う）。
+    pub(crate) fn clause_count(&self) -> usize {
+        self.clauses.len()
+    }
+
     /// 対象行（`scanned`・`c`）と元の 1 行 `row` の組について、宣言順に条件を評価し、最初に真になった句の
     /// 操作を返す（真になる句が無ければ [`Choice::None`]。D4）。
     pub(crate) fn choose(

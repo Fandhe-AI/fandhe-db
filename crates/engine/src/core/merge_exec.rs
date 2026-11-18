@@ -38,7 +38,7 @@ use crate::sql::udf_call::UdfRegistry;
 use crate::sql::view::{resolve_from, Resolved};
 use crate::sql::SqlOutcome;
 use crate::tenant::{DmlCandidate, PredicateDmlError, PredicateDmlOutcome, WriteTarget};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// 束縛に使った対象・元のスキーマ（実行が同じスナップショットの値で計画を組むために返す）。
 pub(super) struct MergeBindSchemas {
@@ -336,6 +336,7 @@ impl EngineCore {
         // 7. 第 1 段: 全組の操作を決める（行は書かない）。1 つの対象行について UPDATE か DELETE を選んだ組が
         // 2 つ目になった時点で `21000`（DO NOTHING と、どの句も真にならなかった組は数えない。D5）。
         let mut eval = MergeEval::new(&plan)?;
+        let clause_count = eval.clause_count();
         let index = probe.index_handle();
         let mut positions: Vec<u32> = Vec::new();
         let planned = crate::tenant::enumerate_merge_candidates_readonly(
@@ -350,7 +351,13 @@ impl EngineCore {
                 positions.clear();
                 probe.matches_of(c, &scanned, &mut positions)?;
                 let mut chosen: Option<Planned> = None;
-                for &pos in &positions {
+                // 句の条件評価（`WHEN ... AND`）は組ごとのネストループ。`ON` の残余と同じ比較回数の上限へ
+                // 計上し（超過は `54000`）、一定間隔で中断要求（`57014`）を確認する。
+                probe.charge_comparisons(positions.len().saturating_mul(clause_count))?;
+                for (n, &pos) in positions.iter().enumerate() {
+                    if n % 1024 == 0 {
+                        crate::interrupt::check()?;
+                    }
                     let row =
                         index
                             .rows
@@ -374,7 +381,7 @@ impl EngineCore {
                                 target_schema,
                                 &mut |n| probe.charge_bytes(n),
                             )?;
-                            chosen = Some(Planned::Update(values));
+                            chosen = Some(Planned::Update(clause, values));
                         }
                     }
                 }
@@ -387,35 +394,39 @@ impl EngineCore {
         })?;
 
         // 8. 第 2 段: 上限の判定（一致ペア・比較回数・予算は第 1 段の中で判定済み）。
-        let mut update_plan: Vec<(u64, Vec<(usize, crate::row_codec::Value)>)> = Vec::new();
+        // UPDATE は選んだ句ごとに分ける（`UPDATE OF` トリガの発火判定は 1 回の適用の SET 列の和集合で
+        // 行われるため、句の SET 列が異なる行を同じ適用に混ぜると、別の句の列で発火してしまう）。
+        let mut update_plan: BTreeMap<usize, HashMap<u64, Vec<(usize, crate::row_codec::Value)>>> =
+            BTreeMap::new();
         let mut delete_plan: Vec<u64> = Vec::new();
+        let mut planned_total: usize = 0;
         for (id, p) in planned {
+            planned_total = planned_total.saturating_add(1);
             match p {
-                Planned::Update(values) => update_plan.push((id, values)),
+                Planned::Update(clause, values) => {
+                    update_plan.entry(clause).or_default().insert(id, values);
+                }
                 Planned::Delete => delete_plan.push(id),
             }
         }
-        crate::sql::parser::check_dml_affected_rows_with_limit(
-            update_plan.len().saturating_add(delete_plan.len()),
-            max_affected_rows,
-        )?;
+        crate::sql::parser::check_dml_affected_rows_with_limit(planned_total, max_affected_rows)?;
         drop(eval);
         drop(probe);
 
         // 9. 第 3 段: 既存の書き込み経路へ適用する。台帳は記録しない（`Omitted`／`Disabled`）ため、文ハッシュは
-        // 記録に使われない（#3357 が MERGE 用の `for_merge` に置き換える）。適用は UPDATE の区間 → DELETE の区間
-        // の最大 2 回（区間ごとに対象表を走査し直すため、区間数に比例した計算量にしない。UPDATE と DELETE の
-        // 対象行は `21000` の判定により互いに素）。
+        // 記録に使われない（#3357 が MERGE 用の `for_merge` に置き換える）。適用は UPDATE の句ごと → DELETE の
+        // 順（走査し直す回数は UPDATE 句数 + 1 で、句数は構文段の上限で抑えられ行数に比例しない。UPDATE と
+        // DELETE の対象行は `21000` の判定により互いに素）。
         debug_assert!(ledger_write.op_id().is_none());
         let hash = crate::recovery::content_hash::for_delete(0);
         let generated_scope =
             crate::sql::generated_column::GeneratedComputeScope::enter(target_table);
         let trigger_scope = crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
         let mut rows_affected: u64 = 0;
-        if !update_plan.is_empty() {
-            let expected = update_plan.len();
-            let mut by_id: HashMap<u64, Vec<(usize, crate::row_codec::Value)>> =
-                update_plan.into_iter().collect();
+        // 適用結果は実際に変更した件数を使う。BEFORE ROW トリガが行を飛ばす（`RETURN NULL`）・別の行を
+        // 消すなどの正常な動作で計画より少なくなっても、文は失敗させない（他の書き込み経路と同じ意味論）。
+        for (_clause, rows) in update_plan {
+            let mut by_id = rows;
             let outcome = crate::tenant::update_rows_joined_unchecked(
                 WriteTarget::InTxn(write_txn),
                 target_table,
@@ -435,18 +446,14 @@ impl EngineCore {
                 PredicateDmlError::Predicate(e) => e,
                 PredicateDmlError::Write(e) => crate::sql::exec::map_write_error(e, "update"),
             })?;
-            // 計画した id が全て列挙で消費されたことを確認する（外れたら write txn を commit しない）。
             match outcome {
-                PredicateDmlOutcome::Applied { rows_affected: n }
-                    if n == expected && by_id.is_empty() =>
-                {
+                PredicateDmlOutcome::Applied { rows_affected: n } => {
                     rows_affected = rows_affected.saturating_add(n as u64);
                 }
                 _ => return Err(merge_plan_mismatch()),
             }
         }
         if !delete_plan.is_empty() {
-            let expected = delete_plan.len();
             let ids: HashSet<u64> = delete_plan.into_iter().collect();
             let outcome = crate::tenant::delete_rows_where_with_triggers(
                 WriteTarget::InTxn(write_txn),
@@ -468,7 +475,7 @@ impl EngineCore {
                 PredicateDmlError::Write(e) => crate::sql::exec::map_write_error(e, "delete"),
             })?;
             match outcome {
-                PredicateDmlOutcome::Applied { rows_affected: n } if n == expected => {
+                PredicateDmlOutcome::Applied { rows_affected: n } => {
                     rows_affected = rows_affected.saturating_add(n as u64);
                 }
                 _ => return Err(merge_plan_mismatch()),
@@ -558,11 +565,12 @@ impl EngineCore {
 
 /// 第 1 段が 1 つの対象行について決めた操作。
 enum Planned {
-    Update(Vec<(usize, crate::row_codec::Value)>),
+    /// 選んだ句の添字と評価済みの SET 値。
+    Update(usize, Vec<(usize, crate::row_codec::Value)>),
     Delete,
 }
 
-/// 第 3 段の適用結果が第 1 段の計画と一致しない（計画した行が列挙で見つからない等）。write txn を commit
+/// 第 3 段の適用結果が想定外の形（`Applied` 以外）だった。write txn を commit
 /// させず `XX000` で fail-closed にする（行・件数・テナントを含めない）。
 fn merge_plan_mismatch() -> SqlSurfaceError {
     SqlSurfaceError::Internal {

@@ -667,15 +667,33 @@ impl ResidualEval {
         id: u64,
         row: &ResultRow,
     ) -> Result<bool, SqlSurfaceError> {
-        let mut view: Vec<Option<ScalarRef<'_>>> =
-            Vec::with_capacity(scanned.len().saturating_add(self.cells.len()));
-        view.extend(scanned.iter().copied());
-        for (cell_pos, ty) in &self.cells {
+        // 配列セルは借用形が正準ペイロードを要するため、先に所有バッファへ書き出す（ビューが借用する。
+        // `MERGE` の SET 評価と同じ扱い）。配列を含まない残余では確保しない。
+        let mut payloads: Vec<Option<Vec<u8>>> = Vec::with_capacity(self.cells.len());
+        for (cell_pos, _) in &self.cells {
             let cell = row
                 .cells
                 .get(*cell_pos)
                 .ok_or_else(|| internal("source cell out of range"))?;
-            view.push(source_scalar(cell, ty, None)?);
+            payloads.push(match cell {
+                Cell::Array(a) => {
+                    let mut buf = Vec::new();
+                    crate::row_codec::write_array_elements_payload(&mut buf, a)
+                        .map_err(|_| internal("source array column could not be re-encoded"))?;
+                    Some(buf)
+                }
+                _ => None,
+            });
+        }
+        let mut view: Vec<Option<ScalarRef<'_>>> =
+            Vec::with_capacity(scanned.len().saturating_add(self.cells.len()));
+        view.extend(scanned.iter().copied());
+        for ((cell_pos, ty), payload) in self.cells.iter().zip(&payloads) {
+            let cell = row
+                .cells
+                .get(*cell_pos)
+                .ok_or_else(|| internal("source cell out of range"))?;
+            view.push(source_scalar(cell, ty, payload.as_deref())?);
         }
         self.conj.matches(&view, id, &[], 0, &mut self.scratch)
     }
@@ -909,6 +927,12 @@ impl<'a> JoinedProbe<'a> {
             log.insert(c.id, pos);
         }
         Ok(first)
+    }
+
+    /// 文全体で共有する比較回数の上限へ `n` 回分を計上する（超過は `54000`。`MERGE` の `WHEN ... AND` の
+    /// 条件評価が、`ON` の残余と同じ上限を共有するために使う）。
+    pub(crate) fn charge_comparisons(&mut self, n: usize) -> Result<(), SqlSurfaceError> {
+        self.budget.charge_comparisons(n, self.max_comparisons)
     }
 
     /// 文全体で共有する予算へ、呼び出し元が保持する値のバイト数を計上する（超過は `54000`）。
