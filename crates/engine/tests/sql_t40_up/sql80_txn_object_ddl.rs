@@ -244,6 +244,35 @@ fn internal_id_reuse_after_rollback_does_not_inherit_a_stale_cursor() {
 }
 
 #[test]
+fn internal_id_reuse_after_rollback_does_not_inherit_session_currval_or_lastval() {
+    let (core, _g) = new_core("sql3315-seq-id-reuse-session");
+    let mut session = ddl_session();
+    auto_ok(&core, "alice", CREATE_T);
+
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(&core, &mut session, &mut txn, "CREATE SEQUENCE a START 100");
+    tx_ok(&core, &mut session, &mut txn, &insert_next(1, "a"));
+    rollback(&core, &mut session, &mut txn);
+
+    // 同じセッションで、再利用された内部 ID の別 SEQUENCE を作る（未採番）。
+    core.execute_sql_in_session(&ctx("alice"), &mut session, "CREATE SEQUENCE b START 7")
+        .expect("create b");
+    let currval = core
+        .execute_sql_in_session(
+            &ctx("alice"),
+            &mut session,
+            "INSERT INTO t (id, n) VALUES (2, currval('b')) USING OPERATION_ID 'op-cv'",
+        )
+        .expect_err("currval before nextval");
+    assert_eq!(currval.wire_code(), "55000");
+    let lastval = core
+        .execute_sql_in_session(&ctx("alice"), &mut session, "SELECT lastval()")
+        .expect_err("lastval before nextval");
+    assert_eq!(lastval.wire_code(), "55000");
+}
+
+#[test]
 fn alter_sequence_options_and_rename_commit_and_rollback() {
     let (core, _g) = new_core("sql3315-seq-alter");
     let mut session = ddl_session();

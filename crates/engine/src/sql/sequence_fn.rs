@@ -77,6 +77,7 @@ fn map_setval_error(e: SetvalError, poisoned: bool) -> SqlSurfaceError {
 /// `setval(..., true)` の値をセッションの `currval` へ記録する（`lastval` の対象は変えない）。
 fn record_session(
     session: &SessionState,
+    storage: &Storage,
     tenant_id: &str,
     sequence_id: u64,
     value: i64,
@@ -85,7 +86,12 @@ fn record_session(
     let mut state = handle
         .lock()
         .map_err(|_| internal("sequence session state unavailable"))?;
-    if state.record_setval(tenant_id, sequence_id, value) {
+    if state.record_setval(
+        tenant_id,
+        sequence_id,
+        value,
+        storage.sequence_allocator().generation(sequence_id),
+    ) {
         Ok(())
     } else {
         Err(SqlSurfaceError::payload_too_large("too many sequences"))
@@ -144,11 +150,12 @@ pub(crate) fn execute_autocommit(
             // commit 済みの後段。件数上限は `admit_fn` が commit 前に検査済みで、ここで失敗しうるのは
             // セッション状態のロックの毒化だけ（接続単位の値で、発生は想定しない）。
             if *is_called {
-                record_session(session, tenant_id, id, *value)?;
+                record_session(session, storage, tenant_id, id, *value)?;
             }
             Ok(result(f, *value))
         }
         SequenceFnKind::Lastval => lastval(
+            storage,
             session,
             tenant_id,
             f,
@@ -191,12 +198,13 @@ pub(crate) fn execute_in_txn(
             )
             .map_err(|e| map_setval_error(e, poisoned.get()))?;
             if *is_called {
-                record_session(session, tenant_id, id, *value)?;
+                record_session(session, storage, tenant_id, id, *value)?;
             }
             Ok((result(f, *value), true))
         }
         SequenceFnKind::Lastval => {
             let r = lastval(
+                storage,
                 session,
                 tenant_id,
                 f,
@@ -219,6 +227,7 @@ pub(crate) fn execute_in_txn(
 /// SEQUENCE で、内部 ID で存在確認する（RENAME は ID を保つため生き、DROP 後は同名で作り直しても
 /// 別 ID なので無効）。無効なら該当エントリを捨てて `55000`（fail-closed。設計記録 D6）。
 fn lastval(
+    storage: &Storage,
     session: &SessionState,
     tenant_id: &str,
     f: &ValidatedSequenceFunction,
@@ -229,7 +238,7 @@ fn lastval(
     let target = handle
         .lock()
         .map_err(|_| internal("sequence session state unavailable"))?
-        .lastval(tenant_id);
+        .lastval(tenant_id, |id| storage.sequence_allocator().generation(id));
     let Some((id, value)) = target else {
         return Err(SqlSurfaceError::LastvalNotYetDefined);
     };

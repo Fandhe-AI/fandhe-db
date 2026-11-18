@@ -611,6 +611,9 @@ fn advance(p: &SequenceParams, cur: &SeqCursor) -> std::result::Result<i64, Allo
 #[derive(Default)]
 pub(crate) struct SequenceAllocator {
     cursors: std::sync::Mutex<std::collections::HashMap<(String, u64), SeqCursor>>,
+    /// 内部 ID の再利用世代（ID → 再利用で払い出された回数。無いものは 0）。セッションの `currval`／`lastval`
+    /// 状態が、ROLLBACK 後に同じ ID を引き継いだ別の SEQUENCE の履歴を読まないための識別子（Issue #3315）。
+    generations: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
 }
 
 impl SequenceAllocator {
@@ -742,6 +745,22 @@ impl SequenceAllocator {
     #[cfg(test)]
     pub(crate) fn cursor_count(&self) -> usize {
         self.cursors.lock().map_or(0, |g| g.len())
+    }
+
+    /// 内部 ID の現在の再利用世代。ロックの毒化は `u64::MAX`（どの記録とも一致せず fail-closed）。
+    pub(crate) fn generation(&self, sequence_id: u64) -> u64 {
+        match self.generations.lock() {
+            Ok(g) => g.get(&sequence_id).copied().unwrap_or(0),
+            Err(_) => u64::MAX,
+        }
+    }
+
+    /// 内部 ID が（ROLLBACK 等で巻き戻って）払い出し直されたとき世代を進める。
+    fn bump_generation(&self, sequence_id: u64) {
+        if let Ok(mut g) = self.generations.lock() {
+            let e = g.entry(sequence_id).or_insert(0);
+            *e = e.saturating_add(1);
+        }
     }
 
     /// `sequence_id` の現在値を全テナント分メモリから捨てる（`DROP SEQUENCE`・RESTART の commit 成功後。
@@ -1188,6 +1207,8 @@ pub(crate) fn create_sequence_in_txn_evicting(
     let id = allocate_sequence_id_in_txn(write_txn)?;
     if let Some(allocator) = allocator {
         allocator.evict(id);
+        // セッション側の currval／lastval 履歴も無効化する（旧 SEQUENCE の値を引き継がせない）。
+        allocator.bump_generation(id);
     }
     let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
     if table.len()? >= MAX_SEQUENCES as u64 {
