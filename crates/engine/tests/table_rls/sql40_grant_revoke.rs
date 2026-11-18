@@ -2,8 +2,8 @@
 //! `docs/design/role-privilege-model.md` §8。
 //!
 //! 公開 API だけで固定できる契約を扱う: 現在ロールが未束縛（現状の全セッション）なら対象・ロールの有無を
-//! 問わず常に同じ `42501`（存在オラクルの防止）、構文エラーは `42601`、範囲外の形は `0A000`、明示トランザクション内は
-//! `0A000`（未束縛は `42501` が先）、束縛ロールが実在しなければ `42501`。ロールを作る `Storage::create_role` は
+//! 問わず常に同じ `42501`（存在オラクルの防止）、構文エラーは `42601`、範囲外の形は `0A000`、明示トランザクション内は共有 write txn の上で同じ判定
+//! （SQL-80・Issue #3316）（未束縛は `42501` が先）、束縛ロールが実在しなければ `42501`。ロールを作る `Storage::create_role` は
 //! crate 内限定のため、付与者の判定・REVOKE の連鎖は `sql::grant_ddl` の単体テストが固定する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -167,11 +167,12 @@ fn bound_but_nonexistent_role_is_denied() {
     }
 }
 
-/// 明示トランザクション内は `0A000`（ACL の書き込みは ROLLBACK で取り消せない）。未束縛は `42501` が先。
+/// 明示トランザクション内の GRANT／REVOKE は autocommit と同じ判定を共有 write txn の上で行う
+/// （SQL-80・Issue #3316）。未束縛は `42501` が先。
 #[test]
 fn explicit_transaction_is_rejected_after_the_principal_gate() {
     let (_g, core) = open_fixture("sql40_txn");
-    for (bound, expected) in [(false, "42501"), (true, "0A000")] {
+    for bound in [false, true] {
         for sql in [
             "GRANT SELECT ON t TO alice",
             "REVOKE SELECT ON missing FROM alice",
@@ -187,7 +188,16 @@ fn explicit_transaction_is_rejected_after_the_principal_gate() {
             let e = core
                 .execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, sql)
                 .expect_err("rejected");
-            assert_eq!(e.wire_code(), expected, "{sql}");
+            // autocommit と同じ SQLSTATE（束縛済みでも DDL 権限・付与権限が無いので拒否。`0A000` ではない）。
+            let mut s2 = SessionState::default();
+            if bound {
+                s2.bind_role_ids(1, 1);
+            }
+            assert_eq!(
+                e.wire_code(),
+                err_of(&core, "t1", &mut s2, sql).wire_code(),
+                "{sql}"
+            );
             core.execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, "ROLLBACK")
                 .expect("rollback");
         }

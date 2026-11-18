@@ -97,6 +97,7 @@ pub(crate) mod trigger;
 pub(crate) mod privilege;
 #[allow(dead_code)]
 pub(crate) mod role;
+pub(crate) mod txn_target;
 // 表ごとの行セキュリティ有効化状態（RLS-13・Issue #2275）。
 pub mod row_security;
 pub(crate) use materialized::read_materialized_view_in;

@@ -1454,6 +1454,7 @@ impl Storage {
 
     /// [`Self::drop_function_matching`] に所有者検査（Issue #2236）を足したもの。照合に成功した定義に対し、
     /// 依存の判定・削除より前に同じ write txn で検査する（所有者でなければ `NotObjectOwner`）。
+    #[cfg(test)]
     pub(crate) fn drop_function_matching_gated(
         &self,
         scope: &str,
@@ -1462,30 +1463,52 @@ impl Storage {
         gate: OwnerGate,
         matcher: impl Fn(&FunctionDef) -> Result<bool>,
     ) -> Result<bool> {
+        let removed = self.drop_function_matching_gated_in(
+            None,
+            scope,
+            function_key,
+            cascade,
+            gate,
+            matcher,
+        )?;
+        if removed {
+            // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
+            self.bump_function_generation(scope);
+        }
+        Ok(removed)
+    }
+
+    /// [`Self::drop_function_matching_gated`] の書き込み先を選べる版。`target` が `Some` なら明示 Tx の共有
+    /// write txn の上で実行し commit しない。関数の世代は進めない（呼び出し元が commit 成功後にだけ進める。
+    /// SQL-80・Issue #3316。`SessionTransaction::mark_function_written`）。
+    pub(crate) fn drop_function_matching_gated_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        scope: &str,
+        function_key: &str,
+        cascade: bool,
+        gate: OwnerGate,
+        matcher: impl Fn(&FunctionDef) -> Result<bool>,
+    ) -> Result<bool> {
         validate_scope(scope)?;
         let key = normalize_key(function_key)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        let found = list_in_txn(&*write_txn, scope, Some(&key))?;
-        let [def] = found.as_slice() else {
-            return Ok(false);
-        };
-        if !matcher(def)? {
-            return Ok(false);
-        }
-        gate.check(&*write_txn, scope, &PrivilegeObject::Function(def.id))?;
-        let sig = arg_signature(&def.params)?;
-        resolve_dependent_triggers(&write_txn, scope, &key, cascade)?;
-        reject_dependent_functions(&write_txn, scope, &key)?;
-        if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
-            return Ok(false);
-        }
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
-        self.bump_function_generation(scope);
-        Ok(true)
+        self.run_catalog_write(target, |write_txn| {
+            let found = list_in_txn(write_txn, scope, Some(&key))?;
+            let [def] = found.as_slice() else {
+                return Ok((false, false));
+            };
+            if !matcher(def)? {
+                return Ok((false, false));
+            }
+            gate.check(write_txn, scope, &PrivilegeObject::Function(def.id))?;
+            let sig = arg_signature(&def.params)?;
+            resolve_dependent_triggers(write_txn, scope, &key, cascade)?;
+            reject_dependent_functions(write_txn, scope, &key)?;
+            if !remove_function_in_txn(write_txn, scope, &key, &sig)? {
+                return Ok((false, false));
+            }
+            Ok((true, true))
+        })
     }
 
     /// 名前（引数の型の並びを省略した形）で定義を削除し、削除した定義のシグネチャを返す。0 件は
@@ -1502,6 +1525,7 @@ impl Storage {
     }
 
     /// [`Self::drop_function_by_name`] に所有者検査（Issue #2236）を足したもの（検査は同名の解決の直後）。
+    #[cfg(test)]
     pub(crate) fn drop_function_by_name_gated(
         &self,
         scope: &str,
@@ -1509,34 +1533,47 @@ impl Storage {
         cascade: bool,
         gate: OwnerGate,
     ) -> Result<Option<String>> {
+        let sig = self.drop_function_by_name_gated_in(None, scope, function_key, cascade, gate)?;
+        if sig.is_some() {
+            // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
+            self.bump_function_generation(scope);
+        }
+        Ok(sig)
+    }
+
+    /// [`Self::drop_function_by_name_gated`] の書き込み先を選べる版（`target` と世代の扱いは
+    /// [`Self::drop_function_matching_gated_in`] と同じ）。
+    pub(crate) fn drop_function_by_name_gated_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        scope: &str,
+        function_key: &str,
+        cascade: bool,
+        gate: OwnerGate,
+    ) -> Result<Option<String>> {
         validate_scope(scope)?;
         let key = normalize_key(function_key)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        let found = list_in_txn(&*write_txn, scope, Some(&key))?;
-        let sig = match found.as_slice() {
-            [] => return Ok(None),
-            [one] => {
-                gate.check(&*write_txn, scope, &PrivilegeObject::Function(one.id))?;
-                arg_signature(&one.params)?
+        self.run_catalog_write(target, |write_txn| {
+            let found = list_in_txn(write_txn, scope, Some(&key))?;
+            let sig = match found.as_slice() {
+                [] => return Ok((None, false)),
+                [one] => {
+                    gate.check(write_txn, scope, &PrivilegeObject::Function(one.id))?;
+                    arg_signature(&one.params)?
+                }
+                _ => {
+                    return Err(CatalogError::Invalid(
+                        FUNCTION_AMBIGUOUS_MESSAGE.to_string(),
+                    ));
+                }
+            };
+            resolve_dependent_triggers(write_txn, scope, &key, cascade)?;
+            reject_dependent_functions(write_txn, scope, &key)?;
+            if !remove_function_in_txn(write_txn, scope, &key, &sig)? {
+                return Ok((None, false));
             }
-            _ => {
-                return Err(CatalogError::Invalid(
-                    FUNCTION_AMBIGUOUS_MESSAGE.to_string(),
-                ));
-            }
-        };
-        resolve_dependent_triggers(&write_txn, scope, &key, cascade)?;
-        reject_dependent_functions(&write_txn, scope, &key)?;
-        if !remove_function_in_txn(&write_txn, scope, &key, &sig)? {
-            return Ok(None);
-        }
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        // commit 成功後にだけ世代を進める（他セッションの refresh が検知する。SQL-66・#1921）。
-        self.bump_function_generation(scope);
-        Ok(Some(sig))
+            Ok((Some(sig), true))
+        })
     }
 }
 

@@ -4,7 +4,7 @@
 //! 役割: 構造検証済みの文（`sql::allowlist::{ValidatedCreateRole, ValidatedDropRole}`）をロールカタログ
 //! （`catalog::role`）への書き込みへ写し、`CatalogError` を SQLSTATE の契約へ写像する。呼び出し元は
 //! `core.rs` の `ParsedSql::{CreateRole, DropRole}` 腕で、DDL 権限ゲート（`sql::ddl::require_ddl_permission`。
-//! 権限なしは対象の有無を問わず `42501`）と明示トランザクション内の `0A000` を通過した後にだけ来る。
+//! 権限なしは対象の有無を問わず `42501`）を通過した後にだけ来る（明示トランザクション内は共有 write txn の上で同じ本体を実行する。Issue #3316）。
 //! `CREATEROLE`／`ADMIN OPTION` による判定への差し替えは #1966・#1971 の担当で、それまでは DDL 権限ゲートで
 //! 代替する（ポリシー DDL と同じ方針）。`ALTER ROLE` も同じゲートを通過した後にだけ来る。
 //!
@@ -169,6 +169,18 @@ pub(crate) fn execute_create_role(
     session: &SessionState,
     stmt: &ValidatedCreateRole,
 ) -> Result<CreateRoleOutcome, SqlSurfaceError> {
+    execute_create_role_in(storage, None, tenant_id, session, stmt)
+}
+
+/// [`execute_create_role`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn の上で
+/// 実行し commit しない。ログイン名の対応表も同じ txn に入る。SQL-80・Issue #3316）。
+pub(crate) fn execute_create_role_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    session: &SessionState,
+    stmt: &ValidatedCreateRole,
+) -> Result<CreateRoleOutcome, SqlSurfaceError> {
     let scram_verifier = build_verifier(stmt.password.as_ref())?;
     let valid_until = match &stmt.valid_until_literal {
         Some(lit) => resolve_valid_until(lit, session)?,
@@ -187,7 +199,7 @@ pub(crate) fn execute_create_role(
         !(stmt.in_roles.is_empty() && stmt.member_roles.is_empty() && stmt.admin_roles.is_empty());
     if !has_memberships {
         storage
-            .create_role(tenant_id, &def)
+            .create_role_in(target, tenant_id, &def)
             .map_err(|e| map_role_error(e, &stmt.name))?;
         return Ok(CreateRoleOutcome {});
     }
@@ -202,7 +214,7 @@ pub(crate) fn execute_create_role(
         admin_roles: &stmt.admin_roles,
     };
     storage
-        .create_role_with_memberships(tenant_id, &def, &m)
+        .create_role_with_memberships_in(target, tenant_id, &def, &m)
         .map_err(|e| match e {
             MembershipChangeError::Catalog(c) => map_role_error(c, &stmt.name),
             other => crate::sql::grant_ddl::map_membership_error(other),
@@ -216,10 +228,24 @@ pub(crate) fn execute_drop_role(
     tenant_id: &str,
     stmt: &ValidatedDropRole,
 ) -> Result<DropRoleOutcome, SqlSurfaceError> {
-    match storage.drop_roles(tenant_id, &stmt.names, stmt.if_exists) {
-        Ok(removed) => Ok(DropRoleOutcome {
-            skipped: removed < stmt.names.len(),
-        }),
+    execute_drop_role_in(storage, None, tenant_id, stmt).map(|(outcome, _)| outcome)
+}
+
+/// [`execute_drop_role`] の書き込み先を選べる版（`target` の扱いは [`execute_create_role_in`] と同じ）。
+pub(crate) fn execute_drop_role_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &ValidatedDropRole,
+) -> Result<(DropRoleOutcome, bool), SqlSurfaceError> {
+    match storage.drop_roles_in(target, tenant_id, &stmt.names, stmt.if_exists) {
+        // 第 2 要素は 1 件以上を実際に削除したか（明示 Tx が no-op の guard 印を巻き戻す判定に使う）。
+        Ok(removed) => Ok((
+            DropRoleOutcome {
+                skipped: removed < stmt.names.len(),
+            },
+            removed > 0,
+        )),
         Err(DropRolesError::NotFound(name)) => Err(SqlSurfaceError::UndefinedRole { name }),
         Err(DropRolesError::HasDependents(name)) => {
             Err(SqlSurfaceError::RoleHasDependents { name })
@@ -245,6 +271,18 @@ pub(crate) fn execute_alter_role(
     session: &SessionState,
     stmt: &ValidatedAlterRole,
 ) -> Result<AlterRoleOutcome, SqlSurfaceError> {
+    execute_alter_role_in(storage, None, tenant_id, session, stmt).map(|(outcome, _)| outcome)
+}
+
+/// [`execute_alter_role`] の書き込み先を選べる版（`target` の扱いは [`execute_create_role_in`] と同じ）。
+pub(crate) fn execute_alter_role_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    session: &SessionState,
+    stmt: &ValidatedAlterRole,
+) -> Result<(AlterRoleOutcome, bool), SqlSurfaceError> {
+    // 第 2 要素は何かを書き込んだか（指定なしの存在確認だけなら偽。明示 Tx が guard 印を巻き戻す判定に使う）。
     match &stmt.action {
         AlterRoleAction::Options(patch) => {
             let new_verifier = match &patch.password {
@@ -264,8 +302,15 @@ pub(crate) fn execute_alter_role(
                 && patch.createdb.is_none()
             {
                 // 指定なしは存在の確認だけ（書き込まない）。
-                return match storage.get_role(tenant_id, &stmt.name) {
-                    Ok(Some(_)) => Ok(AlterRoleOutcome {}),
+                // 明示 Tx（`target` が `Some`）では、同じ Tx で作った・改名したロールを見るため write txn で引く。
+                let found = match target {
+                    Some(write_txn) => {
+                        crate::catalog::role::get_role_in_txn(write_txn, tenant_id, &stmt.name)
+                    }
+                    None => storage.get_role(tenant_id, &stmt.name),
+                };
+                return match found {
+                    Ok(Some(_)) => Ok((AlterRoleOutcome {}, false)),
                     Ok(None) => Err(SqlSurfaceError::UndefinedRole {
                         name: stmt.name.clone(),
                     }),
@@ -273,7 +318,7 @@ pub(crate) fn execute_alter_role(
                 };
             }
             storage
-                .alter_role(tenant_id, &stmt.name, |def| {
+                .alter_role_in(target, tenant_id, &stmt.name, |def| {
                     if let Some(v) = patch.login {
                         def.attributes.login = v;
                     }
@@ -300,15 +345,15 @@ pub(crate) fn execute_alter_role(
                     }
                 })
                 .map_err(|e| map_role_error(e, &stmt.name))?;
-            Ok(AlterRoleOutcome {})
+            Ok((AlterRoleOutcome {}, true))
         }
         AlterRoleAction::Rename { new_name } => {
             let protected: Vec<u64> = [session.session_role_id(), session.current_role_id()]
                 .into_iter()
                 .flatten()
                 .collect();
-            match storage.rename_role(tenant_id, &stmt.name, new_name, &protected) {
-                Ok(()) => Ok(AlterRoleOutcome {}),
+            match storage.rename_role_in(target, tenant_id, &stmt.name, new_name, &protected) {
+                Ok(()) => Ok((AlterRoleOutcome {}, true)),
                 Err(CatalogError::Invalid(m)) if m == ROLE_ALREADY_EXISTS_MESSAGE => {
                     Err(SqlSurfaceError::DuplicateRole {
                         name: new_name.clone(),

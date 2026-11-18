@@ -1273,15 +1273,23 @@ pub(crate) fn sync_login_names_in_txn(write_txn: &redb::WriteTransaction) -> Res
 impl Storage {
     /// `tenant` にロールを作り、内部 ID を返す（単一 write txn・1 回の commit。表の世代は進めない）。
     pub(crate) fn create_role(&self, tenant: &str, def: &RoleDef) -> Result<u64> {
+        self.create_role_in(None, tenant, def)
+    }
+
+    /// [`Self::create_role`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn の上で
+    /// 実行し commit しない。ログイン名の対応表も同じ txn に入る。SQL-80・Issue #3316）。
+    pub(crate) fn create_role_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        def: &RoleDef,
+    ) -> Result<u64> {
         validate_tenant(tenant)?;
         validate_role_shape(def)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        let id = create_role_in_txn(&write_txn, tenant, def)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(id)
+        self.run_catalog_write(target, |write_txn| {
+            let id = create_role_in_txn(write_txn, tenant, def)?;
+            Ok((id, true))
+        })
     }
 
     /// `tenant` のロール `names` を単一 write txn・1 回の commit で順に削除し、実際に消した件数を返す
@@ -1294,27 +1302,33 @@ impl Storage {
         names: &[String],
         if_exists: bool,
     ) -> std::result::Result<usize, DropRolesError> {
+        self.drop_roles_in(None, tenant, names, if_exists)
+    }
+
+    /// [`Self::drop_roles`] の書き込み先を選べる版（`target` の扱いは [`Self::create_role_in`] と同じ）。
+    pub(crate) fn drop_roles_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        names: &[String],
+        if_exists: bool,
+    ) -> std::result::Result<usize, DropRolesError> {
         validate_tenant(tenant)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        let mut removed = 0usize;
-        for name in names {
-            match drop_role_in_txn(&write_txn, tenant, name) {
-                Ok(true) => removed += 1,
-                Ok(false) if if_exists => {}
-                Ok(false) => return Err(DropRolesError::NotFound(name.clone())),
-                Err(CatalogError::Invalid(m)) if m == ROLE_HAS_DEPENDENTS_MESSAGE => {
-                    return Err(DropRolesError::HasDependents(name.clone()));
+        self.run_catalog_write(target, |write_txn| {
+            let mut removed = 0usize;
+            for name in names {
+                match drop_role_in_txn(write_txn, tenant, name) {
+                    Ok(true) => removed += 1,
+                    Ok(false) if if_exists => {}
+                    Ok(false) => return Err(DropRolesError::NotFound(name.clone())),
+                    Err(CatalogError::Invalid(m)) if m == ROLE_HAS_DEPENDENTS_MESSAGE => {
+                        return Err(DropRolesError::HasDependents(name.clone()));
+                    }
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
-        }
-        if removed > 0 {
-            crate::recovery::commit_boundary::commit(write_txn)
-                .map_err(super::convert_storage_error)?;
-        }
-        Ok(removed)
+            Ok((removed, removed > 0))
+        })
     }
 
     /// `tenant` のロール `name` の属性・検証子を単一 write txn・1 回の commit で書き換える
@@ -1325,14 +1339,22 @@ impl Storage {
         name: &str,
         mutate: impl FnOnce(&mut RoleDef),
     ) -> Result<()> {
+        self.alter_role_in(None, tenant, name, mutate)
+    }
+
+    /// [`Self::alter_role`] の書き込み先を選べる版（`target` の扱いは [`Self::create_role_in`] と同じ）。
+    pub(crate) fn alter_role_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        name: &str,
+        mutate: impl FnOnce(&mut RoleDef),
+    ) -> Result<()> {
         validate_tenant(tenant)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        alter_role_in_txn(&write_txn, tenant, name, mutate)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(())
+        self.run_catalog_write(target, |write_txn| {
+            alter_role_in_txn(write_txn, tenant, name, mutate)?;
+            Ok(((), true))
+        })
     }
 
     /// `tenant` のロールを単一 write txn・1 回の commit で改名する（`ALTER ROLE ... RENAME TO`。
@@ -1344,14 +1366,23 @@ impl Storage {
         new_name: &str,
         protected_ids: &[u64],
     ) -> Result<()> {
+        self.rename_role_in(None, tenant, old_name, new_name, protected_ids)
+    }
+
+    /// [`Self::rename_role`] の書き込み先を選べる版（`target` の扱いは [`Self::create_role_in`] と同じ）。
+    pub(crate) fn rename_role_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        old_name: &str,
+        new_name: &str,
+        protected_ids: &[u64],
+    ) -> Result<()> {
         validate_tenant(tenant)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        rename_role_in_txn(&write_txn, tenant, old_name, new_name, protected_ids)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(())
+        self.run_catalog_write(target, |write_txn| {
+            rename_role_in_txn(write_txn, tenant, old_name, new_name, protected_ids)?;
+            Ok(((), true))
+        })
     }
 
     /// `SET ROLE` の名前解決・認可（読み取り専用。[`resolve_settable_role_in_txn`]）。

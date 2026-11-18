@@ -364,8 +364,8 @@ fn reassign_and_drop_owned_are_static_rejections() {
     }
 }
 
-/// 明示トランザクション内の `OWNER TO` は、未束縛なら `42501`、束縛済みなら `0A000`（ROLLBACK で
-/// 取り消せない書き込みのため）。
+/// 明示トランザクション内の `OWNER TO` は、未束縛なら `42501`（writer を取る前）、束縛済みなら共有 write txn
+/// の上で受理され、ROLLBACK の後に所有者は変わらない（SQL-80・Issue #3316）。
 #[test]
 fn owner_to_inside_a_transaction_block_is_not_supported() {
     let f = fx("sql40_owner_tx");
@@ -374,7 +374,7 @@ fn owner_to_inside_a_transaction_block_is_not_supported() {
     for (is_bound, is_operator, expected) in [
         (false, false, "42501"),
         (false, true, "42501"),
-        (true, false, "0A000"),
+        (true, false, "ok"),
     ] {
         let mut s = if is_operator {
             operator()
@@ -388,7 +388,7 @@ fn owner_to_inside_a_transaction_block_is_not_supported() {
         f.core
             .execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        let e = f
+        let got = f
             .core
             .execute_sql_in_txn(
                 &ctx("t1"),
@@ -396,12 +396,54 @@ fn owner_to_inside_a_transaction_block_is_not_supported() {
                 &mut txn,
                 "ALTER TABLE docs OWNER TO alice",
             )
-            .expect_err("rejected");
-        assert_eq!(e.wire_code(), expected);
+            .map(|_| "ok")
+            .unwrap_or_else(|e| e.wire_code());
+        assert_eq!(got, expected);
         f.core
             .execute_sql_in_txn(&ctx("t1"), &mut s, &mut txn, "ROLLBACK")
             .expect("rollback");
     }
+}
+
+/// SQL-80・Issue #3316: 明示 Tx 内の所有者の変更は COMMIT まで別セッションの判定を変えない（所有者は表への暗黙の
+/// 権限を持つ）。ROLLBACK の後も変えず、COMMIT で効く。
+#[test]
+fn owner_change_inside_a_transaction_takes_effect_only_at_commit() {
+    let f = fx("sql40_owner_tx_commit");
+    let mut alice = bound(ALICE, true);
+    let mut bob = bound(BOB, false);
+    f.ok("t1", &mut alice, "CREATE TABLE docs (a TEXT)");
+    assert_eq!(f.code("t1", &mut bob, "SELECT a FROM docs"), "42501");
+    let begin = |s: &mut SessionState| {
+        let mut txn = f.core.new_session_transaction();
+        f.core
+            .execute_sql_in_txn(&ctx("t1"), s, &mut txn, "BEGIN")
+            .expect("begin");
+        txn
+    };
+    // ROLLBACK: 所有者は変わらない。
+    let mut txn = begin(&mut alice);
+    f.core
+        .execute_sql_in_txn(
+            &ctx("t1"),
+            &mut alice,
+            &mut txn,
+            "ALTER TABLE docs OWNER TO bob",
+        )
+        .expect("owner change in transaction");
+    assert_eq!(f.code("t1", &mut bob, "SELECT a FROM docs"), "42501");
+    f.core
+        .execute_sql_in_txn(&ctx("t1"), &mut alice, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(f.code("t1", &mut bob, "SELECT a FROM docs"), "42501");
+    // COMMIT: bob が所有者になり、読める。
+    let mut txn = begin(&mut alice);
+    for sql in ["ALTER TABLE docs OWNER TO bob", "COMMIT"] {
+        f.core
+            .execute_sql_in_txn(&ctx("t1"), &mut alice, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    f.ok("t1", &mut bob, "SELECT a FROM docs");
 }
 
 /// SCHEMA 配下の表への `OWNER TO`: 名前解決器が `s.t` を内部キーへ置き換えた後に束縛され、所有者が行う場合は

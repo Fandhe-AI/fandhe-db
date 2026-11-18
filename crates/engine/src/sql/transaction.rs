@@ -586,6 +586,15 @@ struct TxnDdlState {
     /// 表・索引を DROP した（名前が消えた）か。確定済みカタログで行う後続文の解析・ビュー展開が古い名前を
     /// 見るため、この間は DDL 以外の文を `0A000` にする（暫定。受け皿は #3311）。
     removed: bool,
+    /// 権限・ポリシー・行セキュリティ・ロール・トリガ・関数の削除の DDL を積んだか（SQL-80・Issue #3316）。
+    /// これらを読む判定（権限ゲート・ポリシー適用・トリガの発火・関数の解決）は確定済みのカタログを引くため、
+    /// この間の後続の読み書き・`SET ROLE`・ルーチン呼び出しは古い判定で通さず `0A000` にする（fail-closed。
+    /// 結線までの暫定の規則。受け皿は #3311）。`started` も同時に立てる。
+    guarded: bool,
+    /// 表・索引の DDL を積んだか（SQL-80・Issue #3316）。同じ Tx で作った public 表が、確定済みカタログで
+    /// `search_path` により SCHEMA 配下の同名の表へ解決された名前を隠す。そのため、この間は SCHEMA 配下の内部キーへ
+    /// 解決された対象を持つ本種別の DDL を `0A000` にする（別の表の権限・ポリシーを変える fail-open を防ぐ。受け皿は #3315）。
+    relations_changed: bool,
     /// commit 成功後にメモリ上の現在値を捨てる SEQUENCE の内部 ID（DROP TABLE・DROP COLUMN が道連れに
     /// 削除した所有 SEQUENCE。内部 ID は再利用しないため、commit の後に捨てても害はない）。
     evict_sequences: Vec<u64>,
@@ -704,6 +713,8 @@ impl TempTxn {
 pub(crate) struct DdlMarkSnapshot {
     has_writes: bool,
     started: bool,
+    guarded: bool,
+    relations_changed: bool,
 }
 
 enum TxnState<'e> {
@@ -1421,6 +1432,8 @@ impl<'e> SessionTransaction<'e> {
             written_by_tenant: active.written_by_tenant.clone(),
             ddl_started: active.ddl.started,
             ddl_removed: active.ddl.removed,
+            ddl_guarded: active.ddl.guarded,
+            ddl_relations: active.ddl.relations_changed,
             ddl_evict_len: active.ddl.evict_sequences.len(),
         }
     }
@@ -1753,6 +1766,8 @@ impl<'e> SessionTransaction<'e> {
         // 所有 SEQUENCE を commit 後に捨てると採番が重複するため、列も水位まで切り詰める。
         active.ddl.started = marks.ddl_started;
         active.ddl.removed = marks.ddl_removed;
+        active.ddl.guarded = marks.ddl_guarded;
+        active.ddl.relations_changed = marks.ddl_relations;
         active.ddl.evict_sequences.truncate(marks.ddl_evict_len);
         // 巻き戻した範囲の operation_id を取り消し、同一 Tx 内で再利用できるようにする。
         // 水位は truncate_after の前に読む（Issue #1944）。
@@ -2019,13 +2034,21 @@ impl<'e> SessionTransaction<'e> {
     /// 戻り値は印を立てる前の状態（[`Self::restore_ddl_started`] へ渡す）。本体が「何も変えない成功」
     /// （`IF EXISTS` / `IF NOT EXISTS` の no-op）だったときに印を巻き戻すために使う。
     pub(crate) fn mark_ddl_started(&mut self) -> DdlMarkSnapshot {
+        self.mark_ddl_started_inner(true)
+    }
+
+    /// [`Self::mark_ddl_started`] の本体。`relations` は表・索引の DDL（関係の集合を変えうる）か。
+    fn mark_ddl_started_inner(&mut self, relations: bool) -> DdlMarkSnapshot {
         if let TxnState::Active(active) = &mut self.state {
             let snap = DdlMarkSnapshot {
                 has_writes: active.has_writes,
                 started: active.ddl.started,
+                guarded: active.ddl.guarded,
+                relations_changed: active.ddl.relations_changed,
             };
             active.has_writes = true;
             active.ddl.started = true;
+            active.ddl.relations_changed |= relations;
             snap
         } else {
             DdlMarkSnapshot::default()
@@ -2038,7 +2061,37 @@ impl<'e> SessionTransaction<'e> {
         if let TxnState::Active(active) = &mut self.state {
             active.has_writes = snap.has_writes;
             active.ddl.started = snap.started;
+            active.ddl.guarded = snap.guarded;
+            active.ddl.relations_changed = snap.relations_changed;
         }
+    }
+
+    /// この Tx が関数の DDL（作成・置換・削除）を積み済みか。`ROLLBACK TO` では戻さないため、取り消した後も
+    /// `true` のまま残りうる（安全側。SQL-80・Issue #3316）。`Active` 以外では `false`。
+    pub(crate) fn has_function_ddl(&self) -> bool {
+        matches!(&self.state, TxnState::Active(a) if !a.function_scopes.is_empty())
+    }
+
+    /// この Tx が表・索引の DDL を積み済みか（[`TxnDdlState::relations_changed`]）。`Active` 以外では `false`。
+    /// 本種別の DDL が、確定済みカタログで SCHEMA 配下の内部キーへ解決された対象に当たるかの判定に使う。
+    pub(crate) fn has_relation_ddl(&self) -> bool {
+        matches!(&self.state, TxnState::Active(a) if a.ddl.relations_changed)
+    }
+
+    /// 権限・ポリシー・ロール・トリガ等の DDL を積み始めることを記録する（SQL-80・Issue #3316）。
+    /// `started` に加えて `guarded` を立てる（`relations_changed` は立てない）。戻り値の扱いは
+    /// `mark_ddl_started` と同じ（no-op の成功は [`Self::restore_ddl_started`] で `guarded` ごと巻き戻る）。
+    pub(crate) fn mark_ddl_guarded(&mut self) -> DdlMarkSnapshot {
+        let snap = self.mark_ddl_started_inner(false);
+        if let TxnState::Active(active) = &mut self.state {
+            active.ddl.guarded = true;
+        }
+        snap
+    }
+
+    /// この Tx が権限・ポリシー等の DDL を積み済みか（[`TxnDdlState::guarded`]）。`Active` 以外では `false`。
+    pub(crate) fn has_guarded_ddl(&self) -> bool {
+        matches!(&self.state, TxnState::Active(a) if a.ddl.guarded)
     }
 
     /// DDL 本体の成功を記録する（[`Self::mark_ddl_started`] の後に呼ぶ）。`removed` は表・索引を DROP した

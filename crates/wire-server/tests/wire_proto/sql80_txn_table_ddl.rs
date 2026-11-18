@@ -357,3 +357,78 @@ fn connection_drop_after_ddl_and_savepoint_leaves_nothing_and_frees_the_writer()
     assert!(created, "writer was not released after the connection drop");
     expect_error(&mut second, "SELECT id FROM u LIMIT 1;", "42P01", b'I');
 }
+/// SQL-80・Issue #3316: 関数・ポリシー・行セキュリティ・ロールの DDL も、psql 形（末尾 `;` 付きを 1 文ずつ単独送信）の
+/// 明示 Tx で通り、COMMIT で原子的に確定する。積んだ後の読み取りは固定の `0A000`（古い判定で通さない）で、
+/// `ROLLBACK` の後に通常へ戻る。
+// tracked: #3311
+#[test]
+fn psql_style_security_ddl_commits_and_guards_followers() {
+    let (core, _guard) = new_core();
+    let mut stream = connect(core);
+    expect_tag(&mut stream, CREATE_T, "CREATE TABLE", b'I');
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, "CREATE ROLE reader;", "CREATE ROLE", b'T');
+    expect_tag(
+        &mut stream,
+        "CREATE POLICY p ON t FOR SELECT USING (body = 'x');",
+        "CREATE POLICY",
+        b'T',
+    );
+    expect_tag(
+        &mut stream,
+        "ALTER TABLE t ENABLE ROW LEVEL SECURITY;",
+        "ALTER TABLE",
+        b'T',
+    );
+    // 積んだ後の読み取りは固定の `0A000`（失敗した Tx は `E`）。
+    expect_error(&mut stream, "SELECT id FROM t LIMIT 1;", "0A000", b'E');
+    expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
+    // ROLLBACK では何も残らない（同名の再作成が通る）。
+    expect_tag(&mut stream, "CREATE ROLE reader;", "CREATE ROLE", b'I');
+    expect_tag(&mut stream, "DROP ROLE reader;", "DROP ROLE", b'I');
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, "CREATE ROLE reader;", "CREATE ROLE", b'T');
+    expect_tag(
+        &mut stream,
+        "CREATE POLICY p ON t FOR SELECT USING (body = 'x');",
+        "CREATE POLICY",
+        b'T',
+    );
+    expect_tag(&mut stream, "COMMIT;", "COMMIT", b'I');
+    // COMMIT で確定している（重複は `42710`）。
+    expect_error(&mut stream, "CREATE ROLE reader;", "42710", b'I');
+    expect_error(
+        &mut stream,
+        "CREATE POLICY p ON t FOR SELECT USING (body = 'x');",
+        "42710",
+        b'I',
+    );
+}
+
+/// ソケット切断（Tx の drop）では、積んだロール・ポリシーの DDL は何も残らない。
+#[test]
+fn dropped_connection_discards_security_ddl() {
+    let (core, _guard) = new_core();
+    {
+        let mut stream = connect(core.clone());
+        expect_tag(&mut stream, CREATE_T, "CREATE TABLE", b'I');
+        expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+        expect_tag(&mut stream, "CREATE ROLE ghost;", "CREATE ROLE", b'T');
+        expect_tag(
+            &mut stream,
+            "CREATE POLICY p ON t FOR SELECT USING (body = 'x');",
+            "CREATE POLICY",
+            b'T',
+        );
+        // 切断（Tx は commit されずに drop される）。
+    }
+    let mut stream = connect(core);
+    // writer の解放を待って、同名の作成が通る。
+    expect_tag(&mut stream, "CREATE ROLE ghost;", "CREATE ROLE", b'I');
+    expect_tag(
+        &mut stream,
+        "CREATE POLICY p ON t FOR SELECT USING (body = 'x');",
+        "CREATE POLICY",
+        b'I',
+    );
+}

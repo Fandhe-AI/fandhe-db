@@ -49,6 +49,10 @@ pub(crate) struct WriteMarks {
     pub(crate) ddl_started: bool,
     /// 表・索引を DROP 済みだったか（同上）。
     pub(crate) ddl_removed: bool,
+    /// 権限・ポリシー等の DDL を積んだ印（Issue #3316）。
+    pub(crate) ddl_guarded: bool,
+    /// 表・索引の DDL を積んだ印（Issue #3316）。
+    pub(crate) ddl_relations: bool,
     /// commit 後に採番器から捨てる SEQUENCE の列の長さ（追記専用の列なので長さが水位になる）。
     pub(crate) ddl_evict_len: usize,
 }

@@ -26,7 +26,7 @@ use super::super::role::{
     get_role_by_id_in_txn, get_role_in_txn, role_can_set_in_txn, validate_tenant,
 };
 use super::super::{CatalogError, Storage};
-use super::apply::{commit_with_bumps, relation_kind, AclChangeError, RelKind};
+use super::apply::{relation_kind, AclChangeError, RelKind};
 use super::owner::{is_owner_in_txn, owner_of_in_txn, set_owner_in_txn};
 use super::schema::schema_privileges_in_txn;
 use super::{
@@ -151,89 +151,106 @@ impl Storage {
         operator: bool,
         new_owner: NewOwnerRef<'_>,
     ) -> Result<(), AclChangeError> {
+        self.alter_object_owner_in(None, tenant, kind, name, actor, operator, new_owner)
+            .map(|_| ())
+    }
+
+    /// [`Self::alter_object_owner`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn の
+    /// 上で実行し commit しない）。戻り値は所有者を実際に変えたか（SQL-80・Issue #3316）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn alter_object_owner_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        tenant: &str,
+        kind: AlterOwnerKind,
+        name: &str,
+        actor: u64,
+        operator: bool,
+        new_owner: NewOwnerRef<'_>,
+    ) -> Result<bool, AclChangeError> {
         validate_tenant(tenant)?;
         if actor == 0 {
             return Err(AclChangeError::PermissionDenied);
         }
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(crate::catalog::convert_storage_error)?;
-        // 束縛ロールの現存（DROP 済みの古い束縛で変更しない）。
-        if get_role_by_id_in_txn(&*write_txn, tenant, actor)?.is_none() {
-            return Err(AclChangeError::PermissionDenied);
-        }
-        // 1. 対象（自テナント内で解決する。SCHEMA の不在・他テナントは同じ `SchemaNotFound`）。
-        let (object, schema_of_relation, bump_key) = match kind {
-            AlterOwnerKind::Schema => {
-                let id = crate::catalog::namespace::schema_id_in_txn(&*write_txn, tenant, name)?
-                    .ok_or_else(|| AclChangeError::SchemaNotFound(name.to_string()))?;
-                (PrivilegeObject::Schema(id), None, None)
+        self.run_catalog_write(target, |write_txn| {
+            // 束縛ロールの現存（DROP 済みの古い束縛で変更しない）。
+            if get_role_by_id_in_txn(write_txn, tenant, actor)?.is_none() {
+                return Err(AclChangeError::PermissionDenied);
             }
-            AlterOwnerKind::Table | AlterOwnerKind::View | AlterOwnerKind::MaterializedView => {
-                let actual = relation_kind(&write_txn, tenant, name)?;
-                let matches = match kind {
-                    AlterOwnerKind::Table => true,
-                    AlterOwnerKind::View => actual == RelKind::View,
-                    AlterOwnerKind::MaterializedView => actual == RelKind::Matview,
-                    AlterOwnerKind::Schema => false,
-                };
-                if !matches {
-                    return Err(CatalogError::WrongObjectKind(name.to_string()).into());
+            // 1. 対象（自テナント内で解決する。SCHEMA の不在・他テナントは同じ `SchemaNotFound`）。
+            let (object, schema_of_relation, bump_key) = match kind {
+                AlterOwnerKind::Schema => {
+                    let id = crate::catalog::namespace::schema_id_in_txn(write_txn, tenant, name)?
+                        .ok_or_else(|| AclChangeError::SchemaNotFound(name.to_string()))?;
+                    (PrivilegeObject::Schema(id), None, None)
                 }
-                let schema_id = match crate::catalog::namespace::RelationKey::parse(name) {
-                    Ok(crate::catalog::namespace::RelationKey::InSchema { schema_id, .. }) => {
-                        Some(schema_id)
+                AlterOwnerKind::Table | AlterOwnerKind::View | AlterOwnerKind::MaterializedView => {
+                    let actual = relation_kind(write_txn, tenant, name)?;
+                    let matches = match kind {
+                        AlterOwnerKind::Table => true,
+                        AlterOwnerKind::View => actual == RelKind::View,
+                        AlterOwnerKind::MaterializedView => actual == RelKind::Matview,
+                        AlterOwnerKind::Schema => false,
+                    };
+                    if !matches {
+                        return Err(CatalogError::WrongObjectKind(name.to_string()).into());
                     }
-                    _ => None,
-                };
-                (
-                    PrivilegeObject::Table(name.to_string()),
-                    schema_id,
-                    Some(name.to_string()),
-                )
-            }
-        };
-        // 2. 新しい所有者（自テナントのカタログだけから解決。不在・他テナントは同じ `GranteeNotFound`）。
-        let new_owner_id = match new_owner {
-            NewOwnerRef::Name(n) => get_role_in_txn(&*write_txn, tenant, n)?
-                .map(|r| r.id)
-                .ok_or_else(|| AclChangeError::GranteeNotFound(n.to_string()))?,
-            NewOwnerRef::Id(id) => {
-                if get_role_by_id_in_txn(&*write_txn, tenant, id)?.is_none() {
+                    let schema_id = match crate::catalog::namespace::RelationKey::parse(name) {
+                        Ok(crate::catalog::namespace::RelationKey::InSchema {
+                            schema_id, ..
+                        }) => Some(schema_id),
+                        _ => None,
+                    };
+                    (
+                        PrivilegeObject::Table(name.to_string()),
+                        schema_id,
+                        Some(name.to_string()),
+                    )
+                }
+            };
+            // 2. 新しい所有者（自テナントのカタログだけから解決。不在・他テナントは同じ `GranteeNotFound`）。
+            let new_owner_id = match new_owner {
+                NewOwnerRef::Name(n) => get_role_in_txn(write_txn, tenant, n)?
+                    .map(|r| r.id)
+                    .ok_or_else(|| AclChangeError::GranteeNotFound(n.to_string()))?,
+                NewOwnerRef::Id(id) => {
+                    if get_role_by_id_in_txn(write_txn, tenant, id)?.is_none() {
+                        return Err(AclChangeError::PermissionDenied);
+                    }
+                    id
+                }
+            };
+            // 3. 実行者の判定。
+            if !operator {
+                if !is_owner_in_txn(write_txn, tenant, &object, actor)? {
                     return Err(AclChangeError::PermissionDenied);
                 }
-                id
-            }
-        };
-        // 3. 実行者の判定。
-        if !operator {
-            if !is_owner_in_txn(&*write_txn, tenant, &object, actor)? {
-                return Err(AclChangeError::PermissionDenied);
-            }
-            if !role_can_set_in_txn(&*write_txn, tenant, actor, new_owner_id)? {
-                return Err(AclChangeError::PermissionDenied);
-            }
-            if let Some(schema_id) = schema_of_relation {
-                let bits =
-                    schema_privileges_in_txn(&*write_txn, tenant, schema_id, &[new_owner_id])?;
-                if bits & PRIV_CREATE == 0 {
+                if !role_can_set_in_txn(write_txn, tenant, actor, new_owner_id)? {
                     return Err(AclChangeError::PermissionDenied);
                 }
+                if let Some(schema_id) = schema_of_relation {
+                    let bits =
+                        schema_privileges_in_txn(write_txn, tenant, schema_id, &[new_owner_id])?;
+                    if bits & PRIV_CREATE == 0 {
+                        return Err(AclChangeError::PermissionDenied);
+                    }
+                }
             }
-        }
-        // 4. 書き込み。
-        let old_owner = owner_of_in_txn(&*write_txn, tenant, &object)?;
-        if old_owner == Some(new_owner_id) {
-            return Ok(());
-        }
-        set_owner_in_txn(&write_txn, tenant, &object, new_owner_id)?;
-        if let Some(old) = old_owner {
-            for o in acl_objects_of(&write_txn, tenant, &object)? {
-                rewrite_acl_for_object(&write_txn, tenant, &o, old, new_owner_id)?;
+            // 4. 書き込み。
+            let old_owner = owner_of_in_txn(write_txn, tenant, &object)?;
+            if old_owner == Some(new_owner_id) {
+                return Ok((false, false));
             }
-        }
-        let bumps: Vec<String> = bump_key.into_iter().collect();
-        commit_with_bumps(write_txn, &bumps)
+            set_owner_in_txn(write_txn, tenant, &object, new_owner_id)?;
+            if let Some(old) = old_owner {
+                for o in acl_objects_of(write_txn, tenant, &object)? {
+                    rewrite_acl_for_object(write_txn, tenant, &o, old, new_owner_id)?;
+                }
+            }
+            let bumps: Vec<String> = bump_key.into_iter().collect();
+            super::apply::bump_touched(write_txn, &bumps)?;
+            Ok((true, true))
+        })
     }
 }
 

@@ -242,14 +242,21 @@ fn per_table_limit_is_enforced_and_ids_are_not_reused() {
     let s = Storage::open(&path).expect("open");
     setup(&s, "docs");
     let mk = |name: &str| {
-        s.create_policy_inner::<CatalogError, _>("t1", "docs", &pdef(name), |_| Ok(exprs()), 2)
+        s.create_policy_inner::<CatalogError, _>(
+            None,
+            "t1",
+            "docs",
+            &pdef(name),
+            |_| Ok(exprs()),
+            2,
+        )
     };
     assert_eq!(mk("a1").expect("1"), 1);
     assert_eq!(mk("a2").expect("2"), 2);
     assert!(matches!(mk("a3"), Err(CatalogError::ViewLimitExceeded(_))));
     // 他テナントは別枠。
     assert!(s
-        .create_policy_inner::<CatalogError, _>("t2", "docs", &pdef("a1"), |_| Ok(exprs()), 2)
+        .create_policy_inner::<CatalogError, _>(None, "t2", "docs", &pdef("a1"), |_| Ok(exprs()), 2)
         .is_ok());
     assert!(s.drop_policy("t1", "docs", "a1").expect("drop"));
     // 削除しても ID は再利用されない。

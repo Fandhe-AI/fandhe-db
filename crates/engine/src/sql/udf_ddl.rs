@@ -591,6 +591,20 @@ pub(crate) fn execute_drop_function(
     session: &mut SessionState,
     stmt: &ValidatedDropFunction,
 ) -> Result<DropFunctionOutcome, SqlSurfaceError> {
+    execute_drop_function_in(storage, None, tenant_id, session, stmt)
+}
+
+/// [`execute_drop_function`] の書き込み先を選べる版。`target` が `Some` なら明示 Tx の共有 write txn の上で
+/// 削除し、commit も関数の世代の bump もしない（呼び出し元が `mark_function_written` で commit 成功後に行う）。
+/// セッション内の定義の削除は `session.udfs_mut()` を直接変えるが、ROLLBACK／`ROLLBACK TO` が開始時点・
+/// savepoint 時点の `SessionState` の複製で戻す（SQL-80・Issue #3316）。
+pub(crate) fn execute_drop_function_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    session: &mut SessionState,
+    stmt: &ValidatedDropFunction,
+) -> Result<DropFunctionOutcome, SqlSurfaceError> {
     // 権限検査は保存先（カタログ／セッション内）の振り分けより前。`IF EXISTS` でも `42501` にして、
     // 権限の無いセッションに対象の有無を区別させない（SQL-66・Issue #1922・fail-closed）。
     // 運用者権限が無くても束縛ロールなら所有者検査つきで進む（Issue #2236。未束縛は `42501`）。
@@ -605,7 +619,7 @@ pub(crate) fn execute_drop_function(
         }
     };
     let mut removed = false;
-    removed |= drop_from_catalog(storage, tenant_id, stmt, gate)?;
+    removed |= drop_from_catalog(storage, target, tenant_id, stmt, gate)?;
     // 所有者としての削除は、カタログで所有を確認して消せた定義に限る。所有を確認できない
     // セッション内だけの定義を、運用者権限なしで消させない（権限を広げない）。
     if owner_only && !removed {
@@ -689,21 +703,40 @@ fn routine_types_match(declared: &[CastType], stmt: &ValidatedDropFunction) -> b
 /// カタログから削除し、削除したら `true`。型付きの場合も照合と削除は同一 write txn で行う。
 fn drop_from_catalog(
     storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
     tenant_id: &str,
     stmt: &ValidatedDropFunction,
     gate: OwnerGate,
 ) -> Result<bool, SqlSurfaceError> {
     let cascade = stmt.behavior == DropFunctionBehavior::Cascade;
+    let removed = drop_from_catalog_inner(storage, target, tenant_id, stmt, gate, cascade)?;
+    // 単独 commit（autocommit）の場合だけ、commit 成功後にここで世代を進める（他セッションの refresh が検知する。
+    // SQL-66・#1921）。明示 Tx の共有 write txn は、呼び出し元が `mark_function_written` で commit 成功後に進める。
+    if removed && target.is_none() {
+        storage.bump_function_generation(tenant_id);
+    }
+    Ok(removed)
+}
+
+/// [`drop_from_catalog`] の本体（世代の bump を含まない）。
+fn drop_from_catalog_inner(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &ValidatedDropFunction,
+    gate: OwnerGate,
+    cascade: bool,
+) -> Result<bool, SqlSurfaceError> {
     let Some(types) = &stmt.arg_types else {
         return storage
-            .drop_function_by_name_gated(tenant_id, &stmt.name, cascade, gate)
+            .drop_function_by_name_gated_in(target, tenant_id, &stmt.name, cascade, gate)
             .map(|sig| sig.is_some())
             .map_err(map_function_error);
     };
     // 列挙・署名照合・削除を 1 つの write txn で行う（読みと削除の間に別セッションの
     // drop／再作成が割り込んで新しい定義を誤って消さないため）。
     storage
-        .drop_function_matching_gated(tenant_id, &stmt.name, cascade, gate, |def| {
+        .drop_function_matching_gated_in(target, tenant_id, &stmt.name, cascade, gate, |def| {
             if def.params.len() != types.len() {
                 return Ok(false);
             }
