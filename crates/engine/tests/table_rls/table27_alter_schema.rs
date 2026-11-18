@@ -21,7 +21,6 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::mode::SessionState;
-use engine::sql::transaction::TransactionStatus;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -334,28 +333,42 @@ fn permission_gate_precedes_catalog_lookups() {
     ok_as(&core, "alice", &mut allowed, "ALTER SCHEMA s RENAME TO s2");
 }
 
+/// SQL-80・Issue #3315: `ALTER SCHEMA ... RENAME TO` は共有 write txn に積まれ、ROLLBACK で消え、COMMIT で確定する。
 #[test]
-fn alter_schema_inside_explicit_transaction_is_rejected() {
+fn alter_schema_inside_explicit_transaction_commits_or_rolls_back() {
     let (_p, _g, core) = open_fixture("alt-sch-txn");
     let mut s = allowed_session();
     ok_as(&core, "alice", &mut s, "CREATE SCHEMA a");
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(
-            &ctx("alice"),
-            &mut s,
-            &mut txn,
-            "ALTER SCHEMA a RENAME TO b",
-        )
-        .expect_err("must be rejected");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(
+        &ctx("alice"),
+        &mut s,
+        &mut txn,
+        "ALTER SCHEMA a RENAME TO b",
+    )
+    .expect("rename");
     core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
     assert_eq!(code_as(&core, "alice", &mut s, "CREATE SCHEMA a"), "42P06");
     ok_as(&core, "alice", &mut s, "CREATE SCHEMA b");
+    ok_as(&core, "alice", &mut s, "DROP SCHEMA b");
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &ctx("alice"),
+        &mut s,
+        &mut txn,
+        "ALTER SCHEMA a RENAME TO b",
+    )
+    .expect("rename");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+    assert_eq!(code_as(&core, "alice", &mut s, "CREATE SCHEMA b"), "42P06");
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA a");
 }
 
 #[test]

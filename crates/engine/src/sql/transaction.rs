@@ -586,9 +586,15 @@ struct TxnDdlState {
     /// 表・索引を DROP した（名前が消えた）か。確定済みカタログで行う後続文の解析・ビュー展開が古い名前を
     /// 見るため、この間は DDL 以外の文を `0A000` にする（暫定。受け皿は #3311）。
     removed: bool,
-    /// commit 成功後にメモリ上の現在値を捨てる SEQUENCE の内部 ID（DROP TABLE・DROP COLUMN が道連れに
-    /// 削除した所有 SEQUENCE。内部 ID は再利用しないため、commit の後に捨てても害はない）。
+    /// commit 成功後にメモリ上の現在値を捨てる SEQUENCE の内部 ID（DROP TABLE・DROP COLUMN・DROP SEQUENCE が
+    /// 削除した SEQUENCE）。内部 ID は ROLLBACK で再利用されうるが、払い出しのたびにその ID のカーソルを
+    /// 捨てる（`catalog::sequence::create_sequence_in_txn_evicting`）ため、commit の後に捨てても害はない。
     evict_sequences: Vec<u64>,
+    /// SCHEMA を作成・削除・改名したか（Issue #3315）。後続の文の `search_path` の解決と作成先の選択は
+    /// 確定済みカタログを読むため、同じ Tx の後続文が別の SCHEMA に解決されうる。立てた後は SCHEMA の DDL・
+    /// セッション変数の `SET`/`SHOW` 以外を `0A000` にする（暫定。受け皿は #3311）。`ROLLBACK TO` でも戻さない
+    /// （安全側。後続文の拒否が増えるだけで部分的な DDL を通す経路は作らない）。
+    schema_changed: bool,
 }
 
 /// トランザクション中の状態。`BEGIN` 時点の読み取りスナップショット（`read_snapshot`）と、
@@ -2055,6 +2061,18 @@ impl<'e> SessionTransaction<'e> {
     /// ゲートと INSERT のスキーマの読み取り源の切り替えが使う。`Active` 以外では `false`。
     pub(crate) fn has_ddl(&self) -> bool {
         matches!(&self.state, TxnState::Active(a) if a.ddl.started)
+    }
+
+    /// SCHEMA の DDL を積んだ印を立てる（[`TxnDdlState::schema_changed`]。Issue #3315）。
+    pub(crate) fn mark_schema_changed(&mut self) {
+        if let TxnState::Active(active) = &mut self.state {
+            active.ddl.schema_changed = true;
+        }
+    }
+
+    /// この Tx が SCHEMA の DDL を積んだか（[`TxnDdlState::schema_changed`]）。`Active` 以外では `false`。
+    pub(crate) fn ddl_schema_changed(&self) -> bool {
+        matches!(&self.state, TxnState::Active(a) if a.ddl.schema_changed)
     }
 
     /// この Tx が表・索引を DROP 済みか（[`TxnDdlState::removed`]）。`Active` 以外では `false`。

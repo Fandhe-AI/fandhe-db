@@ -330,7 +330,11 @@ impl EngineCore {
                 // SEQUENCE は所有者行を持たないが、作成者の `SEQUENCES` の既定権限を初期 ACL へ適用するため
                 // 作成の直前に作成者を予約する（単独の `CREATE SEQUENCE` と同じ）。
                 let _owner = self.arm_created_relation_owner(ctx, session, validated.name());
-                crate::sql::ddl::create_sequence_element_in_txn(write_txn, &validated)?;
+                crate::sql::ddl::create_sequence_element_in_txn(
+                    &self.storage,
+                    write_txn,
+                    &validated,
+                )?;
                 Ok(None)
             }
         }

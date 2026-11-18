@@ -77,6 +77,7 @@ mod row_lock_exec;
 mod schema_elements;
 // 明示・暗黙トランザクション内の表・索引の DDL（SQL-80・Issue #3313）。
 mod txn_ddl;
+mod txn_ddl_objects;
 
 // INSERT ... SELECT の実行本体（SQL-51・Issue #1733）。
 mod insert_select_exec;
@@ -12017,7 +12018,19 @@ impl EngineCore {
             | ParsedSql::DropTable(_)
             | ParsedSql::AlterTable(_)
             | ParsedSql::CreateIndex(_)
-            | ParsedSql::DropIndex(_) => self.execute_table_ddl_in_txn(ctx, session, txn, parsed),
+            | ParsedSql::DropIndex(_)
+            // SQL-80・Issue #3315: VIEW・SEQUENCE・SCHEMA・ENUM 型の DDL も同じ入口（`core/txn_ddl_objects.rs`）。
+            // マテリアライズドビューは未結線のため下の既定の腕（`0A000`）に残す。
+            | ParsedSql::CreateView(_)
+            | ParsedSql::DropView(_)
+            | ParsedSql::CreateSequence(_)
+            | ParsedSql::DropSequence(_)
+            | ParsedSql::AlterSequence(_)
+            | ParsedSql::CreateSchema(_)
+            | ParsedSql::DropSchema(_)
+            | ParsedSql::AlterSchema(_)
+            | ParsedSql::CreateType(_)
+            | ParsedSql::DropType(_) => self.execute_table_ddl_in_txn(ctx, session, txn, parsed),
             _ => Err(SqlSurfaceError::transaction_feature_not_supported(
                 "this statement is not supported inside an explicit transaction",
             )),

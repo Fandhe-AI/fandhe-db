@@ -655,11 +655,11 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | 表 | 一時表の `CREATE TEMP TABLE`・`DROP TABLE` | 一時ストア＋`SessionTempCatalog`。現状は Tx 内で `0A000`（temp-table.md） | 積む | #3313 | 一時 write txn（`ensure_temp_txn`）と `session_at_begin` の復元で巻き戻す。永続表と一時表を混ぜた DROP は従来どおり `0A000` |
 | 索引 | `CREATE [UNIQUE] INDEX`（式・部分・GIN・HNSW の宣言）・`DROP INDEX` | 自前（`create_index_bound`・`drop_index`）。`_in_txn` 本体なし | 積む（本体を分離する） | #3313 | redb 内の索引カタログ世代を鍵にするキャッシュへ載せない（V4） |
 | 索引 | 一時表の索引 DDL | `temp_route` で `0A000` | 積む | #3313 | 一時側の write txn に積む |
-| VIEW | `CREATE [OR REPLACE] VIEW`・`DROP VIEW` | 自前。`drop_view_in_txn` あり | 積む | #3315 | |
-| VIEW | マテビューの作成・`REFRESH [CONCURRENTLY]`・`DROP`・マテビューの索引 | 自前。`create_materialized_view_in_txn` などあり | 積む | #3315 | 実体の更新は `note_ddl`（既存の近似） |
-| SEQUENCE | `CREATE`／`ALTER`／`DROP SEQUENCE`・RENAME | 自前。`create_sequence_in_txn`・`drop_sequence_in_txn` あり | 積む | #3315 | メモリ上の採番値は非トランザクション性（sequence-namespace-and-ledger.md D4）。同名で作り直した場合の扱いを実装時に固定する |
-| SCHEMA | `CREATE`／`DROP [CASCADE]`／`ALTER SCHEMA`・`ALTER TABLE ... SET SCHEMA` | 自前（`namespace.rs` の `*_gated`）。`_in_txn` 本体なし | 積む（本体を分離する） | #3315 | `namespace.rs` が進める関数世代は commit 後に回す。`search_path` の刻印は #3314 と連携する |
-| 型 | `CREATE TYPE`（ENUM）・`DROP TYPE` | 自前（`create_enum_type`・`drop_enum_type`） | 積む | #3315 | `ALTER TYPE ... ADD VALUE` は SQL に未公開（`42601` のまま） |
+| VIEW | `CREATE VIEW`・`DROP VIEW [CASCADE]` | 自前。`drop_view_in_txn` あり | 積む（実装済み。「#3315 の実装記録」） | #3315 | `CREATE OR REPLACE VIEW`・DDL 後の列別名／`WITH CHECK OPTION` つきは `0A000`（#3311） |
+| VIEW | マテビューの作成・`REFRESH [CONCURRENTLY]`・`DROP`・マテビューの索引 | 自前。`create_materialized_view_in_txn` などあり | `0A000` を維持（#3311） | #3311 | 複数の文脈での本文評価と REFRESH の commit 箇所 3 つの監査を別に要する |
+| SEQUENCE | `CREATE`／`ALTER`（`RESTART` なし）／`DROP SEQUENCE`・RENAME | 自前。`create_sequence_in_txn`・`drop_sequence_in_txn` あり | 積む（実装済み） | #3315 | メモリ上の採番値は非トランザクション性（sequence-namespace-and-ledger.md D4）。内部 ID の再利用は払い出し時にカーソルを捨てて防ぐ。`ALTER SEQUENCE ... RESTART` は `0A000`（#3311） |
+| SCHEMA | 要素なしの `CREATE`／`DROP`（`CASCADE` なし）／`ALTER SCHEMA ... RENAME TO` | 自前（`namespace.rs` の `*_gated`）。`*_gated_in_txn` 本体を分離 | 積む（実装済み） | #3315 | 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE`・`ALTER TABLE ... SET SCHEMA` は `0A000`（#3311） |
+| 型 | `CREATE TYPE`（ENUM）・`DROP TYPE` | 自前（`create_enum_type_in_txn`・`drop_enum_type_in_txn` を分離） | 積む（実装済み） | #3315 | `ALTER TYPE ... ADD VALUE` は SQL に未公開（`42601` のまま） |
 | 関数 | `CREATE [OR REPLACE] FUNCTION`・`DROP FUNCTION` | 自前。`create_function_in_txn` あり。暗黙 Tx は #2882 で実施済み | 積む | #3316 | `function_generations` は commit 後に進める。ROLLBACK 時はセッションの UDF キャッシュを再読込する |
 | トリガ | `CREATE [OR REPLACE] TRIGGER`・`DROP TRIGGER` | 自前（`create_trigger_inner`・`drop_trigger`） | 積む | #3316 | 共有の public 表への作成を拒否する既存の `0A000`（#3382）は維持する |
 | ポリシー | `CREATE`／`ALTER`／`DROP POLICY`・`ALTER TABLE ... ROW LEVEL SECURITY` | 自前（`policy.rs`・`row_security.rs`） | 積む | #3316 | 同じ Tx の後続文の RLS 判定は write txn 側の定義で行う（V2） |
@@ -809,13 +809,52 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 - テスト: `sql80_txn_ddl_savepoint.rs`（engine）、`sql80_txn_table_ddl.rs`（wire。文末 `;` の psql 形・失敗からの復帰・
   ソケット切断）
 
+### #3315 の実装記録（VIEW・SEQUENCE・SCHEMA・型の DDL）
+
+- 入口: `core/txn_ddl_objects.rs`（`execute_table_ddl_in_txn_inner` から委ねる。Tx の持続時間の期限を共有する）。実行本体は
+  autocommit と同じ `sql::ddl` の `*_in_txn`。`catalog` 側は `create_enum_type`・`drop_enum_type`・`drop_view_with_behavior`・
+  `alter_sequence`・`rename_sequence`・SCHEMA の作成・削除・改名を、write txn 内本体（begin・commit を含まない）と
+  autocommit のラッパーに分けた。判定順は #3313 と同じ（READ ONLY → DDL 権限 → 作成先 → 未対応の形の `0A000` →
+  writer 取得 → 作成先の再判定 → 本体）
+- 受理した形: `CREATE VIEW`・`DROP VIEW [IF EXISTS] [RESTRICT|CASCADE]`、`CREATE`／`DROP SEQUENCE`・`ALTER SEQUENCE`
+  （`RESTART` なし）・`RENAME TO`、要素なしの `CREATE SCHEMA`・`DROP SCHEMA`（`CASCADE` なし）・`ALTER SCHEMA ... RENAME TO`、
+  `CREATE TYPE ... AS ENUM`・`DROP TYPE`。`IF [NOT] EXISTS` で何も書かない場合は DDL の印を巻き戻す。末尾 `;` と暗黙 Tx
+  （複数文メッセージ）でも同じ規則
+- **SEQUENCE の内部 ID の再利用対策**: 内部 ID のカウンタは redb の txn と一緒に ROLLBACK で巻き戻るが、採番器の
+  カーソルは巻き戻らない。このため明示 Tx で作った SEQUENCE を採番して ROLLBACK すると、同じ ID を払い出された別の
+  SEQUENCE が古い現在値を引き継ぐ。`create_sequence_in_txn_evicting` が ID を払い出した直後にその ID のカーソルを全テナント
+  分捨てる。払い出した ID は確定済みのどの SEQUENCE にも割り当てられておらず、writer 保持中は並行して使う者もいないため、
+  捨てるのは孤児だけである。「commit 前に共有メモリを変えない」原則の例外で、再利用は必ずこの払い出しを通るため中断の
+  各経路（ROLLBACK・`ROLLBACK TO`・接続断・期限切れ・commit 失敗）を個別に塞ぐ必要がない（起動時の移行だけは
+  カーソルが無いため従来の関数を使う）。以前の「内部 ID は再利用しない」という記述はこの意味に改める
+- 採番状態は非トランザクション: ROLLBACK しても採番済みの値は戻らず、`DROP SEQUENCE` の採番器の破棄は commit 成功後に
+  `evict_sequences` で行う。`DROP`・`ALTER`・RENAME の後の読み取り・INSERT は、確定済みカタログの古い定義・名前を
+  引かないよう `removed` で拒否する
+- **SCHEMA の DDL の後の文**: 後続文の `search_path` の解決と作成先の選択は確定済みカタログを読むため、SCHEMA を
+  作成・削除・改名した後は SCHEMA の DDL・`SET`/`SHOW` 以外を `0A000` にする（`TxnDdlState::schema_changed`。`ROLLBACK TO` でも
+  戻さない安全側の印）。SCHEMA の内部 ID も ROLLBACK で再利用されうるが、SCHEMA 配下の関係は未結線で、SCHEMA の DDL
+  の後は他の文を拒否するため、SCHEMA ID を鍵にするメモリ上のキャッシュは Tx 内で埋まらない
+- VIEW: 列別名・`WITH CHECK OPTION` の事前検査は確定済みカタログを読むため、DDL を積む前の Tx（writer 保持中で
+  write txn の起点と一致する）でだけ受理し、積んだ後は `0A000`。本文の参照先・名前衝突・件数上限は write txn 内の
+  本体が判定する。同じ Tx で作った VIEW を読むと確定済みカタログに無いため `42P01`（fail-closed）
+- 型: 同じ Tx で作った ENUM 型を使う `CREATE TABLE` は、解析が確定済みカタログを読むため `42704`（fail-closed）。
+  `DROP TYPE` した型を使う列は write txn の再検証で拒否される
+- 権限の再判定（V2）: 作成先の権限（`require_creation_target`）は writer 取得の前後で判定し、SCHEMA の所有者ゲートは本体の
+  中で write txn 上に判定する。ACL・ロールの Tx 内 DDL（#3316）が入るときは、確定済み側ではなく write txn 側で判定し直す
+- 未対応として `0A000` を維持（受け皿は #3311）: マテビューの作成・`REFRESH`・削除と索引、SCHEMA 配下の VIEW・SEQUENCE・型
+  （内部キー `#<id>.…`）、要素つき `CREATE SCHEMA`、`DROP SCHEMA ... CASCADE`、`ALTER TABLE ... SET SCHEMA`、
+  `CREATE OR REPLACE VIEW`、`ALTER SEQUENCE ... RESTART`、SERIAL・IDENTITY 列。PL/pgSQL・`DO` の中の DDL は設計 D6 のとおり
+  対応しない
+- テスト: engine の `sql80_txn_object_ddl.rs`（COMMIT・ROLLBACK・`ROLLBACK TO`・内部 ID の再利用・権限・READ ONLY・拒否の形）、
+  wire の `sql80_txn_object_ddl.rs`（psql 形・切断・暗黙 Tx）。拒否を固定していた既存テストは新しい挙動へ更新した
+
 ### 子 Issue への割り当て（申し送り）
 
 | 子 | 内容 |
 | --- | --- |
 | #3313 | 表・索引・制約・CTAS・一時表、変更ログのオラクル試験 |
 | #3314 | 上限の期限検査（実装済み）、`25001` の判定順（実装済み）。V1・V5・V7 の結線と権限の再判定は、追跡の結果を下の記録に残し、残りは #3311 |
-| #3315 | VIEW・マテビュー・SEQUENCE・SCHEMA・型 |
+| #3315 | VIEW・SEQUENCE・SCHEMA・型（実装済み。「#3315 の実装記録」）。マテビューは #3311 |
 | #3316 | 関数・トリガ・ポリシー・権限・ロール |
 | #3317 | `ROLLBACK TO`・接続断・commit 後フックの巻き戻し（実装済み。「#3317 の実装記録」） |
 | #3318 | Tx の途中・COMMIT の途中の SIGKILL で部分 commit が 0 件であること（`crash-test-cross-table` の道具 #2417・#2418 を拡張） |

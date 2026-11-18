@@ -16889,6 +16889,19 @@ impl Storage {
     /// 呼ばれる。同名の型が既に存在する場合は上書きせず
     /// `Err(CatalogError::TypeAlreadyExists)`。
     pub fn create_enum_type(&self, name: &str, labels: Vec<String>) -> Result<Arc<EnumTypeDef>> {
+        let encoded = Self::prepare_create_enum_type(name, &labels)?;
+        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        Self::create_enum_type_in_txn(&write_txn, name, &encoded)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(Arc::new(EnumTypeDef {
+            name: name.to_string(),
+            labels,
+        }))
+    }
+
+    /// [`Self::create_enum_type`] の txn 前処理（予約名の判定・ラベルの検証・定義のエンコード。write txn を
+    /// 開く前に fail-closed に拒否できる判定だけ。明示 Tx の `CREATE TYPE` も同じ処理を通す。Issue #3315）。
+    pub(crate) fn prepare_create_enum_type(name: &str, labels: &[String]) -> Result<Vec<u8>> {
         // 予約名の判定は名前部だけで行う（SCHEMA 配下の内部キーでも組み込み型の別名と衝突させない）。
         let bare_name = namespace::relation_name_part(name);
         if CREATE_ONLY_RESERVED_TYPE_NAMES.contains(&bare_name.to_ascii_lowercase().as_str()) {
@@ -16896,27 +16909,30 @@ impl Storage {
                 "enum type name collides with a built-in type alias: {bare_name:?}"
             )));
         }
-        let encoded = encode_enum_type_def(name, &labels)?;
-        let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        namespace::ensure_key_schema_alive_in_txn(&*write_txn, name)?;
-        {
-            let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
-            if table.get(name)?.is_some() {
-                return Err(CatalogError::TypeAlreadyExists(name.to_string()));
-            }
-            let count = table.len()?;
-            if count >= MAX_ENUM_TYPES as u64 {
-                return Err(CatalogError::Invalid(format!(
-                    "too many enum types registered: {count}"
-                )));
-            }
-            table.insert(name, encoded.as_slice())?;
+        encode_enum_type_def(name, labels)
+    }
+
+    /// [`Self::create_enum_type`] の write txn 内本体（begin・commit を含まない）。`encoded` は
+    /// [`Self::prepare_create_enum_type`] の結果。同名の重複・件数上限・保存を行う。`Err` の場合は呼び出し側が
+    /// txn を破棄する。明示・暗黙 Tx の `CREATE TYPE`（SQL-80・Issue #3315）と共有する。
+    pub(crate) fn create_enum_type_in_txn(
+        write_txn: &redb::WriteTransaction,
+        name: &str,
+        encoded: &[u8],
+    ) -> Result<()> {
+        namespace::ensure_key_schema_alive_in_txn(write_txn, name)?;
+        let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
+        if table.get(name)?.is_some() {
+            return Err(CatalogError::TypeAlreadyExists(name.to_string()));
         }
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
-        Ok(Arc::new(EnumTypeDef {
-            name: name.to_string(),
-            labels,
-        }))
+        let count = table.len()?;
+        if count >= MAX_ENUM_TYPES as u64 {
+            return Err(CatalogError::Invalid(format!(
+                "too many enum types registered: {count}"
+            )));
+        }
+        table.insert(name, encoded)?;
+        Ok(())
     }
 
     /// 定義済みの ENUM 型をスナップショット読み取りで取得する。
@@ -16985,17 +17001,26 @@ impl Storage {
     pub fn drop_enum_type(&self, name: &str) -> Result<()> {
         validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
-        {
-            let dependents = dependent_tables_in_txn(&write_txn, name)?;
-            if !dependents.is_empty() {
-                return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
-            }
-            let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
-            if table.remove(name)?.is_none() {
-                return Err(CatalogError::TypeNotFound(name.to_string()));
-            }
-        }
+        Self::drop_enum_type_in_txn(&write_txn, name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// [`Self::drop_enum_type`] の write txn 内本体（begin・commit を含まない。Issue #3315）。依存列の検査と
+    /// 削除を行う。`Err` の場合は呼び出し側が txn を破棄する。
+    pub(crate) fn drop_enum_type_in_txn(
+        write_txn: &redb::WriteTransaction,
+        name: &str,
+    ) -> Result<()> {
+        validate_relation_key(name)?;
+        let dependents = dependent_tables_in_txn(write_txn, name)?;
+        if !dependents.is_empty() {
+            return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+        }
+        let mut table = write_txn.open_table_logged(ENUM_TYPES_TABLE)?;
+        if table.remove(name)?.is_none() {
+            return Err(CatalogError::TypeNotFound(name.to_string()));
+        }
+        Ok(())
     }
 
     /// `CREATE VIEW <name> AS <body>`（TABLE-18・SQL-23・TASK-205、Issue #909）の
@@ -17190,6 +17215,19 @@ impl Storage {
     ) -> Result<Vec<CascadedObject>> {
         validate_relation_key(name)?;
         let write_txn = self.begin_write_txn().map_err(convert_storage_error)?;
+        let cascaded = Self::drop_view_with_behavior_in_txn(&write_txn, name, behavior)?;
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
+        Ok(cascaded)
+    }
+
+    /// [`Self::drop_view_with_behavior`] の write txn 内本体（begin・commit を含まない。Issue #3315）。
+    /// 明示・暗黙 Tx の `DROP VIEW` と共有する。`Err` の場合は呼び出し側が txn を破棄する。
+    pub(crate) fn drop_view_with_behavior_in_txn(
+        write_txn: &redb::WriteTransaction,
+        name: &str,
+        behavior: DropBehavior,
+    ) -> Result<Vec<CascadedObject>> {
+        validate_relation_key(name)?;
         {
             let catalog_table = write_txn.open_table_logged(CATALOG_TABLE)?;
             if catalog_table.get(name)?.is_some() {
@@ -17197,21 +17235,20 @@ impl Storage {
             }
             // 索引名を指定された場合も種別不一致（`42809`。TASK-206・INDEX-7、
             // Issue #908）。
-            if index_name_exists_in_txn(&write_txn, name)?
-                || materialized_view_exists_in_txn(&write_txn, name)?
-                || sequence::sequence_exists_in_txn(&write_txn, name)?
+            if index_name_exists_in_txn(write_txn, name)?
+                || materialized_view_exists_in_txn(write_txn, name)?
+                || sequence::sequence_exists_in_txn(write_txn, name)?
             {
                 return Err(CatalogError::WrongObjectKind(name.to_string()));
             }
         }
         // 標準形の関数本体が参照するビューは削除できない（`2BP01`。RESTRICT・CASCADE とも。Issue #2219）。
-        reject_relation_with_function_dependents_in_txn(&write_txn, name)?;
+        reject_relation_with_function_dependents_in_txn(write_txn, name)?;
         let cascaded = match behavior {
             DropBehavior::Restrict => {
                 // matview の参照元になっているビューは削除しない（TABLE-42 (5)、Issue #1667。
                 // CASCADE では列挙層が依存 matview を連鎖削除する）。
-                if !materialized::materialized_views_referencing_in_txn(&write_txn, name)?
-                    .is_empty()
+                if !materialized::materialized_views_referencing_in_txn(write_txn, name)?.is_empty()
                 {
                     return Err(CatalogError::DependentViewsExist(name.to_string()));
                 }
@@ -17225,28 +17262,27 @@ impl Storage {
                 }
                 // ビューの権限（ACL。全テナント分。SQL-40・Issue #1961）。同名再作成へ旧付与を引き継がせない。
                 drop(views_table);
-                privilege::remove_relation_acl_in_txn(&write_txn, name)?;
-                privilege::owner::remove_relation_owners_in_txn(&write_txn, name)?;
+                privilege::remove_relation_acl_in_txn(write_txn, name)?;
+                privilege::owner::remove_relation_owners_in_txn(write_txn, name)?;
                 // INSTEAD OF トリガ定義（全テナント分。TABLE-45・Issue #3193）。
-                trigger::remove_triggers_for_table_in_txn(&write_txn, name)?;
+                trigger::remove_triggers_for_table_in_txn(write_txn, name)?;
                 // commit 記録（SQL-38・Issue #2404）: ビュー定義の変更は表世代を進めないため DDL として記録する。
-                crate::storage::commit_log::note_ddl(&write_txn, name);
+                crate::storage::commit_log::note_ddl(write_txn, name);
                 Vec::new()
             }
             DropBehavior::Cascade => {
                 let closure = dependency::enumerate_drop_dependents_in_txn(
-                    &write_txn,
+                    write_txn,
                     &[dependency::DropTarget::View(name.to_string())],
                 )?;
                 if closure.conservative {
                     return Err(CatalogError::DependentViewsExist(name.to_string()));
                 }
-                let cascaded = apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
-                drop_view_in_txn(&write_txn, name)?;
+                let cascaded = apply_cascaded_objects_in_txn(write_txn, closure.objects)?;
+                drop_view_in_txn(write_txn, name)?;
                 cascaded
             }
         };
-        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)?;
         Ok(cascaded)
     }
 

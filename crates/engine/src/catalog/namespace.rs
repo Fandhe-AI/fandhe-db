@@ -555,6 +555,97 @@ pub(crate) fn create_schema_in_txn(
     Ok(id)
 }
 
+/// [`Storage::create_schema_owned`] の write txn 内本体（begin・commit を含まない。Issue #3315）。判定順は
+/// 識別子 → 予約名（`IF NOT EXISTS` より先。`42939`）→ 組み込み名・同名の既存（`IF NOT EXISTS` なら
+/// `AlreadyExists` の no-op、無ければ `SchemaAlreadyExists`）→ 件数上限 → ID 払い出しと保存。`AlreadyExists`
+/// のときは何も書いていない。明示・暗黙 Tx の `CREATE SCHEMA`（SQL-80）と autocommit が共有する。
+pub(crate) fn create_schema_if_absent_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+    if_not_exists: bool,
+    max_schemas: usize,
+    owner: Option<u64>,
+) -> Result<CreateSchemaResult> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_reserved_schema_name(name) {
+        return Err(CatalogError::ReservedSchemaName(name.to_string()));
+    }
+    if if_not_exists && schema_name_taken_in_txn(write_txn, tenant_id, name)? {
+        return Ok(CreateSchemaResult::AlreadyExists);
+    }
+    create_schema_in_txn(write_txn, tenant_id, name, max_schemas, owner)?;
+    Ok(CreateSchemaResult::Created)
+}
+
+/// [`Storage::drop_schema_gated`] の write txn 内本体（begin・commit を含まない。Issue #3315）。
+/// 所有者検査は存在判定の直後・空判定より前に write txn 上で行う。`NotFoundSkipped` のときは何も書いていない。
+pub(crate) fn drop_schema_gated_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+    if_exists: bool,
+    gate: OwnerGate,
+) -> Result<DropSchemaResult> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_builtin_schema_name(name) {
+        return Err(CatalogError::BuiltinSchema(name.to_string()));
+    }
+    let Some(id) = schema_id_in_txn(write_txn, tenant_id, name)? else {
+        return if if_exists {
+            Ok(DropSchemaResult::NotFoundSkipped)
+        } else {
+            Err(CatalogError::SchemaNotFound(name.to_string()))
+        };
+    };
+    gate.check(write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
+    if schema_has_objects_in_txn(write_txn, tenant_id, id)? {
+        return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+    }
+    {
+        let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
+        table.remove((tenant_id, name))?;
+    }
+    remove_owner_in_txn(write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
+    // SCHEMA 単位の ACL 行を同じ txn で掃除する（残ると `DROP ROLE` が `2BP01` で永久に拒否される。#2234）。
+    super::privilege::remove_schema_acl_in_txn(write_txn, tenant_id, id)?;
+    // この SCHEMA 向けの既定権限（`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`）も同じ txn で消す（#2237）。
+    super::privilege::default_acl::remove_schema_default_acl_in_txn(write_txn, tenant_id, id)?;
+    Ok(DropSchemaResult::Dropped)
+}
+
+/// [`Storage::rename_schema_gated`] の write txn 内本体（begin・commit を含まない。Issue #3315）。
+pub(crate) fn rename_schema_gated_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    old: &str,
+    new: &str,
+    gate: OwnerGate,
+) -> Result<()> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(old)?;
+    validate_identifier(new)?;
+    if is_builtin_schema_name(old) {
+        return Err(CatalogError::BuiltinSchema(old.to_string()));
+    }
+    let Some(id) = schema_id_in_txn(write_txn, tenant_id, old)? else {
+        return Err(CatalogError::SchemaNotFound(old.to_string()));
+    };
+    gate.check(write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
+    if is_builtin_schema_name(new) || schema_id_in_txn(write_txn, tenant_id, new)?.is_some() {
+        return Err(CatalogError::SchemaAlreadyExists(new.to_string()));
+    }
+    if is_reserved_schema_name(new) {
+        return Err(CatalogError::ReservedSchemaName(new.to_string()));
+    }
+    let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
+    table.remove((tenant_id, old))?;
+    table.insert((tenant_id, new), encode_schema_def(id).as_slice())?;
+    Ok(())
+}
+
 impl Storage {
     /// `tenant_id` に SCHEMA `name` を作る。判定順は識別子 → 予約名（`IF NOT EXISTS` より先。
     /// `42939`）→ 組み込み名・同名の既存（`IF NOT EXISTS` なら成功の no-op、無ければ
@@ -596,23 +687,23 @@ impl Storage {
         max_schemas: usize,
         owner: Option<u64>,
     ) -> Result<CreateSchemaResult> {
-        validate_tenant_id(tenant_id)?;
-        validate_identifier(name)?;
-        if is_reserved_schema_name(name) {
-            return Err(CatalogError::ReservedSchemaName(name.to_string()));
-        }
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        // `IF NOT EXISTS` の no-op は commit せず返す（txn は破棄される）。それ以外の既存は下の本体が
-        // `SchemaAlreadyExists` にする。
-        if if_not_exists && schema_name_taken_in_txn(&write_txn, tenant_id, name)? {
-            return Ok(CreateSchemaResult::AlreadyExists);
+        let result = create_schema_if_absent_in_txn(
+            &write_txn,
+            tenant_id,
+            name,
+            if_not_exists,
+            max_schemas,
+            owner,
+        )?;
+        // `IF NOT EXISTS` の no-op は commit せず返す（txn は破棄される）。
+        if result == CreateSchemaResult::Created {
+            crate::recovery::commit_boundary::commit(write_txn)
+                .map_err(super::convert_storage_error)?;
         }
-        create_schema_in_txn(&write_txn, tenant_id, name, max_schemas, owner)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(CreateSchemaResult::Created)
+        Ok(result)
     }
 
     /// `tenant_id` の SCHEMA `name` を削除する（`RESTRICT`）。判定順は識別子 → 組み込み名
@@ -638,37 +729,15 @@ impl Storage {
         if_exists: bool,
         gate: OwnerGate,
     ) -> Result<DropSchemaResult> {
-        validate_tenant_id(tenant_id)?;
-        validate_identifier(name)?;
-        if is_builtin_schema_name(name) {
-            return Err(CatalogError::BuiltinSchema(name.to_string()));
-        }
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let Some(id) = schema_id_in_txn(&*write_txn, tenant_id, name)? else {
-            return if if_exists {
-                Ok(DropSchemaResult::NotFoundSkipped)
-            } else {
-                Err(CatalogError::SchemaNotFound(name.to_string()))
-            };
-        };
-        gate.check(&*write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
-        if schema_has_objects_in_txn(&*write_txn, tenant_id, id)? {
-            return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+        let result = drop_schema_gated_in_txn(&write_txn, tenant_id, name, if_exists, gate)?;
+        if result == DropSchemaResult::Dropped {
+            crate::recovery::commit_boundary::commit(write_txn)
+                .map_err(super::convert_storage_error)?;
         }
-        {
-            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
-            table.remove((tenant_id, name))?;
-        }
-        remove_owner_in_txn(&write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
-        // SCHEMA 単位の ACL 行を同じ txn で掃除する（残ると `DROP ROLE` が `2BP01` で永久に拒否される。#2234）。
-        super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
-        // この SCHEMA 向けの既定権限（`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`）も同じ txn で消す（#2237）。
-        super::privilege::default_acl::remove_schema_default_acl_in_txn(&write_txn, tenant_id, id)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(DropSchemaResult::Dropped)
+        Ok(result)
     }
 
     /// `tenant_id` の SCHEMA `name` を `CASCADE` で削除する（TABLE-27・Issue #1717、設計記録 D8）。
@@ -840,30 +909,10 @@ impl Storage {
         new: &str,
         gate: OwnerGate,
     ) -> Result<()> {
-        validate_tenant_id(tenant_id)?;
-        validate_identifier(old)?;
-        validate_identifier(new)?;
-        if is_builtin_schema_name(old) {
-            return Err(CatalogError::BuiltinSchema(old.to_string()));
-        }
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let Some(id) = schema_id_in_txn(&*write_txn, tenant_id, old)? else {
-            return Err(CatalogError::SchemaNotFound(old.to_string()));
-        };
-        gate.check(&*write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
-        if is_builtin_schema_name(new) || schema_id_in_txn(&*write_txn, tenant_id, new)?.is_some() {
-            return Err(CatalogError::SchemaAlreadyExists(new.to_string()));
-        }
-        if is_reserved_schema_name(new) {
-            return Err(CatalogError::ReservedSchemaName(new.to_string()));
-        }
-        {
-            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
-            table.remove((tenant_id, old))?;
-            table.insert((tenant_id, new), encode_schema_def(id).as_slice())?;
-        }
+        rename_schema_gated_in_txn(&write_txn, tenant_id, old, new, gate)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(())

@@ -257,24 +257,60 @@ fn syntax_table() {
     ok_as(&core, "alice", &mut s, "DROP SCHEMA s RESTRICT");
 }
 
-// intentional: docs/design/schema-tenant-namespace.md
+/// SQL-80・Issue #3315: 要素なしの `CREATE SCHEMA`・`DROP SCHEMA`（RESTRICT）は共有 write txn に積まれ、
+/// COMMIT で確定・ROLLBACK で消える。
 #[test]
-fn schema_ddl_inside_explicit_transaction_is_rejected() {
+fn schema_ddl_inside_explicit_transaction_commits_or_rolls_back() {
     let (p, _g, core) = open_fixture("sch-txn");
     let mut s = allowed_session();
     ok_as(&core, "alice", &mut s, "CREATE SCHEMA existing");
+    for sql in ["CREATE SCHEMA s9", "DROP SCHEMA existing"] {
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+    let core = reopen(core, &p);
+    assert_eq!(
+        code_as(&core, "alice", &mut s, "CREATE SCHEMA existing"),
+        "42P06"
+    );
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA s9");
+    ok_as(&core, "alice", &mut s, "DROP SCHEMA s9");
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "DROP SCHEMA existing")
+        .expect("drop");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+    let core = reopen(core, &p);
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA existing");
+}
+
+/// 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE` は明示 Tx 内では未対応で、何も作らず何も消さない
+/// （Issue #3286・#3315）。
+// tracked: #3311
+#[test]
+fn schema_elements_and_cascade_inside_explicit_transaction_are_rejected() {
+    let (p, _g, core) = open_fixture("sch-txn-unsupported");
+    let mut s = allowed_session();
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA existing");
     for sql in [
-        "CREATE SCHEMA s9",
-        // 要素つきも同じく拒否し、何も作らない（Issue #3286）。
+        // 要素つきも拒否し、何も作らない（Issue #3286）。
         "CREATE SCHEMA s9 CREATE TABLE x (a INT)",
-        "DROP SCHEMA existing",
+        "DROP SCHEMA existing CASCADE",
     ] {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
             .expect("begin");
         let err = core
             .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
-            .expect_err("schema DDL inside a transaction must be rejected");
+            .expect_err("schema DDL form must be rejected inside a transaction");
         assert_eq!(err.wire_code(), "0A000", "{sql}");
         assert_eq!(txn.status(), TransactionStatus::Failed);
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")

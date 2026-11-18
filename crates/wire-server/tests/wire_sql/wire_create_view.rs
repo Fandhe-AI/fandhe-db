@@ -208,11 +208,10 @@ fn wire_view_error_sqlstates() {
     read_ready_for_query(&mut stream);
 }
 
-/// 複数文メッセージ（セミコロン区切り）で `CREATE VIEW` を最後以外に置くと
-/// `0A000`（`statement_splitter::MultiStatementError::WriteNotLast`。DDL も
-/// `INSERT` 等の書き込み系文と同じ分類を共有する）。
+/// 複数文メッセージ（セミコロン区切り）で `CREATE VIEW` を最後以外に置くと、暗黙トランザクションで
+/// DDL と後続の読み取りを 1 つの Tx として実行する（SQL-80・Issue #3315）。
 #[test]
-fn wire_create_view_not_last_in_multi_statement_message_is_rejected() {
+fn wire_create_view_not_last_in_multi_statement_message_runs_in_an_implicit_transaction() {
     let (core, _guard) = new_core_with_docs_table();
     let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
     let addr = spawn_server_with_engine_and_store(store, core);
@@ -222,7 +221,15 @@ fn wire_create_view_not_last_in_multi_statement_message_is_rejected() {
         &mut stream,
         "CREATE VIEW v AS SELECT * FROM docs; SELECT COUNT(*) FROM docs",
     );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    let _columns = read_row_description(&mut stream);
+    let _row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // 確定済み: 同名の作成は `42P07`。
+    send_simple_query(&mut stream, "CREATE VIEW v AS SELECT * FROM docs");
+    expect_error_response_with_sqlstate(&mut stream, "42P07");
     read_ready_for_query(&mut stream);
 }
 /// 評価後射影形ビューへの外側の集計・DISTINCT・ウィンドウ・式 `ORDER BY` と連鎖
