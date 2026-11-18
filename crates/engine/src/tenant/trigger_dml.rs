@@ -381,7 +381,7 @@ pub(super) fn update_rows_with_triggers(
             schema,
             ctx.tenant_id(),
             &written,
-            target.fk_check_mode(),
+            crate::tenant::child_update_fk_check_mode(table, target.fk_check_mode()),
             crate::constraint::RowPolicyWrite::Update,
         )?;
         // BEFORE ROW が SET に無い主キー・UNIQUE 列を書き換えうるため、BEFORE UPDATE の行トリガが

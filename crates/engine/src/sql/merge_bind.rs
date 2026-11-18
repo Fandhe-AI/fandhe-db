@@ -67,9 +67,17 @@ pub struct BoundAssignments {
     literals: Vec<(usize, Value)>,
     exprs: Vec<(usize, BoundSetExpr)>,
     joined_exprs: Vec<(usize, BoundSetExpr, Vec<usize>)>,
+    /// 構文上 SET に挙げられた全列の添字（`SET g = DEFAULT` のように代入計画から除かれる生成列も含む）。
+    /// 文トリガの `UPDATE OF` 判定（Issue #3355）が使う。
+    declared_columns: Vec<usize>,
 }
 
 impl BoundAssignments {
+    /// 構文上 SET に挙げられた全列の添字（代入計画から除かれた生成列への `DEFAULT` を含む）。
+    pub(crate) fn declared_columns(&self) -> &[usize] {
+        &self.declared_columns
+    }
+
     /// 右辺が列参照の項目（(対象の列添字, 解決結果)）。
     pub fn columns(&self) -> &[(usize, ResolvedColumn)] {
         &self.columns
@@ -602,6 +610,10 @@ fn bind_update(
     let (literals, exprs) = crate::sql::parser::bind_set_assignments(&plain, schema)?;
     out.literals = literals;
     out.exprs = exprs;
+    out.declared_columns = assignments
+        .iter()
+        .filter_map(|(name, _)| schema.columns.iter().position(|c| &c.name == name))
+        .collect();
     Ok(out)
 }
 

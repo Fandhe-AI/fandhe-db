@@ -276,7 +276,8 @@ pub(crate) fn classify_write(parsed: &ParsedSql) -> WriteRequirement {
         }
         // SQL-79・Issue #3351: 対象表に、WHEN 句に現れた操作の和（INSERT／UPDATE／DELETE）と SELECT を課す
         // （`DO NOTHING` は操作ビットを足さない）。実行が `0A000` の間も権限の無い主体は `42501` で止め、
-        // `na()` で素通りさせない。元側の読み取りゲートの完成と検証は #3355。
+        // `na()` で素通りさせない。元側の読み取り（元の表・ビュー・部分クエリの中の表）は、本関数の対象外で、
+        // `build_wants` が参照トークンから対象表を差し引いた残りに SELECT を課す（Issue #3355 で検証済み）。
         ParsedSql::Merge(v) => {
             let bits = v
                 .when_clauses

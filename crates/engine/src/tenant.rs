@@ -732,11 +732,11 @@ impl<'a> WriteTarget<'a> {
         }
     }
 
-    /// INSERT 経路用の [`Self::fk_check_mode`]。`table` が [`InsertFkDeferScope`] の対象なら
+    /// INSERT 経路用の [`Self::fk_check_mode`]。`table` が [`MergeFkDeferScope`] の対象なら
     /// `Skip`（行ごとの検査を省く）を返す。省いた検査は区間の持ち主が全バッチの書き込み後に
     /// 1 回行う契約（MERGE の INSERT 句をまたぐ自己参照 FK。Issue #3354）。
     pub(crate) fn insert_fk_check_mode(&self, table: &str) -> crate::constraint::FkCheckMode {
-        if InsertFkDeferScope::is_deferred(table) {
+        if MergeFkDeferScope::is_deferred(table) {
             crate::constraint::FkCheckMode::Skip
         } else {
             self.fk_check_mode()
@@ -744,36 +744,51 @@ impl<'a> WriteTarget<'a> {
     }
 }
 
+/// UPDATE 経路の子側（更新した行が参照する値の組）の FK 検査のモード。`table` が [`MergeFkDeferScope`] の
+/// 対象なら `Skip`、そうでなければ `mode` のまま。**参照先側**（この表を参照する子表の検査）には使わない
+/// （参照先側が `Skip` で素通りになると fail-open）。MERGE が UPDATE 句と INSERT 句をまたぐ参照（自己参照を含む）を
+/// 文単位の検査と同じ意味にするため、区間の持ち主が全句の書き込み後に走査で補う（Issue #3355）。
+pub(crate) fn child_update_fk_check_mode(
+    table: &str,
+    mode: crate::constraint::FkCheckMode,
+) -> crate::constraint::FkCheckMode {
+    if MergeFkDeferScope::is_deferred(table) {
+        crate::constraint::FkCheckMode::Skip
+    } else {
+        mode
+    }
+}
+
 thread_local! {
     /// FK の INSERT 時検査を先送りしている表名（区間が無ければ `None`）。
-    static INSERT_FK_DEFERRED_TABLE: std::cell::RefCell<Option<String>> =
+    static MERGE_FK_DEFERRED_TABLE: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// 指定表への INSERT 経路の FK 検査（子側）を、区間が続く間だけ先送りする RAII ガード。
-/// MERGE が INSERT 句ごとに `execute_insert_batch_with_schema_in` を呼ぶため、句をまたぐ参照を
+/// MERGE が句ごとに既存の書き込み経路（INSERT・UPDATE）を呼ぶため、句をまたぐ参照を
 /// 文単位の検査と同じ意味で通すために使う。区間の持ち主は drop 後に
 /// `constraint::enforce_immediate_foreign_keys_by_scan_in_txn` で検査を必ず補う（省き忘れは fail-open）。
-/// 対象は INSERT 経路の子側検査だけで、UPDATE・DELETE・他表の検査には影響しない。drop で直前の状態へ戻す。
-pub(crate) struct InsertFkDeferScope {
+/// 対象は INSERT・UPDATE 経路の子側検査だけで、参照先側・DELETE・他表の検査には影響しない。drop で直前の状態へ戻す。
+pub(crate) struct MergeFkDeferScope {
     prev: Option<String>,
 }
 
-impl InsertFkDeferScope {
+impl MergeFkDeferScope {
     pub(crate) fn enter(table: &str) -> Self {
-        let prev = INSERT_FK_DEFERRED_TABLE.with(|t| t.borrow_mut().replace(table.to_string()));
+        let prev = MERGE_FK_DEFERRED_TABLE.with(|t| t.borrow_mut().replace(table.to_string()));
         Self { prev }
     }
 
     fn is_deferred(table: &str) -> bool {
-        INSERT_FK_DEFERRED_TABLE.with(|t| t.borrow().as_deref() == Some(table))
+        MERGE_FK_DEFERRED_TABLE.with(|t| t.borrow().as_deref() == Some(table))
     }
 }
 
-impl Drop for InsertFkDeferScope {
+impl Drop for MergeFkDeferScope {
     fn drop(&mut self) {
         let prev = self.prev.take();
-        INSERT_FK_DEFERRED_TABLE.with(|t| *t.borrow_mut() = prev);
+        MERGE_FK_DEFERRED_TABLE.with(|t| *t.borrow_mut() = prev);
     }
 }
 
@@ -7294,17 +7309,16 @@ fn enumerate_dml_candidates_with<E, T>(
 /// 拒否し、呼び出し元は write txn を commit しない（副作用ゼロ）。
 /// - 束縛時のスキーマと実行時のスキーマが違う（並行 `ALTER TABLE`。`22000`）
 /// - `row_security = off`（`42501`。RLS-13）
-/// - 対象表に利用者ポリシーが適用される（UPDATE 用・DELETE 用のどちらでも固定文言の `0A000`。操作ごとに
-///   行集合が変わり、第 1 段の列挙と第 3 段の列挙が一致する保証を作れないため。担当 #3355）
-/// - INSERT 句があり、INSERT 側の利用者ポリシーが適用される（固定文言の `0A000`。Issue #3354。担当 #3355）
-/// - 対象表に文トリガがある（固定文言の `0A000`。MERGE の文トリガは操作の種類ごとに 1 回の契約で、既存の
-///   書き込み経路は呼び出しごとに発火するため。担当 #3355）
+///
+/// 利用者ポリシー（RLS-13）・文トリガは、Issue #3355 から拒否せず、実行器が次の規則で扱う: 対象候補は SELECT 側の
+/// `USING` で絞り（[`enumerate_merge_candidates_readonly`]）、UPDATE・DELETE を選んだ行は各 `USING` を第 1 段で
+/// 評価して違反を `42501` で拒否し、新しい行の `WITH CHECK` は既存の書き込み経路の検査点が行う。文トリガは
+/// [`merge_triggers`] が操作の種類ごとに 1 回発火する。
 pub(crate) fn merge_target_preflight(
     write_txn: &redb::WriteTransaction,
     ctx: &PolicyContext,
     table: &str,
     expected_schema: &crate::catalog::TableSchema,
-    has_insert_clause: bool,
 ) -> Result<(), TenantWriteError> {
     validate_relation_key(table)?;
     let schema = require_table_schema_write_any_identity(write_txn, table)?;
@@ -7314,52 +7328,6 @@ pub(crate) fn merge_target_preflight(
         )));
     }
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
-    let unsupported = |detail: &str| {
-        TenantWriteError::TriggerFailed(SqlSurfaceError::FeatureNotSupported {
-            detail: detail.to_string(),
-        })
-    };
-    for cmd in [
-        crate::sql::row_policy::PolicyCmd::Update {
-            reads_existing: true,
-        },
-        crate::sql::row_policy::PolicyCmd::Delete {
-            reads_existing: true,
-        },
-    ] {
-        if resolve_dml_row_policy(write_txn, ctx, &schema, table, cmd)?.is_some() {
-            return Err(unsupported(
-                "MERGE into a table with row-level security policies is not supported yet",
-            ));
-        }
-    }
-    // `WHEN NOT MATCHED ... THEN INSERT` があるときは INSERT 側の利用者ポリシー（`WITH CHECK`）も同じく
-    // 未対応で拒否する（RLS 相当を緩めない fail-closed の多層防御。書き込み段も挿入時に同じ検査を持つ。
-    // 担当 #3355）。
-    if has_insert_clause
-        && crate::sql::policy_eval::compile_in_txn(
-            write_txn,
-            ctx.tenant_id(),
-            table,
-            &schema,
-            crate::sql::policy_eval::PolicyCheckKind::InsertCheck,
-        )?
-        .is_some()
-    {
-        return Err(unsupported(
-            "MERGE into a table with row-level security policies is not supported yet",
-        ));
-    }
-    let triggers =
-        crate::catalog::trigger::list_triggers_in_txn(write_txn, ctx.tenant_id(), table)?;
-    if triggers
-        .iter()
-        .any(|t| t.level == crate::catalog::trigger::TriggerLevel::Statement)
-    {
-        return Err(unsupported(
-            "MERGE into a table with statement-level triggers is not supported yet",
-        ));
-    }
     Ok(())
 }
 
@@ -7367,8 +7335,9 @@ pub(crate) fn merge_target_preflight(
 ///
 /// 責務境界: 既存の候補列挙本体（[`enumerate_dml_candidates_with`]）をそのまま呼ぶだけで、テナントのキー範囲・
 /// 総走査上限・「所有かつ可視」の選定・協調的中断は UPDATE／DELETE と完全に同一。台帳・トリガ・世代・行の
-/// 書き込みには一切触れない（第 2 の書き込み経路ではない）。利用者ポリシーが無いことは
-/// [`merge_target_preflight`] が保証済みの前提で、ポリシーは `None` で渡す。呼び出し元は `core::merge_exec`。
+/// 書き込みには一切触れない（第 2 の書き込み経路ではない）。利用者ポリシー（RLS-13）が適用される表では、
+/// SELECT 側の `USING` を同じ write txn・同じスキーマから解決して候補列挙へ渡す（SELECT で隠れた対象行は一致にも
+/// BY SOURCE にも入らず「一致なし」になる。Issue #3355）。呼び出し元は `core::merge_exec`。
 /// `predicate` は候補ごとに 1 回呼ばれ、`Some(t)` が採用（`(id, t)` を候補列挙順で返す）。
 pub(crate) fn enumerate_merge_candidates_readonly<E, T>(
     write_txn: &redb::WriteTransaction,
@@ -7387,6 +7356,14 @@ pub(crate) fn enumerate_merge_candidates_readonly<E, T>(
             "table schema changed after the statement was bound".to_string(),
         )));
     }
+    let policy = resolve_dml_row_policy(
+        write_txn,
+        ctx,
+        &schema,
+        table,
+        crate::sql::row_policy::PolicyCmd::Select,
+    )
+    .map_err(dml_write_err)?;
     let row_table_name = user_rows_table_name(table);
     let row_table = write_txn
         .open_table_logged(user_rows_table_def(&row_table_name))
@@ -7396,7 +7373,7 @@ pub(crate) fn enumerate_merge_candidates_readonly<E, T>(
         &row_table,
         ctx,
         &schema,
-        None,
+        policy.as_ref(),
         needs_embedding,
         None,
         max_scanned_rows,
@@ -8530,7 +8507,7 @@ fn apply_predicate_update_in_txn<E>(
             schema,
             ctx.tenant_id(),
             &candidate_rowids,
-            fk_mode,
+            child_update_fk_check_mode(table, fk_mode),
             crate::constraint::RowPolicyWrite::Update,
         )
         .map_err(dml_write_err)?;
@@ -9374,6 +9351,7 @@ pub(crate) fn last_operation(
         .map_err(TenantWriteError::LedgerCorrupted)
 }
 
+pub(crate) mod merge_triggers;
 pub(crate) mod partitioned_dml;
 pub(crate) mod statement_writes;
 pub(crate) mod trigger_dml;

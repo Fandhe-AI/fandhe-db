@@ -77,6 +77,35 @@ pub(crate) struct MergeExecPlan {
     pub(crate) needs_embedding: bool,
 }
 
+impl MergeExecPlan {
+    /// WHEN 句に現れた操作の種類と UPDATE 句の SET 列の和集合（DO NOTHING は数えない）。文トリガの発火計画
+    /// （`tenant::merge_triggers`。Issue #3355）が、実際に行を書いたかによらず種類ごとに 1 回発火する根拠。
+    pub(crate) fn action_kinds(&self) -> crate::tenant::merge_triggers::MergeActionKinds {
+        let mut kinds = crate::tenant::merge_triggers::MergeActionKinds::default();
+        for c in &self.clauses {
+            match &c.action {
+                ActionPlan::Update(set) => {
+                    kinds.update = true;
+                    kinds.update_columns.extend(set.declared.iter().copied());
+                    kinds
+                        .update_columns
+                        .extend(set.literals.iter().map(|(i, _)| *i));
+                    kinds
+                        .update_columns
+                        .extend(set.items.iter().map(|it| it.column_index));
+                    kinds
+                        .update_columns
+                        .extend(set.copies.iter().map(|cp| cp.column_index));
+                }
+                ActionPlan::Delete => kinds.delete = true,
+                ActionPlan::Insert(_) => kinds.insert = true,
+                ActionPlan::DoNothing => {}
+            }
+        }
+        kinds
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MergeClausePlan {
     kind: MergeMatchKind,
@@ -136,6 +165,9 @@ struct SetPlan {
     items: Vec<SetItem>,
     /// 式を経由できない代入先の型への、元の列の単純コピー。
     copies: Vec<CopyItem>,
+    /// 構文上 SET に挙げられた全列（代入計画から除かれる生成列への `DEFAULT` を含む）。文トリガの
+    /// `UPDATE OF` 判定用（Issue #3355）。
+    declared: Vec<usize>,
 }
 
 /// 式項。`set` の列参照は「対象列 ++ `src_cols`（この項自身の並び）」のビューの添字で解決済み。
@@ -345,6 +377,7 @@ fn plan_set(
 ) -> Result<SetPlan, SqlSurfaceError> {
     let mut set = SetPlan {
         literals: a.literals().to_vec(),
+        declared: a.declared_columns().to_vec(),
         ..SetPlan::default()
     };
     for (idx, e) in a.exprs() {

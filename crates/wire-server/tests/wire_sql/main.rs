@@ -102,6 +102,7 @@ mod wire_sql79_merge_bind;
 mod wire_sql79_merge_matched;
 mod wire_sql79_merge_not_matched;
 mod wire_sql79_merge_parse;
+mod wire_sql79_merge_rules;
 mod wire_statement_timeout_setting;
 mod wire_trigger_copy;
 mod wire_trigger_ddl;

@@ -154,9 +154,16 @@ pub(crate) fn plan_row_triggers<'a>(
     let (before, after): (Vec<TriggerDef>, Vec<TriggerDef>) = row
         .into_iter()
         .partition(|t| t.timing == TriggerTiming::Before);
-    let (before_stmt, after_stmt): (Vec<TriggerDef>, Vec<TriggerDef>) = stmt
+    let (mut before_stmt, mut after_stmt): (Vec<TriggerDef>, Vec<TriggerDef>) = stmt
         .into_iter()
         .partition(|t| t.timing == TriggerTiming::Before);
+    // `MERGE`（Issue #3355）の第 3 段は既存の書き込み経路を句ごとに呼ぶため、文トリガは入口・出口で
+    // 操作の種類ごとに 1 回だけ発火する。区間中の対象表（同じ深さ）の文トリガ群はここで空にする
+    // （唯一の抑止点。入れ子の DML は深さが違うので抑止されない）。
+    if crate::tenant::merge_triggers::suppresses(table) {
+        before_stmt.clear();
+        after_stmt.clear();
+    }
     // `UPDATE OF` の絞り込みで全て外れたときだけ従来経路（4 群とも空）。
     if before.is_empty() && after.is_empty() && before_stmt.is_empty() && after_stmt.is_empty() {
         return Ok(child_only(Some(runtime)));
