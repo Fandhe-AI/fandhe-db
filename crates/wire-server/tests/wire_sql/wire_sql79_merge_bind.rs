@@ -2,7 +2,8 @@
 //!
 //! 簡易クエリ（psql 流の末尾 `;` 付き単独送信を含む）で束縛エラーの SQLSTATE と ReadyForQuery の状態を、
 //! 拡張クエリで値位置の `$n` の Parse 成功・ParameterDescription（対象の列型の OID）・Bind／Execute の
-//! 結果（束縛を通れば固定文言の `0A000`、束縛エラーはそのコード）を固定する。行は変わらない。
+//! 結果（束縛エラーはそのコード、束縛を通った `WHEN MATCHED` だけの形は実行〔#3353〕、NOT MATCHED を含む形は
+//! 固定文言の `0A000`）を固定する。
 //! サーバーはポート 0・一意な一時ディレクトリで独立させ、時間計測は使わない。
 
 use crate::common;
@@ -136,11 +137,6 @@ fn simple_query_binding_errors_keep_their_sqlstate_with_and_without_semicolon() 
             "MERGE INTO t USING s ON t.name = s.v WHEN MATCHED THEN DELETE",
             "42804",
         ),
-        // 束縛を通る形は固定文言の 0A000。
-        (
-            "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v",
-            "0A000",
-        ),
     ] {
         for text in [sql.to_string(), format!("{sql};")] {
             send_simple_query(&mut s, &text);
@@ -206,16 +202,13 @@ fn extended_query_value_placeholders_are_parsed_and_described_with_the_target_co
     assert_eq!(count_t(&mut s), "1");
 }
 
+// 束縛を通った NOT MATCHED の形は、実行を入れる #3354 まで固定文言の `0A000` で拒否する。
+// tracked: #3354
 #[test]
 fn extended_query_execute_reports_binding_errors_before_the_fixed_0a000() {
     let (addr, _g) = start();
     let mut s = client(addr);
     for (sql, values, want) in [
-        (
-            "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = $1",
-            vec!["7"],
-            "0A000",
-        ),
         (
             "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET nope = $1",
             vec!["7"],
@@ -225,6 +218,11 @@ fn extended_query_execute_reports_binding_errors_before_the_fixed_0a000() {
             "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.name, $1)",
             vec!["7"],
             "42804",
+        ),
+        (
+            "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, $1)",
+            vec!["7"],
+            "0A000",
         ),
     ] {
         send_length_prefixed_message(&mut s, b'P', &parse_body("", sql, 0));

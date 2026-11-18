@@ -47,7 +47,7 @@ pub(crate) struct BoundCondition {
 
 impl BoundCondition {
     /// 修飾済みの論理木。
-    #[allow(dead_code)] // 実行を結線する #3353・#3354 が消費するまでは単体テストのみが呼び出し元
+    #[allow(dead_code)] // 押し下げ（D3）を入れる #3354 が消費するまでは単体テストのみが呼び出し元
     pub(crate) fn expr(&self) -> &JoinWhereExpr {
         &self.expr
     }
@@ -58,7 +58,6 @@ impl BoundCondition {
     }
 
     /// 残余の束縛結果。
-    #[allow(dead_code)] // 実行を結線する #3353・#3354 が消費するまでは単体テストのみが呼び出し元
     pub(crate) fn residual(&self) -> Option<&JoinedResidual> {
         self.residual.as_ref()
     }

@@ -172,9 +172,9 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "tenant.rs",
-        20,
+        21,
         Class::Applied,
-        "述語形・id 形・結合形 UPDATE/DELETE の対象選択にポリシー。INSERT・UPSERT・TRUNCATE は #2277 または対象外",
+        "述語形・id 形・結合形 UPDATE/DELETE の対象選択にポリシー。MERGE の第 1 段（enumerate_merge_candidates_readonly。Issue #3353）はポリシーを反映できないため、merge_target_preflight が適用表を固定文言の 0A000 で拒否してからポリシーなしで列挙する。INSERT・UPSERT・TRUNCATE は #2277 または対象外",
     ),
     (
         "tenant/partitioned_dml.rs",

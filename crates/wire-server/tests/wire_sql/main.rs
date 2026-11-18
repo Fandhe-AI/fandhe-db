@@ -99,6 +99,7 @@ mod wire_sql67_dollar_quoting;
 mod wire_sql78_noneq_between_param;
 mod wire_sql78_noneq_between_rls;
 mod wire_sql79_merge_bind;
+mod wire_sql79_merge_matched;
 mod wire_sql79_merge_parse;
 mod wire_statement_timeout_setting;
 mod wire_trigger_copy;

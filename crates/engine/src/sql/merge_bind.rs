@@ -91,13 +91,11 @@ impl BoundAssignments {
     }
 
     /// 対象の列だけを使う式・`DEFAULT` の項目（束縛済み式）。
-    #[allow(dead_code)] // 実行を結線する #3353・#3354 が消費するまでは単体テストのみが呼び出し元
     pub(crate) fn exprs(&self) -> &[(usize, BoundSetExpr)] {
         &self.exprs
     }
 
     /// 元の列を含む式の項目（(対象の列添字, 束縛済み式, 参照された元の列の添字)）。
-    #[allow(dead_code)] // 実行を結線する #3353・#3354 が消費するまでは単体テストのみが呼び出し元
     pub(crate) fn joined_exprs(&self) -> &[(usize, BoundSetExpr, Vec<usize>)] {
         &self.joined_exprs
     }
@@ -181,7 +179,6 @@ impl BoundMergeClause {
     }
 
     /// 束縛済みの条件。
-    #[allow(dead_code)] // 実行を結線する #3353・#3354 が消費するまでは単体テストのみが呼び出し元
     pub(crate) fn condition(&self) -> Option<&BoundCondition> {
         self.condition.as_ref()
     }
@@ -258,7 +255,6 @@ impl BoundMerge {
     }
 
     /// 束縛済みの `ON`。
-    #[allow(dead_code)] // 実行を結線する #3353・#3354 が消費するまでは単体テストのみが呼び出し元
     pub(crate) fn on(&self) -> &BoundCondition {
         &self.on
     }
