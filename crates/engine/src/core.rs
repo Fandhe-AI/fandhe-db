@@ -7281,7 +7281,7 @@ impl EngineCore {
                 return Err(e);
             }
         }
-        // SQL-80・Issue #3313（V7。受け皿は #3314）: DDL を積んだ Tx では、拡張クエリで Parse 済みの文
+        // SQL-80・Issue #3313（V7。受け皿は #3311）: DDL を積んだ Tx では、拡張クエリで Parse 済みの文
         // （確定済みカタログで束縛・検証した文）をそのまま実行しない。DDL・Tx 制御・`SET`/`SHOW` 以外は
         // `0A000` で Tx を失敗にする（簡易クエリは文ごとに write txn 上のスキーマで解析し直す）。
         if let Err(e) = txn_ddl::check_extended_execute_after_ddl(txn, parsed) {
@@ -11385,7 +11385,7 @@ impl EngineCore {
             return Err(SqlSurfaceError::ReadOnlySqlTransaction);
         }
         // SQL-80・Issue #3313: 表・索引の DDL を積んだ Tx は、結線を済ませた種類の文だけを実行する
-        // （暫定の許可リスト。受け皿は #3314）。writer・台帳・採番・カタログへ触れる前に拒否する。
+        // （暫定の許可リスト。受け皿は #3311）。writer・台帳・採番・カタログへ触れる前に拒否する。
         txn_ddl::check_post_ddl_statement(session, txn, parsed)?;
 
         // SQL-37（Issue #1586）: 読み取り文は文の開始時刻とトランザクション開始時刻を確定する
@@ -18947,7 +18947,7 @@ impl EngineCore {
             TransactionStatus::Idle => self.begin_copy_unscrubbed(ctx, session, sql, pin),
             TransactionStatus::Failed => Err(txn.take_failed_error()),
             TransactionStatus::InTransaction => {
-                // SQL-80・Issue #3313（受け皿は #3314）: DDL を積んだ Tx の `COPY` は、確定済みカタログと
+                // SQL-80・Issue #3313（受け皿は #3311）: DDL を積んだ Tx の `COPY` は、確定済みカタログと
                 // write txn の食い違いを避けるため結線までは `0A000`（Tx は失敗状態）。
                 if txn.has_ddl() {
                     txn.fail();
@@ -21302,7 +21302,7 @@ impl EngineCore {
         };
         // SQL-80・Issue #3313: 重ね見の区間（DDL を積んだ Tx）では、確定済みの索引カタログに同じ Tx で作った
         // 一意索引が無いため `CREATE UNIQUE INDEX` 由来かを判定できない。誤って制約として受理（fail-open）
-        // しないよう、write txn の索引カタログを引く結線（#3314）まで `0A000` で拒否する。
+        // しないよう、write txn の索引カタログを引く結線（#3311）まで `0A000` で拒否する。
         if crate::sql::txn_overlay::overlay_active(&self.storage) {
             return Err(
                 crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(
@@ -21406,7 +21406,7 @@ impl EngineCore {
             }
             crate::sql::parser::BoundInsertForm::File(bound) => {
                 // SQL-80・Issue #3313: ファイル形のチャンク化は確定済みカタログからスキーマを引くため、
-                // 同じ Tx で作った表・追加した列を解決できない。結線（#3314）まで `0A000` で拒否する。
+                // 同じ Tx で作った表・追加した列を解決できない。結線（#3311）まで `0A000` で拒否する。
                 if crate::sql::txn_overlay::overlay_active(&self.storage) {
                     return Err(
                         crate::sql::allowlist::SqlSurfaceError::transaction_feature_not_supported(

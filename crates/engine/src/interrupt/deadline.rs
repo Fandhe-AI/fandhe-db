@@ -156,8 +156,10 @@ impl DeadlineScope {
                 at,
                 countdown: 0,
                 fired: prev.fired,
-                fire_after: None,
-                seen: 0,
+                // テスト用プローブは入れ子の導入で外さない（本番経路の `fire_after` は常に `None`）。
+                // Tx 内 DDL が Tx の期限を張った内側でも、走査の確認点をプローブで決定的に発火できる。
+                fire_after: prev.fire_after,
+                seen: prev.seen,
             })
         });
         DeadlineGuard {

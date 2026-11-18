@@ -5,7 +5,7 @@
 //! `EngineCore::execute_sql_in_txn`（明示 Tx の production 入口）で、`CREATE TABLE`・`ALTER TABLE` の一部・
 //! `DROP TABLE`・`CREATE INDEX`・`DROP INDEX` を共有 write txn へ積み、COMMIT で原子的に確定し、
 //! ROLLBACK・失敗では痕跡を残さないことを固定する。DDL 後に実行できる文は暫定の許可リストに限り、
-//! それ以外は `0A000` で fail-closed になる（受け皿は #3314。権限の再判定・拡張クエリ・UPDATE/DELETE 等）。
+//! それ以外は `0A000` で fail-closed になる（受け皿は #3311。権限の再判定・拡張クエリ・UPDATE/DELETE 等）。
 //! `sql31_transaction.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／`CleanupGuard`）。
 
 use engine::core::EngineCore;
@@ -377,7 +377,7 @@ fn ddl_without_ddl_permission_is_42501_and_leaks_no_existence() {
 }
 
 #[test]
-// tracked: #3314
+// tracked: #3311
 fn insert_select_after_ddl_is_rejected_with_0a000() {
     // 挿入先スキーマを確定済みカタログから取る INSERT ... SELECT は、同じ Tx の CREATE TABLE・ADD COLUMN を
     // 解決できないため、結線までは 0A000 で拒否する（Tx は失敗状態。部分実行しない）。
@@ -405,7 +405,7 @@ fn insert_select_after_ddl_is_rejected_with_0a000() {
 }
 
 #[test]
-// tracked: #3314
+// tracked: #3311
 fn conflict_on_constraint_and_file_form_insert_after_ddl_are_rejected_with_0a000() {
     // 同じ Tx で作った一意索引を ON CONFLICT ON CONSTRAINT の対象として受理せず（SQL-49 の 42704 を判定できる
     // 結線まで 0A000）、ファイル形 INSERT も確定済みカタログを引くため結線まで 0A000 で拒否する（部分実行しない）。
@@ -466,7 +466,7 @@ fn conflict_on_constraint_and_file_form_insert_after_ddl_are_rejected_with_0a000
 }
 
 #[test]
-// tracked: #3314
+// tracked: #3311
 fn statements_not_yet_wired_after_ddl_are_rejected_with_0a000() {
     // DDL 後の UPDATE・DELETE・TRUNCATE・EXPLAIN・COPY 等は未対応。
     let (core, _guard) = new_core("sql80-post-ddl-gate");
@@ -498,7 +498,7 @@ fn statements_not_yet_wired_after_ddl_are_rejected_with_0a000() {
 }
 
 #[test]
-// tracked: #3314
+// tracked: #3311
 fn reads_after_a_drop_are_rejected_with_0a000() {
     // DROP 後の参照は未対応。確定済みカタログでの解析・ビュー展開が古い名前を見るため。
     let (core, _guard) = new_core("sql80-after-drop");
@@ -827,7 +827,7 @@ fn drop_if_exists_of_a_missing_table_in_a_transaction_commits_without_effect() {
 }
 
 #[test]
-// tracked: #3314
+// tracked: #3311
 fn extended_execute_after_ddl_is_rejected_for_everything_but_ddl() {
     // V7: Parse 済み（確定済みカタログで束縛した）文は、DDL を積んだ Tx では実行しない。
     // 古いスキーマで INSERT を束縛してしまう経路を作らない。
@@ -860,7 +860,7 @@ fn extended_execute_after_ddl_is_rejected_for_everything_but_ddl() {
 }
 
 #[test]
-// tracked: #3314
+// tracked: #3311
 fn copy_after_ddl_is_rejected_with_0a000() {
     let (core, _guard) = new_core("sql80-copy");
     let mut session = ddl_session();
@@ -887,15 +887,55 @@ fn copy_after_ddl_is_rejected_with_0a000() {
     tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
 }
 
-/// 走査を伴う DDL（一意索引・`SET NOT NULL`）は、期限の結線まで行のある表では `0A000`（Issue #3313 レビュー）。
+/// 走査を伴う DDL（一意索引・`SET NOT NULL`）は、走査ループに Tx の期限の確認点が結線された（Issue #3314）ため、
+/// 行のある表でも Tx 内で通る。データ違反は従来どおりの SQLSTATE（`23505`・`23502`）で Tx を失敗にし、痕跡を残さない。
 #[test]
-fn scanning_ddl_on_a_non_empty_table_is_rejected_until_deadline_wiring() {
+fn scanning_ddl_on_a_non_empty_table_runs_inside_a_transaction() {
     let (core, _guard) = new_core("sql80-scan-ddl");
     let mut session = ddl_session();
     core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
         .expect("create");
     core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(1, "a"))
         .expect("seed");
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(2, "b"))
+        .expect("seed");
+    // 重複の無い列への一意索引・SET NOT NULL は通り、COMMIT で確定する。
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE UNIQUE INDEX t_body_u ON t (body)",
+    );
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "ALTER TABLE t ALTER COLUMN body SET NOT NULL",
+    );
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+    assert_eq!(
+        core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(3, "a"))
+            .expect_err("unique index was committed")
+            .wire_code(),
+        "23505"
+    );
+    // 重複のある列への一意索引は 23505。Tx は失敗状態で、ROLLBACK で痕跡を残さない。
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TABLE d (id BIGINT PRIMARY KEY, k INTEGER)",
+    )
+    .expect("create d");
+    for i in 1..=2 {
+        core.execute_sql_in_session(
+            &ctx("alice"),
+            &mut session,
+            &format!("INSERT INTO d (id, k) VALUES ({i}, 7) USING OPERATION_ID 'op-d-{i}'"),
+        )
+        .expect("seed d");
+    }
     let mut txn = core.new_session_transaction();
     begin(&core, &mut session, &mut txn);
     assert_eq!(
@@ -903,22 +943,87 @@ fn scanning_ddl_on_a_non_empty_table_is_rejected_until_deadline_wiring() {
             &core,
             &mut session,
             &mut txn,
-            "CREATE UNIQUE INDEX t_body_u ON t (body)"
+            "CREATE UNIQUE INDEX d_k_u ON d (k)"
         ),
-        "0A000"
+        "23505"
+    );
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "INSERT INTO d (id, k) VALUES (3, 7) USING OPERATION_ID 'op-d-3'",
+    )
+    .expect("no unique index remains");
+    // NULL を含む列への SET NOT NULL は 23502。
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "INSERT INTO d (id) VALUES (4) USING OPERATION_ID 'op-d-4'",
+    )
+    .expect("null row");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    assert_eq!(
+        tx_code(
+            &core,
+            &mut session,
+            &mut txn,
+            "ALTER TABLE d ALTER COLUMN k SET NOT NULL"
+        ),
+        "23502"
     );
     tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+}
+
+/// 走査ループの確認点（Issue #3314）: 文の期限・切断検出が走査中に効くと `57014` になり、Tx は失敗状態で、
+/// カタログ・行・索引に痕跡を残さない。autocommit の走査 DDL も同じ確認点で中断できる。
+#[test]
+fn scan_ddl_checkpoint_interrupts_and_leaves_no_trace() {
+    let (core, _guard) = new_core("sql80-scan-interrupt");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(1, "a"))
+        .expect("seed");
+    // 明示 Tx（Tx の期限を張った内側でもテストのプローブが発火する）。
     let mut txn = core.new_session_transaction();
     begin(&core, &mut session, &mut txn);
-    assert_eq!(
-        tx_code(
-            &core,
-            &mut session,
-            &mut txn,
-            "ALTER TABLE t ALTER COLUMN body SET NOT NULL"
-        ),
-        "0A000"
-    );
+    {
+        let _probe = engine::interrupt::install_fire_after_checks(0);
+        assert_eq!(
+            tx_code(
+                &core,
+                &mut session,
+                &mut txn,
+                "CREATE UNIQUE INDEX t_body_u ON t (body)"
+            ),
+            "57014"
+        );
+    }
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+    // autocommit。
+    {
+        let _probe = engine::interrupt::install_fire_after_checks(0);
+        let err = core
+            .execute_sql_in_session(
+                &ctx("alice"),
+                &mut session,
+                "CREATE UNIQUE INDEX t_body_u ON t (body)",
+            )
+            .expect_err("interrupted");
+        assert_eq!(err.wire_code(), "57014");
+    }
+    // 索引は作られていない（重複の挿入が通り、同名の索引を作れる）。
+    core.execute_sql_in_session(&ctx("alice"), &mut session, &insert(2, "a"))
+        .expect("no unique index remains");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE UNIQUE INDEX t_id_body_u ON t (id, body)",
+    )
+    .expect("DDL works after the interrupt");
 }
 
 /// 走査しない no-op（名前衝突の `IF NOT EXISTS`・既に NOT NULL の列への `SET NOT NULL`）は、行のある表でも成功する。
@@ -980,10 +1085,9 @@ fn view_read_after_ddl_is_rejected() {
         "0A000"
     );
 }
-/// 行を持つ実体化ビューへの一意索引は、通常表と同じく走査 DDL のゲートで `0A000` にする
-/// （期限なしの全行走査で共有 writer を保持しない）。
+/// 行を持つ実体化ビューへの一意索引は、実体の走査に確認点が結線された（Issue #3314）ため Tx 内で通る。
 #[test]
-fn unique_index_on_a_populated_matview_is_rejected() {
+fn unique_index_on_a_populated_matview_runs_inside_a_transaction() {
     let (core, _guard) = new_core("sql80-matview-unique");
     let mut session = ddl_session();
     core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
@@ -998,15 +1102,13 @@ fn unique_index_on_a_populated_matview_is_rejected() {
     .expect("matview");
     let mut txn = core.new_session_transaction();
     begin(&core, &mut session, &mut txn);
-    assert_eq!(
-        tx_code(
-            &core,
-            &mut session,
-            &mut txn,
-            "CREATE UNIQUE INDEX mv_u ON mv (id)"
-        ),
-        "0A000"
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE UNIQUE INDEX mv_u ON mv (id)",
     );
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
 }
 
 /// 何も変えない成功の DDL（`IF NOT EXISTS` の既存名・`IF EXISTS` の不在名）は、DDL を積んだ印を立てず、
@@ -1100,5 +1202,155 @@ fn add_column_serial_and_identity_are_rejected_without_marking_ddl() {
         tx_ok(&core, &mut s2, &mut t2, "ROLLBACK");
     }
     tx_ok(&core, &mut session, &mut txn, &insert(1, "a"));
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+}
+
+/// Tx 内で禁じる分割実行（SQL-32）は、DDL を積んだ後でも `25001` を先に返す（`0A000` より先）。Tx は失敗状態で、
+/// COMMIT しても ROLLBACK 扱いになり、DDL は何も残らない（Issue #3314）。
+#[test]
+fn partitioned_dml_after_ddl_is_25001_and_nothing_persists() {
+    let (core, _guard) = new_core("sql80-partitioned-25001");
+    let mut session = ddl_session();
+    for sql in [
+        "UPDATE t SET body = 'x' WHERE id > 0 USING OPERATION_ID 'p-u' PARTITIONED",
+        "DELETE FROM t WHERE id > 0 USING OPERATION_ID 'p-d' PARTITIONED",
+        "CANCEL PARTITIONED DML 'x' ON t",
+    ] {
+        let mut txn = core.new_session_transaction();
+        begin(&core, &mut session, &mut txn);
+        tx_ok(&core, &mut session, &mut txn, CREATE_T);
+        assert_eq!(
+            tx_code(&core, &mut session, &mut txn, sql),
+            "25001",
+            "{sql}"
+        );
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        assert_eq!(
+            tx_code(&core, &mut session, &mut txn, "SELECT id FROM t"),
+            "25P02"
+        );
+        tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+        assert_eq!(read_rows(&core, "alice", "SELECT id FROM t"), Err("42P01"));
+    }
+}
+
+/// 拡張クエリの Execute でも、DDL 後の分割実行は `0A000` ではなく `25001`（Issue #3314。判定順の修正）。
+#[test]
+fn extended_execute_of_partitioned_dml_after_ddl_is_25001() {
+    let (core, _guard) = new_core("sql80-extended-25001");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    let parsed = core
+        .parse_sql("DELETE FROM t WHERE id > 0 USING OPERATION_ID 'p-e' PARTITIONED")
+        .expect("parse partitioned delete");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE INDEX t_body ON t (body)",
+    );
+    let err = core
+        .execute_parsed_in_txn(&ctx("alice"), &mut session, &mut txn, &parsed)
+        .expect_err("partitioned in txn");
+    assert_eq!(err.wire_code(), "25001");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+}
+
+/// 他セッション（同じテナント・別テナント）から見て、COMMIT 前の表は一度も作られていない名前と
+/// エラーの種類が一致し、文言も名前を除いて一致する（存在を観測できない。Issue #3314・SQL-80 のポインタ）。
+#[test]
+fn uncommitted_table_is_indistinguishable_from_a_never_created_name() {
+    let (core, _guard) = new_core("sql80-invisible");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(&core, &mut session, &mut txn, CREATE_T);
+    for tenant in ["alice", "bob"] {
+        let probe = |name: &str| {
+            core.execute_sql_in_session(
+                &ctx(tenant),
+                &mut SessionState::default(),
+                &format!("SELECT id FROM {name}"),
+            )
+            .expect_err(name)
+        };
+        let pending = probe("t");
+        let never = probe("never_created");
+        assert_eq!(pending.wire_code(), "42P01");
+        assert_eq!(pending.wire_code(), never.wire_code());
+        // 文言の差は名前だけ。
+        assert_eq!(pending.to_string(), "undefined table: t");
+        assert_eq!(never.to_string(), "undefined table: never_created");
+    }
+    // 別セッションの autocommit DDL は writer の待機（55P03）になり、名前が同じでも違っても結果が変わらない。
+    let mut other = ddl_session();
+    for name in ["t", "u"] {
+        let err = core
+            .execute_sql_in_session(
+                &ctx("bob"),
+                &mut other,
+                &format!("CREATE TABLE {name} (id BIGINT PRIMARY KEY)"),
+            )
+            .expect_err(name);
+        assert_eq!(err.wire_code(), "55P03", "{name}");
+    }
+    tx_ok(&core, &mut session, &mut txn, "COMMIT");
+    assert_eq!(read_rows(&core, "alice", "SELECT id FROM t"), Ok(0));
+}
+
+/// 読んだ表へ別セッションが commit した後の DDL は、writer の取得時に `40001`。DDL を積んだ印は立たず、
+/// カタログに何も残らない。読んでいない表への書き込みでは `40001` にならない。
+#[test]
+fn ddl_after_a_conflicting_commit_fails_with_40001_and_leaves_nothing() {
+    let (core, _guard) = new_core("sql80-40001");
+    let mut session = ddl_session();
+    core.execute_sql_in_session(&ctx("alice"), &mut session, CREATE_T)
+        .expect("create");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut session,
+        "CREATE TABLE other (id BIGINT PRIMARY KEY, body TEXT)",
+    )
+    .expect("create other");
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_rows(&core, &mut session, &mut txn, "SELECT id FROM t");
+    core.execute_sql_in_session(&ctx("alice"), &mut ddl_session(), &insert(1, "a"))
+        .expect("concurrent commit on the table read");
+    assert_eq!(
+        tx_code(
+            &core,
+            &mut session,
+            &mut txn,
+            "ALTER TABLE t ADD COLUMN extra TEXT"
+        ),
+        "40001"
+    );
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    tx_ok(&core, &mut session, &mut txn, "ROLLBACK");
+    assert_eq!(
+        read_rows(&core, "alice", "SELECT extra FROM t"),
+        Err("42703")
+    );
+    // 読んでいない表への書き込みは競合にならない。
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_rows(&core, &mut session, &mut txn, "SELECT id FROM t");
+    core.execute_sql_in_session(
+        &ctx("alice"),
+        &mut ddl_session(),
+        "INSERT INTO other (id, body) VALUES (1, 'x') USING OPERATION_ID 'op-other'",
+    )
+    .expect("commit on an unrelated table");
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "ALTER TABLE t ADD COLUMN extra TEXT",
+    );
     tx_ok(&core, &mut session, &mut txn, "COMMIT");
 }

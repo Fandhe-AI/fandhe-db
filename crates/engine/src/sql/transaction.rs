@@ -582,7 +582,7 @@ struct TxnDdlState {
     /// `ROLLBACK TO` で復帰させない・読み取り源を常に writer にする判定に使う。
     started: bool,
     /// 表・索引を DROP した（名前が消えた）か。確定済みカタログで行う後続文の解析・ビュー展開が古い名前を
-    /// 見るため、この間は DDL 以外の文を `0A000` にする（暫定。受け皿は #3314）。
+    /// 見るため、この間は DDL 以外の文を `0A000` にする（暫定。受け皿は #3311）。
     removed: bool,
     /// commit 成功後にメモリ上の現在値を捨てる SEQUENCE の内部 ID（DROP TABLE・DROP COLUMN が道連れに
     /// 削除した所有 SEQUENCE。内部 ID は再利用しないため、commit の後に捨てても害はない）。
@@ -2579,6 +2579,41 @@ impl<'e> SessionTransaction<'e> {
             ),
             _ => None,
         }
+    }
+
+    /// `Active` な Tx の持続時間上限の絶対期限（`started_at + max_duration`。Issue #3314）。
+    /// 既存行を走査する DDL（`core/txn_ddl.rs`）が、走査ループの確認点（`interrupt::check`）と writer 待機を
+    /// Tx の残り時間で打ち切るために張る。`Active` 以外は `Ok(None)`（期限を張らない）。加算が表現範囲を
+    /// 超える場合は fail-closed で `54000`（`StatementDeadline::after` の「0 は無効」を使わない）。
+    pub(crate) fn duration_deadline(
+        &self,
+    ) -> Result<Option<crate::interrupt::StatementDeadline>, SqlSurfaceError> {
+        match &self.state {
+            TxnState::Active(active) => active
+                .started_at
+                .checked_add(self.limits.max_duration)
+                .map(|at| Some(crate::interrupt::StatementDeadline::at(at)))
+                .ok_or_else(|| SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE)),
+            _ => Ok(None),
+        }
+    }
+
+    /// 持続時間の上限を過ぎているか（`Active`・`FailedRecoverable` のみ。それ以外は `false`）。
+    pub(crate) fn duration_exceeded(&self) -> bool {
+        match &self.state {
+            TxnState::Active(active) | TxnState::FailedRecoverable(active) => {
+                // 期限（`started_at + max_duration`）の時計判定は `>=` で起きるため、同じ向きに揃える。
+                active.started_at.elapsed() >= self.limits.max_duration
+            }
+            _ => false,
+        }
+    }
+
+    /// 文の途中（DDL の走査ループ等）で Tx の持続時間上限を過ぎたとき、復帰不可の `Failed` へ遷移させ
+    /// 文の開始時点の上限超過と同じ `54000` を返す（Issue #3314。writer を即時に解放する）。
+    pub(crate) fn fail_duration_exceeded(&mut self) -> SqlSurfaceError {
+        self.fail_unrecoverable();
+        SqlSurfaceError::payload_too_large(LIMIT_EXCEEDED_MESSAGE)
     }
 }
 

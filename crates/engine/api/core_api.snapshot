@@ -275,6 +275,7 @@ pub enum StorageError {
 #[derive(Debug)]
 pub enum CatalogError {
     Backend(redb::Error),
+    Interrupted(crate::interrupt::InterruptReason),
     Invalid(String),
     AmbiguousColumn(String),
     CorruptSchema(String),
