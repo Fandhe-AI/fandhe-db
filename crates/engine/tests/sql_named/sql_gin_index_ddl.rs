@@ -296,15 +296,16 @@ fn gin_ddl_is_gated_by_permission_and_transaction_state() {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        let err = core
-            .execute_sql_in_txn(
-                &ctx(),
-                &mut s,
-                &mut txn,
-                "CREATE INDEX g ON docs USING gin (doc)",
-            )
-            .expect_err("index DDL inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000");
+        // SQL-80・Issue #3313: 表・索引の DDL は共有 write txn へ積まれ、ROLLBACK で痕跡を残さない。
+        core.execute_sql_in_txn(
+            &ctx(),
+            &mut s,
+            &mut txn,
+            "CREATE INDEX g ON docs USING gin (doc)",
+        )
+        .expect("index DDL inside a transaction is accepted");
+        core.execute_sql_in_txn(&ctx(), &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
     }
     assert!(declared(&path).is_empty());
 }

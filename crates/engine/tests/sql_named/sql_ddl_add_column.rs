@@ -675,7 +675,7 @@ fn dollar_parameter_anywhere_in_alter_table_is_rejected_at_parse() {
 /// `DROP TABLE` と同じく DDL 権限の有無に関わらず `0A000` で拒否され、
 /// トランザクションは `Failed` へ遷移し、列は追加されない。
 #[test]
-fn alter_table_inside_explicit_transaction_is_rejected_with_0a000() {
+fn alter_table_inside_explicit_transaction_is_rolled_back_cleanly() {
     use engine::sql::transaction::TransactionStatus;
 
     let (core, path) = new_core_with_table();
@@ -686,16 +686,15 @@ fn alter_table_inside_explicit_transaction_is_rejected_with_0a000() {
 
     core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(
-            &caller,
-            &mut session,
-            &mut txn,
-            &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
-        )
-        .expect_err("ALTER TABLE inside an explicit transaction must be rejected");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
+    // SQL-80・Issue #3313: 明示トランザクション内でも受理され、ROLLBACK で列が残らない。
+    core.execute_sql_in_txn(
+        &caller,
+        &mut session,
+        &mut txn,
+        &format!("ALTER TABLE {TABLE} ADD COLUMN note TEXT"),
+    )
+    .expect("ALTER TABLE ADD COLUMN is accepted inside an explicit transaction");
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
 
     assert_eq!(
         core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")

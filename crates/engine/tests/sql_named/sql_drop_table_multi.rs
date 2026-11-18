@@ -289,10 +289,9 @@ fn explicit_transaction_rejects_multi_drop() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "DROP TABLE a, b")
-        .expect_err("DDL in txn");
-    assert_eq!(err.wire_code(), "0A000");
+    // SQL-80・Issue #3313: 複数表の DROP も同じ write txn で受理され、ROLLBACK で全部戻る。
+    core.execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "DROP TABLE a, b")
+        .expect("DDL is accepted inside an explicit transaction");
     core.execute_sql_in_txn(&ctx("sys"), &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
     assert!(exists(&core, "a") && exists(&core, "b"));

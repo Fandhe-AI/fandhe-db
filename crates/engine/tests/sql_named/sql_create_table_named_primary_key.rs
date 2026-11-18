@@ -252,16 +252,23 @@ fn permission_and_explicit_transaction_gates() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&owner, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(
-            &owner,
-            &mut session,
-            &mut txn,
-            "CREATE TABLE docs (a TEXT, CONSTRAINT pk PRIMARY KEY (a))",
-        )
-        .expect_err("explicit transaction must reject DDL");
-    assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(txn.status(), TransactionStatus::Failed);
+    // SQL-80・Issue #3313: 明示トランザクション内でも受理され、ROLLBACK で表が残らない。
+    core.execute_sql_in_txn(
+        &owner,
+        &mut session,
+        &mut txn,
+        "CREATE TABLE docs (a TEXT, CONSTRAINT pk PRIMARY KEY (a))",
+    )
+    .expect("DDL is accepted inside an explicit transaction");
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    core.execute_sql_in_txn(&owner, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(
+        exec(&core, &mut session, "owner", "SELECT a FROM docs")
+            .expect_err("the rolled back table must not exist")
+            .wire_code(),
+        "42P01"
+    );
 }
 
 /// 構造段の拒否（名前付き `(id)`・名前衝突）は `42601`。

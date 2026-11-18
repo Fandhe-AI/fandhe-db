@@ -466,24 +466,40 @@ fn permission_denial_is_identical_regardless_of_existence_and_has_no_side_effect
         .expect("note still exists");
 }
 
+/// 明示トランザクション内の `DROP COLUMN` は受理され、ROLLBACK で列が戻る（SQL-80・Issue #3313）。
+/// `ALTER COLUMN ... TYPE` は未対応のまま `0A000`（既存行の書き換えを伴う形。受け皿は #3311 配下で要起票）。
+// tracked: #3311
 #[test]
 fn ddl_inside_explicit_transaction_is_rejected_with_0a000() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let mut session = ddl_session();
     let owner = ctx();
-    for sql in [
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&owner, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &owner,
+        &mut session,
+        &mut txn,
         "ALTER TABLE docs DROP COLUMN note",
-        "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(10,2)",
-    ] {
-        let mut txn = core.new_session_transaction();
-        core.execute_sql_in_txn(&owner, &mut session, &mut txn, "BEGIN")
-            .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&owner, &mut session, &mut txn, sql)
-            .expect_err("DDL inside an explicit transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-    }
+    )
+    .expect("DROP COLUMN is accepted inside an explicit transaction");
+    core.execute_sql_in_txn(&owner, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&owner, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &owner,
+            &mut session,
+            &mut txn,
+            "ALTER TABLE docs ALTER COLUMN amount TYPE NUMERIC(10,2)",
+        )
+        .expect_err("ALTER COLUMN TYPE inside an explicit transaction is not supported yet");
+    assert_eq!(err.wire_code(), "0A000");
 }
 
 // ---- Issue #1361: INTEGER→BIGINT・REAL→DOUBLE PRECISION（行の再エンコードを伴う拡大） ----

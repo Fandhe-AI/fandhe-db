@@ -220,10 +220,36 @@ fn read_only_txn_never_takes_writer_while_others_commit() {
         .expect("rollback");
 }
 
-/// DDL はトランザクション内で `0A000` となり、writer を取る前に拒否される。
+/// 表・索引の DDL は writer を取って共有 write txn へ積む（SQL-80・Issue #3313）。ROLLBACK で痕跡を残さない。
 #[test]
-fn ddl_in_explicit_txn_does_not_take_writer() {
+fn ddl_in_explicit_txn_takes_writer_and_rolls_back_cleanly() {
     let (core, _g) = new_core("deferred-writer-ddl");
+    let caller = ctx("tenant-a");
+    let mut session = SessionState::default();
+    session.allow_ddl();
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    assert!(txn.write_txn().is_none());
+    core.execute_sql_in_txn(
+        &caller,
+        &mut session,
+        &mut txn,
+        "CREATE TABLE t9 (id BIGINT PRIMARY KEY)",
+    )
+    .expect("DDL is accepted");
+    assert!(txn.write_txn().is_some());
+    assert!(txn.has_ddl());
+    assert_eq!(txn.status(), TransactionStatus::InTransaction);
+    core.execute_sql_in_txn(&caller, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert!(core.storage.get_table_schema("t9").is_err());
+}
+
+/// SERIAL 列を持つ `CREATE TABLE` は Tx 内では `0A000`（暗黙 SEQUENCE の採番状態が ROLLBACK で戻らないため）。
+#[test]
+fn serial_column_ddl_in_explicit_txn_is_rejected() {
+    let (core, _g) = new_core("deferred-writer-ddl-serial");
     let caller = ctx("tenant-a");
     let mut session = SessionState::default();
     session.allow_ddl();
@@ -235,11 +261,10 @@ fn ddl_in_explicit_txn_does_not_take_writer() {
             &caller,
             &mut session,
             &mut txn,
-            "CREATE TABLE t9 (id BIGINT PRIMARY KEY)",
+            "CREATE TABLE t9 (id BIGINT PRIMARY KEY, n SERIAL)",
         )
-        .expect_err("DDL is rejected");
+        .expect_err("SERIAL is rejected");
     assert_eq!(err.wire_code(), "0A000");
-    assert!(txn.write_txn().is_none());
     assert_eq!(txn.status(), TransactionStatus::Failed);
 }
 

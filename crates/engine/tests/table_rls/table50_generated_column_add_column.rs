@@ -548,7 +548,7 @@ fn legacy_row_identity_table_is_rejected_with_a_fixed_message() {
 }
 
 #[test]
-fn temporary_and_explicit_transaction_forms_are_rejected() {
+fn temporary_is_rejected_and_explicit_transaction_applies_atomically() {
     let (_p, _gd, core) = fixture("gen-add-forms");
     mk(&core);
     let before = dump(&core, TENANT);
@@ -566,16 +566,37 @@ fn temporary_and_explicit_transaction_forms_are_rejected() {
         )
         .expect_err("temp table generated column");
     assert_eq!(err.wire_code(), "0A000");
-    // 明示トランザクションの中の DDL。
+    // 明示トランザクションの中の DDL（Issue #3313）。行のある表への生成列の追加は、全行の走査に Tx の期限が
+    // 結線されるまで 0A000 で拒否する（受け皿は #3314）。失敗した Tx は ROLLBACK で痕跡を残さない。
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
         .expect("begin");
     let err = core
         .execute_sql_in_txn(&c, &mut session, &mut txn, ADD_G)
-        .expect_err("DDL in explicit transaction");
+        .expect_err("scan DDL on a non-empty table in a transaction");
     assert_eq!(err.wire_code(), "0A000");
-    let _ = core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
     assert_eq!(dump(&core, TENANT), before);
+    assert_eq!(code(&core, TENANT, "SELECT g FROM t"), "42703");
+    // 空の表への追加は走査が無いため、COMMIT で原子的に確定する。ROLLBACK は痕跡を残さない。
+    ok(&core, TENANT, "CREATE TABLE e (a INTEGER)");
+    let add_e = "ALTER TABLE e ADD COLUMN g INTEGER GENERATED ALWAYS AS (a * 2) STORED";
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, add_e)
+        .expect("generated ADD COLUMN on an empty table in explicit transaction");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(code(&core, TENANT, "SELECT g FROM e"), "42703");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, add_e)
+        .expect("generated ADD COLUMN on an empty table in explicit transaction");
+    core.execute_sql_in_txn(&c, &mut session, &mut txn, "COMMIT")
+        .expect("commit");
+    ok(&core, TENANT, "INSERT INTO e (a) VALUES (3)");
+    assert_eq!(grid(&core, TENANT, "SELECT a, g FROM e"), g(&[&["3", "6"]]));
 }
 
 #[test]
