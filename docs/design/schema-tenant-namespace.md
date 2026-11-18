@@ -258,7 +258,7 @@ TABLE-27・TABLE-36 のポインタ。`CREATE SCHEMA`／`DROP SCHEMA` と SCHEMA
   予約領域の非零・id=0 は `CorruptSchema`（fail-closed）。ID カウンタは単調で再利用しない
 - **受理範囲**: `CREATE SCHEMA [IF NOT EXISTS] <名>`、`DROP SCHEMA [IF EXISTS] <名> [RESTRICT]`。
   `AUTHORIZATION`・schema_element・`CASCADE`・複数名は `0A000`、修飾名・不正な識別子・余分な
-  トークンは `42601`。明示トランザクション内は既存の DDL 方針どおり `0A000`
+  トークンは `42601`。明示トランザクション内の要素なしの `CREATE SCHEMA`・`DROP SCHEMA`（`CASCADE` なし）・`ALTER SCHEMA` は Issue #3315 で受理に変わった（要素つき・`CASCADE`・SCHEMA 配下は `0A000`。受け皿 #3311）
 - **判定順序**: CREATE は 構文 → DDL 権限 → 予約名（`IF NOT EXISTS` より先）→ 組み込み名・同名の
   既存 → 件数上限 → ID 払い出しと保存。DROP は 構文 → DDL 権限 → 組み込み名 → 存在
   （`(tenant_id, name)` の 1 回 get）→ 空判定 → 削除。予約名（`pg_` 接頭辞）と組み込み名
@@ -542,7 +542,7 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 - **作成先**: path の先頭の要素。自テナントの SCHEMA なら内部キー、`public` なら裸のまま。`pg_catalog`・`information_schema`・`pg_temp` は `0A000`、どの要素にも作れなければ `3F000`。USAGE の無い自テナントの SCHEMA は飛ばさず `42501`（K4）。作成先の SCHEMA には CREATE 権限を検査する（K5）。権限ゲート（`42501`）→ 作成先（`3F000`／`0A000`／`42501`）→ 既存名（`42P07`）の順は変えない
 - **安全弁**（`CREATE MATERIALIZED VIEW` は Issue #3287 で解析時の書き換えに乗った）: 解析時の書き換えを通らない経路（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`・構文語と衝突する名前・解析と実行の間の SCHEMA 作成の競合）は、path 先頭が自テナントの SCHEMA のとき固定文言の `0A000` にし、`public` へ黙って作らない
 - **自己参照 FK**: `REFERENCES <作成名>` は作成先に合わせる（作成先が SCHEMA なら同じ内部キー、`public` なら裸のまま）。書き換え自体は単体テストで固定している（行 ID モードの親への `REFERENCES parent (id)` は #3385 で受理に変わった）
-- **明示トランザクション**: DDL は従来どおり `0A000`。DML の存在照会は確定済みのスナップショットを見る（`COPY` は `BEGIN` 時点）
+- **明示トランザクション**: 要素なしの SCHEMA の DDL は Issue #3315 で受理（SCHEMA 配下の DDL は従来どおり `0A000`）。DML の存在照会は確定済みのスナップショットを見る（`COPY` は `BEGIN` 時点）
 - **残る `0A000`**（MATERIALIZED VIEW の SCHEMA 配置は Issue #3287 で対応済み）: `ALTER TABLE .. SET SCHEMA` の未修飾の対象が SCHEMA に解決される形（#3198）、`ENUM` 型・`MATERIALIZED VIEW` の SCHEMA 配置と組み込み SCHEMA への作成（本 ADR の対象外。専用の Issue が必要）
 - **意図的な差**: 重複作成の `42P07` の文言は、PostgreSQL の裸の名前ではなく `q1.t` 形（修飾形と同じ）で出す。内部 ID は出ない
 
@@ -564,7 +564,7 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 親 #3194 の締めとして、`search_path` の固定テストを新挙動へ更新し、越境試験を足した（ポインタ: TABLE-27）。
 
 - **未修飾の `ALTER TABLE t SET SCHEMA <s>` を受理に変えた**: 未修飾名は解析前に修飾名と同じ内部キーへ書き換わるため、以降は修飾形（`q1.t SET SCHEMA ..`）と同じ経路に乗る。`PathGate` にあった「対象が SCHEMA に解決された SET SCHEMA は `0A000`」の特例は、修飾形の `42501` に先回りするためだけに残っていたので撤去した。判定順・エラーは #3198 のまま（DDL 権限 → 存在 → 移動先の解決（不在・他テナントは同一の `3F000`）→ `public` 境界の `42501` → CREATE 権限 → 実移動）。移動先の識別子が同名の表に引きずられて書き換わらないことは、結合テスト（`table27_search_path.rs`）で固定した
-- **意図的な拒否（`intentional`）**: `public` とテナント SCHEMA の間の移動の `42501`、他テナントの SCHEMA への移動（不在と同じ `3F000`）、システム SCHEMA・一時表への移動の `0A000`、`ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` の `0A000`、明示トランザクション内の DDL の `0A000`、SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）の `0A000`（`CREATE TYPE` は Issue #3288、`CREATE MATERIALIZED VIEW` は Issue #3287 で対応済み。「追記」参照）は、いずれも fail-closed の安全弁として残す
+- **意図的な拒否（`intentional`）**: `public` とテナント SCHEMA の間の移動の `42501`、他テナントの SCHEMA への移動（不在と同じ `3F000`）、システム SCHEMA・一時表への移動の `0A000`、`ALTER SEQUENCE／VIEW／INDEX ... SET SCHEMA` の `0A000`、明示トランザクション内の SCHEMA 配下の DDL・要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE` の `0A000`、SCHEMA 配置が未対応の作成（`CREATE TYPE`・`CREATE MATERIALIZED VIEW`）の `0A000`（`CREATE TYPE` は Issue #3288、`CREATE MATERIALIZED VIEW` は Issue #3287 で対応済み。「追記」参照）は、いずれも fail-closed の安全弁として残す
 - **越境試験（`table27_tenant_boundary.rs` の T9）**: 他テナントだけが持つ SCHEMA 名を `search_path` に置いた閲覧側の未修飾の書き込み・DDL・移動・削除の応答が、その SCHEMA がどこにも無い DB と完全一致する（autocommit・明示トランザクション・可視性 2 モード）。2 テナントが同名の SCHEMA・同名の表・同じ id を持つとき、一方の未修飾の INSERT／UPDATE／UPSERT／DELETE／`CREATE INDEX`／`ADD COLUMN`／TRUNCATE／`SET SCHEMA`／DROP が他方の行・構造を変えない（試行総数の固定と負の対照つき）
 - **wire の結合試験（`wire_search_path.rs`）**: psql 形（末尾 `;` 付き・1 メッセージ 1 文）で、同名 SCHEMA を持つ 2 接続の未修飾の書き込み・`SET SCHEMA`・TRUNCATE・DROP の分離と、他テナントの SCHEMA 名を path に置いた接続の拒否（`#` を含む文言なし）、拒否後も接続が使えることを固定した
 - **全面改訂の扱い**: §12 の「現状の挙動として固定したもの」と #3196 追記の自己参照 FK の記述は、陳腐化した箇所に現状へのポインタを足した（履歴として本文は残す）。D5・D11 の契約自体は変わらない
@@ -581,7 +581,7 @@ DML・DDL・`COPY` の未修飾名と、作成系 DDL の作成先も `search_pa
 - **D6 判定順**: 構文段（`42601` → `0A000`／`42P15` → `54000`。カタログ非依存）→ 実行段で要素ごとの `require_ddl`（カタログを引く前に `42501`。単独の DDL と同じゲート）→ 所有者の解決と `AUTHORIZATION` の検査 → 要素の名前解決（`3F000`・`42501`・`42P01`・`0A000`）→ write txn で SCHEMA 作成（`42P06`・`42939`・`54000`）→ 要素の作成
 - **D7 原子性**: SCHEMA の作成と全要素の作成を 1 つの write txn・1 回の `commit_boundary::commit` で行う。`catalog::namespace::create_schema_in_txn`・`Storage::prepare_create_view`／`create_view_in_txn`・`catalog::sequence::create_sequence_with_default_acl_in_txn`・`sql::ddl::create_*_element_in_txn` は、単独の DDL と共有する txn 内本体（挙動・保存形式は不変）で、第 2 の作成経路は作らない。どこかで `Err` になれば commit せず txn を破棄するため、SCHEMA も作成済みの要素も残らない。クラッシュ時は redb の単一 commit が「全部ある」か「全部無い」かのどちらかだけを見せる。作成した表の世代 bump は commit の直前に行い、commit 記録（`note_ddl`）は要素ごとに単独の DDL と同じに残す。台帳（`USING OPERATION_ID`）は要素つきの形でも消費せず、付いていれば `42601`（`CREATE SCHEMA`・`TABLE`・`VIEW`・`SEQUENCE` は単独でも台帳を取らない）
 - **D8 汎用パスの除外**: 要素つき `CREATE SCHEMA` は、`relation_name::rewrite_relation_names_full`（`nextval('s.q')` の文字列の解決を含む）・`search_path` の参照走査と解決・読み取り先の参照名集めのどれでも文全体を走査しない（走査すると文全体が 1 つの `CREATE TABLE` に見え、作成中でまだ存在しない SCHEMA への修飾が `3F000` になる）。要素の解決は `core::schema_elements` だけが行う。作成中の SCHEMA の内部 ID は write txn で払い出されるため、write txn の外では「新 SCHEMA を指す位置」だけを集めて裸の名前にしておき、ID が決まった後に `#<id>.<名前>` へ 1 対 1 で置換して、単独の DDL と同じ検証器を再実行する。他の SCHEMA・`public` の修飾は既存の解決器（USAGE の検査つき）、残りの未修飾名は既存の `search_path` の解決器と参照ゲートで解く（`public` が隠れた path での未解決は `42P01`）
-- **D9 明示トランザクション内**: 既存の `CREATE SCHEMA` と同じく `0A000`（writer を取る前に拒否）。何も作らない
+- **D9 明示トランザクション内**: 要素つき `CREATE SCHEMA` は `0A000`（writer を取る前に拒否）。何も作らない（要素なしの `CREATE SCHEMA` は Issue #3315 で受理）
 - **テナント境界（P0）**: SCHEMA の照会・払い出しは `(呼び出し元テナント, 名前)` だけ。他テナントの同名 SCHEMA・オブジェクトは存在しない名前と同じに扱い、エラー文言は利用者が書いた名前だけを含む（内部 ID・内部キー・他テナントの情報を含めない）。SCHEMA → `public` への依存（FK・VIEW 本文）は、単独の DDL と同じく `sql::schema_dependency` が `42501` で拒否する
 - **限界**: (1) SERIAL・IDENTITY が作る暗黙 SEQUENCE の名前（`<表>_<列>_seq`）を、同じ文の後続要素の `nextval('<名>')` の文字列引数から未修飾で参照する形は、暗黙名が write txn の中で決まるため新 SCHEMA へは解決されない（`search_path` の解決に回る。明示的な `CREATE SEQUENCE` の名前は解決される）。(2) 要素内の未修飾名の解決は、同じ文で作る名前を新 SCHEMA、それ以外を確定済みカタログのスナップショットで解くため、解決と write txn の間に他セッションが同名を作る競合は単独の DDL と同じ（commit 前の txn 内の存在検査が最終判定）
 - **後続（受け皿 Issue 未起票。起票にはユーザー承認が要る）**: 要素 `CREATE INDEX`・`GRANT`・`CREATE TRIGGER`、VIEW 要素の列別名・`WITH CHECK OPTION`・`OR REPLACE`、要素側の `IF NOT EXISTS`、`AUTHORIZATION` に別ロールを指定した要素つき作成。いずれも `0A000` で fail-closed にしており、既存の拒否固定テストは Issue 番号が確定するまで `intentional:` 注記（本 ADR）を付けている。番号が決まったら `tracked:` 注記へ付け替える

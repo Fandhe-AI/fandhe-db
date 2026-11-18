@@ -4016,7 +4016,10 @@ pub(crate) fn create_table_element_in_txn(
         Storage::create_table_in_write_txn(write_txn, &schema)
     } else {
         crate::catalog::sequence::create_table_with_implicit_sequences_in_txn(
-            write_txn, &schema, &serials,
+            storage.sequence_allocator(),
+            write_txn,
+            &schema,
+            &serials,
         )
         .map(|_| ())
     };
@@ -4057,11 +4060,13 @@ pub(crate) fn create_view_element_in_txn(
 /// 要素つき `CREATE SCHEMA` の `CREATE SEQUENCE` 要素を、呼び出し側の write txn の中で作る（Issue #3286）。
 /// 意味検証（範囲 `22023`）と既定値の補完は単独の [`execute_create_sequence`] と同じ。
 pub(crate) fn create_sequence_element_in_txn(
+    storage: &Storage,
     write_txn: &redb::WriteTransaction,
     validated: &ValidatedCreateSequence,
 ) -> Result<(), SqlSurfaceError> {
     let params = resolve_sequence_params(validated)?;
     crate::catalog::sequence::create_sequence_with_default_acl_in_txn(
+        storage.sequence_allocator(),
         write_txn,
         validated.name(),
         &params,
@@ -4348,6 +4353,287 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 明示・暗黙 Tx の VIEW・SEQUENCE・SCHEMA・型の DDL（SQL-80・Issue #3315）。
+//
+// 呼び出し元は `core/txn_ddl_objects.rs`（権限ゲート・writer の取得・DDL 状態の印の後に呼ぶ）。実行本体は
+// autocommit と同じ catalog の write txn 内本体を共有し、エラーの写像も同じ `map_*` を通す。commit は
+// Tx の COMMIT が 1 回だけ行う（ここでは begin・commit・メモリ上の状態の変更をしない）。
+// ---------------------------------------------------------------------------
+
+/// `CREATE VIEW`（`OR REPLACE` を除く）を共有 write txn の中で実行する（Issue #3315）。本文の構文検証・
+/// 名前衝突・参照先の存在と深さ・件数上限は [`execute_create_view`] と同じ `Storage::prepare_create_view`・
+/// `Storage::create_view_in_txn` を通す。列別名・`WITH CHECK OPTION` の事前検査は呼び出し側が済ませる。
+pub(crate) fn execute_create_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateView,
+) -> Result<CreateViewOutcome, SqlSurfaceError> {
+    let (encoded, shape) = Storage::prepare_create_view(
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        validated.column_aliases(),
+        validated.check_option(),
+    )
+    .map_err(map_create_view_error)?;
+    Storage::create_view_in_txn(
+        write_txn,
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        &encoded,
+        &shape,
+    )
+    .map_err(map_create_view_error)?;
+    Ok(CreateViewOutcome {})
+}
+
+/// `DROP VIEW` を共有 write txn の中で実行する（Issue #3315）。`IF EXISTS` で対象が無いときだけ
+/// `skipped` の成功にする（何も書いていない）。連鎖削除（`CASCADE`）も同じ txn に載る。
+pub(crate) fn execute_drop_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropView,
+) -> Result<DropViewOutcome, SqlSurfaceError> {
+    match Storage::drop_view_with_behavior_in_txn(write_txn, validated.name(), validated.behavior())
+    {
+        Ok(cascaded) => Ok(DropViewOutcome {
+            skipped: false,
+            cascaded,
+        }),
+        Err(CatalogError::ViewNotFound(_)) if validated.if_exists() => Ok(DropViewOutcome {
+            skipped: true,
+            cascaded: Vec::new(),
+        }),
+        Err(e) => Err(map_drop_view_error(e)),
+    }
+}
+
+/// `CREATE SEQUENCE` を共有 write txn の中で実行する（Issue #3315）。払い出した内部 ID のメモリ上の
+/// カーソルは作成時に捨てる（ROLLBACK で巻き戻る内部 ID の再利用対策。`catalog::sequence` の
+/// `create_sequence_in_txn_evicting`）。
+pub(crate) fn execute_create_sequence_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateSequence,
+) -> Result<CreateSequenceOutcome, SqlSurfaceError> {
+    create_sequence_element_in_txn(storage, write_txn, validated)?;
+    Ok(CreateSequenceOutcome {})
+}
+
+/// `DROP SEQUENCE` を共有 write txn の中で実行する（Issue #3315）。戻り値の内部 ID は、Tx の commit 成功後に
+/// 採番器から捨てるために呼び出し側が積む。
+pub(crate) fn execute_drop_sequence_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropSequence,
+) -> Result<(DropSequenceOutcome, u64), SqlSurfaceError> {
+    let id = crate::catalog::sequence::drop_sequence_in_txn(write_txn, validated.name())
+        .map_err(|e| map_sequence_error(e, "DROP SEQUENCE failed"))?;
+    Ok((DropSequenceOutcome {}, id))
+}
+
+/// `ALTER SEQUENCE` が `RESTART` を伴うか（明示 Tx 内では未対応のため、呼び出し側が writer を取る前に拒否する）。
+pub(crate) fn alter_sequence_restarts(validated: &ValidatedAlterSequence) -> bool {
+    matches!(&validated.action, AlterSequenceAction::Options(alter) if alter.restart.is_some())
+}
+
+/// `ALTER SEQUENCE`（`RESTART` なしのオプション変更と `RENAME TO`）を共有 write txn の中で実行する
+/// （Issue #3315）。採番器の現在値は読むだけで変えない。`RESTART` は呼び出し側が先に拒否している前提で、
+/// 万一来たら採番器のメモリを捨てられないため fail-closed の `0A000` にする。
+pub(crate) fn execute_alter_sequence_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedAlterSequence,
+) -> Result<AlterSequenceOutcome, SqlSurfaceError> {
+    match &validated.action {
+        AlterSequenceAction::Options(alter) => {
+            if alter.restart.is_some() {
+                return Err(SqlSurfaceError::transaction_feature_not_supported(
+                    "ALTER SEQUENCE RESTART is not supported inside a transaction block yet",
+                ));
+            }
+            crate::catalog::sequence::alter_sequence_in_txn(
+                storage.sequence_allocator(),
+                write_txn,
+                validated.name(),
+                tenant_id,
+                alter,
+            )
+            .map(|_| ())
+            .map_err(|e| match e {
+                AlterSequenceError::Range(r) => {
+                    SqlSurfaceError::InvalidParameterValue { detail: r.detail() }
+                }
+                AlterSequenceError::Catalog(c) => map_sequence_error(c, "ALTER SEQUENCE failed"),
+            })?
+        }
+        AlterSequenceAction::Rename { new_name } => {
+            crate::catalog::sequence::rename_sequence_in_txn(
+                write_txn,
+                validated.name(),
+                // 改名先は同じ SCHEMA に置く（TABLE-27・Issue #1717）。
+                &crate::catalog::namespace::sibling_key(validated.name(), new_name)
+                    .map_err(|e| map_sequence_error(e, "ALTER SEQUENCE failed"))?,
+            )
+            .map_err(|e| {
+                match e {
+            // 名前参照の DEFAULT が壊れるため RENAME は拒否する（fail-closed）。
+            CatalogError::DependentObjectsStillExist(_) => SqlSurfaceError::feature_not_supported(
+                "ALTER SEQUENCE RENAME of a sequence used by a column default is not supported",
+            ),
+            other => map_sequence_error(other, "ALTER SEQUENCE failed"),
+        }
+            })?
+        }
+    }
+    Ok(AlterSequenceOutcome {})
+}
+
+/// Tx 内の SCHEMA DDL が writer を取る前に行う静的検査（識別子・予約名・組み込み名。Issue #3315）。
+/// autocommit と同じく、拒否が writer 競合（`55P03`）や Failed Tx の writer 保持に化けないようにする。
+pub(crate) fn precheck_create_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedCreateSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_create_schema(tenant_id, validated.name())
+        .map_err(|e| map_schema_error(e, "CREATE SCHEMA failed"))
+}
+
+/// [`precheck_create_schema_in_txn`] の `DROP SCHEMA` 版。
+pub(crate) fn precheck_drop_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedDropSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_schema_name_change(tenant_id, validated.name(), None)
+        .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))
+}
+
+/// [`precheck_create_schema_in_txn`] の `ALTER SCHEMA RENAME` 版。
+pub(crate) fn precheck_alter_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedAlterSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_schema_name_change(
+        tenant_id,
+        validated.name(),
+        Some(validated.new_name()),
+    )
+    .map_err(|e| map_schema_error(e, "ALTER SCHEMA failed"))
+}
+
+/// 要素なしの `CREATE SCHEMA` を共有 write txn の中で実行する（Issue #3315）。戻り値の真偽は「新規に作った」
+/// （`IF NOT EXISTS` で既存のときは何も書かず偽）。
+pub(crate) fn execute_create_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedCreateSchema,
+    owner: Option<u64>,
+) -> Result<(CreateSchemaOutcome, bool), SqlSurfaceError> {
+    let result = crate::catalog::namespace::create_schema_if_absent_in_txn(
+        write_txn,
+        tenant_id,
+        validated.name(),
+        validated.if_not_exists,
+        crate::catalog::namespace::MAX_SCHEMAS_PER_TENANT,
+        owner,
+    )
+    .map_err(|e| map_schema_error(e, "CREATE SCHEMA failed"))?;
+    Ok((
+        CreateSchemaOutcome {},
+        result == crate::catalog::namespace::CreateSchemaResult::Created,
+    ))
+}
+
+/// `ALTER SCHEMA ... RENAME TO` を共有 write txn の中で実行する（Issue #3315）。所有者検査は write txn 上で行う。
+pub(crate) fn execute_alter_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedAlterSchema,
+    gate: OwnerGate,
+) -> Result<AlterSchemaOutcome, SqlSurfaceError> {
+    crate::catalog::namespace::rename_schema_gated_in_txn(
+        write_txn,
+        tenant_id,
+        validated.name(),
+        validated.new_name(),
+        gate,
+    )
+    .map_err(|e| map_schema_error(e, "ALTER SCHEMA failed"))?;
+    Ok(AlterSchemaOutcome {})
+}
+
+/// `DROP SCHEMA`（`CASCADE` なし）を共有 write txn の中で実行する（Issue #3315）。戻り値の真偽は「削除した」
+/// （`IF EXISTS` で不在のときは何も書かず偽）。`CASCADE` は呼び出し側が先に拒否する。
+pub(crate) fn execute_drop_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedDropSchema,
+    gate: OwnerGate,
+) -> Result<(DropSchemaOutcome, bool), SqlSurfaceError> {
+    if validated.cascade {
+        return Err(SqlSurfaceError::transaction_feature_not_supported(
+            "DROP SCHEMA CASCADE is not supported inside a transaction block yet",
+        ));
+    }
+    let result = crate::catalog::namespace::drop_schema_gated_in_txn(
+        write_txn,
+        tenant_id,
+        validated.name(),
+        validated.if_exists,
+        gate,
+    )
+    .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
+    Ok((
+        DropSchemaOutcome {},
+        result == crate::catalog::namespace::DropSchemaResult::Dropped,
+    ))
+}
+
+/// Tx 内 `CREATE TYPE` の事前検査（Issue #3315）。ラベル数の上限と予約名・ラベルの検証だけを行い何も書かない。
+/// writer 取得・DDL 印より前に呼び、失敗しても Tx を継続できるようにする。
+pub(crate) fn precheck_create_type_in_txn(
+    validated: &ValidatedCreateType,
+    limits: &SchemaLimits,
+) -> Result<(), SqlSurfaceError> {
+    if validated.labels().len() > limits.max_enum_labels() {
+        return Err(SqlSurfaceError::payload_too_large("too many enum labels"));
+    }
+    Storage::prepare_create_enum_type(validated.name(), validated.labels())
+        .map_err(map_create_type_error)?;
+    Ok(())
+}
+
+/// `CREATE TYPE ... AS ENUM` を共有 write txn の中で実行する（Issue #3315）。ラベル数の上限と予約名は
+/// [`execute_create_type`] と同じ判定を write txn を使う前に行う。
+pub(crate) fn execute_create_type_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateType,
+    limits: &SchemaLimits,
+) -> Result<CreateTypeOutcome, SqlSurfaceError> {
+    if validated.labels().len() > limits.max_enum_labels() {
+        return Err(SqlSurfaceError::payload_too_large("too many enum labels"));
+    }
+    let encoded = Storage::prepare_create_enum_type(validated.name(), validated.labels())
+        .map_err(map_create_type_error)?;
+    Storage::create_enum_type_in_txn(write_txn, validated.name(), &encoded)
+        .map_err(map_create_type_error)?;
+    Ok(CreateTypeOutcome {})
+}
+
+/// `DROP TYPE` を共有 write txn の中で実行する（Issue #3315）。`IF EXISTS` で対象が無いときだけ
+/// `skipped` の成功にする（何も書いていない）。
+pub(crate) fn execute_drop_type_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropType,
+) -> Result<DropTypeOutcome, SqlSurfaceError> {
+    match Storage::drop_enum_type_in_txn(write_txn, validated.name()) {
+        Ok(()) => Ok(DropTypeOutcome { skipped: false }),
+        Err(CatalogError::TypeNotFound(_)) if validated.if_exists() => {
+            Ok(DropTypeOutcome { skipped: true })
+        }
+        Err(e) => Err(map_drop_type_error(e)),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

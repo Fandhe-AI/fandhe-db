@@ -19,7 +19,6 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::mode::SessionState;
-use engine::sql::transaction::TransactionStatus;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -300,8 +299,10 @@ fn accepted_forms() {
     }
 }
 
+/// SQL-80・Issue #3315: `CREATE SEQUENCE`・`DROP SEQUENCE` は共有 write txn に積まれ、COMMIT で確定・
+/// ROLLBACK で消える（定義は再 open 後も同じ）。
 #[test]
-fn sequence_ddl_inside_explicit_transaction_is_rejected() {
+fn sequence_ddl_inside_explicit_transaction_commits_or_rolls_back() {
     let (p, _g, core) = open_fixture("seq-txn");
     let mut s = allowed_session();
     ok(&core, &mut s, "CREATE SEQUENCE existing");
@@ -309,17 +310,28 @@ fn sequence_ddl_inside_explicit_transaction_is_rejected() {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
-            .expect_err("sequence DDL inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        assert_eq!(txn.status(), TransactionStatus::Failed);
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
             .expect("rollback");
     }
     let core = reopen(core, &p);
     assert_eq!(code(&core, &mut s, "CREATE SEQUENCE existing"), "42P07");
     ok(&core, &mut s, "CREATE SEQUENCE s9");
+    ok(&core, &mut s, "DROP SEQUENCE s9");
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "DROP SEQUENCE existing")
+        .expect("drop");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "CREATE SEQUENCE s10")
+        .expect("create");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+    let core = reopen(core, &p);
+    ok(&core, &mut s, "CREATE SEQUENCE existing");
+    assert_eq!(code(&core, &mut s, "CREATE SEQUENCE s10"), "42P07");
 }
 
 #[test]

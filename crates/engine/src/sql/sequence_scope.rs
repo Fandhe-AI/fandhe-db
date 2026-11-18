@@ -27,10 +27,14 @@ use crate::catalog::sequence::SequenceAllocator;
 pub(crate) struct SessionSequenceState {
     /// キーは `(tenant_id, sequence_id)`。同じ `SessionState` を別テナントの `PolicyContext` で
     /// 使っても、他テナントの `nextval` の結果を `currval` で読めないようにする（テナント境界）。
-    currval: HashMap<(String, u64), i64>,
+    /// 値は `(現在値, 記録時の世代)`。世代は `SequenceAllocator::generation`（内部 ID の再利用で進む。
+    /// Issue #3315）で、読み出し時に現在の世代と食い違うエントリは別の SEQUENCE のものとして無効扱いにする。
+    currval: HashMap<(String, u64), (i64, u64)>,
     /// 直近に `nextval` が成功した `(tenant_id, sequence_id)`（`lastval` の対象。TABLE-24・Issue #1691。
     /// `setval` は変えない）。
-    last: Option<(String, u64)>,
+    /// 3 つ目は `nextval` 記録時の世代（`setval` が `currval` の世代を上書きしても `lastval` が
+    /// 別 SEQUENCE を拾わないよう、`last` 自身に保持する。Issue #3315）。
+    last: Option<(String, u64, u64)>,
 }
 
 /// セッション内に保持する SEQUENCE の件数上限（DoS 対策。超過は `54000`）。
@@ -38,21 +42,34 @@ pub(crate) const MAX_SESSION_SEQUENCES: usize = crate::catalog::sequence::MAX_SE
 
 impl SessionSequenceState {
     /// `nextval` が成功した値を記録する。件数上限を超える新規 SEQUENCE は `false`（拒否）。
-    pub(crate) fn record_nextval(&mut self, tenant_id: &str, sequence_id: u64, value: i64) -> bool {
+    pub(crate) fn record_nextval(
+        &mut self,
+        tenant_id: &str,
+        sequence_id: u64,
+        value: i64,
+        generation: u64,
+    ) -> bool {
         let key = (tenant_id.to_string(), sequence_id);
         if !self.currval.contains_key(&key) && self.currval.len() >= MAX_SESSION_SEQUENCES {
             return false;
         }
-        self.currval.insert(key.clone(), value);
-        self.last = Some(key);
+        self.currval.insert(key.clone(), (value, generation));
+        self.last = Some((key.0, key.1, generation));
         true
     }
 
     /// このセッションの `currval`（`nextval` 未呼び出しは `None`）。
-    pub(crate) fn currval(&self, tenant_id: &str, sequence_id: u64) -> Option<i64> {
-        self.currval
-            .get(&(tenant_id.to_string(), sequence_id))
-            .copied()
+    /// 記録時と世代が食い違う（内部 ID が再利用された別の SEQUENCE）エントリは `None`（fail-closed）。
+    pub(crate) fn currval(
+        &self,
+        tenant_id: &str,
+        sequence_id: u64,
+        generation: u64,
+    ) -> Option<i64> {
+        match self.currval.get(&(tenant_id.to_string(), sequence_id)) {
+            Some(&(v, g)) if g == generation => Some(v),
+            _ => None,
+        }
     }
 
     /// 新しい SEQUENCE をこの状態へ記録できるか（件数上限の事前検査。`setval` が commit の前に
@@ -67,31 +84,77 @@ impl SessionSequenceState {
     /// `setval(..., true)` の値を `currval` へ記録する（TABLE-24・Issue #1691）。PostgreSQL の
     /// `setval` と同じく `lastval` の対象（`last`）は変えない。件数上限を超える新規 SEQUENCE は
     /// `false`（拒否）。`is_called = false` の `setval` は呼び出し元が本関数を呼ばない。
-    pub(crate) fn record_setval(&mut self, tenant_id: &str, sequence_id: u64, value: i64) -> bool {
+    pub(crate) fn record_setval(
+        &mut self,
+        tenant_id: &str,
+        sequence_id: u64,
+        value: i64,
+        generation: u64,
+    ) -> bool {
         let key = (tenant_id.to_string(), sequence_id);
         if !self.currval.contains_key(&key) && self.currval.len() >= MAX_SESSION_SEQUENCES {
             return false;
         }
-        self.currval.insert(key, value);
+        self.currval.insert(key, (value, generation));
         true
     }
 
     /// `lastval` の対象 `(sequence_id, 値)`。呼び出し元テナントのものだけを返し、`nextval` 未呼び出し・
     /// 他テナントが最後に使った場合は `None`（`55000`。テナント境界）。
-    pub(crate) fn lastval(&self, tenant_id: &str) -> Option<(u64, i64)> {
-        let (t, id) = self.last.as_ref()?;
+    /// `generation_of` は内部 ID の現在の世代（再利用で世代が変わったエントリは `None`）。
+    pub(crate) fn lastval(
+        &self,
+        tenant_id: &str,
+        generation_of: impl Fn(u64) -> u64,
+    ) -> Option<(u64, i64)> {
+        let (t, id, last_gen) = self.last.as_ref()?;
         if t != tenant_id {
             return None;
         }
-        let value = self.currval.get(&(t.clone(), *id)).copied()?;
+        if *last_gen != generation_of(*id) {
+            return None;
+        }
+        let &(value, g) = self.currval.get(&(t.clone(), *id))?;
+        if g != *last_gen {
+            return None;
+        }
         Some((*id, value))
+    }
+
+    /// `lastval` の対象が世代の食い違い（DROP で世代が戻った・内部 ID の再利用）で無効になっていれば、
+    /// 呼び出し元テナントの `last` と、その `nextval` 記録時の世代の `currval` エントリを捨てる。
+    /// 破棄済み内部 ID のスロットが接続終了まで残り `MAX_SESSION_SEQUENCES` を使い切るのを防ぐ（Issue #3315）。
+    /// 別の世代（再利用先 SEQUENCE の `setval`）が書いた `currval` は残す。
+    pub(crate) fn reclaim_stale_last(
+        &mut self,
+        tenant_id: &str,
+        generation_of: impl Fn(u64) -> u64,
+    ) {
+        let Some((t, id, last_gen)) = self.last.clone() else {
+            return;
+        };
+        if t != tenant_id || last_gen == generation_of(id) {
+            return;
+        }
+        if self
+            .currval
+            .get(&(t.clone(), id))
+            .is_some_and(|&(_, g)| g == last_gen)
+        {
+            self.currval.remove(&(t, id));
+        }
+        self.last = None;
     }
 
     /// 消えた SEQUENCE（DROP 済み）のエントリを捨てる（`lastval` が存在確認に失敗したとき。設計記録 D6）。
     pub(crate) fn forget(&mut self, tenant_id: &str, sequence_id: u64) {
         let key = (tenant_id.to_string(), sequence_id);
         self.currval.remove(&key);
-        if self.last.as_ref() == Some(&key) {
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|(t, i, _)| (t, i) == (&key.0, &key.1))
+        {
             self.last = None;
         }
     }
@@ -217,44 +280,73 @@ mod tests {
     #[test]
     fn session_state_records_and_bounds() {
         let mut s = SessionSequenceState::default();
-        assert_eq!(s.currval("t", 1), None);
-        assert!(s.record_nextval("t", 1, 5));
-        assert_eq!(s.currval("t", 1), Some(5));
-        assert!(s.record_nextval("t", 1, 6));
-        assert_eq!(s.currval("t", 1), Some(6));
-        assert_eq!(s.last, Some(("t".to_string(), 1)));
+        assert_eq!(s.currval("t", 1, 0), None);
+        assert!(s.record_nextval("t", 1, 5, 0));
+        assert_eq!(s.currval("t", 1, 0), Some(5));
+        assert!(s.record_nextval("t", 1, 6, 0));
+        assert_eq!(s.currval("t", 1, 0), Some(6));
+        assert_eq!(s.last, Some(("t".to_string(), 1, 0)));
     }
 
     #[test]
     fn currval_is_isolated_per_tenant() {
         let mut s = SessionSequenceState::default();
-        assert!(s.record_nextval("alice", 1, 5));
-        assert_eq!(s.currval("bob", 1), None);
-        assert_eq!(s.currval("alice", 1), Some(5));
+        assert!(s.record_nextval("alice", 1, 5, 0));
+        assert_eq!(s.currval("bob", 1, 0), None);
+        assert_eq!(s.currval("alice", 1, 0), Some(5));
     }
 
     #[test]
     fn setval_updates_currval_but_not_last() {
         let mut s = SessionSequenceState::default();
-        assert!(s.record_setval("t", 1, 50));
-        assert_eq!(s.currval("t", 1), Some(50));
-        assert_eq!(s.lastval("t"), None);
-        assert!(s.record_nextval("t", 2, 7));
-        assert!(s.record_setval("t", 2, 50));
-        assert_eq!(s.lastval("t"), Some((2, 50)));
-        assert!(s.record_setval("t", 1, 60));
-        assert_eq!(s.lastval("t"), Some((2, 50)));
+        assert!(s.record_setval("t", 1, 50, 0));
+        assert_eq!(s.currval("t", 1, 0), Some(50));
+        assert_eq!(s.lastval("t", |_| 0), None);
+        assert!(s.record_nextval("t", 2, 7, 0));
+        assert!(s.record_setval("t", 2, 50, 0));
+        assert_eq!(s.lastval("t", |_| 0), Some((2, 50)));
+        assert!(s.record_setval("t", 1, 60, 0));
+        assert_eq!(s.lastval("t", |_| 0), Some((2, 50)));
     }
 
     #[test]
     fn lastval_is_isolated_per_tenant_and_forget_clears_it() {
         let mut s = SessionSequenceState::default();
-        assert!(s.record_nextval("alice", 1, 5));
-        assert_eq!(s.lastval("bob"), None);
-        assert_eq!(s.lastval("alice"), Some((1, 5)));
+        assert!(s.record_nextval("alice", 1, 5, 0));
+        assert_eq!(s.lastval("bob", |_| 0), None);
+        assert_eq!(s.lastval("alice", |_| 0), Some((1, 5)));
         s.forget("alice", 1);
-        assert_eq!(s.lastval("alice"), None);
-        assert_eq!(s.currval("alice", 1), None);
+        assert_eq!(s.lastval("alice", |_| 0), None);
+        assert_eq!(s.currval("alice", 1, 0), None);
+    }
+
+    #[test]
+    fn lastval_ignores_setval_on_reused_id_with_new_generation() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_nextval("t", 1, 5, 1));
+        // 同一内部 ID が別の SEQUENCE（世代 2）へ再利用され、setval だけが呼ばれた。
+        assert!(s.record_setval("t", 1, 50, 2));
+        assert_eq!(s.lastval("t", |_| 2), None);
+    }
+
+    #[test]
+    fn reclaim_stale_last_frees_slot_after_generation_reset() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_nextval("t", 1, 5, 3));
+        // DROP 後は世代が 0 へ戻る。
+        s.reclaim_stale_last("t", |_| 0);
+        assert_eq!(s.lastval("t", |_| 0), None);
+        assert!(s.currval.is_empty());
+    }
+
+    #[test]
+    fn reclaim_stale_last_keeps_currval_written_by_other_generation() {
+        let mut s = SessionSequenceState::default();
+        assert!(s.record_nextval("t", 1, 5, 1));
+        assert!(s.record_setval("t", 1, 50, 2));
+        s.reclaim_stale_last("t", |_| 2);
+        assert_eq!(s.currval("t", 1, 2), Some(50));
+        assert_eq!(s.last, None);
     }
 
     #[test]
@@ -262,10 +354,10 @@ mod tests {
         let mut s = SessionSequenceState::default();
         assert!(s.can_record("t", 1));
         for id in 0..MAX_SESSION_SEQUENCES as u64 {
-            assert!(s.record_setval("t", id, 1));
+            assert!(s.record_setval("t", id, 1, 0));
         }
         assert!(!s.can_record("t", u64::MAX));
-        assert!(!s.record_setval("t", u64::MAX, 1));
+        assert!(!s.record_setval("t", u64::MAX, 1, 0));
         assert!(s.can_record("t", 0));
     }
 

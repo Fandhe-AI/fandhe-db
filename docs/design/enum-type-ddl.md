@@ -44,7 +44,7 @@ ENUM 型のカタログ API は `PolicyContext` を取らない（public の型�
 
 - `CommandComplete` タグは `CREATE TYPE`／`DROP TYPE`（件数なし）。
 - Describe は結果列なし。拡張クエリの `$n` は `42601`。
-- 複数文メッセージで最後以外は `0A000`、明示トランザクション内は `0A000`（他の DDL と同じ）。
+- 明示・暗黙トランザクション内の `CREATE TYPE`／`DROP TYPE` は共有 write txn に積まれる（Issue #3315。`explicit-transaction.md`「#3315 の実装記録」）。同じ Tx で作った型を使う `CREATE TABLE` は `42704`（fail-closed。受け皿 #3311）。SCHEMA 配下の型は `0A000`。
 
 ## 既知の制限・対象外
 

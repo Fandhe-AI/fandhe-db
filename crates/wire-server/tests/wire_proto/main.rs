@@ -16,6 +16,7 @@ mod sql38_set_transaction;
 mod sql69_savepoint_syntax;
 mod sql69_txn_aliases;
 mod sql70_raise_notice;
+mod sql80_txn_object_ddl;
 mod sql80_txn_table_ddl;
 mod wire11_bind_execute_sync;
 mod wire11_message_limits;

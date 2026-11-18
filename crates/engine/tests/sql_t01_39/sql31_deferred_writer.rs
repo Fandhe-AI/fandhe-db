@@ -92,7 +92,7 @@ fn writes_after_first_write_are_serialized_until_rollback() {
 
 /// DDL は `0A000` で拒否され、その間も別セッションの書き込みは成功する（writer を取らない）。
 #[test]
-// tracked: #3315
+// tracked: #3311
 fn rejected_ddl_does_not_hold_the_writer() {
     let (core, _g) = new_core("sql31-deferred-ddl");
     let caller = ctx("tenant-a");
@@ -101,10 +101,15 @@ fn rejected_ddl_does_not_hold_the_writer() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    // 表・索引の DDL は writer を取る（SQL-80・Issue #3313）。未対応の DDL（`CREATE SEQUENCE`。#3315）は
+    // 表・索引の DDL は writer を取る（SQL-80・Issue #3313）。未対応の DDL（`CREATE MATERIALIZED VIEW`。受け皿 #3311）は
     // writer を取る前に拒否される。
     let err = core
-        .execute_sql_in_txn(&caller, &mut session, &mut txn, "CREATE SEQUENCE s9")
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "CREATE MATERIALIZED VIEW mv9 AS SELECT id FROM t",
+        )
         .expect_err("DDL is rejected");
     assert_eq!(err.wire_code(), "0A000");
     let mut other = SessionState::default();

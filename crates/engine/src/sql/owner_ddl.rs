@@ -80,6 +80,30 @@ pub(crate) fn resolve_schema_owner(
     session: &SessionState,
     authorization: Option<&RoleSpec>,
 ) -> Result<Option<u64>, SqlSurfaceError> {
+    resolve_schema_owner_with(session, authorization, |name| {
+        storage.get_role(tenant_id, name).map(|r| r.map(|r| r.id))
+    })
+}
+
+/// [`resolve_schema_owner`] の Tx 版（Issue #3315）。名前付きロールを Tx の共有 write txn 上で引くため、
+/// 同じ Tx で作成・改名したロールを反映する（確定済みカタログを読まない）。
+pub(crate) fn resolve_schema_owner_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    session: &SessionState,
+    authorization: Option<&RoleSpec>,
+) -> Result<Option<u64>, SqlSurfaceError> {
+    resolve_schema_owner_with(session, authorization, |name| {
+        crate::catalog::role::get_role_in_txn(write_txn, tenant_id, name).map(|r| r.map(|r| r.id))
+    })
+}
+
+/// 所有者解決の本体。名前付きロールの引き方（確定済み・Tx 内）だけを `lookup` で差し替える。
+fn resolve_schema_owner_with<E>(
+    session: &SessionState,
+    authorization: Option<&RoleSpec>,
+    lookup: impl FnOnce(&str) -> Result<Option<u64>, E>,
+) -> Result<Option<u64>, SqlSurfaceError> {
     match authorization {
         None => Ok(session.current_role_id().filter(|id| *id != 0)),
         Some(RoleSpec::CurrentRole) => {
@@ -89,8 +113,8 @@ pub(crate) fn resolve_schema_owner(
             Some(id) if id != 0 => Ok(Some(id)),
             _ => Err(SqlSurfaceError::InsufficientPrivilege),
         },
-        Some(RoleSpec::Name(name)) => match storage.get_role(tenant_id, name) {
-            Ok(Some(role)) => Ok(Some(role.id)),
+        Some(RoleSpec::Name(name)) => match lookup(name) {
+            Ok(Some(id)) => Ok(Some(id)),
             Ok(None) => Err(SqlSurfaceError::undefined_role(name.clone())),
             Err(_) => Err(SqlSurfaceError::Internal {
                 detail: "role catalog operation failed".to_string(),

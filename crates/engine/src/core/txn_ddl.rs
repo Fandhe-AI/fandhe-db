@@ -3,6 +3,8 @@
 //! TABLE-22・TASK-349 のポインタ、Issue #3313。設計記録: `docs/design/explicit-transaction.md`
 //! 「明示トランザクション内の DDL の方式」）。
 //!
+//! VIEW・SEQUENCE・SCHEMA・ENUM 型の DDL（Issue #3315）は同じ入口を通り、本体は `core/txn_ddl_objects.rs` が担う。
+//!
 //! 責務境界: `core.rs` の `execute_in_active_txn_inner`（明示 Tx と複数文メッセージの暗黙 Tx が共有する入口）が
 //! DDL の腕から [`EngineCore::execute_table_ddl_in_txn`] を呼ぶ。実行本体は autocommit と同じ `sql::ddl` の
 //! `*_in_txn`（共有 write txn を受け取る。カタログの書き込みは redb の txn に載るため ROLLBACK で消える）で、
@@ -113,11 +115,35 @@ pub(super) fn check_post_ddl_statement(
         return Ok(());
     }
     let removed = txn.ddl_removed();
+    // Issue #3315: SCHEMA の DDL を積んだ後は、後続文の `search_path` の解決が確定済みカタログを読むため、
+    // SCHEMA の DDL・`SET`/`SHOW` 以外を拒否する（暫定。受け皿は #3311）。
+    let schema_changed = txn.ddl_schema_changed();
     // 一時カタログ・`search_path` の振り分けの包みは中身で判定する（包んだままだと許可対象の文も拒否される）。
     let parsed = parsed.peel_session_route();
     // SQL-80・Issue #3316: 権限・ポリシー・ロール・トリガ・関数削除の DDL を積んだ Tx は、権限ゲート・ポリシー
     // 適用・トリガの発火・関数の解決が確定済みカタログを読むため、古い判定で後続文を通さない（fail-closed）。
     // DDL・Tx 制御・セッション変数の `SET`/`SHOW` だけを許す。文言は文の種類だけで、名前・存在を含めない。
+    // Issue #3315: SCHEMA の DDL を積んだ後は、権限・ポリシー等の DDL や表・索引の DDL を含め、名前解決が
+    // 確定済みカタログの旧スキーマを見るため、SCHEMA の DDL・Tx 制御・セッション変数の `SET`/`SHOW` 以外を
+    // 拒否する（fail-closed。保護対象 DDL の分岐より先に適用する）。
+    if schema_changed {
+        let allowed = match parsed {
+            ParsedSql::CreateSchema(_)
+            | ParsedSql::DropSchema(_)
+            | ParsedSql::AlterSchema(_)
+            | ParsedSql::Transaction(_)
+            | ParsedSql::SetTransaction(_) => true,
+            ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
+            _ => false,
+        };
+        return if allowed {
+            Ok(())
+        } else {
+            Err(SqlSurfaceError::transaction_feature_not_supported(
+                "this statement is not supported after SCHEMA DDL inside a transaction block yet",
+            ))
+        };
+    }
     if txn.has_guarded_ddl() {
         let allowed = match parsed {
             ParsedSql::CreateTable(_)
@@ -127,6 +153,18 @@ pub(super) fn check_post_ddl_statement(
             | ParsedSql::DropIndex(_)
             | ParsedSql::Transaction(_)
             | ParsedSql::SetTransaction(_) => true,
+            // Issue #3315: SCHEMA の DDL は常に、VIEW・SEQUENCE・ENUM 型の DDL は SCHEMA の DDL を積む前なら、
+            // 保護対象 DDL の後も受理する（拡張 Execute 経路と同じ結果にそろえる）。
+            ParsedSql::CreateSchema(_) | ParsedSql::DropSchema(_) | ParsedSql::AlterSchema(_) => {
+                true
+            }
+            ParsedSql::CreateView(_)
+            | ParsedSql::DropView(_)
+            | ParsedSql::CreateSequence(_)
+            | ParsedSql::DropSequence(_)
+            | ParsedSql::AlterSequence(_)
+            | ParsedSql::CreateType(_)
+            | ParsedSql::DropType(_) => !schema_changed,
             ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
             other => is_security_ddl(other),
         };
@@ -141,11 +179,21 @@ pub(super) fn check_post_ddl_statement(
         | ParsedSql::DropTable(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateIndex(_)
-        | ParsedSql::DropIndex(_) => true,
+        | ParsedSql::DropIndex(_) => !schema_changed,
+        // Issue #3315: SCHEMA の DDL は SCHEMA の DDL を積んだ後も受理する。VIEW・SEQUENCE・ENUM 型の DDL は
+        // SCHEMA の DDL を積んだ後は未修飾名の作成先が確定済みカタログの `search_path` で決まるため拒否する。
+        ParsedSql::CreateSchema(_) | ParsedSql::DropSchema(_) | ParsedSql::AlterSchema(_) => true,
+        ParsedSql::CreateView(_)
+        | ParsedSql::DropView(_)
+        | ParsedSql::CreateSequence(_)
+        | ParsedSql::DropSequence(_)
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::CreateType(_)
+        | ParsedSql::DropType(_) => !schema_changed,
         other if is_security_ddl(other) => true,
         // `INSERT ... SELECT` は挿入先スキーマを確定済みカタログから取得する（束縛・実行とも）ため、同じ Tx で
         // 作った表・追加した列を解決できない。overlay 結線までは fail-closed で拒否する（受け皿は #3311）。
-        ParsedSql::Insert(_) => !removed,
+        ParsedSql::Insert(_) => !removed && !schema_changed,
         ParsedSql::Statement(stmt) => match stmt {
             Statement::SetSearchMode { .. }
             | Statement::SetTimeZone { .. }
@@ -161,13 +209,15 @@ pub(super) fn check_post_ddl_statement(
             | Statement::ShowHnswEfSearch
             | Statement::SetHnswScanSetting { .. }
             | Statement::ShowHnswScanSetting(_) => true,
-            Statement::Select(v) => !removed && v.using_plan().is_none(),
+            Statement::Select(v) => !removed && !schema_changed && v.using_plan().is_none(),
             Statement::Aggregate(_)
             | Statement::Scan(_)
             | Statement::Join(_)
-            | Statement::SetOperation(_) => !removed,
+            | Statement::SetOperation(_) => !removed && !schema_changed,
             Statement::ConstSelect(v) => {
-                !removed && !crate::sql::const_select::calls_routine(v, session.udfs())
+                !removed
+                    && !schema_changed
+                    && !crate::sql::const_select::calls_routine(v, session.udfs())
             }
             _ => false,
         },
@@ -198,18 +248,48 @@ pub(super) fn check_extended_execute_after_ddl(
     if super::is_partitioned_write(parsed) {
         return Ok(());
     }
+    let schema_changed = txn.ddl_schema_changed();
     let inner = match parsed {
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => routed.inner(),
         other => other,
     };
+    if schema_changed {
+        let allowed = match inner {
+            ParsedSql::CreateSchema(_)
+            | ParsedSql::DropSchema(_)
+            | ParsedSql::AlterSchema(_)
+            | ParsedSql::Transaction(_)
+            | ParsedSql::SetTransaction(_) => true,
+            ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
+            _ => false,
+        };
+        return if allowed {
+            Ok(())
+        } else {
+            Err(SqlSurfaceError::transaction_feature_not_supported(
+                "this statement is not supported after SCHEMA DDL inside a transaction block yet",
+            ))
+        };
+    }
     let allowed = match inner {
         ParsedSql::CreateTable(_)
         | ParsedSql::DropTable(_)
         | ParsedSql::AlterTable(_)
         | ParsedSql::CreateIndex(_)
-        | ParsedSql::DropIndex(_)
+        | ParsedSql::DropIndex(_) => !schema_changed,
+        ParsedSql::CreateSchema(_)
+        | ParsedSql::DropSchema(_)
+        | ParsedSql::AlterSchema(_)
         | ParsedSql::Transaction(_)
         | ParsedSql::SetTransaction(_) => true,
+        // Issue #3315: VIEW・SEQUENCE・ENUM 型の DDL（SCHEMA の DDL を積んだ後は拒否）。
+        ParsedSql::CreateView(_)
+        | ParsedSql::DropView(_)
+        | ParsedSql::CreateSequence(_)
+        | ParsedSql::DropSequence(_)
+        | ParsedSql::AlterSequence(_)
+        | ParsedSql::CreateType(_)
+        | ParsedSql::DropType(_) => !schema_changed,
         ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
         other => is_security_ddl(other),
     };
@@ -436,7 +516,20 @@ impl EngineCore {
                 txn.mark_ddl_done(!outcome.skipped(), Vec::new());
                 Ok(SqlOutcome::DropIndex(outcome))
             }
-            // 呼び出し元の腕が上の 5 種類だけを渡す。到達したら fail-closed。
+            // VIEW・SEQUENCE・SCHEMA・ENUM 型の DDL は `txn_ddl_objects.rs`（Issue #3315）。
+            ParsedSql::CreateView(_)
+            | ParsedSql::DropView(_)
+            | ParsedSql::CreateSequence(_)
+            | ParsedSql::DropSequence(_)
+            | ParsedSql::AlterSequence(_)
+            | ParsedSql::CreateSchema(_)
+            | ParsedSql::DropSchema(_)
+            | ParsedSql::AlterSchema(_)
+            | ParsedSql::CreateType(_)
+            | ParsedSql::DropType(_) => {
+                self.execute_object_ddl_in_txn_inner(ctx, session, txn, parsed)
+            }
+            // 呼び出し元の腕が上の種類だけを渡す。到達したら fail-closed。
             _ => Err(internal()),
         }
     }

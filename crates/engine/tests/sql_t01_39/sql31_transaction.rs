@@ -442,7 +442,7 @@ fn reusing_operation_id_within_the_same_transaction_is_rejected() {
 }
 
 #[test]
-// tracked: #3315
+// tracked: #3311
 fn unsupported_statement_inside_transaction_is_rejected_with_feature_not_supported() {
     let (engine, path) = new_core();
     let _cleanup = CleanupGuard(path);
@@ -453,11 +453,17 @@ fn unsupported_statement_inside_transaction_is_rejected_with_feature_not_support
     engine
         .execute_sql_in_txn(&caller, &mut session, &mut txn, "BEGIN")
         .expect("begin");
-    // 未対応の DDL（`CREATE SEQUENCE` 等。表・索引の DDL は SQL-80・Issue #3313 で対応済みで、
-    // `sql80_txn_table_ddl.rs` が担う。SEQUENCE は #3315）は明示トランザクション内では `0A000`。
+    // 未対応の DDL（`CREATE MATERIALIZED VIEW` 等。表・索引の DDL は SQL-80・Issue #3313、VIEW・SEQUENCE・
+    // SCHEMA・型の DDL は Issue #3315 で対応済みで、`sql80_txn_table_ddl.rs`・`sql80_txn_object_ddl.rs` が担う。
+    // マテリアライズドビューは受け皿 #3311）は明示トランザクション内では `0A000`。
     // `DELETE`・`UPDATE`・UPSERT・複数行 `INSERT` は Issue #1179 で対応済み（`sql31_txn_dml.rs` 参照）。
     let err = engine
-        .execute_sql_in_txn(&caller, &mut session, &mut txn, "CREATE SEQUENCE s_pinned")
+        .execute_sql_in_txn(
+            &caller,
+            &mut session,
+            &mut txn,
+            "CREATE MATERIALIZED VIEW mv_pinned AS SELECT id FROM t",
+        )
         .expect_err("DDL inside a transaction is not supported");
     assert_eq!(err.wire_code(), "0A000");
     assert_eq!(txn.status(), TransactionStatus::Failed);

@@ -209,4 +209,5 @@ mod sql79_merge_pg17_parity;
 mod sql79_merge_returning;
 mod sql79_merge_rules;
 mod sql80_txn_ddl_savepoint;
+mod sql80_txn_object_ddl;
 mod sql80_txn_table_ddl;

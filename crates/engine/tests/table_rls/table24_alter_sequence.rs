@@ -278,8 +278,10 @@ fn ddl_without_permission_is_rejected_regardless_of_existence() {
     ok(&core, &mut s, "CREATE SEQUENCE x");
 }
 
+/// SQL-80・Issue #3315: RESTART なしの `ALTER SEQUENCE` と `RENAME TO` は共有 write txn に積まれ、ROLLBACK で
+/// 消える。`RESTART` は採番器の現在値を commit 後にしか捨てられないため `0A000`（tracked: #3311）。
 #[test]
-fn alter_sequence_inside_explicit_transaction_is_rejected() {
+fn alter_sequence_inside_explicit_transaction_commits_or_rolls_back() {
     let (p, _g, core) = open_fixture("alt-txn");
     let mut s = allowed_session();
     ok(&core, &mut s, "CREATE SEQUENCE existing");
@@ -290,11 +292,8 @@ fn alter_sequence_inside_explicit_transaction_is_rejected() {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
             .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
-            .expect_err("ALTER SEQUENCE inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        assert_eq!(txn.status(), TransactionStatus::Failed);
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
             .expect("rollback");
     }
@@ -305,7 +304,36 @@ fn alter_sequence_inside_explicit_transaction_is_rejected() {
         &mut s,
         "ALTER SEQUENCE existing RESTART 9223372036854775807",
     );
-    ok(&core, &mut s, "DROP SEQUENCE existing");
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    let err = core
+        .execute_sql_in_txn(
+            &ctx("alice"),
+            &mut s,
+            &mut txn,
+            "ALTER SEQUENCE existing RESTART",
+        )
+        .expect_err("RESTART inside a transaction is not supported yet");
+    assert_eq!(err.wire_code(), "0A000");
+    assert_eq!(txn.status(), TransactionStatus::Failed);
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
+        .expect("rollback");
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(
+        &ctx("alice"),
+        &mut s,
+        &mut txn,
+        "ALTER SEQUENCE existing RENAME TO renamed",
+    )
+    .expect("rename");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+    ok(&core, &mut s, "DROP SEQUENCE renamed");
 }
 
 #[test]

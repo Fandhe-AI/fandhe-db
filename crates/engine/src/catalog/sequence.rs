@@ -510,7 +510,8 @@ pub(crate) fn sequence_exists_in_txn(
     }
 }
 
-/// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`・再利用しない）。
+/// 内部 ID を 1 つ払い出す（1 始まり・`checked_add`。カウンタは redb の txn と一緒に ROLLBACK で巻き戻るため、
+/// 再利用されうる。採番器の古いカーソルは `create_sequence_in_txn_evicting` が払い出し時に捨てる）。
 fn allocate_sequence_id_in_txn(write_txn: &redb::WriteTransaction) -> Result<u64> {
     let mut counter = write_txn.open_table_logged(SEQUENCE_ID_COUNTER_TABLE)?;
     let current = counter
@@ -610,6 +611,13 @@ fn advance(p: &SequenceParams, cur: &SeqCursor) -> std::result::Result<i64, Allo
 #[derive(Default)]
 pub(crate) struct SequenceAllocator {
     cursors: std::sync::Mutex<std::collections::HashMap<(String, u64), SeqCursor>>,
+    /// 内部 ID の再利用世代（ID → 再利用で払い出された回数。無いものは 0）。セッションの `currval`／`lastval`
+    /// 状態が、ROLLBACK 後に同じ ID を引き継いだ別の SEQUENCE の履歴を読まないための識別子（Issue #3315）。
+    /// 値は単調増加する世代トークン（再利用のたびに新しい値を払い出す）。DROP で該当 ID の行を捨てる
+    /// ため、件数は生存 ID 数（と巻き戻し後の再利用 ID）に収まる。
+    generations: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
+    /// 世代トークンの払い出し元（単調増加。捨てた ID の古いトークンと再び一致しない）。
+    generation_counter: std::sync::atomic::AtomicU64,
 }
 
 impl SequenceAllocator {
@@ -741,6 +749,35 @@ impl SequenceAllocator {
     #[cfg(test)]
     pub(crate) fn cursor_count(&self) -> usize {
         self.cursors.lock().map_or(0, |g| g.len())
+    }
+
+    /// 内部 ID の現在の再利用世代。ロックの毒化は `u64::MAX`（どの記録とも一致せず fail-closed）。
+    pub(crate) fn generation(&self, sequence_id: u64) -> u64 {
+        match self.generations.lock() {
+            Ok(g) => g.get(&sequence_id).copied().unwrap_or(0),
+            Err(_) => u64::MAX,
+        }
+    }
+
+    /// 内部 ID が（ROLLBACK 等で巻き戻って）払い出し直されたとき世代を進める。
+    fn bump_generation(&self, sequence_id: u64) {
+        if let Ok(mut g) = self.generations.lock() {
+            let token = self
+                .generation_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1);
+            g.insert(sequence_id, token);
+        }
+    }
+
+    /// `DROP` の commit 成功後に呼ぶ。現在値に加えて世代の行も捨てる（`generations` が DROP の
+    /// 繰り返しで増え続けないようにする）。捨てた後の世代は 0 で、以後の再作成は新しいトークンを
+    /// 得るため、古いセッション履歴は復活しない。
+    pub(crate) fn evict_dropped(&self, sequence_id: u64) {
+        self.evict(sequence_id);
+        if let Ok(mut g) = self.generations.lock() {
+            g.remove(&sequence_id);
+        }
     }
 
     /// `sequence_id` の現在値を全テナント分メモリから捨てる（`DROP SEQUENCE`・RESTART の commit 成功後。
@@ -1154,7 +1191,26 @@ fn relation_name_taken_in_txn(write_txn: &redb::WriteTransaction, name: &str) ->
 /// SEQUENCE を作る write txn 内本体（名前衝突 `TableAlreadyExists` → 件数上限 `ViewLimitExceeded`
 /// → 保存。begin・commit を含まない）。[`Storage::create_sequence`] と、表の作成と同じ txn に載せる
 /// [`create_table_with_implicit_sequences_in_txn`] が共有する。内部 ID を払い出し返す。
+///
+/// 採番器のカーソルを持たない呼び出し（起動時の移行）専用。実行中のセッションから呼ぶ経路は、内部 ID の
+/// 再利用で古いカーソルを引き継がないよう [`create_sequence_in_txn_evicting`] を使う。
 pub(crate) fn create_sequence_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    params: &SequenceParams,
+) -> Result<u64> {
+    create_sequence_in_txn_evicting(None, write_txn, name, params)
+}
+
+/// [`create_sequence_in_txn`] に、払い出した内部 ID のメモリ上のカーソルを捨てる処理を足した本体
+/// （Issue #3315。SQL-80）。内部 ID のカウンタは redb の txn と一緒に ROLLBACK で巻き戻る一方、
+/// `SequenceAllocator` のカーソルは巻き戻らない。明示 Tx 内で作った SEQUENCE を採番して ROLLBACK すると、
+/// 次に同じ ID を払い出された別の SEQUENCE（別テナントの採番を含む）が古い現在値を引き継いでしまう。
+/// 払い出した ID は確定済みのどの SEQUENCE にも割り当てられていない（writer を保持している間は並行して
+/// 使う者もいない）ため、払い出し時にその ID のカーソルを全テナント分捨てても他の SEQUENCE の状態を
+/// 壊さない。再利用は必ずこの払い出しを通るので、ROLLBACK・接続断・期限切れの各経路を個別に塞ぐ必要はない。
+pub(crate) fn create_sequence_in_txn_evicting(
+    allocator: Option<&SequenceAllocator>,
     write_txn: &redb::WriteTransaction,
     name: &str,
     params: &SequenceParams,
@@ -1166,6 +1222,11 @@ pub(crate) fn create_sequence_in_txn(
         return Err(CatalogError::TableAlreadyExists(name.to_string()));
     }
     let id = allocate_sequence_id_in_txn(write_txn)?;
+    if let Some(allocator) = allocator {
+        allocator.evict(id);
+        // セッション側の currval／lastval 履歴も無効化する（旧 SEQUENCE の値を引き継がせない）。
+        allocator.bump_generation(id);
+    }
     let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
     if table.len()? >= MAX_SEQUENCES as u64 {
         return Err(CatalogError::ViewLimitExceeded(
@@ -1184,13 +1245,14 @@ pub(crate) fn create_sequence_in_txn(
 /// 作成）なら ACL は適用しない。[`Storage::create_sequence`] と、要素つき `CREATE SCHEMA` の SEQUENCE 要素
 /// （`sql::ddl`。Issue #3286）が共有する。
 pub(crate) fn create_sequence_with_default_acl_in_txn(
+    allocator: &SequenceAllocator,
     write_txn: &redb::WriteTransaction,
     name: &str,
     params: &SequenceParams,
 ) -> Result<u64> {
     validate_relation_key(name)?;
     params.validate()?;
-    let id = create_sequence_in_txn(write_txn, name, params)?;
+    let id = create_sequence_in_txn_evicting(Some(allocator), write_txn, name, params)?;
     if let Some((tenant, role)) = super::privilege::owner::pending_creator_for_key(name) {
         super::privilege::default_acl::apply_default_acl_to_sequence_in_txn(
             write_txn, &tenant, role, name, id,
@@ -1216,6 +1278,7 @@ pub(crate) struct ImplicitSequence {
 /// 表の世代 bump は呼び出し側が commit 直前に行う。`Err` の場合は呼び出し側が txn を破棄する（途中まで作った
 /// SEQUENCE も残らない）。
 pub(crate) fn create_table_with_implicit_sequences_in_txn(
+    allocator: &SequenceAllocator,
     write_txn: &redb::WriteTransaction,
     schema: &TableSchema,
     serials: &[ImplicitSequence],
@@ -1230,7 +1293,12 @@ pub(crate) fn create_table_with_implicit_sequences_in_txn(
         let column = &implicit.column;
         let seq_name =
             choose_implicit_sequence_name_in_txn(write_txn, &schema.name, column, &created)?;
-        let seq_id = create_sequence_in_txn(write_txn, &seq_name, &implicit.params)?;
+        let seq_id = create_sequence_in_txn_evicting(
+            Some(allocator),
+            write_txn,
+            &seq_name,
+            &implicit.params,
+        )?;
         created_ids.push(seq_id);
         let col = named_schema
             .columns
@@ -1334,6 +1402,72 @@ pub(crate) fn choose_implicit_sequence_name_in_txn(
     Err(CatalogError::ViewLimitExceeded(
         "too many sequences".to_string(),
     ))
+}
+
+/// `ALTER SEQUENCE`（RESTART なしを含む）の write txn 内本体（begin・commit を含まない。Issue #3315）。
+/// 名前の解決・範囲検証・定義の上書きと、RESTART なら全テナント分の状態行の削除を行い、内部 ID を返す。
+/// RESTART のメモリ上の現在値の破棄は commit 成功後に呼び出し側が行う（明示 Tx 内の RESTART は
+/// 同じ Tx の後続の `nextval` が古い現在値を読むため、呼び出し側が拒否する）。
+pub(crate) fn alter_sequence_in_txn(
+    allocator: &SequenceAllocator,
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+    tenant_id: &str,
+    alter: &SequenceAlter,
+) -> std::result::Result<u64, AlterSequenceError> {
+    validate_relation_key(name)?;
+    let bytes = load_sequence_bytes_in_txn(write_txn, name)?;
+    let (def, owner) = decode_sequence_def_with_owner(&bytes)?;
+    let caller_current = if alter.restart.is_none() {
+        caller_current_value_in_txn(allocator, write_txn, tenant_id, def.id)?
+    } else {
+        None
+    };
+    let (params, restart_value) =
+        resolve_altered_definition(&def.params, def.restart_value, caller_current, alter)
+            .map_err(AlterSequenceError::Range)?;
+    {
+        let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
+        table.insert(
+            sequence_key(name),
+            encode_sequence_def(def.id, &params, restart_value, owner.as_ref()).as_slice(),
+        )?;
+    }
+    if alter.restart.is_some() {
+        delete_sequence_state_in_txn(write_txn, def.id)?;
+    }
+    Ok(def.id)
+}
+
+/// `ALTER SEQUENCE ... RENAME TO` の write txn 内本体（begin・commit を含まない。Issue #3315）。
+/// 定義キーだけを付け替え、内部 ID と状態行は変えない。
+pub(crate) fn rename_sequence_in_txn(
+    write_txn: &redb::WriteTransaction,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    validate_relation_key(old)?;
+    validate_relation_key(new)?;
+    let bytes = load_sequence_bytes_in_txn(write_txn, old)?;
+    // blob の健全性を確認してから付け替える（破損は CorruptSchema で拒否）。
+    decode_sequence_def(&bytes)?;
+    if super::table_exists_in_txn(write_txn, new)?
+        || super::view_exists_in_txn(write_txn, new)?
+        || super::index_name_exists_in_txn(write_txn, new)?
+        || super::materialized_view_exists_in_txn(write_txn, new)?
+        || sequence_exists_in_txn(write_txn, new)?
+    {
+        return Err(CatalogError::TableAlreadyExists(new.to_string()));
+    }
+    if sequence_has_dependents_in_txn(write_txn, old)? {
+        return Err(CatalogError::DependentObjectsStillExist(old.to_string()));
+    }
+    {
+        let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
+        table.remove(sequence_key(old))?;
+        table.insert(sequence_key(new), bytes.as_slice())?;
+    }
+    Ok(())
 }
 
 /// SEQUENCE `name` を write txn 内で削除する（定義と全テナント分の状態行。[`Storage::drop_sequence`] と
@@ -1605,7 +1739,12 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        create_sequence_with_default_acl_in_txn(&write_txn, name, params)?;
+        create_sequence_with_default_acl_in_txn(
+            self.sequence_allocator(),
+            &write_txn,
+            name,
+            params,
+        )?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
 
@@ -1626,7 +1765,12 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let created = create_table_with_implicit_sequences_in_txn(&write_txn, schema, serials)?;
+        let created = create_table_with_implicit_sequences_in_txn(
+            self.sequence_allocator(),
+            &write_txn,
+            schema,
+            serials,
+        )?;
         // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
         crate::storage::commit_log::note_ddl(&write_txn, &schema.name);
         super::bump_table_generation_in_txn(&write_txn, &schema.name)?;
@@ -1648,7 +1792,7 @@ impl Storage {
         // 残っても害はなく、成功時に残すと全テナント分が滞留する。設計記録 D3）。
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
-            allocator.evict(id);
+            allocator.evict_dropped(id);
             crate::recovery::commit_boundary::PostCommitResult::Ok
         })
         .map_err(super::convert_storage_error)?;
@@ -1670,32 +1814,18 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let bytes = load_sequence_bytes_in_txn(&write_txn, name)?;
-        let (def, owner) = decode_sequence_def_with_owner(&bytes)?;
-        let caller_current = if alter.restart.is_none() {
-            caller_current_value_in_txn(self.sequence_allocator(), &write_txn, tenant_id, def.id)?
-        } else {
-            None
-        };
-        let (params, restart_value) =
-            resolve_altered_definition(&def.params, def.restart_value, caller_current, alter)
-                .map_err(AlterSequenceError::Range)?;
-        {
-            let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
-            table.insert(
-                sequence_key(name),
-                encode_sequence_def(def.id, &params, restart_value, owner.as_ref()).as_slice(),
-            )?;
-        }
-        if alter.restart.is_some() {
-            delete_sequence_state_in_txn(&write_txn, def.id)?;
-        }
+        let id = alter_sequence_in_txn(
+            self.sequence_allocator(),
+            &write_txn,
+            name,
+            tenant_id,
+            alter,
+        )?;
         // RESTART のときだけメモリ上の現在値を捨てる（それ以外のオプション変更は現在値を保持し、
         // ROLLBACK 済みの消費済み値の再払い出しを防ぐ）。破棄は commit 直後に writer permit を
         // 保持したまま行い、commit と破棄の間に別の書き込みが古い現在値で払い出せないようにする。
         let restart = alter.restart.is_some();
         let allocator = self.sequence_allocator();
-        let id = def.id;
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             if restart {
                 allocator.evict(id);
@@ -1716,25 +1846,7 @@ impl Storage {
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let bytes = load_sequence_bytes_in_txn(&write_txn, old)?;
-        // blob の健全性を確認してから付け替える（破損は CorruptSchema で拒否）。
-        decode_sequence_def(&bytes)?;
-        if super::table_exists_in_txn(&write_txn, new)?
-            || super::view_exists_in_txn(&write_txn, new)?
-            || super::index_name_exists_in_txn(&write_txn, new)?
-            || super::materialized_view_exists_in_txn(&write_txn, new)?
-            || sequence_exists_in_txn(&write_txn, new)?
-        {
-            return Err(CatalogError::TableAlreadyExists(new.to_string()));
-        }
-        if sequence_has_dependents_in_txn(&write_txn, old)? {
-            return Err(CatalogError::DependentObjectsStillExist(old.to_string()));
-        }
-        {
-            let mut table = write_txn.open_table_logged(SEQUENCES_TABLE)?;
-            table.remove(sequence_key(old))?;
-            table.insert(sequence_key(new), bytes.as_slice())?;
-        }
+        rename_sequence_in_txn(&write_txn, old, new)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(super::convert_storage_error)
     }
 
