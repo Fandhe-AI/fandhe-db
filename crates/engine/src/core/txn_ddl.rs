@@ -123,6 +123,27 @@ pub(super) fn check_post_ddl_statement(
     // SQL-80・Issue #3316: 権限・ポリシー・ロール・トリガ・関数削除の DDL を積んだ Tx は、権限ゲート・ポリシー
     // 適用・トリガの発火・関数の解決が確定済みカタログを読むため、古い判定で後続文を通さない（fail-closed）。
     // DDL・Tx 制御・セッション変数の `SET`/`SHOW` だけを許す。文言は文の種類だけで、名前・存在を含めない。
+    // Issue #3315: SCHEMA の DDL を積んだ後は、権限・ポリシー等の DDL や表・索引の DDL を含め、名前解決が
+    // 確定済みカタログの旧スキーマを見るため、SCHEMA の DDL・Tx 制御・セッション変数の `SET`/`SHOW` 以外を
+    // 拒否する（fail-closed。保護対象 DDL の分岐より先に適用する）。
+    if schema_changed {
+        let allowed = match parsed {
+            ParsedSql::CreateSchema(_)
+            | ParsedSql::DropSchema(_)
+            | ParsedSql::AlterSchema(_)
+            | ParsedSql::Transaction(_)
+            | ParsedSql::SetTransaction(_) => true,
+            ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
+            _ => false,
+        };
+        return if allowed {
+            Ok(())
+        } else {
+            Err(SqlSurfaceError::transaction_feature_not_supported(
+                "this statement is not supported after SCHEMA DDL inside a transaction block yet",
+            ))
+        };
+    }
     if txn.has_guarded_ddl() {
         let allowed = match parsed {
             ParsedSql::CreateTable(_)
@@ -232,6 +253,24 @@ pub(super) fn check_extended_execute_after_ddl(
         ParsedSql::SessionRouted(routed) if routed.is_persistent() => routed.inner(),
         other => other,
     };
+    if schema_changed {
+        let allowed = match inner {
+            ParsedSql::CreateSchema(_)
+            | ParsedSql::DropSchema(_)
+            | ParsedSql::AlterSchema(_)
+            | ParsedSql::Transaction(_)
+            | ParsedSql::SetTransaction(_) => true,
+            ParsedSql::Statement(stmt) => is_session_variable_statement(stmt),
+            _ => false,
+        };
+        return if allowed {
+            Ok(())
+        } else {
+            Err(SqlSurfaceError::transaction_feature_not_supported(
+                "this statement is not supported after SCHEMA DDL inside a transaction block yet",
+            ))
+        };
+    }
     let allowed = match inner {
         ParsedSql::CreateTable(_)
         | ParsedSql::DropTable(_)

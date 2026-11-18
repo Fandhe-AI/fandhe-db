@@ -474,6 +474,50 @@ fn statements_after_a_schema_change_are_rejected_fail_closed() {
 }
 
 #[test]
+fn security_and_table_ddl_after_a_schema_change_are_rejected_fail_closed() {
+    // 権限 DDL・ロール DDL・表 DDL が、SCHEMA の DDL を積んだ後（保護対象 DDL を挟んでも）拒否される。
+    // tracked: #3311
+    for pre in [None, Some("CREATE ROLE r3315b")] {
+        for sql in [
+            CREATE_T,
+            "CREATE ROLE r3315c",
+            "GRANT SELECT ON t TO r3315b",
+        ] {
+            let (core, _g) = new_core("sql3315-schema-gate-sec");
+            let mut session = ddl_session();
+            let mut txn = core.new_session_transaction();
+            begin(&core, &mut session, &mut txn);
+            if let Some(p) = pre {
+                tx_ok(&core, &mut session, &mut txn, p);
+            }
+            tx_ok(&core, &mut session, &mut txn, "CREATE SCHEMA app");
+            assert_eq!(
+                tx_code(&core, &mut session, &mut txn, sql),
+                "0A000",
+                "{pre:?} {sql}"
+            );
+            rollback(&core, &mut session, &mut txn);
+        }
+    }
+}
+
+#[test]
+fn schema_authorization_sees_a_role_created_in_the_same_txn() {
+    let (core, _g) = new_core("sql3315-schema-auth");
+    let mut session = ddl_session();
+    let mut txn = core.new_session_transaction();
+    begin(&core, &mut session, &mut txn);
+    tx_ok(&core, &mut session, &mut txn, "CREATE ROLE r3315a");
+    tx_ok(
+        &core,
+        &mut session,
+        &mut txn,
+        "CREATE SCHEMA app AUTHORIZATION r3315a",
+    );
+    commit(&core, &mut session, &mut txn);
+}
+
+#[test]
 fn schema_with_elements_and_cascade_are_rejected_without_side_effects() {
     let (core, _g) = new_core("sql3315-schema-unsupported");
     let mut session = ddl_session();

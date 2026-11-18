@@ -187,12 +187,16 @@ impl EngineCore {
                 }
                 crate::sql::ddl::precheck_create_schema_in_txn(ctx.tenant_id(), stmt)?;
                 txn.ensure_writer(ctx)?;
-                let owner = crate::sql::owner_ddl::resolve_schema_owner(
-                    &self.storage,
-                    ctx.tenant_id(),
-                    session,
-                    stmt.authorization.as_ref(),
-                )?;
+                // Issue #3315: 名前付きロールは共有 write txn 上で解決する（同じ Tx の CREATE/ALTER ROLE を反映）。
+                let owner = {
+                    let write_txn = txn.write_txn().ok_or_else(internal)?;
+                    crate::sql::owner_ddl::resolve_schema_owner_in_txn(
+                        write_txn,
+                        ctx.tenant_id(),
+                        session,
+                        stmt.authorization.as_ref(),
+                    )?
+                };
                 let snap = txn.mark_ddl_started();
                 let write_txn = txn.write_txn().ok_or_else(internal)?;
                 let (outcome, created) = crate::sql::ddl::execute_create_schema_in_txn(
