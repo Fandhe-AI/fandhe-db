@@ -77,6 +77,34 @@ pub(crate) struct MergeExecPlan {
     pub(crate) needs_embedding: bool,
 }
 
+impl MergeExecPlan {
+    /// WHEN 句に現れた操作の種類と UPDATE 句の SET 列の和集合（DO NOTHING は数えない）。文トリガの発火計画
+    /// （`tenant::merge_triggers`。Issue #3355）が、実際に行を書いたかによらず種類ごとに 1 回発火する根拠。
+    pub(crate) fn action_kinds(&self) -> crate::tenant::merge_triggers::MergeActionKinds {
+        let mut kinds = crate::tenant::merge_triggers::MergeActionKinds::default();
+        for c in &self.clauses {
+            match &c.action {
+                ActionPlan::Update(set) => {
+                    kinds.update = true;
+                    kinds
+                        .update_columns
+                        .extend(set.literals.iter().map(|(i, _)| *i));
+                    kinds
+                        .update_columns
+                        .extend(set.items.iter().map(|it| it.column_index));
+                    kinds
+                        .update_columns
+                        .extend(set.copies.iter().map(|cp| cp.column_index));
+                }
+                ActionPlan::Delete => kinds.delete = true,
+                ActionPlan::Insert(_) => kinds.insert = true,
+                ActionPlan::DoNothing => {}
+            }
+        }
+        kinds
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MergeClausePlan {
     kind: MergeMatchKind,

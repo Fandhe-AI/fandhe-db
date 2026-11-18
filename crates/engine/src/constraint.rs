@@ -4120,7 +4120,7 @@ pub(crate) fn enforce_deferred_foreign_keys_in_txn(
 }
 
 /// `table` を子とする即時（`INITIALLY DEFERRED` でない）`FOREIGN KEY` を、事後状態の全件走査で検査する
-/// （MERGE の INSERT 句をまたぐ参照のため、[`crate::tenant::InsertFkDeferScope`] で先送りした検査を
+/// （MERGE の INSERT 句をまたぐ参照のため、[`crate::tenant::MergeFkDeferScope`] で先送りした検査を
 /// 全バッチの書き込み後に 1 回補う。Issue #3354）。遅延 FK は COMMIT 時検査の対象のためここでは見ない。
 pub(crate) fn enforce_immediate_foreign_keys_by_scan_in_txn(
     write_txn: &redb::WriteTransaction,

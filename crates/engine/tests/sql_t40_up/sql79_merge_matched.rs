@@ -643,18 +643,30 @@ fn a_ledger_recorded_operation_id_is_rejected_until_the_ledger_is_wired() {
     }
 }
 
-// ビューを対象にする MERGE は、INSTEAD OF・WITH CHECK OPTION との結線を入れる #3355 まで拒否する。
-// tracked: #3355
+// ビューを対象にする MERGE は、基底表へ書き換えて実行する（#3355）。ビュー述語の外の基底行は一致しない。
 #[test]
-fn a_view_target_is_rejected_until_view_writes_are_wired() {
+fn a_view_target_applies_the_view_predicate() {
     let (core, _g) = new_core("sql79m-viewtarget");
     seed(&core);
-    ddl(&core, "CREATE VIEW tv AS SELECT k, x FROM t WHERE x > 0");
-    expect_fixed_0a000(
-        &core,
-        "MERGE INTO tv USING s ON tv.k = s.k WHEN MATCHED THEN DELETE",
-        "feature not supported: MERGE into a view is not supported yet",
+    // t = {1:a/10, 2:b/20, 3:c/30}。b（x = 20）をビューの外へ出す。
+    ddl(&core, "CREATE VIEW tv AS SELECT k, x FROM t WHERE x <> 20");
+    for text in with_semicolon("MERGE INTO tv USING s ON tv.k = s.k WHEN MATCHED THEN DELETE") {
+        let (core, _g) = new_core("sql79m-viewtarget-run");
+        seed(&core);
+        ddl(&core, "CREATE VIEW tv AS SELECT k, x FROM t WHERE x <> 20");
+        assert_eq!(merged(&core, &text), 2, "{text}");
+        assert_eq!(t_rows(&core), "Integer(2):Text(\"b\"):SignedInteger(20)");
+    }
+    // b を元に足しても、ビューの外の行は一致しないので消えない。
+    insert_s(&core, "alice", &[(2, "b", Some(200))]);
+    assert_eq!(
+        merged(
+            &core,
+            "MERGE INTO tv USING s ON tv.k = s.k WHEN MATCHED THEN DELETE"
+        ),
+        2
     );
+    assert_eq!(t_rows(&core), "Integer(2):Text(\"b\"):SignedInteger(20)");
 }
 
 fn trigger_fn(core: &EngineCore) {
@@ -664,30 +676,32 @@ fn trigger_fn(core: &EngineCore) {
     );
 }
 
-// 対象表に文トリガがあると、文トリガの発火回数の規則を入れる #3355 まで拒否する。行は書かない。
-// tracked: #3355
+// 対象表に文トリガがあっても MERGE は実行され、文トリガは操作の種類ごとに 1 回だけ発火する（#3355。
+// 発火の順序・回数の網羅は `sql79_merge_rules.rs`）。
 #[test]
-fn a_statement_trigger_on_the_target_is_rejected_without_writing() {
-    let (core, _g) = new_core("sql79m-stmttrigger");
-    // トリガは共有表（`Storage` 直作成）に定義できないため、SQL で作る利用者表を使う。
-    private_tables(&core);
-    trigger_fn(&core);
-    ddl(
-        &core,
-        "CREATE TRIGGER ts AFTER DELETE ON s.pt FOR EACH STATEMENT EXECUTE FUNCTION noop()",
-    );
-    let before = private_snapshot(&core);
+fn a_statement_trigger_on_the_target_fires_once_per_statement() {
     for text in
         with_semicolon("MERGE INTO s.pt AS d USING s.ps AS e ON d.k = e.k WHEN MATCHED THEN DELETE")
     {
-        let (code, msg) = err_code(&core, &text);
-        assert_eq!(code, "0A000", "{text}");
+        let (core, _g) = new_core("sql79m-stmttrigger");
+        // トリガは共有表（`Storage` 直作成）に定義できないため、SQL で作る利用者表を使う。
+        private_tables(&core);
+        ddl(&core, "CREATE TABLE audit (n INTEGER)");
+        ddl(
+            &core,
+            "CREATE FUNCTION cnt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO audit (n) VALUES (1); RETURN NULL; END $$",
+        );
+        ddl(
+            &core,
+            "CREATE TRIGGER ts AFTER DELETE ON s.pt FOR EACH STATEMENT EXECUTE FUNCTION cnt()",
+        );
+        assert_eq!(merged(&core, &text), 1, "{text}");
+        assert_eq!(private_snapshot(&core), "Text(\"b\"):SignedInteger(20)");
         assert_eq!(
-            msg,
-            "feature not supported: MERGE into a table with statement-level triggers is not supported yet",
+            rows_of(&core, "alice", "SELECT n FROM audit LIMIT 10"),
+            "SignedInteger(1)",
             "{text}"
         );
-        assert_eq!(before, private_snapshot(&core), "{text}");
     }
 }
 
@@ -704,19 +718,36 @@ fn private_snapshot(core: &EngineCore) -> String {
     rows_of(core, "alice", "SELECT k, x FROM s.pt ORDER BY k LIMIT 10")
 }
 
-// 対象表に利用者ポリシーが適用されると、操作ごとのポリシーの合成を入れる #3355 まで拒否する。行は書かない。
-// tracked: #3355
+// 対象表の利用者ポリシーは操作ごとに合成して適用される（#3355。網羅は `sql79_merge_rules.rs`）。
+// SELECT で隠れる行は一致せず、UPDATE・DELETE の USING を満たさない行を選ぶと文全体が `42501` になる。
 #[test]
-fn a_user_policy_on_the_target_is_rejected_without_writing() {
+fn a_user_policy_on_the_target_is_applied_per_operation() {
     let (core, _g) = new_core("sql79m-policy");
     seed(&core);
     ddl(&core, "ALTER TABLE t ENABLE ROW LEVEL SECURITY");
-    ddl(&core, "CREATE POLICY p ON t FOR ALL USING (x > 0)");
-    expect_fixed_0a000(
-        &core,
-        "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE",
-        "feature not supported: MERGE into a table with row-level security policies is not supported yet",
-    );
+    ddl(&core, "CREATE POLICY p ON t FOR ALL USING (x > 15)");
+    // x > 15 の行（b・c）だけが見え、a（10）は一致しない。b・c のうち s に居る c だけが消える。
+    for text in with_semicolon("MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE") {
+        let (core, _g) = new_core("sql79m-policy-run");
+        seed(&core);
+        ddl(&core, "ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+        ddl(&core, "CREATE POLICY p ON t FOR ALL USING (x > 15)");
+        assert_eq!(merged(&core, &text), 1, "{text}");
+        assert_eq!(
+            t_rows(&core),
+            "Integer(2):Text(\"b\"):SignedInteger(20)",
+            "他は SELECT で隠れる a（10）が消えず、c が消える。{text}"
+        );
+    }
+    // 見える行を BY SOURCE で UPDATE し、新しい行が USING 兼 WITH CHECK を満たさなければ文全体が 42501。
+    let before = snapshot(&core);
+    for text in with_semicolon(
+        "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED BY SOURCE THEN UPDATE SET x = 0",
+    ) {
+        let (code, _) = err_code(&core, &text);
+        assert_eq!(code, "42501", "{text}");
+        assert_eq!(before, snapshot(&core), "{text}");
+    }
 }
 
 // ---------------------------------------------------------------------

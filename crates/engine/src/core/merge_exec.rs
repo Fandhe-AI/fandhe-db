@@ -27,9 +27,16 @@
 //! 第 3 段の適用順は UPDATE の句ごと → DELETE → INSERT の句ごと（PostgreSQL の元の行順の逐次適用との差は
 //! `docs/design/sql-merge.md` §10）。
 //!
-//! 対象外の形（`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー）は固定文言の `0A000` で文全体を
-//! 拒否する（受け皿は #3355〜#3357）。INSERT 句があるとき、INSERT 側の利用者ポリシー（RLS 有効の表）も
-//! `merge_target_preflight` が `0A000` で拒否する（#3355）。
+//! 規則の結線（#3355）: 利用者ポリシー（RLS-13）は、第 1 段の候補列挙が SELECT 側の `USING` で対象を絞り、UPDATE・
+//! DELETE を選んだ行（MATCHED・BY SOURCE の両方）に各 `USING` を評価して違反を `42501` で拒否する（新しい行の
+//! `WITH CHECK` は第 3 段の既存の検査点）。文トリガは `tenant::merge_triggers` が WHEN 句に現れた操作の種類ごとに
+//! 入口（BEFORE）と出口（AFTER）で 1 回発火し、第 3 段の間は既存経路の文トリガを抑止する。ビュー対象は基底表へ
+//! 書き換えて実行し（ビュー述語は第 1 段の候補の絞り込み、`WITH CHECK OPTION` は `ViewWriteScope` 経由の既存の
+//! 検査点）、束縛時の指紋と INSTEAD OF の有無を writer 取得後に write txn で照合する。UPDATE 句と INSERT 句を
+//! またぐ子側 FK 検査は先送りして全区間の後に 1 回検査する。
+//!
+//! 対象外の形（`RETURNING`・台帳記録・INSTEAD OF トリガを持つビュー）は固定文言の `0A000` で文全体を拒否する
+//! （受け皿は #3356・#3357。INSTEAD OF は対応しない）。
 //!
 //! 呼び出し元: `core.rs` の `ParsedSql::Merge` の腕（autocommit は暗黙 Tx 経由で明示 Tx と同じ腕・Describe）。
 
@@ -60,7 +67,46 @@ pub(super) struct MergeBindSchemas {
     pub(super) source_schema: TableSchema,
     /// 元が単純形ビューのときの、基底表の名前とビュー定義の述語。
     pub(super) source_view: Option<(String, Vec<crate::sql::allowlist::WherePredicate>)>,
+    /// 対象がビューのときの、書き込み先の基底表・述語・`WITH CHECK OPTION` の検査述語・束縛時の指紋
+    /// （Issue #3355。実行は基底表の経路へ流し、指紋は writer 取得後に write txn で照合する）。
+    pub(super) target_view: Option<MergeTargetViewBinding>,
 }
+
+/// 対象ビューの束縛結果のうち、実行段が使う分（束縛と同じ読み取りスナップショット由来）。
+pub(super) struct MergeTargetViewBinding {
+    /// 対象に書かれたビュー名（INSTEAD OF の再照合・指紋の照合に使う）。
+    pub(super) name: String,
+    /// 連鎖を辿った先の実表名（実行はこの表へ書く）。
+    pub(super) base_table: String,
+    /// ビュー定義由来の述語（基底表の物理列名）。第 1 段の対象候補の絞り込みに使う。
+    pub(super) view_predicates: Vec<crate::sql::allowlist::WherePredicate>,
+    /// `WITH CHECK OPTION` の検査対象の述語（内側のビューが先頭）。
+    pub(super) check_predicates: Vec<Vec<crate::sql::allowlist::WherePredicate>>,
+    /// 束縛に使った読み取りスナップショットから計算した、ビュー連鎖と基底表スキーマの指紋。
+    pub(super) fingerprint: Vec<u8>,
+}
+
+/// `MERGE` の WHEN 句に現れた操作の種類に対応する、トリガのイベントビット（INSTEAD OF の判定に使う）。
+fn merge_trigger_events(stmt: &ValidatedMerge) -> Vec<u8> {
+    use crate::catalog::trigger::TriggerEvents;
+    let mut events = Vec::new();
+    for clause in stmt.when_clauses() {
+        let bit = match clause.action() {
+            crate::sql::allowlist::MergeAction::Update { .. } => TriggerEvents::UPDATE,
+            crate::sql::allowlist::MergeAction::Delete => TriggerEvents::DELETE,
+            crate::sql::allowlist::MergeAction::Insert { .. } => TriggerEvents::INSERT,
+            _ => continue,
+        };
+        if !events.contains(&bit) {
+            events.push(bit);
+        }
+    }
+    events
+}
+
+/// INSTEAD OF トリガを持つビューを対象にした `MERGE` を拒否する固定文言（対応しない。設計記録 D14・§11）。
+const INSTEAD_OF_TARGET_UNSUPPORTED: &str =
+    "MERGE into a view with INSTEAD OF triggers is not supported";
 
 impl EngineCore {
     /// `MERGE` を束縛する（Execute・Describe 共通）。`dummy_flags` は Describe の `$n` ダミーフラグ
@@ -106,11 +152,45 @@ impl EngineCore {
 
         // 対象: 実表またはビュー（自動更新できなければ単独のビュー書き込みと同じ `55000`）。
         let target_name = stmt.target.table();
-        let (target_schema, target_view) = match resolve_from(&snap, target_name)? {
-            Resolved::Table => (schema_of(target_name)?, None),
+        let (target_schema, target_view, target_binding) = match resolve_from(&snap, target_name)? {
+            Resolved::Table => (schema_of(target_name)?, None, None),
             Resolved::View { .. } | Resolved::Buffered { .. } => {
+                // INSTEAD OF トリガを持つビューは自動更新可能性（`55000`）の判定より前に固定文言で拒否する
+                // （対応しない。書き込む側の write txn でも同じ判定を再照合する）。テナントが未束縛なら判定できないので
+                // 実行段の再照合に任せる。
+                if let Some(tenant) = session.resolution_tenant() {
+                    let defs = crate::catalog::trigger::list_triggers_in_source(
+                        read_txn,
+                        tenant,
+                        target_name,
+                    )
+                    .map_err(|_| SqlSurfaceError::Internal {
+                        detail: "trigger catalog operation failed".to_string(),
+                    })?;
+                    let events = merge_trigger_events(stmt);
+                    if defs.iter().any(|t| {
+                        t.timing == crate::catalog::trigger::TriggerTiming::InsteadOf
+                            && t.level == crate::catalog::trigger::TriggerLevel::Row
+                            && events.iter().any(|e| t.events.contains(*e))
+                    }) {
+                        return Err(SqlSurfaceError::feature_not_supported(
+                            INSTEAD_OF_TARGET_UNSUPPORTED,
+                        ));
+                    }
+                }
                 let view = crate::sql::view_dml::resolve_merge_target(&snap, target_name)?;
-                (schema_of(&view.base_table)?, Some(view))
+                let fingerprint =
+                    crate::catalog::view_write_fingerprint_in_read_txn(read_txn, target_name)
+                        .map_err(crate::catalog::table_lookup_error)?;
+                let schema = schema_of(&view.base_table)?;
+                let binding = MergeTargetViewBinding {
+                    name: target_name.to_string(),
+                    base_table: view.base_table.clone(),
+                    view_predicates: view.view_predicates.clone(),
+                    check_predicates: view.check_predicates.clone(),
+                    fingerprint,
+                };
+                (schema, Some(view), Some(binding))
             }
         };
 
@@ -170,6 +250,7 @@ impl EngineCore {
                 target_schema,
                 source_schema,
                 source_view,
+                target_view: target_binding,
             },
         ))
     }
@@ -247,11 +328,6 @@ impl EngineCore {
                 "MERGE with RETURNING is not supported yet",
             ));
         }
-        if bound.target_view().is_some() {
-            return Err(SqlSurfaceError::feature_not_supported(
-                "MERGE into a view is not supported yet",
-            ));
-        }
         // 台帳を記録する構成（`USING OPERATION_ID` つき）は、操作種別と文ハッシュが入る #3357 まで拒否する
         // （記録漏れで再送の冪等性が無いまま受理する経路を作らない）。省略時は台帳へ記録しない（`Omitted`）。
         let ledger_write = self
@@ -269,8 +345,36 @@ impl EngineCore {
         let write_txn = txn.write_txn().ok_or_else(|| SqlSurfaceError::Internal {
             detail: "internal error".to_string(),
         })?;
-        let target_table = stmt.target_table();
+        // 対象がビューなら、以降の実行（計画・事前判定・候補列挙・書き込み・FK 検査・`mark_written`）は
+        // すべて基底表名で行う（単独のビュー書き込みと同じ。ビュー名は指紋・INSTEAD OF の照合にだけ使う）。
+        let target_table: &str = match &schemas.target_view {
+            Some(v) => v.base_table.as_str(),
+            None => stmt.target_table(),
+        };
         let target_schema = &schemas.target_schema;
+        if let Some(v) = &schemas.target_view {
+            // 束縛時のスナップショットで取った指紋を、writer 取得後の最新カタログで照合する。第 1 段より前に
+            // 行うので、0 行の MERGE（書き込み経路に到達しない）でも並行 DDL を検出する。不一致は書き込まない。
+            let live = crate::catalog::view_write_fingerprint_in_txn(write_txn, &v.name).map_err(
+                |_| SqlSurfaceError::Internal {
+                    detail: "failed to load view definition".to_string(),
+                },
+            )?;
+            if live != v.fingerprint {
+                return Err(SqlSurfaceError::invalid_input(
+                    "view definition changed after the statement was bound",
+                ));
+            }
+            // INSTEAD OF の再照合（指紋はトリガを含まない）。書き込み txn の中なので、判定と書き込みの間に
+            // 並行 `CREATE TRIGGER` は入らない。
+            for event in merge_trigger_events(stmt) {
+                if self.view_has_instead_of(ctx, &v.name, event, Some(write_txn))? {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        INSTEAD_OF_TARGET_UNSUPPORTED,
+                    ));
+                }
+            }
+        }
 
         // 4. 計画への変換（純関数）。
         let source_input = match (&stmt.source, &schemas.source_view) {
@@ -297,14 +401,8 @@ impl EngineCore {
             .clauses()
             .iter()
             .any(|c| matches!(c.action(), BoundMergeAction::Insert(_)));
-        crate::tenant::merge_target_preflight(
-            write_txn,
-            ctx,
-            target_table,
-            target_schema,
-            has_insert,
-        )
-        .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
+        crate::tenant::merge_target_preflight(write_txn, ctx, target_table, target_schema)
+            .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
         if matches!(stmt.source, MergeSource::Table(_)) {
             let live = crate::catalog::require_table_schema_write_any_identity(
                 write_txn,
@@ -324,6 +422,30 @@ impl EngineCore {
                 ));
             }
         }
+
+        // 5b. 文トリガ（TABLE-45・D12）。WHEN 句に現れた操作の種類ごとに 1 回、入口（BEFORE）と出口（AFTER）で
+        // 発火する。`TriggerWrittenTablesScope` は文トリガ本体が書いた表も `mark_written` に含めるため、BEFORE の
+        // 発火より前に張る（漏れると COMMIT が write txn を破棄し、遅延 FK も取りこぼす。P0）。発火は redb の
+        // 表ハンドルを開く前（元の走査・候補列挙より前）に行う。
+        let trigger_scope = crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
+        let trigger_runtime = self.trigger_runtime.bind(self);
+        let stmt_triggers = crate::tenant::merge_triggers::MergeStatementTriggers::plan(
+            write_txn,
+            ctx,
+            target_table,
+            target_schema,
+            &plan.action_kinds(),
+            &trigger_runtime,
+        )
+        .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
+        let stmt_writes =
+            crate::tenant::merge_triggers::statement_writes(write_txn, ctx, &trigger_runtime);
+        stmt_triggers
+            .fire_before(&stmt_writes, target_table, target_schema)
+            .and_then(|()| {
+                crate::tenant::merge_triggers::settle_statement_writes(write_txn, ctx, &stmt_writes)
+            })
+            .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
 
         // 6. 元の実体化と probe の構築。書き込むセッションの `ctx`（RLS 暗黙適用）で、同じ write txn から読む。
         let limits = self.joined_dml_limits();
@@ -399,96 +521,177 @@ impl EngineCore {
             cells: Vec::new(),
         };
         let mut positions: Vec<u32> = Vec::new();
-        let planned = crate::tenant::enumerate_merge_candidates_readonly(
-            write_txn,
-            target_table,
-            ctx,
+        // 利用者ポリシー（RLS-13）: UPDATE・DELETE を選んだ対象行（MATCHED・BY SOURCE の両方）に、それぞれの
+        // `USING` を評価する。満たさなければ行を黙って飛ばさず文全体を `42501` で拒否する（行を書く前の
+        // 第 1 段なので副作用ゼロ。`ON CONFLICT DO UPDATE` の既存行検査と同じ規則）。SELECT 側の `USING` は
+        // 候補列挙が先に適用済み（隠れた行は一致にも BY SOURCE にも入らない）。
+        let kinds = plan.action_kinds();
+        let using_update = if kinds.update {
+            crate::sql::policy_eval::compile_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                target_table,
+                target_schema,
+                crate::sql::policy_eval::PolicyCheckKind::ConflictUpdateUsing,
+            )
+            .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?
+        } else {
+            None
+        };
+        let using_delete = if kinds.delete {
+            crate::sql::policy_eval::compile_in_txn(
+                write_txn,
+                ctx.tenant_id(),
+                target_table,
+                target_schema,
+                crate::sql::policy_eval::PolicyCheckKind::ExistingDeleteUsing,
+            )
+            .map_err(|e| crate::sql::exec::map_write_error(e, "delete"))?
+        } else {
+            None
+        };
+        // ビュー対象: ビュー述語は第 1 段の対象候補の絞り込みとして評価する（`ON` の残余には入れない。入れると
+        // BY SOURCE の DELETE・UPDATE がビューの外の基底行に及ぶ）。偽・NULL の行は一致にも BY SOURCE にも入らない。
+        let check_using =
+            |c: &DmlCandidate<'_>, chosen: &Option<Planned>| -> Result<(), SqlSurfaceError> {
+                match chosen {
+                    Some(Planned::Update(..)) => {
+                        if let Some(p) = &using_update {
+                            p.enforce(target_schema, c.id, c.embedding, c.metadata)
+                                .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
+                        }
+                    }
+                    Some(Planned::Delete) => {
+                        if let Some(p) = &using_delete {
+                            p.enforce(target_schema, c.id, c.embedding, c.metadata)
+                                .map_err(|e| crate::sql::exec::map_write_error(e, "delete"))?;
+                        }
+                    }
+                    None => {}
+                }
+                Ok(())
+            };
+        let view_predicates: &[crate::sql::allowlist::WherePredicate] = match &schemas.target_view {
+            Some(v) => &v.view_predicates,
+            None => &[],
+        };
+        let use_view_predicate = schemas.target_view.is_some();
+        let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+        let (view_md, view_expr, _view_rls, view_or) = crate::sql::parser::bind_where_predicates(
+            view_predicates,
             target_schema,
-            plan.needs_embedding,
-            max_scanned_rows,
-            &mut |c: &DmlCandidate<'_>| -> Result<Option<Planned>, SqlSurfaceError> {
-                let scanned = crate::row_codec::scan_scalar_columns(target_schema, c.metadata)?;
-                positions.clear();
-                probe.matches_of(c, &scanned, &mut positions)?;
-                let mut chosen: Option<Planned> = None;
-                if positions.is_empty() {
-                    // 元に一致する行が無い対象行（結合キーが NULL の行を含む）: `WHEN NOT MATCHED BY SOURCE`。
-                    // 一致 0 件なので `21000` は起きない。
-                    if by_source_clauses > 0 {
-                        probe.charge_comparisons(by_source_clauses)?;
-                        match eval.choose_by_source(&scanned, c)? {
-                            Choice::None | Choice::DoNothing => {}
-                            Choice::Delete => {
-                                charge_planned_row(&mut probe)?;
-                                chosen = Some(Planned::Delete);
-                            }
-                            Choice::Update(clause) => {
-                                let values = eval.eval_update(
-                                    clause,
-                                    &scanned,
-                                    c,
-                                    &no_source_row,
-                                    target_schema,
-                                    &mut |n| probe.charge_bytes(n),
-                                )?;
-                                chosen = Some(Planned::Update(clause, values));
-                            }
-                            Choice::Insert(_) => return Err(merge_plan_mismatch()),
+            session.udfs(),
+            &mut node_budget,
+            &[],
+        )?;
+        let planned = crate::sql::exec::run_where_predicate(
+            target_schema,
+            &view_md,
+            &view_expr,
+            &view_or,
+            |view_needs_embedding, view_pred| {
+                crate::tenant::enumerate_merge_candidates_readonly(
+                    write_txn,
+                    target_table,
+                    ctx,
+                    target_schema,
+                    plan.needs_embedding
+                        || view_needs_embedding
+                        || using_update.is_some()
+                        || using_delete.is_some(),
+                    max_scanned_rows,
+                    &mut |c: &DmlCandidate<'_>| -> Result<Option<Planned>, SqlSurfaceError> {
+                        if use_view_predicate && !view_pred(c)? {
+                            return Ok(None);
                         }
-                    }
-                    return Ok(chosen);
-                }
-                // 一致の記録は、どの句が選ばれたか（DO NOTHING・どの句も真にならない場合を含む）に関係なく
-                // `ON` が真であることだけで立てる。一致があるのに MATCHED の句がどれも発火しない対象行は
-                // BY SOURCE の句を受けない。
-                if by_target_clauses > 0 {
-                    for &pos in &positions {
-                        *matched_flags.get_mut(pos as usize).ok_or_else(|| {
-                            SqlSurfaceError::Internal {
-                                detail: "matched source row out of range".to_string(),
+                        let scanned =
+                            crate::row_codec::scan_scalar_columns(target_schema, c.metadata)?;
+                        positions.clear();
+                        probe.matches_of(c, &scanned, &mut positions)?;
+                        let mut chosen: Option<Planned> = None;
+                        if positions.is_empty() {
+                            // 元に一致する行が無い対象行（結合キーが NULL の行を含む）: `WHEN NOT MATCHED BY SOURCE`。
+                            // 一致 0 件なので `21000` は起きない。
+                            if by_source_clauses > 0 {
+                                probe.charge_comparisons(by_source_clauses)?;
+                                match eval.choose_by_source(&scanned, c)? {
+                                    Choice::None | Choice::DoNothing => {}
+                                    Choice::Delete => {
+                                        charge_planned_row(&mut probe)?;
+                                        chosen = Some(Planned::Delete);
+                                    }
+                                    Choice::Update(clause) => {
+                                        let values = eval.eval_update(
+                                            clause,
+                                            &scanned,
+                                            c,
+                                            &no_source_row,
+                                            target_schema,
+                                            &mut |n| probe.charge_bytes(n),
+                                        )?;
+                                        chosen = Some(Planned::Update(clause, values));
+                                    }
+                                    Choice::Insert(_) => return Err(merge_plan_mismatch()),
+                                }
                             }
-                        })? = true;
-                    }
-                }
-                // 句の条件評価（`WHEN ... AND`）は組ごとのネストループ。`ON` の残余と同じ比較回数の上限へ
-                // 計上し（超過は `54000`）、一定間隔で中断要求（`57014`）を確認する。
-                probe.charge_comparisons(positions.len().saturating_mul(matched_clauses))?;
-                for (n, &pos) in positions.iter().enumerate() {
-                    if n % 1024 == 0 {
-                        crate::interrupt::check()?;
-                    }
-                    let row =
-                        index
-                            .rows
-                            .get(pos as usize)
-                            .ok_or_else(|| SqlSurfaceError::Internal {
-                                detail: "matched source row out of range".to_string(),
+                            check_using(c, &chosen)?;
+                            return Ok(chosen);
+                        }
+                        // 一致の記録は、どの句が選ばれたか（DO NOTHING・どの句も真にならない場合を含む）に関係なく
+                        // `ON` が真であることだけで立てる。一致があるのに MATCHED の句がどれも発火しない対象行は
+                        // BY SOURCE の句を受けない。
+                        if by_target_clauses > 0 {
+                            for &pos in &positions {
+                                *matched_flags.get_mut(pos as usize).ok_or_else(|| {
+                                    SqlSurfaceError::Internal {
+                                        detail: "matched source row out of range".to_string(),
+                                    }
+                                })? = true;
+                            }
+                        }
+                        // 句の条件評価（`WHEN ... AND`）は組ごとのネストループ。`ON` の残余と同じ比較回数の上限へ
+                        // 計上し（超過は `54000`）、一定間隔で中断要求（`57014`）を確認する。
+                        probe
+                            .charge_comparisons(positions.len().saturating_mul(matched_clauses))?;
+                        for (n, &pos) in positions.iter().enumerate() {
+                            if n % 1024 == 0 {
+                                crate::interrupt::check()?;
+                            }
+                            let row = index.rows.get(pos as usize).ok_or_else(|| {
+                                SqlSurfaceError::Internal {
+                                    detail: "matched source row out of range".to_string(),
+                                }
                             })?;
-                    let choice = eval.choose_matched(&scanned, c, row)?;
-                    if matches!(choice, Choice::Delete | Choice::Update(_)) && chosen.is_some() {
-                        return Err(SqlSurfaceError::merge_cardinality_violation());
-                    }
-                    match choice {
-                        Choice::None | Choice::DoNothing => {}
-                        Choice::Delete => {
-                            charge_planned_row(&mut probe)?;
-                            chosen = Some(Planned::Delete);
+                            let choice = eval.choose_matched(&scanned, c, row)?;
+                            if matches!(choice, Choice::Delete | Choice::Update(_))
+                                && chosen.is_some()
+                            {
+                                return Err(SqlSurfaceError::merge_cardinality_violation());
+                            }
+                            match choice {
+                                Choice::None | Choice::DoNothing => {}
+                                Choice::Delete => {
+                                    charge_planned_row(&mut probe)?;
+                                    chosen = Some(Planned::Delete);
+                                }
+                                Choice::Update(clause) => {
+                                    let values = eval.eval_update(
+                                        clause,
+                                        &scanned,
+                                        c,
+                                        row,
+                                        target_schema,
+                                        &mut |n| probe.charge_bytes(n),
+                                    )?;
+                                    chosen = Some(Planned::Update(clause, values));
+                                }
+                                Choice::Insert(_) => return Err(merge_plan_mismatch()),
+                            }
                         }
-                        Choice::Update(clause) => {
-                            let values = eval.eval_update(
-                                clause,
-                                &scanned,
-                                c,
-                                row,
-                                target_schema,
-                                &mut |n| probe.charge_bytes(n),
-                            )?;
-                            chosen = Some(Planned::Update(clause, values));
-                        }
-                        Choice::Insert(_) => return Err(merge_plan_mismatch()),
-                    }
-                }
-                Ok(chosen)
+                        check_using(c, &chosen)?;
+                        Ok(chosen)
+                    },
+                )
             },
         )
         .map_err(|e| match e {
@@ -625,7 +828,25 @@ impl EngineCore {
         let hash = crate::recovery::content_hash::for_delete(0);
         let generated_scope =
             crate::sql::generated_column::GeneratedComputeScope::enter(target_table);
-        let trigger_scope = crate::tenant::trigger_writes::TriggerWrittenTablesScope::enter();
+        // 文トリガは入口・出口で種類ごとに 1 回だけ発火するため、第 3 段の既存経路が呼ぶ分類器には対象表の
+        // 文トリガ群を空で返させる（行トリガは発火する）。
+        let stmt_trigger_scope =
+            crate::tenant::merge_triggers::MergeStatementTriggerScope::enter(target_table);
+        // ビュー対象: 基底表への書き込みが「ビュー経由」であること（指紋の照合・`WITH CHECK OPTION` の検査）を
+        // 既存の書き込み経路へ搬送する（単独のビュー書き込みと同じ型）。
+        let view_scope = schemas.target_view.as_ref().map(|v| {
+            crate::sql::view_write_scope::ViewWriteScope::enter_with_checks(
+                &v.name,
+                v.fingerprint.clone(),
+                &v.base_table,
+                v.check_predicates.clone(),
+            )
+        });
+        // UPDATE 句と INSERT 句をまたぐ参照（自己参照を含む）を文単位の検査と同じ意味にするため、複数区間が
+        // 書くときは子側の FK 検査を先送りし、全区間の書き込み後に 1 回検査する（Issue #3354・#3355）。
+        let fk_defer = ((!update_plan.is_empty() && !insert_bounds.is_empty())
+            || insert_bounds.len() > 1)
+            .then(|| crate::tenant::MergeFkDeferScope::enter(target_table));
         let mut rows_affected: u64 = 0;
         // 適用結果は実際に変更した件数を使う。BEFORE ROW トリガが行を飛ばす（`RETURN NULL`）・別の行を
         // 消すなどの正常な動作で計画より少なくなっても、文は失敗させない（他の書き込み経路と同じ意味論）。
@@ -685,10 +906,6 @@ impl EngineCore {
                 _ => return Err(merge_plan_mismatch()),
             }
         }
-        // 句ごとのバッチ間の FK 参照（自己参照を含む）を文単位の検査と同じ意味にするため、複数バッチのときは
-        // 行ごとの FK 検査を先送りし、全バッチの書き込み後に 1 回検査する（Issue #3354）。
-        let fk_defer = (insert_bounds.len() > 1)
-            .then(|| crate::tenant::InsertFkDeferScope::enter(target_table));
         for bounds in &insert_bounds {
             let outcome = crate::sql::exec::execute_insert_batch_with_schema_in(
                 WriteTarget::InTxn(write_txn),
@@ -709,7 +926,22 @@ impl EngineCore {
             )
             .map_err(crate::sql::exec::map_insert_write_error)?;
         }
+        if view_scope.as_ref().is_some_and(|s| s.mismatched()) {
+            return Err(SqlSurfaceError::invalid_input(
+                "view definition changed after the statement was bound",
+            ));
+        }
+        drop(view_scope);
+        drop(stmt_trigger_scope);
         drop(generated_scope);
+
+        // 9b. AFTER STATEMENT（DELETE → UPDATE → INSERT の順。種類ごとに 1 回。書いた行が 0 件でも発火する）。
+        stmt_triggers
+            .fire_after(&stmt_writes, target_table, target_schema)
+            .and_then(|()| {
+                crate::tenant::merge_triggers::settle_statement_writes(write_txn, ctx, &stmt_writes)
+            })
+            .map_err(|e| crate::sql::exec::map_write_error(e, "update"))?;
         let written = trigger_scope.take();
         drop(trigger_scope);
 

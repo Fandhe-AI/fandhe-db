@@ -918,23 +918,49 @@ fn another_tenants_private_rows_are_neither_deleted_updated_nor_inserted() {
     );
 }
 
-// 対象表に INSERT 側の利用者ポリシーが適用されると、ポリシーの合成を入れる #3355 まで拒否する。行は書かない。
-// tracked: #3355
+// 対象表の INSERT 側の利用者ポリシー（`WITH CHECK`）は、単独の INSERT と同じく新しい行へ掛かる（#3355）。
+// 満たす行は挿入され、満たさない行があれば文全体が `42501` になり行は何も書かれない。
 #[test]
-fn an_insert_policy_on_the_target_is_rejected_without_writing() {
+fn an_insert_policy_on_the_target_checks_the_new_rows() {
     let (core, _g) = new_core("sql79n-policy");
     seed(&core);
     ddl(&core, "ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+    ddl(&core, "CREATE POLICY p_sel ON t FOR SELECT USING (true)");
     ddl(&core, "CREATE POLICY p ON t FOR INSERT WITH CHECK (x > 0)");
+    // 元の d（400）は WITH CHECK を満たすので挿入される。
+    for (i, text) in with_semicolon(&format!(
+        "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN {INSERT_ALL}"
+    ))
+    .into_iter()
+    .enumerate()
+    {
+        let (core, _g) = new_core(&format!("sql79n-policy-ok-{i}"));
+        seed(&core);
+        ddl(&core, "ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+        ddl(&core, "CREATE POLICY p_sel ON t FOR SELECT USING (true)");
+        ddl(&core, "CREATE POLICY p ON t FOR INSERT WITH CHECK (x > 0)");
+        assert_eq!(merged(&core, &text), 1, "{text}");
+        assert_eq!(
+            t_rows(&core),
+            join(&[
+                row(1, "a", Some(10)),
+                row(2, "b", Some(20)),
+                row(3, "c", Some(30)),
+                row(4, "d", Some(400)),
+            ]),
+            "{text}"
+        );
+    }
+    // 元に x <= 0 の行が混ざると、文全体が拒否され、満たす行も書かれない。
+    insert_s(&core, "alice", &[(5, "e", Some(-1))]);
     let before = snapshot(&core);
     for text in with_semicolon(&format!(
         "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN {INSERT_ALL}"
     )) {
         let (code, msg) = err_code(&core, &text);
-        assert_eq!(code, "0A000", "{text}");
+        assert_eq!(code, "42501", "{text}");
         assert_eq!(
-            msg,
-            "feature not supported: MERGE into a table with row-level security policies is not supported yet",
+            msg, "new row violates row-level security policy for table \"t\"",
             "{text}"
         );
         assert_eq!(before, snapshot(&core), "{text}");

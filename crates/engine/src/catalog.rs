@@ -6675,6 +6675,36 @@ pub(crate) fn view_write_fingerprint_in_txn(
     )
 }
 
+/// [`Storage::view_write_fingerprint`] と同じ指紋を、呼び出し元が持つ読み取りスナップショットから計算する
+/// （`MERGE` の束縛〔`core::merge_exec`〕が、ビュー解決・スキーマ束縛と**同じ**スナップショットから指紋を取り、
+/// 実行時に [`view_write_fingerprint_in_txn`] と照合するため。Issue #3355）。
+pub(crate) fn view_write_fingerprint_in_read_txn(
+    read_txn: &redb::ReadTransaction,
+    view_name: &str,
+) -> Result<Vec<u8>> {
+    let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let views_table = match read_txn.open_table(VIEWS_TABLE) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    replace_fingerprint(
+        vec![view_name.to_string()],
+        &|n| match &catalog_table {
+            Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+            None => Ok(None),
+        },
+        &|n| match &views_table {
+            Some(t) => Ok(t.get(n)?.map(|g| g.value().to_vec())),
+            None => Ok(None),
+        },
+    )
+}
+
 /// 置換前後の本文（旧定義があれば旧本文も）が読む relation 群（指紋探索の起点）。
 fn replace_fingerprint_starts(
     name: &str,
