@@ -20267,6 +20267,15 @@ impl EngineCore {
     /// 同一の判定（[`Self::validate_insert_batch_byte_and_chunk_limits`] への委譲）を
     /// 行う重複を解消する（codex-review Low 指摘・PR #873）。①（`max_files_per_batch`）
     /// は行の形には掛けない（Issue #3308）。
+    fn validate_merge_insert_groups_limits(
+        &self,
+        groups: &[Vec<crate::sql::parser::BoundInsert>],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let slices: Vec<&[crate::sql::parser::BoundInsert]> =
+            groups.iter().map(|g| g.as_slice()).collect();
+        self.validate_insert_batch_groups_limits(&slices)
+    }
+
     fn validate_insert_row_batch_limits(
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
@@ -20289,13 +20298,24 @@ impl EngineCore {
         &self,
         bounds: &[crate::sql::parser::BoundInsert],
     ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        self.validate_insert_batch_groups_limits(&[bounds])
+    }
+
+    /// 複数の書き込みバッチ（MERGE の INSERT 句ごとの束縛結果）を 1 つの文として扱い、
+    /// 行別・バッチ合計バイト量とチャンク総量の上限を全グループの累計で検証する
+    /// （Issue #3354。句ごとに上限がリセットされて INDEX-4 を迂回するのを防ぐ）。
+    fn validate_insert_batch_groups_limits(
+        &self,
+        groups: &[&[crate::sql::parser::BoundInsert]],
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        let total_rows: usize = groups.iter().fold(0usize, |a, g| a.saturating_add(g.len()));
         let mut shapes: Vec<(usize, usize)> = Vec::new();
-        shapes.try_reserve_exact(bounds.len()).map_err(|_| {
+        shapes.try_reserve_exact(total_rows).map_err(|_| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "failed to reserve batch shape buffer".to_string(),
             }
         })?;
-        for bound in bounds {
+        for bound in groups.iter().flat_map(|g| g.iter()) {
             let mut row_bytes: usize = 0;
             for value in &bound.values {
                 let value_len = match value {
@@ -20400,9 +20420,9 @@ impl EngineCore {
         crate::batch_limits::validate_row_batch_shape(&shapes, &self.batch_limits).map_err(
             |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
         )?;
-        crate::batch_limits::validate_chunk_total(bounds.len(), &self.batch_limits).map_err(
-            |e| crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string()),
-        )?;
+        crate::batch_limits::validate_chunk_total(total_rows, &self.batch_limits).map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
+        })?;
         Ok(())
     }
 

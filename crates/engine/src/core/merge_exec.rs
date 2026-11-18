@@ -608,9 +608,10 @@ impl EngineCore {
                         clock,
                     )?);
                 }
-                self.validate_insert_row_batch_limits(&bounds)?;
                 insert_bounds.push(bounds);
             }
+            // 上限は全 INSERT 句の累計で 1 回判定する（句ごとにリセットされない）。
+            self.validate_merge_insert_groups_limits(&insert_bounds)?;
         }
         drop(eval);
         drop(probe);

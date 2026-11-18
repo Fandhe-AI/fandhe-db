@@ -850,6 +850,31 @@ fn the_insert_row_limit_applies_to_the_merge_insert_rows() {
     assert_eq!(before, snapshot(&core));
 }
 
+/// INSERT のバッチ上限（④チャンク総量）は句ごとではなく文全体の累計で判定する（INDEX-4・Issue #3354）。
+#[test]
+fn the_insert_batch_chunk_limit_is_cumulative_across_insert_clauses() {
+    let sql = format!(
+        "MERGE INTO t USING s ON t.k = s.k \
+         WHEN NOT MATCHED AND s.v < 450 THEN {INSERT_ALL} \
+         WHEN NOT MATCHED THEN {INSERT_ALL}"
+    );
+    let limits = |chunks: usize| engine::batch_limits::BatchLimits {
+        max_batch_chunks: chunks,
+        ..Default::default()
+    };
+    // 未一致の 2 行（d・e）が別々の句へ振り分けられても、句ごとの 1 行ではなく文全体の 2 行で判定される。
+    let (core, _g) = limited_core("sql79n-lim-chunks-ng", |c| c.with_batch_limits(limits(1)));
+    seed(&core);
+    insert_s(&core, "alice", &[(5, "e", Some(500))]);
+    let before = snapshot(&core);
+    assert_eq!(err_code(&core, &sql).0, "54000");
+    assert_eq!(before, snapshot(&core));
+    let (core, _g) = limited_core("sql79n-lim-chunks-ok", |c| c.with_batch_limits(limits(2)));
+    seed(&core);
+    insert_s(&core, "alice", &[(5, "e", Some(500))]);
+    assert_eq!(merged(&core, &sql), 2);
+}
+
 #[test]
 fn the_source_visible_row_limit_applies() {
     let (core, _g) = limited_core("sql79n-lim-input", |c| {
