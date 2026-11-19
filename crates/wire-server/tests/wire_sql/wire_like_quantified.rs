@@ -103,6 +103,7 @@ fn wire_like_any_all_and_tilde_operators_with_trailing_semicolon() {
 }
 
 /// 要素数 1025 は `54000`、サブクエリ形は `0A000`、ESCAPE 付きは `42601` が ErrorResponse で返る。
+// intentional: docs/design/like-wildcard-patterns.md
 #[test]
 fn wire_like_quantified_rejections_carry_sqlstate() {
     let (core, _guard) = new_core();

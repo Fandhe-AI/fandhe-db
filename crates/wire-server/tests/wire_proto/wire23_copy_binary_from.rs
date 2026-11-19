@@ -564,6 +564,7 @@ fn success_inside_explicit_transaction_is_visible_after_commit() {
 
 // --- 列型・オプション ---
 
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn unsupported_column_type_is_0a000_before_copy_in_response() {
     let (core, _g) = new_core(wide_limits());
@@ -579,6 +580,7 @@ fn unsupported_column_type_is_0a000_before_copy_in_response() {
     s.shutdown(Shutdown::Write).ok();
 }
 
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn binary_with_row_format_options_is_rejected() {
     let (core, _g) = new_core(wide_limits());

@@ -287,6 +287,7 @@ fn quoted_null_and_bool_word_table_names_are_accepted() {
 
 /// Issue #2014・TABLE-46: HALFVEC 列を射影する `COPY ... TO` はテーブル形・括弧形とも
 /// fail-closed の 0A000 で拒否する（テキストで `[a,b,...]` を書き出さない）。
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn halfvec_projection_is_rejected_with_0a000() {
     let path = unique_db_path("copy-to-halfvec");
@@ -325,6 +326,7 @@ fn halfvec_projection_is_rejected_with_0a000() {
 
 /// Issue #2018・TABLE-49: INT8VEC 列を射影する `COPY ... TO` はテーブル形・括弧形とも
 /// fail-closed の 0A000 で拒否する（テキストで `[a,b,...]` を書き出さない）。
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn int8vec_projection_is_rejected_with_0a000() {
     let path = unique_db_path("copy-to-int8vec");
@@ -363,6 +365,7 @@ fn int8vec_projection_is_rejected_with_0a000() {
 
 /// Issue #2025・TABLE-47: SPARSEVEC 列を射影する `COPY ... TO` はテーブル形・括弧形とも
 /// fail-closed の 0A000 で拒否する（テキストで `{idx:val,...}/N` を書き出さない）。
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn sparsevec_projection_is_rejected_with_0a000() {
     let path = unique_db_path("copy-to-sparsevec");

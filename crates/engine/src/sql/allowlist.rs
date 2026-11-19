@@ -36580,6 +36580,7 @@ mod tests {
 
     /// SQL-9・Issue #3258: `[NOT] LIKE|ILIKE ANY|SOME|ALL`（`~~` 系の演算子名を含む）の構文。
     /// 後置 `NOT` は演算子の `negated`（量化子は反転しない）。拒否の形は固定のコードで返す。
+    // intentional: docs/design/like-wildcard-patterns.md
     #[test]
     fn like_quantified_parses_and_rejects() {
         let tail = "ORDER BY embedding <=> '[0.1]' LIMIT 5";
@@ -42337,6 +42338,7 @@ mod tests {
     /// Issue #3260・#3261: DISTINCT ON の判定順序（構文 → 54000 → 42P01 → 未対応併用 → 42P10 →
     /// 実行できない文脈 0A000）。セッション最上位の入口（`session_stmt`）だけが整合した文を受理し、
     /// それ以外の入口（`validate_sql`）は整合した文も `0A000`（fail-closed）。
+    // intentional: docs/design/select-distinct-on.md
     #[test]
     fn distinct_on_classification_order() {
         let lookup = catalog_with(&["documents"]);
@@ -42418,6 +42420,7 @@ mod tests {
     }
 
     /// Issue #3261: 実行段へ重複排除を運べない文脈は 0A000（黙って重複排除を落とさない）。
+    // intentional: docs/design/select-distinct-on.md
     #[test]
     fn distinct_on_unsupported_execution_contexts_are_0a000() {
         let lookup = catalog_with(&["documents"]);

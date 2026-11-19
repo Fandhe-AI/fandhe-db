@@ -341,6 +341,7 @@ fn distinct_on_cap_is_not_affected_by_invisible_groups() {
 }
 
 /// ORDER BY なしの未対応形も fail-closed（0A000／42601）で、結果は全テナントで同一。
+// intentional: docs/design/select-distinct-on.md
 #[test]
 fn distinct_on_unsupported_forms_remain_fail_closed_without_order_by() {
     let (core, _g) = build("sql25-don-fc", &ROWS, None);

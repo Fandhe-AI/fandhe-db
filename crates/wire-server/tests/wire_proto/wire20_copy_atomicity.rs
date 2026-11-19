@@ -411,6 +411,7 @@ fn wire20_atomic_copy_to_in_the_middle_then_error_rolls_back_insert() {
 }
 
 /// A8: COPY TO が途中の文で binary 非対応型を理由に拒否される。後続文は実行されない。
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn wire20_atomic_copy_to_binary_unsupported_in_the_middle_rolls_back_insert() {
     let (core, _guard) = new_core();
@@ -633,6 +634,7 @@ fn wire20_failed_txn_rejects_copy_from_without_entering_copy_in() {
 
 /// B5: 明示トランザクション中の COPY TO が binary 非対応型で拒否されると `'E'`。
 /// 後続文は実行されない。
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn wire20_explicit_txn_copy_to_binary_unsupported_enters_failed() {
     let (core, _guard) = new_core();

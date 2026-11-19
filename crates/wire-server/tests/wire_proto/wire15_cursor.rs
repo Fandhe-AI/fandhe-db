@@ -901,6 +901,7 @@ fn wire15_declare_set_operation_and_cte_join_over_simple_query_isolates_tenants(
 
 /// psql と同じく末尾 `;` 付きで 1 文ずつ送る `DECLARE c SCROLL CURSOR ...;` → `FETCH`
 /// → `CLOSE` が通る。`WITH HOLD` は ErrorResponse `0A000` で Tx が `Failed`（`'E'`）になる。
+// tracked: #3340, #3341
 #[test]
 fn wire15_declare_scroll_cursor_with_trailing_semicolon_over_simple_query() {
     let (core, _guard) = new_core_with_rows();

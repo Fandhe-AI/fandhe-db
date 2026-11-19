@@ -578,6 +578,7 @@ mod tests {
         assert!(check(&["lang"], &["lang", "id", "lang"]).is_ok());
     }
 
+    // intentional: docs/design/select-distinct-on.md
     #[test]
     fn distinct_on_prefix_rejects_column_and_alias_name_collision() {
         // SELECT DISTINCT ON (lang) lang, id AS lang ... ORDER BY body

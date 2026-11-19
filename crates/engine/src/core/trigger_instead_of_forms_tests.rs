@@ -6,6 +6,7 @@ use super::trigger_instead_of_tests::{
 };
 
 // D4: `ON CONFLICT`・`USING OPERATION_ID` は固定の 0A000（書き込み前に拒否し、監査表に何も載らない）。
+// intentional: docs/design/trigger-instead-of.md
 #[test]
 fn conflict_and_operation_id_forms_are_0a000() {
     let (core, _g) = core_with("instof-d4");
