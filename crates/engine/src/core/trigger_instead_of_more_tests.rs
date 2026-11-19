@@ -207,6 +207,7 @@ fn explicit_transaction_trigger_failure_fails_the_transaction() {
 }
 
 // 定義の形: ROW 必須・TRUNCATE／UPDATE OF／WHEN 不可・テーブルは 42809・BEFORE/AFTER のビューは 42809。
+// intentional: docs/design/trigger-instead-of.md
 #[test]
 fn definition_shapes_are_fail_closed() {
     let (core, _g) = core_with("instof-ddl");
@@ -249,6 +250,7 @@ fn definition_shapes_are_fail_closed() {
 }
 
 // 共有 public ビューへの INSTEAD OF は定義時に 0A000（全テナントの書き込みを表現できないため）。
+// intentional: docs/design/trigger-instead-of.md
 #[test]
 fn shared_public_view_is_rejected_at_definition() {
     let (core, _g) = core_with("instof-public");
@@ -267,6 +269,7 @@ fn shared_public_view_is_rejected_at_definition() {
 
 // 未対応の形（RETURNING）は固定の 0A000。トリガ無しのビューは従来どおり 55000
 // （他テナントが同名のビューを持っていても応答は変わらない）。
+// intentional: docs/design/trigger-instead-of.md
 #[test]
 fn unsupported_forms_are_0a000_and_no_trigger_stays_55000() {
     let (core, _g) = core_with("instof-forms");

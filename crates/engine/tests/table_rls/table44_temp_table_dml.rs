@@ -1128,6 +1128,7 @@ fn prepared_statements_are_revalidated_against_the_temp_catalog() {
 
 // ---- カーソル ---------------------------------------------------------------------------------------
 
+// intentional: docs/design/temp-table.md
 #[test]
 fn cursors_over_temp_tables_are_rejected() {
     let (core, _g) = new_core("t44-dml-cursor", LedgerMode::CompareOnlyWithoutLedger);

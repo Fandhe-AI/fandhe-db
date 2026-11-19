@@ -371,6 +371,7 @@ fn resend_is_rejected_and_never_double_applies() {
 }
 
 /// 束縛エラー・変換エラー・上限超過は台帳を消費しない: 同じ op id で修正後の文を実行できる。
+// intentional: docs/design/update-from-delete-using.md
 #[test]
 fn failed_statements_do_not_consume_the_operation_id() {
     let alice = ctx("alice");

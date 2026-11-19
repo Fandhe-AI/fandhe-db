@@ -1075,6 +1075,7 @@ fn distinct_on_over_group_cap_is_54000_for_every_tenant() {
 }
 
 /// 実行段へ重複排除を運べない形は拒否（黙って重複排除を落とさない）。
+// intentional: docs/design/select-distinct-on.md
 #[test]
 fn distinct_on_unsupported_forms_are_rejected_fail_closed() {
     for sql in [

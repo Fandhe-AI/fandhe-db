@@ -198,6 +198,7 @@ fn tilde_tilde_operators_match_like_family() {
 }
 
 /// SQL-9・Issue #3258: 上限・型・未対応形は固定のコードで fail-closed に拒否する。
+// intentional: docs/design/like-wildcard-patterns.md
 #[test]
 fn like_any_all_rejections_are_fail_closed() {
     let (path, _g) = setup("like-quant-reject");

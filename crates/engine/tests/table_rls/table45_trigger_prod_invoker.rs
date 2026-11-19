@@ -204,6 +204,7 @@ fn body_error_does_not_reveal_other_tenants() {
 }
 
 // 共有 public 表への CREATE TRIGGER は定義時に 0A000（Issue #3361 の回帰）。
+// intentional: docs/design/trigger-catalog.md
 #[test]
 fn trigger_on_shared_public_table_is_rejected() {
     let (_g, core) = open("t45prod-public", LedgerMode::Optional);

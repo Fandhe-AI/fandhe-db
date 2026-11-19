@@ -348,6 +348,7 @@ fn explicit_transaction_commit_and_rollback() {
 
 /// 台帳（RECOVER-10/11）: 再送は `23505` で二重適用されず、別文への再利用は `22023`、
 /// 拒否された文は op id を消費しない。
+// intentional: docs/design/update-from-delete-using.md
 #[test]
 fn operation_id_resend_reuse_and_rejection() {
     let alice = ctx("alice");
