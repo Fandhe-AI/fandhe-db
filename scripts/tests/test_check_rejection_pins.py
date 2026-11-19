@@ -590,6 +590,25 @@ class AmbiguousRenameTest(unittest.TestCase):
         new = m("c", "", self.BODY) + m("d", "    // tracked: #2\n", other)
         self.assertEqual(kinds(run_check(P, old, new)), ["missing-annotation"])
 
+    def test_parent_mod_rename_with_blank_line_insertion_is_caught(self):
+        def src(mod, gap):
+            return (f"mod {mod} {{\n    // tracked: #1\n{gap}    #[test]\n    fn reject_x() {{\n"
+                    + self.BODY + "    }\n}\n")
+        old = src("a", "")
+        new = src("b", "\n")
+        for ctx in (0, 3):
+            self.assertEqual(kinds(run_check(P, old, new, context=ctx)), ["missing-annotation"])
+
+    def test_parent_mod_rename_with_blank_line_ambiguous_fails_closed(self):
+        def m(name, gap):
+            return (f"mod {name} {{\n    // tracked: #1\n{gap}    #[test]\n    fn reject_x() {{\n"
+                    + self.BODY + "    }\n}\n")
+        old = m("a", "") + m("b", "")
+        new = m("c", "\n") + m("d", "")
+        for ctx in (0, 3):
+            with self.assertRaises(crp.DiffParseError):
+                run_check(P, old, new, context=ctx)
+
 
 if __name__ == "__main__":
     unittest.main()

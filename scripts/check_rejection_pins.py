@@ -535,6 +535,37 @@ def _body_text(t: TestRange) -> List[str]:
     return [x for k, x in t.lines if k >= t.fn_line]
 
 
+def _find_base_counterpart(
+    t: TestRange,
+    base_by_key: Dict[Tuple[Tuple[str, ...], str], TestRange],
+    head_keys: Set[Tuple[Tuple[str, ...], str]],
+    path: str,
+) -> Optional[TestRange]:
+    """HEAD 側テストに対応する base 側テスト。親 mod 名変更時は同名・末尾一致で対応付ける。
+
+    完全一致が無く、同名の base 候補が複数あり対応を一意に決められない場合は、
+    注記の切り離しを見逃さないよう検査不能（DiffParseError）として失敗させる（fail-closed）。
+    """
+    exact = base_by_key.get((t.module, t.name))
+    if exact is not None:
+        return exact
+    cands = [bt for (m, n), bt in base_by_key.items() if n == t.name and (m, n) not in head_keys]
+    if not cands:
+        return None
+    scored = [(_common_suffix_len(bt.module, t.module), bt) for bt in cands]
+    best = max(sc for sc, _ in scored)
+    top = [bt for sc, bt in scored if sc == best]
+    if len(top) > 1:
+        want = _body_text(t)
+        top = [bt for bt in top if _body_text(bt) == want] or top
+    if len(top) == 1:
+        return top[0]
+    raise DiffParseError(
+        f"{path}: cannot map test '{t.name}' in module {'::'.join(t.module) or '(root)'} "
+        f"to a unique base test ({len(top)} candidates)"
+    )
+
+
 def select_targets(
     file_diffs: List[FileDiff], read_head: ReadFn, read_base: ReadFn
 ) -> List[Tuple[str, TestRange]]:
@@ -552,6 +583,7 @@ def select_targets(
             base_src = read_base(fd.old_path)
             if base_src is not None:
                 base_by_key = {(bt.module, bt.name): bt for bt in find_tests(base_src)}
+        head_keys = {(t.module, t.name) for t in head_tests}
         for t in head_tests:
             last = t.end if t.end is not None else t.fn_line
             if any(t.start <= a <= last for a in fd.added):
@@ -560,7 +592,7 @@ def select_targets(
                 # 注記ブロックの手前（空行・コメント）への追加。無関係な先頭コメントの編集では
                 # 対象にせず、base 側で連続していた注記ブロックが HEAD で切り離された
                 # （ブロック内容が変わった）場合に限り対象にする（D5）
-                bt = base_by_key.get((t.module, t.name))
+                bt = _find_base_counterpart(t, base_by_key, head_keys, fd.new_path)
                 if bt is not None and [x for _, x in bt.block] != [x for _, x in t.block]:
                     out[(fd.new_path, t.fn_line)] = (fd.new_path, t)
         if fd.deleted and fd.old_path is not None:
