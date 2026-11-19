@@ -201,6 +201,7 @@ fn extended_protocol_view_insert_reaches_instead_of_trigger() {
 
 /// 未対応の形は `0A000`、トリガの無い別テナントの同名ビューは従来どおり `55000`。どちらの応答にも
 /// テナント・内部キーを含めない。
+// intentional: docs/design/trigger-instead-of.md
 #[test]
 fn unsupported_forms_and_untriggered_views_do_not_leak() {
     let (core, _g) = new_core();

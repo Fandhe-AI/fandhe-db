@@ -208,6 +208,7 @@ fn operation_id_forms_report_tags_resend_and_reuse_errors() {
 /// FROM／USING 内の `JOIN ... ON` と 3 表の形（Issue #3294）も、末尾 `;` 付き単独送信（psql 形）で正確な
 /// タグを返し、明示トランザクションの ROLLBACK で巻き戻る。未対応の結合形（`JOIN ... USING`）は
 /// `0A000` で拒否され、接続は ReadyForQuery（`I`）へ戻って使い続けられる。
+// intentional: docs/design/update-from-delete-using.md
 #[test]
 fn join_on_and_three_table_forms_report_exact_tags() {
     let (core, _g) = new_core();

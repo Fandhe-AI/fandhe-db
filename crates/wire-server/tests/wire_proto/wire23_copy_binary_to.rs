@@ -268,6 +268,7 @@ fn wire23_copy_to_binary_legacy_syntax_matches_new_syntax() {
     assert_eq!(a, b);
 }
 
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn wire23_copy_to_binary_unsupported_type_is_rejected_before_copy_out() {
     let (core, _g) = new_core();
@@ -321,6 +322,7 @@ fn wire23_copy_to_binary_followed_by_select_responds_in_order() {
     assert_eq!(read_ready_for_query_status(&mut s), b'I');
 }
 
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn wire23_copy_to_binary_in_transaction_sees_uncommitted_and_failure_marks_failed() {
     let (core, _g) = new_core();
@@ -341,6 +343,7 @@ fn wire23_copy_to_binary_in_transaction_sees_uncommitted_and_failure_marks_faile
     assert_eq!(read_ready_for_query_status(&mut s), b'E');
 }
 
+// intentional: docs/design/wire-copy-protocol.md
 #[test]
 fn wire23_copy_to_binary_conflicting_option_is_rejected() {
     let (core, _g) = new_core();

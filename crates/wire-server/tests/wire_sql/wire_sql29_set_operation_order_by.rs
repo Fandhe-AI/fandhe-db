@@ -105,6 +105,7 @@ fn first_error_code_until_ready(s: &mut Stream) -> Option<String> {
 
 /// 簡易クエリ: 全体 `ORDER BY` はソート順の行を返す（末尾 `;`・`OFFSET`／`LIMIT`／`FETCH` を含む）。
 /// 誤りの形は従来の SQLSTATE のままで、各エラーの後も接続は継続する。
+// intentional: docs/design/set-operations.md
 #[test]
 fn set_operation_order_by_simple_query_sorts_and_classifies() {
     let (core, _guard) = new_core();
@@ -188,6 +189,7 @@ fn drain_until_ready(s: &mut Stream) -> (Vec<String>, bool, Option<String>) {
 
 /// 拡張クエリ: Describe の列と Execute の行が一致し（ソート順）、誤りの形は Describe と Execute で
 /// 同じ SQLSTATE を返す。
+// intentional: docs/design/set-operations.md
 #[test]
 fn set_operation_order_by_extended_query_describe_matches_execute() {
     let (core, _guard) = new_core();
