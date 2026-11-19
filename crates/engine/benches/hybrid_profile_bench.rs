@@ -281,12 +281,9 @@ fn main() {
     while next_id < num_docs {
         let batch_len = SEED_BATCH_ROWS.min(num_docs - next_id);
         let mut metadata_batch: Vec<Vec<u8>> = Vec::with_capacity(batch_len);
-        for i in next_id..next_id + batch_len {
-            let encoded = encode_scalar_columns(
-                &schema,
-                &[Value::Null, Value::Text(corpus.bodies[i].clone())],
-            )
-            .expect("encode scalar columns for bench seeding");
+        for body in corpus.bodies.iter().skip(next_id).take(batch_len) {
+            let encoded = encode_scalar_columns(&schema, &[Value::Null, Value::Text(body.clone())])
+                .expect("encode scalar columns for bench seeding");
             metadata_batch.push(encoded);
         }
         let rows: Vec<(u64, RowInput<'_>)> = (0..batch_len)
