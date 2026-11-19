@@ -164,6 +164,12 @@ class FindTestsTest(unittest.TestCase):
         (t,) = crp.find_tests(src)
         self.assertEqual((t.start, t.end), (2, 5))
 
+    def test_empty_mod_on_one_line_does_not_raise_or_stay_on_stack(self):
+        for decl in ("mod empty {}", "pub mod empty { }", "mod empty {} // x"):
+            src = decl + "\nmod t {\n    #[test]\n    fn a() {\n        x();\n    }\n}\n"
+            (t,) = crp.find_tests(src)
+            self.assertEqual(t.module, ("t",))
+
     def test_non_test_fn_ignored(self):
         self.assertEqual(crp.find_tests("fn a() {\n}\n"), [])
 
@@ -369,6 +375,11 @@ class SameNameModuleTest(unittest.TestCase):
         ts = crp.find_tests(self.SRC)
         self.assertEqual([(t.module, t.name) for t in ts],
                          [(("a",), "reject_unsupported"), (("b",), "reject_unsupported")])
+
+    def test_empty_mod_in_changed_file_is_not_a_violation(self):
+        old = "mod empty {}\nfn helper() {\n}\n" + self.SRC
+        new = old.replace("fn helper() {\n}", "fn helper() {\n    1;\n}")
+        self.assertEqual(run_check(P, old, new), [])
 
     def test_deleting_a_does_not_target_b(self):
         new = self.SRC.replace(

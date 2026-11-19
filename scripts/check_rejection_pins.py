@@ -378,6 +378,11 @@ _MOD_RE = re.compile(
     r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+((?:r#)?[^\W\d]\w*)\s*\{"
     r"\s*(?://.*|/\*.*?\*/\s*)?$"
 )
+# 同じ行で閉じる空モジュール（`mod x {}`）。スタックへ積まず読み進める（D4・D5）
+_EMPTY_MOD_RE = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:r#)?[^\W\d]\w*\s*\{\s*\}"
+    r"\s*(?://.*|/\*.*?\*/\s*)?$"
+)
 # `mod` を含むブロック開始行を _MOD_RE で解釈できない場合は所属不明として失敗させる（fail-closed）
 _MOD_WORD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\b[^;]*\{")
 
@@ -449,6 +454,12 @@ def find_tests(text: str) -> List[TestRange]:
             continue
         if mod_stack and _masked_line(masked, i).rstrip() == mod_stack[-1][0] + "}":
             mod_stack.pop()
+            block = []
+            has_test = False
+            test_line = 0
+            i += 1
+            continue
+        if _EMPTY_MOD_RE.match(_masked_line(masked, i)):
             block = []
             has_test = False
             test_line = 0
