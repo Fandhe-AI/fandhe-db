@@ -5,7 +5,7 @@
 #       適用し、注記（tracked: / intentional:）の無い拒否固定テストと書式不正の注記を検出する。
 #       判定の本体は同じディレクトリの check_rejection_pins.py（標準ライブラリのみ）。
 #       本スクリプトは使用法・基準 ref の検証・Python 中核の起動だけを受け持つ。
-# 呼び出し元: 人。Makefile・CI への結線は後続の #3165 で行う。
+# 呼び出し元: 人・`make rejection-pin-check`（`make ci` に含む）・ci.yml の rejection-pin-check ジョブ（Issue #3165。基準 ref は origin/main 固定）。
 # 使い方: scripts/check_rejection_pins.sh <base-ref>   例: scripts/check_rejection_pins.sh origin/main
 # 終了コード: 0 = 違反なし / 1 = 違反あり・検査不能（fail-closed） / 2 = 使用法の誤り
 # 前提: オフラインで動く（ネットワーク・gh は使わない）。HEAD のコミット内容だけを読み、

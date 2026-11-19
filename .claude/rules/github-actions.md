@@ -30,7 +30,7 @@ branch protection（classic）は未設定。主なジョブ名:
 
 | 区分 | 必須チェック名 |
 | ---- | -------------- |
-| `ci.yml` の独立ジョブ | `test-default-build`・`crash-test`（Issue #2157 のバックアップ復元の段は前提ターゲットとして同ジョブで実行。新規ジョブなし）・`crash-test-interrupt`・`crash-test-cross-table`・`crash-test-unique-index`・`crash-test-partitioned-dml`・`crash-test-temp-table`・`crash-test-view-write`・`crash-test-sequence`・`crash-test-gin-index`・`change-log-oracle`（マージ後に必須へ追加予定）・`tmp-leak-check`・`core-api-check`・`sort-determinism-check`・`scripts-test`・`simd-codegen-check`・`cross-check` |
+| `ci.yml` の独立ジョブ | `test-default-build`・`crash-test`（Issue #2157 のバックアップ復元の段は前提ターゲットとして同ジョブで実行。新規ジョブなし）・`crash-test-interrupt`・`crash-test-cross-table`・`crash-test-unique-index`・`crash-test-partitioned-dml`・`crash-test-temp-table`・`crash-test-view-write`・`crash-test-sequence`・`crash-test-gin-index`・`change-log-oracle`（マージ後に必須へ追加予定）・`tmp-leak-check`・`core-api-check`・`sort-determinism-check`・`rejection-pin-check`（マージ後に必須へ追加予定）・`scripts-test`・`simd-codegen-check`・`cross-check` |
 | `ci.yml` の reusable（lint-docs） | `lint-docs / markdownlint`・`lint-docs / yamllint`・`lint-docs / editorconfig-checker`・`lint-docs / commitlint`・`lint-docs / lint-docs-complete`（集約） |
 | `ci.yml` の reusable（rust-ci） | `rust-ci / cargo fmt --check`・`rust-ci / cargo clippy`・`rust-ci / cargo test`・`rust-ci / cargo deny check`・`rust-ci / rust-base-ci-complete`（集約） |
 | `ai-review.yml` | `skip-guard`・`codex / preflight`・`codex / review`・`codex / post_feedback` |
@@ -59,7 +59,7 @@ branch protection（classic）は未設定。主なジョブ名:
 
 1. 新しいワークフローを作らず、既存ワークフローへのジョブ追加を優先する（ワークフロー数を増やさない）
 2. 必須にするジョブ名は ruleset の更新が要る。命名は既存ジョブ（kebab-case）に揃える
-3. 独立ジョブ（生の steps）は `permissions: contents: read`・`timeout-minutes`・SHA 固定の `actions/checkout`（`fetch-depth` は既定の 1 のまま。submodule は取得しない）にする
+3. 独立ジョブ（生の steps）は `permissions: contents: read`・`timeout-minutes`・SHA 固定の `actions/checkout`（`fetch-depth` は既定の 1 のまま。ただし `rejection-pin-check` は `origin/main` との merge-base を取るため `fetch-depth: 0`。submodule は取得しない）にする
 4. 不要な `needs` を作らない（独立ジョブは並列）。逆に、セットアップ（checkout・toolchain）が実行時間を支配する小さなジョブは統合を検討する
 5. チェックの中身は `Makefile`/`scripts/` の共通コマンド（`make <target>`）を呼ぶ。CI 独自にロジックを書かない（[makefile](./makefile.md)）。`ci` ターゲットとの対応も保つ
 6. cargo ビルドを伴うジョブは `CARGO_INCREMENTAL=0`（`ci.yml` は workflow の `env:`）。reusable の rust-ci は `cache: true` で cargo キャッシュを使う。独立ジョブはキャッシュを持たないため、重いビルドを足す前に reusable 側（Fandhe-AI/actions）への取り込みを検討する

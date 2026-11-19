@@ -188,6 +188,11 @@ core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差�
 sort-determinism-check: ## RRF 融合等のソート非決定性 API 再混入検知
 	@scripts/sort_determinism_check.sh
 
+# 拒否固定テストの注記検査（Issue #3164・#3165。origin/main との merge-base からの差分に ADR rejection-pin-annotation の D2〜D9 を適用。基準は固定で上書き不可。先に git fetch origin で origin/main を最新にする）
+.PHONY: rejection-pin-check
+rejection-pin-check: ## 拒否固定テストの注記（tracked:／intentional:）検査（origin/main からの差分）
+	@scripts/check_rejection_pins.sh origin/main
+
 # TASK-156（CORE-14）aarch64 クロスコンパイル確認。cargo check のみ（リンクしないためクロスリンカ不要）。手元に target 未導入でも make ci を壊さないよう独立ターゲットとする（bench-* と同方針）。`contrast-bench` feature を付けないため usearch（TASK-127 CORE-5・Issue #176。C++ ビルドを伴う）は本コマンドの対象に含まれない
 .PHONY: check-cross
 check-cross: ## aarch64 クロスコンパイル確認（cargo check のみ）
@@ -239,7 +244,7 @@ worktree-lag-check-selftest: ## worktree-lag-check のセルフテスト
 	@scripts/tests/check_worktree_lag_test.sh
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-ddl crash-test-txn-kill-points crash-test-unique-index crash-test-partitioned-dml crash-test-temp-table crash-test-view-write crash-test-sequence crash-test-gin-index change-log-oracle tmp-leak-check core-api-check sort-determinism-check scripts-test simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test test-default-build crash-test crash-test-interrupt crash-test-cross-table crash-test-ddl crash-test-txn-kill-points crash-test-unique-index crash-test-partitioned-dml crash-test-temp-table crash-test-view-write crash-test-sequence crash-test-gin-index change-log-oracle tmp-leak-check core-api-check sort-determinism-check rejection-pin-check scripts-test simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 .PHONY: bench-simd

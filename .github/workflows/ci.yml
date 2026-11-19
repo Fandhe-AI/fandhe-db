@@ -406,6 +406,28 @@ jobs:
         run: make sort-determinism-check
 
   # --------------------------------------------------
+  # rejection-pin-check（拒否固定テストの注記検査。Issue #3165・実装は #3164）
+  # --------------------------------------------------
+  # origin/main との merge-base からの差分に、注記（tracked:／intentional:）の無い
+  # 拒否固定テストや書式不正の注記が無いことを scripts/check_rejection_pins.sh で検査する。
+  # 判断の根拠は docs/design/rejection-pin-annotation.md 参照。
+  # merge-base を取るため本ジョブだけ fetch-depth: 0（github-actions.md チェックリスト 3 の例外）。
+  # push（main）では HEAD と origin/main が同一で差分が空になり自明に成功する。main 上の
+  # 網羅検査ではなく、PR 側の検査が本体である。必須チェックへの追加はオーナー作業。
+  rejection-pin-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - name: Run rejection-pin-check
+        run: make rejection-pin-check
+
+  # --------------------------------------------------
   # scripts-test（scripts/ 配下の Python 補助スクリプトの単体テスト）
   # --------------------------------------------------
   # `python3 -m unittest discover scripts/tests`（Makefile の scripts-test）を実行する。
