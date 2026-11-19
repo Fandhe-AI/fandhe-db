@@ -54,9 +54,11 @@ _DISALLOWED_DOCS = {"docs/design/implementation-status.md"}
 
 _FN_RE = re.compile(
     r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
-    r'(?:extern\s+"[^"]*"\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)',
-    _A,
+    r'(?:extern\s+"[^"]*"\s+)?fn\s+((?:r#)?[^\W\d]\w*)',
 )
+# fn 名は Rust の Unicode 識別子（XID 相当を str の \w で近似）も認識する。
+# `fn` を含むのに _FN_RE で解釈できない行は検査不能として失敗させる（fail-closed）
+_FN_WORD_RE = re.compile(r"\bfn\b")
 # コメントを除いた属性テキスト全体が `#[test]` のときだけテスト属性とみなす（D4）
 _TEST_ATTR_RE = re.compile(r"^\s*#\s*\[\s*test\s*\]\s*$", _A)
 _RAW_OPEN_RE = re.compile(r'b?r(#*)"', _A)
@@ -477,6 +479,10 @@ def find_tests(text: str) -> List[TestRange]:
             i = end_i + 1
             continue
         m = _FN_RE.match(line)
+        if has_test and not m and _FN_WORD_RE.search(_masked_line(masked, i)):
+            raise DiffParseError(
+                f"cannot parse fn after #[test] at line {ln} (unsupported fn declaration)"
+            )
         if m and has_test:
             indent, name = m.group(1), m.group(2)
             end: Optional[int] = None

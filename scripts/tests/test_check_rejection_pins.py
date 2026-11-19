@@ -610,5 +610,23 @@ class AmbiguousRenameTest(unittest.TestCase):
                 run_check(P, old, new, context=ctx)
 
 
+class UnicodeFnNameTest(unittest.TestCase):
+    """Unicode 識別子の fn も検査対象にし、解釈不能な fn は検査不能として失敗させる（D4・fail-closed）。"""
+
+    def test_unicode_fn_name_detected(self):
+        src = '#[test]\nfn 拒否を確認() {\n    assert_eq!(err.wire_code(), "0A000");\n}\n'
+        self.assertEqual([t.name for t in crp.find_tests(src)], ["拒否を確認"])
+        self.assertEqual(kinds(run_check(P, None, src)), ["missing-annotation"])
+
+    def test_raw_identifier_detected(self):
+        src = "#[test]\nfn r#type() {\n}\n"
+        self.assertEqual([t.name for t in crp.find_tests(src)], ["r#type"])
+
+    def test_unparsable_fn_after_test_attr_fails(self):
+        src = "#[test]\nfn 1bad() {\n}\n"
+        with self.assertRaises(crp.DiffParseError):
+            crp.find_tests(src)
+
+
 if __name__ == "__main__":
     unittest.main()
