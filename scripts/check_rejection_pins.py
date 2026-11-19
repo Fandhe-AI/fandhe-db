@@ -480,11 +480,14 @@ def find_tests(text: str) -> List[TestRange]:
         if m and has_test:
             indent, name = m.group(1), m.group(2)
             end: Optional[int] = None
-            if _ONE_LINE_FN_RE.search(line):
+            if _ONE_LINE_FN_RE.search(_masked_line(masked, i)):
                 end = ln
             else:
                 closer = indent + "}"
                 for j in range(i + 1, n):
+                    # 複数行文字列・コメント内の同インデント `}` を終端と誤認しない（fail-closed）
+                    if j < len(line_states) and line_states[j] != "code":
+                        continue
                     if _masked_line(masked, j).rstrip() == closer:
                         end = j + 1
                         break

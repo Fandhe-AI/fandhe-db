@@ -139,6 +139,21 @@ class FindTestsTest(unittest.TestCase):
         (t,) = crp.find_tests("#[test]\nfn a() {\n    x();\n")
         self.assertIsNone(t.end)
 
+    def test_one_line_fn_with_trailing_comment(self):
+        (t,) = crp.find_tests("#[test]\nfn a() {} // note\n")
+        self.assertEqual(t.end, 2)
+        a, b = crp.find_tests("#[test]\nfn a() {} // note\n#[test]\nfn b() {\n}\n")
+        self.assertEqual(a.end, 2)
+        self.assertEqual(b.end, 5)
+
+    def test_closer_inside_multiline_string_is_not_end(self):
+        src = '#[test]\nfn a() {\n    let s = "x\n}\ny";\n    assert_eq!(e, "0A000");\n}\n'
+        (t,) = crp.find_tests(src)
+        self.assertEqual(t.end, 7)
+        src = '#[test]\nfn a() {\n    let s = r#"x\n}\ny"#;\n    assert_eq!(e, "0A000");\n}\n'
+        (t,) = crp.find_tests(src)
+        self.assertEqual(t.end, 7)
+
     def test_format_braces_do_not_break_range(self):
         src = '#[test]\nfn a() {\n    f("{sql} {");\n}\n#[test]\nfn b() {\n}\n'
         a, b = crp.find_tests(src)
