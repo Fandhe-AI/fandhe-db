@@ -610,6 +610,36 @@ class AmbiguousRenameTest(unittest.TestCase):
                 run_check(P, old, new, context=ctx)
 
 
+class ScopeAmbiguityTest(unittest.TestCase):
+    """raw 識別子・Unicode 名の mod と mod 以外のスコープの同名テストで注記切り離しを見逃さない（D5・fail-closed）。"""
+
+    BODY = '        assert_eq!(err.wire_code(), "0A000");\n'
+
+    def _mods(self, a, b, gap):
+        return (f"mod {a} {{\n    // tracked: #1\n{gap}    #[test]\n    fn reject_x() {{\n" + self.BODY
+                + f"    }}\n}}\nmod {b} {{\n    #[test]\n    fn reject_x() {{\n" + self.BODY + "    }\n}\n")
+
+    def test_raw_and_unicode_mod_names_recorded(self):
+        src = self._mods("r#type", "モジュール", "")
+        self.assertEqual([t.module for t in crp.find_tests(src)], [("r#type",), ("モジュール",)])
+
+    def test_detached_annotation_in_raw_ident_mod_is_caught(self):
+        old = self._mods("r#type", "r#match", "")
+        new = self._mods("r#type", "r#match", "\n")
+        self.assertEqual(kinds(run_check(P, old, new)), ["missing-annotation"])
+
+    def test_unparsable_mod_name_fails_closed(self):
+        with self.assertRaises(crp.DiffParseError):
+            crp.find_tests("mod a::b {\n    #[test]\n    fn reject_x() {\n    }\n}\n")
+
+    def test_same_name_in_sibling_impl_blocks_fails_closed(self):
+        def src(gap):
+            return ("impl A {\n    // tracked: #1\n" + gap + "    #[test]\n    fn reject_x() {\n" + self.BODY
+                    + "    }\n}\nimpl B {\n    #[test]\n    fn reject_x() {\n" + self.BODY + "    }\n}\n")
+        with self.assertRaises(crp.DiffParseError):
+            run_check(P, src(""), src("\n"))
+
+
 class UnicodeFnNameTest(unittest.TestCase):
     """Unicode 識別子の fn も検査対象にし、解釈不能な fn は検査不能として失敗させる（D4・fail-closed）。"""
 

@@ -375,9 +375,11 @@ def _lex(text: str) -> Tuple[str, List[str]]:
 
 
 _MOD_RE = re.compile(
-    r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{"
+    r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+((?:r#)?[^\W\d]\w*)\s*\{"
     r"\s*(?://.*|/\*.*?\*/\s*)?$"
 )
+# `mod` を含むブロック開始行を _MOD_RE で解釈できない場合は所属不明として失敗させる（fail-closed）
+_MOD_WORD_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\b[^;]*\{")
 
 
 def _walk_back_over_comments(lines: List[str], start: int) -> int:
@@ -453,6 +455,8 @@ def find_tests(text: str) -> List[TestRange]:
             i += 1
             continue
         mm = _MOD_RE.match(line)
+        if not mm and _MOD_WORD_RE.match(_masked_line(masked, i)):
+            raise DiffParseError(f"cannot parse mod declaration at line {ln} (unsupported mod name)")
         if mm:
             mod_stack.append((mm.group(1), mm.group(2)))
             block = []
@@ -572,6 +576,24 @@ def _find_base_counterpart(
     )
 
 
+def _index_tests(tests: List[TestRange], path: str) -> Dict[Tuple[Tuple[str, ...], str], TestRange]:
+    """(module, name) をキーにテストを索引化する。同キーが複数あれば検査不能として失敗させる（fail-closed）。
+
+    別々の impl ブロック等 mod 以外のスコープにある同名テストは所属が曖昧になり、
+    注記切り離しの検出を回避できてしまうため（D5）。
+    """
+    out: Dict[Tuple[Tuple[str, ...], str], TestRange] = {}
+    for bt in tests:
+        key = (bt.module, bt.name)
+        if key in out:
+            raise DiffParseError(
+                f"{path}: ambiguous duplicate test '{bt.name}' in module "
+                f"{'::'.join(bt.module) or '(root)'} (cannot determine scope)"
+            )
+        out[key] = bt
+    return out
+
+
 def select_targets(
     file_diffs: List[FileDiff], read_head: ReadFn, read_base: ReadFn
 ) -> List[Tuple[str, TestRange]]:
@@ -584,11 +606,12 @@ def select_targets(
         if head_text is None:
             continue
         head_tests = find_tests(head_text)
+        _index_tests(head_tests, fd.new_path)
         base_by_key: Dict[Tuple[Tuple[str, ...], str], TestRange] = {}
         if fd.old_path is not None:
             base_src = read_base(fd.old_path)
             if base_src is not None:
-                base_by_key = {(bt.module, bt.name): bt for bt in find_tests(base_src)}
+                base_by_key = _index_tests(find_tests(base_src), fd.old_path)
         head_keys = {(t.module, t.name) for t in head_tests}
         for t in head_tests:
             last = t.end if t.end is not None else t.fn_line
