@@ -54,7 +54,7 @@ make skill（`.claude/skills/make`）の方針に従い、Makefile に処理を�
 
 | 種別 | ターゲット | 契約 |
 | ---- | ---------- | ---- |
-| 検査（ソース不変） | `fmt-check`・`lint`・`test`・`lint-docs`・`core-api-check`・`sort-determinism-check`・`simd-codegen-check`・`deny`・`scripts-test` | ソース・設定を変更しない（ビルド成果物・キャッシュは可）。失敗は非 0 終了 |
+| 検査（ソース不変） | `fmt-check`・`lint`・`test`・`lint-docs`・`core-api-check`・`sort-determinism-check`・`rejection-pin-check`・`simd-codegen-check`・`deny`・`scripts-test` | ソース・設定を変更しない（ビルド成果物・キャッシュは可）。失敗は非 0 終了 |
 | 修正 | `fmt` | 整形のみ。それ以外の自動修正をここに足さない |
 | 環境構築 | `setup`・`rustup`・`submodule`・`hooks` | 再実行しても安全。`docs/spec` は private のため取得失敗は警告のみで成功終了（ビルドは spec 抜きで成立させる） |
 | 集約 | `ci` | `ci.yml` と同等のチェックを一括実行する。`ci.yml` にジョブを足したら `ci` の依存にも足す（逆も同様） |

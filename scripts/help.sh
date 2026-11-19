@@ -117,6 +117,9 @@ cat <<'EOF'
   sort-determinism-check
       RRF 融合等のソート非決定性 API 再混入検知
       $ scripts/sort_determinism_check.sh
+  rejection-pin-check
+      拒否固定テストの注記（tracked:／intentional:）検査（origin/main からの差分）
+      $ scripts/check_rejection_pins.sh origin/main
   check-cross
       aarch64 クロスコンパイル確認（cargo check のみ）
       $ cargo check -p fandhe-db-engine --all-targets --target aarch64-unknown-linux-gnu
@@ -174,6 +177,7 @@ cat <<'EOF'
       $ scripts/check_tmp_leak.sh
       $ scripts/core_api_check.sh
       $ scripts/sort_determinism_check.sh
+      $ scripts/check_rejection_pins.sh origin/main
       $ python3 -m unittest discover scripts/tests
       $ scripts/simd_codegen_check.sh
       $ scripts/deny.sh

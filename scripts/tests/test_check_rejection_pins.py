@@ -669,5 +669,78 @@ class UnicodeFnNameTest(unittest.TestCase):
             crp.find_tests(src)
 
 
+class CiCheckoutShapeTest(unittest.TestCase):
+    """ci.yml の rejection-pin-check ジョブの取得形（Issue #3165）を再現する。
+
+    pull_request の HEAD は main へ PR を --no-ff で取り込んだマージコミットで、
+    `make rejection-pin-check` は固定の基準 `origin/main` を使う。全履歴取得
+    （fetch-depth: 0）なら検査でき、浅い取得では fail-closed で失敗することを固定する。
+    """
+
+    def _origin(self, tmp, body):
+        repo = Path(tmp) / "origin"
+        (repo / "crates/engine/tests").mkdir(parents=True)
+        (repo / "docs/design").mkdir(parents=True)
+        (repo / "docs/design/x.md").write_text("# x\n")
+        tf = repo / "crates/engine/tests/t.rs"
+        tf.write_text("fn base() {\n}\n")
+
+        def git(*a, cwd=repo):
+            subprocess.run(["git", *GIT_FLAGS, "-C", str(cwd), *a], check=True,
+                           env=GIT_ENV, capture_output=True)
+
+        git("init", "-q")
+        git("add", ".")
+        git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "topic")
+        tf.write_text("fn base() {\n}\n" + body)
+        git("add", ".")
+        git("commit", "-q", "-m", "change")
+        git("checkout", "-q", "main")
+        # main が PR 作成後に進んだ状況（merge-base が第 1 親と異なる）を再現する
+        (repo / "docs/design/y.md").write_text("# y\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "main advance")
+        git("checkout", "-q", "-b", "pr")
+        git("merge", "-q", "--no-ff", "-m", "merge", "topic")
+        return repo
+
+    def _clone(self, tmp, origin, *extra):
+        dest = Path(tmp) / "clone"
+        subprocess.run(["git", *GIT_FLAGS, "clone", "-q", *extra,
+                        f"file://{origin}", str(dest)],
+                       check=True, env=GIT_ENV, capture_output=True)
+        (dest / "scripts").mkdir(exist_ok=True)
+        for n in ("check_rejection_pins.sh", "lib.sh", "check_rejection_pins.py"):
+            shutil.copy(SCRIPTS / n, dest / "scripts" / n)
+        return dest
+
+    def _run(self, repo):
+        return subprocess.run(
+            ["bash", str(repo / "scripts/check_rejection_pins.sh"), "origin/main"],
+            capture_output=True, text=True, env=GIT_ENV, cwd=repo,
+        )
+
+    def test_full_clone_detects_missing_annotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = self._origin(tmp, REJECT_BODY)
+            r = self._run(self._clone(tmp, origin, "--no-local"))
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertIn("create_in_tenant_schema_is_unsupported", r.stdout)
+
+    def test_full_clone_passes_with_annotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = self._origin(tmp, "// tracked: #3171\n" + REJECT_BODY)
+            r = self._run(self._clone(tmp, origin, "--no-local"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_shallow_clone_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            origin = self._origin(tmp, "// tracked: #3171\n" + REJECT_BODY)
+            r = self._run(self._clone(tmp, origin, "--no-local", "--depth", "1",
+                                      "--no-single-branch"))
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
