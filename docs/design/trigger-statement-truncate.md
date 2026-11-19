@@ -14,8 +14,9 @@ Issue #1726（親 #1720）の実装記録。上位の決定は [trigger-executio
   発火しない（PostgreSQL と同じ）
 - NEW／OLD は持たない（`old_row: None`・`new_row` は空。D1）。戻り値は無視する（D3）。`TG_LEVEL` は
   `TriggerCall::tg_level()`、`TG_OP` に `TRUNCATE` を追加した
-- 遷移テーブル（REFERENCING）・INSTEAD OF・CONSTRAINT TRIGGER・DEFERRABLE・TRUNCATE の行トリガは、定義の段で
-  `0A000`（#1722 で実装済み。`sql::allowlist::trigger` の `unsupported_forms_are_0a000` が回帰を担保する）
+- 遷移テーブル（REFERENCING）・CONSTRAINT TRIGGER・DEFERRABLE・TRUNCATE の行トリガは、定義の段で
+  `0A000`（#1722 で実装済み。`sql::allowlist::trigger` の `unsupported_forms_are_0a000` が回帰を担保する）。
+  INSTEAD OF はビューへの ROW だけ受理する（Issue #3193。[trigger-instead-of.md](trigger-instead-of.md)）
 
 ## 1 文のライフサイクル（D4 の段との対応）
 
@@ -40,7 +41,7 @@ Issue #1726（親 #1720）の実装記録。上位の決定は [trigger-executio
 | UPDATE／DELETE の述語形 | 発火。BEFORE STATEMENT が書いた行は対象に入り、AFTER STATEMENT が書いた行は入らない（D5） |
 | 結合形 UPDATE の内部実行器 | UPDATE 文トリガがあれば `0A000`（S10: SET 列が列挙の後でしか確定せず、BEFORE STATEMENT を前に置けない） |
 | TRUNCATE（Autocommit・明示 Tx） | 発火（下記） |
-| 公開の `sql::exec::execute_truncate`・RETURNING 付き・UPSERT・分割実行・NoSQL・生の行 API・参照アクションが及ぶ子表 | 文トリガ（TRUNCATE を含む）があれば `0A000`（通過証を渡さない） |
+| 公開の `sql::exec::execute_truncate`・RETURNING 付き UPSERT・分割実行・NoSQL・生の行 API・参照アクションが及ぶ子表（UPSERT 本体は Issue #3191 で、SQL 表層の RETURNING 付き INSERT／UPDATE／DELETE は Issue #3192 で発火する） | 文トリガ（TRUNCATE を含む）があれば `0A000`（通過証を渡さない） |
 | 一時表 | トリガを定義できない（定義の段で `0A000`） |
 
 ## TRUNCATE の順序
@@ -66,7 +67,7 @@ PostgreSQL と同じく、全表の BEFORE → 削除 → 全表の AFTER の順
 | 結合形 UPDATE の文トリガは `0A000` | 上記 S10。SQL の dispatch はもともと未結線 |
 | `INSERT ... SELECT`・サブクエリ形の内側の評価は write txn より前に行われうる | BEFORE STATEMENT の書き込みが内側の評価から見えない場合がある。発火の回数は守るので fail-open ではない |
 | ビューへの文トリガは `42809` のまま（D8 は `0A000` を想定） | どちらも拒否。SQLSTATE の統一は範囲外 |
-| 文トリガの `WHEN` は発火時にも `0A000` | 定義時の拒否の二重化 |
+| 文トリガの `WHEN` は発火時にも `0A000` | 定義時の拒否の二重化（Issue #3190 でも文トリガの `WHEN` は定義時に `0A000`） |
 
 ## セキュリティ上の性質
 
@@ -80,7 +81,7 @@ PostgreSQL と同じく、全表の BEFORE → 削除 → 全表の AFTER の順
 
 ## 対象外・引き継ぎ
 
-- UPSERT・RETURNING 付き・NoSQL・COPY・分割実行・参照アクションの子表での文トリガの発火（`0A000` のまま）
+- RETURNING 付き UPSERT・NoSQL・COPY・分割実行・参照アクションの子表での文トリガの発火（`0A000` のまま）
 - 結合形 UPDATE の文トリガ（SQL の dispatch の結線と一緒に行う）
 - `RESTART IDENTITY` と TRUNCATE トリガの組み合わせ
 - 入れ子の深さの上限（#1727）、台帳と crash-test の整合（#1728）、自己変更の衝突 `27000` と窓口の拡張（#2226）、

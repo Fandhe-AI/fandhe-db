@@ -20,6 +20,10 @@
 //! - 可変長要素の本文の累計 [`MAX_ARRAY_AGG_PAYLOAD_BYTES`]
 //! - 溜めた状態の大きさ [`MAX_ARRAY_AGG_STATE_BYTES`]（1 件あたりの固定見積りを含む）
 //!
+//! `json_agg`・`jsonb_agg`（Issue #3264）も同じ状態を使い、確定時だけ [`crate::sql::json_agg`] が
+//! JSON テキストへ書く。要素数の上限は JSON 列の要素数上限（`MAX_JSON_CONTAINER_ITEMS`）になる
+//! （配列の 1,024 件では実用上狭いため）。それ以外の上限・`54000` の契約は共通。
+//!
 //! 上限判定はテナントの可視行だけで決まり、他テナントの行の有無に依存しない。
 
 use std::cmp::Ordering;
@@ -36,7 +40,9 @@ use crate::sql::order_value::{
     compare_order_key, expr_value_to_order_value, extract_column_order_value_ref,
     scalar_key_ref_to_owned, NullPlacement, OrderValue,
 };
-use crate::sql::parser::{ArrayAggInput, ArrayAggValue, StringAggKeySource, StringAggOrderKey};
+use crate::sql::parser::{
+    ArrayAggInput, ArrayAggOutput, ArrayAggValue, StringAggKeySource, StringAggOrderKey,
+};
 use crate::sql::udf_call::{self, ExprValue};
 use crate::uuid::Uuid;
 
@@ -65,17 +71,33 @@ const PAYLOAD_TOO_LARGE_DETAIL: &str = "array_agg result exceeds the allowed siz
 /// 溜めた状態の超過。
 const STATE_TOO_LARGE_DETAIL: &str = "array_agg accumulated state exceeds the allowed size";
 
+/// [`ArrayAggState::finish`] の確定結果（`array_agg` は配列、`json_agg`・`jsonb_agg` は JSON テキスト）。
+#[derive(Debug, PartialEq)]
+pub(crate) enum ArrayAggFinished {
+    Array(ArrayValue),
+    /// `json` 型の配列テキスト。
+    Json(String),
+}
+
 /// 所有された要素値 1 個（[`ArrayValue`] の要素型 variant と 1 対 1）。
 #[derive(Clone)]
 enum Elem {
     Text(String),
     Bool(bool),
     Integer(i32),
+    /// `SMALLINT`（Issue #3230）。
+    SmallInt(i16),
     BigInt(i64),
     Real(f32),
     Double(f64),
     Date(i32),
     Timestamp(i64),
+    /// `TIME`（Issue #3232）。0 時起点のマイクロ秒。
+    Time(i64),
+    /// `INTERVAL`（Issue #3234）。生の三要素を保ち、`DISTINCT` の鍵だけ正規化キーにする。
+    Interval(crate::datetime::Interval),
+    /// `TIMESTAMPTZ`（Issue #3233）。UTC 起点のマイクロ秒。
+    TimestampTz(i64),
     Uuid(Uuid),
     Numeric(Decimal),
     Bytea(Vec<u8>),
@@ -113,7 +135,14 @@ impl Elem {
             Elem::Bytea(b) => out.extend_from_slice(b),
             Elem::Bool(b) => out.push(u8::from(*b)),
             Elem::Integer(v) | Elem::Date(v) => out.extend_from_slice(&v.to_be_bytes()),
-            Elem::BigInt(v) | Elem::Timestamp(v) => out.extend_from_slice(&v.to_be_bytes()),
+            Elem::SmallInt(v) => out.extend_from_slice(&v.to_be_bytes()),
+            Elem::BigInt(v) | Elem::Timestamp(v) | Elem::Time(v) | Elem::TimestampTz(v) => {
+                out.extend_from_slice(&v.to_be_bytes())
+            }
+            // スカラー INTERVAL と同じ正規化キー（`1 mon` と `30 days` は同じ鍵）。
+            Elem::Interval(v) => {
+                out.extend_from_slice(&crate::datetime::interval_cmp_key(v).to_be_bytes())
+            }
             Elem::Real(v) => out.extend_from_slice(&canon_f64(f64::from(*v))),
             Elem::Double(v) => out.extend_from_slice(&canon_f64(*v)),
             Elem::Uuid(u) => out.extend_from_slice(u.as_bytes()),
@@ -145,6 +174,10 @@ struct Entry {
 #[derive(Clone)]
 pub(crate) struct ArrayAggState {
     elem_ty: ArrayElemType,
+    /// 確定時の出力形（Issue #3264）。
+    output: ArrayAggOutput,
+    /// 溜めてよい要素数の上限（出力形で決まる）。
+    max_elements: usize,
     /// `ORDER BY`・`DISTINCT` のいずれかでキーを評価して並べ替えるか（`false` は入力順）。
     collect: bool,
     distinct: bool,
@@ -164,6 +197,13 @@ impl ArrayAggState {
     pub(crate) fn new(input: &ArrayAggInput) -> Self {
         Self {
             elem_ty: input.elem,
+            output: input.output,
+            max_elements: match input.output {
+                ArrayAggOutput::Array => MAX_ARRAY_AGG_ELEMENTS,
+                ArrayAggOutput::Json | ArrayAggOutput::Jsonb => {
+                    crate::json::MAX_JSON_CONTAINER_ITEMS
+                }
+            },
             collect: !input.keys.is_empty(),
             distinct: input.distinct,
             specs: input
@@ -249,7 +289,7 @@ impl ArrayAggState {
         } else {
             None
         };
-        if self.entries.len() >= MAX_ARRAY_AGG_ELEMENTS {
+        if self.entries.len() >= self.max_elements {
             return Err(SqlSurfaceError::payload_too_large(TOO_MANY_ELEMENTS_DETAIL));
         }
         let next_payload = self
@@ -293,7 +333,7 @@ impl ArrayAggState {
 
     /// 確定する。空集合は `None`（呼び出し元が `Cell::Null` にする）。キーがあれば安定ソートして
     /// から要素型の配列へ詰める。
-    pub(crate) fn finish(mut self) -> Result<Option<ArrayValue>, SqlSurfaceError> {
+    pub(crate) fn finish(mut self) -> Result<Option<ArrayAggFinished>, SqlSurfaceError> {
         if self.entries.is_empty() {
             return Ok(None);
         }
@@ -316,7 +356,12 @@ impl ArrayAggState {
             });
         }
         let elems: Vec<Option<Elem>> = self.entries.into_iter().map(|e| e.elem).collect();
-        build_array(self.elem_ty, elems).map(Some)
+        let array = build_array(self.elem_ty, elems)?;
+        match self.output {
+            ArrayAggOutput::Array => Ok(Some(ArrayAggFinished::Array(array))),
+            output => crate::sql::json_agg::render(&array, output)
+                .map(|text| Some(ArrayAggFinished::Json(text))),
+        }
     }
 }
 
@@ -346,16 +391,22 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
         Ok(out)
     }
     Ok(match ty {
-        ArrayElemType::Text => ArrayValue::Text(collect(elems, |e| match e {
-            Elem::Text(s) => Some(s),
-            _ => None,
-        })?),
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => {
+            ArrayValue::Text(collect(elems, |e| match e {
+                Elem::Text(s) => Some(s),
+                _ => None,
+            })?)
+        }
         ArrayElemType::Bool => ArrayValue::Bool(collect(elems, |e| match e {
             Elem::Bool(b) => Some(b),
             _ => None,
         })?),
         ArrayElemType::Integer => ArrayValue::Integer(collect(elems, |e| match e {
             Elem::Integer(v) => Some(v),
+            _ => None,
+        })?),
+        ArrayElemType::SmallInt => ArrayValue::SmallInt(collect(elems, |e| match e {
+            Elem::SmallInt(v) => Some(v),
             _ => None,
         })?),
         ArrayElemType::BigInt => ArrayValue::BigInt(collect(elems, |e| match e {
@@ -372,6 +423,18 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
         })?),
         ArrayElemType::Date => ArrayValue::Date(collect(elems, |e| match e {
             Elem::Date(v) => Some(v),
+            _ => None,
+        })?),
+        ArrayElemType::Time => ArrayValue::Time(collect(elems, |e| match e {
+            Elem::Time(v) => Some(v),
+            _ => None,
+        })?),
+        ArrayElemType::Interval => ArrayValue::Interval(collect(elems, |e| match e {
+            Elem::Interval(v) => Some(v),
+            _ => None,
+        })?),
+        ArrayElemType::TimestampTz => ArrayValue::TimestampTz(collect(elems, |e| match e {
+            Elem::TimestampTz(v) => Some(v),
             _ => None,
         })?),
         ArrayElemType::Timestamp => ArrayValue::Timestamp(collect(elems, |e| match e {
@@ -402,6 +465,12 @@ fn build_array(ty: ArrayElemType, elems: Vec<Option<Elem>>) -> Result<ArrayValue
         ArrayElemType::Enum => {
             return Err(accumulator_bug(
                 "array_agg over ENUM elements reached finish",
+            ))
+        }
+        // `BIT(n)` もスカラー BIT と同じく array_agg 非対応（Issue #3235）。束縛段が拒否する。
+        ArrayElemType::Bit(_) => {
+            return Err(accumulator_bug(
+                "array_agg over BIT elements reached finish",
             ))
         }
     })
@@ -461,20 +530,57 @@ fn elem_from_scalar(
     use row_codec::ScalarRef as S;
     let mismatch = || accumulator_bug("array_agg column value does not match its element type");
     Ok(match (ty, v) {
-        (ArrayElemType::Text, S::Text(s)) => Elem::Text(try_clone_str(s)?),
+        (
+            ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_),
+            S::Text(s),
+        ) => Elem::Text(try_clone_str(s)?),
         (ArrayElemType::Bool, S::Bool(b)) => Elem::Bool(*b),
         (ArrayElemType::Integer, S::Integer(x)) => Elem::Integer(*x),
+        // smallint 列は `ScalarRef::Integer`（i32）で読まれる。範囲外は格納値の破損として扱う。
+        (ArrayElemType::SmallInt, S::Integer(x)) => {
+            Elem::SmallInt(i16::try_from(*x).map_err(|_| {
+                accumulator_bug("array_agg observed an out-of-range smallint value")
+            })?)
+        }
         (ArrayElemType::BigInt, S::BigInt(x)) => Elem::BigInt(*x),
         (ArrayElemType::Real, S::Real(x)) => Elem::Real(*x),
         (ArrayElemType::Double, S::Double(x)) => Elem::Double(*x),
         (ArrayElemType::Date, S::Date(x)) => Elem::Date(*x),
         (ArrayElemType::Timestamp, S::Timestamp(x)) => Elem::Timestamp(*x),
+        (ArrayElemType::Time, S::Time(x)) => Elem::Time(*x),
+        (ArrayElemType::Interval, S::Interval(x)) => Elem::Interval(*x),
+        (ArrayElemType::TimestampTz, S::TimestampTz(x)) => Elem::TimestampTz(*x),
         (ArrayElemType::Uuid, S::Uuid(u)) => Elem::Uuid(*u),
         (ArrayElemType::Numeric { .. }, S::Numeric(d)) => Elem::Numeric(*d),
         (ArrayElemType::Bytea, S::Bytes(b)) => Elem::Bytea(try_clone_bytes(b)?),
         (ArrayElemType::Json, S::Json(s)) => Elem::Json(try_clone_str(s)?),
         (ArrayElemType::Jsonb, S::Json(s)) => Elem::Jsonb(try_clone_str(s)?),
-        _ => return Err(mismatch()),
+        // 組が合わない場合と `Enum`（array_agg 非対応）は mismatch。全要素型を列挙し、
+        // 要素型の追加時にコンパイルエラーで対応判断を強制する（Issue #3229）。
+        (
+            ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::SmallInt
+            | ArrayElemType::Time
+            | ArrayElemType::Interval
+            | ArrayElemType::Bit(_)
+            | ArrayElemType::TimestampTz
+            | ArrayElemType::Enum,
+            _,
+        ) => return Err(mismatch()),
     })
 }
 
@@ -492,24 +598,59 @@ fn elem_from_expr(ty: ArrayElemType, v: ExprValue<'_>) -> Result<Option<Elem>, S
         return Ok(None);
     }
     Ok(Some(match (ty, v) {
-        (ArrayElemType::Text, ExprValue::Text(s)) => Elem::Text(try_clone_str(&s)?),
+        (
+            ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_),
+            ExprValue::Text(s),
+        ) => Elem::Text(try_clone_str(&s)?),
         (ArrayElemType::Bool, ExprValue::Bool(b)) => Elem::Bool(b),
         (ArrayElemType::Integer, ExprValue::Scalar(x)) => {
             let n = i32::try_from(int_of(x)?)
                 .map_err(|_| SqlSurfaceError::numeric_out_of_range("integer out of range"))?;
             Elem::Integer(n)
         }
+        (ArrayElemType::SmallInt, ExprValue::Scalar(x)) => {
+            let n = i16::try_from(int_of(x)?)
+                .map_err(|_| SqlSurfaceError::numeric_out_of_range("smallint out of range"))?;
+            Elem::SmallInt(n)
+        }
         (ArrayElemType::BigInt, ExprValue::Scalar(x)) => Elem::BigInt(int_of(x)?),
         (ArrayElemType::Real, ExprValue::Scalar(x)) => Elem::Real(x as f32),
         (ArrayElemType::Double, ExprValue::Scalar(x)) => Elem::Double(x),
         (ArrayElemType::Date, ExprValue::Date(d)) => Elem::Date(d),
         (ArrayElemType::Timestamp, ExprValue::Timestamp(t)) => Elem::Timestamp(t),
+        (ArrayElemType::Time, ExprValue::Time(t)) => Elem::Time(t),
+        (ArrayElemType::Interval, ExprValue::Interval(v)) => Elem::Interval(v),
+        (ArrayElemType::TimestampTz, ExprValue::TimestampTz(t)) => Elem::TimestampTz(t),
         (ArrayElemType::Uuid, ExprValue::Uuid(u)) => Elem::Uuid(u),
         (ArrayElemType::Numeric { .. }, ExprValue::Numeric(d)) => Elem::Numeric(d),
         (ArrayElemType::Bytea, ExprValue::Bytes(b)) => Elem::Bytea(try_clone_bytes(&b)?),
         (ArrayElemType::Json, ExprValue::JsonText(s)) => Elem::Json(try_clone_str(&s)?),
         (ArrayElemType::Jsonb, ExprValue::Json(s)) => Elem::Jsonb(try_clone_str(&s)?),
-        _ => return Err(mismatch()),
+        // 全要素型を列挙する理由は `elem_from_scalar` と同じ（Issue #3229）。
+        (
+            ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::SmallInt
+            | ArrayElemType::Time
+            | ArrayElemType::Interval
+            | ArrayElemType::Bit(_)
+            | ArrayElemType::TimestampTz
+            | ArrayElemType::Enum,
+            _,
+        ) => return Err(mismatch()),
     }))
 }
 
@@ -587,6 +728,8 @@ mod tests {
     fn state(elem_ty: ArrayElemType, distinct: bool) -> ArrayAggState {
         ArrayAggState {
             elem_ty,
+            output: ArrayAggOutput::Array,
+            max_elements: MAX_ARRAY_AGG_ELEMENTS,
             collect: false,
             distinct,
             specs: Vec::new(),
@@ -720,7 +863,9 @@ mod tests {
         st.push_entry(None, Vec::new()).expect("push");
         assert_eq!(
             st.finish().expect("finish"),
-            Some(ArrayValue::Integer(vec![None, None]))
+            Some(ArrayAggFinished::Array(ArrayValue::Integer(vec![
+                None, None
+            ])))
         );
     }
 }

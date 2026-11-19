@@ -134,9 +134,8 @@ pub(super) fn common_element_type(kinds: &[CastKind]) -> Result<CastType, SqlSur
             } else if has(K::Int4) {
                 Ok(CastType::Int4)
             } else {
-                Err(unsupported(
-                    "ARRAY of smallint elements is not supported yet",
-                ))
+                // 残りは Int2 のみ（Issue #3230）。PG の `select_common_type` と同じく smallint[]。
+                Ok(CastType::Int2)
             }
         }
         1 => {
@@ -161,6 +160,12 @@ pub(super) fn common_element_type(kinds: &[CastKind]) -> Result<CastType, SqlSur
             K::Jsonb => Ok(CastType::Jsonb),
             K::Uuid => Ok(CastType::Uuid),
             K::Bytea => Ok(CastType::Bytea),
+            // 要素がすべて time なら `time[]`（Issue #3232）。他の型との混在は group 不一致で 42804。
+            K::Time => Ok(CastType::Time),
+            // 要素がすべて interval なら `interval[]`（Issue #3234）。
+            K::Interval => Ok(CastType::Interval),
+            // 要素がすべて timestamptz なら `timestamptz[]`（Issue #3233）。timestamp との混在は 42804。
+            K::TimestampTz => Ok(CastType::TimestampTz),
             _ => Err(unsupported(
                 "ARRAY of this element type is not supported yet",
             )),
@@ -288,6 +293,11 @@ pub(super) fn bind_empty_array_as(target: &CastType) -> Result<BoundExpr, SqlSur
 
 /// 要素型に対応する式の型（添字の結果型）。
 fn elem_expr_type(elem: ArrayElemType) -> Result<ExprType, SqlSurfaceError> {
+    // `BIT(n)` 要素の添字は `bit` 値（Issue #3235）。スカラー BIT は cast-only のため比較・CAST は
+    // 後段で `0A000` になる。
+    if matches!(elem, ArrayElemType::Bit(_)) {
+        return Ok(ExprType::Bit);
+    }
     crate::sql::cast::elem_cast_type(elem)
         .and_then(|t| t.expr_type())
         .ok_or_else(|| unsupported("subscripting an array of this element type is not supported"))
@@ -351,7 +361,13 @@ pub(super) fn bind_subscript(
         ));
     }
     let (bound_base, base_ty) = bind_operand(base, env, node_budget)?;
+    let bit_elem = crate::sql::cast::bit_array_elem(&bound_base, env.schema());
     let elem = match source_cast_kind(base, &bound_base, base_ty, env.schema()) {
+        // `BIT(n)[]` は要素の CAST の型を持たず `SourceKind::Bit` になるため、`n` つきの要素型は
+        // 束縛済みの式から取る（Issue #3235）。
+        SourceKind::Bit if bit_elem.is_some() => bit_elem.ok_or_else(|| {
+            unsupported("subscripting an array of this element type is not supported")
+        })?,
         SourceKind::Array(Some(elem_ty)) => CastType::Array(Box::new(elem_ty))
             .array_elem_type()
             .ok_or_else(|| {
@@ -433,18 +449,16 @@ pub(super) fn own(v: ExprValue<'_>) -> Result<ExprValue<'static>, SqlSurfaceErro
         ExprValue::Text(s) => ExprValue::Text(Cow::Owned(s.into_owned())),
         ExprValue::Date(d) => ExprValue::Date(d),
         ExprValue::Timestamp(t) => ExprValue::Timestamp(t),
+        ExprValue::Time(t) => ExprValue::Time(t),
+        ExprValue::Interval(v) => ExprValue::Interval(v),
+        ExprValue::TimestampTz(t) => ExprValue::TimestampTz(t),
         ExprValue::Json(s) => ExprValue::Json(Cow::Owned(s.into_owned())),
         ExprValue::JsonText(s) => ExprValue::JsonText(Cow::Owned(s.into_owned())),
         ExprValue::Numeric(d) => ExprValue::Numeric(d),
         ExprValue::Uuid(u) => ExprValue::Uuid(u),
         ExprValue::Bytes(b) => ExprValue::Bytes(Cow::Owned(b.into_owned())),
         ExprValue::Null => ExprValue::Null,
-        ExprValue::Vector(_)
-        | ExprValue::Time(_)
-        | ExprValue::TimestampTz(_)
-        | ExprValue::Interval(_)
-        | ExprValue::Bit(_)
-        | ExprValue::Array(_) => {
+        ExprValue::Vector(_) | ExprValue::Bit(_) | ExprValue::Array(_) => {
             return Err(SqlSurfaceError::Internal {
                 detail: "array element evaluated to a type that cannot be stored".to_string(),
             })

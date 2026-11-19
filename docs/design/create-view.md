@@ -10,6 +10,8 @@ spec 本文は転記しない（`.claude/rules/spec-confidentiality.md` 準拠�
 `MATERIALIZED VIEW`（TABLE-42）は本ファイル末尾の「Issue #1668 追記」にまとめる。以降の節は
 非マテリアライズドビューの記録である。更新可能ビュー（TABLE-43。関連ポインタ SQL-49・
 RLS-10 (b)・ERR-6 の `55000`）は末尾の「Issue #1675 追記」にまとめる。
+本文 `WHERE` の受理方針（式述語・`OR`・`IS NULL` 等への拡大。Issue #3237）は末尾の
+「Issue #3237 追記」にまとめる。
 
 ## 概要
 
@@ -36,6 +38,8 @@ DROP VIEW <name>
   いずれも構造的に受理しない（`42601`）。使える単純述語は
   `Equality`／`Prefix`／`BoolEquality`／`BoolColumn`／`Compare`（列 対
   リテラル）のみ。
+  （受理範囲は Issue #3237 の方針に従い Issue #3238 で拡大済み。上の「使える単純述語」は Phase 1 時点の
+  記述で、現行は末尾「Issue #3238 追記」を参照。）
 - `DROP VIEW` は単一ビュー名（`IF EXISTS` 付きも可。Issue #1614、[drop-table.md](drop-table.md) の「Issue #1614 追記」）の指定のみを受理し、
   `CASCADE`／`RESTRICT` は Issue #1641 で受理に変わった（[drop-table.md](drop-table.md) の「Issue #1641 追記」）。複数名指定は `42601`。
 - 拡張クエリプロトコルの `$n` を含む `CREATE VIEW`／`DROP VIEW` は Parse 時点で
@@ -254,6 +258,7 @@ JOIN 本文の辺はテーブルに限る。本文の大きさの上限（64 KiB
   依存検査（`2BP01`）・RLS（本文は参照セッションの `PolicyContext` で評価）は不変。
   単純形の段（`LIMIT` なしの列射影）は式述語を持てず、式述語つきの連鎖本文は `LIMIT` 付きの行形か
   集計形で書く。
+  （この制約は Issue #3238 で解除済み。末尾「Issue #3238 追記」参照。）
 - 単純形 → 評価後射影形: `resolve_from` が連鎖の各段（単純形）を、下位の本文の上に重ねた行形の
   `BufferedView`（`LIMIT` なし）として内側から畳み込む。各段の列スコープは下位の結果列に対する
   外側の検査（`22000`／`42702`）で担保する。式項目・UDF 述語を持つ段は作成時に `42601`。
@@ -482,7 +487,7 @@ TABLE-41 (2) のポインタ（TABLE-18 の RLS 契約は変えない）。兄�
 - 順序: 構文 → 本文サイズ → DDL 権限（`42501`。互換性の情報を権限のない主体へ返さない）→ 別名の突合
   （`42601`／`42701`）→ 同名が表・索引なら `42809` → 新本文の検証（参照先不存在 `42P01` 等）→
   自己参照・循環 `42P17` → 互換性 `42P16` → 依存ビューあり `0A000` → ネスト深さ `54000` → 置換。
-  不在なら通常の `CREATE VIEW` と同じ。明示トランザクション内の DDL は従来どおり `0A000`
+  不在なら通常の `CREATE VIEW` と同じ。明示トランザクション内の `CREATE VIEW`・`DROP VIEW` は Issue #3315 で受理に変わった（`OR REPLACE` は `0A000`。受け皿 #3311）
 
 ### 互換性規則（`sql::view_replace::check_replace_compatible`）
 
@@ -676,7 +681,7 @@ Issue #1665（`REFRESH`）・#1666（`REFRESH ... CONCURRENTLY`）・#1667（索
 
 - 単純形本文の `*` は作成時に展開せず保存する。基表への `ADD COLUMN` で出力列がずれたら
   REFRESH は `0A000` で拒否し旧実体を残す（PostgreSQL は成功する）。
-- 明示トランザクション内の CREATE／REFRESH は `0A000`（PostgreSQL は REFRESH を許す）。
+- 明示トランザクション内の CREATE／REFRESH は `0A000`（PostgreSQL は REFRESH を許す。Issue #3315 の後もマテビューは未結線で、受け皿は #3311）。
 - `CONCURRENTLY` と `WITH NO DATA` の併用は構文段で `42601`。
 - CONCURRENTLY の重複行は `21000` ではなく `23505`（非 CONCURRENTLY と同結果にする方針）。
 - 単一ライタのため、REFRESH 中は基表への書き込みが待たされる。
@@ -803,3 +808,160 @@ SQL-49・RLS-10 (b)・ERR-6 の `55000`。本節は設計判断の記録でコ�
 
 > Issue #2199 注記: 基表が採番方式の表（暗黙の `id` を持たない）のときの単一行形 `WHERE id = <n>` は、基表の通常の列への述語形へ
 > 書き換える（宣言の無い `id` は `42703`）。詳細は [rowid-primary-key-separation.md](rowid-primary-key-separation.md) の §11。
+
+## Issue #3193 追記（INSTEAD OF トリガとの優先順位）
+
+ビューに書き込みテナント自身の `INSTEAD OF` トリガ（該当イベント）があれば、更新可能性の判定より先にトリガへ
+振り分ける（自動書き換えより優先。更新可能ビューでも同じ）。自動更新不可（`55000`）の判定は、テナントを
+持てる実行段・Describe へ移した。詳細は [trigger-instead-of.md](trigger-instead-of.md)。
+
+## Issue #3237 追記: VIEW 本文 WHERE の受理方針
+
+関連ポインタ: TABLE-18・TABLE-41・TABLE-43・SQL-24・RLS-10 (b)。本節は方針の決定記録であり、
+コードは変更しない。実装は #3238（受理の拡張）・#3239（参照時の再検証と `RENAME` 追随）・#3240（エラー文言と
+越境試験）が直列で担う。
+
+### 背景
+
+- 単純形（`sql::allowlist::parse_view_body` → `check_view_body_predicates`）が受理する述語は
+  `Equality`／`BoolEquality`／`BoolColumn`／`Compare`（列と文字列リテラル）／裸の列の `LIKE`／恒偽に限られる
+- 整数・浮動小数との比較（`n > 3`）は `WherePredicate::Expression` として解析されるため拒否される
+- `LIMIT` なしの本文は評価後射影形（Buffered）へも落ちない。`check_buffered_body_shape` が
+  `limit_implicit` を構文段で拒否する（#1796）
+- `LIMIT` 付きでも、最上位の Scan／Aggregate は `ViewBodyCheck::Resolved` で `BodyExprPolicy::Reject` になる
+
+### LIMIT なし本文の扱い
+
+**決定: 単純形（インライン展開）のまま保持し、単純形の許可リストを広げる。Buffered へは回さない。**
+
+1. Buffered は `LIMIT` の省略を構文段で拒否する（#1796）
+2. Buffered にすると `ResultLimits` の既定上限で本文が打ち切られ、選択的な外側 `WHERE` の対象行が
+   黙って欠ける（「Issue #1659 追記」に記録済み）
+3. 更新可能ビュー（TABLE-43）と `WITH CHECK OPTION` は、単純形のインライン展開
+   （`Resolved::View` の `view_predicates`／`check_predicates`）が前提で、Buffered 側は自動更新できない
+
+### 受理形・拒否形
+
+| 位置 | 受理 | 拒否（SQLSTATE） | 備考 |
+| ---- | ---- | ---------------- | ---- |
+| (A) 単純形本文（`LIMIT` なし。`FROM` はテーブルか単純形ビュー）の `WHERE` | 従来: `Equality`／`BoolEquality`／`BoolColumn`／`Compare`／裸の列の `LIKE`・`ILIKE`／恒偽。新規: `InList`／`Between`／`IsNull`／`Not`（構文段で葉まで押し下げた後の形）／非空の `Or`（各分岐を同じ規則で再帰判定）／`Expression` のうち `udf_call::first_non_builtin_call` が `None`（組み込み関数のみ） | 非組み込み呼び出しを含む `Expression`（セッション UDF・WASM UDF・未知の名前）、`PredicateCall`（`visible()` 等）、サブクエリ系（`InSubquery`／`Exists`／`ScalarSubqueryCompare`／`QuantifiedSubqueryCompare`）、`IdCompare`、`CorrelatedExists`、式左辺の `LIKE`／`ILIKE`（`42601`） | 投影の式項目（`Projection::Items`）は従来どおり `42601`。本件の範囲は `WHERE` だけ |
+| (B) 単純形の段が Buffered ビューの上に重なる連鎖 | (A) で受理した形は `check_buffered_outer_pred` でも受理される。ただし `ILIKE`（裸の列を含む）は例外で、`check_buffered_outer_pred` が `case_insensitive: true` を `0A000` で拒否する既存契約を維持する（合成スキーマが元列の照合を保持せず、ICU 照合を黙って ASCII 比較へ変えないため。受理には照合伝搬が要るので本件の範囲外） | (A) と同じ。加えて `ILIKE` は `0A000` | 「単純形の段は式述語を持てない」（Issue #1436）を解除する。`check_simple_layer_over_buffered` が作成時に同じ規則で検査し、作れても参照時に必ず失敗する定義を作らない |
+| (C) Buffered 本文（`LIMIT`・集計等）の最上位 Scan／Aggregate | `ViewBodyCheck::Resolved` の最上位を `BodyExprPolicy::Reject` から `BuiltinOnly` へ変え、`LIMIT` の有無で受理形が食い違わないようにする | 非組み込み呼び出し等（`42601`） | |
+| (D) Buffered 本文の集合演算の枝・サブクエリの内側 | 受理形は拡大しない | 従来どおり `Reject` を維持（`42601`） | fail-closed。Resolved を一律に変えず、サブクエリ内側（`check_body_subquery`）を明示的に `Reject` で検査する、と #3238 へ指示する |
+| (E) CTE 本文（#1862） | 現状の判定表のまま | 現状のまま | `check_view_body_predicates` は CTE 本文の解析と共有されるため、判定表を「ビュー本文用」と「CTE 本文用」に分けるか方針を引数で渡す。CTE 側の拡大は対象外 |
+
+### UDF の判定位置
+
+- 定義時: 単純形は `parse_view_body` の述語検査で `first_non_builtin_call` を判定し、Buffered は
+  `check_body_pred` の `BuiltinOnly` で判定する。どちらも `42601`
+- 参照時: 単純形は `reparse_stored_body` が同じ `parse_view_body` を、Buffered は `reparse_buffered_body` が
+  `classify_view_body`（`Resolved`）を通る。どちらも束縛より前に同じ判定が働き、参照セッションの
+  UDF レジストリで束縛されることはない
+- 参照時の失敗は既存の格納本文再検証の契約に揃え、**本文を含まない固定文言の `XX000`**（`corrupt_view_error`）とする。
+  通常の定義経路では到達せず、カタログ破損・公開 API 経由の不正な格納・版の食い違いのときだけ到達する。
+  利用者の文の構文誤り（`42601`）と区別する
+
+### Structural の保留の扱い
+
+`ViewBodyCheck::Structural` の保留（#1436）と `catalog::Storage::create_view` の `Resolved` 再検証は維持する。
+最上位の扱いは両段とも `BuiltinOnly` で揃うが、連鎖の判別・relation 一覧・深さ検査に実カタログでの再検証が
+要るため、再検証は残す。冗長になる部分の整理は対象外とする。
+
+### テナント境界と互換性
+
+- 本文の述語は外側の述語・RLS と AND で合成される。RLS は参照セッションの `PolicyContext` で実行段が独立に
+  適用するため、本文の `OR` が可視性を広げることはない（RLS-10 (b)）。`PredicateCall` は拒否のまま
+- `WITH CHECK OPTION` の束縛は空の UDF レジストリで行い、`visible()` とサブクエリは `0A000` のまま
+- 格納済み本文の分類（Simple／Buffered）は変わらない。`LIMIT` 付き・集計・`JOIN`・CTE・集合演算・サブクエリを含む本文は
+  `parse_view_body` の構造段で必ず失敗するため、述語の許可リストを広げても Buffered 格納済みの本文が Simple へ移らない
+- 保存形式は `render_view_body` の出力だけで、AST から正規化描画する（未検証文字列を連結しない）。
+  `render_where_predicate` は現状 `Expression`／`InList`／`Between`／`IsNull`／`Not` を空文字列で描画するため、
+  新しい形を空文字列のまま格納することを禁じ、「描画 → 再トークン化 → `parse_view_body`」の往復を #3238 の受入に含める
+
+### 実装の割り振り
+
+| Issue | 内容 |
+| ----- | ---- |
+| #3238 | 判定表の拡張と CTE との分離／`Resolved` 最上位の `BuiltinOnly` 化（サブクエリ内側は `Reject` 維持）／`render_where_predicate` の網羅と往復の固定／`check_simple_layer_over_buffered` との整合 |
+| #3239 | `reparse_buffered_body`・`rename_column_in_view_body`・`view_alias::rewrite_where` を新しい形に網羅させる／`DROP COLUMN`・`ALTER COLUMN TYPE` の依存検査（式木内の列参照を含む）／再起動後の参照 |
+| #3240 | `CatalogError::Invalid` の文言を原因ごとに分ける／他テナント越境の試験 |
+
+### 対象外
+
+- 式左辺の `LIKE`／`ILIKE`: 今回は受理しない。`check_buffered_outer_pred` が拒否するため、連鎖の有無で挙動が分かれることを避ける。対応しない
+- 投影の式項目・集計引数の式: 本件は `WHERE` のみ。対応しない
+- 集合演算の枝とサブクエリ内側の式述語: fail-closed のため `Reject` を維持。対応しない
+- CTE 本文の判定表の拡大: 対応しない（本件の範囲外）
+- `JOIN` 本文の `LIMIT` 必須と両辺テーブル限定: #3236 で対象外と明記済み
+- `ALTER VIEW`: 従来から対象外
+- `Structural`／`Resolved` の冗長な再検証の整理: 対応しない（挙動に影響しない整理のため）
+
+## Issue #3238 追記: VIEW 本文 WHERE の式述語の受理（実装記録）
+
+「Issue #3237 追記」の表 (A)〜(E) を実装した。TABLE-18・TABLE-42・TABLE-43・RLS-10 (b) のポインタ。
+
+- **判定表の分離**: `allowlist.rs` の `BodyPredicateTable { View, CteStrict }`。`parse_view_body` は `View`、
+  `parse_cte_select_body`（CTE 本文・FROM の派生表本文）と CTE の集計・tail 経路は `CteStrict`（従来の狭い表を据え置き）。
+- **View 表の受理**: `IN`／`BETWEEN`／`IS [NOT] NULL`、`first_non_builtin_call` が空の式述語（数値比較・算術・組み込み関数）、
+  `NOT`・非空の `OR`（全分岐の全葉を再帰判定）。`visible()`・式左辺の `LIKE`・サブクエリ系は `OR`／`NOT` の内側でも `42601`。
+  `now()`・現在時刻の値関数・`json_*` は非組み込み扱いのまま `42601`。
+- **Buffered 本文**: トップレベルの `Scan`／`Aggregate` は `Structural`／`Resolved` とも `BuiltinOnly`。サブクエリ内側
+  （`check_body_subquery`）と集合演算の枝は `Reject` を維持。
+- **描画と往復ガード**: `render_where_predicate` が `Expression`／`InList`／`Between`／`IsNull`／`Not` を描画する。
+  `render_stored_simple_view_body` は保存形を `tokenize_stored_view_body` → `parse_view_body` で再解析し、元 AST
+  （ゾーンなし `TIMESTAMPTZ` は UTC 確定形へ正規化）と一致しなければ `42601`（固定文言）で拒否する。
+  `CREATE VIEW` と `RENAME COLUMN`・`RENAME TABLE` の再描画が共有する。
+- **MATERIALIZED VIEW**: 本文の許可形は `CREATE VIEW` と同じ（Issue #1668 追記）ため、受理範囲も同じく広がる。
+- **連鎖**: 単純形の段が Buffered ビューの上に重なる場合は既存の `check_buffered_outer_pred` を使う（変更なし。ILIKE は従来どおり `0A000`）。
+- **据え置き**: 作成時の `CatalogError::Invalid` の文言分離・越境試験の網羅は #3240。式述語つきビューの `RENAME COLUMN` 追随・
+  参照時の再検証の網羅は #3239 で対応済み（下の「Issue #3239 追記」）。
+
+## Issue #3239 追記: 式述語つきビューの参照時再検証と列改名の追随（実装記録）
+
+TABLE-18・TABLE-38・TABLE-41・TABLE-43・SQL-24・RLS-10 (b) のポインタ。
+
+- **列改名の追随**: `rename_column_in_view_body` は `WHERE` を共有の走査器 `check_constraint::map_predicate_columns`
+  （CHECK の列改名・ビュー列別名と同じ。第 2 の走査器は作らない）で書き換える。式述語・`IN`・`BETWEEN`・`IS NULL`・`NOT`・
+  `OR` を 1 回の走査で一括写像するため連鎖置換は起きず、関数名は写像されない。事前に網羅的な `match`（`_` なし）で
+  View 表の受理形か確かめ、`Projection::Items` と受理外の形は `Err`（fail-closed）。保存時は従来どおり
+  `render_stored_simple_view_body` の往復ガードを通し、意味が化ける本文（予約名への改名等）は保存しない。
+- **拒否の SQLSTATE**: 追随できない形（評価後射影形・列別名つき・往復不一致・再検証不能）は `0A000`、追随後の本文が
+  サイズ上限を超えれば `54000`、参照時の本文の破損は従来どおり固定文言の `XX000`。拒否時は計画確定前のためビュー定義・
+  スキーマとも変わらない。表の `RENAME` は表名の写像だけで、式述語つき本文でも追随する。
+- **参照時の再検証**: `reparse_stored_body`／`reparse_buffered_body`・`view_alias::rewrite_where` は作成時と同じ経路を通り、
+  述語形ごとの分岐を持たない。再オープン後・連鎖・`LIMIT` 付き本文・列別名つきビューの外側からの式述語を結合テストで固定した。
+- **依存検査**: `DROP COLUMN` は式・`OR` の枝・`NOT` の内側・`IN`／`BETWEEN`／`IS NULL` だけで参照される列も依存として
+  拒否する（`2BP01`）。`ALTER COLUMN TYPE` は `USING` を伴う一般変換だけビュー依存を `0A000` で拒否し、拡大・整数の
+  再タグ付けは従来どおり検査しない（ビューは参照時に現スキーマで束縛し直す）。
+- **`Not` 再帰の堅牢化**: `check_predicate_columns_within` は `Not(inner)` の内側を常に再帰検査する。構文段は否定を葉まで
+  押し下げるため `Not(Expression)`／`Not(Or)` は通常生成されないが、現れても否定越しに非公開列を素通りさせない。
+- **対象外**: 評価後射影形・列別名つきビューの `RENAME` 追随（従来どおり `0A000`。#1659 の後続課題）、MATERIALIZED VIEW が
+  参照する表の列 `RENAME`（暫定ガードの `0A000`）、`CatalogError::Invalid` の文言分離と越境試験の網羅（#3240）。
+
+## Issue #3240 追記: ビュー定義エラー文言の分離と越境試験
+
+親 #3236。TABLE-18・TABLE-41・TABLE-27・RLS-10 (b)・ERR-6 のポインタ。
+
+- **文言の分離**: catalog の `validate_new_view_body_in_txn` などが返す `CatalogError::Invalid` は、拒否原因ごとの
+  `pub(crate) const VIEW_*_MESSAGE`（固定の英語文言）を使う。`sql::ddl::map_create_view_error`（`CREATE OR REPLACE VIEW` も
+  委譲）は定数との完全一致で写像し、未知の detail は汎用の固定文言（`42601`）へ丸める。detail・内側エラーの文言・識別子は
+  応答へ連結しない。`CatalogError` に variant は足さない（公開 enum の破壊的変更を避ける）。
+- **SQLSTATE**: 内側の検査が `0A000`（未対応機能。例: `LIMIT` 付きビューの上の `ILIKE`）を返した場合だけ `0A000`
+  （`VIEW_UNSUPPORTED_FEATURE_MESSAGE`）を保つ。深さ超過は従来どおり `54000`。それ以外の定義エラーは `42601`。
+  白リスト方式のため、未知の内側エラーは `42601` のままで fail-closed。
+- **存在秘匿**: 判定順序は変えない。参照先の存在確認（`TableNotFound`）が形状の判定より先に行われ、他テナントの SCHEMA 配下の
+  名前は SQL 層の名前解決で `3F000`／`42P01` になるため、原因別の文言は存在オラクルにならない。
+- **試験**: `table27_tenant_boundary.rs` の双子 DB に、他テナント SCHEMA を本文で読むビュー定義（単純形・式述語・`LIMIT`・
+  集計・JOIN の辺・`IN (サブクエリ)`・CTE・`UNION` の枝・列別名・`WITH CHECK OPTION`・`CREATE OR REPLACE VIEW`）を追加し、
+  SQLSTATE と文言のバイト一致・拒否後の `42P01` を固定した。原因別の文言は `table18_view_body_where_expr.rs`、
+  `wire_create_view.rs`（末尾 `;` の単独送信）で固定した。
+- **対象外**: 受理範囲の拡大は #3237 の決定どおり行わない。`CREATE TABLE`・`DROP VIEW`・MATERIALIZED VIEW の
+  `Invalid` 写像は本件の対象外（MATERIALIZED VIEW の原因別分離は未起票）。
+
+## Issue #3324 追記: LATERAL を含む JOIN 本文（SQL-62 (7)・TABLE-18 のポインタ）
+
+- 受理: 左側を持つ LATERAL 派生表を含む JOIN 本文（CTE 入力はすべて派生表で、利用者 CTE を含まない）。非集計なら `LIMIT` 必須（既存の JOIN 本文の規則）。単一 FROM の派生表／LATERAL・LATERAL を含まない派生表・具体化ビュー・CTAS は従来どおり拒否
+- 構造検証（`CREATE VIEW` の構文段）は列を引けず左側の列を解決できないため、固定文言の `0A000`（`lateral_bind::UNRESOLVABLE_LEFT_COLUMNS`）を合図に受理を保留する（`ViewBodyKind::LateralDeferred`。relation 一覧はトークン列から読み取る上位集合。スキーマ修飾の relation 名は固定 `0A000`）。`create_view` が write txn 内の実カタログ（`Resolved`）で再検証して確定する（保留形は `ViewBodyShape` で `buffered`・`join`・`deferred_expr` を立てる保守側）
+- 依存: 本文の relation 一覧に、JOIN の実表に加えて LATERAL の内側（CTE 入力の slot）が読む実表・ビューを含める。`DROP TABLE` は内側だけが読む表でも `2BP01`、`OR REPLACE` は再検証（存在しない内側の表は `42P01`、失敗した置換は元のビューを変えない）
+- 参照時は同じ分類を再実行し、参照者の `ctx`・同じ `read_txn` で CTE 入力つき JOIN の実行器が評価する（作成者の可視性は引き継がない。RLS-10 (b)）。ビュー経由の `EXPLAIN` は集計・LIMIT・JOIN 本文のビューと同じ `42601`。照合の検査（`check_buffered_view_collations`）は内側の表も含める
+- 試験: `sql62_lateral_view.rs`・`rls10_lateral_paths.rs`。設計は [lateral-derived-table.md](lateral-derived-table.md)

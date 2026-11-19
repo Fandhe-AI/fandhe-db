@@ -2,9 +2,11 @@
 
 - ステータス: **Accepted（実装既定値）**
 - 対応: Issue #942・TASK-221
+- 改訂: Issue #3312・TASK-349（Tx 内の DDL の方式。方式は決定済み・実装は #3313〜#3318。
+  「明示トランザクション内の DDL の方式」節）
 - 改訂: Issue #2396・TASK-333（決定 1 を改訂。writer の遅延取得と `40001` の判定は
   下記 1a。実装は #2399〜#2405・#2408 で進行中。#2399・#2400・#2401・#2404・#2405・#2412 は実施済み。設計記録は #2397）
-- ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・
+- ポインタ: `docs/spec/04-behavior/sql-surface.md` SQL-31・SQL-80・
   `docs/spec/04-behavior/persistence.md` RECOVER-12・
   `docs/spec/04-behavior/error-format.md` ERR-6
 - 関連ポインタ: SQL-38・SQL-19・ERR-7・PERSIST-4・WIRE-15・RLS-7・TASK-335・RECOVER-5・RECOVER-6・RECOVER-8・TASK-96・TASK-97・TASK-99・
@@ -56,7 +58,7 @@ Issue（#2399〜#2405・#2408〜#2413）が拠り所にする設計記録で、�
   （読み取りスナップショット）だけを開く。
 - writer は最初の書き込み文で取得する。書き込み文は DML（INSERT・UPDATE・DELETE・
   TRUNCATE・UPSERT・ファイル形 INSERT・COPY FROM）、ロック句、`LOCK TABLE`。
-- トランザクション内の DDL は、これまでどおり writer を取得する前に `0A000` で拒否する。
+- トランザクション内の表・索引の DDL（`CREATE TABLE`・`DROP TABLE`・`ALTER TABLE` の一部・`CREATE INDEX`・`DROP INDEX`）は、権限・作成先の判定の後、writer を取得して共有 write txn へ積む（改訂 #3313）。未対応の形（制約の追加・削除・改名・型変更・SERIAL/IDENTITY 列・SCHEMA 配下・一時表など）と他種別の DDL は、これまでどおり writer を取得する前（SERIAL/IDENTITY 列だけは取得後・何も書く前）に `0A000` で拒否する（「明示トランザクション内の DDL の方式」節の「#3313 の実装記録」）
 - 読み取りだけのトランザクションは writer を一度も取得しないため、他セッションの
   書き込みを待たせない。
 - 暗黙のトランザクション（WIRE-16）は対象外。従来どおり開始時に取得する（#2401）。
@@ -388,7 +390,7 @@ DML は `PredicateDmlError<E>` を使う）を導入した。Issue #942 では�
 `parsed_operation_id` は `Delete`・`Update` の `operation_id` も返し、同一
 トランザクション内での再利用（`25000`）は全 DML に効く。
 
-**明示トランザクション内で拒否（`0A000`）を維持するもの**: DDL。ファイル形 `INSERT`
+**明示トランザクション内で拒否（`0A000`）を維持するもの**: 表・索引以外の DDL と、表・索引の DDL の未対応の形（改訂 #3313: 表・索引の DDL の主な形は受理に変わった。「明示トランザクション内の DDL の方式」節の「#3313 の実装記録」）。ファイル形 `INSERT`
 と、`USING PLAN` を伴う検索 SELECT・`EXPLAIN` は Issue #1353 で受理に変わった
 （「6. トランザクション内の読み取り」参照）。
 
@@ -443,7 +445,7 @@ FailedRecoverable(Box<ActiveTxn<'e>>), Failed { session_at_begin: SessionState, 
     （INSERT・ビュー DML・DELETE・UPDATE・TRUNCATE・データ変更 CTE・INSERT…SELECT・`setval` 系）が
     `write_txn()` を取る直前に呼ぶ。`COPY FROM` は確定処理（CopyDone 後）で取得するため、
     データ受信中は持たない。`lastval` も同じ腕のため writer を取る（粒度は粗いが安全側）。
-    DDL（`0A000`）・一時表・読み取り・カーソルは取得しない。ロック句・`LOCK TABLE` は今も
+    DDL（`0A000`。改訂 #3312: 実装後は `ensure_writer_with` で取得する）・一時表・読み取り・カーソルは取得しない。ロック句・`LOCK TABLE` は今も
     `42601` で拒否されるので届かない（#2230・#1958 は同じ入口を呼ぶ）。
   - `55P03`（待機上限超過）の発生点は `BEGIN` から最初の書き込み文へ移る。受けた Tx は `Failed`
     になり、以降の文は `25P02`、受理するのは `ROLLBACK` だけ。取得前は何も書いていない。
@@ -604,7 +606,7 @@ FailedRecoverable(Box<ActiveTxn<'e>>), Failed { session_at_begin: SessionState, 
 テーブル世代・索引宣言は確定済みスナップショットから読み、辞書構築（LLM 展開の入力）と
 `USING PLAN` の検索本体の行の読みだけを共有書き込みトランザクションへ切り替える
 （`EngineCore::execute_validated_with_dict`・`dictionary_from_write_txn`）。トランザクション
-内は DDL 不可で単一ライタを保持するため、BEGIN 以降カタログと確定済みの世代は誰にも変えられない。
+内は DDL 不可で単一ライタを保持するため（改訂 #3312: DDL 済みの Tx では成り立たない。V5 参照）、BEGIN 以降カタログと確定済みの世代は誰にも変えられない。
 世代の事前・事後照合は同じ確定済み側から読むので一致し、書き込みトランザクション側で読むと
 dirty では必ず不一致になるため使わない。辞書は `DictionaryCache` に lookup も insert もしない
 （未 commit の行から作った辞書を世代キーのキャッシュに載せると、ROLLBACK 後の世代再利用で
@@ -612,6 +614,306 @@ dirty では必ず不一致になるため使わない。辞書は `DictionaryCa
 Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定外の文種別は `Internal` で拒否する。
 書き込み後の読み取りはキャッシュ・HNSW を使わない brute-force になる
 （性能上のトレードオフ。テーブル単位のキャッシュ再利用は後続課題）。
+
+## 明示トランザクション内の DDL の方式（Issue #3312・SQL-80・TASK-349 ポインタ）
+
+- ステータス: **方式は決定済み・実装は進行中**。実装は子 Issue #3313〜#3318（親 #3311）が担う。#3313（表・索引。下記「#3313 の実装記録」）は実装済みで、それ以外の種別は各実装が入るまでは現行の `0A000` が正しい挙動である
+- ポインタ: SQL-80・SQL-31・SQL-23・SQL-52・TABLE-22・TABLE-36・TABLE-44・TASK-349（関連: SQL-69・SQL-38・SQL-32・RECOVER-12・TABLE-10・PERSIST-1）
+- 本節は実装上の判断とポインタ表記だけを書く。spec 本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
+- #3312 は設計記録のみで、コード・依存・`0A000` の挙動は変えなかった（#3313 以降の実装記録は各節の末尾へ追記する）
+
+### 現状の整理（拒否の理由）
+
+- 入口は `EngineCore::execute_in_active_txn_inner`（`core.rs`）。既定の拒否腕（`transaction_feature_not_supported`）と、関数・ポリシー・GRANT/REVOKE・既定権限・所有者・ロールの個別の拒否腕、および `core/temp_route.rs::execute_temp_routed_in_txn` の一時表の索引 DDL が、writer を取る前に `0A000` を返す
+- autocommit の DDL 本体の大半は、`catalog.rs` の `create_table`・`drop_tables`・`alter_table_*`・`create_index_bound`・`drop_index`・`create_or_replace_view_checked`・`create_enum_type` などの関数の中で、それぞれ自前の write txn を開いて commit する。そのため Tx の `ROLLBACK` では取り消せない
+- `_in_txn` 本体を既に持つ種別と持たない種別がある（下表の「本体」列）
+- 前例が 1 つある。暗黙 Tx（WIRE-16）の `CREATE [OR REPLACE] FUNCTION`（#2882）は `udf_ddl::CatalogWrite::InTxn` で共有 write txn へ書く。関数世代は commit 成功後に進める（`SessionTransaction::mark_function_written` → commit 後の `bump_function_generation`）
+
+### 基本方式（決定）
+
+- **D1: Tx の共有 write txn を、カタログ変更の唯一の書き込み先にする**。各 DDL 本体を「write txn を受け取る `_in_txn` 本体」と「autocommit の薄いラッパー」に分ける（決定 3 の `WriteTarget` の DML と同じ形）。Tx 内では本体へ `InTxn(write_txn)` を渡す。autocommit の挙動は変えない
+- **D2: 別の上書き層（インメモリのカタログ写し）は作らない**。redb の write txn 自身を Tx 内の上書き層として使う。退けた案:
+  - インメモリの上書き層: カタログ読み取りの全経路と二重実装になり、取りこぼしが fail-open になる
+  - DDL を COMMIT 時まで遅らせて実行する: 後続文が変更後のカタログを見られない
+  - DDL ごとに `Durability::None` で commit する: 「savepoint の redb 結線」節（#1943）で既に退けている
+  - redb の fork: 依存の変更になる
+- **D3: 1 つの DDL 文の中で write txn を 2 つ以上開く本体は、Tx 内では受理しない**。単一の write txn へ組み直すまで `0A000` のまま（fail-closed）。1 文の DDL の原子性（SQL-23 の改訂注記・TABLE-10）は従来どおり維持する
+- **D4: DDL が触れたすべての表（作成・削除・rename の新旧の名前・依存の連鎖で変わった表）について `commit_log::note_ddl` を呼ぶ**。呼び漏れは既存の `CommitFootprintUnrecordable`（`54000`）で commit 前に拒否される。この fail-closed は緩めない
+- **D5: 文の実行ディスパッチは起源（明示 Tx か暗黙 Tx か）を区別しない**（既存方針）。受理した DDL は暗黙 Tx（WIRE-16）でも同じ規則で積まれる。暗黙 Tx の writer は従来どおり開始時に取得する
+- **D6: PL/pgSQL の本体と `DO` の中の DDL は、引き続き `0A000` で拒否する**。入れ子の文が `execute_in_active_txn_inner` を通るため、トップレベルの受理がそのまま入れ子へ広がる。これを防ぐゲートを各子 Issue の実装時に置く。内部 savepoint（`EXCEPTION` 節）は差分方式の対象外（#2227・#2879 節）
+
+### DDL 種別ごとの Tx 内の扱い
+
+列の意味: 「本体」は現状の autocommit の commit 形（「自前」は関数内で `begin_write_txn` を開くこと）、「Tx 内」は積む／拒否を維持、「担当」は子 Issue。
+
+| 種別 | 文 | 本体 | Tx 内 | 担当 | 注意 |
+| --- | --- | --- | --- | --- | --- |
+| 表 | `CREATE TABLE`（列制約・PK・UNIQUE・FK・CHECK・暗黙 SEQUENCE を含む） | 自前。`create_table_in_txn`・`create_table_with_implicit_sequences_in_txn` あり | 積む | #3313 | 暗黙の採番状態は SEQUENCE の行に従う |
+| 表 | `DROP TABLE [CASCADE]` | 自前。`drop_tables_in_txn`・`drop_targets_with_dependents_in_txn` あり | 積む | #3313 | 依存の連鎖（VIEW・SEQUENCE・トリガ・ポリシー・ACL）も同じ write txn で処理する |
+| 表 | `ALTER TABLE`（列の追加・削除・型変更・既定値・NOT NULL・制約の追加と削除・RENAME・複数アクション） | 自前。一部に `_in_txn` あり、`alter_table_in_single_txn` あり | 積む | #3313 | 既存行の検証・書き換えは上限の中で行う（「上限」） |
+| 表 | `CREATE TABLE ... AS` | `ctas_exec` が 1 つの write txn。存在の事前確認は確定済み状態を読む | 積む | #3313 | 事前確認を write txn 内へ移す（V3） |
+| 表 | 一時表の `CREATE TEMP TABLE`・`DROP TABLE` | 一時ストア＋`SessionTempCatalog`。現状は Tx 内で `0A000`（temp-table.md） | 積む | #3313 | 一時 write txn（`ensure_temp_txn`）と `session_at_begin` の復元で巻き戻す。永続表と一時表を混ぜた DROP は従来どおり `0A000` |
+| 索引 | `CREATE [UNIQUE] INDEX`（式・部分・GIN・HNSW の宣言）・`DROP INDEX` | 自前（`create_index_bound`・`drop_index`）。`_in_txn` 本体なし | 積む（本体を分離する） | #3313 | redb 内の索引カタログ世代を鍵にするキャッシュへ載せない（V4） |
+| 索引 | 一時表の索引 DDL | `temp_route` で `0A000` | 積む | #3313 | 一時側の write txn に積む |
+| VIEW | `CREATE VIEW`・`DROP VIEW [CASCADE]` | 自前。`drop_view_in_txn` あり | 積む（実装済み。「#3315 の実装記録」） | #3315 | `CREATE OR REPLACE VIEW`・DDL 後の列別名／`WITH CHECK OPTION` つきは `0A000`（#3311） |
+| VIEW | マテビューの作成・`REFRESH [CONCURRENTLY]`・`DROP`・マテビューの索引 | 自前。`create_materialized_view_in_txn` などあり | `0A000` を維持（#3311） | #3311 | 複数の文脈での本文評価と REFRESH の commit 箇所 3 つの監査を別に要する |
+| SEQUENCE | `CREATE`／`ALTER`（`RESTART` なし）／`DROP SEQUENCE`・RENAME | 自前。`create_sequence_in_txn`・`drop_sequence_in_txn` あり | 積む（実装済み） | #3315 | メモリ上の採番値は非トランザクション性（sequence-namespace-and-ledger.md D4）。内部 ID の再利用は払い出し時にカーソルを捨てて防ぐ。`ALTER SEQUENCE ... RESTART` は `0A000`（#3311） |
+| SCHEMA | 要素なしの `CREATE`／`DROP`（`CASCADE` なし）／`ALTER SCHEMA ... RENAME TO` | 自前（`namespace.rs` の `*_gated`）。`*_gated_in_txn` 本体を分離 | 積む（実装済み） | #3315 | 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE`・`ALTER TABLE ... SET SCHEMA` は `0A000`（#3311） |
+| 型 | `CREATE TYPE`（ENUM）・`DROP TYPE` | 自前（`create_enum_type_in_txn`・`drop_enum_type_in_txn` を分離） | 積む（実装済み） | #3315 | `ALTER TYPE ... ADD VALUE` は SQL に未公開（`42601` のまま） |
+| 関数 | `CREATE [OR REPLACE] FUNCTION`・`DROP FUNCTION` | 自前。`create_function_in_txn` あり。暗黙 Tx は #2882 で実施済み | 積む（実装済み） | #3316 | `function_generations` は commit 後に進める。ROLLBACK 時はセッションの UDF キャッシュを再読込する |
+| トリガ | `CREATE [OR REPLACE] TRIGGER`・`DROP TRIGGER` | 自前（`create_trigger_inner`・`drop_trigger`） | 積む（実装済み） | #3316 | 共有の public 表への作成を拒否する既存の `0A000`（#3382）は維持する |
+| ポリシー | `CREATE`／`ALTER`／`DROP POLICY`・`ALTER TABLE ... ROW LEVEL SECURITY` | 自前（`policy.rs`・`row_security.rs`） | 積む（実装済み） | #3316 | 積んだ後の後続文は `0A000`（下の「#3316 の実装記録」。結線は #3311） |
+| 権限 | `GRANT`／`REVOKE`・`ALTER DEFAULT PRIVILEGES`・`ALTER ... OWNER TO` | 自前（`privilege/apply.rs`・`default_acl.rs`・`owner_change.rs`） | 積む（実装済み） | #3316 | 同上 |
+| ロール | `CREATE`／`ALTER`／`DROP ROLE` | 自前。`*_in_txn` あり | 積む（実装済み） | #3316 | ログイン名の対応表も同じ write txn に入る。ロール DDL の後の `SET ROLE` は `0A000`（結線は #3311） |
+| 拒否を維持 | `PARTITIONED` 付きの書き込み（分割実行。SQL-32 ポインタ） | — | `25001`（既存の `PartitionedDmlInTransaction`） | — | 変えない |
+| 拒否を維持 | PL/pgSQL 本体・`DO` の中の DDL | — | `0A000` | 受け皿なし | D6 |
+| 拒否を維持 | D3 に当たる本体と、どの子でも結線していない DDL | — | `0A000` | 各子 | fail-closed の既定 |
+
+`25001` と `0A000` の使い分け:
+
+- PostgreSQL がトランザクションブロックの中で禁じる文は `25001` にする（現状は分割実行だけ）
+- 本 DB が Tx 内で未対応なだけの文は `0A000` にする
+- 将来 `CREATE INDEX CONCURRENTLY` などを受理する場合は `25001` 側に入れる（現状は構文として `42601`）
+
+### 可視性
+
+- **V1: 同じ Tx の後続文が読むカタログ**: DDL を積んだ Tx は `ActiveTxn` に DDL 済みの印（例 `has_ddl`）を持つ。印がある間は、カタログ・スキーマ・表世代・索引宣言・ポリシー・ACL・ロール・関数の読み取りを**すべて共有 write txn から**行う。確定済みの状態を黙って読む経路は作らない。結線前の経路は `0A000` で拒否する（fail-closed）
+- **V2: 権限・ポリシー・ロールの判定**: 同じ Tx の中でこれらを変えた後の判定は、必ず write txn 側の定義で行う（確定済み側で判定すると REVOKE や CREATE POLICY の後に古い権限で読めてしまい fail-open になる）。DDL の権限ゲート（`42501`）は、writer を取る前に 1 回判定し（権限の無い主体に writer を取らせず、従来の順序も保つため）、writer を取った後に write txn 上で再判定する（`BEGIN` 後に他のセッションが commit した REVOKE を見落とさないため）
+- **V3: 名前の存在・衝突の判定**: `42P07`・`42P01` などは writer を取った後に write txn の中で確定する。確定済み状態での事前確認（`relation_name_exists` など）は最適化として使ってよいが、エラーを確定する根拠にはしない（CTAS の TOCTOU 対策と同じ型）。他のセッションの DDL は writer の待機（`55P03`）で直列化されるため、COMMIT 前の名前の衝突を観測できない
+- **V4: キャッシュの構造的ゲートを DDL にも広げる（P0）**: 世代を鍵にするキャッシュ（表世代・redb 内の索引カタログ世代・`DictionaryCache`・`relation_snapshot`・HNSW など）に、write txn から読んだ内容を lookup も insert もしない。ROLLBACK するとその世代番号が再利用され、別のセッションや別のテナントへ漏れるため。決定 6 の既存の規則を DDL にも適用する
+- **V5: `USING PLAN`・`EXPLAIN` の世代照合**: 決定 6 の「Tx 内は DDL 不可なので確定済み側で照合する」という前提は、DDL 済みの Tx では成り立たない。DDL 済みの Tx では照合の前後とも write txn から読む。結線までは `0A000`（#3314）
+- **V6: 他のセッションからの見え方**: redb は commit 前の write txn の内容を他の read txn に見せないため、COMMIT 前の名前・存在は他のセッションから見えない。COMMIT の後は既存の `note_ddl` の記録により、該当する表を読んでいた他の Tx に `40001` が出る（1a-6）。共有されるオブジェクトの DDL はもともと COMMIT 後に全テナントへ見えるため、新しい側チャネルにはならない
+- **V7: 拡張クエリの Parse／Bind／Describe**（`refresh_prepared_in_txn`・`PreparedPathStamp`）: DDL 済みの Tx では名前解決を write txn で行う。できない経路は再 Parse を促す `0A000` にする。ROLLBACK の後は刻印を COMMIT 前の状態へ戻すか失効させる（#3314）
+
+### writer の取得
+
+- 判定はすべて、カタログ・行・台帳・世代に何も書かないうちに行う
+- DDL は最初の書き込み文と同じ入口 `SessionTransaction::ensure_writer_with(ctx, ..)` で writer を取る。待機の上限は `55P03`、`40001` の判定は 1a-3・1a-11 のとおり
+- 判定の順序:
+  1. READ ONLY の `25006`（既存の先行判定）
+  2. `PARTITIONED` の `25001`
+  3. 権限ゲートの 1 回目（`42501`）
+  4. `ensure_writer_with`
+  5. 権限の再判定と名前の判定（write txn 上）
+  6. 書き込みと `note_ddl`
+
+### 上限
+
+- DDL も 1 文として `check_and_register_statement` で数える。文数の上限 `max_statements` に入り、超えたら `54000` で `Failed` にする。持続時間の上限 `max_duration` は `BEGIN` から数える（不変）
+- 既存の行を処理する DDL（`CREATE INDEX` の構築・制約の追加時の既存行の検証・`ALTER COLUMN TYPE` の書き換え・CTAS）は、ループの中で期限を検査する。期限は文の期限と Tx の残り時間の小さい方とし、超えたらその DDL は `54000` で `Failed` にする。走査ループの検査点は #3314 で結線した（「#3314 の実装記録」）
+- 1 commit あたりの足跡の上限（`MAX_FOOTPRINT_ELEMENTS_PER_COMMIT`）は従来どおり適用する。DDL はフラグで表すため要素数には数えない
+
+### 破棄
+
+- `ROLLBACK`・`25P02` からの `ROLLBACK`・接続断（drop）・期限切れの解放（`release_if_expired`）のいずれでも共有 write txn は abort される。redb 上のカタログ変更は残らない
+- redb の外にある状態は、COMMIT 成功後に適用するフックとして `ActiveTxn` に積む（`mark_function_written` を一般化する形。abort の経路では捨てる）。主な対象は `function_generations`・セッションの UDF キャッシュ・一時カタログ・`search_path` の刻印・メモリ上の採番値。書き込み中（commit 前）に共有のインメモリ状態を変えるコードは置かない。子 Issue ごとに #1179 と同じ「commit 後の副作用の監査」を受入条件にする
+- `ROLLBACK TO`: redb 上のカタログ表の作成・削除・行は #2879 の差分方式（`table_image`）で巻き戻る。`SHAPES` に無い型の表は `Unrestorable`（`0A000`）で fail-closed になる。savepoint 時点の commit 後フックの列とセッションのキャッシュも同じ時点へ戻す（#3317）
+- 変更ログと PITR: 明示 Tx は 1 commit = 1 レコードで commit 時の最終内容を読む（change-log-pitr.md D4）ため、DDL と DML が同じ commit に混ざる。変更ログのオラクル試験とレプリカでの適用で検証する（#3313・#3318）
+
+### #3313 の実装記録（表・索引の DDL）
+
+- 実装の入口は `core/txn_ddl.rs`（`execute_in_active_txn_inner` の `CreateTable`・`DropTable`・`AlterTable`・
+  `CreateIndex`・`DropIndex` の腕から呼ぶ）。明示 Tx と暗黙 Tx（WIRE-16。複数文メッセージ）が同じ入口を通るため、
+  暗黙 Tx でも同じ DDL を受理し、後続の文が失敗すれば表・索引ごと巻き戻る
+- 実行本体は autocommit と同じ本体へ共有 write txn を渡す。`catalog.rs` は `create_index_bound`・`drop_index` を
+  「検証＋write txn 内本体」と autocommit のラッパーへ分け、共有 txn 版（`create_index_in_shared_txn`・
+  `drop_index_in_shared_txn`・`create_table_in_shared_txn`・`drop_tables_in_shared_txn`・
+  `alter_table_in_shared_txn`）が commit 記録（`note_ddl`）と表世代・索引カタログ世代の bump を本体の直後に行う。
+  commit は Tx の COMMIT が 1 回だけ行う。`sql/ddl.rs` の `execute_*_in_txn` が名前の存在確認を write txn で
+  確定する（V3）
+- 判定順: READ ONLY（`25006`）→ DDL 権限（`42501`）→ 作成先の検査 → 未対応の形の `0A000`（writer を取る前・
+  カタログを読む前）→ writer の取得（`55P03`・`40001`）→ DDL 本体。本体が失敗した Tx は復帰不可の `Failed`
+  （`SessionTransaction::mark_ddl_started` が印を立て、`is_recoverable` を偽にする）
+- Tx の DDL 状態（`TxnDdlState`）: `started`（読み取り源を常に writer にする。改訂 #3317: `ROLLBACK TO` の拒否と復帰不可の判定からは外した）、
+  `removed`（DROP 済み）、`evict_sequences`（DROP TABLE・DROP COLUMN が道連れに削除した SEQUENCE の内部 ID）。
+  採番器の現在値は commit 成功後にだけ捨てる。`ActiveTxn` と一緒に捨てるため ROLLBACK・失敗・期限切れでは何も
+  実行されない。遅延 FK 検査は同じ Tx で DROP した表を対象から外す
+- 受理する形: `CREATE TABLE`（列制約・PK・UNIQUE・CHECK・FK を含む。public）・`DROP TABLE [IF EXISTS] a, b
+  [RESTRICT|CASCADE]`（永続表のみ）・`ALTER TABLE` の `ADD COLUMN`・`DROP COLUMN`・`ALTER COLUMN SET/DROP NOT NULL`・
+  `SET/DROP DEFAULT` とそれらの複数アクション・`CREATE [UNIQUE] INDEX`（式・部分・GIN・HNSW の宣言）・`DROP INDEX`
+- DDL 後の文（暫定の許可リスト。受け皿は #3311）: 受理するのは DDL・Tx 制御・`SET`/`SHOW`・`INSERT`
+  （単一行・複数行・`ON CONFLICT`・`RETURNING`）・`SELECT`/集計/スキャン/JOIN/集合演算/定数 SELECT
+  （`USING PLAN`・ルーチン呼び出し・ビュー展開を除く）。表・索引を DROP した後は DDL 以外を `0A000` にする。
+  それ以外（`UPDATE`・`DELETE`・`TRUNCATE`・`EXPLAIN`・`COPY`・カーソル・`LOCK`・`DO`・`SET ROLE` など）は `0A000`。
+  拡張クエリの Execute（Parse・Bind 済みの文）は、確定済みカタログで束縛した文を実行しないため、DDL・Tx 制御・
+  `SET`/`SHOW` 以外を `0A000` にする（`execute_parsed_in_txn_unscrubbed`。V7。受け皿は #3311）。`COPY` は
+  `begin_copy_in_txn` が同じく `0A000`。同じ Tx で作った表への SELECT・INSERT を Parse 時点で解決できない
+  拡張クエリは `42P01` になる
+- 確定済みカタログを読む解析の表スキーマの引き当て（`impl TableLookup for Storage`・INSERT の
+  `InsertSchemaLookup`）は、Tx が変更した表（dirty）の write txn 上のスキーマを文の区間だけ重ねて見る
+  （`sql::txn_overlay`。スレッドローカルの RAII。重ねるのは張った `Storage` だけで、一時表用の別 `Storage`
+  には効かない）。実行本体は write txn を直接読む。確定済みカタログ側の権限（ACL）は重ねないため、
+  束縛ロールのセッションが同じ Tx で作った表へ触れる経路は `42501` になる想定（fail-closed。**未検証**。
+  検証は #3314 の記録）
+- 世代を鍵にするキャッシュ（V4）: write txn から読んだ内容をキャッシュへ載せない。DDL を積んだ Tx の読み取りは
+  常に writer から読み、ROLLBACK 後の世代の再利用でも別セッションの検索へ漏れないことをテスト
+  （`sql80_txn_table_ddl.rs`）で固定した
+- `ROLLBACK TO`: 本 Issue では暫定で `0A000`（名前付き・PL/pgSQL の内部 savepoint の両方）、DDL 後の `SAVEPOINT` は
+  巻き戻し不能として登録していた。改訂 #3317: 下の「#3317 の実装記録」で巻き戻せるようにした
+- 未対応のまま残した形（`0A000`）: `ALTER TABLE` の制約の追加・削除・`RENAME`・`ALTER COLUMN TYPE`・`SET SCHEMA`・
+  行セキュリティ、`CREATE TABLE ... AS`、SERIAL/IDENTITY 列（暗黙 SEQUENCE の採番状態が ROLLBACK で戻らず、再利用される
+  内部 ID と食い違うため）、SCHEMA 配下の表・索引、一時表の DDL（既存行を処理する DDL の期限の検査点は #3314 で結線した）
+- 変更ログのオラクル試験: `FANDHE_CHANGE_LOG_ORACLE=1`（`--all-features`）で `sql_t40_up`・`sql_named`・`table_rls`・
+  `sql_t01_39` を流して緑（DDL と DML が混ざる commit を含む）。`make change-log-oracle` の全体（2 段）は未検証
+
+### #3314 の実装記録（上限・`25001`・可視性の固定）
+
+ポインタ: SQL-80・SQL-31・SQL-23・SQL-52・TABLE-22・TABLE-36・TABLE-44・TASK-349（関連: SQL-32・SQL-71）。
+
+- **Tx の持続時間の期限を走査 DDL へ結線**: `execute_table_ddl_in_txn` の先頭で `DeadlineScope::install` により
+  `SessionTransaction::duration_deadline`（`started_at + max_duration`。加算があふれたら `54000`）を張る。writer の待機
+  （`effective_lock_wait`）と、下記の走査ループの確認点が、`statement_timeout` の期限との早い方で打ち切る。
+  打ち切りが `StatementTimeout` で、かつ Tx の持続時間を過ぎていれば、`fail_duration_exceeded` が復帰不可の `Failed`
+  にして `54000` を返す（文の開始時点の上限超過と同じ契約）。過ぎていなければ `57014`。
+- **確認点**（commit より前。`CatalogError::Interrupted` で返し、表層で `QueryCanceled` へ写す。文言は固定で名前・件数を含めない）:
+  一意制約の重複走査・`SET NOT NULL` の NULL 検査・部分索引と式索引の既存行検証・式/部分 UNIQUE の重複走査・
+  GIN の初回構築・生成列の `ADD COLUMN` の全行計算・実体化ビューの一意索引の実体走査。
+  これに伴い、行のある表で `0A000` にしていた走査 DDL のゲート（`reject_scan_ddl_on_nonempty_table`）を撤去した。
+- **autocommit への副作用**: 同じ本体を通る autocommit の走査 DDL も `statement_timeout`・切断検出で中断できるようになった。
+  確認点は commit より前なので副作用は残らず、1 文の DDL の原子性は保たれる。
+- **`25001` の判定順**: 拡張クエリの Execute で、DDL 後の分割実行（`PARTITIONED` 付き `UPDATE`/`DELETE`・`CANCEL PARTITIONED DML`）は
+  `check_extended_execute_after_ddl` を素通りさせ、`execute_parsed_in_txn_inner` の `25001` に先に到達させる（従来は `0A000` が先だった）。
+- **固定したテスト（変更なしで成り立っていた性質）**: 他セッションからの COMMIT 前の表は、一度も作られていない名前と
+  エラーの種類・文言が一致する（同じテナント・別テナント）。別セッションの DDL は名前にかかわらず writer の待機で `55P03`。
+  読んだ表への他セッションの commit の後の DDL は `40001` で、DDL の印は立たず何も残らない（読んでいない表では `40001` にならない）。
+  DDL も文数の上限に数えられ、暗黙 Tx（複数文メッセージ）でも超過でメッセージ全体が残らない。
+- **追跡の結果（DDL 後の文の結線）**: `UPDATE`・`DELETE` の実行本体は `WriteTarget::InTxn` を受け取るが、表スキーマを
+  確定済みカタログ（`Storage::get_table_schema`）から取って束縛する経路があり、同じ Tx で作った表・追加した列を解決できない。
+  索引カタログ・一意の強制・FK・生成列・世代キャッシュについても write txn を読むことを示せていない。規則（束縛と実行の両方が
+  write txn を読むことを追跡で示せた種類だけを許可リストへ入れる）に従い、`UPDATE`・`DELETE`・`TRUNCATE`・`INSERT ... SELECT`・
+  `ON CONFLICT ON CONSTRAINT`・DROP 後の参照・`EXPLAIN`・`USING PLAN`・拡張クエリの Execute（`25001` の順序を除く）は `0A000` のまま残し、
+  受け皿は #3311（要起票）とした。
+- **権限の再判定（V2）**: 表・索引の DDL の権限ゲート（`require_ddl`）はセッションの主体だけで決まりカタログを読まないため、
+  write txn 上で再判定する意味がない。カタログに依存する `require_creation_target`（SCHEMA の権限）は、SCHEMA 配下の DDL を `0A000` のまま
+  残すため結線していない。結線するときは writer を取った後で write txn 上で再判定する。束縛ロールの DDL 後の DML の権限は、DML を結線した時点で検証する。
+- 単独のテストバイナリ `tests/sql80_txn_ddl_deadline.rs`（時間依存のため束ねない）。時間の揺らぎでは結果が変わらない形にしてある。
+
+### #3317 の実装記録（`ROLLBACK TO`・失敗からの復帰・接続断）
+
+- 水位: `WriteMarks`（`sql/savepoint.rs`）に DDL 状態の水位（`ddl_started`・`ddl_removed`・`ddl_evict_len`）を足し、
+  `SAVEPOINT` 時点で複製、`ROLLBACK TO`（`restore_at`）が redb の復元・差分の再適用・世代の突き合わせがすべて成功した
+  後にだけ戻す（失敗した経路ではメモリ上の状態を変えない）。`evict_sequences` は追記専用の列なので長さで切り詰める。
+  これを戻さないと、取り消した `DROP TABLE` が所有していた生きている SEQUENCE の現在値を COMMIT 後に捨て、採番が
+  重複する
+- DDL 後の `SAVEPOINT`: 行と同じ差分方式（`table_image`）で捕捉する。`restore_at` の DDL ゲートと `plan_savepoint` の
+  DDL ゲートを外した。差分を取れない場合（未知の型・multimap・上限超過・期限超過）は従来どおり `Unrestorable`
+  （`ROLLBACK TO` は `0A000`）
+- 失敗からの復帰: `is_recoverable` から DDL の条件を外した。失敗した DDL は、それより前の savepoint への
+  `ROLLBACK TO` でだけ取り消せる（差分は redb の実内容から取るため部分的な書き込みも時点へ戻る）。savepoint が無ければ
+  従来どおり復帰不可。`XX000`・`40001`・上限超過は従来どおり復帰不可
+- PL/pgSQL・`DO` の内部 savepoint: DDL 後は `pl_rollback_to` が `0A000`（設計 D6。対応しない）
+- 戻さないもの: commit 記録の足跡（`note_ddl`。余分に残るだけで偽陰性を生まない。#1945 節と同じ）、採番状態
+  （非トランザクショナル）。`function_scopes` は暗黙 Tx 専用で savepoint と交わらないが、明示 Tx の関数 DDL を入れる
+  #3316 で同じ水位方式へ含める必要がある（申し送り。#3316 の判断: 戻さなくても余分な世代 bump になるだけで安全。
+  「#3316 の実装記録」の S8）
+- 破棄: `25P02` からの `ROLLBACK`・drop（接続断）は既存の abort 経路で成立し、テストで固定した
+- テスト: `sql80_txn_ddl_savepoint.rs`（engine）、`sql80_txn_table_ddl.rs`（wire。文末 `;` の psql 形・失敗からの復帰・
+  ソケット切断）
+
+### #3315 の実装記録（VIEW・SEQUENCE・SCHEMA・型の DDL）
+
+- 入口: `core/txn_ddl_objects.rs`（`execute_table_ddl_in_txn_inner` から委ねる。Tx の持続時間の期限を共有する）。実行本体は
+  autocommit と同じ `sql::ddl` の `*_in_txn`。`catalog` 側は `create_enum_type`・`drop_enum_type`・`drop_view_with_behavior`・
+  `alter_sequence`・`rename_sequence`・SCHEMA の作成・削除・改名を、write txn 内本体（begin・commit を含まない）と
+  autocommit のラッパーに分けた。判定順は #3313 と同じ（READ ONLY → DDL 権限 → 作成先 → 未対応の形の `0A000` →
+  writer 取得 → 作成先の再判定 → 本体）
+- 受理した形: `CREATE VIEW`・`DROP VIEW [IF EXISTS] [RESTRICT|CASCADE]`、`CREATE`／`DROP SEQUENCE`・`ALTER SEQUENCE`
+  （`RESTART` なし）・`RENAME TO`、要素なしの `CREATE SCHEMA`・`DROP SCHEMA`（`CASCADE` なし）・`ALTER SCHEMA ... RENAME TO`、
+  `CREATE TYPE ... AS ENUM`・`DROP TYPE`。`IF [NOT] EXISTS` で何も書かない場合は DDL の印を巻き戻す。末尾 `;` と暗黙 Tx
+  （複数文メッセージ）でも同じ規則
+- **SEQUENCE の内部 ID の再利用対策**: 内部 ID のカウンタは redb の txn と一緒に ROLLBACK で巻き戻るが、採番器の
+  カーソルは巻き戻らない。このため明示 Tx で作った SEQUENCE を採番して ROLLBACK すると、同じ ID を払い出された別の
+  SEQUENCE が古い現在値を引き継ぐ。`create_sequence_in_txn_evicting` が ID を払い出した直後にその ID のカーソルを全テナント
+  分捨てる。払い出した ID は確定済みのどの SEQUENCE にも割り当てられておらず、writer 保持中は並行して使う者もいないため、
+  捨てるのは孤児だけである。「commit 前に共有メモリを変えない」原則の例外で、再利用は必ずこの払い出しを通るため中断の
+  各経路（ROLLBACK・`ROLLBACK TO`・接続断・期限切れ・commit 失敗）を個別に塞ぐ必要がない（起動時の移行だけは
+  カーソルが無いため従来の関数を使う）。以前の「内部 ID は再利用しない」という記述はこの意味に改める
+- 採番状態は非トランザクション: ROLLBACK しても採番済みの値は戻らず、`DROP SEQUENCE` の採番器の破棄は commit 成功後に
+  `evict_sequences` で行う。`DROP`・`ALTER`・RENAME の後の読み取り・INSERT は、確定済みカタログの古い定義・名前を
+  引かないよう `removed` で拒否する
+- **SCHEMA の DDL の後の文**: 後続文の `search_path` の解決と作成先の選択は確定済みカタログを読むため、SCHEMA を
+  作成・削除・改名した後は SCHEMA の DDL・`SET`/`SHOW` 以外を `0A000` にする（`TxnDdlState::schema_changed`。`ROLLBACK TO` でも
+  戻さない安全側の印）。SCHEMA の内部 ID も ROLLBACK で再利用されうるが、SCHEMA 配下の関係は未結線で、SCHEMA の DDL
+  の後は他の文を拒否するため、SCHEMA ID を鍵にするメモリ上のキャッシュは Tx 内で埋まらない
+- VIEW: 列別名・`WITH CHECK OPTION` の事前検査は確定済みカタログを読むため、DDL を積む前の Tx（writer 保持中で
+  write txn の起点と一致する）でだけ受理し、積んだ後は `0A000`。本文の参照先・名前衝突・件数上限は write txn 内の
+  本体が判定する。同じ Tx で作った VIEW を読むと確定済みカタログに無いため `42P01`（fail-closed）
+- 型: 同じ Tx で作った ENUM 型を使う `CREATE TABLE` は、解析が確定済みカタログを読むため `42704`（fail-closed）。
+  `DROP TYPE` した型を使う列は write txn の再検証で拒否される
+- 権限の再判定（V2）: 作成先の権限（`require_creation_target`）は writer 取得の前後で判定し、SCHEMA の所有者ゲートは本体の
+  中で write txn 上に判定する。ACL・ロールの Tx 内 DDL（#3316）が入るときは、確定済み側ではなく write txn 側で判定し直す
+- 未対応として `0A000` を維持（受け皿は #3311）: マテビューの作成・`REFRESH`・削除と索引、SCHEMA 配下の VIEW・SEQUENCE・型
+  （内部キー `#<id>.…`）、要素つき `CREATE SCHEMA`、`DROP SCHEMA ... CASCADE`、`ALTER TABLE ... SET SCHEMA`、
+  `CREATE OR REPLACE VIEW`、`ALTER SEQUENCE ... RESTART`、SERIAL・IDENTITY 列。PL/pgSQL・`DO` の中の DDL は設計 D6 のとおり
+  対応しない
+- テスト: engine の `sql80_txn_object_ddl.rs`（COMMIT・ROLLBACK・`ROLLBACK TO`・内部 ID の再利用・権限・READ ONLY・拒否の形）、
+  wire の `sql80_txn_object_ddl.rs`（psql 形・切断・暗黙 Tx）。拒否を固定していた既存テストは新しい挙動へ更新した
+
+### #3316 の実装記録（関数・ポリシー・権限・ロール・トリガ）
+
+ポインタ: SQL-80・SQL-31・SQL-23・SQL-52・TABLE-22・TABLE-36・TABLE-44・TASK-349。
+
+- **入口**: `core/txn_security_ddl.rs`（`execute_in_active_txn_inner` の関数・ポリシー・権限・所有者・ロール・トリガの腕と、
+  `core/txn_ddl.rs` の `ALTER TABLE ... ROW LEVEL SECURITY` の腕から呼ぶ）。明示 Tx と暗黙 Tx が同じ入口を通る。実行本体は
+  autocommit と同じ `sql/*_ddl.rs` の `execute_*_in`（書き込み先 `Option<&WriteTransaction>` を受ける。`None` が autocommit）で、
+  第 2 の実行器は作らない。Tx の持続時間の期限（`DeadlineScope`）と `54000` の扱いは表・索引の DDL と同じ。
+- **本体の分割（D1）**: `catalog/txn_target.rs` の `Storage::run_catalog_write(target, body)` が「自前の write txn を開いて
+  変更があれば commit」と「共有 write txn へ相乗り（commit も abort もしない）」を 1 つの本体で表す。ポリシー・行セキュリティ・
+  トリガ・ACL・既定権限・所有者・ロール・メンバーシップ・関数の削除の各本体は 1 回の write txn で完結していたため（D3 に当たる
+  ものは無かった）、`*_in` 版へ移した。autocommit の判定順・エラー・no-op で commit しない挙動は変えない。表世代の bump と
+  `note_ddl` は本体が共有 txn の上で行う。関数の世代だけは commit 後に回す（autocommit は呼び出し側が commit 後に進め、Tx は
+  `mark_function_written` が COMMIT 成功後に進める）。
+- **判定順**: READ ONLY（`25006`）→ 権限ゲート（`42501`。autocommit の腕と同じ位置・順。writer を取る前）→ 未対応の形の
+  `0A000`（一時表への `OWNER TO`・共有 public 表への `CREATE TRIGGER`〔本体の判定〕）→ writer の取得（`55P03`・`40001`）→
+  DDL を積んだ印 → 本体。付与者の権限（grant option）・所有者・依存の判定は本体が write txn の上で行うため、writer を取った後の
+  再判定は構造的に満たされる（`BEGIN` の後に他セッションが commit した変更も見る）。セッションだけで決まるゲートは
+  カタログを読まないので再判定の意味が無い（V2）。no-op（`IF EXISTS` の skip・所有者が変わらない・状態が変わらない行セキュリティ）は
+  印を巻き戻す。
+- **後続文の制限（P0。暫定。受け皿は #3311）**: ポリシー・行セキュリティ・GRANT/REVOKE・既定権限・所有者・ロール・トリガ・
+  `DROP FUNCTION` を積んだ Tx は `TxnDdlState::guarded` を立て（`started` も立つ）、`check_post_ddl_statement` が DDL・Tx 制御・
+  セッション変数の `SET`/`SHOW` 以外を固定文言の `0A000` にする。権限判定・ポリシー適用・トリガの発火・関数の解決は確定済みの
+  カタログを読むため、同じ Tx で変えた内容を見ずに通す fail-open を作らない（SELECT・INSERT・`SET ROLE`・ルーチン呼び出し・
+  カーソル・`EXPLAIN`・`COPY` などは `0A000`）。文言は文の種類だけで名前・存在を含まない。`CREATE [OR REPLACE] FUNCTION` は従来
+  （暗黙 Tx。#2882）どおり印を立てず、セッションのレジストリ経由で後続の呼び出しが新定義を見る。表の DDL の後の
+  `CREATE FUNCTION` は関数本体の束縛が確定済みカタログを読むため `0A000` のまま。本種別の DDL は表・索引の DDL の後でも
+  受理する（本体が write txn だけを読む）。拡張クエリの Execute の許可リストにも足した。
+- **SCHEMA 配下の対象と名前解決の食い違い（P0）**: 名前解決は文ごとに確定済みのカタログで行われるため、同じ Tx で作った
+  public の表・関数は、`search_path` で見える SCHEMA 配下の同名の関係・関数へ誤って解決されうる（実測: `search_path = public, s`
+  で `s.t` がある状態の `BEGIN; CREATE TABLE t ...; GRANT SELECT ON t TO bob` が `s.t` へ付与された。テストで再現し修正）。
+  そこで、表・索引の DDL（`relations_changed`）または関数の DDL を積んだ後は、内部キー（`#<id>.<name>`）に解決された対象を
+  固定の `0A000` で拒否する（`reject_schema_keys_after_shape_change`。関係と関数を混ぜない。トリガ関数を同じ Tx で作って
+  トリガを張る形を通すため。受け皿は #3315）。何も積んでいない間は解決が確定済みの状態と一致するので受理する（共有 public 表には
+  トリガを持てない〔#3361〕ため、トリガの対象は SCHEMA 配下の表に限られる）。ポリシー・行セキュリティは未修飾の名前を
+  `search_path` で解決せず public の表として扱うため、この食い違いは起きない。SCHEMA 配下の表の DDL は Tx 内で受理しない（#3311）。
+  SCHEMA の作成・削除・改名は #3315 で受理するが、SCHEMA 配下の関係は未結線のため、この前提は変わらない。
+- **commit 後の副作用の監査（S8）**: 共有 txn の本体は redb の外の状態を変えない。関数の世代は `function_scopes`（COMMIT 成功後
+  にだけ bump）、セッションの UDF レジストリは ROLLBACK／`ROLLBACK TO` が `SessionState` の複製で戻す。採番器・ログイン名の
+  対応表（`roles` と同じ write txn）・キャッシュ（世代を鍵にするものは write txn の内容を載せない）は対象外または変更なし。
+  `function_scopes` は `ROLLBACK TO` で戻さない（取り消した関数 DDL の scope を COMMIT 後に余分に bump するだけで、他セッションの
+  refresh が再読込するだけ。偽陰性を生まない）。
+- **`ROLLBACK TO`**: `WriteMarks` に `ddl_guarded` の水位を足し、`restore_at` の成功後にだけ戻す。権限・ポリシー・トリガ・
+  ACL・所有者・ロール・メンバーシップ・ログイン名・関数の各カタログ表の型は `table_image::SHAPES` に含まれるため差分方式で戻る。
+- **変更ログ・PITR**: 1 commit = 1 レコード（既存）。表の足跡を持たないロール DDL だけの Tx も COMMIT できる。
+- **受理しない形（`0A000`）**: PL/pgSQL 本体・`DO`・動的 `EXECUTE` の中の本種別の DDL（D6。`plpgsql_host::classify` が DML と SELECT 系
+  以外を拒否する。注記 `intentional: docs/design/explicit-transaction.md`）、共有 public 表への `CREATE TRIGGER`（#3382）、
+  一時表への `OWNER TO`、積んだ後の後続文（受け皿は #3311。専用の Issue は未起票で、起票はユーザー承認待ち）。
+- テスト: `table_rls/sql80_txn_security_ddl.rs`（COMMIT・ROLLBACK・越境〔同じテナント・別テナント〕・後続文の `0A000`・組み合わせ・
+  `ROLLBACK TO`・判定順・`DO`・トリガと関数）、`sql_t40_up/sql66_udf_*`（Tx 内の関数 DDL）、`rls13_*`・`sql39_*`・`sql40_*`・
+  `table45_trigger_ddl`（旧 `0A000` の固定を新しい挙動へ更新）、wire は `wire_proto/sql80_txn_table_ddl.rs`（psql 形・接続断）。
+
+### 子 Issue への割り当て（申し送り）
+
+| 子 | 内容 |
+| --- | --- |
+| #3313 | 表・索引・制約・CTAS・一時表、変更ログのオラクル試験 |
+| #3314 | 上限の期限検査（実装済み）、`25001` の判定順（実装済み）。V1・V5・V7 の結線と権限の再判定は、追跡の結果を下の記録に残し、残りは #3311 |
+| #3315 | VIEW・SEQUENCE・SCHEMA・型（実装済み。「#3315 の実装記録」）。マテビューは #3311 |
+| #3316 | 関数・トリガ・ポリシー・権限・ロール（実装済み。「#3316 の実装記録」。積んだ後の後続文の結線は #3311） |
+| #3317 | `ROLLBACK TO`・接続断・commit 後フックの巻き戻し（実装済み。「#3317 の実装記録」） |
+| #3318 | Tx の途中・COMMIT の途中の SIGKILL で部分 commit が 0 件であること（`crash-test-cross-table` の道具 #2417・#2418 を拡張） |
+
+- 拒否を固定している既存テスト（`sql_named/*` などの `0A000` のアサーション）は、各子の実装時に新しい挙動へ更新する。期待値は弱めない
+- DDL 種別ごとの設計記録（`temp-table.md`・`create-view.md`・`udf-catalog.md`・`role-privilege-model.md` など）の `0A000` の記述も各子の実装時に更新する。本 Issue では現行の挙動の記述として残す
 
 ## 分離レベルの受理方針（Issue #1937）
 
@@ -776,7 +1078,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 - `crates/engine/tests/sql31_transaction.rs`: BEGIN/INSERT/INSERT/COMMIT の
   可視性・ROLLBACK の完全巻き戻し・入れ子 BEGIN の `25001`・トランザクション外
   COMMIT/ROLLBACK の `25P01`・同一トランザクション内 `operation_id` 再利用の
-  `25000`・対応外文（DDL）の `0A000`・文数上限の `54000`・TRUNCATE と INSERT の原子的
+  `25000`・対応外文（DDL）の `0A000`（各子 Issue の実装時に新しい挙動へ更新する。#3312）・文数上限の `54000`・TRUNCATE と INSERT の原子的
   commit・接続断相当（drop）での完全ロールバックを固定。
 - `crates/engine/tests/sql31_txn_dml.rs`（Issue #1179）: 複数行 INSERT・UPSERT・
   UPDATE・DELETE の COMMIT／ROLLBACK／drop、`UPDATE`・述語形 `DELETE` の `RETURNING`
@@ -856,6 +1158,7 @@ production コード（`crates/wire-server/src/`）は無変更・テスト専�
 
 ## 対象外・申し送り
 
+- Tx 内の DDL（#3312）: 方式は「明示トランザクション内の DDL の方式」節で決定済み。表・索引は #3313 で実装済み（「#3313 の実装記録」）。残りは #3314〜#3318。PL/pgSQL・`DO` の中の DDL は拒否を維持する（D6。受け皿の Issue なし・対応しない）。
 - #2396 関連の申し送り: #2408（`55P03`・上限の起点・カーソル・状態バイトの整合と層 B）、
   #2411（カーソルの分割の検証。実装は #2403）、#2413（CHANGELOG・実装記録。記載済み）、#1933（READ ONLY）、
   #2230（行ロック句・`LOCK TABLE` は専用節を参照）。
@@ -1211,6 +1514,15 @@ crash 道具 `crates/engine/examples/crash_tool_cross_table.rs` の `txn` モー
 - `scripts/crash_test_txn_kill_points.sh`（`make crash-test-txn-kill-points`）が 3 点をセットごとに実行し、PAUSED が最後の進行行であること・終了コード 137・verify の `rows`／`batches` が期待値と完全一致することを確かめる。観測できなかった点があれば失敗にする。
 - ランダム段（`crash_test_cross_table.sh` の txn 段）は最後の進行行で kill 位置を分類し、`rows <= acked + 4` の上限検査を足し、txn 段全体で `IN_TXN` を 1 度も観測しなければ失敗にする。判定を段全体にするのは遅い runner での不安定化を避けるため（3 点の網羅は決定的段が担う）。
 - 実行場所: 既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。DDL の道具は #2417、kill 位置の分類は #2418、DDL エラー・`55P03` は #2419。
+
+## DDL を含む明示トランザクションの crash テスト（Issue #3318・SQL-80・SQL-31・SQL-23・SQL-52・TABLE-22・TABLE-36・TABLE-44・TASK-349 ポインタ）
+
+- 道具は `crates/engine/examples/crash_tool_txn_ddl.rs`（`write`・`write-pause`・`verify`・`self-check`）。engine の本番コードは変えず、公開 API の `execute_sql_in_txn` だけで Tx を組む。
+- 文列（Tx k）: `CREATE TABLE td_<k>`・空の表への `CREATE UNIQUE INDEX`・行の `INSERT`（in-txn 点）・スカラー `CREATE INDEX`・既存の台帳 `td_log` への `INSERT`（before-commit 点）・`COMMIT`（after-commit 点）。
+- 期待: in-txn・before-commit では当該 Tx のカタログ・行・索引宣言・物理構造・台帳行が全く残らず、after-commit では全部残る。`verify` は表集合が連続した通番であること・索引宣言が各 Tx の 2 件ちょうどであること・行と台帳行の完全一致・一意索引の読み取り専用検証と重複拒否・スカラー索引の読み出し一致・未 commit の Tx の物理表の残骸なし・別テナントから行が見えないことを fail-closed で確かめる。`self-check` が負の対照を持つ。
+- ランダム段: `write` が `IN_TXN`・`COMMIT_SENT`（`COMMIT` の直前。間に待機なし）・`COMMITTED` を出し、最後の進行行が `COMMIT_SENT` なら Tx 数は ack 済み n か n+1、それ以外は n と完全一致。`IN_TXN` を 1 度も観測しなければ失敗。`COMMIT_SENT` の観測は必須にしない（COMMIT は短く遅い runner で不安定になるため。redb commit の前後は決定的段が毎回検査する）。
+- 対応しない: `commit_active` の redb commit 前後への同期点の追加。本番コードの変更と feature 付きの別ビルドが要るため。
+- 実行場所: `scripts/crash_test_txn_kill_points.sh` の段 B（決定的）・段 C（ランダム）。既存の `crash-test-cross-table` ジョブの step（必須チェック名は不変）。
 
 ## 失敗時の台帳非記録と読み取り文の `USING OPERATION_ID`（Issue #2068・RECOVER-12・RECOVER-9・SQL-10 ポインタ）
 

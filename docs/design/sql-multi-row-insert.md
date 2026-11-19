@@ -30,9 +30,9 @@ SQL テキスト
                        │
                        ▼（RowBatch のみ）
        core::EngineCore::execute_insert_form の RowBatch 分岐
-         1. ①行数上限: bounds.len() > self.batch_limits.max_files_per_batch → 54000
+         1. （Issue #3308 以降）①は掛けない。行数上限は --max-insert-rows 指定時のみ
          2. ②③④: EngineCore::validate_insert_batch_byte_and_chunk_limits
-            （batch_limits::validate_batch_shape・validate_chunk_total）→ 54000
+            （batch_limits::validate_row_batch_shape・validate_chunk_total）→ 54000
          3. sql::exec::execute_insert_batch_with_schema（単一 write トランザク
             ション・単一台帳エントリ・operation_id 必須化ガード込み）
 ```
@@ -111,3 +111,65 @@ limits`）が想定外に大きい `Vec<BoundInsert>` を受け取ることは�
 採番する。内容照合ハッシュは `id` を材料にしない別タグ（`InsertIdentityBatch`・
 `InsertIdentityBatchExpr`）で、全行が明示 `id` のバッチは従来のタグ・バイト列のまま。
 詳細は [migrated-id-identity.md](migrated-id-identity.md) の D8。
+
+## Issue #3308 追記: 行の形から INDEX-4 ① を外す
+
+- INDEX-4 ①（`max_files_per_batch`。既定 64）はファイル形の一括投入向けの値であり、行の形
+  （複数行 `VALUES`・UPSERT・`RETURNING` 付き・INSERT…SELECT・NoSQL `rows[]`）の行数には
+  掛けない。65 行以上の複数行 `VALUES` は既定構成で成功する。上の判定順・上限表の ① の記述は
+  本追記が優先する。
+- 行数の上限は `--max-insert-rows`（`dml_limits.max_insert_rows_per_statement`）の指定時だけ。
+  未指定時の実効上限は ④（1 行 = 1 チャンクで `max_batch_chunks`。既定 4096・
+  `FANDHE_DB_BATCH_MAX_CHUNKS` で上書き可）になる。②③④と SQL 文長の上限は従来どおりで、
+  超過は `54000`・副作用ゼロ。
+- ④は束縛前（`row_count` だけで判定できる時点）にも判定し、`--max-insert-rows` 未指定でも
+  束縛の作業量を有界に保つ（`EngineCore::validate_row_count_chunk_limit`）。
+- ファイル形の一括投入（`execute_insert_sql_batch`・`incremental::index_file_batch`）の ① は変更しない。
+  `COPY FROM` は Issue #3309 で ① を外し、`--max-insert-rows` 指定時だけ行数を `54000` で拒否する
+  （[wire-copy-protocol.md](wire-copy-protocol.md) の既知の相違 5）。警告・README の整合は Issue #3310（下の追記）。
+- 関連 ID: SQL-16・INDEX-4・NOSQL-6（ポインタのみ）。
+
+## Issue #3310 追記: ① を外したあとの資源上限
+
+行の形から ① を外した（Issue #3308・#3309）あと、入力量を抑える上限は ②（1 行のバイト量）・
+③（バッチ合計バイト）・④（チャンク数。1 行 = 1 チャンク）・SQL 文長とトークン数・1 メッセージと
+HTTP 本文の 1 MiB・`--max-insert-rows`（指定時）である。上の §3 の「構文段上限 1,000」は #997 で
+廃止済みで、§4 の「束縛は 1,000 行で有界」は、④ の束縛前判定と文長・トークン数の上限に置き換わった。
+
+### 表層ごとに最初に効く上限（既定構成）
+
+| 表層 | 行数だけ増やす | 1 行だけ巨大 |
+| ---- | -------------- | ------------ |
+| wire 簡易クエリ | 1 MiB のメッセージ上限（`54000`。本文を読む前に判定） | 同左 |
+| engine API の SQL | トークン数 20,000（`42601`）。1 列の挿入だけが ④ に届く。字句解析で打ち切るため束縛・書き込みには到達しない | 文長 1 MiB（`42601`） |
+| engine の束縛 API | ④（`row_count` だけで判定し、`bind` closure・スキーマ取得より前。`54000`） | ② は束縛後（`54000`） |
+| NoSQL `rows[]` | ④（スキーマ取得・束縛より前。`54000`）。本文 1 MiB 超は 413・`54000` | 本文 1 MiB |
+| COPY FROM | ④ は 1 行ごとの束縛前、③ は CopyData を `pending` へ積む前（`54000`） | ② は束縛後。改行のない行は ③ が上限（`54000`） |
+
+字句解析の上限は全文に効くため、SQLSTATE（`42601`）は変えていない。受け入れ条件の「`54000` で働く」
+とは engine API のトークン数・文長でずれており、`54000` へ揃えるかはオーナー判断待ち（受け皿
+Issue は未起票）。現在の挙動（拒否・副作用ゼロ）を試験で固定した。
+
+メモリが入力に比例しないことは、確保量を数える allocator（`unsafe` が必要）ではなく、構造で示す。
+束縛 closure が呼ばれないこと、上限を超えた回の `feed` で拒否されて後続の入力量に依らないこと、
+本文を読む前に framing が拒否することを試験が確かめる。SQL テキストは解析を省略せず、解析量が定数
+（1 MiB・20,000 トークン）で抑えられていることに依る。
+
+### 起動時警告
+
+`insert_rows_cap_warning` は ④ の超過だけを判定し、`FANDHE_DB_BATCH_MAX_CHUNKS` だけを案内する。
+① は行の形に効かないため `--batch-max-files` は案内しない。CLI > 環境変数 > 既定の優先順位は
+`resolve_batch_limits` の単体試験で固定する。
+
+### 試験の対応
+
+| 観点 | 試験 |
+| ---- | ---- |
+| SQL（トークン・文長・④ が束縛より先・③・②） | `crates/engine/tests/table_rls/insert_multi_row.rs` |
+| 束縛 API（④ が `bind`・スキーマ取得より先。insert・upsert・returning） | `crates/engine/tests/sql_named/sql_insert_batch_public_api.rs` |
+| COPY（engine 直接） | `crates/engine/tests/table_rls/copy_from.rs` |
+| COPY（wire 越し） | `crates/wire-server/tests/wire_proto/wire17_copy_limits.rs` |
+| NoSQL `rows[]` | `crates/wire-server/tests/http_nosql/nosql6_insert.rs` |
+| 警告 | `crates/wire-server/src/dml_limits_opt.rs`・`tests/wire_cli/wire_dml_limits_cli.rs` |
+
+大量 COPY の ③ の計測は [wire-copy-protocol.md](wire-copy-protocol.md) の「Issue #3310」を参照。

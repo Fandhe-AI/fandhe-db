@@ -209,25 +209,31 @@ fn export_schemas<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), Sche
     Ok(())
 }
 
-/// 共有の ENUM 型。
+/// 範囲内の ENUM 型（共有の `public` と、選択したテナントの SCHEMA 配下。Issue #3288）。
+/// 共有は `"name"`、SCHEMA 配下は引用符なしの `schema.name`（SCHEMA 修飾名は引用符付きを受理しないため
+/// [`Namer::qualified_required`] で描画する）。出力順は描画名（共有が先、続いて SCHEMA 名・型名）で決め、
+/// 内部 ID の並びに依存させない（往復で同じ DDL 列にする）。他テナントの型は存在を示さず無視する。
 fn export_enums<E>(ctx: &Ctx<'_>, out: &mut Emitter<'_, E>) -> Result<(), SchemaDdlError<E>> {
+    let mut targets = Vec::new();
     for (k, v) in read_str_table::<E>(ctx, ENUM_TYPES_TABLE)? {
         // キーの所属で絞る（デコードより前。他テナントの SCHEMA 配下の型は存在を示さず無視する）。
-        match ctx.namer.scope::<E>(&k)? {
-            KeyScope::Shared if ctx.scope.includes_shared() => {}
-            KeyScope::Shared | KeyScope::Foreign => continue,
-            // `CREATE TYPE` は SCHEMA 修飾名を受理しないため、SCHEMA 配下の型は戻せない。
-            KeyScope::Tenant { .. } => {
-                return Err(unsupported(
-                    "enum type",
-                    "schema-scoped enum type cannot be recreated by SQL",
-                ));
-            }
+        if !in_scope(ctx, &k)? {
+            continue;
         }
+        targets.push((ctx.namer.sort_key::<E>(&k)?, k, v));
+    }
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, k, v) in targets {
         let def: EnumTypeDef = decode_enum_type_def(&k, &v)?;
-        let mut s = String::from("CREATE TYPE ");
-        push_ident(&mut s, def.name())?;
-        s.push_str(" AS ENUM (");
+        let name = match ctx.namer.scope::<E>(&k)? {
+            KeyScope::Shared => {
+                let mut n = String::new();
+                push_ident(&mut n, def.name())?;
+                n
+            }
+            _ => ctx.namer.qualified_required::<E>(&k)?,
+        };
+        let mut s = format!("CREATE TYPE {name} AS ENUM (");
         for (i, label) in def.labels().iter().enumerate() {
             if i > 0 {
                 s.push_str(", ");
@@ -344,14 +350,6 @@ fn view_like_order_with_deps<E>(
     }
     for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
         if in_scope(ctx, &k)? {
-            // `CREATE MATERIALIZED VIEW` は SCHEMA 修飾名を受理しない（共有にしか作れない）ため、
-            // SCHEMA 配下の定義は戻せない。デコードより前に、固定文言で全体を失敗させる。
-            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
-                return Err(unsupported(
-                    "materialized view",
-                    "schema-scoped materialized view cannot be recreated by SQL",
-                ));
-            }
             let def = decode_materialized_view_def(&k, &v)?;
             pending.insert(k, ViewLike::Materialized(def));
         }
@@ -396,19 +394,13 @@ fn view_like_order_with_deps<E>(
 }
 
 /// 範囲内のマテリアライズド VIEW の定義を返す（論理ダンプ前の列構成の照合用。Issue #3097）。
-/// SCHEMA 配下の定義は戻せないため、`view_like_order_with_deps` と同じく固定文言で全体を失敗させる。
+/// SCHEMA 配下の定義も範囲内なら含む（`CREATE MATERIALIZED VIEW s.mv` で戻せる。Issue #3287）。
 pub(super) fn in_scope_materialized_defs<E>(
     ctx: &Ctx<'_>,
 ) -> Result<Vec<MaterializedViewDef>, SchemaDdlError<E>> {
     let mut out = Vec::new();
     for (k, v) in read_str_table::<E>(ctx, MATERIALIZED_VIEWS_TABLE)? {
         if in_scope(ctx, &k)? {
-            if matches!(ctx.namer.scope::<E>(&k)?, KeyScope::Tenant { .. }) {
-                return Err(unsupported(
-                    "materialized view",
-                    "schema-scoped materialized view cannot be recreated by SQL",
-                ));
-            }
             out.push(decode_materialized_view_def(&k, &v)?);
         }
     }
@@ -461,7 +453,16 @@ fn export_foreign_keys<E>(
     for key in table_keys::<E>(ctx)? {
         let schema: TableSchema = get_table_schema_in_txn_impl(ctx.rt, &key, true)?;
         for fk in schema.foreign_keys() {
-            let sql = render_foreign_key(ctx, &key, fk)?;
+            // 参照先列名 `id` の解釈は親の行識別方式で決まる（Issue #3178）。`id` 単独参照のときだけ
+            // 親のスキーマを引き、取れなければ fail-closed でダンプ全体を失敗させる。
+            let parent_uses_pseudo_id = if fk.references_parent_id() {
+                let parent: TableSchema =
+                    get_table_schema_in_txn_impl(ctx.rt, fk.parent_table(), true)?;
+                parent.has_pseudo_id()
+            } else {
+                false
+            };
+            let sql = render_foreign_key(ctx, &key, fk, parent_uses_pseudo_id)?;
             out.emit(DdlSection::PostData, DdlObjectKind::ForeignKey, &sql)?;
         }
     }

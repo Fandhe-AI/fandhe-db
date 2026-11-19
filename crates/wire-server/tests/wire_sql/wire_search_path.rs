@@ -139,8 +139,8 @@ fn wire_simple_query_set_show_reset_and_rollback() {
     assert_eq!(show(&mut stream), "\"$user\", public");
 }
 
-/// handshake の username が `"$user"` に展開される（同名の SCHEMA があれば作成先は `0A000`、無ければ
-/// `public`）。`public` を含まない path では一時表以外の未修飾名が `42P01` で届く。
+/// handshake の username が `"$user"` に展開される（同名の SCHEMA があれば作成先はその SCHEMA、無ければ
+/// `public`。Issue #3196）。`public` を含まない path では一時表以外の未修飾名が `42P01` で届く。
 #[test]
 fn wire_dollar_user_expands_from_the_authenticated_username() {
     let (core, _guard) = new_core();
@@ -159,11 +159,15 @@ fn wire_dollar_user_expands_from_the_authenticated_username() {
         simple_ok(&mut stream, "CREATE SCHEMA alice"),
         "CREATE SCHEMA"
     );
-    simple_err(
-        &mut stream,
-        "CREATE TABLE u (id BIGINT PRIMARY KEY)",
-        "0A000",
+    assert_eq!(
+        simple_ok(&mut stream, "CREATE TABLE u (id BIGINT PRIMARY KEY)"),
+        "CREATE TABLE"
     );
+    // `alice.u` に作られ、`public.u` とは独立している（同名で作れる）。
+    send_simple_query(&mut stream, "SELECT id FROM alice.u LIMIT 1");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
+    read_ready_for_query(&mut stream);
     assert_eq!(
         simple_ok(&mut stream, "CREATE TABLE public.u (id BIGINT PRIMARY KEY)"),
         "CREATE TABLE"
@@ -404,4 +408,373 @@ fn wire_unqualified_read_resolves_into_own_schema_with_trailing_semicolon() {
     assert!(text.contains("C42P01"), "{text}");
     assert!(!text.contains('#'), "{text}");
     read_ready_for_query(&mut bob);
+}
+
+/// Issue #3196: psql 形（末尾 `;` 付きの単独送信）で、`SET search_path TO q1` の後の作成・DML・読み取りが
+/// 自テナントの SCHEMA に解決される。他テナントの同名 path では作成が `3F000`、DML が `42P01` で、
+/// 内部 ID を含む文言は出ない。
+#[test]
+fn wire_create_and_dml_resolve_into_own_schema_with_trailing_semicolon() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+
+    simple_ok(&mut alice, "CREATE SCHEMA q1;");
+    simple_ok(&mut alice, "SET search_path TO q1;");
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT);"
+        ),
+        "CREATE TABLE"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "INSERT INTO t (id, name) VALUES (1, 'a');"),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "INSERT INTO t (id, name) VALUES (2, 'b');"),
+        "INSERT 0 1"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "UPDATE t SET name = 'c' WHERE id = 1;"),
+        "UPDATE 1"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "DELETE FROM t WHERE id = 2;"),
+        "DELETE 1"
+    );
+    send_simple_query(&mut alice, "SELECT id, name FROM q1.t;");
+    let _ = read_row_description(&mut alice);
+    assert_eq!(
+        read_data_row(&mut alice),
+        vec![Some("1".to_string()), Some("c".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut alice), "SELECT 1");
+    read_ready_for_query(&mut alice);
+    // public には作られていない。
+    simple_err(&mut alice, "SELECT id FROM public.t;", "42P01");
+
+    // bob は q1 を持たない。作成は `3F000`、DML は `42P01`（内部 ID・名前を出さない）。
+    simple_ok(&mut bob, "SET search_path TO q1;");
+    for (sql, code) in [
+        ("CREATE TABLE t (id BIGINT PRIMARY KEY);", "C3F000"),
+        ("INSERT INTO t (id, name) VALUES (5, 'z');", "C42P01"),
+    ] {
+        send_simple_query(&mut bob, sql);
+        let (kind, body) = read_message(&mut bob);
+        assert_eq!(kind, b'E', "ErrorResponse");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains(code), "{sql}: {text}");
+        assert!(!text.contains('#'), "{sql}: {text}");
+        read_ready_for_query(&mut bob);
+    }
+}
+/// Bind 済みの portal を Execute し、DataRow の先頭セルを集める。
+fn execute_first_cells(stream: &mut TcpStream, portal: &str) -> Vec<Option<String>> {
+    send_length_prefixed_message(stream, b'E', &execute_body(portal, 0));
+    let mut cells = Vec::new();
+    loop {
+        let (kind, body) = read_message(stream);
+        match kind {
+            b'D' => cells.push(first_cell(&body)),
+            b'C' => break,
+            other => panic!("unexpected message {}", other as char),
+        }
+    }
+    cells
+}
+
+/// Issue #3197: Parse 後に（psql 形の末尾 `;` 付きで）`SET search_path` すると、`public` が見える path でも
+/// 同じ準備済み文（`$n` あり・なし・Describe）が新しい path で解決し直される。`RESET` で元へ戻る。
+#[test]
+fn wire_extended_query_re_resolves_after_search_path_change() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    simple_ok(&mut stream, "CREATE SCHEMA q1");
+    simple_ok(
+        &mut stream,
+        "CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    simple_ok(&mut stream, "INSERT INTO t (id, name) VALUES (1, 'a')");
+    simple_ok(
+        &mut stream,
+        "CREATE TABLE q1.t (id BIGINT PRIMARY KEY, name TEXT)",
+    );
+    simple_ok(&mut stream, "INSERT INTO q1.t (id, name) VALUES (10, 'x')");
+
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("plain", "SELECT id FROM t LIMIT 5", 0),
+    );
+    assert_eq!(read_message(&mut stream).0, b'1');
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("param", "SELECT id FROM t WHERE id > $1 LIMIT 5", 0),
+    );
+    assert_eq!(read_message(&mut stream).0, b'1');
+    sync(&mut stream);
+
+    let run_both = |stream: &mut TcpStream, expected: &str| {
+        send_length_prefixed_message(stream, b'B', &bind_body("p0", "plain"));
+        assert_eq!(read_message(stream).0, b'2');
+        assert_eq!(
+            execute_first_cells(stream, "p0"),
+            vec![Some(expected.to_string())]
+        );
+        sync(stream);
+        send_length_prefixed_message(stream, b'B', &bind_body_one_param("p1", "param", "0"));
+        assert_eq!(read_message(stream).0, b'2');
+        assert_eq!(
+            execute_first_cells(stream, "p1"),
+            vec![Some(expected.to_string())]
+        );
+        sync(stream);
+    };
+    run_both(&mut stream, "1");
+
+    // `public` が見える path へ変えても、Parse 時の解決結果を使い回さず q1.t へ解決される。
+    assert_eq!(
+        simple_ok(&mut stream, "SET search_path TO q1, public;"),
+        "SET"
+    );
+    run_both(&mut stream, "10");
+    // Describe(Statement) も再解決後の文で応答する（ParameterDescription の後に RowDescription）。
+    send_length_prefixed_message(&mut stream, b'D', b"Splain\0");
+    assert_eq!(read_message(&mut stream).0, b't');
+    assert_eq!(read_message(&mut stream).0, b'T');
+    sync(&mut stream);
+
+    // 拡張クエリの INSERT（`$n`）も path の先頭の SCHEMA に入る。
+    send_length_prefixed_message(
+        &mut stream,
+        b'P',
+        &parse_body("ins", "INSERT INTO t (id, name) VALUES ($1, 'n')", 0),
+    );
+    assert_eq!(read_message(&mut stream).0, b'1');
+    send_length_prefixed_message(&mut stream, b'B', &bind_body_one_param("p2", "ins", "11"));
+    assert_eq!(read_message(&mut stream).0, b'2');
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("p2", 0));
+    assert_eq!(read_message(&mut stream).0, b'C');
+    sync(&mut stream);
+    send_simple_query(&mut stream, "SELECT id FROM q1.t ORDER BY id;");
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("10".to_string())]);
+    assert_eq!(read_data_row(&mut stream), vec![Some("11".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+
+    assert_eq!(simple_ok(&mut stream, "RESET search_path;"), "RESET");
+    run_both(&mut stream, "1");
+}
+
+/// Issue #3197: 他テナントの SCHEMA には解決されず、`42P01` の文言に内部キー・他テナントの名前が出ない。
+#[test]
+fn wire_extended_query_does_not_resolve_into_another_tenants_schema() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    simple_ok(&mut alice, "CREATE SCHEMA q1");
+    simple_ok(&mut alice, "CREATE TABLE q1.t (id BIGINT PRIMARY KEY)");
+    simple_ok(&mut alice, "INSERT INTO q1.t (id) VALUES (10)");
+
+    simple_ok(&mut bob, "SET search_path TO q1;");
+    send_length_prefixed_message(
+        &mut bob,
+        b'P',
+        &parse_body("s", "SELECT id FROM t LIMIT 5", 0),
+    );
+    let (kind, body) = read_message(&mut bob);
+    assert_eq!(kind, b'E', "ErrorResponse");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(text.contains("C42P01"), "{text}");
+    assert!(!text.contains('#'), "{text}");
+    sync(&mut bob);
+}
+/// 1 列の結果を返す SELECT を送り、先頭セルを行ごとに集める（psql 形の単独送信。末尾 `;` 付きで渡してよい）。
+fn select_cells(stream: &mut TcpStream, sql: &str) -> Vec<Option<String>> {
+    send_simple_query(stream, sql);
+    let _ = read_row_description(stream);
+    let mut cells = Vec::new();
+    loop {
+        let (kind, body) = read_message(stream);
+        match kind {
+            b'D' => cells.push(first_cell(&body)),
+            b'C' => break,
+            other => panic!("unexpected message {}", other as char),
+        }
+    }
+    read_ready_for_query(stream);
+    cells
+}
+
+/// Issue #3199: 両テナントが同名 SCHEMA `q1`・同名表 `t` を持つとき、psql 形の未修飾の書き込み・DDL
+/// （`SET SCHEMA`・`TRUNCATE`・`DROP` を含む）は自テナント側だけを変え、他テナントの行・構造に触れない。
+#[test]
+fn wire_unqualified_writes_and_ddl_never_touch_a_same_named_schema_of_another_tenant() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    for (stream, id) in [(&mut alice, 1), (&mut bob, 2)] {
+        simple_ok(stream, "CREATE SCHEMA q1;");
+        simple_ok(stream, "CREATE SCHEMA q2;");
+        simple_ok(
+            stream,
+            "CREATE TABLE q1.t (id BIGINT PRIMARY KEY, n INTEGER);",
+        );
+        simple_ok(
+            stream,
+            &format!("INSERT INTO q1.t (id, n) VALUES (1, {id});"),
+        );
+        simple_ok(stream, "SET search_path TO q1, public;");
+    }
+    // alice の未修飾の書き込みは alice の q1.t だけに効く。
+    simple_ok(&mut alice, "INSERT INTO t (id, n) VALUES (2, 20);");
+    simple_ok(&mut alice, "UPDATE t SET n = 11 WHERE id = 1;");
+    simple_ok(&mut alice, "DELETE FROM t WHERE id = 2;");
+    assert_eq!(
+        select_cells(&mut alice, "SELECT n FROM t WHERE id = 1;"),
+        vec![Some("11".to_string())]
+    );
+    assert_eq!(
+        select_cells(&mut bob, "SELECT n FROM t;"),
+        vec![Some("2".to_string())]
+    );
+    // 未修飾の SET SCHEMA は同テナントの別 SCHEMA へ移せる。public への移動は修飾形と同じ `42501`。
+    simple_err(&mut alice, "ALTER TABLE t SET SCHEMA public;", "42501");
+    simple_ok(&mut alice, "ALTER TABLE t SET SCHEMA q2;");
+    simple_err(&mut alice, "SELECT n FROM t;", "42P01");
+    assert_eq!(
+        select_cells(&mut alice, "SELECT n FROM q2.t;"),
+        vec![Some("11".to_string())]
+    );
+    // bob の q1.t は移動の影響を受けない。
+    assert_eq!(
+        select_cells(&mut bob, "SELECT n FROM t;"),
+        vec![Some("2".to_string())]
+    );
+    // alice の TRUNCATE・DROP も bob の表を残す。
+    simple_ok(&mut alice, "SET search_path TO q2, public;");
+    simple_ok(&mut alice, "TRUNCATE t;");
+    simple_ok(&mut alice, "DROP TABLE t;");
+    simple_err(&mut alice, "SELECT n FROM q2.t;", "42P01");
+    assert_eq!(
+        select_cells(&mut bob, "SELECT n FROM q1.t;"),
+        vec![Some("2".to_string())]
+    );
+}
+
+/// Issue #3199: 他テナントだけが持つ SCHEMA 名を path に置いた接続は、未修飾の書き込み・DDL・移動が
+/// 不在と同じ拒否になり、内部キー `#` を含む文言を返さない。未対応の作成形も fail-closed で、接続は使い続けられる。
+#[test]
+fn wire_foreign_schema_path_and_unsupported_creates_fail_closed_and_keep_the_connection() {
+    let (core, _guard) = new_core();
+    let store = allowed_store(
+        &[
+            ("alice", "tenant-a", "correct-horse"),
+            ("bob", "tenant-b", "battery-staple"),
+        ],
+        &["alice", "bob"],
+    );
+    let addr = spawn_server(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "battery-staple");
+    simple_ok(&mut alice, "CREATE SCHEMA q1;");
+    simple_ok(&mut alice, "CREATE TABLE q1.t (id BIGINT PRIMARY KEY);");
+    simple_ok(&mut alice, "INSERT INTO q1.t (id) VALUES (10);");
+    simple_ok(&mut bob, "CREATE SCHEMA mine;");
+    simple_ok(&mut bob, "SET search_path TO q1;");
+    for (sql, code) in [
+        ("INSERT INTO t (id) VALUES (5);", "C42P01"),
+        ("UPDATE t SET id = 6 WHERE id = 10;", "C42P01"),
+        ("DELETE FROM t;", "C42P01"),
+        ("TRUNCATE t;", "C42P01"),
+        ("DROP TABLE t;", "C42P01"),
+        ("ALTER TABLE t SET SCHEMA mine;", "C42P01"),
+        ("CREATE TABLE z (id BIGINT PRIMARY KEY);", "C3F000"),
+    ] {
+        send_simple_query(&mut bob, sql);
+        let (kind, body) = read_message(&mut bob);
+        assert_eq!(kind, b'E', "ErrorResponse: {sql}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains(code), "{sql}: {text}");
+        assert!(!text.contains('#'), "{sql}: {text}");
+        read_ready_for_query(&mut bob);
+    }
+    // alice の表は bob の試行の後も無傷。
+    assert_eq!(
+        select_cells(&mut alice, "SELECT id FROM q1.t;"),
+        vec![Some("10".to_string())]
+    );
+    // MATERIALIZED VIEW は path 先頭の SCHEMA へ作られる（Issue #3287。`WITH DATA` の既定は `SELECT <行数>`）。
+    simple_ok(&mut alice, "SET search_path TO q1, public;");
+    assert_eq!(
+        simple_ok(
+            &mut alice,
+            "CREATE MATERIALIZED VIEW mv AS SELECT id FROM t;"
+        ),
+        "SELECT 1"
+    );
+    assert_eq!(
+        select_cells(&mut alice, "SELECT id FROM q1.mv;"),
+        vec![Some("10".to_string())]
+    );
+    simple_err(&mut alice, "SELECT id FROM public.mv;", "42P01");
+    // 他テナントの接続（path に alice の SCHEMA 名）からは不在と同じ拒否で、`#` を出さない。
+    for (sql, code) in [
+        ("SELECT id FROM mv;", "C42P01"),
+        ("REFRESH MATERIALIZED VIEW mv;", "C42P01"),
+        ("DROP MATERIALIZED VIEW mv;", "C42P01"),
+        ("REFRESH MATERIALIZED VIEW q1.mv;", "C3F000"),
+        ("DROP MATERIALIZED VIEW q1.mv;", "C3F000"),
+    ] {
+        send_simple_query(&mut bob, sql);
+        let (kind, body) = read_message(&mut bob);
+        assert_eq!(kind, b'E', "ErrorResponse: {sql}");
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains(code), "{sql}: {text}");
+        assert!(!text.contains('#'), "{sql}: {text}");
+        read_ready_for_query(&mut bob);
+    }
+    assert_eq!(
+        simple_ok(&mut alice, "REFRESH MATERIALIZED VIEW mv;"),
+        "REFRESH MATERIALIZED VIEW"
+    );
+    assert_eq!(
+        simple_ok(&mut alice, "DROP MATERIALIZED VIEW mv;"),
+        "DROP MATERIALIZED VIEW"
+    );
+    // 拒否の後も同じ接続で読み取りができる。
+    assert_eq!(
+        select_cells(&mut alice, "SELECT id FROM t;"),
+        vec![Some("10".to_string())]
+    );
 }

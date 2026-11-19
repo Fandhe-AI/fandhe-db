@@ -14,19 +14,27 @@
 //! 4. 全行の後に制約検査・FK（参照元側・参照先側）を 1 回ずつ行い、そのあと AFTER ROW を
 //!    変更の順 × トリガ名のバイト順で発火する（戻り値は無視。実行モデルの D3）
 //!
+//! 参照アクションが書き換える子表の ROW トリガは、参照先側の FK 検査の段で子行ごとに発火する
+//! （Issue #3284。`constraint::referential_triggers`。子の AFTER は連鎖・事後検証の後、親の AFTER より先）。
+//!
 //! BEFORE が主キー・UNIQUE 列を書き換えうるため、BEFORE UPDATE トリガがある表では参照先側の FK 検査を
 //! 全列を更新済みとして行う（fail-closed）。AFTER の失敗は文全体の失敗で、呼び出し元の txn が commit
 //! されないため行・トリガの書いた行・台帳・索引はいずれも残らない。トリガが書いた表の遅延 FK は
 //! [`super::trigger_insert`] と同じ規則で扱う。エラーは `TenantWriteError`（トリガ由来は `TriggerFailed`）。
+//!
+//! `RETURNING`（Issue #3192）: 適用段は行ごとのループの中で、書いた最終 NEW（UPDATE）・削除前の値（DELETE）を
+//! 呼び出し元の投影コールバックへ commit 前に渡す（`NULL` 返却でスキップした行は渡さない）。結合形は
+//! `RETURNING` を渡さない（`0A000` のまま）。
 
 use crate::storage::change_log::CaptureWriteTxn as _;
 use redb::ReadableTable;
 
 use super::trigger_insert::settle_trigger_written_tables;
+use super::trigger_row_loop::RowLoopScope;
 use super::{
     captured_values_from_parts, encode_row, merge_row_for_update_set, resolve_update_set_values,
-    row_key, statement_writes, user_rows_table_def, user_rows_table_name, RowId, TenantWriteError,
-    WriteTarget,
+    row_key, statement_writes, user_rows_table_def, user_rows_table_name, CapturedRow,
+    CapturedRowOrigin, ReturningProjectFn, RowId, TenantWriteError, WriteTarget,
 };
 use crate::catalog::{map_row_table_error, CatalogError, ColumnType, TableSchema};
 use crate::policy::PolicyContext;
@@ -44,6 +52,10 @@ const ROW_ENCODE_MISMATCH: &str = "trigger function returned a row that does not
 pub(super) struct TriggeredDml {
     /// 実際に変更した行数（BEFORE の `NULL` 返却でスキップした行は含まない）。
     pub(super) applied: usize,
+    /// 候補のうち消費した件数（BEFORE の `NULL` 返却でスキップした行を含む。`should_stop` で打ち切った
+    /// ときは `candidate_ids.len()` 未満）。分割実行 DML（Issue #3283）がカーソルを進める根拠で、
+    /// `applied` とは異なる（スキップ行は書かないが、再走査・再発火させないため消費に数える）。
+    pub(super) consumed: usize,
     /// トリガ本体が別表へ書き込んだか。全行スキップでも別表への書き込みがあれば txn を commit 対象にする。
     pub(super) trigger_wrote: bool,
 }
@@ -112,9 +124,36 @@ fn read_row(
     Ok(row)
 }
 
+/// 行 `row`（スキーマ幅の値の列）の生成列を、通常列から計算した値で上書きする（TABLE-50・Issue #3329）。
+/// `generated` が `None`（生成列の無い表）なら何もしない。`only` が `Some` ならその位置だけ再計算する。
+/// BEFORE ROW トリガの連鎖の後（NOT NULL 検査・encode より前）に、トリガ付きの INSERT・UPDATE・UPSERT が
+/// 共有して呼ぶ。トリガが NEW の生成列へ代入していても計算結果で上書きする。評価エラーは
+/// `SetExpressionEvaluationFailed`（文全体の失敗）。
+pub(crate) fn apply_generated_columns(
+    generated: Option<&crate::sql::generated_column::CompiledGeneratedColumns>,
+    schema: &TableSchema,
+    id: u64,
+    row: &mut [Value],
+    only: Option<&[usize]>,
+) -> Result<(), TenantWriteError> {
+    let Some(generated) = generated else {
+        return Ok(());
+    };
+    let embedding: Vec<f32> = match schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, ColumnType::Vector(_)))
+        .and_then(|idx| row.get(idx))
+    {
+        Some(Value::Vector(v)) => v.clone(),
+        _ => Vec::new(),
+    };
+    generated.compute_values(id, &embedding, row, only)
+}
+
 /// BEFORE が返した最終 NEW を検査して `(embedding, metadata)` へ encode する（NOT NULL・VECTOR 次元・
 /// 行 codec）。
-fn encode_final_row(
+pub(crate) fn encode_final_row(
     schema: &TableSchema,
     final_row: &[Value],
 ) -> Result<(Vec<f32>, Vec<u8>), TenantWriteError> {
@@ -153,6 +192,10 @@ fn encode_final_row(
 
 /// `candidate_ids`（列挙済みの対象行）を、BEFORE UPDATE トリガを通して更新し、全行の後に制約検査・FK
 /// 検査・AFTER UPDATE トリガを行う。書き込み後の世代 bump・commit は呼び出し元の責務。
+///
+/// `project`（`RETURNING`。Issue #3192）が `Some` なら、書いた各行の最終 NEW を行ごとに commit 前・この
+/// write txn の中で 1 回ずつ渡す（BEFORE が `NULL` を返してスキップした行は渡さない。AFTER の影響は受けない）。
+/// 行ストアのハンドルは行ごとのブロックで閉じ済みの位置で呼ぶ。`Err` は txn の abort になる。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn update_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -164,7 +207,13 @@ pub(super) fn update_rows_with_triggers(
     spec: &UpdateSpec<'_>,
     plan: &RowTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
+    mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
+    // 生成列（TABLE-50・Issue #3329）: 結線していない経路は固定文言の `0A000`。BEFORE ROW の後（BEFORE が
+    // 無ければ SET の対象列に依存するものだけ）に計算する。束縛は 1 文（チャンク）に 1 回。
+    let generated =
+        crate::sql::generated_column::CompiledGeneratedColumns::for_write(schema, table)?;
     // 対象行が 0 件でも `row_security = off` の拒否を文の開始時点で適用する（RLS-13・Issue #2278）。
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
     if spec
@@ -182,13 +231,25 @@ pub(super) fn update_rows_with_triggers(
     written
         .try_reserve_exact(candidate_ids.len())
         .map_err(|_| reserve_err())?;
-    let mut after_queue: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+    let mut after_queue: Vec<(Vec<Value>, Vec<Value>, Vec<usize>)> = Vec::new();
     if !plan.after.is_empty() {
         after_queue
             .try_reserve_exact(candidate_ids.len())
             .map_err(|_| reserve_err())?;
     }
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
+    // BEFORE ROW の本体が同じ表を書き換えると、BEFORE 前に読んだ OLD から作る最終行が黙って上書きする
+    // （失われた更新）。候補ループの間だけ表を記録し、トリガ本体の同表 `UPDATE` を拒否させる。
+    let row_loop = (!plan.before.is_empty()).then(|| RowLoopScope::enter(table));
+    let mut consumed = 0usize;
     for (pos, id) in candidate_ids.iter().enumerate() {
+        // 分割実行 DML（Issue #3283）の writer 保持時間・期限の確認点。1 件以上消費した後の候補の直前でだけ
+        // 判定し、打ち切ったときは消費済みの行だけ後段（制約・FK・AFTER）へ進む。
+        if pos > 0 && should_stop.as_mut().is_some_and(|f| f()) {
+            break;
+        }
+        consumed = pos + 1;
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         let row_extra: &[(usize, Value)] = match spec.row_overrides {
             Some(o) => o.get(pos).map(Vec::as_slice).ok_or_else(|| {
@@ -210,6 +271,7 @@ pub(super) fn update_rows_with_triggers(
                 spec.assignments,
                 spec.set_exprs,
                 row_extra,
+                generated.as_ref(),
             )?;
             let new_candidate =
                 captured_values_from_parts(schema, merged_embedding.clone(), &merged_metadata)?;
@@ -248,9 +310,11 @@ pub(super) fn update_rows_with_triggers(
                 new_candidate,
             )
             .map_err(TenantWriteError::TriggerFailed)?;
-            let Some(final_row) = fired else {
+            let Some(mut final_row) = fired else {
                 continue;
             };
+            // BEFORE の後に全生成列を計算し直す（NOT NULL 検査・encode より前。Issue #3329）。
+            apply_generated_columns(generated.as_ref(), schema, *id, &mut final_row, None)?;
             let (embedding, metadata) = encode_final_row(schema, &final_row)?;
             (embedding, metadata, final_row)
         };
@@ -280,10 +344,36 @@ pub(super) fn update_rows_with_triggers(
             pre_images.record(RowId::from_legacy_id(*id), old_values.clone());
         }
         written.push(RowId::from_legacy_id(*id));
+        if let Some(project) = project.as_mut() {
+            project(&CapturedRow {
+                id: *id,
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility,
+                origin: CapturedRowOrigin::Updated,
+                values: final_row.clone(),
+            })?;
+        }
+        // AFTER ROW の WHEN は行の変更時に評価し、TRUE のトリガだけをキューへ積む（D7）。
         if !plan.after.is_empty() {
-            after_queue.push((old_values, final_row));
+            let selected = crate::trigger::fire::select_after_row(
+                plan.runtime,
+                writes,
+                table,
+                schema,
+                &plan.after,
+                TriggerOp::Update,
+                Some(&old_values),
+                &final_row,
+            )
+            .map_err(TenantWriteError::TriggerFailed)?;
+            if !selected.is_empty() {
+                after_queue.push((old_values, final_row, selected));
+            }
         }
     }
+    drop(row_loop_guard);
+    // 外側の書き込みが済んだため、以降（制約検査・AFTER）のトリガ本体の同表 `UPDATE` は許す。
+    drop(row_loop);
     if !written.is_empty() {
         let delta = crate::constraint::enforce_row_constraints_in_txn(
             write_txn,
@@ -291,7 +381,7 @@ pub(super) fn update_rows_with_triggers(
             schema,
             ctx.tenant_id(),
             &written,
-            target.fk_check_mode(),
+            crate::tenant::child_update_fk_check_mode(table, target.fk_check_mode()),
             crate::constraint::RowPolicyWrite::Update,
         )?;
         // BEFORE ROW が SET に無い主キー・UNIQUE 列を書き換えうるため、BEFORE UPDATE の行トリガが
@@ -299,13 +389,19 @@ pub(super) fn update_rows_with_triggers(
         // 無ければ SET の列だけ。
         let updated_columns: Vec<usize> = if plan.before.is_empty() {
             let mut cols = update_set_columns(spec);
+            // SET の対象列に依存して再計算された生成列も変更列として扱う（Issue #3329）。
+            if let Some(g) = &generated {
+                let extra = g.affected(&cols);
+                cols.extend(extra);
+            }
             cols.sort_unstable();
             cols.dedup();
             cols
         } else {
             (0..schema.columns.len()).collect()
         };
-        crate::constraint::enforce_referencing_rows_in_txn(
+        // 参照アクションが書き換える子表の ROW トリガも、子行ごとに発火する（Issue #3284）。
+        crate::constraint::enforce_referencing_rows_with_triggers_in_txn(
             write_txn,
             table,
             schema,
@@ -316,16 +412,21 @@ pub(super) fn update_rows_with_triggers(
             },
             Some(&pre_images),
             target.fk_check_mode(),
+            Some(&crate::constraint::ChildTriggers {
+                runtime: plan.runtime,
+                writes,
+            }),
         )?;
     }
     // AFTER ROW（段 6）。変更の順 × トリガ名のバイト順。
-    for (old, new) in &after_queue {
-        crate::trigger::fire::fire_after_row(
+    for (old, new, selected) in &after_queue {
+        crate::trigger::fire::invoke_after_row(
             plan.runtime,
             writes,
             table,
             schema,
             &plan.after,
+            selected,
             TriggerOp::Update,
             Some(old),
             new,
@@ -346,6 +447,7 @@ pub(super) fn update_rows_with_triggers(
     settle_trigger_written_tables(write_txn, target, ctx, writes)?;
     Ok(TriggeredDml {
         applied: written.len(),
+        consumed,
         trigger_wrote: !writes.written_tables().is_empty(),
     })
 }
@@ -367,6 +469,9 @@ pub(super) fn update_set_columns(spec: &UpdateSpec<'_>) -> Vec<usize> {
 
 /// `candidate_ids`（列挙済みの対象行）を、BEFORE DELETE トリガを通して削除し、全行の後に索引の後片付け・
 /// 参照先 FK 検査・AFTER DELETE トリガを行う。世代 bump・commit は呼び出し元の責務。
+///
+/// `project`（`RETURNING`。Issue #3192）が `Some` なら、BEFORE を通って実際に削除した各行の削除前の値を、
+/// 行ごとに commit 前・この write txn の中で 1 回ずつ渡す（`NULL` 相当でスキップした行は渡さない）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn delete_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -377,6 +482,8 @@ pub(super) fn delete_rows_with_triggers(
     candidate_ids: &[u64],
     plan: &RowTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
+    mut should_stop: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<TriggeredDml, TenantWriteError> {
     // `delete_row_impl` と同じ判定条件（`id` 参照 FK を含む）で、参照アクションの起点の旧値を残す。
     let needs_fk_removed_pre_image = schema.primary_key().is_some()
@@ -389,15 +496,26 @@ pub(super) fn delete_rows_with_triggers(
     removed
         .try_reserve_exact(candidate_ids.len())
         .map_err(|_| reserve_err())?;
-    let mut after_queue: Vec<Vec<Value>> = Vec::new();
+    let mut after_queue: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
     if !plan.after.is_empty() {
         after_queue
             .try_reserve_exact(candidate_ids.len())
             .map_err(|_| reserve_err())?;
     }
-    for id in candidate_ids {
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
+    // UPDATE 側と同じ理由（BEFORE ROW の本体による同表の書き換えを候補ループの間だけ拒否させる）。
+    let row_loop = (!plan.before.is_empty()).then(|| RowLoopScope::enter(table));
+    let mut consumed = 0usize;
+    for (pos, id) in candidate_ids.iter().enumerate() {
+        // UPDATE 側と同じ確認点（分割実行 DML。Issue #3283）。
+        if pos > 0 && should_stop.as_mut().is_some_and(|f| f()) {
+            break;
+        }
+        consumed = pos + 1;
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         let existing = read_row(write_txn, table, ctx, *id)?;
+        let existing_visibility = existing.visibility;
         let old_values =
             captured_values_from_parts(schema, existing.embedding, &existing.metadata)?;
         if !plan.before.is_empty() {
@@ -431,10 +549,35 @@ pub(super) fn delete_rows_with_triggers(
             removed_pre_images.record(RowId::from_legacy_id(*id), old_values.clone());
         }
         removed.push(RowId::from_legacy_id(*id));
+        if let Some(project) = project.as_mut() {
+            project(&CapturedRow {
+                id: *id,
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility: existing_visibility,
+                origin: CapturedRowOrigin::Deleted,
+                values: old_values.clone(),
+            })?;
+        }
+        // AFTER ROW の WHEN は行の変更時に評価し、TRUE のトリガだけをキューへ積む（D7）。
         if !plan.after.is_empty() {
-            after_queue.push(old_values);
+            let selected = crate::trigger::fire::select_after_row(
+                plan.runtime,
+                writes,
+                table,
+                schema,
+                &plan.after,
+                TriggerOp::Delete,
+                Some(&old_values),
+                &[],
+            )
+            .map_err(TenantWriteError::TriggerFailed)?;
+            if !selected.is_empty() {
+                after_queue.push((old_values, selected));
+            }
         }
     }
+    drop(row_loop_guard);
+    drop(row_loop);
     if !removed.is_empty() {
         crate::constraint::forget_unique_index_rows_in_txn(
             write_txn,
@@ -449,7 +592,8 @@ pub(super) fn delete_rows_with_triggers(
             ctx.tenant_id(),
             &removed,
         )?;
-        crate::constraint::enforce_referencing_rows_in_txn(
+        // 参照アクションが書き換える子表の ROW トリガも、子行ごとに発火する（Issue #3284）。
+        crate::constraint::enforce_referencing_rows_with_triggers_in_txn(
             write_txn,
             table,
             schema,
@@ -457,15 +601,20 @@ pub(super) fn delete_rows_with_triggers(
             crate::constraint::ReferencedRowsChange::Removed { ids: &removed },
             needs_fk_removed_pre_image.then_some(&removed_pre_images),
             target.fk_check_mode(),
+            Some(&crate::constraint::ChildTriggers {
+                runtime: plan.runtime,
+                writes,
+            }),
         )?;
     }
-    for old in &after_queue {
-        crate::trigger::fire::fire_after_row(
+    for (old, selected) in &after_queue {
+        crate::trigger::fire::invoke_after_row(
             plan.runtime,
             writes,
             table,
             schema,
             &plan.after,
+            selected,
             TriggerOp::Delete,
             Some(old),
             &[],
@@ -486,6 +635,7 @@ pub(super) fn delete_rows_with_triggers(
     settle_trigger_written_tables(write_txn, target, ctx, writes)?;
     Ok(TriggeredDml {
         applied: removed.len(),
+        consumed,
         trigger_wrote: !writes.written_tables().is_empty(),
     })
 }

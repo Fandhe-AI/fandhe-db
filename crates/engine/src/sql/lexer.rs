@@ -360,6 +360,15 @@ pub const MAX_INPUT_LEN: usize = 1_048_576;
 /// （security.md「不安全な設計｜無制限リソース確保」対応）。
 pub const MAX_TOKEN_COUNT: usize = 20_000;
 
+/// `~~`／`~~*` 系演算子を字句段で写す先の語（`LIKE`／`ILIKE`。Issue #3258・SQL-9 ポインタ）。
+fn like_word(case_insensitive: bool) -> &'static str {
+    if case_insensitive {
+        "ILIKE"
+    } else {
+        "LIKE"
+    }
+}
+
 /// `QuotedBoolWord` を、WHERE の述語葉位置（直前が `WHERE`／`AND`／`OR`／`NOT`／それらに
 /// 続く `(`、直後が述語境界）以外では従来どおり `Ident` へ戻す（Issue #1526・PR #2297 指摘）。
 /// 引用付き `"true"`／`"false"` を列名として使う既存の全経路（DDL・投影・値式・INSERT・
@@ -427,7 +436,7 @@ pub(crate) fn requote_legacy_value_function_columns(tokens: &mut [Token]) {
 /// 未引用が真偽リテラルを意味する形式）は戻さない。`= true` のような値位置は対象外。
 /// 呼び出し元は `sql::view`（参照時）・カタログのビュー本文検査・作成時の自己検証。
 pub(crate) fn tokenize_stored_view_body(input: &str) -> Result<Vec<Token>, LexError> {
-    let mut tokens = tokenize_impl(input, false, false, true, None)?;
+    let mut tokens = tokenize_impl(input, false, true, true, None)?;
     requote_legacy_value_function_columns(&mut tokens);
     if input.starts_with(STORED_BODY_BOOL_LITERAL_MARKER) {
         return Ok(tokens);
@@ -851,6 +860,8 @@ fn tokenize_impl(
                 && (content.eq_ignore_ascii_case("NULL")
                     || content.eq_ignore_ascii_case("ARRAY")
                     || content.eq_ignore_ascii_case("DEFAULT")
+                    // 引用付き `"case"` は SET 右辺で `CASE WHEN ...` の開始と区別して列参照にする（Issue #3351）。
+                    || content.eq_ignore_ascii_case("CASE")
                     || (is_create_function_head(&tokens)
                         && (is_clause_word(content) || is_standard_body_started(&tokens)))))
                 || is_value_function_keyword(content)
@@ -952,6 +963,27 @@ fn tokenize_impl(
             lookahead.next();
             if matches!(lookahead.peek(), Some(&(_, '~'))) {
                 lookahead.next();
+                // `!~~`／`!~~*` は `NOT LIKE`／`NOT ILIKE` の演算子名（Issue #3258・SQL-9 ポインタ）。
+                // 2 トークンを積むため、上限（1 個分は上で検査済み）をもう 1 個分検査する。
+                if matches!(lookahead.peek(), Some(&(_, '~'))) {
+                    lookahead.next();
+                    let ci = if matches!(lookahead.peek(), Some(&(_, '*'))) {
+                        lookahead.next();
+                        true
+                    } else {
+                        false
+                    };
+                    if tokens.len().saturating_add(2) > MAX_TOKEN_COUNT {
+                        return Err(LexError {
+                            message: "too many tokens".to_string(),
+                            byte_offset: offset,
+                        });
+                    }
+                    tokens.push(Token::Ident("NOT".to_string()));
+                    tokens.push(Token::Ident(like_word(ci).to_string()));
+                    chars = lookahead;
+                    continue;
+                }
                 if matches!(lookahead.peek(), Some(&(_, '*'))) {
                     lookahead.next();
                     tokens.push(Token::RegexNotMatchCi);
@@ -976,8 +1008,22 @@ fn tokenize_impl(
 
         if c == '~' {
             // `~*`（大文字小文字無視）→ `~` の最長一致（SQL-55・Issue #1787）。
+            // `~~`／`~~*` は `LIKE`／`ILIKE` の演算子名で、字句段で同じ語へ写す
+            // （Issue #3258・SQL-9 ポインタ。`!=` と同じく新しい `Token` は作らない）。
             let mut lookahead = chars.clone();
             lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '~'))) {
+                lookahead.next();
+                let ci = if matches!(lookahead.peek(), Some(&(_, '*'))) {
+                    lookahead.next();
+                    true
+                } else {
+                    false
+                };
+                tokens.push(Token::Ident(like_word(ci).to_string()));
+                chars = lookahead;
+                continue;
+            }
             if matches!(lookahead.peek(), Some(&(_, '*'))) {
                 lookahead.next();
                 tokens.push(Token::RegexMatchCi);
@@ -2109,6 +2155,42 @@ mod tests {
         // 描画→再字句化で同じトークン列に戻る。
         let t = toks("a ~ 'x' b ~* 'y' c !~ 'z' d !~* 'w'");
         assert_eq!(toks(&render_tokens(&t).unwrap()), t);
+    }
+
+    /// SQL-9・Issue #3258: `~~` 系は LIKE の語列へ字句段で写す（既存の正規表現演算子は不変）。
+    #[test]
+    fn like_operator_names_desugar_to_like_words() {
+        use Token::*;
+        assert_eq!(toks("a~~b"), toks("a LIKE b"));
+        assert_eq!(toks("a ~~* b"), toks("a ILIKE b"));
+        assert_eq!(toks("a!~~b"), toks("a NOT LIKE b"));
+        assert_eq!(toks("a !~~* b"), toks("a NOT ILIKE b"));
+        assert_eq!(toks("a ~~ ANY(b)"), toks("a LIKE ANY(b)"));
+        // 不変: 空白を挟んだ `~ ~`・単独の正規表現演算子・`!=`・文字列リテラル内。
+        assert_eq!(
+            toks("a ~ ~ b"),
+            vec![ident("a"), RegexMatch, RegexMatch, ident("b")]
+        );
+        assert_eq!(toks("a ~* b")[1], RegexMatchCi);
+        assert_eq!(toks("a !~ b")[1], RegexNotMatch);
+        assert_eq!(toks("a !~* b")[1], RegexNotMatchCi);
+        assert_eq!(toks("'~~'"), vec![StringLiteral("~~".into())]);
+        // 描画→再字句化で同じトークン列に戻る。
+        let t = toks("a ~~ 'x' b !~~* 'y'");
+        assert_eq!(toks(&render_tokens(&t).unwrap()), t);
+    }
+
+    /// Issue #3258: 2 トークンを積む `!~~` は上限を 1 個も超えない（fail-closed）。
+    #[test]
+    fn not_like_operator_respects_token_limit() {
+        let base = "*".repeat(MAX_TOKEN_COUNT - 1);
+        let err = tokenize(&format!("{base}!~~")).expect_err("over limit");
+        assert_eq!(err.message, "too many tokens");
+        let base = "*".repeat(MAX_TOKEN_COUNT - 2);
+        assert_eq!(
+            tokenize(&format!("{base}!~~")).expect("at limit").len(),
+            MAX_TOKEN_COUNT
+        );
     }
 
     /// TABLE-25・Issue #1598: jsonb 包含・存在演算子の字句化（最長一致・境界）。

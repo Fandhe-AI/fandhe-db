@@ -51,14 +51,17 @@
 
 ### 許可リスト（`sql::allowlist::validate_copy`）
 
-- `FROM STDIN` 形は列リスト必須（`id` を含むこと。テーブル形の全列省略は
-  `42601`）。`operation_id` 必須化ガード（`LedgerMode::require`）はカタログ
+- `FROM STDIN` 形の列リストは省略できる（Issue #3252・WIRE-17・WIRE-22・SQL-34 ポインタ）。省略時は
+  束縛段（`CopyInSession::new`）が表のスキーマから全列を補い、並びは表形 `COPY t TO STDOUT` と同じ
+  （従来方式・移行済み表は疑似列 `id` が先頭）。権限は全列扱い、`HEADER MATCH` の照合対象も補完後の列。
+  列を持たない表は `0A000`、`()` は `42601`。列リストを書く場合は従来どおり（従来方式の表は `id` を含むこと）。`operation_id` 必須化ガード（`LedgerMode::require`）はカタログ
   照会より前（`validate_insert` と同じ順序）。
 - `TO STDOUT` 形の内側 `SELECT` は、`validate_sql_tokens`（本 Issue で
   `validate_sql` から切り出した公開トークン列版。純粋なリファクタリング）が
   返す `Statement::Scan`（広域取得。SQL-15・Issue #454）のみを受理する
   （第 2 の SELECT パーサーを持たない）。順位付き `SELECT`（`ORDER BY`／
-  `USING PLAN`）・集計は `42601`。
+  `USING PLAN`）は `42601`。集計 `SELECT`（`Statement::Aggregate`）は Issue #3253 で受理する
+  （下の「Issue #3253」節）。
 - テーブル形 `COPY <table> [(<col>, ...)] TO STDOUT`（Issue #1771・WIRE-22 (5)・SQL-34 ポインタ）:
   括弧形と同じ `ValidatedCopyTo`（`table_form = true`）で表し、内側の `ValidatedScan` は
   `SELECT *`（列リスト付きなら列投影）相当を直接組み立てる（トークンの合成・第 2 の SELECT
@@ -135,7 +138,7 @@
   - `HEADER`: 最初に確定した 1 レコードをヘッダ行として扱う（引用付き・チャンク境界をまたぐ
     ヘッダも同じ splitter で 1 レコードになる）。`true` は破棄、`MATCH` は列数と各列名
     （`id` 疑似列を含む COPY 列リスト。大小区別・NULL 不可）の一致を検査し、不一致は固定文言の
-    `22000`（ヘッダの内容は含めない）。ヘッダ行は行数①・チャンク数④・束縛の対象外で、生バイトは
+    `22000`（ヘッダの内容は含めない）。ヘッダ行は行数・チャンク数④・束縛の対象外で、生バイトは
     ③に従来どおり計上される（ヘッダ用の保持は 1 レコード分で③により有界）。
   - csv で `QUOTE`／`ESCAPE` が CR／LF の場合は、レコード終端と曖昧になるため CopyInResponse
     送出前に `0A000` で拒否する。
@@ -152,7 +155,7 @@
 - INDEX-4 の 4 上限（`batch_limits.rs`）: 複数行 `INSERT` は行を全て集めて
   から一括判定するのに対し、COPY はストリーミングであるため CopyDone を
   待たずに超過を検出する。`check_running_total`（③生 CopyData バイト量）は
-  `feed` の先頭で `pending` へ追加する前に判定し、①（行数）・④（生成チャンク
+  `feed` の先頭で `pending` へ追加する前に判定し、`--max-insert-rows`（行数。指定時のみ）・④（生成チャンク
   数。1 行=1 チャンクと読み替える既存の単文 INSERT 経路と同じ読み替え）・
   ②（当該行のデコード後バイト量）は完了したレコードごとに判定する。いずれの
   超過も副作用ゼロ（`Vec<BoundInsert>` へ積む前に拒否）。
@@ -217,9 +220,13 @@
    読み飛ばす）。(b) csv の `ESCAPE != QUOTE` で閉じ引用符直後の引用符は引用の再開として
    受理せず `22000`（PostgreSQL は受理。COPY TO はこの形を出力しない）。(c) text の
    `\<LF>`（エスケープされた改行による行継続）は未対応で、生 LF は常に行終端。
-5. **既定の①（`max_files_per_batch`）が 64 行**: 既定設定では 65 行以上の
-   COPY は `54000` になる。契約どおりの挙動だが、既知の運用上の制約
-   （起動時 CLI `--batch-max-files`〔優先〕または環境変数 `FANDHE_DB_BATCH_MAX_FILES` で上書き可能）として記録する。
+5. **行数の上限（Issue #3309 で変更。旧「既定の①が 64 行」）**: INDEX-4 ①
+   （`max_files_per_batch`）は COPY の行数に掛からない。既定構成でも 65 行以上の
+   COPY FROM STDIN（text・CSV・binary）が成功する。行数の上限は `--max-insert-rows`
+   指定時だけで（複数行 `VALUES` と同じ。超過は CopyData 受信中に `54000`）、未指定時の実効上限は
+   ④（1 行 = 1 チャンクで `max_batch_chunks`。既定 4096）になる。②（1 行のデコード後バイト量）・
+   ③（生 CopyData の累計）・④と 1 メッセージ上限（`framing::MAX_MESSAGE_LEN`）は従来どおり
+   受信中に `54000` で判定し、原子性（全行巻き戻し）・`operation_id` 台帳は変えない。
 6. **Flush（'H'）／Sync（'S'）の受理形状**: PostgreSQL wire v3 上この 2 種類は
    length=4（body 厳密に空）以外の形状を持たない。COPY サブプロトコル中に
    届いた場合は本文なしの no-op として無視するが、本文付き（宣言長が
@@ -249,7 +256,7 @@
 | `crates/engine/src/sql/allowlist.rs` | `validate_sql` → `validate_sql_tokens` への純粋な切り出し、`validate_copy`／`validate_copy_tokens`・`CopyStatement`・`ValidatedCopyFrom`／`ValidatedCopyTo`・`CopyFormat` |
 | `crates/engine/src/sql/copy.rs`（新設） | `is_copy_statement`・`RecordSplitter`・text／CSV デコーダ・`bind_copy_record`・`CopyInSession`／`CopyInBatch` |
 | `crates/engine/src/core.rs` | `CopyPlan`・`EngineCore::begin_copy`／`commit_copy_in` |
-| `crates/engine/src/batch_limits.rs` | 逐次判定ヘルパー（`check_row_count`／`check_row_body_len`／`check_running_total`） |
+| `crates/engine/src/batch_limits.rs` | 逐次判定ヘルパー（`check_row_body_len`／`check_running_total`） |
 | `crates/engine/tests/copy_from.rs`（新設） | engine API の層 A（原子性・INDEX-4・台帳共有・RLS・fail-closed） |
 | `crates/wire-server/src/copy.rs`（新設） | CopyIn／CopyOut サブプロトコル・行エンコーダ |
 | `crates/wire-server/src/handshake.rs` | 'Q' 分岐での COPY 委譲（`is_copy_statement` の覗き見） |
@@ -415,7 +422,7 @@ ReadyForQuery を返して接続を継続する。層 A: `crates/wire-server/tes
 - 責務分割: フレーム解析（`BinaryCopyReader`）と型変換は wire-server、束縛・INDEX-4 上限・commit は engine。
   engine へは型変換済みの正規テキスト（`Vec<Option<String>>`）だけを `CopyInSession::feed_fields` で渡す。
   text/csv の `feed` と binary の `feed_fields` は、非公開の `RecordSink::push_record` を共有する
-  （判定順序は フィールド数照合 → ① 行数 → ④ チャンク数 → 束縛 → ② 行あたりのバイト量）。
+  （判定順序は フィールド数照合 → `--max-insert-rows`（指定時のみ）→ ④ チャンク数 → 束縛 → ② 行あたりのバイト量）。
   ③（生 CopyData 累計）は binary でも全 payload を `account_raw_bytes` で計上し、フレーム解析より前に判定する。
 - 事前拒否: 列リストに非対応型（VECTOR・DATE・TIMESTAMP・JSON・JSONB・配列・ENUM）があれば、
   `copy_binary_types::resolve_columns`（Issue #1768）で `CopyInResponse` を送る前に `0A000` で拒否する。
@@ -501,3 +508,47 @@ Issue #1773 の実装に対し、失敗要因と COPY の位置の組み合わ�
 - 既知の相違: `Failed` 中の `COMMIT` は `25P02` で `'E'` のまま（PostgreSQL は `ROLLBACK` タグを返す。
   既存の fail-closed 契約を維持）。
 - 対象外: COPY 位置での commit 後 panic の緊急応答検査（新しい障害注入点が必要）。
+
+## Issue #3253: COPY (集計 SELECT) TO STDOUT（SQL-34・WIRE-22 ポインタ）
+
+- 構文段: `validate_copy_to_tokens` が `Statement::Aggregate` も受理する。`ValidatedCopyTo.inner` は
+  `CopyToSource`（`Scan`／`Aggregate`）へ変わった（公開型の破壊的変更。テーブル形は常に `Scan`）。
+- 実行段: `EngineCore::run_copy_to_scan` が集計を、通常の SELECT の集計アームから切り出した
+  `run_validated_aggregate` へ渡す（サブクエリ解決・RLS・グループ数上限を共有し、第 2 の実行器を持たない）。
+  結果列が HALFVEC／INT8VEC／SPARSEVEC なら `0A000`、結果件数が `--max-result-rows` を超えれば
+  明示 `LIMIT` や単一行集計を含め無条件に `54000`（CopyOutResponse より前に確定。部分出力なし）。
+- 権限ゲート: 括弧形は集計も通常の SELECT と同じ列走査規則（`ColumnSpec::Scan`）。
+- 拒否の維持: 順位付き SELECT・`USING PLAN`・JOIN・集合演算・評価後射影が要る CTE・WHERE 中の
+  サブクエリは従来どおり `42601`。評価後射影を要しない CTE は通常の SELECT と同じく集計へ畳まれて受理される。
+- wire-server のコード変更なし（`QueryResult` 汎用の符号化をそのまま使う）。
+
+## Issue #3310: 大量 COPY と ③ の計測（WIRE-17・INDEX-4 ポインタ）
+
+行の形から ① を外したあとの COPY の資源上限は ②（1 行 16 MiB）・③（CopyData 累計 64 MiB。
+デコード前の生バイトで数える）・④（行数 = チャンク数。既定 4096）・1 メッセージ 1 MiB である。
+改行のない行は `pending` に溜まるが、③ が保持量の上限になる（試験で固定）。
+
+### 計測
+
+`make bench-copy-volume`（`crates/engine/benches/copy_volume_bench.rs`。手動・CI 非対象）。
+表は `docs(embedding VECTOR(d), lang TEXT)`、text 形式、各要素は小数 6 桁。約 1 MiB の塊を `feed`
+する。実行環境: Linux 7.0（x86_64）・Intel Core i7-13700K・release ビルド。値は 1 回の実測で参考値
+（経過時間は行の文字列生成を含む。ピークメモリはプロセス単位の `VmHWM`）。
+
+| d | 1 行（バイト） | ③ 内の最大行数 | 構成 A（④ 4096）で拒否 | 構成 B（④ 100 万）で拒否 | ③ 直下の COPY の経過時間 | ピークメモリ（生バイトに対する倍率） |
+| -- | -------------- | -------------- | ---------------------- | ------------------------ | ------------------------ | ------------------------------------ |
+| 128 | 1,159 | 57,902 | 3,616 行で `54000`（④） | 56,952 行で `54000`（③） | 786 ms（56,952 行） | 105 MiB（1.66） |
+| 768 | 6,919 | 9,699 | 4,077 行で `54000`（④） | 9,664 行で `54000`（③） | 716 ms（9,664 行） | 96 MiB（1.51） |
+| 1536 | 13,831 | 4,852 | 4,050 行で `54000`（④） | 4,800 行で `54000`（③） | 695 ms（4,800 行） | 91 MiB（1.44） |
+
+構成 A の受理行数が 4096 未満なのは、拒否の判定が約 1 MiB の塊の単位だからである（塊を足すと
+4096 を超える回で拒否される）。
+
+### 結論
+
+- 既定では、1 行が平均 16 KiB（64 MiB ÷ 4096）以下なら ④ が先に効き、これを超える行（d が約 1,800
+  を超える text 形式）で ③ が先に効く。d = 1536 でも 4096 行（約 56 MB）までは ③ 内に収まる。
+- ③ 直下（約 64 MiB）の COPY のピークメモリは生バイトの 1.4〜1.7 倍（約 90〜105 MiB）で、経過時間は
+  0.7〜0.8 秒だった。
+- 既定値（③ 64 MiB・④ 4096）は変えない。変更が要るかは別判断（受け皿 Issue は未起票）。
+- 未検証: ピークメモリの他 OS での値、`--durability` が異なる構成、同時に複数接続が COPY する場合。

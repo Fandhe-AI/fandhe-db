@@ -762,9 +762,9 @@ fn create_table_vector_nullable_accepts_null_and_not_null_rejects_with_23502() {
 }
 
 /// Issue #1561（TABLE-30・NOSQL-13）: `create_table` の型名 `"smallint"` が受理され、
-/// 範囲外値は 22003、配列要素型としての `"smallint"` は拒否のまま（0A000）。
+/// 範囲外値は 22003。配列要素型としての `"smallint"` も Issue #3230（TABLE-14）で受理される。
 #[test]
-fn create_table_smallint_column_binds_range_and_rejects_array_element() {
+fn create_table_smallint_column_binds_range_and_accepts_array_element() {
     let (core, _guard) = new_core();
     let session = ddl_session(core);
     let resp = query(
@@ -787,15 +787,41 @@ fn create_table_smallint_column_binds_range_and_rejects_array_element() {
     assert_eq!(http_common::wire_code_of(&oor), "22003", "got: {oor:?}");
     let arr = query(
         &session,
-        br#"{"op":"create_table","table":"sm2","columns":[{"name":"a","type":"array","element_type":"smallint","max_len":4}]}"#,
+        br#"{"op":"create_table","table":"sm2","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"smallint","max_len":4}
+    ]}"#,
     );
-    assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
+    assert_eq!(arr.status, 200, "got: {arr:?}");
+    let arr_ok = query(
+        &session,
+        br#"{"op":"insert","table":"sm2","rows":[{"id":1,"embedding":[0.1,0.2],"a":[1,null,32767]}],"operation_id":"sm2-1"}"#,
+    );
+    assert_eq!(arr_ok.status, 200, "got: {arr_ok:?}");
+    let arr_oor = query(
+        &session,
+        br#"{"op":"insert","table":"sm2","rows":[{"id":2,"embedding":[0.1,0.2],"a":[32768]}],"operation_id":"sm2-2"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_oor),
+        "22003",
+        "got: {arr_oor:?}"
+    );
+    let arr_ty = query(
+        &session,
+        br#"{"op":"insert","table":"sm2","rows":[{"id":3,"embedding":[0.1,0.2],"a":["1"]}],"operation_id":"sm2-3"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_ty),
+        "42601",
+        "got: {arr_ty:?}"
+    );
 }
 
 /// Issue #1571（TABLE-32・NOSQL-13）: `create_table`／`add_column` の型名 `"time"` が受理され、
-/// 範囲外・書式不正は拒否、配列要素型としての `"time"` は 0A000 のまま（副作用なし）。
+/// 範囲外・書式不正は拒否。配列要素型としての `"time"` も Issue #3232（TABLE-14）で受理される。
 #[test]
-fn create_table_time_column_binds_and_rejects_array_element() {
+fn create_table_time_column_binds_and_accepts_array_element() {
     let (core, _guard) = new_core();
     let session = ddl_session(core);
     let resp = query(
@@ -823,9 +849,66 @@ fn create_table_time_column_binds_and_rejects_array_element() {
     assert_eq!(add.status, 200, "got: {add:?}");
     let arr = query(
         &session,
-        br#"{"op":"create_table","table":"tm2","columns":[{"name":"a","type":"array","element_type":"time","max_len":4}]}"#,
+        br#"{"op":"create_table","table":"tm2","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"time","max_len":4}
+    ]}"#,
     );
-    assert_eq!(http_common::wire_code_of(&arr), "0A000", "got: {arr:?}");
+    assert_eq!(arr.status, 200, "got: {arr:?}");
+    let arr_ok = query(
+        &session,
+        br#"{"op":"insert","table":"tm2","rows":[{"id":1,"embedding":[0.1,0.2],"a":["10:00:00",null,"24:00:00"]}],"operation_id":"tm2-1"}"#,
+    );
+    assert_eq!(arr_ok.status, 200, "got: {arr_ok:?}");
+    let arr_oor = query(
+        &session,
+        br#"{"op":"insert","table":"tm2","rows":[{"id":2,"embedding":[0.1,0.2],"a":["24:00:01"]}],"operation_id":"tm2-2"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_oor),
+        "22008",
+        "got: {arr_oor:?}"
+    );
+    let arr_ty = query(
+        &session,
+        br#"{"op":"insert","table":"tm2","rows":[{"id":3,"embedding":[0.1,0.2],"a":[1]}],"operation_id":"tm2-3"}"#,
+    );
+    assert_eq!(
+        http_common::wire_code_of(&arr_ty),
+        "42601",
+        "got: {arr_ty:?}"
+    );
+}
+
+/// Issue #3234（TABLE-14・TABLE-34・NOSQL-13）: 配列の要素型 `"interval"` が受理され、JSON 文字列の
+/// 要素が束縛でき、書式不正は 22007、JSON 数値は 42601 で拒否される。
+#[test]
+fn create_table_interval_array_column_binds() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let arr = query(
+        &session,
+        br#"{"op":"create_table","table":"iv2","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"interval","max_len":4}
+    ]}"#,
+    );
+    assert_eq!(arr.status, 200, "got: {arr:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"iv2","rows":[{"id":1,"embedding":[0.1,0.2],"a":["1 day",null,"2 hours"]}],"operation_id":"iv2-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let bad = query(
+        &session,
+        br#"{"op":"insert","table":"iv2","rows":[{"id":2,"embedding":[0.1,0.2],"a":["x"]}],"operation_id":"iv2-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&bad), "22007", "got: {bad:?}");
+    let num = query(
+        &session,
+        br#"{"op":"insert","table":"iv2","rows":[{"id":3,"embedding":[0.1,0.2],"a":[1]}],"operation_id":"iv2-3"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&num), "42601", "got: {num:?}");
 }
 
 /// Issue #1577（TABLE-33・NOSQL-13）: `create_table`／`add_column` の型名 `"timestamptz"` が
@@ -857,6 +940,37 @@ fn create_table_timestamptz_column_binds() {
         br#"{"op":"alter_table","table":"tz","add_column":{"name":"t2","type":"timestamptz"}}"#,
     );
     assert_eq!(add.status, 200, "got: {add:?}");
+}
+
+/// Issue #3233（TABLE-14・TABLE-33）: 配列要素型としての `"timestamptz"` が受理され、文字列要素が
+/// 束縛できる。範囲外は 22008、数値要素は 42601 で拒否される（副作用なし）。
+#[test]
+fn create_table_timestamptz_array_element_binds() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let resp = query(
+        &session,
+        br#"{"op":"create_table","table":"tza","columns":[
+        {"name":"embedding","type":"vector","dim":2},
+        {"name":"a","type":"array","element_type":"timestamptz","max_len":4}
+    ]}"#,
+    );
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+    let ok = query(
+        &session,
+        br#"{"op":"insert","table":"tza","rows":[{"id":1,"embedding":[0.1,0.2],"a":["2026-01-01T00:00:00+09:00",null]}],"operation_id":"tza-1"}"#,
+    );
+    assert_eq!(ok.status, 200, "got: {ok:?}");
+    let oor = query(
+        &session,
+        br#"{"op":"insert","table":"tza","rows":[{"id":2,"embedding":[0.1,0.2],"a":["2026-13-01 00:00:00Z"]}],"operation_id":"tza-2"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&oor), "22008", "got: {oor:?}");
+    let ty = query(
+        &session,
+        br#"{"op":"insert","table":"tza","rows":[{"id":3,"embedding":[0.1,0.2],"a":[1]}],"operation_id":"tza-3"}"#,
+    );
+    assert_eq!(http_common::wire_code_of(&ty), "42601", "got: {ty:?}");
 }
 
 /// Issue #1583（TABLE-34・NOSQL-13）: `create_table`／`add_column` の型名 `"interval"` が
@@ -977,6 +1091,7 @@ fn create_table_duplicate_explicit_check_name_is_42601() {
     assert_eq!(http_common::wire_code_of(&resp), "42601", "got: {resp:?}");
 }
 
+/// intentional: docs/design/nosql-ddl-mapping.md
 #[test]
 fn create_table_check_constraint_malformed_forms_are_42601() {
     let cases: &[(&str, &str)] = &[
@@ -988,12 +1103,32 @@ fn create_table_check_constraint_malformed_forms_are_42601() {
         ("missing predicate", r#"{"kind":"check"}"#),
         ("empty predicate", r#"{"kind":"check","predicate":[]}"#),
         (
-            "in op",
-            r#"{"kind":"check","predicate":[{"column":"a","op":"in","value":[1,2]}]}"#,
+            "empty in list",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"in","value":[]}]}"#,
         ),
         (
-            "or group",
-            r#"{"kind":"check","predicate":[{"or":[{"column":"a","op":"gt","value":0}]}]}"#,
+            "bool in element",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"in","value":[true]}]}"#,
+        ),
+        (
+            "between arity",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"between","value":[1]}]}"#,
+        ),
+        (
+            "is_null with value",
+            r#"{"kind":"check","predicate":[{"column":"a","op":"is_null","value":1}]}"#,
+        ),
+        (
+            "empty or group",
+            r#"{"kind":"check","predicate":[{"or":[]}]}"#,
+        ),
+        (
+            "rls predicate name inside or",
+            r#"{"kind":"check","predicate":[{"or":[{"column":"a","op":"gt","value":0},{"column":"visible","op":"eq","value":true}]}]}"#,
+        ),
+        (
+            "rls predicate name inside not",
+            r#"{"kind":"check","predicate":[{"not":{"column":"visible()","op":"is_null"}}]}"#,
         ),
         (
             "unknown op",
@@ -1205,6 +1340,234 @@ fn create_table_check_constraint_leaf_count_over_limit_is_54000() {
     );
     let resp = query(&session, body.as_bytes());
     assert_eq!(http_common::wire_code_of(&resp), "54000", "got: {resp:?}");
+}
+
+// --- CHECK の拡張述語形（Issue #3246・NOSQL-13・TABLE-16。SQL 表層と同じ形が
+// NoSQL `create_table` でも受理・enforce され、テナント境界を越えないことを固定する） ---
+
+/// `in`／`between`／`not_null`／`or`／`ne`／`not` を組み合わせた表（列は NULL 可）。
+const EXT_CHECK_TABLE_BODY: &str = r#"{"op":"create_table","table":"ext","columns":[
+    {"name":"n","type":"integer","nullable":true},
+    {"name":"s","type":"text","nullable":true}
+],"constraints":[
+    {"kind":"check","name":"n_in","predicate":[{"column":"n","op":"in","value":[1,2,3]}]},
+    {"kind":"check","name":"n_range","predicate":[{"column":"n","op":"between","value":[0,3]}]},
+    {"kind":"check","name":"n_not_two","predicate":[{"column":"n","op":"ne","value":2}]},
+    {"kind":"check","name":"s_required","predicate":[{"column":"s","op":"not_null"}]},
+    {"kind":"check","name":"s_shape","predicate":[{"or":[
+        {"column":"s","op":"eq","value":"a"},
+        {"column":"s","op":"prefix","value":"b"}
+    ]}]},
+    {"kind":"check","name":"s_not_z","predicate":[{"not":{"column":"s","op":"eq","value":"z"}}]}
+]}"#;
+
+fn ext_insert(id: u32, row_fields: &str, op: &str) -> Vec<u8> {
+    format!(
+        r#"{{"op":"insert","table":"ext","rows":[{{"id":{id},{row_fields}}}],"operation_id":"{op}"}}"#
+    )
+    .into_bytes()
+}
+
+#[test]
+fn create_table_check_extended_forms_follow_three_valued_logic() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    let resp = query(&session, EXT_CHECK_TABLE_BODY.as_bytes());
+    assert_eq!(resp.status, 200, "got: {resp:?}");
+
+    // 充足行。`n` を省略（NULL）しても IN／BETWEEN／NOT(=) は UNKNOWN になり合格する。
+    assert_eq!(
+        query(&session, &ext_insert(1, r#""n":1,"s":"a""#, "ext-ok-1")).status,
+        200
+    );
+    assert_eq!(
+        query(&session, &ext_insert(2, r#""n":3,"s":"bx""#, "ext-ok-2")).status,
+        200
+    );
+    assert_eq!(
+        query(&session, &ext_insert(3, r#""s":"a""#, "ext-null-n")).status,
+        200
+    );
+
+    // それぞれの制約の違反は 409／23514。
+    for (id, fields, op) in [
+        (10, r#""n":4,"s":"a""#, "ext-bad-in"),
+        (11, r#""n":2,"s":"a""#, "ext-bad-ne"),
+        (12, r#""n":1,"s":"c""#, "ext-bad-or"),
+        (13, r#""n":1"#, "ext-bad-not-null"),
+        (14, r#""n":1,"s":"z""#, "ext-bad-not"),
+    ] {
+        let resp = query(&session, &ext_insert(id, fields, op));
+        assert_eq!(resp.status, 409, "case {op}: got {resp:?}");
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            "23514",
+            "case {op}: got {resp:?}"
+        );
+    }
+
+    // update の違反も 23514。
+    let update = br#"{"op":"update","table":"ext","set":{"n":2},"where":{"id":1},"operation_id":"ext-upd-bad"}"#;
+    let resp = query(&session, update);
+    assert_eq!(resp.status, 409, "got: {resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23514", "got: {resp:?}");
+
+    // 違反した書き込みは副作用ゼロ（充足した 3 行のみ）。
+    let scan = br#"{"op":"scan","table":"ext","limit":50}"#;
+    assert_eq!(scan_row_count(&query(&session, scan)), 3);
+}
+
+/// テナント境界（P0）: 拡張述語形の CHECK は書き込み行の列値だけを評価し、他テナントの行・
+/// 値・テナント名を応答へ漏らさない。
+#[test]
+fn create_table_extended_check_does_not_cross_tenant_boundary_via_nosql() {
+    let (core, _guard) = new_core();
+    let users_path = common::write_user_store_file(&[
+        ("alice", TENANT_A, "pw-alice"),
+        ("bob", "tenant-b", "pw-bob"),
+    ]);
+    let store = UserStore::load_from_file(&users_path).expect("valid user store");
+    let store = store
+        .with_ddl_allowed_users(&["alice".to_string(), "bob".to_string()])
+        .expect("both usernames known");
+    let addr = spawn_with_store(store, core);
+    let alice = login(addr, "alice", "pw-alice");
+    let bob = login(addr, "bob", "pw-bob");
+
+    assert_eq!(query(&alice, EXT_CHECK_TABLE_BODY.as_bytes()).status, 200);
+
+    // 同じ id・充足行を両テナントへ。alice の行には識別しやすい値を使う。
+    assert_eq!(
+        query(&alice, &ext_insert(1, r#""n":1,"s":"a""#, "x-a-1")).status,
+        200
+    );
+
+    // bob の違反行（同じ id）は 23514。メッセージに alice の値・テナント名は含まれない。
+    let resp = query(&bob, &ext_insert(1, r#""n":4,"s":"a""#, "x-b-bad"));
+    assert_eq!(resp.status, 409, "got: {resp:?}");
+    assert_eq!(http_common::wire_code_of(&resp), "23514", "got: {resp:?}");
+    let message = http_common::error_message_of(&resp);
+    for leaked in [TENANT_A, "alice"] {
+        assert!(
+            !message.contains(leaked),
+            "message must not echo {leaked:?}: {message}"
+        );
+    }
+    assert!(
+        message.contains("n_in"),
+        "message must name the constraint: {message}"
+    );
+
+    // bob の充足行は成功し、各テナントは自分の 1 行だけを見る。
+    assert_eq!(
+        query(&bob, &ext_insert(1, r#""n":3,"s":"bx""#, "x-b-1")).status,
+        200
+    );
+    let scan = br#"{"op":"scan","table":"ext","limit":50}"#;
+    assert_eq!(scan_row_count(&query(&alice, scan)), 1);
+    assert_eq!(scan_row_count(&query(&bob, scan)), 1);
+}
+
+/// RLS 述語名は `or`／`not` の内側に紛れ込ませても CHECK へ流れず `42601` で拒否される
+/// （テナント境界の fail-closed。入れ子の内側まで再帰検査する）。
+#[test]
+fn create_table_check_rls_predicate_name_nested_in_or_not_is_rejected_without_side_effect() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(core);
+    for pred in [
+        r#"[{"or":[{"column":"a","op":"gt","value":0},{"column":"visible","op":"eq","value":true}]}]"#,
+        r#"[{"not":{"or":[{"column":"a","op":"gt","value":0},{"column":"visible()","op":"is_null"}]}}]"#,
+    ] {
+        let body = format!(
+            r#"{{"op":"create_table","table":"t","columns":[{{"name":"a","type":"integer"}}],"constraints":[{{"kind":"check","predicate":{pred}}}]}}"#
+        );
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(http_common::wire_code_of(&resp), "42601", "got: {resp:?}");
+    }
+    // 副作用ゼロ: 同名テーブルを有効な定義で作成できる。
+    let ok = br#"{"op":"create_table","table":"t","columns":[{"name":"a","type":"integer"}]}"#;
+    assert_eq!(query(&session, ok).status, 200);
+}
+
+/// intentional: docs/design/sql-check-constraint.md
+/// engine が判定する拒否（TEXT 列の BETWEEN・数値列への文字列要素の IN）の `wire_code` が
+/// SQL 表層と一致すること（wire は先回り判定しない）。
+#[test]
+fn create_table_check_engine_rejections_match_sql_surface_wire_codes() {
+    let cases: [(&str, &str, &str); 2] = [
+        (
+            r#"{"column":"s","op":"between","value":["a","z"]}"#,
+            "CHECK (s BETWEEN 'a' AND 'z')",
+            "22000",
+        ),
+        (
+            r#"{"column":"n","op":"in","value":["a","b"]}"#,
+            "CHECK (n IN ('a', 'b'))",
+            "22000",
+        ),
+    ];
+    for (leaf, sql_check, expected) in cases {
+        let (core, _guard) = new_core();
+        let session = ddl_session(Arc::clone(&core));
+        let body = format!(
+            r#"{{"op":"create_table","table":"t","columns":[{{"name":"n","type":"integer"}},{{"name":"s","type":"text"}}],"constraints":[{{"kind":"check","predicate":[{leaf}]}}]}}"#
+        );
+        let resp = query(&session, body.as_bytes());
+        assert_eq!(
+            http_common::wire_code_of(&resp),
+            expected,
+            "case {leaf}: got {resp:?}"
+        );
+
+        let (ctx, mut sql) = sql_ddl_session();
+        let err = core
+            .execute_sql_in_session_legacy(
+                &ctx,
+                &mut sql,
+                &format!("CREATE TABLE t_sql (n INTEGER, s TEXT, {sql_check})"),
+            )
+            .expect_err("sql must reject");
+        assert_eq!(err.wire_code(), expected, "case {leaf}: sql parity");
+    }
+}
+
+/// NoSQL で作った拡張形 CHECK の表へ、SQL 表層の末尾 `;` 付き単独 INSERT を流しても同じ
+/// 検査点で違反が `23514` になる（Issue #3246 受入基準 3）。
+#[test]
+fn create_table_extended_check_is_enforced_for_sql_statements_with_trailing_semicolon() {
+    let (core, _guard) = new_core();
+    let session = ddl_session(Arc::clone(&core));
+    assert_eq!(query(&session, EXT_CHECK_TABLE_BODY.as_bytes()).status, 200);
+
+    let (ctx, mut sql) = sql_ddl_session();
+    core.execute_sql_in_session_legacy(
+        &ctx,
+        &mut sql,
+        "INSERT INTO ext (id, n, s) VALUES (20, 1, 'a') USING OPERATION_ID 'sql-ok';",
+    )
+    .expect("satisfying insert must succeed");
+    for (id, values) in [(21, "4, 'a'"), (22, "1, 'c'"), (23, "2, 'a'")] {
+        let err = core
+            .execute_sql_in_session_legacy(
+                &ctx,
+                &mut sql,
+                &format!(
+                    "INSERT INTO ext (id, n, s) VALUES ({id}, {values}) USING OPERATION_ID 'sql-bad-{id}';"
+                ),
+            )
+            .expect_err("violating insert must be rejected");
+        assert_eq!(err.wire_code(), "23514", "values {values}");
+    }
+    let scan = br#"{"op":"scan","table":"ext","limit":50}"#;
+    assert_eq!(scan_row_count(&query(&session, scan)), 1);
+}
+
+#[test]
+fn create_table_extended_check_without_ddl_permission_is_42501() {
+    let (core, _guard) = new_core();
+    let session = non_ddl_session(core);
+    let resp = query(&session, EXT_CHECK_TABLE_BODY.as_bytes());
+    assert_eq!(http_common::wire_code_of(&resp), "42501", "got: {resp:?}");
 }
 
 #[test]

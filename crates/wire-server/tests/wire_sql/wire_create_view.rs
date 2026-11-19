@@ -208,11 +208,10 @@ fn wire_view_error_sqlstates() {
     read_ready_for_query(&mut stream);
 }
 
-/// 複数文メッセージ（セミコロン区切り）で `CREATE VIEW` を最後以外に置くと
-/// `0A000`（`statement_splitter::MultiStatementError::WriteNotLast`。DDL も
-/// `INSERT` 等の書き込み系文と同じ分類を共有する）。
+/// 複数文メッセージ（セミコロン区切り）で `CREATE VIEW` を最後以外に置くと、暗黙トランザクションで
+/// DDL と後続の読み取りを 1 つの Tx として実行する（SQL-80・Issue #3315）。
 #[test]
-fn wire_create_view_not_last_in_multi_statement_message_is_rejected() {
+fn wire_create_view_not_last_in_multi_statement_message_runs_in_an_implicit_transaction() {
     let (core, _guard) = new_core_with_docs_table();
     let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
     let addr = spawn_server_with_engine_and_store(store, core);
@@ -222,7 +221,15 @@ fn wire_create_view_not_last_in_multi_statement_message_is_rejected() {
         &mut stream,
         "CREATE VIEW v AS SELECT * FROM docs; SELECT COUNT(*) FROM docs",
     );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    let _columns = read_row_description(&mut stream);
+    let _row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // 確定済み: 同名の作成は `42P07`。
+    send_simple_query(&mut stream, "CREATE VIEW v AS SELECT * FROM docs");
+    expect_error_response_with_sqlstate(&mut stream, "42P07");
     read_ready_for_query(&mut stream);
 }
 /// 評価後射影形ビューへの外側の集計・DISTINCT・ウィンドウ・式 `ORDER BY` と連鎖
@@ -481,4 +488,184 @@ fn wire_create_or_replace_view_with_dependent_views() {
     );
     expect_error_response_with_sqlstate(&mut stream, "0A000");
     read_ready_for_query(&mut stream);
+}
+/// 数値列 `n`（NULL 可）を持つ表の fixture（Issue #3238。既存の `docs` は数値列を持たない）。
+fn new_core_with_numeric_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-create-view-numeric");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs_n",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("n", ColumnType::Integer, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// Issue #3238: psql が送る「末尾 `;` 付きの単独 simple query」で、式述語（数値比較・`OR`・
+/// `IS NULL`）の本文の `CREATE VIEW` が通り、参照結果が正しい。非組み込み関数の本文は
+/// `42601` の後に `ReadyForQuery` が返り、接続は使い続けられる。
+// intentional: docs/design/create-view.md
+#[test]
+fn wire_create_view_accepts_expression_predicate_bodies_with_trailing_semicolon() {
+    let (core, _guard) = new_core_with_numeric_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (id, n) in [(1, "1"), (2, "5"), (3, "NULL")] {
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "INSERT INTO docs_n (id, embedding, n) VALUES ({id}, '[0.1,0.2,0.3]', {n}) USING OPERATION_ID 'op-n-{id}'"
+            ),
+        );
+        let _tag = read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+
+    for (view, pred, want) in [
+        ("vn", "n > 3", vec!["2"]),
+        ("vo", "n > 3 OR n IS NULL", vec!["2", "3"]),
+        ("vz", "n IS NULL", vec!["3"]),
+    ] {
+        send_simple_query(
+            &mut stream,
+            &format!("CREATE VIEW {view} AS SELECT * FROM docs_n WHERE {pred};"),
+        );
+        let tag = read_command_complete(&mut stream);
+        assert_eq!(tag, "CREATE VIEW", "view={view}");
+        read_ready_for_query(&mut stream);
+
+        send_simple_query(&mut stream, &format!("SELECT id FROM {view} LIMIT 10;"));
+        let _columns = read_row_description(&mut stream);
+        let mut got = Vec::new();
+        for _ in 0..want.len() {
+            let row = read_data_row(&mut stream);
+            got.push(row[0].clone().expect("id"));
+        }
+        got.sort();
+        assert_eq!(got, want, "view={view}");
+        let tag = read_command_complete(&mut stream);
+        assert_eq!(tag, format!("SELECT {}", want.len()), "view={view}");
+        read_ready_for_query(&mut stream);
+    }
+
+    // 非組み込み関数の本文は 42601。接続は使い続けられる。
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW vu AS SELECT * FROM docs_n WHERE no_such_fn(n) > 1;",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "SELECT * FROM vu LIMIT 10");
+    expect_error_response_with_sqlstate(&mut stream, "42P01");
+    read_ready_for_query(&mut stream);
+}
+/// Issue #3239: psql の形（末尾 `;` 付きの単独 simple query）で、式述語本文のビューが親表の
+/// 列改名に追随し、参照結果が改名前と一致する。追随できない形（`LIMIT` 付き本文）は `0A000` の後に
+/// `ReadyForQuery` が返り、接続は使い続けられる。
+// intentional: docs/design/create-view.md
+#[test]
+fn wire_rename_column_follows_expression_predicate_view() {
+    let (core, _guard) = new_core_with_numeric_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    for (id, n) in [(1, "1"), (2, "5"), (3, "NULL")] {
+        send_simple_query(
+            &mut stream,
+            &format!(
+                "INSERT INTO docs_n (id, embedding, n) VALUES ({id}, '[0.1,0.2,0.3]', {n}) USING OPERATION_ID 'op-r-{id}'"
+            ),
+        );
+        let _tag = read_command_complete(&mut stream);
+        read_ready_for_query(&mut stream);
+    }
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW vw AS SELECT * FROM docs_n WHERE n > 3 OR n IS NULL;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "CREATE VIEW vlim AS SELECT * FROM docs_n WHERE n > 3 OR n IS NULL LIMIT 5;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "CREATE VIEW");
+    read_ready_for_query(&mut stream);
+    // 評価後射影形のビューが列を読むため、改名は 0A000。接続は使い続けられる。
+    send_simple_query(&mut stream, "ALTER TABLE docs_n RENAME COLUMN n TO m;");
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "DROP VIEW vlim;");
+    assert_eq!(read_command_complete(&mut stream), "DROP VIEW");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "ALTER TABLE docs_n RENAME COLUMN n TO m;");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id FROM vw LIMIT 10;");
+    let _columns = read_row_description(&mut stream);
+    let mut got = Vec::new();
+    for _ in 0..2 {
+        let row = read_data_row(&mut stream);
+        got.push(row[0].clone().expect("id"));
+    }
+    got.sort();
+    assert_eq!(got, vec!["2", "3"]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+}
+
+// intentional: docs/design/create-view.md
+/// ビュー定義の拒否が原因別の SQLSTATE になる（Issue #3240。TABLE-18・ERR-6 ポインタ）。psql 相当の
+/// 末尾 `;` 付き単独送信で、JOIN 辺のビュー参照・集合演算の枝からの参照は `42601`、
+/// `LIMIT` 付きビューの上の `ILIKE` は `0A000`。各拒否の後も接続は使い続けられ、受理形
+/// （数値比較 ＋ `LIMIT`）は同じ形式で `CREATE VIEW` タグになる。
+#[test]
+fn wire_create_view_rejections_are_cause_specific_and_connection_stays_usable() {
+    let (core, _guard) = new_core_with_docs_table();
+    let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
+    let addr = spawn_server_with_engine_and_store(store, core);
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+    send_simple_query(
+        &mut alice,
+        "CREATE VIEW lim AS SELECT id, lang FROM docs LIMIT 5;",
+    );
+    let _tag = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+    for (sql, sqlstate) in [
+        (
+            "CREATE VIEW x_join AS SELECT docs.id FROM docs JOIN lim ON docs.id = lim.id LIMIT 5;",
+            "42601",
+        ),
+        (
+            "CREATE VIEW x_union AS SELECT id FROM docs UNION ALL SELECT id FROM lim;",
+            "42601",
+        ),
+        (
+            "CREATE VIEW x_ilike AS SELECT id FROM lim WHERE lang ILIKE 'j%';",
+            "0A000",
+        ),
+    ] {
+        send_simple_query(&mut alice, sql);
+        expect_error_response_with_sqlstate(&mut alice, sqlstate);
+        read_ready_for_query(&mut alice);
+    }
+    send_simple_query(
+        &mut alice,
+        "CREATE VIEW ok_num AS SELECT id FROM docs WHERE id > 1 LIMIT 5;",
+    );
+    let tag = read_command_complete(&mut alice);
+    assert_eq!(tag, "CREATE VIEW");
+    read_ready_for_query(&mut alice);
 }

@@ -419,6 +419,9 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
         Token::Ident(name) if name.eq_ignore_ascii_case("DECLARE") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("FETCH") => StatementEffect::ReadOnly,
         Token::Ident(name) if name.eq_ignore_ascii_case("CLOSE") => StatementEffect::ReadOnly,
+        // Issue #3336: `MOVE` もセッション内メモリ上の位置だけを動かすため `ReadOnly`。
+        // 漏らすと未知の先頭語として `Write` に倒れ、複数文で `0A000` に化ける。
+        Token::Ident(name) if name.eq_ignore_ascii_case("MOVE") => StatementEffect::ReadOnly,
         // TASK-213・SQL-29 (b)（Issue #928）: `WITH`（非再帰 CTE）は読み取り系。ただし
         // データ変更 CTE（SQL-63・Issue #1875。`(` の直後に `INSERT`／`UPDATE`／`DELETE` が現れる
         // 本文）は書き込みを持ちうる形のため `Write` に倒す（fail-closed）。現時点では
@@ -439,6 +442,8 @@ pub fn classify_statement(stmt: &str) -> StatementEffect {
                             if n.eq_ignore_ascii_case("INSERT")
                                 || n.eq_ignore_ascii_case("UPDATE")
                                 || n.eq_ignore_ascii_case("DELETE")
+                                // SQL-79・Issue #3351: 本文が MERGE の形も `Write` に倒す（fail-closed）。
+                                || n.eq_ignore_ascii_case("MERGE")
                     )
             });
             if has_dml_body || calls_non_builtin_function(&tokens) || has_row_lock_clause(&tokens) {
@@ -1766,6 +1771,11 @@ mod tests {
             classify_statement("SET search_mode = 'recall'"),
             StatementEffect::SessionLocal
         );
+        // Issue #3336: `MOVE` は位置だけを動かすため `ReadOnly`。
+        assert_eq!(
+            classify_statement("MOVE FORWARD 2 IN c"),
+            StatementEffect::ReadOnly
+        );
         // Issue #2882: UDF カタログへ書くため `Write`（暗黙トランザクションで巻き戻せる）。
         assert_eq!(
             classify_statement("CREATE FUNCTION f(x) AS x"),
@@ -1807,6 +1817,20 @@ mod tests {
         );
         assert_eq!(
             classify_statement("TRUNCATE TABLE t USING OPERATION_ID 'o1'"),
+            StatementEffect::Write
+        );
+        // SQL-79・Issue #3351: MERGE は既定（未知の先頭語）の `Write`。データ変更 CTE の本文が MERGE の形も
+        // `Write` に倒す（fail-closed）。
+        assert_eq!(
+            classify_statement(
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE USING OPERATION_ID 'o1'"
+            ),
+            StatementEffect::Write
+        );
+        assert_eq!(
+            classify_statement(
+                "WITH x AS (MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE) SELECT 1"
+            ),
             StatementEffect::Write
         );
         // TASK-202・SQL-23（Issue #900）: `ALTER` は `lexer::Keyword` へ含めない

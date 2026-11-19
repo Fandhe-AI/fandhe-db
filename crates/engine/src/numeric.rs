@@ -702,7 +702,7 @@ pub(crate) fn avg_unscaled(
     })
 }
 
-/// `NUMERIC` 式の四則演算の種類（[`decimal_arith`]。`sql::udf_call` の
+/// `NUMERIC` 式の四則演算・剰余の種類（[`decimal_arith`]。`sql::udf_call` の
 /// `BuiltinFn::NumericArith` が唯一の呼び出し元。Issue #1812・SQL-42 ポインタ）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecimalOp {
@@ -710,6 +710,8 @@ pub(crate) enum DecimalOp {
     Sub,
     Mul,
     Div,
+    /// 剰余（`%`。符号は被除数に従い、scale は両辺の大きい方。Issue #3273）。
+    Rem,
 }
 
 /// [`decimal_arith`] の失敗。呼び出し元が `22012`／`22003` へ写像する。
@@ -750,6 +752,17 @@ pub(crate) fn decimal_arith(
                 .unscaled
                 .checked_mul(b.unscaled)
                 .ok_or(DecimalArithError::OutOfRange)?;
+            Decimal::from_parts(v, scale).map_err(oor)?
+        }
+        DecimalOp::Rem => {
+            if b.unscaled == 0 {
+                return Err(DecimalArithError::DivisionByZero);
+            }
+            let scale = a.scale.max(b.scale);
+            let x = rescale_up(a, scale)?;
+            let y = rescale_up(b, scale)?;
+            // 符号は被除数に従う（`i128::checked_rem`。除数 0 は上で除外済み）。
+            let v = x.checked_rem(y).ok_or(DecimalArithError::OutOfRange)?;
             Decimal::from_parts(v, scale).map_err(oor)?
         }
         DecimalOp::Div => {
@@ -1077,6 +1090,26 @@ mod tests {
         );
         assert_eq!(
             decimal_arith(Div, &d(1, 0), &d(0, 0)),
+            Err(DecimalArithError::DivisionByZero)
+        );
+    }
+
+    /// Issue #3273: 剰余は符号が被除数に従い、scale は両辺の大きい方（PostgreSQL 17 の numeric `%`）。
+    #[test]
+    fn decimal_rem_follows_dividend_sign_and_max_scale() {
+        use DecimalOp::Rem;
+        // 10.5 % 3 = 1.5、7.00 % 2.5 = 2.00。
+        assert_eq!(decimal_arith(Rem, &d(105, 1), &d(3, 0)), Ok(d(15, 1)));
+        assert_eq!(decimal_arith(Rem, &d(700, 2), &d(25, 1)), Ok(d(200, 2)));
+        // 符号は被除数に従う。
+        assert_eq!(decimal_arith(Rem, &d(-105, 1), &d(3, 0)), Ok(d(-15, 1)));
+        assert_eq!(decimal_arith(Rem, &d(105, 1), &d(-3, 0)), Ok(d(15, 1)));
+        assert_eq!(
+            decimal_arith(Rem, &d(7, 0), &d(0, 0)),
+            Err(DecimalArithError::DivisionByZero)
+        );
+        assert_eq!(
+            decimal_arith(Rem, &d(7, 0), &d(0, 2)),
             Err(DecimalArithError::DivisionByZero)
         );
     }

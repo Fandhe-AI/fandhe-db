@@ -305,18 +305,33 @@ fn unsupported_forms_fail_closed() {
     ] {
         exec(&core, "tenant-a", sql).unwrap_or_else(|e| panic!("control {sql:?} failed: {e}"));
     }
-    // ビュー本体の WHERE にも置けない（式述語は従来どおり拒否）。
+    // ビュー本体の WHERE には置ける（Issue #3238。組み込み関数だけの式述語は受理する）。
+    // 結果は基表への直接実行と一致する。
     let mut session = SessionState::default();
     session.allow_ddl();
-    assert!(
-        core.execute_sql_in_session(
-            &ctx("tenant-a"),
-            &mut session,
-            "CREATE VIEW v AS SELECT id FROM t WHERE a IS DISTINCT FROM b",
-        )
-        .is_err(),
-        "view body must reject IS DISTINCT FROM"
-    );
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut session,
+        "CREATE VIEW v AS SELECT id FROM t WHERE a IS DISTINCT FROM b",
+    )
+    .expect("view body accepts IS DISTINCT FROM");
+    let via_view = match exec(&core, "tenant-a", "SELECT id FROM v LIMIT 100").expect("view") {
+        SqlOutcome::Query(r) => {
+            let mut v: Vec<u64> = r
+                .rows
+                .iter()
+                .map(|row| match row.cells.first() {
+                    Some(Cell::Integer(n)) => *n,
+                    Some(Cell::SignedInteger(n)) => u64::try_from(*n).expect("non-negative id"),
+                    other => panic!("expected id cell, got {other:?}"),
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        }
+        other => panic!("expected Query, got {other:?}"),
+    };
+    assert_eq!(via_view, ids(&core, "a IS DISTINCT FROM b"));
     // BOOLEAN 列の式経路は対象外（0A000）。
     assert!(
         ids_of(&core, "tenant-a", "flag IS DISTINCT FROM NULL").is_err(),

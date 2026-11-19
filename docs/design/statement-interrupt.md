@@ -98,6 +98,10 @@ commit 境界より後（`commit_boundary::commit` の後・台帳の記録・re
 
 対象外（#1953）: wire の `SET`／`SHOW statement_timeout`・起動時 CLI・`'Q'`／`'E'` での導入（#1954。COPY FROM でクライアントのデータ送信を待つ読み取りは協調的中断では止められない）、距離カーネル内部・`parallel_search`・HNSW 内部への確認点（`KernelError`／`SearchProvider` の公開 API 変更と `search_or_fallback` の縮退吸収の整理が要る）、DDL の行ループ（索引構築・`ALTER TABLE` の書き換え）、分割実行での `ClientGone`・SQL-77 のチャンク間待機、HTTP（NoSQL）表層の既定値、既存ベンチでの無効時オーバーヘッドの実測。
 
+### Tx 内 DDL の走査ループ（Issue #3314）
+
+既存行を走査する DDL（一意制約の重複走査・`SET NOT NULL`・部分/式索引の既存行検証・GIN の初回構築・生成列の `ADD COLUMN`・実体化ビューの一意索引）の行ループに `check_reason()` を置いた。エラーは `CatalogError::Interrupted` で返し、表層で `QueryCanceled` に写す。確認点は commit より前にあるため副作用は残らない。明示・暗黙 Tx の DDL は `execute_table_ddl_in_txn` が Tx の持続時間の期限を張るため、`statement_timeout` との早い方で打ち切られ、Tx の期限なら `54000` になる。同じ本体を通る autocommit の DDL も `statement_timeout`・切断検出で中断できる。テスト用プローブ（`install_fire_after_checks`）は入れ子の `install` で外れない。
+
 ### wire の切断検出
 
 - `WireStream::liveness_probe()`（既定は `None`）が、接続ソケットの複製と受信経路と共有する side buffer の組を返す。認証後セッションの受信経路は `SideBufTcp` で包み、TLS 接続でも TLS レコード復号より下層（生バイト列）に置くため順序が保たれる

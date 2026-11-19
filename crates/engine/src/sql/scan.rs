@@ -48,6 +48,13 @@
 //! いれば、全行走査の代わりにポスティングで候補を絞る（[`crate::sql::gin_scan`]）。候補は PK 点検索と同様に
 //! 全走査と同じ [`with_visible_row`]（WHERE 全体の再評価を含む）を通るため、出力は全走査と同一。
 //!
+//! **`SELECT DISTINCT ON`**（Issue #3261・SQL-25 のポインタ。`docs/design/select-distinct-on.md`）:
+//! `bound.distinct_on = Some(k)` の文は必ず経路 (B) を通り、`BinaryHeap` の代わりにグループ代表行の
+//! 整列済み `Vec`（先頭 `k` キーが等しい行を 1 グループとし、全順序で最初の行だけを残す）を保持する。
+//! 重複排除は `OFFSET`／`LIMIT` より前に行い、保持するのはグループ数（`limit + offset` 以下）で
+//! 入力行数ではない。候補判定は [`with_visible_row`] の内側（RLS・`WHERE` 通過後）だけで行うため、
+//! 不可視行は代表行の選択・グループ数・`54000` の成否のいずれにも現れない。
+//!
 //! `OFFSET`（Issue #916・SQL-25 (b)・TASK-209。詳細は
 //! `docs/design/sql-offset-paging.md`）は「可視かつ `WHERE` 一致」の行のみを対象に
 //! 読み飛ばす。RLS 判定・`WHERE` 評価が確定した後でのみ計数するため、不可視行は
@@ -65,7 +72,7 @@ use crate::sql::exec_stats::{stage_end, stage_start, ExecStage, ExecStats};
 use crate::sql::expr_program::{ExprProgram, StackValue};
 use crate::sql::keyset::{KeysetPosition, ScanPage};
 use crate::sql::order_value::{
-    compare_keyset_order, compare_keyset_ref_to_owned, compare_nullable,
+    compare_keyset_order, compare_keyset_ref_to_owned, compare_nullable, compare_order_key,
     compare_ref_and_owned_values, compare_statement_order, expr_value_to_jsonb_key,
     expr_value_to_key_ref, extract_order_value_ref, scalar_key_ref_to_owned, NullPlacement,
     OrderValue, ScalarKeyRef,
@@ -251,7 +258,7 @@ fn raise_tier_for_policy(tier: DecodeTier, needs: PolicyNeeds) -> DecodeTier {
 enum DecodeTier {
     /// 投影列が疑似列 `id`・embedding を参照しない `Computed` 式のみ・`WHERE` 句
     /// なしの場合に限り選択する。dim・metadata の構造検証（破損検知）は
-    /// `DimAndScalar` と同じ [`storage::decode_row_dim_and_metadata_borrowed`] を
+    /// `DimAndScalar` と同じ [`storage::decode_row_dim_and_metadata_body_borrowed`] を
     /// 通す（`sql::aggregate` の `DecodeTier::Fast` と同方針。破損した可視行を
     /// fail-open で見逃さない）。
     Fast,
@@ -457,6 +464,46 @@ fn compare_candidate_ref_to_entry(
     }
 }
 
+/// `SELECT DISTINCT ON`（Issue #3261）のグループ比較。候補（借用の `refs`）と保持中の代表行 `other` を
+/// 実効 `ORDER BY` の先頭 `prefix_len` キーだけで比較する（`Equal` は同一グループ）。方向・NULL 位置は
+/// 通常の比較と同じ [`compare_nullable`] 経由で、NULL 同士・NaN 同士・`-0.0` と `0.0` は同順位
+/// （PostgreSQL の `DISTINCT` のグループ同一性と一致する）。グループ間の順序は前置キーだけで決まる。
+fn compare_prefix_ref_to_entry(
+    order_by: &[BoundOrderKey],
+    prefix_len: usize,
+    refs: &[Option<ScalarKeyRef<'_>>],
+    other: &HeapEntry,
+) -> Ordering {
+    for (idx, key) in order_by.iter().take(prefix_len).enumerate() {
+        let a = refs.get(idx).and_then(|o| o.as_ref());
+        let b = other.keys.get(idx).and_then(|o| o.as_ref());
+        let ord = compare_ref_key(a, b, key.descending, key.nulls);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// [`compare_prefix_ref_to_entry`] の所有キー同士の版（採用が決まった候補を整列済みの代表行列へ
+/// 挿入する位置の再計算に使う）。
+fn compare_prefix_entries(
+    order_by: &[BoundOrderKey],
+    prefix_len: usize,
+    a: &HeapEntry,
+    b: &HeapEntry,
+) -> Ordering {
+    for (idx, key) in order_by.iter().take(prefix_len).enumerate() {
+        let x = a.keys.get(idx).and_then(|o| o.as_ref());
+        let y = b.keys.get(idx).and_then(|o| o.as_ref());
+        let ord = compare_order_key(x, y, key.descending, key.nulls);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// `refs`（複製前の候補キー集合）が確保すれば占めるであろう [`heap_entry_bytes`]
 /// を、複製せず借用長だけから見積もる（Issue #915 追加是正: Cursor Bugbot
 /// 指摘「複数 TEXT キーの合計長を見ずに 1 キーずつしか予算照合しない」への
@@ -554,7 +601,9 @@ fn with_visible_row<T>(
 
     let (dim, metadata): (u32, &[u8]) = match tier {
         DecodeTier::Fast | DecodeTier::DimAndScalar => {
-            storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
+            // ヘッダは上の RLS 段で 1 回だけデコード済み。offset を渡して再デコードしない（Issue #3223）。
+            storage::decode_row_dim_and_metadata_body_borrowed(buf, offset)
+                .map_err(storage_internal)?
         }
         DecodeTier::Embedding => storage::decode_row_body_into(buf, offset, embedding_scratch)
             .map_err(storage_internal)?,
@@ -1366,6 +1415,20 @@ fn execute_scan_with_budget_inner(
     }
     let keyset_after: Option<&KeysetPosition> =
         bound.keyset.as_ref().and_then(|k| k.after.as_ref());
+    // Issue #3261: `SELECT DISTINCT ON` の意味を運べない併用は走査の前に拒否する（束縛段・構文段で
+    // 拒否済みの多層防御。黙って重複排除を落とした結果を返さない）。
+    if let Some(k) = bound.distinct_on {
+        if !bound.windows().is_empty() || bound.ties_row_cap.is_some() || keyset_active {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "SELECT DISTINCT ON cannot be combined with window functions, WITH TIES or keyset paging",
+            ));
+        }
+        if k == 0 || bound.order_by.len() < k {
+            return Err(SqlSurfaceError::Internal {
+                detail: "DISTINCT ON prefix exceeds the ORDER BY keys".to_string(),
+            });
+        }
+    }
     // SQL-30・TASK-214（Issue #930）: ウィンドウ項目を持つ広域取得は専用の実行器
     // （`sql::window::execute_window_scan`）へ委譲する。本体側の変更をこの
     // dispatch 1 行に留めることで、`sql::scan` を編集する他 PR との衝突を
@@ -1638,7 +1701,7 @@ fn execute_scan_with_budget_inner(
                 }
             }
         }
-    } else if leading_key_is_id(bound) && !ctx.allows_public() {
+    } else if leading_key_is_id(bound) && !ctx.allows_public() && bound.distinct_on.is_none() {
         // 経路 (A): 先頭キーが `id` かつ `ctx` が他テナントの `Public` 行を
         // 可視としない場合、可視行は自テナントのパーティションに閉じる
         // （`id` はテナント内で一意なため後続キーは無関係）。物理キーは
@@ -1826,8 +1889,17 @@ fn execute_scan_with_budget_inner(
         let scan_passes: usize = if bound.ties_row_cap.is_some() { 2 } else { 1 };
         let mut tie_worst: Option<HeapEntry> = None;
         let mut ties_extra: Vec<HeapEntry> = Vec::new();
-        let stop_threshold = early_stop_threshold(bound.result_cap, bound.offset)?;
+        // DISTINCT ON の上限は入力行数ではなくグループ数（`heap_capacity`。暗黙上限では `cap + 1 + offset`）
+        // に掛かるため、可視一致行数による早期中断は使わない。
+        let distinct_k = bound.distinct_on;
+        let stop_threshold = if distinct_k.is_some() {
+            None
+        } else {
+            early_stop_threshold(bound.result_cap, bound.offset)?
+        };
         let mut matched: usize = 0;
+        // DISTINCT ON のグループ代表行（全順序で昇順に整列。グループ間の順序は前置キーだけで決まる）。
+        let mut groups: Vec<HeapEntry> = Vec::new();
 
         for scan_pass in 0..scan_passes {
             if scan_pass == 1 {
@@ -1965,7 +2037,44 @@ fn execute_scan_with_budget_inner(
                                 return Ok(None);
                             }
                         }
-                        if let Some(w) = &tie_worst {
+                        if let Some(k) = distinct_k {
+                            // Issue #3261: グループ位置は借用のまま二分探索で引く（採用が決まるまで複製しない）。
+                            let located = groups.binary_search_by(|g| {
+                                compare_prefix_ref_to_entry(&bound.order_by, k, &refs, g).reverse()
+                            });
+                            match located {
+                                Ok(idx) => {
+                                    let Some(rep) = groups.get(idx) else {
+                                        return Err(SqlSurfaceError::Internal {
+                                            detail: "distinct group index out of range".to_string(),
+                                        });
+                                    };
+                                    // 同一グループは、既存の代表行より前（全順序）のときだけ置き換える。
+                                    if compare_candidate_ref_to_entry(
+                                        &bound.order_by,
+                                        &refs,
+                                        id,
+                                        key_tenant,
+                                        rep,
+                                        false,
+                                    ) != Ordering::Less
+                                    {
+                                        return Ok(None);
+                                    }
+                                }
+                                Err(pos) => {
+                                    // 満杯で最悪グループより後ろなら捨てる（追い出し済みのグループの行が
+                                    // 後から来ても同じ理由で復帰しない）。
+                                    if groups.len() >= heap_capacity && pos >= groups.len() {
+                                        return Ok(None);
+                                    }
+                                }
+                            }
+                            // 置き換え・追い出しの完了まで新旧が同時に存在するため、現在の計上額全体に
+                            // 新候補を足して確保前に照合する（「計上額 ≥ 同時保持量」）。
+                            let predicted = predicted_heap_entry_bytes(&refs, key_tenant.len());
+                            try_accumulate_budget(heap_budget, predicted, max_result_bytes)?;
+                        } else if let Some(w) = &tie_worst {
                             // 2 回目の走査: `w` と同じ `(id, tenant_id)` を渡すと比較は `ORDER BY`
                             // キー部分だけになり、`Equal` が「キーが等しい」を意味する。
                             if compare_candidate_ref_to_entry(
@@ -2044,6 +2153,54 @@ fn execute_scan_with_budget_inner(
                     spec: Rc::clone(&spec),
                     keyset: keyset_active,
                 };
+                if let Some(k) = distinct_k {
+                    // 位置は所有キー同士で再計算する（判定時と同じスナップショット・同じ `groups`）。
+                    let located = groups.binary_search_by(|g| {
+                        compare_prefix_entries(&bound.order_by, k, g, &candidate)
+                    });
+                    let bytes = heap_entry_bytes(&candidate);
+                    heap_budget = try_accumulate_budget(heap_budget, bytes, max_result_bytes)?;
+                    match located {
+                        Ok(idx) => {
+                            let Some(slot) = groups.get_mut(idx) else {
+                                return Err(SqlSurfaceError::Internal {
+                                    detail: "distinct group index out of range".to_string(),
+                                });
+                            };
+                            let old = std::mem::replace(slot, candidate);
+                            let old_bytes = heap_entry_bytes(&old);
+                            drop(old);
+                            heap_budget = heap_budget.checked_sub(old_bytes).ok_or_else(|| {
+                                SqlSurfaceError::Internal {
+                                    detail: "scan result byte budget underflow while replacing a distinct group representative"
+                                        .to_string(),
+                                }
+                            })?;
+                        }
+                        Err(pos) => {
+                            groups
+                                .try_reserve(1)
+                                .map_err(|e| SqlSurfaceError::Internal {
+                                    detail: format!("failed to reserve distinct groups: {e}"),
+                                })?;
+                            groups.insert(pos, candidate);
+                            if groups.len() > heap_capacity {
+                                if let Some(popped) = groups.pop() {
+                                    let popped_bytes = heap_entry_bytes(&popped);
+                                    drop(popped);
+                                    heap_budget =
+                                        heap_budget.checked_sub(popped_bytes).ok_or_else(|| {
+                                            SqlSurfaceError::Internal {
+                                                detail: "scan result byte budget underflow while evicting the worst distinct group"
+                                                    .to_string(),
+                                            }
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if tie_worst.is_some() {
                     // 同値行も結果行数の上限に数える。超過は結果を打ち切らず `54000`。
                     // 数えるのは可視行だけなので、他テナントの行の有無は成否に影響しない。
@@ -2159,7 +2316,11 @@ fn execute_scan_with_budget_inner(
         // `saturating_sub` ではなく `checked_sub` を使い、対応が崩れていれば
         // fail-closed に `Internal` へ落とす（過小申告のまま静かに処理を
         // 続けない）。
-        let mut sorted = heap.into_sorted_vec();
+        let mut sorted = if distinct_k.is_some() {
+            std::mem::take(&mut groups)
+        } else {
+            heap.into_sorted_vec()
+        };
         // Issue #2093: `limit + 1` 件目（次ページの存在の印）は投影せず、保持分の予算だけ戻す。
         let mut keyset_has_more = false;
         if keyset_active && sorted.len() > bound.limit {
@@ -2395,6 +2556,141 @@ mod tests {
         crate::storage::bump_generation_and_commit(write_txn).expect("commit");
     }
 
+    /// 検証専用: 生の行バッファを直接 insert する（本体破損・ヘッダ破損の再現用）。
+    fn write_raw_row(storage: &Storage, tenant_key: &str, id: u64, buf: &[u8]) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name("docs"),
+                ))
+                .expect("open row table");
+            table.insert((tenant_key, id), buf).expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    fn encoded(tenant: &str, visibility: Visibility, embedding: &[f32]) -> Vec<u8> {
+        crate::storage::encode_row(&RowInput {
+            tenant_id: tenant,
+            visibility,
+            embedding,
+            metadata: &[],
+        })
+        .expect("encode row")
+    }
+
+    fn id_only_scan(limit: usize) -> BoundScan {
+        let mut b = bound_star_scan(limit);
+        b.projection = vec![ProjectedColumn::Id];
+        b
+    }
+
+    /// Issue #3223: Fast・Embedding 両段で、可視行の本体破損は Err、不可視行の
+    /// 本体破損はスキップ、ヘッダ破損・キー/ヘッダ tenant 不一致は Err（fail-closed・TABLE-12）。
+    #[test]
+    fn scan_fail_closed_contract_after_single_header_decode() {
+        for tier_scan in [id_only_scan(10), bound_star_scan(10)] {
+            let path = unique_db_path("scan-hdr-once-corrupt");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            let schema = nullable_vector_schema();
+            storage.create_table(&schema).expect("create table");
+            let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+            // 不可視（他テナント Private）行は本体が破損していてもスキップ。
+            let mut bad_body = encoded("tenant-b", Visibility::Private, &[1.0, 2.0, 3.0]);
+            bad_body.pop();
+            write_raw_row(&storage, "tenant-b", 1, &bad_body);
+            write_row_direct(&storage, "docs", "tenant-a", 2, &[1.0, 2.0, 3.0]);
+            {
+                let read_txn = storage.db().begin_read().expect("begin_read");
+                let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan).expect("scan");
+                assert_eq!(r.rows.iter().map(|x| x.id).collect::<Vec<_>>(), vec![2]);
+            }
+
+            // 可視行の本体破損は Err。
+            let mut bad_visible = encoded("tenant-a", Visibility::Public, &[1.0, 2.0, 3.0]);
+            bad_visible.pop();
+            write_raw_row(&storage, "tenant-a", 3, &bad_visible);
+            {
+                let read_txn = storage.db().begin_read().expect("begin_read");
+                let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan);
+                assert!(matches!(r, Err(SqlSurfaceError::Internal { .. })));
+            }
+            write_raw_row(
+                &storage,
+                "tenant-a",
+                3,
+                &encoded("tenant-a", Visibility::Public, &[]),
+            );
+
+            // ヘッダ破損（未知 version）は Err。
+            let mut bad_header = encoded("tenant-a", Visibility::Public, &[1.0, 2.0, 3.0]);
+            bad_header[0] = 0xFF;
+            write_raw_row(&storage, "tenant-a", 4, &bad_header);
+            {
+                let read_txn = storage.db().begin_read().expect("begin_read");
+                let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan);
+                assert!(matches!(r, Err(SqlSurfaceError::Internal { .. })));
+            }
+            write_raw_row(
+                &storage,
+                "tenant-a",
+                4,
+                &encoded("tenant-a", Visibility::Public, &[]),
+            );
+
+            // キー側 tenant とヘッダ側 tenant の不一致（TABLE-12）は Err。
+            write_raw_row(
+                &storage,
+                "tenant-a",
+                5,
+                &encoded("tenant-a2", Visibility::Public, &[1.0, 2.0, 3.0]),
+            );
+            let read_txn = storage.db().begin_read().expect("begin_read");
+            let r = execute_scan(&read_txn, &ctx, &schema, &tier_scan);
+            assert!(matches!(r, Err(SqlSurfaceError::Internal { .. })));
+        }
+    }
+
+    /// Issue #3223 の回帰ガード: 走査した行ごとにヘッダデコードは 1 回、本体の
+    /// 構造デコードは可視行のみ（`Fast` 段）。
+    #[test]
+    fn scan_decodes_header_once_per_row() {
+        let path = unique_db_path("scan-hdr-once-count");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        for id in 1..=5u64 {
+            write_row_direct(&storage, "docs", "tenant-a", id, &[1.0, 2.0, 3.0]);
+        }
+        for id in 6..=8u64 {
+            write_row_direct_with_visibility(
+                &storage,
+                "docs",
+                "tenant-b",
+                id,
+                &[1.0, 2.0, 3.0],
+                Visibility::Private,
+            );
+        }
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let before = crate::storage::decode_probe::snapshot();
+        let r = execute_scan(&read_txn, &ctx, &schema, &id_only_scan(100)).expect("scan");
+        let delta = crate::storage::decode_probe::snapshot().since(before);
+        assert_eq!(r.rows.len(), 5);
+        assert_eq!(delta.dim_and_metadata, 5);
+        assert!(delta.header >= 5, "scan must decode headers");
+        assert!(
+            delta.header <= 8,
+            "header must be decoded at most once per scanned row, got {}",
+            delta.header
+        );
+    }
+
     fn bound_star_scan(limit: usize) -> BoundScan {
         BoundScan {
             result_cap: None,
@@ -2417,6 +2713,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         }
     }
 
@@ -2567,6 +2864,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         // パス 1 のヒープ候補 1 件分の内訳（[`heap_entry_keys_bytes`]・
@@ -2932,6 +3230,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         let err = execute_scan_with_budget(&read_txn, &ctx, &schema, &bound, 4096)
@@ -3015,6 +3314,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         // 巨大なキーを複製すれば単独でも超過するが、上位候補にならないため
@@ -3099,6 +3399,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         // 十分大きい既定予算では、最終的に id=2（"a"）だけが残る。
@@ -3206,6 +3507,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         // パス 1 終了時点のヒープ候補 7 件分（`heap_entry_bytes` と同じ計算式。
@@ -3278,6 +3580,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         }
     }
 
@@ -3350,6 +3653,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3430,6 +3734,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3504,6 +3809,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3565,6 +3871,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -3738,6 +4045,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::DimAndScalar);
@@ -3762,6 +4070,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
         let (tier, mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Fast);
@@ -3792,6 +4101,7 @@ mod tests {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
         };
         let (tier, _mask) = decode_tier_for(&schema, &bound);
         assert_eq!(tier, DecodeTier::Embedding);

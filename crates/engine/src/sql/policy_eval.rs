@@ -37,6 +37,9 @@ pub(crate) enum PolicyCheckKind {
     ConflictUpdateUsing,
     /// `ON CONFLICT DO UPDATE` の既存行に掛ける SELECT 側の `USING`。
     ConflictSelectUsing,
+    /// `MERGE` が `DELETE` を選んだ既存行に掛ける DELETE 側の `USING`（Issue #3355。違反は行を黙って
+    /// 飛ばさず文全体を `42501` で拒否する。UPDATE 側は [`Self::ConflictUpdateUsing`] を共用する）。
+    ExistingDeleteUsing,
 }
 
 impl PolicyCheckKind {
@@ -49,6 +52,9 @@ impl PolicyCheckKind {
             Self::ConflictSelectUsing => {
                 matches!(command, PolicyCommand::All | PolicyCommand::Select)
             }
+            Self::ExistingDeleteUsing => {
+                matches!(command, PolicyCommand::All | PolicyCommand::Delete)
+            }
         }
     }
 
@@ -58,12 +64,17 @@ impl PolicyCheckKind {
             Self::InsertCheck | Self::UpdateCheck => {
                 def.check_sql.as_deref().or(def.using_sql.as_deref())
             }
-            Self::ConflictUpdateUsing | Self::ConflictSelectUsing => def.using_sql.as_deref(),
+            Self::ConflictUpdateUsing | Self::ConflictSelectUsing | Self::ExistingDeleteUsing => {
+                def.using_sql.as_deref()
+            }
         }
     }
 
     fn is_using_expression(self) -> bool {
-        matches!(self, Self::ConflictUpdateUsing | Self::ConflictSelectUsing)
+        matches!(
+            self,
+            Self::ConflictUpdateUsing | Self::ConflictSelectUsing | Self::ExistingDeleteUsing
+        )
     }
 }
 

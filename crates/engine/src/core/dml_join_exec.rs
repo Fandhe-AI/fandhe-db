@@ -7,10 +7,11 @@
 //! 結合・一意化・上限の本体は `sql::join::dml`、書き込み・制約検査・世代 bump は `tenant` が担い、
 //! 本モジュールはゲート（`WriteTarget`・台帳・未対応形）と結果・エラーの写像だけを持つ。
 //!
-//! 結線状況（分岐 B）: Issue #1754（構文・束縛）が未マージのため SQL 文字列からの dispatch は
-//! まだ無く、構文段は従来どおり FROM／USING を拒否する（挙動不変）。#1754 のマージ後に `core.rs` の
-//! UPDATE／DELETE 分岐から本入口を呼ぶ（autocommit は `execute_subquery_dml_autocommit` と同じ
-//! 文単位の暗黙トランザクションに流す）。それまで本モジュールは単体テストからのみ到達する。
+//! 結線状況: SQL 入口（`core/dml_from_exec.rs`。Issue #3202）が autocommit の暗黙 Tx・明示 Tx の両方から本入口を
+//! 呼び、台帳（`operation_id`）も Issue #3203 で SQL 経路から渡される。
+//! `RETURNING`（Issue #3204）は、計画（[`JoinedDmlPlan::returning`]）が `Some` のとき本入口が
+//! probe の走査結果と一致記録から収集コールバックを組み立てて書き込み経路へ渡し、返却行を
+//! [`JoinedDmlOutcome::returning_rows`] で返す。
 //!
 //! テナント境界（P0）: 対象側は既存の候補列挙（テナントのキー範囲に閉じた走査・所有かつ可視）だけ、
 //! FROM／USING 側は書き込むセッションの `PolicyContext`（RLS 暗黙適用）で走査する。エラー文言に
@@ -26,14 +27,13 @@
 //! 受け取り、FROM／USING 側の走査より**前**に台帳を事前照合する（再送は結果・上限・データ変化に
 //! 左右されず `23505`、別文への `operation_id` 再利用は `22023`）。確定記録は書き込み本体が同じ txn で行う。
 
-// 分岐 B では SQL 経路からの呼び出しが無い。#1754 の結線時に撤去する。
-#![allow(dead_code)]
-
 use super::EngineCore;
 use crate::policy::PolicyContext;
 use crate::recovery::content_hash::ContentHash;
 use crate::recovery::required_op_id::OperationId;
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::dml_from_returning::{joined_returning_collector, FromRowRef};
+use crate::sql::exec::ResultRow;
 use crate::sql::join::dml::{JoinedDmlPlan, JoinedProbe};
 use crate::sql::join::JoinLimits;
 use crate::sql::mode::SessionState;
@@ -45,14 +45,28 @@ fn not_supported(detail: &str) -> SqlSurfaceError {
     }
 }
 
-/// 結合形 DML の実行結果。`matches` は一致した対象行 id と採った source の走査位置
-/// （Issue #1756 が FROM 側列参照の RETURNING で使う内部値）。
+/// 結合形 DML の実行結果。`matches` は一致した対象行 id と採った source の走査位置。
+/// `returning_rows` は計画が `RETURNING` を持つときの返却行（持たなければ `None`）。
 pub(crate) struct JoinedDmlOutcome {
     pub(crate) rows_affected: u64,
+    // SQL 経路の RETURNING は `JoinedProbe` の共有ハンドルから直接読むため、本フィールドを読むのは
+    // 単体テスト（`dml_join_exec_tests`）だけ。本番ビルドへ死んだ値を持ち込まないよう `cfg(test)` に限る。
+    #[cfg(test)]
     pub(crate) matches: Vec<(u64, u32)>,
+    pub(crate) returning_rows: Option<Vec<ResultRow>>,
 }
 
 impl EngineCore {
+    /// 結合形 DML の結合上限（起動時設定）。実行と `EXPLAIN`（Issue #3293）が同じ値で走査前検証を行う。
+    pub(super) fn joined_dml_limits(&self) -> JoinLimits {
+        JoinLimits {
+            max_input_rows: self.join_limits.max_input_rows(),
+            max_output_rows: self.join_limits.max_output_rows(),
+            max_relations: self.join_limits.max_relations(),
+            ..JoinLimits::default()
+        }
+    }
+
     /// 結合形 DML を実行する。起動時設定の上限（結合・走査・影響行数）を使う。`content_hash` は
     /// 構文段で算出した正規化文ハッシュ（台帳の照合・記録に使う）。
     #[allow(clippy::too_many_arguments)]
@@ -64,14 +78,8 @@ impl EngineCore {
         plan: &JoinedDmlPlan,
         operation_id: Option<&OperationId>,
         content_hash: &ContentHash,
-        project: Option<&mut ReturningProjectFn<'_>>,
     ) -> Result<JoinedDmlOutcome, SqlSurfaceError> {
-        let limits = JoinLimits {
-            max_input_rows: self.join_limits.max_input_rows(),
-            max_output_rows: self.join_limits.max_output_rows(),
-            max_relations: self.join_limits.max_relations(),
-            ..JoinLimits::default()
-        };
+        let limits = self.joined_dml_limits();
         self.execute_joined_dml_with_limits(
             target,
             ctx,
@@ -79,7 +87,6 @@ impl EngineCore {
             plan,
             operation_id,
             content_hash,
-            project,
             &limits,
             self.dml_limits.max_affected_rows,
             self.scan_limits.max_scanned_rows(),
@@ -97,7 +104,6 @@ impl EngineCore {
         plan: &JoinedDmlPlan,
         operation_id: Option<&OperationId>,
         content_hash: &ContentHash,
-        project: Option<&mut ReturningProjectFn<'_>>,
         limits: &JoinLimits,
         max_affected_rows: Option<std::num::NonZeroUsize>,
         max_scanned_rows: usize,
@@ -108,11 +114,6 @@ impl EngineCore {
                 "UPDATE ... FROM / DELETE ... USING is not supported for this statement",
             ));
         };
-        if plan.returning_references_source {
-            return Err(not_supported(
-                "RETURNING with a column of the FROM / USING table is not supported yet",
-            ));
-        }
         let ledger_write = self
             .ledger_mode
             .resolve(operation_id)
@@ -135,21 +136,33 @@ impl EngineCore {
             crate::sql::exec::map_write_error(crate::tenant::TenantWriteError::from(e), op)
         })?;
 
-        // source のスキーマが束縛後に変わっていないこと（対象表は書き込み側が照合する）。
-        let live_source =
-            crate::catalog::require_table_schema_write_any_identity(write_txn, &plan.source.table)
-                .map_err(|e| match e {
-                    crate::catalog::CatalogError::TableNotFound(name) => {
-                        SqlSurfaceError::UndefinedTable { name }
-                    }
-                    _ => SqlSurfaceError::Internal {
-                        detail: "failed to load table schema".to_string(),
-                    },
-                })?;
-        if live_source != plan.source.schema {
-            return Err(SqlSurfaceError::invalid_input(
-                "table schema changed after the statement was bound",
-            ));
+        // source のスキーマが束縛後に変わっていないこと（対象表は書き込み側が照合する）。畳み込み
+        // source（Issue #3294）は JOIN の全実表を照合する。畳み込みスキーマは合成で実表ではない。
+        let single_source;
+        let source_tables: &[(String, crate::catalog::TableSchema)] = match &plan.source.fold {
+            Some(fold) => &fold.real,
+            None => {
+                single_source = [(plan.source.table.clone(), plan.source.schema.clone())];
+                &single_source
+            }
+        };
+        for (table, bound_schema) in source_tables {
+            let live_source = crate::catalog::require_table_schema_write_any_identity(
+                write_txn, table,
+            )
+            .map_err(|e| match e {
+                crate::catalog::CatalogError::TableNotFound(name) => {
+                    SqlSurfaceError::UndefinedTable { name }
+                }
+                _ => SqlSurfaceError::Internal {
+                    detail: "failed to load table schema".to_string(),
+                },
+            })?;
+            if &live_source != bound_schema {
+                return Err(SqlSurfaceError::invalid_input(
+                    "table schema changed after the statement was bound",
+                ));
+            }
         }
 
         // FROM／USING 側を `ctx`（RLS 暗黙適用）で走査してハッシュ表にする。以降の書き込み側の
@@ -161,6 +174,40 @@ impl EngineCore {
         let target = WriteTarget::InTxn(write_txn);
         let needs_embedding_extra = probe.needs_embedding();
 
+        // RETURNING の収集（Issue #3204）。述語クロージャが probe を可変借用する一方、収集は
+        // 走査結果と一致記録の共有ハンドルだけを読む（書き込み経路は「候補列挙 → 適用」の順で、
+        // 適用段に入ってから収集を呼ぶため借用は重ならない。重なっても `XX000` で fail-closed）。
+        let index_handle = probe.index_handle();
+        let matches_handle = probe.matches_handle();
+        let index_ref: &crate::sql::join::dml::SourceIndex = &index_handle;
+        // 畳み込み source の行は 1 本のセル列で、FROM／USING 側の各 relation が同じセル位置の
+        // 規則（畳み込みスキーマの走査投影）で読む。relation ごとに同じ行を指す参照を並べる。
+        let source_relations = plan.source_relation_count();
+        let lookup = |id: u64| -> Option<Vec<FromRowRef<'_>>> {
+            let pos = *matches_handle.try_borrow().ok()?.get(&id)?;
+            let row = index_ref.rows.get(usize::try_from(pos).ok()?)?;
+            Some(vec![FromRowRef { cells: &row.cells }; source_relations])
+        };
+        let mut returning_rows: Vec<ResultRow> = Vec::new();
+        let mut returning_budget = 0usize;
+        let mut collector = plan.returning.as_ref().map(|bound| {
+            joined_returning_collector(
+                ctx,
+                bound,
+                schema,
+                // 採番方式の表は行 id を返さない（単一表の `RETURNING` と同じ規則）。
+                schema.is_allocated(),
+                &lookup,
+                &mut returning_budget,
+                &mut returning_rows,
+            )
+        });
+        let project: Option<&mut ReturningProjectFn<'_>> =
+            collector.as_mut().map(|c| c as &mut ReturningProjectFn<'_>);
+
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間（`UPDATE ... FROM`）。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(&plan.target.table);
         let result = crate::sql::exec::run_where_predicate(
             schema,
             &plan.target.metadata_filters,
@@ -226,11 +273,14 @@ impl EngineCore {
                             predicate,
                             project,
                             true,
+                            // 結合形の `RETURNING` はトリガを発火しない（Issue #3192 の対象外。0A000 のまま）。
+                            None,
                         ),
                     }
                 }
             },
         );
+        drop(collector);
         let rows_affected = match result {
             Ok(PredicateDmlOutcome::Applied { rows_affected }) => rows_affected as u64,
             Ok(PredicateDmlOutcome::LimitExceeded { count }) => {
@@ -247,7 +297,9 @@ impl EngineCore {
         };
         Ok(JoinedDmlOutcome {
             rows_affected,
-            matches: probe.matches().to_vec(),
+            #[cfg(test)]
+            matches: probe.matches_sorted()?,
+            returning_rows: plan.returning.is_some().then_some(returning_rows),
         })
     }
 }

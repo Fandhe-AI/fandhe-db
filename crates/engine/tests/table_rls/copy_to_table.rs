@@ -160,8 +160,8 @@ fn invalid_forms_are_rejected() {
     assert_eq!(code("COPY docs () TO STDOUT"), "42601");
     assert_eq!(code("COPY docs TO '/tmp/x'"), "42601");
     assert_eq!(code("COPY docs TO STDOUT USING OPERATION_ID 'x'"), "42601");
-    // FROM STDIN は列リスト必須のまま（回帰）。
-    assert_eq!(code("COPY docs FROM STDIN"), "42601");
+    // FROM STDIN は空の括弧だけが拒否のまま（列リスト省略は Issue #3252 で受理）。
+    assert_eq!(code("COPY docs () FROM STDIN"), "42601");
 }
 
 /// ビューは 42809。

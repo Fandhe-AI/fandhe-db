@@ -18,7 +18,11 @@
 //!   場合）は `(tenant, schema)` の 1 回の照会で、無ければ `3F000`（他テナントの SCHEMA も
 //!   同じ応答）、あれば内部キー `#<schema_id>.<name>`（ADR D2。[`RelationKey`]）の
 //!   `Token::Ident` へ置き換える（Issue #1717。表・ビュー・索引・SEQUENCE の名前位置）。
-//!   MATERIALIZED VIEW の SCHEMA 配置は未対応で `0A000`
+//!   MATERIALIZED VIEW の名前位置も同じ（Issue #3287。作成・更新・削除・参照）。
+//!   `ALTER MATERIALIZED VIEW .. SET SCHEMA` だけは対象外で、実行腕が `0A000` で拒否する
+//! - ENUM 型の名前（`CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の名前位置。Issue #3288）と、列型・キャスト・
+//!   `ALTER TABLE` の型名位置（`sql::type_name_position`。Issue #3289）も同じ規則（`public.` は裸の名前、
+//!   テナントの SCHEMA は内部キー）。関係位置（[`relation_positions`]）には足さない
 //!
 //! 内部キーを作れるのはこの解決器だけである（字句解析器は `#` を含む識別子を作らない。
 //! 保存済みビュー本文だけは `lexer::tokenize_stored_view_body` が引用形で受理する）。
@@ -36,15 +40,6 @@ use crate::sql::lexer::{Keyword, Token};
 /// の ctx を持つ入口だけが `Storage::schema_id` を包んで渡す（テナントは ctx から。SQL 文からは
 /// 変えられない）。
 pub(crate) type SchemaResolver<'a> = &'a dyn Fn(&str) -> Result<Option<u64>, SqlSurfaceError>;
-
-/// 名前位置の対象オブジェクト種別（置き換え後の可否判定に使う）。
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ObjKind {
-    /// 表・ビュー・索引・SEQUENCE（SCHEMA 配下に置ける）。
-    Plain,
-    /// MATERIALIZED VIEW（SCHEMA 配下への配置は未対応。`0A000`）。
-    Matview,
-}
 
 /// [`rewrite_relation_names`] の結果。
 #[derive(Debug, Default)]
@@ -99,8 +94,6 @@ pub(crate) struct RelPos {
     pub index: usize,
     /// 作成対象名（`CREATE TABLE`／`CREATE [OR REPLACE] VIEW`／`CREATE SEQUENCE` の名前）の位置か。
     pub create_name: bool,
-    /// MATERIALIZED VIEW の名前位置か（SCHEMA 配下への配置は未対応で `0A000`。Issue #1717）。
-    pub matview: bool,
 }
 
 /// `tokens[i]` が `DELETE FROM <表> [[AS] <別名>] USING <表の並び>` の `USING`（表参照リストを導く語）か。
@@ -109,8 +102,11 @@ pub(crate) struct RelPos {
 /// ないため、WHERE 内の列名 `using` を USING 句と誤判定しないよう位置で限定する
 /// （`allowlist::looks_like_delete_using` と同じ規則。こちらは修飾表名も許す）。
 fn delete_using_opener(tokens: &[Token], i: usize) -> bool {
-    if !ident_is(tokens.first(), "DELETE")
-        || !matches!(tokens.get(1), Some(Token::Keyword(Keyword::From)))
+    // `MERGE INTO <表> [[AS] <別名>] USING <表>`（SQL-79・Issue #3351）の元も同じ位置規則で表参照位置にする。
+    let head_ok = (ident_is(tokens.first(), "DELETE")
+        && matches!(tokens.get(1), Some(Token::Keyword(Keyword::From))))
+        || (ident_is(tokens.first(), "MERGE") && ident_is(tokens.get(1), "INTO"));
+    if !head_ok
         || !matches!(
             tokens.get(2),
             Some(Token::Ident(_) | Token::QualifiedIdent { .. })
@@ -147,14 +143,13 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
     let head_drop = ident_is(tokens.first(), "DROP");
     // 文頭付近（先頭 6 トークン）に現れる最初のオブジェクト種別語（`CREATE UNIQUE INDEX`・
     // `CREATE OR REPLACE VIEW`・`DROP SEQUENCE` 等）。`MATERIALIZED VIEW` は種別が VIEW になるため
-    // `head_matview` で区別する。
+    // 名前位置の判定では区別しない（MATERIALIZED VIEW も表・ビューと同じ内部キーへ置換する）。
     let head6 = tokens.get(..6).unwrap_or(tokens);
     let ddl_obj: Option<&'static str> = head6.iter().find_map(|t| {
         ["TABLE", "VIEW", "INDEX", "SEQUENCE"]
             .into_iter()
             .find(|k| ident_is(Some(t), k))
     });
-    let head_matview = head6.iter().any(|t| ident_is(Some(t), "MATERIALIZED"));
     let obj_ddl_head = ["CREATE", "DROP", "ALTER", "REFRESH"]
         .iter()
         .any(|k| ident_is(tokens.first(), k));
@@ -210,7 +205,6 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
         }
         let mut relation_pos = false;
         let mut is_create_name = false;
-        let mut kind = ObjKind::Plain;
         match cur {
             Token::Punct('(') => {
                 if let Some(l) = levels.last_mut() {
@@ -353,9 +347,6 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                     } else if is("VIEW") {
                         // `CREATE [OR REPLACE] VIEW`・`DROP VIEW`・`ALTER VIEW`・
                         // `{CREATE|DROP|ALTER|REFRESH} MATERIALIZED VIEW` の名前位置。
-                        if head_matview {
-                            kind = ObjKind::Matview;
-                        }
                         is_create_name = head_create;
                         obj_ddl_head && ddl_obj == Some("VIEW") && i <= 5
                     } else if is("SEQUENCE") {
@@ -366,12 +357,14 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                         // 構文エラー。索引は対象表の SCHEMA に置かれる）。
                         head_drop && ddl_obj == Some("INDEX") && i <= 2
                     } else if is("CONCURRENTLY") {
-                        head_drop && ddl_obj == Some("INDEX") && i <= 3
+                        // `DROP INDEX CONCURRENTLY <名>` と `REFRESH MATERIALIZED VIEW CONCURRENTLY <名>`
+                        // （Issue #3287）の名前位置。
+                        (head_drop && ddl_obj == Some("INDEX") && i <= 3)
+                            || (ident_is(tokens.first(), "REFRESH")
+                                && ddl_obj == Some("VIEW")
+                                && i <= 4)
                     } else if is("EXISTS") {
                         let if_prefixed = ident_is(prev2, "IF") || ident_is(prev2, "NOT");
-                        if if_prefixed && head_matview && ddl_obj == Some("VIEW") {
-                            kind = ObjKind::Matview;
-                        }
                         let ok = if_prefixed
                             && match ddl_obj {
                                 Some("TABLE") => table_head,
@@ -399,7 +392,8 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                                 && i == 1
                                 && !(ident_is(Some(cur), "TABLE")
                                     && tokens.get(i.saturating_add(1)).is_some_and(is_ident_like)))
-                            || is("UPDATE")
+                            // MERGE の `WHEN MATCHED THEN UPDATE SET` の `SET` は構文語（表参照ではない）。
+                            || (is("UPDATE") && !ident_is(tokens.first(), "MERGE"))
                             || is("ONLY")
                             || is("REFERENCES")
                     }
@@ -491,7 +485,6 @@ pub(crate) fn relation_positions(tokens: &[Token]) -> RelationWalk {
                 out.positions.push(RelPos {
                     index: i,
                     create_name: is_create_name,
-                    matview: kind == ObjKind::Matview,
                 });
             }
             _ => {}
@@ -508,7 +501,7 @@ pub(crate) struct RewriteInfo {
     /// 準備済み文が未修飾名の `search_path` ゲートから除外するために使う（置換は 1 対 1 なので位置は
     /// 保たれる。TABLE-27・Issue #1715）。
     pub positions: Vec<usize>,
-    /// `CREATE TABLE` の作成対象名が `public.` で明示修飾されていたか。
+    /// 作成対象名（`CREATE TABLE`・`VIEW`・`SEQUENCE`・`TYPE`）が `public.` で明示修飾されていたか。
     pub create_public: bool,
 }
 
@@ -531,12 +524,18 @@ pub(crate) fn rewrite_relation_names_full(
     tokens: &mut [Token],
     resolver: Option<SchemaResolver<'_>>,
 ) -> Result<RewriteInfo, SqlSurfaceError> {
-    rewrite_sequence_name_literals(tokens, resolver)?;
     let mut info = RewriteInfo {
         names: Vec::new(),
         positions: Vec::new(),
         create_public: false,
     };
+    // 要素つき `CREATE SCHEMA` は文全体を解決しない（Issue #3286。設計記録 D8）。要素の修飾名・未修飾名は
+    // 新しい SCHEMA の内部 ID が払い出された後に `core::schema_elements` が要素ごとに解決する。ここで
+    // 解決すると、まだ存在しない作成中の SCHEMA への修飾が `3F000` になる。
+    if crate::sql::allowlist::is_create_schema_statement(tokens) {
+        return Ok(info);
+    }
+    rewrite_sequence_name_literals(tokens, resolver)?;
     if !tokens
         .iter()
         .any(|t| matches!(t, Token::QualifiedIdent { .. }))
@@ -557,10 +556,12 @@ pub(crate) fn rewrite_relation_names_full(
     struct Target {
         index: usize,
         create_name: bool,
-        matview: bool,
         function_pos: bool,
         /// `DROP FUNCTION s.f` の関数名位置（存在しない SCHEMA は `3F000` で fail-closed にする）。
         drop_name: bool,
+        /// `CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の型名位置（Issue #3288）。型は relation と別の
+        /// 名前空間なので、`public.` の修飾は一時表との衝突検査（[`RewriteInfo::names`]）に含めない。
+        type_pos: bool,
     }
     let mut targets: Vec<Target> = walk
         .positions
@@ -568,18 +569,30 @@ pub(crate) fn rewrite_relation_names_full(
         .map(|p| Target {
             index: p.index,
             create_name: p.create_name,
-            matview: p.matview,
             function_pos: false,
             drop_name: false,
+            type_pos: false,
         })
         .collect();
     let mut public_drop_rewrites: Vec<(usize, String)> = Vec::new();
     let grant_function_range = grant_function_token_range(tokens);
+    // 列型・キャストの型名の位置（Issue #3289）。関係位置とは別の走査器で、K2 と同じ解決を共用する。
+    let type_walk = crate::sql::type_name_position::type_name_positions(tokens);
     for (i, t) in tokens.iter().enumerate() {
         let Token::QualifiedIdent { qualifier, .. } = t else {
             continue;
         };
         if walk.positions.iter().any(|p| p.index == i) {
+            continue;
+        }
+        if type_walk.iter().any(|p| p.index == i) {
+            targets.push(Target {
+                index: i,
+                create_name: false,
+                function_pos: false,
+                drop_name: false,
+                type_pos: true,
+            });
             continue;
         }
         // `DROP FUNCTION s.f`（#1920）は型の並びの括弧を省略できるため、先頭が `DROP FUNCTION` の文では
@@ -592,6 +605,27 @@ pub(crate) fn rewrite_relation_names_full(
             || grant_function_range
                 .as_ref()
                 .is_some_and(|r| r.contains(&i));
+        // 型名の位置（Issue #3288）。`CREATE TYPE <名>`（3 語目）・`DROP TYPE <名>`（3 語目）・
+        // `DROP TYPE IF EXISTS <名>`（5 語目）。列型・キャスト・`ALTER TABLE` の型名位置は上の
+        // `type_name_position` の走査結果で別に解決する（Issue #3289）。
+        // `public.` は裸の名前、不在・他テナントの SCHEMA は `3F000`、組み込み SCHEMA・`pg_temp` は `0A000`
+        // （[`resolve`] を関係名と共用する）。
+        let create_type_name =
+            i == 2 && ident_is(tokens.first(), "CREATE") && ident_is(tokens.get(1), "TYPE");
+        let drop_type_name = ident_is(tokens.first(), "DROP")
+            && ident_is(tokens.get(1), "TYPE")
+            && (i == 2
+                || (i == 4 && ident_is(tokens.get(2), "IF") && ident_is(tokens.get(3), "EXISTS")));
+        if create_type_name || drop_type_name {
+            targets.push(Target {
+                index: i,
+                create_name: create_type_name,
+                function_pos: false,
+                drop_name: false,
+                type_pos: true,
+            });
+            continue;
+        }
         // `DROP FUNCTION public.f` は `DROP TABLE public.t` と同様に裸の名前へ正規化する
         // （DROP は UDF カタログの削除だけで、組み込み関数へ化ける経路にならない）。
         if drop_function_name && qualifier.eq_ignore_ascii_case("public") {
@@ -624,9 +658,9 @@ pub(crate) fn rewrite_relation_names_full(
             targets.push(Target {
                 index: i,
                 create_name: false,
-                matview: false,
                 function_pos: true,
                 drop_name: strict_function_name,
+                type_pos: false,
             });
         } else {
             residual_column_qualifier = true;
@@ -645,23 +679,18 @@ pub(crate) fn rewrite_relation_names_full(
             continue;
         };
         let (qualifier, name) = (qualifier.clone(), name.clone());
-        let kind = if pos.matview {
-            ObjKind::Matview
-        } else {
-            ObjKind::Plain
-        };
         match resolve(
             &qualifier,
             &name,
             // 一時表の作成対象名だけが対象（`REFERENCES public.u` 等の参照側は許可する）。
             create_temp_table && pos.create_name,
-            kind,
             resolver,
         ) {
             Ok(Resolved::Public) => {
                 // 同名の CTE があると、置換後の裸の名前が CTE に解決され永続表を指さなくなる。
                 // `public.` が永続側を指す契約を守れないため拒否する（fail-closed）。
-                if cte_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                // 型名の位置は relation と別の名前空間なので CTE 名とは衝突しない（検査しない）。
+                if !pos.type_pos && cte_names.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
                     return Err(SqlSurfaceError::feature_not_supported(
                         "public-qualified relation conflicts with a CTE name",
                     ));
@@ -671,7 +700,9 @@ pub(crate) fn rewrite_relation_names_full(
                         "qualified relation name collides with a syntax word",
                     ));
                 }
-                info.names.push(name.clone());
+                if !pos.type_pos {
+                    info.names.push(name.clone());
+                }
                 info.positions.push(i);
                 info.create_public |= pos.create_name;
                 if let Some(slot) = tokens.get_mut(i) {
@@ -1068,7 +1099,6 @@ fn resolve(
     qualifier: &str,
     name: &str,
     create_temp: bool,
-    kind: ObjKind,
     resolver: Option<SchemaResolver<'_>>,
 ) -> Result<Resolved, SqlSurfaceError> {
     if qualifier.eq_ignore_ascii_case("public") {
@@ -1097,11 +1127,6 @@ fn resolve(
     let Some(schema_id) = schema_id else {
         return Err(SqlSurfaceError::invalid_schema_name(qualifier));
     };
-    if kind == ObjKind::Matview {
-        return Err(SqlSurfaceError::feature_not_supported(
-            "materialized views inside a schema are not supported",
-        ));
-    }
     Ok(Resolved::InSchema(
         RelationKey::InSchema {
             schema_id,
@@ -1163,6 +1188,18 @@ pub(crate) fn tokenize_resolved_with(
     marked: bool,
     resolver: Option<SchemaResolver<'_>>,
 ) -> Result<Vec<Token>, SqlSurfaceError> {
+    tokenize_resolved_with_pre(sql, marked, resolver, |_| Ok(()))
+}
+
+/// [`tokenize_resolved_with`] に、修飾名の解決（`public.t` の修飾除去・SCHEMA 修飾の内部キー化）の直前で
+/// 字句列へ掛ける処理 `pre` を加えた版。`COPY` が `search_path` による未修飾名の解決を、明示修飾
+/// （`public.t` 等。この時点では `QualifiedIdent` のまま）を再解決しない順序で行うために使う（Issue #3196）。
+pub(crate) fn tokenize_resolved_with_pre(
+    sql: &str,
+    marked: bool,
+    resolver: Option<SchemaResolver<'_>>,
+    pre: impl FnOnce(&mut [Token]) -> Result<(), SqlSurfaceError>,
+) -> Result<Vec<Token>, SqlSurfaceError> {
     let tokens = if marked {
         crate::sql::lexer::tokenize_marked(sql)?
     } else {
@@ -1170,6 +1207,7 @@ pub(crate) fn tokenize_resolved_with(
     };
     // 標準 SQL の行数制限句（`FETCH FIRST n ROWS ONLY` 等）を正規形へ書き換える（Issue #1793）。
     let mut tokens = crate::sql::fetch_clause::normalize_statement_tokens(tokens)?;
+    pre(&mut tokens)?;
     rewrite_relation_names(&mut tokens, resolver)?;
     Ok(tokens)
 }
@@ -1214,6 +1252,45 @@ mod tests {
         // `DELETE` で始まらない文の `USING`（`ALTER ... USING <式>`・JOIN の USING）は影響を受けない。
         let t = tokenize("ALTER TABLE t ALTER COLUMN c TYPE int USING c").expect("lex");
         assert_eq!(relation_positions(&t).positions.len(), 1);
+    }
+
+    /// SQL-79・Issue #3351: `MERGE INTO <対象> USING <元>` の対象と元が表参照位置になる（`THEN UPDATE SET` の
+    /// `SET` と `USING OPERATION_ID` は参照位置にしない）。
+    #[test]
+    fn merge_target_and_source_are_relation_positions() {
+        same(
+            "MERGE INTO public.a USING public.b ON a.id = b.id WHEN MATCHED THEN UPDATE SET x = b.x",
+            "MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET x = b.x",
+        );
+        same(
+            "MERGE INTO public.a AS t USING public.b s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "MERGE INTO a AS t USING b s ON t.id = s.id WHEN MATCHED THEN DELETE",
+        );
+        let t = tokenize(
+            "MERGE INTO a USING b ON a.id = b.id WHEN MATCHED THEN UPDATE SET x = 1 USING OPERATION_ID 'x'",
+        )
+        .expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 2);
+    }
+
+    /// Issue #3294: FROM／USING 内の `JOIN` の直後の表と、`ON` 式の後のカンマの直後の表も表参照位置になる
+    /// （`search_path` ゲートの素通りを防ぐ）。
+    #[test]
+    fn join_and_comma_after_on_in_dml_from_lists_are_relation_positions() {
+        same(
+            "DELETE FROM public.a USING public.b JOIN public.c ON b.id = c.id WHERE a.id = b.id",
+            "DELETE FROM a USING b JOIN c ON b.id = c.id WHERE a.id = b.id",
+        );
+        same(
+            "UPDATE public.a SET x = b.x FROM public.b LEFT JOIN public.c ON b.id = c.id, public.d \
+             WHERE a.id = b.id",
+            "UPDATE a SET x = b.x FROM b LEFT JOIN c ON b.id = c.id, d WHERE a.id = b.id",
+        );
+        let t = tokenize(
+            "DELETE FROM a USING b JOIN c ON b.id = c.id CROSS JOIN d USING OPERATION_ID 'x'",
+        )
+        .expect("lex");
+        assert_eq!(relation_positions(&t).positions.len(), 4);
     }
 
     #[test]
@@ -1424,6 +1501,113 @@ mod tests {
         );
     }
 
+    /// Issue #3288・#3289: `CREATE TYPE`・`DROP TYPE [IF EXISTS]` の型名と、列型・キャスト・`ALTER TABLE` の型名位置が
+    /// 解決される。`public.` は裸の名前、テナントの SCHEMA は内部キー、不在は `3F000`、組み込み SCHEMA・
+    /// `pg_temp` は `0A000`。型名位置ではない修飾名（列修飾・関数名）は解決しない。
+    #[test]
+    fn type_names_are_resolved_in_type_name_positions() {
+        same(
+            "CREATE TYPE public.mood AS ENUM ('a')",
+            "CREATE TYPE mood AS ENUM ('a')",
+        );
+        same("DROP TYPE PUBLIC.mood", "DROP TYPE mood");
+        same(
+            "DROP TYPE IF EXISTS public.mood",
+            "DROP TYPE IF EXISTS mood",
+        );
+        for (sql, idx) in [
+            ("CREATE TYPE s.mood AS ENUM ('a')", 2),
+            ("DROP TYPE s.mood", 2),
+            ("DROP TYPE IF EXISTS s.mood", 4),
+        ] {
+            let t = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                matches!(t.get(idx), Some(Token::Ident(k)) if k == "#12.mood"),
+                "{sql}: {t:?}"
+            );
+        }
+        // `public.` の作成名は明示修飾として報告され、一時表との衝突検査用の名前には含めない。
+        let mut t = tokenize("CREATE TYPE public.mood AS ENUM ('a')").expect("lex");
+        let info = rewrite_relation_names_full(&mut t, Some(&probe)).expect("ok");
+        assert!(info.create_public);
+        assert!(info.names.is_empty());
+        assert_eq!(info.positions, vec![2]);
+        let mut t = tokenize("CREATE TYPE s.mood AS ENUM ('a')").expect("lex");
+        let info = rewrite_relation_names_full(&mut t, Some(&probe)).expect("ok");
+        assert!(!info.create_public);
+        for (sql, want) in [
+            ("CREATE TYPE z.mood AS ENUM ('a')", "3F000"),
+            ("DROP TYPE z.mood", "3F000"),
+            ("DROP TYPE IF EXISTS z.mood", "3F000"),
+            ("CREATE TYPE pg_catalog.x AS ENUM ('a')", "0A000"),
+            ("DROP TYPE pg_temp.x", "0A000"),
+            ("DROP TYPE information_schema.x", "0A000"),
+        ] {
+            assert_eq!(
+                rewrite_in_tenant(sql).expect_err(sql).wire_code(),
+                want,
+                "{sql}"
+            );
+        }
+        // テナントが分からない入口は `3F000`。
+        let mut t = tokenize("DROP TYPE s.mood").expect("lex");
+        assert_eq!(
+            rewrite_relation_names(&mut t, None)
+                .expect_err("no tenant")
+                .wire_code(),
+            "3F000"
+        );
+        // 列型・キャスト・ALTER の型名位置（Issue #3289）。テナントの SCHEMA は内部キー、`public.` は裸の名前。
+        for sql in [
+            "CREATE TABLE t (m s.mood)",
+            "CREATE TABLE t (id BIGINT, m s.mood[])",
+            "SELECT 'a'::s.mood",
+            "SELECT CAST('a' AS s.mood)",
+            "ALTER TABLE t ADD COLUMN c s.mood",
+            "ALTER TABLE t ALTER COLUMN c TYPE s.mood",
+        ] {
+            let t = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                t.iter()
+                    .any(|x| matches!(x, Token::Ident(k) if k == "#12.mood")),
+                "{sql}: {t:?}"
+            );
+            assert!(
+                !t.iter().any(|x| matches!(x, Token::QualifiedIdent { .. })),
+                "{sql}"
+            );
+        }
+        same("SELECT 1::public.integer", "SELECT 1::integer");
+        same("CREATE TABLE t (m public.mood)", "CREATE TABLE t (m mood)");
+        // 型名位置の不在・組み込み SCHEMA は固定のエラー。
+        for (sql, want) in [
+            ("CREATE TABLE t (m z.mood)", "3F000"),
+            ("SELECT 'a'::z.mood", "3F000"),
+            ("SELECT 'a'::pg_catalog.int4", "0A000"),
+            ("ALTER TABLE t ADD COLUMN c pg_temp.mood", "0A000"),
+        ] {
+            assert_eq!(
+                rewrite_in_tenant(sql).expect_err(sql).wire_code(),
+                want,
+                "{sql}"
+            );
+        }
+        // `public.` の型名は一時表との衝突検査用の名前（relation の名前空間）に含めない。
+        let mut t = tokenize("CREATE TABLE t (m public.mood)").expect("lex");
+        let info = rewrite_relation_names_full(&mut t, Some(&probe)).expect("ok");
+        assert!(info.names.is_empty());
+        assert!(!info.create_public);
+        // 型名位置ではない修飾名（列修飾・関数名）は解決しない（従来どおり構文段で扱う）。
+        for sql in ["SELECT x.id FROM s.t", "SELECT s.f(1)"] {
+            let t = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                !t.iter()
+                    .any(|x| matches!(x, Token::Ident(k) if k == "#12.id")),
+                "{sql}"
+            );
+        }
+    }
+
     /// CREATE INDEX の索引名の修飾は PG と同じく構文エラー（索引は対象表の SCHEMA に置かれる）。
     #[test]
     fn index_name_qualifier_on_create_is_left_to_the_parser() {
@@ -1547,15 +1731,31 @@ mod tests {
         assert_eq!(relation_positions(&t).positions.len(), 1);
     }
 
-    /// MATERIALIZED VIEW の SCHEMA 配置は未対応（`0A000`）。存在しない SCHEMA は `3F000`。
+    /// MATERIALIZED VIEW の名前位置も内部キーへ置換される（Issue #3287）。存在しない SCHEMA は `3F000`。
     #[test]
-    fn matview_in_tenant_schema_is_unsupported() {
-        assert_eq!(
-            rewrite_in_tenant("CREATE MATERIALIZED VIEW s.m AS SELECT id FROM t")
-                .expect_err("matview")
-                .wire_code(),
-            "0A000"
-        );
+    fn matview_in_tenant_schema_is_rewritten() {
+        for sql in [
+            "CREATE MATERIALIZED VIEW s.m AS SELECT id FROM t",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS s.m AS SELECT id FROM t",
+            "REFRESH MATERIALIZED VIEW s.m",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY s.m",
+            "DROP MATERIALIZED VIEW s.m",
+            "DROP MATERIALIZED VIEW IF EXISTS s.m",
+        ] {
+            let toks = rewrite_in_tenant(sql).expect(sql);
+            assert!(
+                toks.iter().any(
+                    |t| matches!(t, Token::Ident(n) if n.starts_with('#') && n.ends_with(".m"))
+                ),
+                "{sql}"
+            );
+            assert!(
+                !toks
+                    .iter()
+                    .any(|t| matches!(t, Token::QualifiedIdent { .. })),
+                "{sql}"
+            );
+        }
         assert_eq!(
             rewrite_in_tenant("CREATE MATERIALIZED VIEW z.m AS SELECT id FROM t")
                 .expect_err("matview")
@@ -1573,6 +1773,11 @@ mod tests {
         ] {
             assert_eq!(rewrite(sql).expect_err(sql).wire_code(), "0A000", "{sql}");
         }
+        // 型名の位置（キャストの `public.<型>`）は CTE 名と衝突しない（別名前空間）。
+        same(
+            "WITH integer AS (SELECT 1 AS n) SELECT n::public.integer FROM integer",
+            "WITH integer AS (SELECT 1 AS n) SELECT n::integer FROM integer",
+        );
         // 別名の CTE とは衝突しない。
         same(
             "WITH c AS (SELECT id FROM public.t) SELECT id FROM c",

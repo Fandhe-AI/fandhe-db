@@ -1153,10 +1153,6 @@ fn column_only_positions_reject_variables_with_0a000() {
         "PERFORM DISTINCT v FROM t",
         "PERFORM sum(1) OVER (PARTITION BY v) FROM t",
         "PERFORM sum(1) OVER (ORDER BY v) FROM t",
-        "PERFORM q FROM t UNION SELECT v FROM u",
-        "DELETE FROM t WHERE q = 1 RETURNING v",
-        "UPDATE t SET x = 1 RETURNING v",
-        "INSERT INTO t(x) VALUES (1) RETURNING v",
         "PERFORM count(DISTINCT v) FROM t",
     ] {
         assert_eq!(
@@ -1167,6 +1163,14 @@ fn column_only_positions_reject_variables_with_0a000() {
     }
     // 同じ形で変数でない列は受理される（列専用位置そのものは拒否しない）。
     classified("BEGIN PERFORM DISTINCT q FROM t; END");
+    // RETURNING の項目は式を受理する（Issue #3249）ため値の位置になり、変数を置換できる。
+    for stmt in [
+        "DELETE FROM t WHERE q = 1 RETURNING v",
+        "UPDATE t SET x = 1 RETURNING v",
+        "INSERT INTO t(x) VALUES (1) RETURNING v",
+    ] {
+        classified(&format!("DECLARE v int; BEGIN {stmt}; END"));
+    }
 }
 
 #[test]

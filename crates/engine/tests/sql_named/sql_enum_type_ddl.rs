@@ -20,7 +20,6 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::mode::SessionState;
-use engine::sql::transaction::TransactionStatus;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
 
@@ -109,7 +108,6 @@ fn malformed_statements_are_syntax_errors_regardless_of_permission() {
         "CREATE TYPE t1 AS (a int)",
         "CREATE TYPE t1",
         "CREATE TYPE IF NOT EXISTS t1 AS ENUM ('a')",
-        "CREATE TYPE s.t1 AS ENUM ('a')",
         "CREATE TYPE t1 AS ENUM ('a') junk",
         "DROP TYPE t1 CASCADE",
         "DROP TYPE a, b",
@@ -118,6 +116,27 @@ fn malformed_statements_are_syntax_errors_regardless_of_permission() {
         assert_eq!(code(&core, &mut denied, sql), "42601", "denied: {sql}");
         assert_eq!(code(&core, &mut allowed, sql), "42601", "allowed: {sql}");
     }
+}
+
+/// SCHEMA 修飾の型名（Issue #3288）は構文エラーではなく名前解決の対象。存在しない SCHEMA は権限の有無に
+/// 依らず同じ `3F000`（`CREATE SEQUENCE nosuch.q` と同じ解析段の判定順。他テナントの SCHEMA も同じ応答）。
+#[test]
+fn qualified_type_name_in_unknown_schema_is_3f000_regardless_of_permission() {
+    let (_p, _g, core) = open_fixture("enum-ddl-qualified-unknown");
+    let mut denied = SessionState::default();
+    let mut allowed = allowed_session();
+    for sql in [
+        "CREATE TYPE s.t1 AS ENUM ('a')",
+        "DROP TYPE s.t1",
+        "DROP TYPE IF EXISTS s.t1",
+    ] {
+        assert_eq!(code(&core, &mut denied, sql), "3F000", "denied: {sql}");
+        assert_eq!(code(&core, &mut allowed, sql), "3F000", "allowed: {sql}");
+    }
+    assert_eq!(
+        code(&core, &mut denied, "CREATE SEQUENCE s.q"),
+        code(&core, &mut denied, "CREATE TYPE s.t1 AS ENUM ('a')")
+    );
 }
 
 #[test]
@@ -245,21 +264,41 @@ fn type_names_are_case_sensitive() {
 }
 
 #[test]
-fn type_ddl_inside_explicit_transaction_is_rejected() {
+fn type_ddl_inside_explicit_transaction_commits_or_rolls_back_atomically() {
+    // SQL-80・Issue #3315: `CREATE TYPE`・`DROP TYPE` は共有 write txn に積まれ、COMMIT で確定・ROLLBACK で消える。
     let (p, _g, core) = open_fixture("enum-ddl-txn");
     let mut s = allowed_session();
-    for sql in ["CREATE TYPE mood AS ENUM ('a')", "DROP TYPE mood"] {
+    let run_txn = |core: &EngineCore, s: &mut SessionState, sqls: &[&str], end: &str| {
         let mut txn = core.new_session_transaction();
-        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        core.execute_sql_in_txn(&ctx("alice"), s, &mut txn, "BEGIN")
             .expect("begin");
-        let err = core
-            .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
-            .expect_err("type DDL inside a transaction must be rejected");
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-        assert_eq!(txn.status(), TransactionStatus::Failed);
-        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
-            .expect("rollback");
-    }
+        for sql in sqls {
+            core.execute_sql_in_txn(&ctx("alice"), s, &mut txn, sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        }
+        core.execute_sql_in_txn(&ctx("alice"), s, &mut txn, end)
+            .expect("end");
+    };
+    // ROLLBACK した CREATE は何も残さない（同名の autocommit の作成が通る）。
+    run_txn(
+        &core,
+        &mut s,
+        &["CREATE TYPE mood AS ENUM ('a')"],
+        "ROLLBACK",
+    );
+    run(&core, &mut s, "CREATE TYPE mood AS ENUM ('b')").expect("rolled back create left nothing");
+    run(&core, &mut s, "DROP TYPE mood").expect("drop");
+    run_txn(&core, &mut s, &["CREATE TYPE mood AS ENUM ('a')"], "COMMIT");
+    assert_eq!(
+        code(&core, &mut s, "CREATE TYPE mood AS ENUM ('b')"),
+        "42710"
+    );
+    run_txn(&core, &mut s, &["DROP TYPE mood"], "ROLLBACK");
+    assert_eq!(
+        code(&core, &mut s, "CREATE TYPE mood AS ENUM ('b')"),
+        "42710"
+    );
+    run_txn(&core, &mut s, &["DROP TYPE mood"], "COMMIT");
     assert!(reopen(core, &p).get_enum_type("mood").is_err());
 }
 

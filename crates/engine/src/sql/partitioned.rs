@@ -145,6 +145,7 @@ pub(crate) fn map_partitioned_failure<E>(
     map_predicate: impl FnOnce(E) -> SqlSurfaceError,
 ) -> SqlSurfaceError {
     let committed = failure.committed_total;
+    let has_effects = committed > 0 || failure.side_effects_committed;
     // 取り消しは件数入りの `VD002`（commit 件数の有無を問わない）。
     match failure.cause {
         PartitionedStopCause::CancelRequested => {
@@ -201,7 +202,7 @@ pub(crate) fn map_partitioned_failure<E>(
             detail: format!("{op} failed"),
         },
     };
-    if committed == 0 {
+    if !has_effects {
         return cause_error;
     }
     SqlSurfaceError::partial_completion(committed, cause_error.error_class(), operation_id)
@@ -430,6 +431,7 @@ mod tests {
         PartitionedDmlFailure {
             cause,
             committed_total: committed,
+            side_effects_committed: false,
         }
     }
 

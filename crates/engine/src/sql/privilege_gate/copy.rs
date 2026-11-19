@@ -15,11 +15,11 @@
 //!   見つからなければ `42P01` で拒否する（`read.rs` の `require_relations_bits` の規則をそのまま使う）。
 //! - 列単位の付与（Issue #2083。`columns.rs`）: `FROM` は列リストの列への INSERT、`TO` のテーブル形は列リスト
 //!   （省略時は全列）への SELECT、問い合わせ形は単一 relation なら名指しした列への SELECT（それ以外は全列）。
-//!   従来方式の表の疑似列 `id`（`FROM` の列リストは必ず含む）は表単位でしか満たせない。
+//!   従来方式の表の疑似列 `id`（`FROM` の列リスト省略時は全列扱いで含む）は表単位でしか満たせない。
 //! - 拒否は固定文言の `42501`。表名・ロール ID・テナントを含めない。
 
 use crate::catalog::privilege::{PRIV_INSERT, PRIV_SELECT};
-use crate::sql::allowlist::{CopyStatement, Projection, SqlSurfaceError};
+use crate::sql::allowlist::{CopyStatement, CopyToSource, Projection, SqlSurfaceError};
 use crate::sql::lexer::Token;
 use crate::sql::mode::SessionState;
 use crate::storage::Storage;
@@ -95,8 +95,13 @@ pub(crate) fn require_copy_privileges(
         )),
         CopyStatement::To(v) => {
             let target = v.inner.table_name();
-            let target_spec = match (&v.inner.projection, v.is_table_form()) {
-                (Projection::Columns(cols), true) => ColumnSpec::Names(cols.clone()),
+            // 括弧形（広域取得・集計とも）は通常の SELECT と同じトークン走査規則（`Scan`）。
+            // 集計のテーブル形は構文段で作られない組で、到達したら厳しい側（全列）へ倒す。
+            let target_spec = match (&v.inner, v.is_table_form()) {
+                (CopyToSource::Scan(s), true) => match &s.projection {
+                    Projection::Columns(cols) => ColumnSpec::Names(cols.clone()),
+                    _ => ColumnSpec::All,
+                },
                 (_, true) => ColumnSpec::All,
                 (_, false) => ColumnSpec::Scan,
             };

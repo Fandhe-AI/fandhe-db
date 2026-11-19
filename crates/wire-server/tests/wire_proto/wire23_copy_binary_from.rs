@@ -424,12 +424,36 @@ fn invalid_utf8_and_nul_in_text_are_22p03() {
 // --- 上限（INDEX-4）と全体ロールバック ---
 
 #[test]
-fn row_count_over_limit_is_54000_with_zero_rows() {
+fn chunk_count_over_limit_is_54000_with_zero_rows() {
+    // 行数は ④（1 行 = 1 チャンク）で頭打ちになる。INDEX-4 ① は COPY に掛からない（Issue #3309）。
     let data = stream_of(
         &[good_tuple(1, 1), good_tuple(2, 2), good_tuple(3, 3)],
         true,
     );
-    copy_fails(limits(2, 1024 * 1024, 1024 * 1024, 1000), &[&data], "54000");
+    copy_fails(limits(1000, 1024 * 1024, 1024 * 1024, 2), &[&data], "54000");
+}
+
+#[test]
+fn file_count_limit_does_not_apply_to_binary_copy_rows() {
+    let (core, _g) = new_core(limits(2, 1024 * 1024, 1024 * 1024, 1000));
+    let mut s = connect(core);
+    let data = stream_of(
+        &[good_tuple(1, 1), good_tuple(2, 2), good_tuple(3, 3)],
+        true,
+    );
+    copy_ok(&mut s, &data, "COPY 3");
+    assert_eq!(count_rows(&mut s), 3);
+    s.shutdown(Shutdown::Write).ok();
+}
+
+#[test]
+fn more_than_64_tuples_are_accepted_with_default_file_limit() {
+    let (core, _g) = new_core(limits(64, 1024 * 1024, 4 * 1024 * 1024, 1000));
+    let mut s = connect(core);
+    let tuples: Vec<Vec<u8>> = (1..=100u16).map(|i| good_tuple(i, i32::from(i))).collect();
+    copy_ok(&mut s, &stream_of(&tuples, true), "COPY 100");
+    assert_eq!(count_rows(&mut s), 100);
+    s.shutdown(Shutdown::Write).ok();
 }
 
 #[test]
@@ -449,7 +473,7 @@ fn row_body_over_limit_is_54000_with_zero_rows() {
 /// 消費しないため、`08P01` の予算超過に到達せず失敗する（`wire17_copy_limits.rs` と同じ観測方法）。
 #[test]
 fn limit_error_is_detected_before_copy_done_and_later_data_is_discarded() {
-    let (core, _g) = new_core(limits(2, 1024 * 1024, 1024 * 1024, 1000));
+    let (core, _g) = new_core(limits(1000, 1024 * 1024, 1024 * 1024, 2));
     let mut s = connect(core);
     start_copy(&mut s, COPY_BIN);
     let data = stream_of(

@@ -227,7 +227,8 @@ fn foreign_key_statement_lists_every_option_and_never_concatenates_raw_names() {
         ForeignKeyMatch::Full,
         ForeignKeyDeferrability::DeferrableInitiallyDeferred,
     );
-    let sql = table::render_foreign_key::<Infallible>(&ctx, "#7.child", &fk).expect("render");
+    let sql =
+        table::render_foreign_key::<Infallible>(&ctx, "#7.child", &fk, false).expect("render");
     assert_eq!(
         sql,
         "ALTER TABLE app.child ADD CONSTRAINT \"fk_child_parent\" FOREIGN KEY (\"pid\") \
@@ -246,10 +247,22 @@ fn foreign_key_statement_lists_every_option_and_never_concatenates_raw_names() {
     assert!(to_id.references_parent_id());
     assert_eq!(
         unsupported_kind(table::render_foreign_key::<Infallible>(
-            &ctx, "child", &to_id
+            &ctx, "child", &to_id, true
         )),
         "foreign key"
     );
+    // 採番方式の親（疑似列なし）の宣言済み `id` 列への参照は通常の列参照として戻せる（Issue #3178）。
+    let sql =
+        table::render_foreign_key::<Infallible>(&ctx, "child", &to_id, false).expect("render");
+    assert!(sql.contains("REFERENCES \"parents\" (\"id\")"), "{sql}");
+}
+
+/// ダンプのうち `CREATE TYPE` の文だけ（出力順のまま）。
+fn enum_statements(dump: &[String]) -> Vec<String> {
+    dump.iter()
+        .filter(|s| s.starts_with("CREATE TYPE "))
+        .cloned()
+        .collect()
 }
 
 fn dump_sql(s: &Storage, scope: &SchemaDdlScope) -> Result<Vec<String>, Err0> {
@@ -274,6 +287,8 @@ fn inject(storage: &Storage, table: &str, key: &str, value: &[u8]) {
     w.commit().expect("commit");
 }
 
+/// SCHEMA 配下の matview（Issue #3287）・ENUM は持ち主のスコープにだけ現れ、他テナントの
+/// ダンプには影響しない。持ち主のダンプは、読めない定義を黙って落とさず失敗する。
 #[test]
 fn matviews_and_enums_are_scoped_by_owner_and_never_leak_across_tenants() {
     let path = unique_db_path("ddl-export-scoped-kinds");
@@ -298,31 +313,71 @@ fn matviews_and_enums_are_scoped_by_owner_and_never_leak_across_tenants() {
         .iter()
         .map(|s| dump_sql(&storage, s).expect("baseline"))
         .collect();
-    // テナント B にだけ、SCHEMA 配下の matview と ENUM（中身は読まれない）を置く。
+    // テナント B にだけ、SCHEMA 配下の matview と ENUM（中身は他テナントには読まれない）を置く。
     inject(&storage, "materialized_views", &format!("#{id_b}.mv"), b"x");
     inject(&storage, "enum_types", &format!("#{id_b}.en"), b"x");
     for (s, b) in scopes.iter().zip(&before) {
         assert_eq!(&dump_sql(&storage, s).expect("unchanged by tenant-b"), b);
     }
-    // 持ち主の B のダンプは、黙って落とさず失敗する（matview の検査が ENUM より先に走る）。
-    assert_eq!(
-        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-b"))),
-        "materialized view"
-    );
-    // A 自身の SCHEMA 配下の matview・ENUM も黙って落とさない。
+    // 持ち主の B のダンプは、読めない定義を黙って落とさず失敗する（SCHEMA 配下の matview は
+    // 定義を decode して書き出す対象のため、壊れた blob は破損として全体失敗になる）。
+    assert!(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-b")).is_err());
+    // A 自身の SCHEMA 配下の matview も黙って落とさない。
     inject(&storage, "materialized_views", &format!("#{id_a}.mv"), b"x");
-    assert_eq!(
-        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a"))),
-        "materialized view"
-    );
-    // ENUM も加えると失敗は続く（matview の検査が先に走るため種別は matview のまま）。
-    inject(&storage, "enum_types", &format!("#{id_a}.en"), b"x");
-    assert_eq!(
-        unsupported_kind(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a"))),
-        "materialized view"
-    );
+    assert!(dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-a")).is_err());
     // 共有分だけの書き出しは、テナント固有の行に影響されない。
     dump_sql(&storage, &SchemaDdlScope::shared_only()).expect("shared only");
+}
+
+/// SCHEMA 配下の ENUM 型は `CREATE TYPE <schema>.<name>` として出る（Issue #3288）。共有の型と並べて、
+/// 共有が先・SCHEMA 配下は描画名順に出し、他テナントの型は別テナントのダンプに現れない。
+#[test]
+fn schema_scoped_enum_types_are_exported_as_qualified_names_without_leaking() {
+    let path = unique_db_path("ddl-export-schema-enum");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open");
+    storage.create_schema("tenant-a", "a_s", false).expect("a");
+    storage.create_schema("tenant-b", "b_s", false).expect("b");
+    let id_a = storage
+        .schema_id("tenant-a", "a_s")
+        .expect("id")
+        .expect("some");
+    let id_b = storage
+        .schema_id("tenant-b", "b_s")
+        .expect("id")
+        .expect("some");
+    let labels = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    storage
+        .create_enum_type("shared_mood", labels(&["x"]))
+        .expect("shared");
+    storage
+        .create_enum_type(&format!("#{id_a}.zeta"), labels(&["a", "b"]))
+        .expect("a zeta");
+    storage
+        .create_enum_type(&format!("#{id_a}.alpha"), labels(&["it's"]))
+        .expect("a alpha");
+    storage
+        .create_enum_type(&format!("#{id_b}.secret"), labels(&["s"]))
+        .expect("b");
+    let a = dump_sql(&storage, &SchemaDdlScope::shared_and_tenant("tenant-a")).expect("dump a");
+    assert_eq!(
+        enum_statements(&a),
+        vec![
+            "CREATE TYPE \"shared_mood\" AS ENUM ('x')".to_string(),
+            "CREATE TYPE a_s.alpha AS ENUM ('it''s')".to_string(),
+            "CREATE TYPE a_s.zeta AS ENUM ('a', 'b')".to_string(),
+        ]
+    );
+    let shared = dump_sql(&storage, &SchemaDdlScope::shared_only()).expect("shared");
+    assert_eq!(
+        enum_statements(&shared),
+        vec!["CREATE TYPE \"shared_mood\" AS ENUM ('x')".to_string()]
+    );
+    let b = dump_sql(&storage, &SchemaDdlScope::tenant_only("tenant-b")).expect("dump b");
+    assert_eq!(
+        enum_statements(&b),
+        vec!["CREATE TYPE b_s.secret AS ENUM ('s')".to_string()]
+    );
 }
 
 #[test]

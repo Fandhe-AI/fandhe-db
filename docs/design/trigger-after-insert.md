@@ -9,7 +9,7 @@ Issue #1724（親 #1720）の実装記録。上位の決定は [trigger-executio
 
 - SQL `INSERT ... VALUES`（単一行・複数行。autocommit・明示 Tx）と `INSERT ... SELECT` が、書き込み
   テナント自身の AFTER ROW トリガを文の終わりに発火する
-- 発火しない経路（UPSERT・RETURNING・NoSQL・ファイル形・生の行挿入・ビュー経由・データ変更 CTE の
+- UPSERT は Issue #3191 で結線済み（[trigger-upsert.md](trigger-upsert.md)）。発火しない経路（RETURNING 付き UPSERT・NoSQL の RETURNING・ファイル形・生の行挿入・ビュー経由・データ変更 CTE の
   副文）は、INSERT トリガのある表で従来どおり `0A000`（台帳に触れない）。文トリガは Issue #1726 で結線済み
 - 受け入れ条件: 監査表への自動記録が動く。トリガ内でエラーが起きたら文全体がロールバックされる
   （行・監査行・台帳・索引とも残らない）
@@ -45,8 +45,8 @@ AFTER が失敗すれば台帳エントリも破棄され、D10 の「全トリ�
 | 表名 | 裸の識別子だけ。SCHEMA 配下の内部キー（`#<id>.<name>`）は不在と同じ `42P01` で拒否する（SCHEMA 修飾の解決は #2226） |
 | エラー | `SqlSurfaceError` へ既存の写像で変換し、トリガ本体 → 発火側へ透過（最終的に `TriggerFailed`） |
 
-本番の結線（PL/pgSQL の SQL 文をこの窓口経由で実行するホスト）は #2226・#2228 の担当。本 Issue では
-テスト注入の呼び出し口がこの窓口で監査表へ書く。
+本番の結線（PL/pgSQL の SQL 文をこの窓口経由で実行するホスト）は #3184 で入り、既定になったのは #3185。本 Issue の
+記録時点ではテスト注入の呼び出し口がこの窓口で監査表へ書いていた。
 
 ## 遅延 FK（fail-open の防止）
 
@@ -76,7 +76,7 @@ AFTER が失敗すれば台帳エントリも破棄され、D10 の「全トリ�
 - トリガ内の書き込み先に INSERT トリガがある場合は `0A000`（PostgreSQL は入れ子で発火）
 - AFTER の `WHEN` は `0A000`（実行モデルの引き継ぎ表では D7 の AFTER 側が #1724 に割り当てられているが、
   カタログ DDL が `WHEN` を `0A000` で拒否しており、評価は #1725 の作業項目だったが、#1725 では見送り、
-  `WHEN` は引き続き `0A000`。詳細は [trigger-update-delete.md](trigger-update-delete.md)）
+  `WHEN` は引き続き `0A000` だった（Issue #3190 で行トリガの `WHEN` を有効化済み。実行モデルの D7 の実装記録を参照）。詳細は [trigger-update-delete.md](trigger-update-delete.md)）
 - 区間外の明示 Tx 経路では、トリガが書いた表の遅延 FK を文の終わりに検査する
 
 ## 後続への引き継ぎ
@@ -85,4 +85,4 @@ AFTER が失敗すれば台帳エントリも破棄され、D10 の「全トリ�
   #2226・#2228。入れ子の深さ上限（D11）は #1727 で実装済み
 - `WHEN` の評価・UPDATE／DELETE・UPSERT は #1725、文トリガ・TRUNCATE は #1726
 - crash-test・越境マトリクス・台帳との整合の強化は #1728
-- `RETURNING` の最終値投影・共有 `public` 表の全テナント発火（D9）は要判断
+- `RETURNING` の最終値投影は Issue #3192 で結線済み（AFTER 系は返却へ影響しない）。共有 `public` 表の全テナント発火（D9）は要判断

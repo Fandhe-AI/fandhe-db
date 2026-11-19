@@ -100,7 +100,7 @@ DDL へ戻す手段が無い種別・属性があれば `Unsupported` でダン�
 ## 10. 残課題
 
 - 権限の書き出しは第 14 節で対応済み（Issue #3096）
-- 外部キー: 参照先の列名が `id` のものは SQL 表層が暗黙 id への参照として `0A000` で拒否するため、ダンプには現れない。それ以外の外部キーは SQL で作れ、SQL 経由の往復を第 13 節の試験が確かめる
+- 外部キー: 親が採番方式の `id` 参照（Issue #3178 で受理）は通常の列参照としてダンプへ書き出す。従来方式の親の `id` 疑似列への参照は戻せないため `Unsupported`。SQL 経由の往復を第 13 節の試験が確かめる
 - マテリアライズド VIEW・SCHEMA 配下の SEQUENCE は §15 で対応済み（既知の制約も §15）
 
 ## 11. 表データの書き出し（Issue #2161）
@@ -258,7 +258,7 @@ COPY <表> (<列>, ...) FROM STDIN;
   - 公開は従来どおり `hard_link` で、作業ディレクトリは復元先の親の中なので同じファイルシステムで完結する。成功・失敗とも作業ディレクトリと一時名を消す。作業ディレクトリは削除前に実パスの (dev, ino) を照合し、差し替えなら消さずに実パスを通知する（Issue #3137）。消せなかった残骸は、`/proc` のパスでなく実パス（親 + 作業ディレクトリ名 + 一時名）を標準エラーに出す
   - 以前の「共有の親でも復元できる」という説明は取り下げた。共有ディレクトリ（`/tmp` 直下など）へは復元できない。専用ディレクトリ（0755 や 0700）を使うこと
 - **残骸の掃除（Issue #3136）**: 異常終了で残った作業ディレクトリ（`.fandhe-dump-restore-<pid>-<seq>.d`。中は `.db-…tmp`）は、次の `dump-restore` が復元先の親で中身ごと掃除する。作業ディレクトリを作る前に親へ共有 lock を取り、後始末の後まで持つ。取れなければ何も作らず終了コード 1 で失敗する（fail-closed）。`--from` が予約名なら掃除ごと見送る
-- **COPY のバッチ分割**: 1 バッチの上限は engine の実際の上限（行数①・チャンク数④〔1 行 1 チャンク〕・合計バイト③）の最小値と 8 MiB で決め、次の行を足すと超える場合は足す前に commit して新しいバッチを始める。1 行だけで上限を超えるダンプは `feed` が拒否し、何も公開しない
+- **COPY のバッチ分割**: 1 バッチの上限は engine の実際の上限（行数〔`--max-insert-rows` 指定時のみ。INDEX-4 ① は掛からない〕・チャンク数④〔1 行 1 チャンク〕・合計バイト③）の最小値と 8 MiB で決め、次の行を足すと超える場合は足す前に commit して新しいバッチを始める。1 行だけで上限を超えるダンプは `feed` が拒否し、何も公開しない
 - 実行の文脈: ヘッダのテナントの文脈（認証済みセッションと同じ可視性集合）で、文ごとに実行する。`--shared-only` のダンプは固定の内部テナント名で実行する（共有の定義は実行テナントに依存せず、行は無い）。DDL 実行権限はこの一時 DB 上のセッションにだけ与える。`COPY` は engine のバッチ上限（行数）に収まる単位に分けて commit する（一時 DB は公開されるまで誰にも見えないため、分割 commit でも原子性は変わらない）。台帳（`OPERATION_ID`）は使わず、復元後の DB にも作らない（§11.7）
 - `--data-only` のダンプは、表が無い新規 DB へは復元できないため終了コード 4 で拒否する（既存 DB への流し込みは §12.7）
 - **ダンプファイルは untrusted 入力**: ヘッダは完全一致、枠は上限と長さの検証、本文は 1 文の検証と、種別ごとの形（先頭の語句。`setval` は `SELECT setval('<名前>', <整数>, TRUE|FALSE)`、外部キーは `ADD CONSTRAINT ... FOREIGN KEY`、行セキュリティは `ENABLE`／`FORCE` だけ、`materialized-view` は末尾が `WITH NO DATA`（直前に空白）の `CREATE MATERIALIZED VIEW`、`materialized-view-refresh` は `REFRESH MATERIALIZED VIEW "<識別子>"`（または SCHEMA 修飾名）の厳密形で `parts: all` のヘッダのときだけ、COPY は `COPY <表> (<列>, ...) FROM STDIN` だけ）で絞る。
@@ -303,7 +303,7 @@ COPY <表> (<列>, ...) FROM STDIN;
 
 | 要素 | 現状 | 固定する試験 |
 | ---- | ---- | ------------ |
-| 参照先の列名が `id` の外部キー | SQL 表層が `0A000` で拒否する（列 `id` を明示した表でも同じ）。ダンプには現れない | `foreign_key_to_a_column_named_id_is_rejected_so_it_never_reaches_the_dump` |
+| 参照先の列名が `id` の外部キー | 親が採番方式なら通常の列参照として往復する。疑似列を持つ親への参照は `Unsupported`（`ddl_export/tests.rs` の単体試験）。データ入りの往復は #3182 で固定した | `foreign_key_to_a_column_named_id_round_trips_through_the_dump` |
 | 従来方式（暗黙 id）の表が持つ外部キー | 暗黙 id の表そのものが `Unsupported`（外部キーだけを落として戻すことはしない） | `dump_fails_closed_when_a_legacy_table_carries_a_foreign_key` |
 | `GENERATED ALWAYS` の IDENTITY | INSERT 形式では `Unsupported`、COPY 形式では往復する（§11.6） | `logical_dump_data.rs` の `identity_columns_round_trip_through_copy_and_fail_closed_for_insert`。fixture の IDENTITY は `BY DEFAULT` |
 | 暗黙 id の表 | `Unsupported`（§4） | `logical_dump_schema.rs` の既存試験（`table_with_implicit_id_row_identity_fails_the_whole_dump`） |

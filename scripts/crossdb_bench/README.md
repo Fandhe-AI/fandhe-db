@@ -151,7 +151,7 @@ python scripts/crossdb_bench/run.py --db self --config hnsw \
 | キー | 内容 |
 | --- | --- |
 | `phases.ann_probe` | 上記 3. の `EXPLAIN` 検証結果（`engine`/`hnsw_params`/`ann_plan`/生の行） |
-| `phases.ann_probe.knn_operator_plan` | 実際の kNN 形（`<#>`）の `EXPLAIN` から抜いた `engine`/`ann_plan`。`<#>` は現行 HNSW の対応 metric 外で厳密全走査になり（`plain_scan_opclass_mismatch`）、`USING PLAN` の `ann_probe` とは経路が違う。到達しないとき `hnsw_index_warm` は unsupported・`ef_search` は `null` |
+| `phases.ann_probe.knn_operator_plan` | 実際の kNN 形（`<=>`）の `EXPLAIN` から抜いた `engine`/`ann_plan`。kNN の演算子が HNSW の対応 metric 外だと厳密全走査になり（`plain_scan_opclass_mismatch`）、`USING PLAN` の `ann_probe` とは経路が違う観測用。到達しないとき `hnsw_index_warm` は unsupported・`ef_search` は `null` |
 | `phases.hnsw_index_warm` | 索引構築を含む初回 `vector_knn` 相当クエリの単発計時（`first_query_us`。informational。kNN が HNSW に到達しない構成では unsupported） |
 | `phases.bulk_knn_k*`/`bulk_knn_where_k200` | `ef_search`/`ef_effective`（`ef.max(k)`。`hnsw.rs::search_masked_with` の契約からの導出値） |
 | `phases.bulk_hybrid_k200` | `ef_search`/`dense_fetch_k_initial`/`dense_fetch_k_may_expand`（直後の段落参照。`ef_effective` は常に `null`） |
@@ -232,7 +232,7 @@ doc・`crates/wire-server/docs/nosql-api.md`「転送路の共通規則」節）
 | `where_compound_count` | `filter[].op` が `eq`／`prefix` のみで範囲比較演算子が無く `id > 100` を表現できない |
 | `udf_call` | 宣言的 UDF 呼び出しに対応する `op` が許可リスト（4 値）に無い |
 | `explain` | `vector` 指定検索への `explain:true` は `42601` で拒否される契約（`plan` 検索の `EXPLAIN` は LLM プランナー未接続のため対象外） |
-| `ingest_bulk` | COPY 相当のストリーミング一括投入 op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当（1 要求あたり既定上限 64 行・INDEX-4 ①・要求ごとに commit）で、SQL 表層の COPY 計測と同形の分割投入は未実装 |
+| `ingest_bulk` | COPY 相当のストリーミング一括投入 op が無い。`op: insert` の `rows` 配列は複数行 INSERT 相当（INDEX-4 ① は掛からない〔Issue #3308〕・要求ごとに commit）で、SQL 表層の COPY 計測と同形の分割投入は未実装 |
 
 `group_by_having` は NoSQL の `aggregate`（`group_by`／`having`）に `ORDER BY`／
 `LIMIT` 相当のフィールドが無いため、`self_db.py` の `... ORDER BY n DESC
@@ -412,6 +412,8 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 | `agg_multi` | `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` |
 | `group_by_having` | `GROUP BY`/`HAVING` |
 | `hybrid_rrf` | ベクトル + 全文検索の RRF 融合 |
+| `hybrid_rrf_depth50` / `hybrid_rrf_depth200` | Issue #3225。self（`window => 50／200`。初回 fetch_k は 2 倍）と Redis（K=100・WINDOW=50／K=400・WINDOW=200）の取得深さを揃えた hybrid。p50 と品質指標 3 種（下記）を並べる。env では変えない固定値 |
+| `hybrid_text_conjunction` | Redis のみ・計測なしの診断。`@body:(t1 t2 ...)` が AND か OR かを `FT.EXPLAIN` と一致件数で記録（self は OR） |
 | `mode_recall` / `mode_precision` | 取得モード切替（self のみ） |
 | `rls_isolation` | tenant-b 接続（self）／同一 public-only フィルタの再実行（他 DB）での `COUNT(*)`（RLS 相当の境界確認） |
 | `udf_call` | 宣言的 UDF 呼び出し（self のみ） |
@@ -444,10 +446,11 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 - **fsync 等の永続化設定は未変更**: 公平性のためではなく、単に「素の Docker
   イメージ・デフォルト設定」を比較対象にする方針のため。本番運用のチューニング
   差は本ベンチの対象外。
-- **距離指標**: 自作 DB は `<#>`（負の内積の昇順＝内積の降順。
-  `crates/engine/src/kernel.rs`「スコアは内積」参照。Issue #2952・SQL-33）。
-  `<=>` はコサイン距離なので DB 間比較には使わない。`mode_precision` だけは
-  `<#>` との併用が engine で `0A000` となるため `<=>` のまま（self 専用フェーズ）。
+- **距離指標**: 自作 DB は全 kNN 形で `<=>`（コサイン距離。SQL-33。Issue #3224 で
+  Issue #2952 の `<#>` から戻した。`<#>` は HNSW の対応 metric 外で hnsw 構成が
+  厳密全走査になるため）。他 DB と recall 正解（numpy 内積）は内積のままで、
+  フィクスチャが L2 正規化済みのためコサインと順位が一致する（`recall.py` の
+  `fixture_norm_stats` を `meta.fixture_norm` に記録）。
   pgvector は `<#>`（負の内積）、Qdrant は
   `Distance.DOT`、LanceDB は `metric="dot"` に揃えている。sqlite-vec の
   vec0 は内積相当の `distance_metric` を持たない（実機確認: `l2`/`l1`/`cosine`
@@ -493,7 +496,7 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 従来の厳密一致版（同点は決定的だが恣意的な順序で 10 件に切ったうえで完全一致
 を要求する）は `recall_at_10_strict` として引き続き記録する。exact 構成でも
 同点境界の順序差により 1.0 未満になり得る（sqlite-vec は距離指標がコサイン
-近似のため、同点構造自体が自作 DB〔内積〕と異なりさらに低くなり得る）。
+近似のため、同点構造自体が自作 DB〔コサイン〕と異なりさらに低くなり得る）。
 
 ## 既知の unsupported 項目（スモークテストで確認済み）
 
@@ -527,6 +530,22 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 - **self**: `ingest_bulk` は SQL 表層では `COPY ... FROM STDIN`（TASK-220・WIRE-17）で
   計測する（`self_copy.py`）。docs jsonl が見つからない場合のみ unsupported を記録する。
 
+### hybrid 深さ arm の品質指標（Issue #3225）
+
+DB 間で共通の hybrid 正解は作れないため、BM25 の関連性 recall ではない次の 3 指標を並べる。
+算出不能なときは 0 ではなく `null` と理由（`quality_unsupported`・`topic_hit_rate_reason`）を記録する。
+
+- `dense_gt_recall_at_10`（同点許容。厳密版は `_strict`）: hybrid 上位 10 件と内積総当たり正解の一致率。
+  深さを浅くしたとき密側の上位が融合結果から落ちる度合いを測る
+- `overlap_at_10_vs_depth200`（`hybrid_rrf_depth50` のみ）: 同じ DB の depth200 arm 上位 10 件との重なり
+- `topic_hit_rate_at_10`: クエリの `topic` と一致する返却文書の割合（ラベル基準の代理指標）
+
+並べて見る例:
+
+```bash
+jq '.phases | to_entries[] | select(.key|startswith("hybrid_rrf_depth")) | {arm:.key, p50_us:.value.p50_us, recall:.value.dense_gt_recall_at_10, overlap:.value.overlap_at_10_vs_depth200, topic:.value.topic_hit_rate_at_10}' results/self_exact.json results/redis_exact.json
+```
+
 ## ファイル構成
 
 | ファイル | 役割 |
@@ -544,6 +563,7 @@ DB ごとに float32 の総和順序が異なると計算結果が最終桁で�
 | `mongodb_plain_db.py` | MongoDB Community の全フェーズ実装 |
 | `redis_db.py` | Redis の全フェーズ実装 |
 | `elasticsearch_db.py` | Elasticsearch の全フェーズ実装 |
+| `hybrid_depth.py` | hybrid 深さ arm の定義と品質指標の純ロジック（標準ライブラリのみ。Issue #3225。テストは `scripts/tests/test_crossdb_hybrid_depth.py`） |
 | `run.py` | CLI エントリポイント（フィクスチャ読み込み → 各 db モジュール呼び出し → recall 計算 → JSON 書き出し） |
 | `containers.sh` | pgvector・Qdrant・MySQL・MongoDB・Redis・Elasticsearch コンテナの起動・停止（`docker rm -f` で毎回冪等に作り直す） |
 
@@ -600,3 +620,4 @@ CROSSDB_DIR="$S" CROSSDB_PYTHON="$V" scripts/bench_crossdb_ab.sh
   条件が異なる。`CROSSDB_REDIS_HYBRID_WINDOW=200` で Redis 側を self の
   pool_depth に揃えた informational な追加計測ができる（本番スコアボードの
   既定計測条件は変えない。`redis_db.py` 側の既定値は 50 のまま不変）。
+  なお `hybrid_rrf_depth50`／`hybrid_rrf_depth200`（Issue #3225）は固定値で、この環境変数の影響を受けない。

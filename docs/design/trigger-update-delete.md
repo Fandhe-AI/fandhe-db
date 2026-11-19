@@ -19,21 +19,23 @@ Issue #1725（親 #1720）の実装記録。上位の決定は [trigger-executio
   後回しの区間（`DeferNotNullBindScope`）は `bind_*` 呼び出しの範囲だけで、表名で限定する
 - `UPDATE OF <列>` は、その列が `SET` の対象として書かれた文でだけ発火する。BEFORE による書き換えは
   判定に含めない（D7）
-- 分割実行 DML（`... PARTITIONED`）は、対象表に該当イベントのトリガ（行・文を問わない）が 1 つでもあれば
-  `0A000`。ジョブ記録・台帳照合より前に判定するので、第 1 チャンクでは commit 前に止まり副作用はゼロ（D8）
+- 分割実行 DML（`... PARTITIONED`）は、行トリガ（BEFORE／AFTER ROW）をチャンクごとに発火する（Issue #3283。
+  [trigger-partitioned-dml.md](trigger-partitioned-dml.md)）。文トリガ・子表のトリガがあれば `0A000`。
+  判定はジョブ記録・台帳照合より前なので、第 1 チャンクでは commit 前に止まり副作用はゼロ（D8）
 
 ## 経路ごとの扱い
 
 | 経路 | 扱い |
 | ---- | ---- |
 | SQL の UPDATE／DELETE（上記 3 形。ビュー経由・データ変更 CTE の副文も同じフォーム関数を通るため INSERT と同様に発火する） | 発火 |
-| 分割実行 DML | 該当イベントのトリガがあれば `0A000` |
-| `RETURNING` 付きの UPDATE／DELETE | 該当イベントのトリガがあれば `0A000`（最終値の投影は後続） |
-| UPSERT（`ON CONFLICT`） | INSERT・UPDATE のどちらかのトリガがあれば `0A000`（`DO UPDATE` を発火させるのは後続） |
-| NoSQL の更新・削除（述語形を含む。入口で通過証を渡さず `None` で分類する）、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000` |
-| 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | `0A000`（カタログの FK 宣言だけから静的に判定。親にトリガが無くても拒否する）。自己参照 FK の対象表自身も子表に数える（参照アクションで書き換わる同表の別行ではトリガを発火できないため、黙って飛ばさず `0A000`） |
+| 分割実行 DML | 行トリガは発火（Issue #3283）。文トリガ・子表のトリガは `0A000` |
+| `RETURNING` 付きの UPDATE／DELETE（id 指定形・述語形） | 発火（Issue #3192。返る行は書いた最終 NEW、DELETE は削除前の値。[sql-returning.md](sql-returning.md)） |
+| UPSERT（`ON CONFLICT`） | 発火（#3191。`DO UPDATE` の更新側で BEFORE／AFTER ROW UPDATE。[trigger-upsert.md](trigger-upsert.md)）。`RETURNING` 付きは `0A000` |
+| NoSQL（HTTP）表層の単一行・述語形の更新・削除（Issue #3282 で結線。入口が通過証と発火元の主体の写しを渡し、SQL 表層と同じ実行器・発火計画を使う） | 発火する |
+| NoSQL の `RETURNING` 付き更新・削除、結合形（`UPDATE ... FROM`／`DELETE ... USING`）の `RETURNING`、生の行 API、`replace_typed_rows_by_text_key` | 該当イベントのトリガがあれば `0A000`（意図的に未結線） |
+| 参照アクション（CASCADE・SET NULL・SET DEFAULT）が及ぶ子表に該当イベントのトリガ | ROW トリガは子行ごとに発火（Issue #3284 の実装記録。`constraint/referential_triggers.rs`）。親にトリガが無くても、文の開始時にカタログの FK 宣言から静的に判定して発火経路に載せる。自己参照 FK の対象表自身も子表に数える。子表の文トリガと、結線の無い経路は `0A000` |
 | 文トリガ（UPDATE・DELETE の STATEMENT） | 発火（[trigger-statement-truncate.md](trigger-statement-truncate.md)。Issue #1726） |
-| `WHEN` 付き | `0A000` のまま（発火時にも二重に拒否。評価は後続） |
+| `WHEN` 付き | 当時は `0A000`。Issue #3190 で評価を結線済み（実行モデルの D7 の実装記録） |
 
 判定はすべて、同じ write txn の中でカタログだけを見て行う。書き込みテナントの scope のトリガだけを見るので、
 他テナントの定義・行の有無は応答の差に出ない。文言は固定の英語で、トリガ名・表名・値を含めない。
@@ -64,14 +66,17 @@ AFTER の失敗は文全体の失敗で、同じ write txn の単一 commit な�
 
 ## PostgreSQL との差
 
-- 同じ文で複数トリガが同じ行を触る場合の自己変更の衝突（27000。D6）は今回入れない。
-  `TriggerWriteHandle` は `insert_row` しか持たず、外側の文の対象行をトリガが変更・削除する状態を作れない
-  ためで、窓口に UPDATE／DELETE が入る #2226 に引き継ぐ
+- 同じ文で複数トリガが同じ行を触る場合の自己変更の衝突（27000。D6）は行単位では検出しない。
+  Issue #3186 で窓口に UPDATE が入ったため、BEFORE ROW の行ごとループの最中の同表 `UPDATE` は表単位の `0A000` で
+  塞いだ（[plpgsql-subset.md](plpgsql-subset.md) の「Issue #3186 追記」）。トリガ本体の `DELETE`（Issue #3187）も、
+  外側の行ループが進行中の表を対象にすると、表単位の暫定ガード（`trigger::row_loop`）が固定文言の `0A000` で
+  拒否する。`27000` を返す行単位の検出は、`ErrorClass` への variant 追加（公開 enum の破壊的変更）と合わせた
+  後続の課題
 - 制約検査・FK 検査は全行の書き込み後にまとめて行う（BEFORE と AFTER の間）
 
 ## 引き継ぎ
 
-- UPSERT の発火、`RETURNING` の最終値の投影、`WHEN` の評価（NEW／OLD の列修飾の束縛を要する）
+- `WHEN` の評価（NEW／OLD の列修飾の束縛を要する）。UPSERT の発火は #3191、`RETURNING` の最終値の投影は Issue #3192 で結線済み（`RETURNING` 付き UPSERT は `0A000` のまま）
 - 結合形 DML の SQL dispatch の結線（現状は `0A000`）
 - 入れ子の深さ上限（#1727）、自己変更の衝突 27000 と窓口の UPDATE／DELETE（#2226）
 - 分割実行の途中のチャンクで DDL によりトリガが追加された場合は、既存の部分完了の写像に従う

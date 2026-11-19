@@ -584,6 +584,13 @@ pub struct UpdateOutcome {
     pub rows_affected: u64,
 }
 
+/// `MERGE`（SQL-79・Issue #3353）の実行結果。`rows_affected` は UPDATE と DELETE で実際に変更した行数の合計
+/// （DO NOTHING・どの WHEN 句にも当たらなかった組は含めない）。応答のコマンドタグは `MERGE <n>`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeOutcome {
+    pub rows_affected: u64,
+}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
@@ -977,9 +984,58 @@ fn rescore_cosine(
 /// NULL 行を除いた候補スロットだけを走査する（疎側の `input.ids` は全スロットのまま呼び出し元が
 /// 持つため、NULL 行は疎側の候補に残る）。`input` が当該 arena のバッファ（`ids` が恒等スロット列で
 /// `vectors.len() == ids.len() * dim`）でなければ、黙って全体を走査せず `KernelError` で拒否する。
+///
+/// Issue #3217: `row_norms_sq` はスナップショット常駐のノルム²（`snapshot_norms_for_full_scan` が
+/// 位置対応を確認した場合のみ `Some`）。`dense_slots: None` の全走査でだけ使い、長さが `ids` と
+/// 不一致なら kernel 側が C1 へ縮退する。
+///
+/// ノルム² の計算は構築時ではなく `search` の全走査経路（`dense_slots: None`）に入った時点まで
+/// 遅延する（`norms`。HNSW 選択時・`dense_slots` の部分集合経路では adapter が使われない／ノルムを
+/// 使わないため、O(n·dim) の走査コストを払わない）。
 struct CosineDenseAdapter<'a> {
     inner: &'a dyn SearchProvider,
     dense_slots: Option<&'a [u32]>,
+    norms: Option<FullScanNormsSource<'a>>,
+}
+
+/// `snapshot_norms_for_full_scan` の引数一式。全走査が必要になるまで評価を遅延させるための束。
+#[derive(Clone, Copy)]
+struct FullScanNormsSource<'a> {
+    snapshot: Option<&'a std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>>,
+    arena: &'a VectorArena,
+    mask_kept_slots: Option<&'a Vec<u32>>,
+    slot_count: usize,
+}
+
+impl<'a> FullScanNormsSource<'a> {
+    fn resolve(self) -> Option<&'a [f32]> {
+        snapshot_norms_for_full_scan(
+            self.snapshot,
+            self.arena,
+            self.mask_kept_slots,
+            self.slot_count,
+        )
+    }
+}
+
+/// Issue #3217: 全走査が走査する `arena` がキャッシュ済みスナップショット自身の arena で、候補マスク
+/// が無く、長さが slot 数と一致するときだけスナップショット常駐のノルム² を返す。縮約 arena・
+/// 新規構築 arena・マスク経路は位置が対応しないため `None`（別行のノルムを使う誤結果を防ぐ fail-closed）。
+fn snapshot_norms_for_full_scan<'a>(
+    snapshot: Option<&'a std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>>,
+    arena: &VectorArena,
+    mask_kept_slots: Option<&Vec<u32>>,
+    slot_count: usize,
+) -> Option<&'a [f32]> {
+    if mask_kept_slots.is_some() {
+        return None;
+    }
+    let snap = snapshot?;
+    if !std::ptr::eq(snap.arena(), arena) {
+        return None;
+    }
+    let norms = snap.row_norms_sq()?;
+    (norms.len() == slot_count).then_some(norms)
 }
 
 impl SearchProvider for CosineDenseAdapter<'_> {
@@ -991,7 +1047,7 @@ impl SearchProvider for CosineDenseAdapter<'_> {
             None => self.inner.search_cosine(crate::kernel::CosineSearchInput {
                 ids: input.ids,
                 vectors: input.vectors,
-                row_norms_sq: None,
+                row_norms_sq: self.norms.and_then(FullScanNormsSource::resolve),
                 dim: input.dim,
                 query: input.query,
                 k: input.k,
@@ -3080,7 +3136,12 @@ pub(crate) fn execute_statement_with_cache_observed(
                             .search_cosine(crate::kernel::CosineSearchInput {
                                 ids: &slot_ids,
                                 vectors: arena.vectors(),
-                                row_norms_sq: None,
+                                row_norms_sq: snapshot_norms_for_full_scan(
+                                    cache_hit_snapshot.as_ref(),
+                                    arena,
+                                    mask_kept_slots.as_ref(),
+                                    slot_ids.len(),
+                                ),
                                 dim: arena.dim(),
                                 query,
                                 k: k_eff,
@@ -3379,6 +3440,12 @@ pub(crate) fn execute_statement_with_cache_observed(
                     let cosine_dense = CosineDenseAdapter {
                         inner: provider,
                         dense_slots: dense_slots.as_deref(),
+                        norms: Some(FullScanNormsSource {
+                            snapshot: cache_hit_snapshot.as_ref(),
+                            arena,
+                            mask_kept_slots: mask_kept_slots.as_ref(),
+                            slot_count: slot_ids.len(),
+                        }),
                     };
                     let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
                         Some(adapter) => adapter,
@@ -5244,6 +5311,30 @@ pub(crate) fn execute_insert_with_schema_in(
     expected_schema: Option<&crate::catalog::TableSchema>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_with_schema_in_projecting(
+        target,
+        ctx,
+        bound,
+        ledger_mode,
+        expected_schema,
+        triggers,
+        None,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+/// [`execute_insert_with_schema_in`] の `RETURNING` 投影つき本体（Issue #3192）。`project` は INSERT トリガ
+/// 経路が書いた行の最終 NEW を commit 前に受け取る。戻りの `bool` は、その経路を通ったか
+/// （[`crate::tenant::InsertWriteReport::trigger_path`]）。偽なら `project` は呼ばれていない。
+pub(crate) fn execute_insert_with_schema_in_projecting(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundInsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+    project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+) -> Result<(InsertOutcome, bool), SqlSurfaceError> {
     use crate::storage::Visibility;
 
     let ledger_write = ledger_mode
@@ -5262,13 +5353,17 @@ pub(crate) fn execute_insert_with_schema_in(
         &bound.volatile_default_columns,
         bound.id_omitted,
         triggers,
+        project,
     )
     .map_err(map_insert_write_error)?;
 
-    Ok(InsertOutcome {
-        rows_affected: report.rows_written,
-        incremental: None,
-    })
+    Ok((
+        InsertOutcome {
+            rows_affected: report.rows_written,
+            incremental: None,
+        },
+        report.trigger_path,
+    ))
 }
 
 /// SQL 表層 `TRUNCATE [TABLE] [ONLY] <table> [*] [, ...] USING OPERATION_ID '<id>'`（複数テーブルは SQL-48 (4)、Issue #1643）
@@ -5434,10 +5529,13 @@ fn mask_returning_row_id(schema: &crate::catalog::TableSchema, mut row: ResultRo
 fn returning_collector<'a>(
     ctx: &'a PolicyContext,
     returning: &'a [crate::sql::parser::ProjectedColumn],
+    schema: &TableSchema,
     mask_row_id: bool,
     budget: &'a mut usize,
     rows: &'a mut Vec<ResultRow>,
 ) -> impl FnMut(&crate::tenant::CapturedRow) -> Result<(), crate::tenant::TenantWriteError> + 'a {
+    // 式項目は文ごとに 1 回だけコンパイルし、行ごとには評価スタックを使い回す（Issue #3249）。
+    let mut projector = crate::sql::returning::ReturningProjector::new(returning, schema);
     move |row: &crate::tenant::CapturedRow| {
         if !ctx.is_visible(&row.tenant_id, row.visibility) {
             // 新規挿入行は不可視なら `XX000` で書き込みを中止する（fail-closed。
@@ -5450,7 +5548,7 @@ fn returning_collector<'a>(
             }
             return Ok(());
         }
-        match crate::sql::returning::project_row(row.id, &row.values, returning, budget) {
+        match projector.project_row(row.id, &row.values, budget) {
             Ok(mut result_row) => {
                 // 採番方式の表は内部 rowid を応答へ出さない（TABLE-23・Issue #2199）。
                 if mask_row_id {
@@ -5467,8 +5565,13 @@ fn returning_collector<'a>(
             Err(SqlSurfaceError::PayloadTooLarge { detail }) => {
                 Err(crate::tenant::TenantWriteError::ReturningProjectionTooLarge(detail))
             }
-            Err(other) => Err(crate::tenant::TenantWriteError::ReturningProjectionFailed(
-                other.to_string(),
+            // 内部不整合は従来どおり `XX000`。式の評価エラー（`22012` 等）は元の SQLSTATE のまま
+            // 透過する（Issue #3249。同じ式の SELECT と同じ `wire_code`）。
+            Err(other @ SqlSurfaceError::Internal { .. }) => Err(
+                crate::tenant::TenantWriteError::ReturningProjectionFailed(other.to_string()),
+            ),
+            Err(other) => Err(crate::tenant::TenantWriteError::ReturningExpressionFailed(
+                other,
             )),
         }
     }
@@ -5519,6 +5622,7 @@ pub fn execute_delete_returning(
         ledger_mode,
         returning,
         schema,
+        None,
     )
 }
 
@@ -5534,6 +5638,8 @@ pub(crate) fn execute_delete_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
@@ -5548,6 +5654,7 @@ pub(crate) fn execute_delete_returning_in(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -5561,6 +5668,7 @@ pub(crate) fn execute_delete_returning_in(
         ledger_write,
         Some(schema),
         Some(&mut project),
+        triggers,
     )
     // [`execute_delete`]（RETURNING なし）と同じ `"delete"` 語彙で写像する
     // （Cursor Bugbot Low 指摘・PR #991）。本関数は DELETE の実行であり、
@@ -5690,6 +5798,7 @@ pub fn execute_update_returning(
         ledger_mode,
         returning,
         schema,
+        None,
     )
 }
 
@@ -5702,6 +5811,8 @@ pub(crate) fn execute_update_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id.as_ref())
@@ -5714,6 +5825,7 @@ pub(crate) fn execute_update_returning_in(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -5728,6 +5840,7 @@ pub(crate) fn execute_update_returning_in(
         ledger_write,
         Some(schema),
         Some(&mut project),
+        triggers,
     )
     .map_err(|e| map_write_error(e, "update"))?;
 
@@ -5814,6 +5927,8 @@ pub(crate) fn map_write_error(
         // SET 右辺式の評価エラー（Issue #1544・SQL-45 のポインタ）も内側の
         // `SqlSurfaceError` を透過する（通常の式評価と同じ `wire_code`）。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner,
+        // RETURNING 式項目の評価エラー（Issue #3249）も内側の `SqlSurfaceError` を透過する。
+        TenantWriteError::ReturningExpressionFailed(inner) => inner,
         // `nextval`／`currval` の採番・解決の失敗（`2200H`・`55000`・`22003`・`0A000` 等。
         // TABLE-24・Issue #1690）も内側の `SqlSurfaceError` を透過する。
         TenantWriteError::SequenceEvaluationFailed(inner) => inner,
@@ -5876,6 +5991,13 @@ pub(crate) fn map_write_error(
             "cannot truncate a table referenced in a foreign key constraint: \
              table \"{referencing_table}\" references \"{table}\""
         )),
+        // 生成列を持つ表への書き込み（計算点が未結線の経路。TABLE-50・Issue #3327）。`_` 節（`XX000`）へ
+        // 丸めず固定文言の `0A000` で返す（表名・テナント・値を含めない）。
+        TenantWriteError::GeneratedColumnWriteUnsupported => {
+            SqlSurfaceError::feature_not_supported(
+                "writes to tables with generated columns are not supported yet",
+            )
+        }
         // `FOREIGN KEY` の参照アクション（`CASCADE`・`SET NULL`・`SET DEFAULT`。
         // Issue #1076）の連鎖が深さ・行数の上限を超えた。`_` 節（`XX000`）へ丸めると
         // クライアントが上限超過をサーバー内部事象と取り違える。
@@ -6016,6 +6138,8 @@ pub(crate) fn execute_predicate_delete_returning(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     returning: &[crate::sql::parser::ProjectedColumn],
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
@@ -6023,6 +6147,7 @@ pub(crate) fn execute_predicate_delete_returning(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -6037,7 +6162,7 @@ pub(crate) fn execute_predicate_delete_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
-        None,
+        triggers,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -6143,7 +6268,7 @@ fn execute_predicate_delete_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
-    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    // DELETE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）でも発火する（Issue #3192）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
@@ -6193,6 +6318,7 @@ fn execute_predicate_delete_inner(
                 predicate,
                 project,
                 reads_existing,
+                triggers,
             ),
         },
     );
@@ -6282,6 +6408,8 @@ pub(crate) fn execute_predicate_update_returning(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     returning: &[crate::sql::parser::ProjectedColumn],
+    // トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は `None`。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
@@ -6289,6 +6417,7 @@ pub(crate) fn execute_predicate_update_returning(
     let mut project = returning_collector(
         ctx,
         returning,
+        schema,
         schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -6304,7 +6433,7 @@ pub(crate) fn execute_predicate_update_returning(
         max_affected_rows,
         max_scanned_rows,
         Some(&mut project),
-        None,
+        triggers,
     )?;
     drop(project);
     Ok(ReturningOutcome {
@@ -6328,7 +6457,7 @@ fn execute_predicate_update_inner(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     max_scanned_rows: usize,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
-    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）は渡さない（`0A000`）。
+    // UPDATE トリガの通過証（Issue #1725）。`RETURNING` 付き（`project: Some`）でも発火する（Issue #3192）。
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<u64, SqlSurfaceError> {
     let ledger_write = ledger_mode
@@ -6386,6 +6515,7 @@ fn execute_predicate_update_inner(
                 predicate,
                 project,
                 reads_existing,
+                triggers,
             ),
         },
     );
@@ -6424,6 +6554,8 @@ pub(crate) fn execute_predicate_delete_partitioned(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     fixed_time: Option<i64>,
     privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+    // 行トリガの通過証（Issue #3283）。`None` は該当トリガのある表を `0A000` で拒否する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<DeleteOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -6447,6 +6579,7 @@ pub(crate) fn execute_predicate_delete_partitioned(
                 max_affected_rows,
                 fixed_time,
                 privilege_recheck.clone(),
+                triggers,
                 predicate,
             )
         },
@@ -6481,6 +6614,8 @@ pub(crate) fn execute_predicate_update_partitioned(
     max_affected_rows: Option<std::num::NonZeroUsize>,
     fixed_time: Option<i64>,
     privilege_recheck: Option<crate::sql::privilege_gate::write::RelationPrivilegeRecheck>,
+    // 行トリガの通過証（Issue #3283）。`None` は該当トリガのある表を `0A000` で拒否する。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<UpdateOutcome, SqlSurfaceError> {
     let ledger_write = ledger_mode
         .resolve(bound.operation_id())
@@ -6506,6 +6641,7 @@ pub(crate) fn execute_predicate_update_partitioned(
                 max_affected_rows,
                 fixed_time,
                 privilege_recheck.clone(),
+                triggers,
                 predicate,
             )
         },
@@ -6601,19 +6737,43 @@ pub(crate) fn execute_insert_batch_with_schema_in(
     expected_schema: Option<&crate::catalog::TableSchema>,
     triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
+    execute_insert_batch_with_schema_in_projecting(
+        target,
+        ctx,
+        bounds,
+        ledger_mode,
+        expected_schema,
+        triggers,
+        None,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+/// [`execute_insert_batch_with_schema_in`] の `RETURNING` 投影つき本体（Issue #3192）。`project` と戻りの
+/// `bool` の契約は [`execute_insert_with_schema_in_projecting`] と同じ。
+pub(crate) fn execute_insert_batch_with_schema_in_projecting(
+    target: crate::tenant::WriteTarget<'_>,
+    ctx: &PolicyContext,
+    bounds: &[crate::sql::parser::BoundInsert],
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
+    expected_schema: Option<&crate::catalog::TableSchema>,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
+    project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
+) -> Result<(InsertOutcome, bool), SqlSurfaceError> {
     let Some(first) = bounds.first() else {
         return Err(SqlSurfaceError::invalid_input(
             "INSERT batch must contain at least one row",
         ));
     };
     if bounds.len() == 1 {
-        return execute_insert_with_schema_in(
+        return execute_insert_with_schema_in_projecting(
             target,
             ctx,
             first,
             ledger_mode,
             expected_schema,
             triggers,
+            project,
         );
     }
 
@@ -6654,13 +6814,17 @@ pub(crate) fn execute_insert_batch_with_schema_in(
         expected_schema,
         &volatile,
         triggers,
+        project,
     )
     .map_err(map_insert_write_error)?;
 
-    Ok(InsertOutcome {
-        rows_affected: report.rows_written,
-        incremental: None,
-    })
+    Ok((
+        InsertOutcome {
+            rows_affected: report.rows_written,
+            incremental: None,
+        },
+        report.trigger_path,
+    ))
 }
 
 /// `INSERT ... SELECT` の内側 SELECT 評価**前**の台帳事前照合（SQL-51 (5)・Issue #1733）。
@@ -6769,9 +6933,11 @@ fn volatile_default_columns_of(
 /// 呼び出し元（`core.rs`）が束縛段で `42601` 拒否するため本関数へは到達しない
 /// 契約（サーバー側チャンク化行を返す応答形が未定義のため fail-closed）。
 /// 既存の書き込み経路（[`execute_insert_batch_with_schema`]）をそのまま通した
-/// うえで、書き込んだ値そのもの（`bounds[*].values`。既定値・トリガの類は
-/// 存在しないため常に書き込んだ値と一致する）を `RowDescription` へ再読み込み
-/// なしで投影する。
+/// うえで、書き込んだ値そのもの（`bounds[*].values`。INSERT トリガの無い表では
+/// 既定値・トリガの類が無いため常に書き込んだ値と一致する）を `RowDescription` へ再読み込み
+/// なしで投影する。INSERT トリガのある表（Issue #3192）では、トリガ適用後の最終行
+/// （BEFORE が書き換えた NEW）が書き込み後にしか確定しないため、書いた各行を txn 内・commit 前に
+/// 投影コールバックで集めて採用する（`InsertWriteReport::trigger_path`）。
 ///
 /// **RLS 可視性の検査（fail-closed）**: 挿入行の tenant は常に `ctx.tenant_id()`・
 /// visibility は常に `Private` 固定。`ctx` から不可視（`Public` のみの
@@ -6792,6 +6958,7 @@ pub fn execute_insert_returning(
         ledger_mode,
         returning,
         schema,
+        None,
     )
 }
 
@@ -6839,6 +7006,29 @@ fn sequence_patched_values(
     Ok(values)
 }
 
+/// 束縛済み INSERT 群の対象表名（空は空文字。呼び出し元が空でないことを先に保証する）。
+fn schema_table_key(bounds: &[crate::sql::parser::BoundInsert]) -> &str {
+    bounds.first().map(|b| b.table.as_str()).unwrap_or("")
+}
+
+/// `tenant` の表 `table` に INSERT イベントのトリガがあるか（事前投影の要否判定用。読み取りのみ）。
+fn table_has_insert_triggers<R: crate::storage::read_source::ReadSource>(
+    src: &R,
+    tenant: &str,
+    table: &str,
+) -> Result<bool, SqlSurfaceError> {
+    let defs =
+        crate::catalog::trigger::list_triggers_in_source(src, tenant, table).map_err(|e| {
+            SqlSurfaceError::Internal {
+                detail: format!("trigger lookup failed: {e}"),
+            }
+        })?;
+    Ok(defs.iter().any(|t| {
+        t.events
+            .contains(crate::catalog::trigger::TriggerEvents::INSERT)
+    }))
+}
+
 /// `INSERT` の挿入行に固定で付く可視性（書き込み側と RETURNING の可視性検査で共有する）。
 const INSERT_ROW_VISIBILITY: crate::storage::Visibility = crate::storage::Visibility::Private;
 
@@ -6854,6 +7044,9 @@ pub(crate) fn execute_insert_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     schema: &TableSchema,
+    // INSERT トリガの通過証（Issue #3192）。`RETURNING` 付きでも該当トリガを発火する。公開の非セッション入口は
+    // `None`（該当トリガがあれば `0A000`）。
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     // codex-review Low 指摘（PR #873）対応: `column_meta`・`project_row` は
     // いずれも `bounds`（呼び出し元が既に束縛済みの書き込み予定値）・
@@ -6885,24 +7078,54 @@ pub(crate) fn execute_insert_returning_in(
     let has_sequence = bounds
         .iter()
         .any(|b| b.id_omitted || b.volatile_default_columns.iter().any(is_sequence_mark));
+    // 式項目（Issue #3249）は文ごとに 1 回だけコンパイルする。採番・`id` 省略の仮値では式を正しく
+    // 評価できず（`10 / seq_col` が仮値 0 で誤って拒否される）、払い出し後の再投影は commit 後に
+    // 失敗しうる（commit 成功境界の違反）ため、この組み合わせは書き込み前に fail-closed で拒否する。
+    let mut projector = crate::sql::returning::ReturningProjector::new(returning, schema);
+    if projector.has_computed() && has_sequence {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "RETURNING expressions are not supported with sequence-assigned values yet",
+        ));
+    }
     let mut rows = Vec::new();
     let mut budget = 0usize;
+    // INSERT トリガがある表では、BEFORE が値を短縮したり行をスキップしたりして最終行が入力値より小さく
+    // なり得るため、入力値の事前投影による予算拒否（`54000`）を行わない。実際に返す行の予算は txn 内の
+    // 収集（下の `returning_collector`）が検査する（Issue #3192）。トリガの無い表は従来どおり。
+    // 生成列（TABLE-50・Issue #3328）を持つ表も同様に、束縛値には生成列の値が無く、計算後の値は書き込み txn 内で
+    // しか確定しないため、事前投影を省いて txn 内の収集（計算後の行）の結果を採用する。
+    let has_generated = schema.columns.iter().any(|c| c.generated.is_some());
+    let skip_pre_projection = match (&target, triggers) {
+        _ if has_generated => true,
+        (_, None) => false,
+        (crate::tenant::WriteTarget::InTxn(txn), Some(_)) => {
+            table_has_insert_triggers(*txn, ctx.tenant_id(), schema_table_key(bounds))?
+        }
+        (crate::tenant::WriteTarget::Autocommit(storage), Some(_)) => {
+            use redb::ReadableDatabase as _;
+            let read = storage
+                .db()
+                .begin_read()
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("trigger lookup failed: {e}"),
+                })?;
+            table_has_insert_triggers(&read, ctx.tenant_id(), schema_table_key(bounds))?
+        }
+    };
     for bound in bounds {
+        if skip_pre_projection {
+            break;
+        }
         if has_sequence {
             let probe = sequence_patched_values(bound, schema, |_| Some(0))?;
             rows.push(mask_returning_row_id(
                 schema,
-                crate::sql::returning::project_row(bound.id, &probe, returning, &mut budget)?,
+                projector.project_row(bound.id, &probe, &mut budget)?,
             ));
         } else {
             rows.push(mask_returning_row_id(
                 schema,
-                crate::sql::returning::project_row(
-                    bound.id,
-                    &bound.values,
-                    returning,
-                    &mut budget,
-                )?,
+                projector.project_row(bound.id, &bound.values, &mut budget)?,
             ));
         }
     }
@@ -6926,25 +7149,74 @@ pub(crate) fn execute_insert_returning_in(
         }
         _ => None,
     };
-    let insert_outcome =
-        execute_insert_batch_with_schema_in(target, ctx, bounds, ledger_mode, Some(schema), None)?;
+    // トリガ経路では最終行（BEFORE が書き換えた後の NEW）が書き込み後にしか確定しないため、書いた各行を
+    // txn 内・commit 前に集める（投影の失敗は txn の abort。台帳・行・トリガの書き込みは残らない）。
+    // 事前投影（上）は fail-fast の予算検査として残し、トリガ経路ではこちらの結果を採用する。
+    let mut trigger_rows: Vec<ResultRow> = Vec::new();
+    let mut trigger_budget = 0usize;
+    let mut trigger_project = returning_collector(
+        ctx,
+        returning,
+        schema,
+        schema.is_allocated(),
+        &mut trigger_budget,
+        &mut trigger_rows,
+    );
+    let (insert_outcome, trigger_path) = execute_insert_batch_with_schema_in_projecting(
+        target,
+        ctx,
+        bounds,
+        ledger_mode,
+        Some(schema),
+        triggers,
+        // トリガ判定の確定は書き込み txn 内。事前判定とずれてトリガ無し経路になった場合も、tenant 側が
+        // commit 前にこの収集で予算を検査する（Issue #3192）。トリガ機構が無い構成（`None`）では渡さない。
+        (triggers.is_some() || has_generated)
+            .then_some(&mut trigger_project as &mut crate::tenant::ReturningProjectFn<'_>),
+    )?;
+    drop(trigger_project);
 
-    if has_sequence {
+    if trigger_path || has_generated {
+        // 払い出し値は `final_row` に入っているため再投影は不要。ただし採番の受け渡し値は持ち越さない。
+        if has_sequence {
+            let _ = crate::sql::sequence_scope::take_assigned();
+        }
+        return Ok(ReturningOutcome {
+            command: crate::sql::returning::DmlCommand::Insert,
+            rows_affected: insert_outcome.rows_affected,
+            result: QueryResult {
+                columns,
+                rows: trigger_rows,
+            },
+        });
+    }
+
+    // 事前判定（別 snapshot）ではトリガありとして事前投影を省いたが、書き込み txn の計画ではトリガ無し
+    // （判定後に最後の INSERT トリガが DROP された）場合は `trigger_rows` を使わない。トリガが
+    // 走っていないので書き込んだ値は束縛値そのものであり、ここで束縛値から投影し直して行の欠落を防ぐ。
+    // 予算検査は tenant 側が commit 前に同じ収集で済ませているため、ここでの投影は失敗しない。
+    if has_sequence || skip_pre_projection {
         // 行・列をキーにした索引を一度だけ構築し、RETURNING の検索を線形時間に保つ
         // （重複記録は先頭を優先。従来の線形 `find` と同じ意味論）。
         let mut assigned: std::collections::HashMap<(usize, usize), i64> =
             std::collections::HashMap::new();
-        for (r, c, v) in crate::sql::sequence_scope::take_assigned() {
-            assigned.entry((r, c)).or_insert(v);
+        if has_sequence {
+            for (r, c, v) in crate::sql::sequence_scope::take_assigned() {
+                assigned.entry((r, c)).or_insert(v);
+            }
         }
         rows.clear();
         let mut budget = 0usize;
         for (row_idx, bound) in bounds.iter().enumerate() {
             // 払い出し値が記録されていない列は黙って 0 にせず内部不整合として拒否する
             // （fail-closed。書き込みは commit 済みだが、誤った値を返すより失敗を返す）。
-            let values = sequence_patched_values(bound, schema, |col| {
-                assigned.get(&(row_idx, col)).copied()
-            })?;
+            let values = if has_sequence {
+                sequence_patched_values(bound, schema, |col| {
+                    assigned.get(&(row_idx, col)).copied()
+                })?
+            } else {
+                bound.values.clone()
+            };
             let row_id = if bound.id_omitted {
                 let assigned_id = assigned
                     .get(&(row_idx, crate::sql::sequence_scope::PSEUDO_ID_COLUMN))
@@ -6959,7 +7231,7 @@ pub(crate) fn execute_insert_returning_in(
             };
             rows.push(mask_returning_row_id(
                 schema,
-                crate::sql::returning::project_row(row_id, &values, returning, &mut budget)?,
+                projector.project_row(row_id, &values, &mut budget)?,
             ));
         }
     }
@@ -7014,6 +7286,7 @@ pub fn execute_upsert(
         bound,
         ledger_mode,
         bound_schema,
+        None,
     )
 }
 
@@ -7028,8 +7301,17 @@ pub(crate) fn execute_upsert_in(
     bound: &BoundUpsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     bound_schema: &crate::catalog::TableSchema,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
-    let rows_affected = execute_upsert_inner(target, ctx, bound, ledger_mode, bound_schema, None)?;
+    let rows_affected = execute_upsert_inner(
+        target,
+        ctx,
+        bound,
+        ledger_mode,
+        bound_schema,
+        triggers,
+        None,
+    )?;
     Ok(InsertOutcome {
         rows_affected,
         incremental: None,
@@ -7058,6 +7340,7 @@ pub fn execute_upsert_returning(
         ledger_mode,
         returning,
         bound_schema,
+        None,
     )
 }
 
@@ -7072,6 +7355,7 @@ pub(crate) fn execute_upsert_returning_in(
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     returning: &[crate::sql::parser::ProjectedColumn],
     bound_schema: &crate::catalog::TableSchema,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
 ) -> Result<ReturningOutcome, SqlSurfaceError> {
     let columns = crate::sql::returning::column_meta(returning, bound_schema)?;
     let mut rows: Vec<ResultRow> = Vec::new();
@@ -7079,6 +7363,7 @@ pub(crate) fn execute_upsert_returning_in(
     let mut project = returning_collector(
         ctx,
         returning,
+        bound_schema,
         bound_schema.is_allocated(),
         &mut budget,
         &mut rows,
@@ -7089,6 +7374,7 @@ pub(crate) fn execute_upsert_returning_in(
         bound,
         ledger_mode,
         bound_schema,
+        triggers,
         Some(&mut project),
     )?;
     drop(project);
@@ -7108,6 +7394,7 @@ fn execute_upsert_inner(
     bound: &BoundUpsert,
     ledger_mode: crate::recovery::required_op_id::LedgerMode,
     bound_schema: &crate::catalog::TableSchema,
+    triggers: Option<&crate::trigger::TriggerRuntime>,
     project: Option<&mut crate::tenant::ReturningProjectFn<'_>>,
 ) -> Result<u64, SqlSurfaceError> {
     use crate::storage::Visibility;
@@ -7214,6 +7501,7 @@ fn execute_upsert_inner(
             ledger_write,
             Some(bound_schema),
             &volatile,
+            triggers,
         ),
         Some(project) => crate::tenant::upsert_typed_rows_capturing_unchecked(
             target,
@@ -7226,6 +7514,7 @@ fn execute_upsert_inner(
             ledger_write,
             Some(bound_schema),
             &volatile,
+            triggers,
             project,
         ),
     }
@@ -7565,6 +7854,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: None,
+                norms: None,
             };
             adapter.search(SearchInput {
                 ids: &[1_u64, 2],
@@ -7588,6 +7878,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: None,
+                norms: None,
             };
             adapter.search(SearchInput {
                 ids: &[0_u64, 1, 2],
@@ -7629,6 +7920,7 @@ mod tests {
             let adapter = CosineDenseAdapter {
                 inner: &inner,
                 dense_slots: Some(&[1_u32]),
+                norms: None,
             };
             adapter.search(SearchInput {
                 ids: &[0_u64, 1],
@@ -7641,6 +7933,70 @@ mod tests {
         assert!(run(vec![dh(0, 0.1)]).is_err());
         assert!(run(vec![dh(0, 0.1), dh(1, 0.2)]).is_err());
         assert!(run(vec![dh(1, 0.2)]).is_ok());
+    }
+
+    /// Issue #3217 レビュー指摘: ノルム² は adapter 構築では計算せず、全走査経路に入った時点で
+    /// 初めて計算する（構築のみ・`dense_slots` 部分集合経路では計算しない）。
+    #[test]
+    fn cosine_dense_adapter_computes_norms_lazily_only_on_full_scan() {
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+        let path = unique_db_path("exec-norms-lazy");
+        let _guard = CleanupGuard(path.clone());
+        let storage = crate::storage::Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&crate::catalog::TableSchema::new(
+                "docs",
+                vec![
+                    crate::catalog::ColumnDef::new("path", crate::catalog::ColumnType::Text, false),
+                    crate::catalog::ColumnDef::new(
+                        "embedding",
+                        crate::catalog::ColumnType::Vector(2),
+                        false,
+                    ),
+                ],
+            ))
+            .expect("create table");
+        let arena = VectorArena::build(&storage, "docs").expect("arena");
+        let ctx = crate::policy::PolicyContext::new("tenant-a").expect("ctx");
+        let snap = std::sync::Arc::new(crate::sql::arena_cache::SqlArenaSnapshot::new(
+            arena,
+            Vec::new(),
+            ctx,
+            0,
+        ));
+        let src = FullScanNormsSource {
+            snapshot: Some(&snap),
+            arena: snap.arena(),
+            mask_kept_slots: None,
+            slot_count: 0,
+        };
+        let inner = CosineOnly(Vec::new());
+        let input = || SearchInput {
+            ids: &[],
+            vectors: &[],
+            dim: 2,
+            query: &[1.0, 0.0],
+            k: 1,
+        };
+        // 構築のみ（HNSW 選択時に相当）: 計算されない。
+        let adapter = CosineDenseAdapter {
+            inner: &inner,
+            dense_slots: None,
+            norms: Some(src),
+        };
+        assert!(!snap.row_norms_sq_is_computed());
+        // 部分集合経路: 計算されない。
+        let subset_inner = CosineSubsetOnly(Vec::new());
+        let subset = CosineDenseAdapter {
+            inner: &subset_inner,
+            dense_slots: Some(&[]),
+            norms: Some(src),
+        };
+        subset.search(input()).expect("subset search");
+        assert!(!snap.row_norms_sq_is_computed());
+        // 全走査経路: ここで初めて計算される。
+        adapter.search(input()).expect("full scan");
+        assert!(snap.row_norms_sq_is_computed());
     }
 
     /// Issue #1991: HYBRID 密側アダプタは NaN 行を除き、`1 - d` のスコア降順・同点は id 昇順で返す。
@@ -7656,6 +8012,7 @@ mod tests {
         let adapter = CosineDenseAdapter {
             inner: &inner,
             dense_slots: None,
+            norms: None,
         };
         let ids = [4_u64, 2, 7, 1, 9];
         let hits = adapter
@@ -8173,8 +8530,11 @@ mod tests {
             let projection = [ProjectedColumn::Id];
             let mut budget = 0usize;
             let mut rows = Vec::new();
+            let schema = crate::catalog::TableSchema::new("docs", Vec::new());
             let result =
-                returning_collector(ctx, &projection, false, &mut budget, &mut rows)(&row(origin));
+                returning_collector(ctx, &projection, &schema, false, &mut budget, &mut rows)(
+                    &row(origin),
+                );
             (result, rows)
         }
 

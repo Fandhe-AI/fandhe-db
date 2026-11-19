@@ -8,14 +8,15 @@
 //!
 //! 出力語彙は JOIN の `EXPLAIN`（`sql::join::explain`）と同じ閉じた集合
 //! （`set_operation`・`set_operator`・`scan`・`relation`・`aggregate`・`group_keys`・`aggregates`・
-//! `having`・`sort`・`sort_keys`・`limit`・`offset`）。表名・別名・LIMIT／OFFSET の値・行数は
+//! `having`・`sort`・`sort_keys`・`limit`・`offset`）に、定数枝の葉 `result`（`source: constant`）を足す。表名・別名・LIMIT／OFFSET の値・行数は
 //! 出さない（SQL-75 (5)。テナント存在情報と利用者リテラルの露出を避ける）。
 
 use crate::sql::allowlist::{SetOperator, SetTree, ValidatedSetOperation};
 use crate::sql::explain_tree::{present, ExplainNode, ExplainTreeError};
 use crate::sql::set_op::{BoundSetLeaf, LeafShape};
 
-/// 集合演算の段の木を組み立てる。外側から全体 `limit`（あるときだけ）→ `set_operation` の入れ子 →
+/// 集合演算の段の木を組み立てる。外側から全体 `limit`（あるときだけ）→ 全体 `sort`（あるときだけ）→
+/// `set_operation` の入れ子 →
 /// 葉（`scan`、枝内 `limit`／`sort`／`aggregate` 付き）。`leaves` と `leaf_lines` の長さが木の葉の数と
 /// 違うときは fail-closed（[`ExplainTreeError::InvalidLine`]）。再帰の深さは構文段の上限
 /// （枝 16・括弧 4）で抑えられる。
@@ -31,6 +32,15 @@ pub(crate) fn explain_tree(
     let mut shapes = leaves.iter().map(|l| &l.shape);
     let mut ordinal = 0usize;
     let mut current = build(&validated.tree, &mut shapes, &mut lines, &mut ordinal)?;
+    // Issue #3267: 全体 `ORDER BY` は合成結果の外側・全体 `limit` の内側（実行順の逆）。キー名は出さない。
+    if !validated.order_by.is_empty() {
+        let mut node = ExplainNode::try_stage(
+            "sort".to_string(),
+            vec![format!("sort_keys: {}", validated.order_by.len())],
+        )?;
+        node.push_child(current)?;
+        current = node;
+    }
     if validated.limit.is_some() || validated.offset != 0 {
         let mut node = ExplainNode::try_stage(
             "limit".to_string(),
@@ -57,7 +67,9 @@ fn operator_token(op: SetOperator) -> &'static str {
         SetOperator::Union => "union",
         SetOperator::UnionAll => "union_all",
         SetOperator::Intersect => "intersect",
+        SetOperator::IntersectAll => "intersect_all",
         SetOperator::Except => "except",
+        SetOperator::ExceptAll => "except_all",
     }
 }
 
@@ -76,6 +88,18 @@ fn build<'a>(
             node.push_child(build(left, shapes, lines, ordinal)?)?;
             node.push_child(build(right, shapes, lines, ordinal)?)?;
             Ok(node)
+        }
+        // Issue #3271: 定数枝は葉 `result`（`source: constant`。`cte_explain` と同じ語彙）。
+        // `relation:` の序数は位置ベースで、定数枝も葉の位置を 1 つ消費する（`result` 葉自体は
+        // `relation:` 行を持たない）。走査分類の行は空でなければ対応が崩れているので fail-closed。
+        SetTree::ConstBranch(_) => {
+            shapes.next().ok_or(ExplainTreeError::InvalidLine)?;
+            let const_lines = lines.next().ok_or(ExplainTreeError::InvalidLine)?;
+            if !const_lines.is_empty() {
+                return Err(ExplainTreeError::InvalidLine);
+            }
+            *ordinal = ordinal.saturating_add(1);
+            crate::sql::cte_explain::const_result_leaf()
         }
         SetTree::Branch(_) | SetTree::LimitedBranch(_) | SetTree::AggregateBranch(_) => {
             let shape = shapes.next().ok_or(ExplainTreeError::InvalidLine)?;

@@ -137,6 +137,10 @@ foreign key constraint` 相当）でテナント・値・行・表名を含ま�
 1 行でも違反があれば `23503` で副作用ゼロに拒否）→ `encode_schema` → カタログ
 挿入 → 子テーブルの世代 bump → commit。確定した制約名を返す。
 
+採番方式（Allocated）の親への `REFERENCES parent (id)` は、既存行の再検証でも親の宣言した
+`id` 列を普通の列として扱う（正準キーの照会・走査。親テナントの物理キー範囲に閉じる。
+[foreign-key.md](foreign-key.md) D24、Issue #3181）。疑似列を持つ親だけが物理キーの点照会になる。
+
 ### F8. 判定順（DROP。決定的・fail-closed）
 
 名前の検索は **UNIQUE → FOREIGN KEY → CHECK** の順（どれにも無ければ

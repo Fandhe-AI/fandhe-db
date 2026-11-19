@@ -25,9 +25,10 @@ const BIG: &str = "big";
 const MIB: usize = 1024 * 1024;
 
 fn schema() -> TableSchema {
-    let col = |name: &str, ty: ColumnType, c: Option<Collation>| ColumnDef {
-        collation: c,
-        ..ColumnDef::new(name, ty, true)
+    let col = |name: &str, ty: ColumnType, c: Option<Collation>| {
+        let mut def = ColumnDef::new(name, ty, true);
+        def.collation = c;
+        def
     };
     TableSchema::new(
         TABLE,
@@ -463,7 +464,7 @@ fn argument_shape_and_type_errors_are_rejected_fail_closed() {
     for sql in [
         "SELECT sum(k, 1) FROM t",
         "SELECT count(s ORDER BY s) FROM t",
-        "SELECT sum(DISTINCT k) FROM t",
+        "SELECT variance(DISTINCT k) FROM t",
         "SELECT string_agg(max(s), ',') FROM t",
     ] {
         assert_eq!(code_of(&core, sql), "42601", "{sql}");

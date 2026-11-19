@@ -1,6 +1,6 @@
 # BEFORE ROW INSERT トリガの発火（TABLE-45・Issue #1723）
 
-- ステータス: 実装記録（発火側の意味論は engine 水準で固定。SQL だけで通す E2E は #2228 の後）
+- ステータス: 実装記録（発火側の意味論は engine 水準で固定。SQL だけで通す E2E は #3185 で追加済み）
 - 対応 Issue: #1723（親 #1720。前提 #1722・実行モデルの ADR は [trigger-execution-model.md](trigger-execution-model.md)）
 - 仕様ポインタ: `docs/spec/04-behavior/` の TABLE-45（本文は転記しない）
 
@@ -10,6 +10,7 @@
 を返してその行の挿入をやめる、という PostgreSQL 17 と同じ意味を engine に入れる。実行モデルの D2（DEFAULT
 の順序）・D3・D4 の段 1〜4・D5・D8（ガードの土台）のうち INSERT に関する部分を担当する。
 
+（記録時点の記述。#2228・#3184・#3185 で実体の結線と既定の本番化は済み、SQL・wire の E2E は #3185。）
 トリガ関数の実体（`RETURNS trigger` の PL/pgSQL 関数）は #2228 の担当で、まだ無い。したがって
 `catalog::trigger::returns_trigger` は常に `false` のままで、SQL の `CREATE TRIGGER` は `42P17` で止まる。
 本 Issue は「呼び出し口」のトレイトだけを定義し（`trigger::call`）、既定の実装は固定文言の `0A000` を返す
@@ -32,9 +33,10 @@
 | ---- | ---- |
 | SQL `INSERT ... VALUES`（単一行・複数行。autocommit・明示 Tx） | 発火 |
 | `INSERT ... SELECT` | 発火（BEFORE ROW。AFTER ROW は [trigger-after-insert.md](trigger-after-insert.md)） |
-| `INSERT ... RETURNING` | INSERT トリガのある表は `0A000`（最終値での投影は後続。下記） |
-| UPSERT（`ON CONFLICT`） | INSERT トリガのある表は `0A000`（#1725 で結線） |
-| NoSQL 表層・ファイル形 INSERT・生の `RowInput` 挿入・ビュー経由・データ変更 CTE の副文 | INSERT トリガのある表は `0A000` |
+| `INSERT ... RETURNING` | 発火（Issue #3192。返る行は BEFORE の連鎖後・制約検査後の最終 NEW。[sql-returning.md](sql-returning.md)） |
+| UPSERT（`ON CONFLICT`） | 発火（#3191。[trigger-upsert.md](trigger-upsert.md)）。`RETURNING` 付きは `0A000` |
+| NoSQL（HTTP）表層の `insert`（単行・`rows[]`。Issue #3282 で結線） | 発火する（入口が通過証と発火元の主体の写しを渡す） |
+| NoSQL の `RETURNING` 付き `insert`・ファイル形 INSERT・生の `RowInput` 挿入・ビュー経由・データ変更 CTE の副文 | INSERT トリガのある表は `0A000` |
 | 一時表・CTAS | 通過証なし（トリガの無い表のみ。ガードは常に通る） |
 
 `0A000` は書き込み txn の中でスキーマ取得の直後・台帳より前に判定する（結線していない経路は台帳に触れず、
@@ -88,8 +90,8 @@
 
 ## 後続への引き継ぎ
 
-- トリガ関数の実体・`returns_trigger` の結線・SQL E2E は #2228。**実体を結線する前に、入れ子の深さ上限
+- トリガ関数の実体・`returns_trigger` の結線は #2228、SQL・wire の E2E は #3185 で済み。**実体を結線する前に、入れ子の深さ上限
   （D11・#1727）が要る**（同じ表に INSERT するトリガは無限再帰になりうる）
-- `RETURNING` の最終値での投影（txn 内の投影コールバック）、文トリガ（#1726）、
+- 文トリガ（#1726）、
   UPSERT・UPDATE／DELETE（#1725）、crash-test と越境マトリクス（#1728）
 - D9 の共有 `public` 表の全テナント発火（オーナー・spec 側の判断）

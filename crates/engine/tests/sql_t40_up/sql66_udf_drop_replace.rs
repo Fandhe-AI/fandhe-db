@@ -528,9 +528,10 @@ fn replace_rejects_cycles_and_leaves_state_unchanged() {
     );
 }
 
-/// DDL 権限ありの明示トランザクション内の OR REPLACE は 0A000（取り消せない永続書き込みをしない）。
+/// DDL 権限ありの明示トランザクション内の OR REPLACE は共有 write txn へ積まれ（SQL-80・Issue #3316）、
+/// ROLLBACK では元の定義のまま残る。
 #[test]
-fn replace_inside_explicit_transaction_is_rejected_for_ddl_sessions() {
+fn replace_inside_explicit_transaction_is_rolled_back_for_ddl_sessions() {
     let path = unique_db_path("sql66-dr-replace-txn");
     let _g = CleanupGuard(path.clone());
     let core = open(&path);
@@ -540,17 +541,20 @@ fn replace_inside_explicit_transaction_is_rejected_for_ddl_sessions() {
     let mut txn = core.new_session_transaction();
     core.execute_sql_in_txn(&alice, &mut s, &mut txn, "BEGIN")
         .expect("begin");
-    let err = core
-        .execute_sql_in_txn(
-            &alice,
-            &mut s,
-            &mut txn,
-            "CREATE OR REPLACE FUNCTION pre(x) AS x + 1",
-        )
-        .expect_err("persistent DDL inside a transaction must be rejected");
-    assert_eq!(err.wire_code(), "0A000");
+    core.execute_sql_in_txn(
+        &alice,
+        &mut s,
+        &mut txn,
+        "CREATE OR REPLACE FUNCTION pre(x) AS x + 1",
+    )
+    .expect("replace in explicit txn");
     core.execute_sql_in_txn(&alice, &mut s, &mut txn, "ROLLBACK")
         .expect("rollback");
+    // 別セッションが読む定義は元のまま。
+    let mut other = loaded(&core, "alice", false);
+    assert!(other.udfs().get("pre").is_some());
+    core.refresh_session_udfs(&ctx("alice"), &mut other);
+    assert!(other.udfs().get("pre").is_some());
 }
 
 /// SQL-66・#2798: DDL セッションの型付き・RETURNS つきの OR REPLACE は永続化される。

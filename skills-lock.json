@@ -11,97 +11,97 @@
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/apple-silicon/SKILL.md",
-      "computedHash": "80e401bc1f70bbf01f291ac9c33dd8fe53e1fa1d1ccb29695c9524c5c20c90d0"
+      "computedHash": "136c6f8af5572bcd720130bcdbdfdeb84fca7800279a10920235bfbaa15abcb7"
     },
     "comment-code": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/comment-code/SKILL.md",
-      "computedHash": "6c37b2c182cf80dba8dcbf5381fdb9797c12691c71e8bcaccf727e778f07e902"
+      "computedHash": "c0beb068354a58b5e74c76bba9d2336d1d02d023bd0ec73739337c62993c384a"
     },
     "commitlint": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/commitlint/SKILL.md",
-      "computedHash": "279f34d003dabaabb41b9e29ed943c3aba5623898ef924ce37676482d3de15c3"
+      "computedHash": "5806fec66f14687b05ed61d787e7e67630c1d8edc8301a16c56bb33ed4c0f6fb"
     },
     "contribute-skill": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/contribute-skill/SKILL.md",
-      "computedHash": "05c26806a1fb7c5cfe7576c9339a4edb407a5284d0f3553a69579588df1d0f3f"
+      "computedHash": "d85eb3d38740df7161401dbed4d3a32580fa2f4e77f520b85f37deeb7dff8b06"
     },
     "create-commit": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/create-commit/SKILL.md",
-      "computedHash": "abacabffa6a0c000474467bf5cb823b2d1bd288d41f9a27c4d7902c953d68d00"
+      "computedHash": "77ba8d6f43816fabfdc7d73068688235c74a18dcc923efabfa2d8c9d553e02c9"
     },
     "create-issue": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/create-issue/SKILL.md",
-      "computedHash": "711dc73fcb1c1d0d5f3050b9ae90ed94d2a8f2fdca7bbcb45a3993c84f93d19f"
+      "computedHash": "e6dbbc8faa9ea38e3340ba825f18ab19d0d1da2f13fd850c65928c8aa82c7f14"
     },
     "create-issue-tree": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/create-issue-tree/SKILL.md",
-      "computedHash": "a1dc4356dc377badf14b24c3df609754a7b57a1405f46ca8ca08eaecbe31ce2b"
+      "computedHash": "7f8428dec66d9134c047d12a7d03e42d1808744cfa4374e4469cbf1698d2e8de"
     },
     "create-plan": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/create-plan/SKILL.md",
-      "computedHash": "b711dacee9edf271d8f9b96d135bff9faaa1c0b44f4a70cde59e0536f7f2eb3d"
+      "computedHash": "a100f5502e957d9e24875f25dec78f384b4c1e640f920be0f96b94dd216bd8f7"
     },
     "create-pr": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/create-pr/SKILL.md",
-      "computedHash": "89978f30972c3de1774b2f0b9e60d43a5dbb28ff82b44799e39078156364482e"
+      "computedHash": "d895101f05cfe9de4f88b7e8277c73f0855165c010c59b38eba2b3a6faa853e4"
     },
     "editorconfig": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/editorconfig/SKILL.md",
-      "computedHash": "1db7f4583983d2e8ba09fb15de1d75887a348452f1a15635c09c5580dcf13df5"
+      "computedHash": "d3bc7c3f017aa73fb35ee179e0344d44fd4671a016ce2624c6755c858fc79210"
     },
     "github-docs": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/github-docs/SKILL.md",
-      "computedHash": "6214a8088a7b8ca99f4dfc66535cc12893afb1954accac63fe537bb605efb181"
+      "computedHash": "2ab64e8f268329ec2a8e311702e7393b6c35729c466bbcf0df6d40c7e9aa8f64"
     },
     "implement-issue": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/implement-issue/SKILL.md",
-      "computedHash": "e8ba3a074f8f14f82e37976b0a2398fceff2f8b09900525be66066c2003fdadb"
+      "computedHash": "cfa4d436bce7f95be699e511ff9966060a2a900780a00d6863eb7f169e5e6f80"
     },
     "implement-issue-tree": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/implement-issue-tree/SKILL.md",
-      "computedHash": "8874a9af66bdd46e36fcc724bc701d8ad7b71d23cfc778301942d06e5247e429"
+      "computedHash": "3f7aa055e50f8c5900c7552e1cd201e15de7e8f1486018e49d35ff34c6d0f01f"
     },
     "implement-review": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/implement-review/SKILL.md",
-      "computedHash": "4358f7dc8ca6a9da8b076fe904a31afcae0539b1520dc32bb80802e20d283193"
+      "computedHash": "a72f2239f6bc87ee5c7567e05adcc5a91e751df1367eadf6d297a08b01f7a3fa"
     },
     "implement-review-pr": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/implement-review-pr/SKILL.md",
-      "computedHash": "d57630c75b1ba0b03e4a217dd802098ac1454bf7dc69b03213c3db30546108a9"
+      "computedHash": "556669e747c4e4c82c64a8f6d2f341bfc6603c87896c3c4ef43b2337b48275ed"
     },
     "init-claude": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/init-claude/SKILL.md",
-      "computedHash": "516db36bf42c6ebcb1453c9743f5a4b84ae698ee3f6e4f6243c49c563765418f"
+      "computedHash": "059f40c2f6a84f0573d6eb16cfd420489c7225f76f5b6bcccd94e63caa8de5be"
     },
     "lefthook": {
       "source": "Fandhe-AI/agent-reference-skills",
@@ -113,49 +113,49 @@
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/make/SKILL.md",
-      "computedHash": "d0ea071b89cccec0e765324ac12533858e7cb6f979c1309a29444c54c1881a49"
+      "computedHash": "794c6b0b6c370d9f9cf69b6f1e51e495c920a27ff80d289be51fec47418d43d1"
     },
     "nvidia-cuda": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/nvidia-cuda/SKILL.md",
-      "computedHash": "995bc379a5ec9f87d0665509a6cffd4217569c748c6d1240a99ab7d25eedc980"
+      "computedHash": "8e1ba3dc257debb782d2b8646839451176e8796da21204634ad8b2fb12f7a0ee"
     },
     "rust": {
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/SKILL.md",
-      "computedHash": "fe3409df0607523fd8ce4c4f6446ec4f3bde914216c8614d13c35bfde567daff"
+      "computedHash": "bc2153892ef12a0aa1dd5c84fb424c88c8b939ef7ad3eb1a9d606790d43c758f"
     },
     "setup-repo-guards": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/setup-repo-guards/SKILL.md",
-      "computedHash": "c66413aba4b4b5cb038cc710e05151d44a7c295e60bfff3547d42daf08fb5093"
+      "computedHash": "71c3f105145816b089fea43d6b2628e2dc0f0510c1ad8f1eae4d602f58f968f8"
     },
     "sync-skills-lock": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/sync-skills-lock/SKILL.md",
-      "computedHash": "762912d567220a0b74893761c69032537177400af364bf2e4c5591d2eb1d05f7"
+      "computedHash": "3f8a9cad99ca84e06b0f9c779a7fd9edc9a7fdbc9980d351bbdfa407e0136ae8"
     },
     "update-claude": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/update-claude/SKILL.md",
-      "computedHash": "2a4c7d0e03db16fb5cbff502fb08272a60f6086c9c3f06e84416eb358f89678d"
+      "computedHash": "f8d582c1f70b78e17fe4151246d69d6545bbcaa846be68a8b358eb52341c0486"
     },
     "update-docs": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/update-docs/SKILL.md",
-      "computedHash": "4e0e4fcefdfa22d0cfdd3776bd58a4a9b544fd009ca3bf1ae814b25763055bd2"
+      "computedHash": "d9a70ffe989be67fcf17cb1124d7088a93465bab0b2a2c6fcd62cd11ed4ffcbb"
     },
     "update-issue-tree": {
       "source": "Fandhe-AI/agent-cli-skills",
       "sourceType": "github",
       "skillPath": "skills/update-issue-tree/SKILL.md",
-      "computedHash": "faf9237a454f0fca581f243896c182f399c553552cf253e66bd091ca9742cdd5"
+      "computedHash": "c260b527346c7435f3cc9b0047f322000aaca13c7759f0cb6505721b5eb746ab"
     }
   }
 }

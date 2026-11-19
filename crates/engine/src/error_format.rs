@@ -95,7 +95,7 @@ macro_rules! define_error_classes {
 pub(crate) const SHARED_WIRE_CODES: &[&str] = &["23502", "23505", "22023", "P0002"];
 
 define_error_classes! {
-    count = 103;
+    count = 105;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -285,6 +285,10 @@ define_error_classes! {
     /// 予約名（`pg_` 接頭辞）の SCHEMA 作成を拒否した（`42939`。TABLE-27・ERR-6、Issue #1713）。
     /// [`crate::sql::allowlist::SqlSurfaceError::ReservedName`] の写像。
     ReservedName => ("42939", "RESERVED_NAME"),
+    /// 要素つき `CREATE SCHEMA` の要素が、作成中の SCHEMA とは別の SCHEMA で修飾された名前を作ろうとした
+    /// （`42P15`。TABLE-27・Issue #3286）。文言には利用者が書いた名前だけを含め、他テナントの情報を含めない。
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidSchemaDefinition`] の写像。
+    InvalidSchemaDefinition => ("42P15", "INVALID_SCHEMA_DEFINITION"),
     /// `GENERATED ALWAYS AS IDENTITY` 列へ利用者が値を書こうとした（`428C9`。TABLE-24・ERR-6、
     /// Issue #1695）。スキーマだけで決まる拒否で、テナントの状態に依存しない（存在オラクルにならない）。
     /// [`crate::sql::allowlist::SqlSurfaceError::GeneratedAlways`] の写像。
@@ -395,6 +399,10 @@ define_error_classes! {
     /// できない（`42702`）。[`crate::sql::allowlist::SqlSurfaceError::
     /// AmbiguousColumn`] の写像。
     AmbiguousColumn => ("42702", "AMBIGUOUS_COLUMN"),
+    /// 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`。SQL-53 (b)・Issue #3297）で、書き込み先と
+    /// FROM／USING の表の公開名が重複した（`42712`。PG の `duplicate_alias`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::DuplicateAlias`] の写像。
+    DuplicateAlias => ("42712", "DUPLICATE_ALIAS"),
     /// 式評価の 0 除算（`22012`、Issue #1163・SQL-26・ERR-2）。
     /// [`crate::sql::allowlist::SqlSurfaceError::DivisionByZero`] の写像。
     DivisionByZero => ("22012", "DIVISION_BY_ZERO"),

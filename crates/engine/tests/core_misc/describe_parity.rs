@@ -86,6 +86,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::Truncate(_)
         | SqlOutcome::Delete(_)
         | SqlOutcome::Update(_)
+        | SqlOutcome::Merge(_)
         | SqlOutcome::CreateTable(_)
         | SqlOutcome::CreateTableAs(_)
         | SqlOutcome::DropTable(_)
@@ -114,6 +115,7 @@ fn assert_describe_matches_execute(core: &EngineCore, ctx: &PolicyContext, sql: 
         | SqlOutcome::DeclareCursor
         | SqlOutcome::Fetch(_)
         | SqlOutcome::CloseCursor
+        | SqlOutcome::Move(_)
         | SqlOutcome::Do
         | SqlOutcome::SetTransaction
         | SqlOutcome::Lock => None,

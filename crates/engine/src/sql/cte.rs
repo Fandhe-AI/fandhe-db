@@ -538,8 +538,42 @@ pub(crate) fn validate_data_modifying_cte(
             }
             cols.clone()
         }
-        // 関数呼び出し項目は RETURNING の構造検証で拒否済み（防御的に fail-closed）。
-        Projection::Items(_) => return Err(data_modifying_cte_unsupported()),
+        // 別名付き列参照・式（Issue #3248・#3249・#3251）。公開名は SELECT・基表 DML の束縛段と
+        // 同じ規則（別名 → 別名付き列参照の別名 → 既定名）で決める。式内の列は対象表の列へ照合して
+        // 未知列を `42703` にする。型・UDF の解決は実行・Describe の束縛段（`dm_cte_exec`）が担う。
+        Projection::Items(items) => {
+            let known = lookup
+                .table_columns(target)?
+                .ok_or_else(data_modifying_cte_unsupported)?;
+            let mut names = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    crate::sql::allowlist::SelectItem::Column(c) => {
+                        if !known.iter().any(|k| k == c) {
+                            return Err(SqlSurfaceError::undefined_column(c.clone()));
+                        }
+                        names.push(c.clone());
+                    }
+                    crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
+                        let mut idents = std::collections::HashSet::new();
+                        crate::sql::parser::collect_expr_idents(expr, &mut idents);
+                        let mut sorted: Vec<&String> = idents.iter().collect();
+                        sorted.sort();
+                        for ident in sorted {
+                            if !known.iter().any(|k| k == ident) {
+                                return Err(SqlSurfaceError::undefined_column(ident.clone()));
+                            }
+                        }
+                        names.push(
+                            alias
+                                .clone()
+                                .unwrap_or_else(|| crate::sql::parser::default_expr_alias(expr)),
+                        );
+                    }
+                }
+            }
+            names
+        }
     };
     if !def.column_aliases.is_empty() {
         if def.column_aliases.len() > exposed.len() {

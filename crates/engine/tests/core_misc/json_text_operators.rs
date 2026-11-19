@@ -406,7 +406,9 @@ fn json_function_results_reject_jsonb_operators_like_json_columns() {
         "to_json(1)",
         "json_extract_path(doc, 'a')",
     ];
-    let operators = ["- 'a'", "- 1", "#- '{a}'", "|| '{}'", "? 'a'", "@> '{}'"];
+    // `|| '{}'` は json（原文保存）が PostgreSQL で text 連結になるためここには含めない
+    // （Issue #3278。下で text 連結になることを固定する）。
+    let operators = ["- 'a'", "- 1", "#- '{a}'", "? 'a'", "@> '{}'"];
     for result in results {
         for op in operators {
             let via_function = code(&core, &alice, &format!("{result} {op}"));
@@ -414,6 +416,14 @@ fn json_function_results_reject_jsonb_operators_like_json_columns() {
             assert_eq!(via_function, via_column, "{result} {op}");
         }
         assert_eq!(code(&core, &alice, &format!("{result} - 'a'")), "42883");
+        // 型なしリテラルとの `||` は json 列と同じく text 連結（Issue #3278）。
+        assert!(
+            matches!(
+                cell(&core, &alice, &format!("{result} || '{{}}'")),
+                Cell::Text(_)
+            ),
+            "{result} || '{{}}'"
+        );
     }
 }
 

@@ -46,6 +46,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::CapturedRowDecodeFailed(_) => ErrorClass::InternalError,
         TenantWriteError::TooManyRowsScanned { .. } => ErrorClass::PayloadTooLarge,
         TenantWriteError::TruncateReferencedByForeignKey { .. } => ErrorClass::FeatureNotSupported,
+        // Issue #3327（TABLE-50）: 生成列を持つ表への書き込みの暫定拒否は `0A000`。
+        TenantWriteError::GeneratedColumnWriteUnsupported => ErrorClass::FeatureNotSupported,
         TenantWriteError::UniqueViolation => ErrorClass::UniqueViolation,
         TenantWriteError::CheckViolation { .. } => ErrorClass::CheckViolation,
         TenantWriteError::WithCheckOptionViolation => ErrorClass::WithCheckOptionViolation,
@@ -56,6 +58,8 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
         TenantWriteError::IndexExpressionEvaluationFailed(inner) => inner.error_class(),
         // Issue #1544: SET 右辺式の評価エラーも内側の分類へ委譲する。
         TenantWriteError::SetExpressionEvaluationFailed(inner) => inner.error_class(),
+        // Issue #3249: RETURNING 式項目の評価エラーも内側の分類へ委譲する。
+        TenantWriteError::ReturningExpressionFailed(inner) => inner.error_class(),
         // Issue #1690: nextval／currval の採番・解決の失敗も内側の分類へ委譲する。
         TenantWriteError::SequenceEvaluationFailed(inner) => inner.error_class(),
         // Issue #1723: BEFORE ROW INSERT トリガの発火失敗も内側の分類へ委譲する。
@@ -74,6 +78,9 @@ fn expected_class(e: &TenantWriteError) -> ErrorClass {
 /// `crates/engine/tests/error_format.rs` が別途カバーするため、ここでは
 /// 網羅 `match`（本ファイルの `expected_class`）のコンパイル固定が主目的。
 #[test]
+// `GeneratedColumnWriteUnsupported` は計算点が結線されていない経路（ファイル形 INSERT・生の `RowInput`・未結線の入口）の停止。
+// 結線済みの経路は SQL・COPY・NoSQL・ビュー・トリガ・FK の参照アクション（#3328・#3329）で、残す経路は設計で決定済み。
+// intentional: docs/design/generated-column.md
 fn tenant_write_error_class_matches_expected_for_constructible_variants() {
     let cases = [
         TenantWriteError::Forbidden,
@@ -90,6 +97,7 @@ fn tenant_write_error_class_matches_expected_for_constructible_variants() {
             table: "p".to_string(),
             referencing_table: "c".to_string(),
         },
+        TenantWriteError::GeneratedColumnWriteUnsupported,
         TenantWriteError::UniqueViolation,
         TenantWriteError::ForeignKeyViolation,
         TenantWriteError::ReferentialActionLimitExceeded,

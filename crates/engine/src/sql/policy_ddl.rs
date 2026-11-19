@@ -5,8 +5,8 @@
 //! ValidatedDropPolicy}`）をポリシーカタログ（`catalog::policy`）への書き込みへ写し、`CatalogError` を
 //! SQLSTATE の契約へ写像する。式の束縛は `sql::policy_expr` がカタログの write txn の中のスキーマに対して
 //! 行う。呼び出し元は `core.rs` の `ParsedSql::{CreatePolicy, AlterPolicy, DropPolicy}` 腕で、DDL 権限ゲート
-//! （`sql::ddl::require_ddl_permission`。権限なしは対象の有無を問わず `42501`）と明示トランザクション内の
-//! `0A000` を通過した後にだけ来る。表の所有者の判定はロール機構が入るまでこの権限ゲートで代替する。
+//! （`sql::ddl::require_ddl_permission`。権限なしは対象の有無を問わず `42501`）を通過した後にだけ来る（明示トランザクション内は共有 write txn の上で
+//! 同じ本体を実行する。Issue #3316）。表の所有者の判定はロール機構が入るまでこの権限ゲートで代替する。
 //!
 //! 判定順（決定的・fail-closed）: 構文（`allowlist`）→ 権限 → 明示 Tx → カタログの単一 write txn 内で
 //! 対象の種別（ビュー等は `42809`）→ 表の存在（`42P01`）→ 式の束縛（未知列 `42703`・非真偽値 `42804`）→
@@ -85,6 +85,17 @@ pub(crate) fn execute_create_policy(
     tenant_id: &str,
     stmt: &ValidatedCreatePolicy,
 ) -> Result<CreatePolicyOutcome, SqlSurfaceError> {
+    execute_create_policy_in(storage, None, tenant_id, stmt)
+}
+
+/// [`execute_create_policy`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn。
+/// SQL-80・Issue #3316）。
+pub(crate) fn execute_create_policy_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &ValidatedCreatePolicy,
+) -> Result<CreatePolicyOutcome, SqlSurfaceError> {
     let def = PolicyDef {
         id: 0,
         name: stmt.name.clone(),
@@ -96,7 +107,7 @@ pub(crate) fn execute_create_policy(
         referenced_columns: Vec::new(),
     };
     storage
-        .create_policy(tenant_id, &stmt.table, &def, |schema| {
+        .create_policy_in(target, tenant_id, &stmt.table, &def, |schema| {
             let using = bind_opt(stmt.using.as_ref(), schema)?;
             let check = bind_opt(stmt.check.as_ref(), schema)?;
             let referenced_columns = merge_referenced_columns(
@@ -122,10 +133,20 @@ pub(crate) fn execute_alter_policy(
     tenant_id: &str,
     stmt: &ValidatedAlterPolicy,
 ) -> Result<AlterPolicyOutcome, SqlSurfaceError> {
+    execute_alter_policy_in(storage, None, tenant_id, stmt)
+}
+
+/// [`execute_alter_policy`] の書き込み先を選べる版（`target` の扱いは [`execute_create_policy_in`] と同じ）。
+pub(crate) fn execute_alter_policy_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &ValidatedAlterPolicy,
+) -> Result<AlterPolicyOutcome, SqlSurfaceError> {
     match &stmt.action {
         AlterPolicyAction::Rename(new_name) => {
             storage
-                .rename_policy(tenant_id, &stmt.table, &stmt.name, new_name)
+                .rename_policy_in(target, tenant_id, &stmt.table, &stmt.name, new_name)
                 .map_err(|e| {
                     let e: PolicyDdlError = e.into();
                     // 不在は旧名、改名先の重複は新名を報告する。
@@ -146,50 +167,56 @@ pub(crate) fn execute_alter_policy(
             check,
         } => {
             storage
-                .alter_policy(tenant_id, &stmt.table, &stmt.name, |schema, current| {
-                    if using.is_some() && !current.command.allows_using() {
-                        return Err(PolicyDdlError::Sql(SqlSurfaceError::unsupported(
-                            "only WITH CHECK expression allowed for INSERT",
-                        )));
-                    }
-                    if check.is_some() && !current.command.allows_check() {
-                        return Err(PolicyDdlError::Sql(SqlSurfaceError::unsupported(
-                            "WITH CHECK cannot be applied to SELECT or DELETE",
-                        )));
-                    }
-                    let new_using = match using {
-                        Some(p) => Some(bind_policy_expr(p, schema)?),
-                        None => current
-                            .using_sql
-                            .as_deref()
-                            .map(|s| bind_stored_policy_expr(s, schema))
-                            .transpose()?,
-                    };
-                    let new_check = match check {
-                        Some(p) => Some(bind_policy_expr(p, schema)?),
-                        None => current
-                            .check_sql
-                            .as_deref()
-                            .map(|s| bind_stored_policy_expr(s, schema))
-                            .transpose()?,
-                    };
-                    let referenced_columns = merge_referenced_columns(
-                        schema,
-                        new_using
-                            .as_ref()
-                            .map_or(&[][..], |b| &b.referenced_columns),
-                        new_check
-                            .as_ref()
-                            .map_or(&[][..], |b| &b.referenced_columns),
-                    );
-                    Ok::<_, PolicyDdlError>(PolicyDef {
-                        roles: roles.clone().unwrap_or_else(|| current.roles.clone()),
-                        using_sql: new_using.map(|b| b.sql),
-                        check_sql: new_check.map(|b| b.sql),
-                        referenced_columns,
-                        ..current.clone()
-                    })
-                })
+                .alter_policy_in(
+                    target,
+                    tenant_id,
+                    &stmt.table,
+                    &stmt.name,
+                    |schema, current| {
+                        if using.is_some() && !current.command.allows_using() {
+                            return Err(PolicyDdlError::Sql(SqlSurfaceError::unsupported(
+                                "only WITH CHECK expression allowed for INSERT",
+                            )));
+                        }
+                        if check.is_some() && !current.command.allows_check() {
+                            return Err(PolicyDdlError::Sql(SqlSurfaceError::unsupported(
+                                "WITH CHECK cannot be applied to SELECT or DELETE",
+                            )));
+                        }
+                        let new_using = match using {
+                            Some(p) => Some(bind_policy_expr(p, schema)?),
+                            None => current
+                                .using_sql
+                                .as_deref()
+                                .map(|s| bind_stored_policy_expr(s, schema))
+                                .transpose()?,
+                        };
+                        let new_check = match check {
+                            Some(p) => Some(bind_policy_expr(p, schema)?),
+                            None => current
+                                .check_sql
+                                .as_deref()
+                                .map(|s| bind_stored_policy_expr(s, schema))
+                                .transpose()?,
+                        };
+                        let referenced_columns = merge_referenced_columns(
+                            schema,
+                            new_using
+                                .as_ref()
+                                .map_or(&[][..], |b| &b.referenced_columns),
+                            new_check
+                                .as_ref()
+                                .map_or(&[][..], |b| &b.referenced_columns),
+                        );
+                        Ok::<_, PolicyDdlError>(PolicyDef {
+                            roles: roles.clone().unwrap_or_else(|| current.roles.clone()),
+                            using_sql: new_using.map(|b| b.sql),
+                            check_sql: new_check.map(|b| b.sql),
+                            referenced_columns,
+                            ..current.clone()
+                        })
+                    },
+                )
                 .map_err(|e| map_policy_error(e, &stmt.name))?;
         }
     }
@@ -203,7 +230,17 @@ pub(crate) fn execute_drop_policy(
     tenant_id: &str,
     stmt: &ValidatedDropPolicy,
 ) -> Result<DropPolicyOutcome, SqlSurfaceError> {
-    match storage.drop_policy(tenant_id, &stmt.table, &stmt.name) {
+    execute_drop_policy_in(storage, None, tenant_id, stmt)
+}
+
+/// [`execute_drop_policy`] の書き込み先を選べる版（`target` の扱いは [`execute_create_policy_in`] と同じ）。
+pub(crate) fn execute_drop_policy_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &ValidatedDropPolicy,
+) -> Result<DropPolicyOutcome, SqlSurfaceError> {
+    match storage.drop_policy_in(target, tenant_id, &stmt.table, &stmt.name) {
         Ok(true) => Ok(DropPolicyOutcome { skipped: false }),
         Ok(false) | Err(CatalogError::TableNotFound(_)) if stmt.if_exists => {
             Ok(DropPolicyOutcome { skipped: true })

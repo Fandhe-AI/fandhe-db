@@ -72,6 +72,22 @@
 //!     等価の葉ではないため序数に数えない。逆向き（`$n ~ <列>`）・両辺 `$n`・式の内側の `$n`
 //!     （`lower(s) ~ $1`）・`$1::text` は `42601` のまま。判定は `noneq_leaf_at` に集約する。
 //!
+//! 12. `SELECT／UPDATE／DELETE ... WHERE (<c1>, ..., <ck>) (= | <> | < | <= | > | >=) (<d1>, ..., <dk>)` の
+//!     成分のうち、成分全体が `$n` 単独の位置（Issue #3257・SQL-9・WIRE-12 のポインタ。パターン 9 と同じ
+//!     文種・`WHERE` 領域・左右の境界規則）。同じ位置の相手成分が裸の列なら `$n` の型はその列の型、
+//!     相手も `$n` なら型を決められず宣言型が無ければ `42P18`。相手がリテラル・式・修飾列の位置、
+//!     `$n` が式の内側（`$1 + 1`）の形は登録せず `42601`。`EXPLAIN` 前置・`WITH`・集合演算は先頭語・
+//!     集合演算の allowlist で対象外のまま `42601`。判定は `row_compare_param_slots` に集約し、受理・
+//!     推論・Describe 用ダミー置換が同じ表を参照する。展開で生成される比較葉は等価述語の序数に数えない。
+//!     Describe・構造検証用のダミーは相手列の型で有効な値（`row_compare_dummy_token`）。
+//!
+//! 13. `SELECT／UPDATE／DELETE ... WHERE (<c1>, ..., <ck>) [NOT] IN ((<d1>, ..., <dk>) [, ...])` の
+//!     要素の成分のうち、成分全体が `$n` 単独で同じ位置の左辺成分が裸の列の位置（Issue #3300・SQL-9・
+//!     WIRE-12 のポインタ。パターン 12 と同じ文種・`WHERE` 領域・境界規則）。`$n` の型は左辺の列の型。
+//!     左辺成分の `$n`・リテラル／式／修飾列の左辺・要素が行でない形・サブクエリ形・スカラー
+//!     `n IN ($1)` は登録せず `42601`。判定は `row_in_param_slots` に集約し、受理・推論・Describe 用
+//!     ダミー置換が同じ表を参照する（`row_compare_param_slots` 経由）。脱糖で生成される葉は序数に数えない。
+//!
 //! `LIMIT $n`・`USING MODE $n`・`HINT ORDER($n, ...)`・`SET search_mode = $n`・
 //! `ON CONFLICT ... DO UPDATE SET a = $n`（`$n` 単独の右辺。加算形はパターン 8）・hybrid 関数
 //! 引数（`HYBRID_RRF(col, $n, ...)`）・パターン 9 以外の非等価比較（`id > $n` 等）はいずれも
@@ -220,6 +236,365 @@ fn is_where_clause_boundary(tokens: &[Token], idx: usize, in_where_region: bool)
         "ON" => ident_eq_ignore_case(next1, "CONFLICT"),
         _ => false,
     }
+}
+
+/// 先頭の `EXPLAIN` を 1 トークン剥がした本文（Issue #3297）。結合 DML の判定
+/// （`looks_like_update_from`／`looks_like_delete_using` は先頭が UPDATE／DELETE を要求する）用。
+fn strip_explain(tokens: &[Token]) -> &[Token] {
+    match tokens.first() {
+        Some(Token::Ident(w)) if w.eq_ignore_ascii_case("EXPLAIN") => {
+            tokens.get(1..).unwrap_or(&[])
+        }
+        _ => tokens,
+    }
+}
+
+/// `UPDATE ... FROM`／`DELETE ... USING`（`EXPLAIN` 前置を含む）か（Issue #3297）。位置規則が
+/// 結合 DML にだけ修飾付き列（`s.k = $1`）を認めるための判定。
+pub(crate) fn is_joined_dml(tokens: &[Token]) -> bool {
+    let body = strip_explain(tokens);
+    crate::sql::allowlist::looks_like_update_from(body)
+        || crate::sql::allowlist::looks_like_delete_using(body)
+}
+
+/// 結合 DML の Describe 用ダミーフラグの全体（Issue #3297）。`UPDATE ... FROM` は
+/// 「SET の代入ごと（宣言順。`<列> = $n` で `$n` の置換種別が String なら真）」に続けて
+/// 「WHERE の連言分ごと」（[`joined_where_conjunct_flags`]）を並べる。`DELETE ... USING` は WHERE 分だけ。
+/// 消費側（`core::dml_from_exec`）が代入数で前後を分け、個数が合わなければ全て検証側へ倒す。
+pub(crate) fn joined_dml_dummy_flags(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<bool> {
+    let body = strip_explain(tokens);
+    let mut flags = Vec::new();
+    if crate::sql::allowlist::looks_like_update_from(body) {
+        if let Some((set_idx, end)) = set_region(body) {
+            let region = body
+                .get(set_idx.saturating_add(1)..end.min(body.len()))
+                .unwrap_or(&[]);
+            let mut depth: usize = 0;
+            let mut seg_start = 0usize;
+            let finish = |seg: &[Token], flags: &mut Vec<bool>| {
+                // 行値代入 `(a, b) = (...)` は構文解析後に左辺の列ごとの代入へ展開される。
+                // 代入数と揃えるため左辺の列数ぶんの偽フラグを積む（`$n` 由来のダミー検証省略の対象外）。
+                if matches!(seg.first(), Some(Token::Punct('('))) {
+                    let mut d: usize = 0;
+                    let mut cols: usize = 1;
+                    let mut close = None;
+                    for (i, t) in seg.iter().enumerate() {
+                        match t {
+                            Token::Punct('(') => d = d.saturating_add(1),
+                            Token::Punct(')') => {
+                                d = d.saturating_sub(1);
+                                if d == 0 {
+                                    close = Some(i);
+                                    break;
+                                }
+                            }
+                            Token::Punct(',') if d == 1 => cols = cols.saturating_add(1),
+                            _ => {}
+                        }
+                    }
+                    // 右辺が `( <式>, ... )` で要素数が左辺の列数と一致するとき、要素ごとに
+                    // 「単独の `$n`（置換種別が String）か」を積む。それ以外は全て検証側（偽）。
+                    let elems: Option<Vec<bool>> = close.and_then(|c| {
+                        let rest = seg.get(c.saturating_add(1)..)?;
+                        // 右辺は `( ... )` か `ROW( ... )`（`set_row_value_slots` と同じく ROW は任意）。
+                        let (Token::Punct('='), after_eq) = (rest.first()?, rest.get(1..)?) else {
+                            return None;
+                        };
+                        let after_row = if ident_eq_ignore_case(after_eq.first(), "ROW") {
+                            after_eq.get(1..)?
+                        } else {
+                            after_eq
+                        };
+                        let (Token::Punct('('), inner) = (after_row.first()?, after_row.get(1..)?)
+                        else {
+                            return None;
+                        };
+                        let inner = inner.strip_suffix(&[Token::Punct(')')])?;
+                        let mut out = Vec::new();
+                        let mut dd: usize = 0;
+                        let mut st = 0usize;
+                        let one = |e: &[Token]| {
+                            matches!(e, [Token::Param(n)] if kind_of(kinds, *n) == ParamLiteralKind::String)
+                        };
+                        for (i, t) in inner.iter().enumerate() {
+                            match t {
+                                Token::Punct('(') | Token::Punct('[') => dd = dd.saturating_add(1),
+                                Token::Punct(')') | Token::Punct(']') => dd = dd.saturating_sub(1),
+                                Token::Punct(',') if dd == 0 => {
+                                    out.push(one(inner.get(st..i)?));
+                                    st = i.saturating_add(1);
+                                }
+                                _ => {}
+                            }
+                        }
+                        out.push(one(inner.get(st..)?));
+                        (out.len() == cols).then_some(out)
+                    });
+                    match elems {
+                        Some(v) => flags.extend(v),
+                        None => flags.extend(std::iter::repeat_n(false, cols)),
+                    }
+                    return;
+                }
+                // 右辺は素の `$n` に加え、括弧で包んだ `($n)`（何重でも）も単独の `$n` とみなす。
+                let mut rhs = seg.get(2..).unwrap_or(&[]);
+                while let Some(inner) = rhs
+                    .strip_prefix(&[Token::Punct('(')])
+                    .and_then(|r| r.strip_suffix(&[Token::Punct(')')]))
+                {
+                    rhs = inner;
+                }
+                flags.push(matches!(
+                    (seg.get(..2), rhs),
+                    (
+                        Some([Token::Ident(_) | Token::QuotedNull(_), Token::Punct('=')]),
+                        [Token::Param(n)],
+                    ) if kind_of(kinds, *n) == ParamLiteralKind::String
+                ));
+            };
+            for (i, t) in region.iter().enumerate() {
+                match t {
+                    Token::Punct('(') | Token::Punct('[') => depth = depth.saturating_add(1),
+                    Token::Punct(')') | Token::Punct(']') => depth = depth.saturating_sub(1),
+                    Token::Punct(',') if depth == 0 => {
+                        finish(region.get(seg_start..i).unwrap_or(&[]), &mut flags);
+                        seg_start = i.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+            finish(region.get(seg_start..).unwrap_or(&[]), &mut flags);
+        }
+    }
+    flags.extend(joined_where_conjunct_flags(tokens, kinds));
+    flags
+}
+
+/// 結合 DML の WHERE の連言分（深さ 0 の `AND` 区切り）ごとの Describe 用ダミーフラグ（Issue #3297）。
+/// 連言分が `<列|修飾列> = $n`（`$n` の置換種別が String）なら真。`sql::join::dml_plan` が対象側・
+/// source 側の述語列へ振り分け、`$n` 由来のダミー値に限って DATE・UUID・ENUM 等の値検証を省く。
+/// 位置規則（[`validate_param_positions`]）が `OR`・括弧内の `$n` を拒否するため、`$n` を含む WHERE は
+/// この単純な連言だけになる。`BETWEEN … AND …` 等で連言分の数が構文解析後と食い違う場合は、
+/// 呼び出し側が個数の不一致を検知してフラグを使わない（全て検証側。fail-closed）。
+pub(crate) fn joined_where_conjunct_flags(
+    tokens: &[Token],
+    kinds: &[ParamLiteralKind],
+) -> Vec<bool> {
+    let Some((start, end)) = where_region(tokens) else {
+        return Vec::new();
+    };
+    let mut region = tokens.get(start.saturating_add(1)..end).unwrap_or(&[]);
+    // `where_region` は末尾の `;` を領域に含めるため、最後の連言分の形判定の前に除く。
+    while let Some(rest) = region.strip_suffix(&[Token::Punct(';')]) {
+        region = rest;
+    }
+    let mut flags = Vec::new();
+    push_conjunct_flags(region, kinds, &mut flags, 0);
+    flags
+}
+
+/// 連言分フラグ算出で括弧を外して再帰する最大段数（WHERE の式深さ上限と同じ値）。
+const MAX_PAREN_FLATTEN_DEPTH: usize = crate::sql::udf_call::MAX_EXPR_DEPTH;
+
+/// [`joined_where_conjunct_flags`] の本体。深さ 0 の `AND` で分割し、全体が 1 組の括弧で包まれた
+/// 連言分は `sql::join::plan::flatten_conjuncts` と同じく括弧内を再帰的に平坦化する（個数を AST と揃える）。
+/// 括弧内に深さ 0 の `OR` がある連言分は AST でも 1 葉なので偽フラグ 1 個とする。
+///
+/// 本関数は構文解析（既存の WHERE 深さ上限）より前に走るため、括弧の入れ子は `nest` で
+/// [`MAX_PAREN_FLATTEN_DEPTH`] までしか辿らない。超えた連言分は偽フラグ 1 個で打ち切る
+/// （AST の連言分数と食い違い、`split_where` が全フラグを検証側へ倒す。fail-closed）。
+/// 過剰な入れ子そのものは、この後の構文解析が `54000` で拒否する（スタック枯渇の防止）。
+fn push_conjunct_flags(
+    region: &[Token],
+    kinds: &[ParamLiteralKind],
+    flags: &mut Vec<bool>,
+    nest: usize,
+) {
+    let mut depth: usize = 0;
+    let mut seg_start = 0usize;
+    let finish = |seg: &[Token], flags: &mut Vec<bool>| {
+        if let Some(inner) = strip_outer_parens(seg) {
+            if nest >= MAX_PAREN_FLATTEN_DEPTH || has_top_level_or(inner) {
+                flags.push(false);
+            } else {
+                push_conjunct_flags(inner, kinds, flags, nest.saturating_add(1));
+            }
+            return;
+        }
+        flags.push(matches!(
+            seg,
+            [
+                Token::Ident(_) | Token::QuotedNull(_) | Token::QualifiedIdent { .. },
+                Token::Punct('='),
+                Token::Param(n),
+            ] if kind_of(kinds, *n) == ParamLiteralKind::String
+        ));
+    };
+    for (i, t) in region.iter().enumerate() {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Keyword(lexer::Keyword::And) if depth == 0 => {
+                finish(region.get(seg_start..i).unwrap_or(&[]), flags);
+                seg_start = i.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    finish(region.get(seg_start..).unwrap_or(&[]), flags);
+}
+
+/// 先頭の `(` と末尾の `)` が互いに対応する（全体を 1 組の括弧が包む）とき、その内側を返す。
+fn strip_outer_parens(seg: &[Token]) -> Option<&[Token]> {
+    let inner = seg
+        .strip_prefix(&[Token::Punct('(')])?
+        .strip_suffix(&[Token::Punct(')')])?;
+    let mut depth: usize = 0;
+    for t in inner {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(inner)
+}
+
+/// 括弧の外側（深さ 0）に `OR` 語があるか。
+fn has_top_level_or(seg: &[Token]) -> bool {
+    let mut depth: usize = 0;
+    seg.iter().any(|t| match t {
+        Token::Punct('(') => {
+            depth = depth.saturating_add(1);
+            false
+        }
+        Token::Punct(')') => {
+            depth = depth.saturating_sub(1);
+            false
+        }
+        Token::Ident(s) => depth == 0 && s.eq_ignore_ascii_case("or"),
+        _ => false,
+    })
+}
+
+/// 結合 DML の関係一覧 `(公開名, 表名)`（先頭が書き込み先、続いて FROM／USING の表。Issue #3297）。
+/// `$n` の型推論が WHERE の修飾子から表を引くためのトークン走査で、`EXPLAIN` 前置は剥がす。
+/// 解釈できない形（スキーマ修飾・派生表・JOIN 等）に当たったらそこまでで打ち切るか `None`
+/// を返し、呼び出し側は型を決められない `Text` へ倒す（束縛段が `42703`／`42702`／`42P01` を返す。
+/// 存在を観測させない）。個数は `MAX_TABLE_REFS` で頭打ち。
+pub(crate) fn joined_dml_relations(tokens: &[Token]) -> Option<Vec<(String, String)>> {
+    use crate::sql::allowlist::is_dml_target_reserved_word as reserved;
+    let body = strip_explain(tokens);
+    let name_of = |t: Option<&Token>| match t {
+        Some(Token::Ident(n) | Token::QuotedNull(n)) => Some(n.clone()),
+        _ => None,
+    };
+    // `[AS] <別名>` を読み、次の添字と別名を返す。
+    let alias_at = |idx: usize| -> (usize, Option<String>) {
+        if ident_eq_ignore_case(body.get(idx), "AS") {
+            return match name_of(body.get(idx + 1)) {
+                Some(a) => (idx + 2, Some(a)),
+                None => (idx + 1, None),
+            };
+        }
+        match body.get(idx) {
+            Some(Token::Ident(a)) if !reserved(a) && !a.eq_ignore_ascii_case("USING") => {
+                (idx + 1, Some(a.clone()))
+            }
+            Some(Token::QuotedNull(a)) => (idx + 1, Some(a.clone())),
+            _ => (idx, None),
+        }
+    };
+    let (target_idx, list_start) = if crate::sql::allowlist::looks_like_update_from(body) {
+        let mut depth: usize = 0;
+        let from = body.iter().enumerate().find_map(|(i, t)| match t {
+            Token::Punct('(') => {
+                depth = depth.saturating_add(1);
+                None
+            }
+            Token::Punct(')') => {
+                depth = depth.saturating_sub(1);
+                None
+            }
+            Token::Keyword(lexer::Keyword::From)
+                if depth == 0 && !crate::sql::allowlist::is_distinct_from_at(body, i) =>
+            {
+                Some(i)
+            }
+            _ => None,
+        })?;
+        (1usize, from.checked_add(1)?)
+    } else if crate::sql::allowlist::looks_like_delete_using(body) {
+        let mut depth: usize = 0;
+        let using = body.iter().enumerate().skip(3).find_map(|(i, t)| match t {
+            Token::Punct('(') => {
+                depth = depth.saturating_add(1);
+                None
+            }
+            Token::Punct(')') => {
+                depth = depth.saturating_sub(1);
+                None
+            }
+            Token::Ident(w)
+                if depth == 0
+                    && w.eq_ignore_ascii_case("USING")
+                    && !ident_eq_ignore_case(body.get(i + 1), "OPERATION_ID") =>
+            {
+                Some(i)
+            }
+            _ => None,
+        })?;
+        (2usize, using.checked_add(1)?)
+    } else {
+        return None;
+    };
+    let mut rels: Vec<(String, String)> = Vec::new();
+    let target = name_of(body.get(target_idx))?;
+    let (_, alias) = alias_at(target_idx + 1);
+    rels.push((alias.unwrap_or_else(|| target.clone()), target));
+    let mut i = list_start;
+    while rels.len() < crate::sql::relation::MAX_TABLE_REFS {
+        let Some(table) = name_of(body.get(i)) else {
+            break;
+        };
+        let (next, alias) = alias_at(i + 1);
+        rels.push((alias.unwrap_or_else(|| table.clone()), table));
+        // 次の関係の開始位置（`,` または `JOIN` の直後）を探す。`INNER`／`LEFT` 等の修飾や `ON` 条件は
+        // トップレベルで読み飛ばし、`WHERE` 等の句境界か末尾に達したら打ち切る（JOIN 連鎖の後続表も型推論の対象）。
+        let mut depth: usize = 0;
+        let mut j = next;
+        let mut found = None;
+        while let Some(t) = body.get(j) {
+            match t {
+                Token::Punct('(') => depth = depth.saturating_add(1),
+                Token::Punct(')') => depth = depth.saturating_sub(1),
+                Token::Punct(',') if depth == 0 => {
+                    found = j.checked_add(1);
+                    break;
+                }
+                Token::Ident(w) if depth == 0 && w.eq_ignore_ascii_case("JOIN") => {
+                    found = j.checked_add(1);
+                    break;
+                }
+                Token::Keyword(lexer::Keyword::Where) if depth == 0 => break,
+                Token::Ident(w)
+                    if depth == 0
+                        && ["RETURNING", "ORDER", "LIMIT", "OPERATION_ID"]
+                            .iter()
+                            .any(|k| w.eq_ignore_ascii_case(k)) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        match found {
+            Some(n) => i = n,
+            None => break,
+        }
+    }
+    Some(rels)
 }
 
 /// `tokens` 中のトップレベル `WHERE`（パターン 4）の受理範囲 `(start, end)` を
@@ -692,6 +1067,332 @@ fn noneq_leaf_at(tokens: &[Token], i: usize, start: usize, end: usize) -> Option
     }
 }
 
+/// `[start, end)` 内の `(` ごとに対応する `)` の添字を、スタック 1 回の走査で求める
+/// （戻り値は `tokens` 添字で引く表。対応が無い `(` は `None`）。左境界を満たす `(` ごとに
+/// 再走査しないため、入れ子が深くても全体で線形時間になる。
+fn matching_closes(tokens: &[Token], start: usize, end: usize) -> Vec<Option<usize>> {
+    let end = end.min(tokens.len());
+    let mut closes: Vec<Option<usize>> = vec![None; end];
+    let mut stack: Vec<usize> = Vec::new();
+    for j in start..end {
+        match tokens.get(j) {
+            Some(Token::Punct('(')) => stack.push(j),
+            Some(Token::Punct(')')) => {
+                if let Some(open) = stack.pop() {
+                    if let Some(slot) = closes.get_mut(open) {
+                        *slot = Some(j);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    closes
+}
+
+/// 行の 1 辺 `( e1 , ... , en )`（`open` が `(`、`close` が対応する `)`）を、括弧深さ 1・角括弧深さ 0 の
+/// `,` で区切った成分の `(開始, 終了)` 範囲（終了は排他）に分ける。成分数が
+/// [`crate::sql::allowlist::MAX_ROW_COMPARE_COMPONENTS`] を超える・空の成分がある場合は `None`
+/// （構文段が `54000`／`42601` で拒否する形のため、ここでは登録しない）。
+fn row_components(tokens: &[Token], open: usize, close: usize) -> Option<Vec<(usize, usize)>> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let (mut depth, mut bracket) = (0usize, 0usize);
+    let mut from = open + 1;
+    for j in open..=close {
+        match tokens.get(j)? {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth = depth.saturating_sub(1),
+            Token::Punct('[') => bracket += 1,
+            Token::Punct(']') => bracket = bracket.saturating_sub(1),
+            Token::Punct(',') if depth == 1 && bracket == 0 => {
+                if from >= j || out.len() >= crate::sql::allowlist::MAX_ROW_COMPARE_COMPONENTS {
+                    return None;
+                }
+                out.push((from, j));
+                from = j + 1;
+            }
+            _ => {}
+        }
+    }
+    if from >= close || out.len() >= crate::sql::allowlist::MAX_ROW_COMPARE_COMPONENTS {
+        return None;
+    }
+    out.push((from, close));
+    Some(out)
+}
+
+/// パターン 12 の構造判定の単一情報源（Issue #3257・SQL-9・WIRE-12 のポインタ）。
+/// `WHERE` 領域 `(start, end)` 内の行値比較 `( C1 , ... , Ck ) op ( D1 , ... , Dk )`
+/// （左 `(` の直前が [`is_noneq_left_boundary`]、右 `)` の直後が [`is_noneq_right_boundary`]、
+/// `op` は `= <> < <= > >=`、`2 <= k <= MAX_ROW_COMPARE_COMPONENTS`・左右同数）の成分のうち、
+/// 成分全体が `$n` 単独の位置だけを返す（トークン添字 → 分類）。分類は同じ位置の相手成分で決まる。
+/// - 裸の列（`true`／`false`／`null` を除く）: [`WhereParamShape::Column`]。
+/// - 単独の `$m`: [`WhereParamShape::Indeterminate`]。
+/// - それ以外（リテラル・式・修飾列。`$n` が式の内側の場合も含む）は登録せず、呼び出し側の
+///   既存経路で `42601` になる（fail-closed）。
+///
+/// 展開で生成される比較葉は Describe 用ダミーフラグの序数に数えられない（束縛段が別カウンタ・空フラグで
+/// 束縛する）ため、この `$n` は等価述語の序数にも数えない。
+fn row_compare_param_slots(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+) -> HashMap<usize, WhereParamShape> {
+    let mut out = HashMap::new();
+    let closes = matching_closes(tokens, start, end);
+    // パターン 13: 行値の `[NOT] IN` の要素の成分の `$n`（Issue #3300）。
+    out.extend(row_in_param_slots(tokens, start, end, &closes));
+    let mut i = start + 1;
+    while i < end {
+        if !matches!(tokens.get(i), Some(Token::Punct('('))) || !is_noneq_left_boundary(tokens, i) {
+            i += 1;
+            continue;
+        }
+        let Some(close) = closes.get(i).copied().flatten() else {
+            i += 1;
+            continue;
+        };
+        let op_at = close + 1;
+        let op_len = match tokens.get(op_at) {
+            Some(Token::Punct('=')) => Some(1),
+            _ => noneq_op_len(tokens, op_at),
+        };
+        let Some(op_len) = op_len else {
+            i += 1;
+            continue;
+        };
+        let r_open = op_at + op_len;
+        if !matches!(tokens.get(r_open), Some(Token::Punct('('))) {
+            i += 1;
+            continue;
+        }
+        let Some(r_close) = closes.get(r_open).copied().flatten() else {
+            i += 1;
+            continue;
+        };
+        if !is_noneq_right_boundary(tokens, r_close + 1, end) {
+            i += 1;
+            continue;
+        }
+        let (Some(left), Some(right)) = (
+            row_components(tokens, i, close),
+            row_components(tokens, r_open, r_close),
+        ) else {
+            i += 1;
+            continue;
+        };
+        if left.len() != right.len() || left.len() < 2 {
+            i += 1;
+            continue;
+        }
+        let single = |range: (usize, usize)| -> Option<&Token> {
+            (range.1 == range.0 + 1)
+                .then(|| tokens.get(range.0))
+                .flatten()
+        };
+        let classify = |other: Option<&Token>| match other {
+            Some(Token::Param(_)) => Some(WhereParamShape::Indeterminate),
+            Some(Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
+            Some(Token::Ident(c))
+                if !c.eq_ignore_ascii_case("true")
+                    && !c.eq_ignore_ascii_case("false")
+                    && !c.eq_ignore_ascii_case("null") =>
+            {
+                Some(WhereParamShape::Column(c.clone()))
+            }
+            _ => None,
+        };
+        for (l, r) in left.iter().zip(right.iter()) {
+            for (mine, other) in [(*l, *r), (*r, *l)] {
+                if let (Some(Token::Param(_)), Some(shape)) =
+                    (single(mine), classify(single(other)))
+                {
+                    out.insert(mine.0, shape);
+                }
+            }
+        }
+        i = r_close + 1;
+    }
+    out
+}
+
+/// パターン 13 の構造判定の単一情報源（Issue #3300・SQL-9・WIRE-12 のポインタ）。
+/// `WHERE` 領域 `(start, end)` 内の行値の `( C1 , ... , Ck ) [NOT] IN ( ( D1 , ... , Dk ) [, ...] )`
+/// （左 `(` の直前が [`is_noneq_left_boundary`]、リスト閉じ `)` の直後が [`is_noneq_right_boundary`]、
+/// `2 <= k <= MAX_ROW_COMPARE_COMPONENTS`・各要素の成分数は左辺と同数・要素数は
+/// [`crate::sql::allowlist::MAX_IN_LIST_ITEMS`] 以下）の要素の成分のうち、成分全体が `$n` 単独で、
+/// 同じ位置の左辺成分が裸の列のものだけを返す（トークン添字 → [`WhereParamShape::Column`]）。
+/// 左辺成分の `$n`（1 個の `$n` が複数要素と対になり型を決められない）・リテラル／式／修飾列の
+/// 左辺・要素が行でない形・サブクエリ形・空リストは登録せず、呼び出し側の既存経路で `42601`
+/// （構文段の `0A000` を含む）になる（fail-closed）。`closes` は [`matching_closes`] の表で、
+/// パターン 12 と共有して全体を線形時間に保つ。脱糖で生成される葉は序数に数えない。
+fn row_in_param_slots(
+    tokens: &[Token],
+    start: usize,
+    end: usize,
+    closes: &[Option<usize>],
+) -> HashMap<usize, WhereParamShape> {
+    let mut out = HashMap::new();
+    let mut i = start + 1;
+    while i < end {
+        if !matches!(tokens.get(i), Some(Token::Punct('('))) || !is_noneq_left_boundary(tokens, i) {
+            i += 1;
+            continue;
+        }
+        let Some(close) = closes.get(i).copied().flatten() else {
+            i += 1;
+            continue;
+        };
+        let mut at = close + 1;
+        if ident_eq_ignore_case(tokens.get(at), "NOT") {
+            at += 1;
+        }
+        if !ident_eq_ignore_case(tokens.get(at), "IN") {
+            i += 1;
+            continue;
+        }
+        let list_open = at + 1;
+        if !matches!(tokens.get(list_open), Some(Token::Punct('('))) {
+            i += 1;
+            continue;
+        }
+        let Some(list_close) = closes.get(list_open).copied().flatten() else {
+            i += 1;
+            continue;
+        };
+        if !is_noneq_right_boundary(tokens, list_close + 1, end) {
+            i += 1;
+            continue;
+        }
+        let Some(left) = row_components(tokens, i, close) else {
+            i += 1;
+            continue;
+        };
+        if left.len() < 2 {
+            i += 1;
+            continue;
+        }
+        // リストの中身は `( 要素 ) , ( 要素 ) ...` の並びだけを受理する。
+        let mut items: Vec<Vec<(usize, usize)>> = Vec::new();
+        let mut pos = list_open + 1;
+        let mut ok = true;
+        loop {
+            if items.len() >= crate::sql::allowlist::MAX_IN_LIST_ITEMS
+                || !matches!(tokens.get(pos), Some(Token::Punct('(')))
+            {
+                ok = false;
+                break;
+            }
+            let Some(item_close) = closes.get(pos).copied().flatten() else {
+                ok = false;
+                break;
+            };
+            if item_close >= list_close {
+                ok = false;
+                break;
+            }
+            match row_components(tokens, pos, item_close) {
+                Some(comps) if comps.len() == left.len() => items.push(comps),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+            match tokens.get(item_close + 1) {
+                Some(Token::Punct(',')) => pos = item_close + 2,
+                _ if item_close + 1 == list_close => break,
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            i += 1;
+            continue;
+        }
+        for comps in &items {
+            for (l, r) in left.iter().zip(comps.iter()) {
+                let is_param = r.1 == r.0 + 1 && matches!(tokens.get(r.0), Some(Token::Param(_)));
+                if !is_param || l.1 != l.0 + 1 {
+                    continue;
+                }
+                let shape = match tokens.get(l.0) {
+                    Some(Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
+                    Some(Token::Ident(c))
+                        if !c.eq_ignore_ascii_case("true")
+                            && !c.eq_ignore_ascii_case("false")
+                            && !c.eq_ignore_ascii_case("null") =>
+                    {
+                        Some(WhereParamShape::Column(c.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some(shape) = shape {
+                    out.insert(r.0, shape);
+                }
+            }
+        }
+        i = list_close + 1;
+    }
+    out
+}
+
+/// FROM 直後の第 1 表がスキーマ修飾（`schema.table`。`QualifiedIdent`）の JOIN／カンマ結合を検出する
+/// （`looks_like_join` は素の識別子の第 1 表しか見ないため、修飾の第 1 表がすり抜けて JOIN 内の `$n` が
+/// 受理されるのを防ぐ fail-closed の補完。allowlist 側の判定は変えない）。
+fn qualified_first_table_joins(tokens: &[Token]) -> bool {
+    if !matches!(
+        tokens.first(),
+        Some(Token::Keyword(crate::sql::lexer::Keyword::Select))
+    ) {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            Token::Punct('(') => depth += 1,
+            Token::Punct(')') => depth -= 1,
+            Token::Keyword(crate::sql::lexer::Keyword::From) if depth == 0 => {
+                if !matches!(tokens.get(i + 1), Some(Token::QualifiedIdent { .. })) {
+                    return false;
+                }
+                // 修飾名を素の識別子 1 個に置き換えて、既存の先読み（別名・JOIN 語の判定）を再利用する。
+                let mut rest: Vec<Token> = tokens.get(i + 1..).unwrap_or(&[]).to_vec();
+                if let Some(first) = rest.first_mut() {
+                    *first = Token::Ident("t".to_string());
+                }
+                return crate::sql::allowlist::from_clause_starts_join(&rest, 0);
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// パターン 12 の `$n` のうち、相手成分が列のもの（トークン添字 → 列名）。`core.rs` が Describe・構造検証用の
+/// 型付きダミーを作るために使う（受理・推論と同じ [`row_compare_param_slots`] を参照する）。
+pub(crate) fn row_compare_column_slots(tokens: &[Token]) -> HashMap<usize, String> {
+    let head_ok = matches!(
+        tokens.first(),
+        Some(Token::Keyword(crate::sql::lexer::Keyword::Select))
+    ) || ident_eq_ignore_case(tokens.first(), "UPDATE")
+        || ident_eq_ignore_case(tokens.first(), "DELETE");
+    if !head_ok || has_set_operator_branch(tokens) {
+        return HashMap::new();
+    }
+    let Some((start, end)) = where_region(tokens) else {
+        return HashMap::new();
+    };
+    row_compare_param_slots(tokens, start, end)
+        .into_iter()
+        .filter_map(|(i, shape)| match shape {
+            WhereParamShape::Column(c) => Some((i, c)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// パターン 9 の `$n` のトークン添字 → 分類。先頭語が `SELECT`／`UPDATE`／`DELETE`（Issue #2431）
 /// で集合演算を持たない文に限る（集合演算は枝ごとに Describe 用フラグの序数が
 /// 0 から始まり対応がずれるため対象外）。それ以外は空で、該当する `$n` は `42601` のまま。
@@ -741,6 +1442,8 @@ fn where_noneq_param_slots_and_bounds(
         Some(Token::Ident(c) | Token::QuotedNull(c)) => Some(WhereParamShape::Column(c.clone())),
         _ => None,
     };
+    // パターン 12: 行値比較の成分の `$n`（Issue #3257）。
+    out.extend(row_compare_param_slots(tokens, start, end));
     let mut i = start + 1;
     while i < end {
         let Some(leaf) = noneq_leaf_at(tokens, i, start, end) else {
@@ -785,6 +1488,158 @@ fn where_noneq_param_slots_and_bounds(
         i = leaf.next;
     }
     (out, bounds, distinct)
+}
+
+/// LATERAL 派生表の本文の WHERE に置いた `$n` の受理位置の解析結果（Issue #3324・SQL-62 (7)）。
+#[derive(Debug, Clone)]
+pub(crate) struct LateralParamLayout {
+    /// 内側の関係（本文の FROM の単一の表）の名前。型の引き当て先。
+    pub(crate) table: String,
+    /// 受理した `$n` のトークン添字 → 比較相手の内側の列名。
+    pub(crate) slots: HashMap<usize, String>,
+}
+
+/// 文が「`SELECT` 先頭・LATERAL 派生表をちょうど 1 つ持つ」形のとき、LATERAL 本文の WHERE の
+/// 最上位の連言に置かれた `<内側列> <比較> $n`・`<内側列> [NOT] BETWEEN $a AND $b` の `$n` の位置を返す。
+///
+/// 呼び出し元は `validate_param_positions`（受理判定）と `infer_param_positions`（型の引き当て）。
+/// 受理位置の単一情報源で、判定は O(トークン数)・添字は `get()`。該当しない形（LATERAL が 0 または複数・
+/// 本文が単一の表の `SELECT ... FROM` でない・本文の WHERE に深さ 0 の `OR` がある）は `None`。
+/// `None` のとき `$n` は従来どおり派生表・JOIN の一律拒否（`42601`）に任せる（fail-closed）。
+/// 外側の WHERE・投影・ON・LIMIT の `$n` と、外側参照の列（`d.k`）への `$n` 比較は受理位置に含めない。
+/// Bind 後は検証済みのリテラルへ置換して再解析するため、ここは Parse／Describe の整合だけを担う。
+pub(crate) fn lateral_param_layout(tokens: &[Token]) -> Option<LateralParamLayout> {
+    if !matches!(tokens.first(), Some(Token::Keyword(Keyword::Select))) {
+        return None;
+    }
+    let mut laterals = tokens.iter().enumerate().filter(|(i, t)| {
+        matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("LATERAL"))
+            && matches!(tokens.get(i.saturating_add(1)), Some(Token::Punct('(')))
+    });
+    let (lat_idx, _) = laterals.next()?;
+    if laterals.next().is_some() {
+        return None;
+    }
+    let open = lat_idx.checked_add(1)?;
+    // 対応する `)`（本文の終端）。
+    let mut depth: usize = 0;
+    let mut close = None;
+    for (i, t) in tokens.iter().enumerate().skip(open) {
+        match t {
+            Token::Punct('(') => depth = depth.saturating_add(1),
+            Token::Punct(')') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let body_start = open.checked_add(1)?;
+    if !matches!(
+        tokens.get(body_start),
+        Some(Token::Keyword(Keyword::Select))
+    ) {
+        return None;
+    }
+    let body = tokens.get(body_start..close)?;
+    // 本文の深さ 0 の FROM 句: `FROM <表> [[AS] <別名>]` の単一の表だけを受理する。
+    let mut d: usize = 0;
+    let mut from_at = None;
+    for (i, t) in body.iter().enumerate() {
+        match t {
+            Token::Punct('(') => d = d.saturating_add(1),
+            Token::Punct(')') => d = d.saturating_sub(1),
+            Token::Keyword(Keyword::From) if d == 0 => {
+                from_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let from_at = from_at?;
+    let table = match body.get(from_at.checked_add(1)?) {
+        Some(Token::Ident(n) | Token::QuotedNull(n)) => n.clone(),
+        _ => return None,
+    };
+    let mut alias_at = from_at.saturating_add(2);
+    if ident_eq_ignore_case(body.get(alias_at), "AS") {
+        alias_at = alias_at.saturating_add(1);
+    }
+    let alias = match body.get(alias_at) {
+        Some(Token::Ident(a) | Token::QuotedNull(a)) => Some(a.clone()),
+        _ => None,
+    };
+    // 修飾子つきの列は、内側の別名（無ければ表名）で修飾されたものだけを内側の列として扱う。
+    // それ以外（外側の別名）は列に正規化せず、`$n` の比較相手として受理しない。
+    let inner_name = alias.as_deref().unwrap_or(table.as_str());
+    let norm: Vec<Token> = body
+        .iter()
+        .map(|t| match t {
+            Token::QualifiedIdent { qualifier, name }
+                if qualifier.eq_ignore_ascii_case(inner_name) =>
+            {
+                Token::Ident(name.clone())
+            }
+            other => other.clone(),
+        })
+        .collect();
+    let (start, end) = where_region(&norm)?;
+    // 深さ 0 の `OR` がある WHERE は連言として分解できない。
+    let mut depth_at: Vec<usize> = Vec::with_capacity(norm.len());
+    let mut dd: usize = 0;
+    for t in &norm {
+        match t {
+            Token::Punct('(') => dd = dd.saturating_add(1),
+            Token::Punct(')') => dd = dd.saturating_sub(1),
+            _ => {}
+        }
+        depth_at.push(dd);
+    }
+    let region_has_top_or = norm.iter().enumerate().take(end).skip(start).any(|(i, t)| {
+        matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("OR"))
+            && depth_at.get(i).copied() == Some(0)
+    });
+    if region_has_top_or {
+        return None;
+    }
+    let mut slots: HashMap<usize, String> = HashMap::new();
+    let mut accept = |rel: usize, col: &str| {
+        if depth_at.get(rel).copied() == Some(0) {
+            slots.insert(body_start.saturating_add(rel), col.to_string());
+        }
+    };
+    // 等価（パターン 4 と同じ形）: `<列> = $n`（左は連言の先頭、右は連言の終端）。
+    for i in start.saturating_add(1)..end {
+        let Some(Token::Param(_)) = norm.get(i) else {
+            continue;
+        };
+        let (Some(Token::Punct('=')), Some(col_tok)) = (
+            i.checked_sub(1).and_then(|j| norm.get(j)),
+            i.checked_sub(2).and_then(|j| norm.get(j)),
+        ) else {
+            continue;
+        };
+        let (Token::Ident(col) | Token::QuotedNull(col)) = col_tok else {
+            continue;
+        };
+        if is_noneq_left_boundary(&norm, i.saturating_sub(2))
+            && is_noneq_right_boundary(&norm, i.saturating_add(1), end)
+        {
+            accept(i, col);
+        }
+    }
+    // 非等価比較・BETWEEN（パターン 9 と同じ判定）。`$n op $m` などの型を決められない形は受理しない。
+    let (noneq, _, _) = where_noneq_param_slots_and_bounds(&norm);
+    for (rel, shape) in noneq {
+        if let WhereParamShape::Column(col) = shape {
+            accept(rel, &col);
+        }
+    }
+    Some(LateralParamLayout { table, slots })
 }
 
 /// 番号 `n`（1 始まり）の置換リテラル種別。範囲外・0 は `String`（fail-closed）。
@@ -970,16 +1825,31 @@ fn values_param_slots(
 /// 判定する。列名・関数名としての出現は境界にしない）。無ければ文末。
 /// `INSERT ... ON CONFLICT ... DO UPDATE SET` は先頭語が `INSERT` のため `None`。
 fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
-    if !ident_eq_ignore_case(tokens.first(), "UPDATE")
-        || !ident_eq_ignore_case(tokens.get(2), "SET")
-    {
+    if !ident_eq_ignore_case(tokens.first(), "UPDATE") {
         return None;
     }
+    // Issue #3297: `UPDATE ... FROM` 形に限り、対象表の別名（`UPDATE t [AS] x SET`）の位置の SET も
+    // 受理する。単一表 UPDATE の受理範囲（`tokens[2] == SET`）は変えない。
+    let is_from_form = crate::sql::allowlist::looks_like_update_from(tokens);
+    let set_idx: usize = if ident_eq_ignore_case(tokens.get(2), "SET") {
+        2
+    } else if is_from_form && ident_eq_ignore_case(tokens.get(3), "SET") {
+        3
+    } else if is_from_form
+        && ident_eq_ignore_case(tokens.get(2), "AS")
+        && ident_eq_ignore_case(tokens.get(4), "SET")
+    {
+        4
+    } else {
+        return None;
+    };
+    // Issue #3297: `UPDATE ... FROM` 形では深さ 0 の `FROM`（`IS [NOT] DISTINCT FROM` を除く）が
+    // SET 節の終端。ここで止めないと右辺が FROM 句まで伸びて式セグメントに化ける。
     let mut depth: usize = 0;
     let end = tokens
         .iter()
         .enumerate()
-        .skip(3)
+        .skip(set_idx.saturating_add(1))
         .find_map(|(idx, t)| match t {
             Token::Punct('(') | Token::Punct('[') => {
                 depth = depth.saturating_add(1);
@@ -990,6 +1860,13 @@ fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
                 None
             }
             Token::Keyword(crate::sql::lexer::Keyword::Where) if depth == 0 => Some(idx),
+            Token::Keyword(crate::sql::lexer::Keyword::From)
+                if depth == 0
+                    && is_from_form
+                    && !crate::sql::allowlist::is_distinct_from_at(tokens, idx) =>
+            {
+                Some(idx)
+            }
             Token::Ident(name)
                 if depth == 0
                     && (name.eq_ignore_ascii_case("RETURNING")
@@ -1001,7 +1878,7 @@ fn set_region(tokens: &[Token]) -> Option<(usize, usize)> {
             _ => None,
         })
         .unwrap_or(tokens.len());
-    Some((2, end))
+    Some((set_idx, end))
 }
 
 /// `SET` 節を 1 パスで前向きに走査し、括弧深さ 0 の `(SET|,) <列> = <右辺>` ごとに
@@ -1312,6 +2189,10 @@ impl ParamLayout {
 /// パターン 7 の式セグメント（`sql::param_infer` が型推論に使う）を返す。
 /// [`infer_param_positions`] の `ParamPosition::InExpr(i)` の `i` は本戻り値の添字。
 pub(crate) fn expr_param_segments(tokens: &[Token]) -> Vec<ExprSegment> {
+    // `MERGE` は式の内側の `$n` を受理しない（Issue #3352。`sql::params_merge`）。
+    if crate::sql::allowlist::looks_like_merge(tokens) {
+        return Vec::new();
+    }
     ParamLayout::build(tokens).segments
 }
 
@@ -1323,6 +2204,11 @@ pub(crate) fn expr_param_segments(tokens: &[Token]) -> Vec<ExprSegment> {
 /// - `$n` の番号が [`MAX_PARAMS`] を超える場合は
 ///   [`SqlSurfaceError::payload_too_large`]（`54000`）。
 pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError> {
+    // SQL-79・Issue #3352: `MERGE` は `WHEN` 句ごとに SET／VALUES を持つため、専用の走査に閉じる
+    // （汎用の位置規則は広げない。他の文の判定は変えない）。
+    if crate::sql::allowlist::looks_like_merge(tokens) {
+        return crate::sql::params_merge::validate(tokens);
+    }
     // WIRE-15・TASK-218: カーソル（`DECLARE`/`FETCH`/`CLOSE`）は `$n` 束縛を
     // 本バージョンのスコープ外として一律拒否する（fail-closed。範囲を縮小）。
     // 特に `DECLARE ... FOR SELECT ... WHERE col = $1` は、後段のパターン 4
@@ -1334,6 +2220,7 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         Some(Token::Ident(name))
             if name.eq_ignore_ascii_case("DECLARE")
                 || name.eq_ignore_ascii_case("FETCH")
+                || name.eq_ignore_ascii_case("MOVE")
                 || name.eq_ignore_ascii_case("CLOSE")
     ) && tokens.iter().any(|t| matches!(t, Token::Param(_)))
     {
@@ -1357,6 +2244,36 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         return Err(SqlSurfaceError::unsupported(
             "parameter placeholders are not supported in WITH statements",
         ));
+    }
+
+    // Issue #3324（SQL-62 (7)）: LATERAL 派生表の本文の WHERE の最上位の連言に置いた
+    // `<内側列> <比較> $n`・`BETWEEN $a AND $b` だけを受理する。この形の文では、全 `$n` が受理位置に
+    // あることを要求し（外側の WHERE・投影・ON・LIMIT 等の `$n` は `42601`）、後続の位置判定
+    // （`where_region` は最初の WHERE を指すため、外側の無修飾列の等価を誤受理しうる）には進まない。
+    if tokens.iter().any(|t| matches!(t, Token::Param(_))) {
+        if let Some(layout) = lateral_param_layout(tokens) {
+            let mut max_index: u16 = 0;
+            for (i, t) in tokens.iter().enumerate() {
+                let Token::Param(n) = t else { continue };
+                if !layout.slots.contains_key(&i) {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "parameter placeholder ${n} is not supported at this position"
+                    )));
+                }
+                if matches!(tokens.get(i.saturating_add(1)), Some(Token::TypeCast)) {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "parameter placeholder ${n} followed by '::' is not supported at this position"
+                    )));
+                }
+                max_index = max_index.max(*n);
+            }
+            if max_index > MAX_PARAMS {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "parameter number ${max_index} exceeds the allowed maximum (${MAX_PARAMS})"
+                )));
+            }
+            return Ok(max_index);
+        }
     }
 
     // SQL-62・Issue #1866: FROM の派生表を含む文も `$n` を一律拒否する（fail-closed）。内側の述語が
@@ -1396,7 +2313,8 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
         }
         _ => tokens,
     };
-    if crate::sql::allowlist::looks_like_join(join_tokens)
+    if (crate::sql::allowlist::looks_like_join(join_tokens)
+        || qualified_first_table_joins(join_tokens))
         && tokens.iter().any(|t| matches!(t, Token::Param(_)))
     {
         return Err(SqlSurfaceError::unsupported(
@@ -1465,6 +2383,34 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
     // （`$n` ごとの再走査をしない。二次時間防止）。
     let layout = ParamLayout::build(tokens);
 
+    let joined_dml = is_joined_dml(tokens);
+    // Issue #3297: 結合 DML の WHERE の `$n` は、`OR`・括弧を含まない連言（深さ 0 の `AND` 区切り）の
+    // 等価葉に限る。Describe 用ダミーフラグを連言分ごとに振り分ける前提で、対応を保証できる形だけを
+    // 受理し、それ以外は `42601`（fail-closed）。
+    let joined_where_has_or = joined_dml
+        && where_idx.zip(where_region_end).is_some_and(|(start, end)| {
+            tokens
+                .get(start..end)
+                .unwrap_or(&[])
+                .iter()
+                .any(|t| matches!(t, Token::Ident(w) if w.eq_ignore_ascii_case("OR")))
+        });
+    let joined_paren_depth: Vec<usize> = if joined_dml {
+        let mut d: usize = 0;
+        tokens
+            .iter()
+            .map(|t| {
+                match t {
+                    Token::Punct('(') => d = d.saturating_add(1),
+                    Token::Punct(')') => d = d.saturating_sub(1),
+                    _ => {}
+                }
+                d
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut max_index: u16 = 0;
     for (i, token) in tokens.iter().enumerate() {
         let Token::Param(n) = token else { continue };
@@ -1495,11 +2441,15 @@ pub fn validate_param_positions(tokens: &[Token]) -> Result<u16, SqlSurfaceError
             i > start
                 && i < end
                 && matches!(prev1, Some(Token::Punct('=')))
-                && matches!(prev2, Some(Token::Ident(_) | Token::QuotedNull(_)))
+                && (matches!(prev2, Some(Token::Ident(_) | Token::QuotedNull(_)))
+                    // Issue #3297: 結合 DML の WHERE の `<公開名>.<列> = $n`。
+                    || (joined_dml && matches!(prev2, Some(Token::QualifiedIdent { .. }))))
+                && (!joined_dml
+                    || (!joined_where_has_or && joined_paren_depth.get(i).copied() == Some(0)))
         });
 
         // パターン 9: `SELECT` の `WHERE` 内の非等価比較・`BETWEEN`（Issue #2430）。
-        let is_where_noneq = layout.where_noneq_slots.contains_key(&i);
+        let is_where_noneq = !joined_dml && layout.where_noneq_slots.contains_key(&i);
 
         // パターン 5: `INSERT ... VALUES (...)` の行内リテラル位置。
         let is_insert_value = layout.values_slots.contains_key(&i);
@@ -1559,6 +2509,12 @@ pub(crate) enum ParamPosition {
     Text,
     /// `WHERE <列> = $n` の列名。
     WhereColumn(String),
+    /// 結合 DML（`UPDATE ... FROM`／`DELETE ... USING`。Issue #3297）の `WHERE <公開名>.<列> = $n`。
+    /// 型は修飾子の公開名が指す表の列から引く。
+    WhereQualifiedColumn { qualifier: String, column: String },
+    /// LATERAL 派生表の本文の WHERE の `<内側列> <比較> $n`（Issue #3324）。型は本文の FROM の表
+    /// （`table`）の列から引く（引けなければ `Text`）。
+    LateralColumn { table: String, column: String },
     /// `SELECT` の `WHERE` で `$n op $m`（両辺とも `$n`）の出現。型を決められない
     /// （Issue #2430。同じ番号の別の出現で決まればそれを使い、無ければ宣言型、
     /// それも無ければ `42P18`）。
@@ -1573,6 +2529,14 @@ pub(crate) enum ParamPosition {
     /// `INSERT ... ON CONFLICT ... DO UPDATE SET <列> = <列> + $n` の代入先列名
     /// （Issue #2427・SQL-49）。型は INSERT 対象表の当該列から決める。
     UpsertAddColumn(String),
+    /// `MERGE ... WHEN ... THEN UPDATE SET <列> = $n` の対象の列名（Issue #3352。`sql::params_merge`）。
+    MergeSetColumn(String),
+    /// `MERGE ... WHEN ... THEN INSERT [(<列>, ...)] VALUES (...)` の値（Issue #3352）。`columns` は句の
+    /// 列リスト（省略は `None`＝対象表の `*` 展開）、`index` は値の序数（0 始まり）。
+    MergeInsertValue {
+        columns: Option<Vec<String>>,
+        index: usize,
+    },
 }
 
 /// `$n` の型公告（`ParameterDescription` の OID 決定と、バイナリ受理可否の
@@ -2095,13 +3059,34 @@ fn boolean_literal_tokens(n: u16, value: &str) -> Result<Vec<Token>, SqlSurfaceE
 /// [`values_region_bounds`] を共有）。
 pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<Vec<ParamPosition>> {
     let mut out: Vec<Vec<ParamPosition>> = vec![Vec::new(); usize::from(param_count)];
+    // `MERGE`（Issue #3352）: 許可位置の分類は専用の走査が返す。それ以外（`USING OPERATION_ID $n`）は `Text`。
+    if crate::sql::allowlist::looks_like_merge(tokens) {
+        let positions = crate::sql::params_merge::param_positions(tokens);
+        for (i, token) in tokens.iter().enumerate() {
+            let Token::Param(n) = token else { continue };
+            let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
+                continue;
+            };
+            slot.push(positions.get(&i).cloned().unwrap_or(ParamPosition::Text));
+        }
+        return out;
+    }
     let where_bounds = where_region(tokens);
+    let joined_dml = is_joined_dml(tokens);
     let layout = ParamLayout::build(tokens);
+    let lateral = lateral_param_layout(tokens);
     for (i, token) in tokens.iter().enumerate() {
         let Token::Param(n) = token else { continue };
         let Some(slot) = usize::from(*n).checked_sub(1).and_then(|k| out.get_mut(k)) else {
             continue;
         };
+        if let Some((l, col)) = lateral.as_ref().and_then(|l| Some((l, l.slots.get(&i)?))) {
+            slot.push(ParamPosition::LateralColumn {
+                table: l.table.clone(),
+                column: col.clone(),
+            });
+            continue;
+        }
         let prev1 = i.checked_sub(1).and_then(|j| tokens.get(j));
         let prev2 = i.checked_sub(2).and_then(|j| tokens.get(j));
         if matches!(prev1, Some(Token::DistanceOp(_))) {
@@ -2143,6 +3128,15 @@ pub(crate) fn infer_param_positions(tokens: &[Token], param_count: u16) -> Vec<V
             if i > start && i < end && matches!(prev1, Some(Token::Punct('='))) {
                 if let Some(Token::Ident(col) | Token::QuotedNull(col)) = prev2 {
                     slot.push(ParamPosition::WhereColumn(col.clone()));
+                    continue;
+                }
+                // Issue #3297: 結合 DML の `<公開名>.<列> = $n` は修飾子つきで型を引く。
+                if let (Some(Token::QualifiedIdent { qualifier, name }), true) = (prev2, joined_dml)
+                {
+                    slot.push(ParamPosition::WhereQualifiedColumn {
+                        qualifier: qualifier.clone(),
+                        column: name.clone(),
+                    });
                     continue;
                 }
             }
@@ -2570,6 +3564,56 @@ fn substitute_with<E>(
     Ok(out)
 }
 
+/// 行値比較の成分の `$n`（パターン 12）に使う、相手列の型で有効な Describe・構造検証用ダミー（Issue #3257）。
+/// `Ok(None)` は既定のダミー（`'0'`・数値・真偽値）のままでよい型。未対応の型は `0A000`
+/// （固定文言・値を含めない。リテラル同士の行値比較が束縛段で拒否する型と同じ側へ倒す fail-closed）。
+/// 利用者入力は含まず、固定の定数かカタログの ENUM ラベルだけから作る。
+pub(crate) fn row_compare_dummy_token(
+    ty: &crate::catalog::ColumnType,
+) -> Result<Option<Token>, SqlSurfaceError> {
+    use crate::catalog::ColumnType as T;
+    let lit = |s: &str| Ok(Some(Token::StringLiteral(s.to_string())));
+    match ty {
+        T::Text
+        | T::Varchar(_)
+        | T::Bpchar(_)
+        | T::Numeric { .. }
+        | T::SmallInt
+        | T::Integer
+        | T::BigInt
+        | T::Real
+        | T::Double
+        | T::Boolean => Ok(None),
+        T::Date => lit("2000-01-01"),
+        T::Timestamp => lit("2000-01-01 00:00:00"),
+        // 明示オフセット付き: セッション TimeZone の読み取り（`session_tz_dependent`）を起こさない。
+        T::TimestampTz => lit("2000-01-01 00:00:00+00"),
+        T::Time => lit("00:00:00"),
+        T::Interval => lit("0 seconds"),
+        T::Uuid => lit("00000000-0000-0000-0000-000000000000"),
+        T::Bytea => lit("\\x00"),
+        T::Enum(def) => match def.labels().first() {
+            Some(label) => lit(label),
+            None => Err(row_compare_param_type_unsupported()),
+        },
+        T::Vector(_)
+        | T::HalfVec(_)
+        | T::Int8Vec(_)
+        | T::SparseVec(_)
+        | T::Bit(_)
+        | T::Array(_)
+        | T::Json
+        | T::Jsonb => Err(row_compare_param_type_unsupported()),
+    }
+}
+
+fn row_compare_param_type_unsupported() -> SqlSurfaceError {
+    SqlSurfaceError::FeatureNotSupported {
+        detail: "parameter placeholders in a row value comparison are not supported for this column type"
+            .to_string(),
+    }
+}
+
 /// Parse 時点の構造検証専用: すべての `$n` を、位置に依存しない固定ダミー値へ
 /// 置換する。ダミーは非空・非制御文字（[`crate::sql::using_operation_id::
 /// OperationId::parse`]・[`crate::sql::allowlist::validate_using_plan_question`]
@@ -2585,6 +3629,19 @@ pub fn substitute_dummy(tokens: &[Token]) -> Vec<Token> {
 /// `Number("0")`、`Boolean` 種別は `Ident("false")` のダミーへ置換し、数値・真偽値
 /// 列の位置でも Describe 用の構造検証が通るようにする。
 pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind]) -> Vec<Token> {
+    substitute_dummy_typed_with(tokens, kinds, &HashMap::new())
+}
+
+/// [`substitute_dummy_typed`] の上書き付き版（Issue #3257）。`overrides`（トークン添字 → ダミー）に
+/// ある位置のうち `String` 種別の `$n` は、上書きのトークンへ置換する。行値比較の成分の `$n`
+/// （パターン 12）が、相手列の型（DATE・UUID・ENUM 等）で有効な値になるよう `core.rs` が作る。
+/// 展開で生成される比較葉は Describe 用ダミーフラグで検証を省けないため、ダミー自体を型に合わせる。
+/// 上書きは Parse の構造検証・Describe 専用で、Bind は常に実値で置換し直す。
+pub(crate) fn substitute_dummy_typed_with(
+    tokens: &[Token],
+    kinds: &[ParamLiteralKind],
+    overrides: &HashMap<usize, Token>,
+) -> Vec<Token> {
     let (_, between_bounds, distinct_slots) = where_noneq_param_slots_and_bounds(tokens);
     substitute_with(tokens, |n, i| {
         // パターン 10: `IS [NOT] DISTINCT FROM $n` は列型に依らず束縛が通る `NULL` ダミーにする
@@ -2593,7 +3650,10 @@ pub(crate) fn substitute_dummy_typed(tokens: &[Token], kinds: &[ParamLiteralKind
             return Ok::<_, std::convert::Infallible>(vec![Token::Ident("NULL".to_string())]);
         }
         Ok::<_, std::convert::Infallible>(vec![match kind_of(kinds, n) {
-            ParamLiteralKind::String => Token::StringLiteral("0".to_string()),
+            ParamLiteralKind::String => overrides
+                .get(&i)
+                .cloned()
+                .unwrap_or_else(|| Token::StringLiteral("0".to_string())),
             ParamLiteralKind::Integer | ParamLiteralKind::Float => Token::Number("0".to_string()),
             // BETWEEN の境界は既存構文処理が文字列リテラルのみ受理するため文字列で置換する。
             ParamLiteralKind::Boolean if between_bounds.contains(&i) => {
@@ -4649,5 +5709,326 @@ mod typed_value_tests {
         let big = vec![b'1'; max_plain];
         let err = decode_bind_values_nullable_typed(&tokens, &[Some(big)], &typed).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    // --- パターン 12: WHERE の行値比較の成分の `$n`（Issue #3257） ---------------------------
+
+    fn positions(sql: &str) -> Result<u16, SqlSurfaceError> {
+        let tokens = lexer::tokenize_with_params(sql).expect("tokenize_with_params");
+        validate_param_positions(&tokens)
+    }
+
+    fn positions_of(sql: &str) -> Vec<Vec<ParamPosition>> {
+        let tokens = lexer::tokenize_with_params(sql).expect("tokenize");
+        let n = validate_param_positions(&tokens).expect("positions should validate");
+        infer_param_positions(&tokens, n)
+    }
+
+    fn flags(sql: &str) -> Vec<bool> {
+        let tokens = lexer::tokenize_with_params(sql).expect("tokenize");
+        where_equality_literal_is_param(&tokens)
+    }
+
+    #[test]
+    fn accepts_row_compare_component_params_and_classifies_them() {
+        for sql in [
+            "SELECT id FROM t WHERE (a, b) < ($1, $2)",
+            "SELECT id FROM t WHERE ($1, $2) >= (a, b)",
+            "SELECT id FROM t WHERE (a, b) <> ($1, $2) LIMIT 5;",
+            "SELECT id FROM t WHERE x = 1 AND ((a, b) = ($1, $2))",
+            "UPDATE t SET s = 'z' WHERE (a, b) > ($1, $2) USING OPERATION_ID $3",
+            "DELETE FROM t WHERE (a, b) <= ($1, $2) USING OPERATION_ID $3",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+        let got = positions_of("SELECT id FROM t WHERE (a, b) < ($1, $2)");
+        assert_eq!(got[0], vec![ParamPosition::WhereColumn("a".to_string())]);
+        assert_eq!(got[1], vec![ParamPosition::WhereColumn("b".to_string())]);
+        let got = positions_of("SELECT id FROM t WHERE ($1, $2) < (a, b)");
+        assert_eq!(got[0], vec![ParamPosition::WhereColumn("a".to_string())]);
+        // 片側が `$n`・片側がリテラルでも、`$n` の相手が列なら受理する。
+        assert!(positions("SELECT id FROM t WHERE (a, b) < ($1, 5)").is_ok());
+    }
+
+    #[test]
+    fn row_compare_pair_of_params_is_indeterminate() {
+        let got = positions_of("SELECT id FROM t WHERE ($1, a) < ($2, b)");
+        assert_eq!(got[0], vec![ParamPosition::WhereIndeterminate]);
+        assert_eq!(got[1], vec![ParamPosition::WhereIndeterminate]);
+    }
+
+    #[test]
+    fn rejects_row_compare_params_outside_pattern_12() {
+        for sql in [
+            // 相手がリテラル・式・修飾列
+            "SELECT id FROM t WHERE (a, 7) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, a + 1) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, t.b) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, true) < ($1, $2)",
+            // `$n` が式の内側・型キャスト付き
+            "SELECT id FROM t WHERE (a, b) < ($1 + 1, $2)",
+            "SELECT id FROM t WHERE (a, b) < ($1::int, $2)",
+            "SELECT id FROM t WHERE (a, b) < (lower($1), $2)",
+            // 成分数の不一致・成分 1 個
+            "SELECT id FROM t WHERE (a, b) < ($1, $2, $3)",
+            "SELECT id FROM t WHERE (a) < ($1)",
+            // 先頭語・文種・領域の外
+            "EXPLAIN SELECT id FROM t WHERE (a, b) < ($1, $2)",
+            "WITH c AS (SELECT 1) SELECT id FROM t WHERE (a, b) < ($1, $2)",
+            "INSERT INTO t (id, embedding) VALUES (1, '[0,0]') ON CONFLICT (id) DO UPDATE SET a = 1 WHERE (a, b) < ($1, $2)",
+            "SELECT id FROM t WHERE (a, b) < ($1, $2) UNION SELECT id FROM t WHERE a = 1",
+            "SELECT a FROM t GROUP BY a HAVING (a, b) < ($1, $2)",
+        ] {
+            let r = positions(sql);
+            assert!(
+                matches!(&r, Err(e) if e.wire_code() == "42601"),
+                "{sql}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_compare_params_do_not_shift_dummy_flag_ordinals() {
+        // 行値の `$n` は序数に数えない。兄弟の等価・範囲の葉の序数は従来どおり。
+        assert_eq!(
+            flags("SELECT id FROM t WHERE (a, b) = ($1, $2) AND lang = 'en'"),
+            vec![false]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE ($1, x) < (a, b) AND lang = $3"),
+            vec![true]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE s = 'p' OR (a, b) < ($1, $2)"),
+            vec![false]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE (a, b) < ($1, $2) OR m = $3 AND lang = 'x'"),
+            vec![true, false]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE NOT (a, b) < ($1, $2) AND m = $3"),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn accepts_row_in_component_params_and_classifies_them() {
+        for sql in [
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2), ($3, $4))",
+            "SELECT id FROM t WHERE (a, b) NOT IN (($1, $2)) LIMIT 5;",
+            "SELECT id FROM t WHERE NOT (a, b) IN (($1, $2))",
+            "SELECT id FROM t WHERE NOT ((a, b) IN (($1, $2)))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, 5), (3, $2))",
+            "SELECT id FROM t WHERE x = 1 AND (a, b) IN (($1, $2))",
+            "UPDATE t SET s = 'z' WHERE (a, b) IN (($1, $2)) USING OPERATION_ID $3",
+            "DELETE FROM t WHERE (a, b) NOT IN (($1, $2)) USING OPERATION_ID $3",
+        ] {
+            assert!(positions(sql).is_ok(), "{sql}");
+        }
+        let got = positions_of("SELECT id FROM t WHERE (a, b) IN (($1, $2), ($3, $4))");
+        assert_eq!(got[0], vec![ParamPosition::WhereColumn("a".to_string())]);
+        assert_eq!(got[1], vec![ParamPosition::WhereColumn("b".to_string())]);
+        assert_eq!(got[2], vec![ParamPosition::WhereColumn("a".to_string())]);
+        assert_eq!(got[3], vec![ParamPosition::WhereColumn("b".to_string())]);
+    }
+
+    #[test]
+    fn rejects_row_in_params_outside_pattern_13() {
+        for sql in [
+            // 左辺成分の `$n`
+            "SELECT id FROM t WHERE ($1, $2) IN ((a, b))",
+            "SELECT id FROM t WHERE ($1, b) IN (($2, $3))",
+            // 相手がリテラル・式・修飾列
+            "SELECT id FROM t WHERE (a, 7) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, a + 1) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, t.b) IN (($1, $2))",
+            // `$n` が式の内側・型キャスト付き
+            "SELECT id FROM t WHERE (a, b) IN (($1 + 1, $2))",
+            "SELECT id FROM t WHERE (a, b) IN (($1::int, $2))",
+            // 要素が行でない・成分数の不一致
+            "SELECT id FROM t WHERE (a, b) IN ($1, $2)",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2, $3))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2) $3)",
+            // スカラー IN は従来どおり拒否
+            "SELECT id FROM t WHERE n IN ($1)",
+            "SELECT id FROM t WHERE n IN ($1, $2)",
+            // 先頭語・文種・領域の外
+            "EXPLAIN SELECT id FROM t WHERE (a, b) IN (($1, $2))",
+            "WITH c AS (SELECT 1) SELECT id FROM t WHERE (a, b) IN (($1, $2))",
+            "SELECT id FROM t WHERE (a, b) IN (($1, $2)) UNION SELECT id FROM t WHERE a = 1",
+            "SELECT a FROM t GROUP BY a HAVING (a, b) IN (($1, $2))",
+            "INSERT INTO t (id, embedding) VALUES (1, '[0,0]') ON CONFLICT (id) DO UPDATE SET a = 1 WHERE (a, b) IN (($1, $2))",
+        ] {
+            let r = positions(sql);
+            assert!(
+                matches!(&r, Err(e) if e.wire_code() == "42601"),
+                "{sql}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_in_params_do_not_shift_dummy_flag_ordinals() {
+        assert_eq!(
+            flags("SELECT id FROM t WHERE (a, b) IN (($1, $2)) AND lang = $3"),
+            vec![true]
+        );
+        assert_eq!(
+            flags("SELECT id FROM t WHERE m = $1 AND (a, b) NOT IN (($2, $3), ($4, $5))"),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn row_compare_slots_are_found_in_linear_time_for_nested_parens() {
+        // 入れ子の括弧を大量に並べても、左境界ごとの再走査で二次時間にならない（有界時間で完了する）。
+        let depth = 3000;
+        let sql = format!(
+            "SELECT id FROM t WHERE {}a{} < 1",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let tokens = lexer::tokenize_with_params(&sql).expect("tokenize");
+        let started = std::time::Instant::now();
+        let _ = where_noneq_param_slots(&tokens);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn row_compare_dummy_tokens_match_column_types() {
+        use crate::catalog::ColumnType;
+        assert_eq!(row_compare_dummy_token(&ColumnType::Text).unwrap(), None);
+        assert_eq!(row_compare_dummy_token(&ColumnType::Integer).unwrap(), None);
+        assert!(matches!(
+            row_compare_dummy_token(&ColumnType::Date).unwrap(),
+            Some(Token::StringLiteral(s)) if s == "2000-01-01"
+        ));
+        assert!(matches!(
+            row_compare_dummy_token(&ColumnType::TimestampTz).unwrap(),
+            Some(Token::StringLiteral(s)) if s.ends_with("+00")
+        ));
+        for ty in [ColumnType::Json, ColumnType::Jsonb, ColumnType::Bit(3)] {
+            let err = row_compare_dummy_token(&ty).unwrap_err();
+            assert_eq!(err.wire_code(), "0A000");
+        }
+    }
+
+    /// Issue #3297: `UPDATE ... FROM` の SET 節は深さ 0 の `FROM` で終わる。`IS DISTINCT FROM` と
+    /// 単一表 UPDATE の領域は変わらず、別名形は結合 DML のときだけ受理する。
+    #[test]
+    fn set_region_ends_at_from_only_for_update_from() {
+        let t = |sql: &str| tokenize_with_params(sql).expect("tokenize");
+        let tk = t("UPDATE a SET x = $1 FROM b WHERE a.id = b.id");
+        let (set, end) = set_region(&tk).expect("region");
+        assert_eq!(
+            (
+                set,
+                matches!(tk.get(end), Some(Token::Keyword(lexer::Keyword::From)))
+            ),
+            (2, true)
+        );
+        let tk =
+            t("UPDATE a SET x = CASE WHEN y IS DISTINCT FROM $1 THEN 1 ELSE 2 END WHERE id = 1");
+        let (_, end) = set_region(&tk).expect("region");
+        assert!(matches!(
+            tk.get(end),
+            Some(Token::Keyword(lexer::Keyword::Where))
+        ));
+        // 別名形は結合 DML のときだけ。
+        assert_eq!(
+            set_region(&t("UPDATE a AS z SET x = $1 FROM b")).map(|r| r.0),
+            Some(4)
+        );
+        assert_eq!(
+            set_region(&t("UPDATE a z SET x = $1 FROM b")).map(|r| r.0),
+            Some(3)
+        );
+        assert!(set_region(&t("UPDATE a z SET x = $1 WHERE id = 1")).is_none());
+    }
+
+    /// Issue #3297: 結合 DML の関係一覧（公開名, 表名）。`EXPLAIN` 前置を剥がし、別名を公開名にする。
+    #[test]
+    fn joined_dml_relations_resolve_exposed_names() {
+        let t = |sql: &str| tokenize_with_params(sql).expect("tokenize");
+        let rels = |sql: &str| joined_dml_relations(&t(sql));
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            rels("UPDATE docs AS d SET x = 1 FROM langs l, other WHERE d.id = l.id"),
+            Some(vec![
+                pair("d", "docs"),
+                pair("l", "langs"),
+                pair("other", "other")
+            ])
+        );
+        assert_eq!(
+            rels("EXPLAIN DELETE FROM docs d USING langs WHERE d.id = langs.id"),
+            Some(vec![pair("d", "docs"), pair("langs", "langs")])
+        );
+        assert_eq!(rels("UPDATE docs SET x = 1 WHERE id = 1"), None);
+        // JOIN 連鎖の後続表も関係一覧に入る。
+        assert_eq!(
+            rels("DELETE FROM a USING b JOIN c ON b.k = c.k LEFT JOIN d x ON x.k = c.k WHERE a.k = b.k"),
+            Some(vec![pair("a", "a"), pair("b", "b"), pair("c", "c"), pair("x", "d")])
+        );
+    }
+
+    /// Issue #3297: 結合 DML の WHERE の `$n` は修飾列を受理し、`OR`・括弧内・非等価は拒否する。
+    #[test]
+    fn joined_dml_where_params_are_limited_to_conjunctive_equalities() {
+        let ok =
+            |sql: &str| validate_param_positions(&tokenize_with_params(sql).expect("tokenize"));
+        assert!(ok("UPDATE a SET x = 'k' FROM b WHERE a.id = b.id AND b.w = $1").is_ok());
+        assert!(ok("DELETE FROM a USING b WHERE a.id = b.id AND b.w = $1").is_ok());
+        for sql in [
+            "DELETE FROM a USING b WHERE a.id = b.id AND (b.w = $1 OR b.w = 'z')",
+            "DELETE FROM a USING b WHERE a.id = b.id AND b.w = $1 OR b.w = 'z'",
+            "DELETE FROM a USING b WHERE a.id = b.id AND b.w >= $1",
+            "DELETE FROM a USING b WHERE a.id = b.id AND b.w BETWEEN $1 AND $2",
+        ] {
+            assert!(ok(sql).is_err(), "{sql}");
+        }
+        // 単一表の `SELECT` の修飾列は従来どおり受理しない。
+        assert!(ok("SELECT id FROM a WHERE a.w = $1").is_err());
+        let tk = tokenize_with_params(
+            "DELETE FROM a USING b WHERE a.id = b.id AND b.w = $1 AND b.v = 'k'",
+        )
+        .expect("tokenize");
+        assert_eq!(
+            joined_where_conjunct_flags(&tk, &[]),
+            vec![false, true, false]
+        );
+        // 括弧内の連言も AST と同じ単位（葉ごと）で数える。`OR` を含む括弧は 1 葉。
+        let tk = tokenize_with_params(
+            "DELETE FROM a USING b WHERE a.id = b.id AND (b.l = 'J' AND b.f = true) AND b.d = $1",
+        )
+        .expect("tokenize");
+        assert_eq!(
+            joined_where_conjunct_flags(&tk, &[ParamLiteralKind::String]),
+            vec![false, false, false, true]
+        );
+        // 括弧を過剰に重ねた入力でも再帰が打ち切られる（構文解析前の経路でスタックを枯渇させない）。
+        let depth = 5000;
+        let sql = format!(
+            "DELETE FROM a USING b WHERE {}a.k = b.k{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let tk = tokenize_with_params(&sql).expect("tokenize");
+        let flags = joined_where_conjunct_flags(&tk, &[]);
+        assert!(
+            flags.len() <= MAX_PAREN_FLATTEN_DEPTH + 2,
+            "{}",
+            flags.len()
+        );
+        let tk = tokenize_with_params(
+            "DELETE FROM a USING b WHERE (b.l = 'J' OR b.f = 'x') AND b.d = $1",
+        )
+        .expect("tokenize");
+        assert_eq!(
+            joined_where_conjunct_flags(&tk, &[ParamLiteralKind::String]),
+            vec![false, true]
+        );
     }
 }

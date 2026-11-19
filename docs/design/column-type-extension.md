@@ -788,7 +788,7 @@ NoSQL 表層の JSON 束縛（`insert`／`update`／`filter`）の型別対応�
 - **カタログ**: タグ `bit`・param は `n` の 10 進（先頭ゼロ・符号・`-`・範囲外は復号で拒否）。`bit`・`varbit` は ENUM 名として予約する。`BIT(N)` は VECTOR 列の本数に数えない。
 - **行 codec**: 自己記述型（presence ＋ `u32` LE ビット長 ＋ `ceil(len/8)` バイト）。encode でも宣言長との一致を再検証する。`ALTER TABLE ADD COLUMN` の DEFAULT は `TableSchema::bit_default_ref`（遅延キャッシュ）から借用で補完する。
 - **エラー分類**: 文字種違反 `22P02`、ビット数不一致 `22026`（`ErrorClass::StringDataLengthMismatch` を新設）、`BIT(0)`・上限超過 `22023`、未対応の型綴り `0A000`。
-- **対象外**: `B'1010'` ビット列定数、`'1010'::bit(4)`／CAST、`hamming_distance`・`jaccard_distance`、比較述語・ORDER BY・GROUP BY、wire のバイナリ形式（`bit_send`／`bit_recv`）と宣言 OID 1560 の Parse、COPY BINARY、`bit[]`（OID 1561）、`BIT VARYING`。距離カーネルの SQL 接続と `binary_quantize` は兄弟 Issue の担当。
+- **対象外**: `B'1010'` ビット列定数、`'1010'::bit(4)`／CAST、`hamming_distance`・`jaccard_distance`、比較述語・ORDER BY・GROUP BY、wire のバイナリ形式（`bit_send`／`bit_recv`）と宣言 OID 1560 の Parse、COPY BINARY、`bit[]`（OID 1561。**Issue #3235 で解消**。[array-column-type.md](array-column-type.md) の追記節）、`BIT VARYING`。距離カーネルの SQL 接続と `binary_quantize` は兄弟 Issue の担当。
 
 ## Issue #2023 追記: binary_quantize(vector)（TABLE-48 (3) ポインタ）
 

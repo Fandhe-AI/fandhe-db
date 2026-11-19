@@ -100,6 +100,11 @@ pub(crate) struct SqlArenaSnapshot {
     metadata: Vec<Vec<u8>>,
     built_ctx: PolicyContext,
     built_table_generation: u64,
+    /// 行ごとのノルム²（`<=>` 全走査の C2 入力。Issue #3217）。初回の `<=>` 全走査で
+    /// 一度だけ `arena` から計算する遅延初期化。スナップショット自身と同じ寿命で破棄
+    /// される（世代・ctx 単位。他テナントのスナップショットとは共有しない）。確保失敗は
+    /// `None`（C1 経路へ縮退する fail-closed）。追加メモリは行数 × 4 バイト。
+    row_norms_sq: std::sync::OnceLock<Option<Box<[f32]>>>,
 }
 
 impl SqlArenaSnapshot {
@@ -117,7 +122,28 @@ impl SqlArenaSnapshot {
             metadata,
             built_ctx,
             built_table_generation,
+            row_norms_sq: std::sync::OnceLock::new(),
         }
+    }
+
+    /// `arena` の各行のノルム²（スロット順）。初回呼び出しで一度だけ計算して常駐させる
+    /// （Issue #3217）。`sql::exec` の `<=>` 全走査が、実際に走査する arena がこの
+    /// スナップショットの `arena()` そのものである場合に限り `CosineSearchInput::
+    /// row_norms_sq` へ渡す。確保失敗時は `None`（呼び出し側は C1 経路へ縮退する）。
+    pub(crate) fn row_norms_sq(&self) -> Option<&[f32]> {
+        self.row_norms_sq
+            .get_or_init(|| {
+                crate::kernel::row_norms_sq(self.arena.vectors(), self.arena.dim())
+                    .ok()
+                    .map(Vec::into_boxed_slice)
+            })
+            .as_deref()
+    }
+
+    /// テスト専用: ノルム² が既に計算・常駐済みか（遅延計算の検証用。Issue #3217）。
+    #[cfg(test)]
+    pub(crate) fn row_norms_sq_is_computed(&self) -> bool {
+        self.row_norms_sq.get().is_some()
     }
 
     pub(crate) fn arena(&self) -> &VectorArena {
@@ -158,9 +184,13 @@ impl SqlArenaSnapshot {
             .iter()
             .map(|m| m.len().saturating_add(std::mem::size_of::<Vec<u8>>()))
             .fold(0usize, |acc, n| acc.saturating_add(n));
+        // 行ノルム²（遅延確保）は初期化の有無によらず上限見積もりとして常に算入し、
+        // 総量上限の判定が遅延確保で破れないようにする（Issue #3217）。
+        let norms_bytes = self.arena.len().saturating_mul(std::mem::size_of::<f32>());
         self.arena
             .approx_heap_bytes()
             .saturating_add(metadata_bytes)
+            .saturating_add(norms_bytes)
     }
 }
 
@@ -413,6 +443,25 @@ mod tests {
     use crate::storage::Storage;
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
     use redb::ReadableDatabase;
+
+    /// Issue #3217: ノルム² は初回で一度だけ計算され、以降は同じスライスを返す。
+    #[test]
+    fn row_norms_sq_is_computed_once_and_matches_kernel() {
+        let path = unique_db_path("arena-cache-norms-once");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let c = ctx("tenant-a");
+        let snapshot = sample_snapshot(&storage, "docs", &c, 0);
+        let first = snapshot.row_norms_sq().expect("norms");
+        let second = snapshot.row_norms_sq().expect("norms again");
+        assert!(std::ptr::eq(first, second));
+        let expected =
+            crate::kernel::row_norms_sq(snapshot.arena().vectors(), snapshot.arena().dim())
+                .expect("kernel norms");
+        assert_eq!(first, expected.as_slice());
+        assert_eq!(first.len(), snapshot.arena().len());
+    }
 
     fn ctx(tenant: &str) -> PolicyContext {
         PolicyContext::new(tenant).expect("valid tenant")

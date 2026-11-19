@@ -994,6 +994,43 @@ pub struct SparseIndex {
     /// 設定を使うことで、索引とクエリの非対称を構造的に作れなくする。共有の `Arc` は
     /// 索引ごとの所有ではないため [`Self::approx_heap_bytes`] には数えない。
     analysis: Arc<TextAnalysis>,
+    /// 構築時コーパスの最大 `DocId`（Issue #3221）。可視集合が恒等スロット列
+    /// [`VisibleDocs::SlotRange`] のとき「全文書が可視」を `O(1)` で確定する判定に使う。
+    /// 空コーパスは構築時に拒否されるため必ず 1 件以上から決まる。ヒープを持たない。
+    max_doc_id: DocId,
+    /// 全文書が可視のときの文書長合計（Issue #3221）。構築時の `total_len` と同じ値で、
+    /// [`VisibleBitmap`] の全可視形（[`VisibleBits::All`]）の統計に使う。この値と
+    /// `max_doc_id` はこの索引（＝テナント × 世代で分離された `SparseIndexCache` の
+    /// 1 エントリ）自身のコーパスだけから決まり、他テナントの索引からは参照されない。
+    full_visible_total_len: u64,
+}
+
+/// 可視集合の表現（Issue #3221）。hybrid 検索が毎クエリ構築していた
+/// `BTreeSet<DocId>` を、全可視の形では作らずに済ませるための crate 内部の型。
+///
+/// - `Set`: 従来どおりの一般の可視集合。
+/// - `SlotRange`: 可視集合が `0..len` の恒等スロット列そのものであることを、
+///   呼び出し元（`hybrid.rs`）が入力列を線形に確かめたうえで渡す。意味は
+///   `BTreeSet(0..len)` と完全に等しい（ビット一致の根拠）。
+#[derive(Clone, Copy)]
+pub(crate) enum VisibleDocs<'a> {
+    /// 一般の可視集合。
+    Set(&'a BTreeSet<DocId>),
+    /// `0..len` の恒等スロット列。
+    SlotRange {
+        /// 可視な DocId の個数（`DocId < len` が可視）。
+        len: u64,
+    },
+}
+
+impl VisibleDocs<'_> {
+    /// 可視集合が空か。
+    pub(crate) fn is_empty(&self) -> bool {
+        match self {
+            Self::Set(s) => s.is_empty(),
+            Self::SlotRange { len } => *len == 0,
+        }
+    }
 }
 
 /// [`SparseIndex::search_within`] が可視集合（`visible_ids`）を `doc_idx` 空間の
@@ -1006,13 +1043,23 @@ pub struct SparseIndex {
 /// 有界）でのみ決まり、untrusted な `visible_ids` の大きさで増幅しない
 /// （`.claude/rules/coding-rust.md`: untrusted 入力によるリソース確保の増幅防止）。
 struct VisibleBitmap {
-    /// `doc_idx / 64` を添字とするビット集合。ビット `doc_idx % 64` が立っている
-    /// 文書が可視。
-    words: Vec<u64>,
-    /// 可視文書数（`words` の立っているビット数）。
+    /// 可視ビット集合の実体。
+    bits: VisibleBits,
+    /// 可視文書数（立っているビット数）。
     n: usize,
     /// 可視文書の文書長合計（`avg_doc_len = total_len / n` の分子）。
     total_len: u64,
+}
+
+/// [`VisibleBitmap`] のビット集合の表現（Issue #3221）。
+enum VisibleBits {
+    /// 索引の全文書（`doc_idx < doc_count`）が可視。確保なし。
+    All {
+        /// 索引の文書数。
+        doc_count: usize,
+    },
+    /// `doc_idx / 64` を添字とするビット集合。ビット `doc_idx % 64` が立っている文書が可視。
+    Words(Vec<u64>),
 }
 
 impl VisibleBitmap {
@@ -1040,18 +1087,69 @@ impl VisibleBitmap {
             total_len = total_len.saturating_add(u64::from(doc_len));
         }
         Self {
-            words,
+            bits: VisibleBits::Words(words),
             n,
             total_len,
+        }
+    }
+
+    /// [`VisibleDocs`] から構築する（Issue #3221）。`Set` は [`Self::build`] そのもの。
+    /// `SlotRange { len }` は `BTreeSet(0..len)` と等価に扱い、`id_index`（SipHash）を引かない。
+    ///
+    /// - `index.max_doc_id < len`: 全文書が可視と確定。統計は構築時に固定した値を返し、
+    ///   確保も走査も行わない（`O(1)`）。
+    /// - それ以外: `doc_ids` を 1 回だけ添字走査して `DocId < len` の文書を立てる（`O(N)`）。
+    ///
+    /// 入力は呼び出し元が検証済みの恒等列だが、本関数は全可視の判定をデータ（`max_doc_id`・
+    /// `len`）から毎回行い、呼び出し元のフラグを信用しない。不成立なら可視集合は広がらず
+    /// 部分走査へ倒れる（fail-closed）。
+    fn build_docs(index: &SparseIndex, visible: VisibleDocs<'_>) -> Self {
+        match visible {
+            VisibleDocs::Set(s) => Self::build(index, s),
+            VisibleDocs::SlotRange { len } => {
+                if index.max_doc_id < len {
+                    return Self {
+                        bits: VisibleBits::All {
+                            doc_count: index.doc_ids.len(),
+                        },
+                        n: index.doc_ids.len(),
+                        total_len: index.full_visible_total_len,
+                    };
+                }
+                let word_count = index.doc_ids.len().div_ceil(64);
+                let mut words = vec![0u64; word_count];
+                let mut n = 0usize;
+                let mut total_len: u64 = 0;
+                for (idx, &doc_id) in index.doc_ids.iter().enumerate() {
+                    if doc_id >= len {
+                        continue;
+                    }
+                    let Some(word) = words.get_mut(idx / 64) else {
+                        continue;
+                    };
+                    *word |= 1u64 << (idx % 64);
+                    n = n.saturating_add(1);
+                    let doc_len = index.doc_len.get(idx).copied().unwrap_or(0);
+                    total_len = total_len.saturating_add(u64::from(doc_len));
+                }
+                Self {
+                    bits: VisibleBits::Words(words),
+                    n,
+                    total_len,
+                }
+            }
         }
     }
 
     /// `doc_idx` が可視ビットマップに含まれるか（範囲外は `false`。fail-closed）。
     fn contains(&self, doc_idx: u32) -> bool {
         let idx = doc_idx as usize;
-        match self.words.get(idx / 64) {
-            Some(word) => word & (1u64 << (idx % 64)) != 0,
-            None => false,
+        match &self.bits {
+            VisibleBits::All { doc_count } => idx < *doc_count,
+            VisibleBits::Words(words) => match words.get(idx / 64) {
+                Some(word) => word & (1u64 << (idx % 64)) != 0,
+                None => false,
+            },
         }
     }
 }
@@ -1069,33 +1167,44 @@ enum ScoreScope<'a> {
     Visible(&'a VisibleBitmap),
 }
 
+/// `k1_len_norm` の未計算スロットを表す番兵 NaN のビット列（Issue #3222）。
+/// 判定は `to_bits()` のビット比較で行う。`k1` は有限かつ 0 以上、`b` は
+/// `[0, 1]`、母数 avgdl は `f64::MIN_POSITIVE` 以上へ丸めるため、`k1 * len_norm`
+/// は NaN にならない（`+inf` にはなり得るが番兵とは別ビット）。仮に NaN が
+/// 生じてもハードウェアの正準 NaN はこの専用ペイロードと一致しない。
+const LEN_NORM_UNSET_BITS: u64 = 0x7FF8_0000_DEAD_0001;
+
 /// [`SparseIndex::score_pass`] が呼び出し間で使い回すスクラッチ一式（Issue #546。
 /// 親 #545・#390 レビュー指摘「N 非依存化フォローアップ」への対応）。
 ///
 /// 不変条件（プールへ返却する時点・プールから取り出した直後のいずれでも成立）:
 /// `acc` の全要素は `0.0`、`touched`・`visible_hits`・`touched_classes` は空
-/// （`clear()` 済みで capacity は保持）、`k1_len_norm_cache` は空。
+/// （`clear()` 済みで capacity は保持）、`k1_len_norm` の全要素は未計算の番兵
+/// （[`LEN_NORM_UNSET_BITS`]）。
 /// [`SparseIndex::release_scratch`] がこの不変条件を回復してからプールへ戻す
 /// （`touched` に記録された `doc_idx` のみをゼロ戻しする。「`acc[idx] == 0.0`
 /// ⇔ 未加算」という [`SparseIndex::score_pass`] の不変条件により、`touched` に
 /// 載っていない要素は既に `0.0` であるため、全要素走査によるゼロクリアと結果は
-/// 同一）。`k1_len_norm_cache` も同様に `touched_classes`（初めて `entry` へ
-/// 挿入した文書長クラスを記録した列。Issue #546 レビュー指摘・PR #565: 巨大な
-/// `HashMap::clear()` は要素数でなく確保済み容量に比例するため、多数の相異なる
-/// 文書長クラスにヒットしたクエリの後で 1 件しかヒットしない後続クエリが返却
-/// されても容量分のコストを毎回払ってしまう）を使い、[`ScoreScratch::
-/// clear_len_norm_cache`] でタッチしたキーだけを `remove` することで
-/// `O(M)`（`M` = そのパスで実際にタッチした文書長クラス数）を維持する。
+/// 同一）。`k1_len_norm` も同様に `touched_classes`（初めて値を書いた文書長
+/// クラスを記録した列。Issue #546 レビュー指摘・PR #565）を使い、[`ScoreScratch::
+/// clear_len_norm_cache`] でタッチしたスロットにだけ番兵を書き戻すことで
+/// `O(M)`（`M` = そのパスで実際にタッチした文書長クラス数）を維持する
+/// （配列全体の埋め直しは行わない。Issue #3222: 旧 `HashMap<u32, f64>` の
+/// SipHash 計算を文書長クラス添字の配列参照へ置き換えた）。
 #[derive(Debug)]
 struct ScoreScratch {
     acc: Vec<f64>,
     touched: Vec<u32>,
     visible_hits: Vec<(u32, u32)>,
-    k1_len_norm_cache: HashMap<u32, f64>,
-    /// `k1_len_norm_cache` へ初めて挿入した文書長クラスを挿入順に記録した列
-    /// （Issue #546 レビュー指摘・PR #565）。`k1_len_norm_cache` のキー集合と
+    /// 文書長クラス（`doc_len_class` の値。`0..len_classes.len()` の密な添字）
+    /// ごとの `k1 * len_norm` の遅延キャッシュ（Issue #3222）。未計算スロットは
+    /// [`LEN_NORM_UNSET_BITS`] のビット列を持つ番兵 NaN で表す。長さは
+    /// [`ScoreScratch::new_for`] が `len_classes.len()`（<= 文書数）へ固定する。
+    k1_len_norm: Vec<f64>,
+    /// `k1_len_norm` へ初めて値を書いた文書長クラスを記録した列
+    /// （Issue #546 レビュー指摘・PR #565）。番兵以外のスロットの集合と
     /// 常に一致し、[`ScoreScratch::clear_len_norm_cache`] が `O(M)` での
-    /// クリアに使う。
+    /// 番兵復元に使う。
     touched_classes: Vec<u32>,
     /// `doc_idx` を添字とする「このパスで既に `touched` へ記録したか」の
     /// 世代カウンタ（`hnsw.rs::VisitedScratch` と同型の epoch 方式。codex-review
@@ -1129,8 +1238,15 @@ struct ScoreScratch {
 }
 
 impl ScoreScratch {
-    /// 索引の文書数 `n`（`doc_ids.len()`）に対応する全ゼロの新規スクラッチを
+    /// 索引の文書数 `n`（`doc_ids.len()`）と文書長クラス数 `classes`
+    /// （`len_classes.len()`）に対応する全ゼロの新規スクラッチを
     /// 確保する（[`SparseIndex::acquire_scratch`] のプール枯渇時フォールバック）。
+    ///
+    /// `k1_len_norm` の長さは確保前に `classes <= n <= MAX_CORPUS_DOCS` を検査する
+    /// （無制限確保の禁止）。索引構築上は `len_classes` が `doc_len_by_idx` の
+    /// dedup であるため常に成立する（到達不能な防御）が、破れた場合は長さ 0 で
+    /// 確保し、ヒットループの `get_mut` が `None` となって該当ヒットを棄却する
+    /// （fail-closed）。
     ///
     /// `touched`・`visible_hits` は `Vec::with_capacity(n)` で容量を `n` に
     /// 固定する（codex-review 指摘・PR #565: 空 `Vec::new()` から `push` で
@@ -1142,16 +1258,21 @@ impl ScoreScratch {
     /// すれば以後の `push` で `n` を超えて再確保されることはなく、
     /// [`SparseIndex::approx_heap_bytes`] が計上する「容量 `n` ぶん」の
     /// 見積もりと実際の確保量が常に一致する。
-    fn new_for(n: usize) -> Self {
+    fn new_for(n: usize, classes: usize) -> Self {
+        let classes = if classes <= n && n <= MAX_CORPUS_DOCS {
+            classes
+        } else {
+            0
+        };
         Self {
             acc: vec![0.0; n],
             touched: Vec::with_capacity(n),
             visible_hits: Vec::with_capacity(n),
-            k1_len_norm_cache: HashMap::new(),
+            k1_len_norm: vec![f64::from_bits(LEN_NORM_UNSET_BITS); classes],
             // 相異なる文書長クラス数（`len_classes.len()`）は文書数 `n` を
             // 超えないため、`touched`/`visible_hits` と同じ理由で容量を `n` へ
             // 固定する（Issue #546 レビュー指摘・PR #565）。
-            touched_classes: Vec::with_capacity(n),
+            touched_classes: Vec::with_capacity(classes),
             // `doc_idx` ごとに厳密 1 要素（`n` 個）の世代カウンタ。全要素 `0`
             // 初期化のため `epoch` の初期値 `0` とは呼び出し前の
             // `wrapping_add(1)` で確実に区別する（codex-review 指摘・PR #565）。
@@ -1160,16 +1281,20 @@ impl ScoreScratch {
         }
     }
 
-    /// `k1_len_norm_cache` を `touched_classes` に記録された文書長クラスだけを
-    /// `remove` することでクリアする（Issue #546 レビュー指摘・PR #565）。
-    /// `HashMap::clear()` は確保済み容量（過去に大きく育った制御領域）に比例する
-    /// 処理量になり得るため、実際にタッチしたキー集合（`O(M)`）だけを取り除く。
-    /// `touched_classes` は `k1_len_norm_cache` のキー集合と 1 対 1 に対応する
-    /// （挿入は必ず `entry().or_insert_with` の `Vacant` 分岐でのみ行われ、その
-    /// 場でだけ `touched_classes` へ記録するため）。
+    /// `k1_len_norm` を、`touched_classes` に記録された文書長クラスのスロットだけ
+    /// 番兵へ戻すことでクリアする（Issue #546 レビュー指摘・PR #565・Issue #3222）。
+    /// 配列全体の埋め直しは `len_classes.len()` に比例するため行わず、実際に
+    /// タッチしたクラス集合（`O(M)`）だけを復元する。`touched_classes` は番兵
+    /// 以外のスロット集合と 1 対 1 に対応する（書き込みはヒットループの 1 箇所で、
+    /// その場で `touched_classes` へ記録するため）。パスをまたぐ値の残留は
+    /// 可視集合外の統計の混入（RLS 縮約契約違反）になるため、返却時と
+    /// `score_pass` 冒頭の 2 重で必ず呼ぶ。
     fn clear_len_norm_cache(&mut self) {
+        let unset = f64::from_bits(LEN_NORM_UNSET_BITS);
         for class in self.touched_classes.drain(..) {
-            self.k1_len_norm_cache.remove(&class);
+            if let Some(slot) = self.k1_len_norm.get_mut(class as usize) {
+                *slot = unset;
+            }
         }
     }
 }
@@ -1240,31 +1365,31 @@ const MAX_SCORE_SCRATCH_POOL: usize = 4;
 
 impl SparseIndex {
     /// スクラッチプールから 1 本取り出す（[`Self::score_pass`] の入口）。プールが
-    /// 空、または取り出したスクラッチの `acc` 長がこの索引の文書数と不一致
+    /// 空、または取り出したスクラッチの `acc` 長・`k1_len_norm` 長がこの索引の
+    /// 文書数・文書長クラス数と不一致
     /// （通常到達しないが、fail-closed のため明示的に検証する）の場合は
     /// [`ScoreScratch::new_for`] で新規確保する。ロックは pop のみの短時間保持。
     fn acquire_scratch(&self) -> ScoreScratch {
         let n = self.doc_ids.len();
+        let classes = self.len_classes.len();
         let popped = self
             .scratch_pool
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop();
         match popped {
-            Some(s) if s.acc.len() == n => s,
-            _ => ScoreScratch::new_for(n),
+            Some(s) if s.acc.len() == n && s.k1_len_norm.len() == classes => s,
+            _ => ScoreScratch::new_for(n, classes),
         }
     }
 
     /// スクラッチをプールへ返却する（[`ScorePass::drop`] から呼ばれる）。返却前に
     /// `touched` に記録された `doc_idx` のみをゼロ戻しし（[`ScoreScratch`] の
     /// 不変条件を回復）、`touched`/`visible_hits` は `clear()`（capacity は
-    /// 維持し次回確保コストを避ける）。`k1_len_norm_cache` は
+    /// 維持し次回確保コストを避ける）。`k1_len_norm` は
     /// [`ScoreScratch::clear_len_norm_cache`] で `touched_classes` に記録された
-    /// キーのみを `remove` する（Issue #546 レビュー指摘・PR #565: `HashMap::
-    /// clear()` は確保済み容量に比例するため、多数の文書長クラスにヒットした
-    /// 過去のクエリの容量が残ったまま `clear()` すると、後続の小さいクエリの
-    /// 返却コストまで肥大化する）。プールが [`MAX_SCORE_SCRATCH_POOL`] に
+    /// スロットのみを番兵へ戻す（Issue #546 レビュー指摘・PR #565・Issue #3222:
+    /// 配列全体の埋め直しは文書長クラス数に比例するため行わない）。プールが [`MAX_SCORE_SCRATCH_POOL`] に
     /// 達していれば返却せず破棄する（有界プール）。ロックは push のみの短時間
     /// 保持。
     fn release_scratch(&self, mut scratch: ScoreScratch) {
@@ -1504,6 +1629,12 @@ impl SparseIndex {
         let doc_count = u32::try_from(doc_len_by_idx.len()).unwrap_or(u32::MAX);
         let avg_doc_len = total_len as f64 / f64::from(doc_count);
 
+        // 全可視判定用の最大 DocId（Issue #3221）。空コーパスは冒頭で拒否済みだが、
+        // `None` でも `unwrap` せず構築失敗として fail-closed にする。
+        let Some(max_doc_id) = doc_ids_by_idx.iter().copied().max() else {
+            return Err(SparseError::EmptyCorpus);
+        };
+
         // 文書長クラス表の構築（Issue #391）。`doc_len_by_idx` の相異なる値を
         // 昇順・重複なしに並べたものが `len_classes`。各文書の `doc_len_class` は
         // その値が `len_classes` の何番目にあるかを二分探索で求める。`doc_len_by_idx`
@@ -1558,6 +1689,8 @@ impl SparseIndex {
             scratch_pool: Mutex::new(Vec::new()),
             prefix_vocab,
             analysis,
+            max_doc_id,
+            full_visible_total_len: total_len,
         })
     }
 
@@ -1788,7 +1921,7 @@ impl SparseIndex {
         // 索引自身の構築済みパラメータは `with_params` の定義域検査を通過済み。
         // クエリ時上書き専用の数値安全上限（`MAX_QUERY_K1`）は適用しない
         // （`k1 > 1e200` で構築した既存索引の挙動を変えない）。
-        self.score_within_checked(query, visible_ids, self.params())
+        self.score_within_checked(query, VisibleDocs::Set(visible_ids), self.params())
     }
 
     /// 構築時の `k1`・`b` を [`Bm25Params`] として返す。
@@ -1814,6 +1947,18 @@ impl SparseIndex {
         visible_ids: &BTreeSet<DocId>,
         params: Bm25Params,
     ) -> Result<SparseScored, SparseError> {
+        self.score_within_docs_with_params(query, VisibleDocs::Set(visible_ids), params)
+    }
+
+    /// [`Self::score_within_with_params`] の可視集合表現を [`VisibleDocs`] へ一般化した
+    /// crate 内部版（Issue #3221）。hybrid 検索（`hybrid.rs::sparse_refetch_loop`）が全可視の
+    /// 形で `BTreeSet` を作らずに呼ぶ。検証順序・結果は `Set` 経路と同一。
+    pub(crate) fn score_within_docs_with_params(
+        &self,
+        query: &str,
+        visible: VisibleDocs<'_>,
+        params: Bm25Params,
+    ) -> Result<SparseScored, SparseError> {
         // 索引自身のパラメータ（`hybrid_search` 経路が `params()` で渡す）は
         // `with_params` で検証済みのため、クエリ時上限 `MAX_QUERY_K1` を再適用しない。
         let params = if params == self.params() {
@@ -1821,7 +1966,7 @@ impl SparseIndex {
         } else {
             Bm25Params::new(params.k1, params.b)?
         };
-        self.score_within_checked(query, visible_ids, params)
+        self.score_within_checked(query, visible, params)
     }
 
     /// [`Self::score_within`]・[`Self::score_within_with_params`] 共通の本体。
@@ -1829,7 +1974,7 @@ impl SparseIndex {
     fn score_within_checked(
         &self,
         query: &str,
-        visible_ids: &BTreeSet<DocId>,
+        visible_ids: VisibleDocs<'_>,
         params: Bm25Params,
     ) -> Result<SparseScored, SparseError> {
         if query.len() > MAX_QUERY_BYTES {
@@ -1871,7 +2016,7 @@ impl SparseIndex {
             return Ok(empty());
         }
 
-        let bitmap = VisibleBitmap::build(self, visible_ids);
+        let bitmap = VisibleBitmap::build_docs(self, visible_ids);
         if bitmap.n == 0 {
             return Ok(empty());
         }
@@ -1947,7 +2092,7 @@ impl SparseIndex {
     /// ヒットごとの `len_norm`（`1-b+b*doc_len/avgdl` 由来の `k1 * len_norm`）は
     /// クエリ内で `avgdl`（母数 `n`／`avg_doc_len`。[`ScoreScope`] により変わる）が
     /// 確定した後は文書長のみに依存するため、文書長クラス（[`Self::len_classes`]）
-    /// ごとに実際にヒットループでタッチした時点で 1 回だけ計算し `HashMap` へ
+    /// ごとに実際にヒットループでタッチした時点で 1 回だけ計算し、クラス添字の配列へ
     /// キャッシュする（tantivy の fieldnorm 量子化に相当。ただし本実装はロッシー
     /// 量子化をせず「相異なる文書長 = クラス」の厳密写像とする。式・演算順は旧来の
     /// インライン計算と完全に同一であるため `denominator` は旧実装とビット一致
@@ -2024,17 +2169,17 @@ impl SparseIndex {
 
         // 索引の寿命内で使い回すスクラッチを取り出す（Issue #546）。
         // [`Self::acquire_scratch`]/[`Self::release_scratch`] の不変条件により
-        // `acc` は全要素 `0.0`・`touched`/`visible_hits`/`k1_len_norm_cache` は
-        // 空の状態で渡ってくるが、防御的に（呼び出し元・プール実装の変更に対する
+        // `acc` は全要素 `0.0`・`touched`/`visible_hits` は空・`k1_len_norm` は
+        // 全要素番兵の状態で渡ってくるが、防御的に（呼び出し元・プール実装の変更に対する
         // 縮退耐性として）ここでも軽量なフィールド（`touched`/`visible_hits`/
-        // `k1_len_norm_cache`。全要素走査を要する `acc` は対象外）を明示的に
+        // `k1_len_norm`。全要素走査を要する `acc` は対象外）を明示的に
         // クリアし、母数の異なる前回パスの値が混入しないことを構造的に保証する
         // （テナント縮約契約〔RLS 相当〕を壊さないための多重防御）。
-        // `k1_len_norm_cache` は `HashMap::clear()` ではなく
+        // `k1_len_norm` は全体の埋め直しではなく
         // [`ScoreScratch::clear_len_norm_cache`]（`touched_classes` に記録した
-        // キーのみ `remove`）を使う（Issue #546 レビュー指摘・PR #565: この
-        // 防御的クリアはパス毎に必ず実行されるため、`clear()` のまま残すと
-        // 確保済み容量に比例するコストを毎クエリ払ってしまう）。
+        // スロットのみ番兵へ復元）を使う（Issue #546 レビュー指摘・PR #565・
+        // Issue #3222: この防御的クリアはパス毎に必ず実行されるため、配列全体の
+        // 走査では文書長クラス数に比例するコストを毎クエリ払ってしまう）。
         let mut scratch = self.acquire_scratch();
         scratch.touched.clear();
         scratch.visible_hits.clear();
@@ -2050,7 +2195,7 @@ impl SparseIndex {
         // 指摘（PR #426）に対応し、ヒットループ内で実際にタッチしたクラスのみを
         // 遅延計算してキャッシュする方式へ変更した。式・演算順（`k1_len_norm[c]`
         // は旧実装の `self.k1 * len_norm` と同一算出）は不変のため `denominator` は
-        // 引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class` →
+        // 引き続きビット一致する。配列スロットの値は決定的に定まる（`class` →
         // 一意な `f64`）ためスコア自体の決定性に影響しない。
         let k1_plus_1 = params.k1 + 1.0;
 
@@ -2074,7 +2219,7 @@ impl SparseIndex {
             acc,
             touched,
             visible_hits,
-            k1_len_norm_cache,
+            k1_len_norm,
             touched_classes,
             visited_epoch,
             epoch,
@@ -2122,20 +2267,23 @@ impl SparseIndex {
                 let Some(&len) = self.len_classes.get(class as usize) else {
                     continue;
                 };
-                // `entry` の `Vacant` 分岐でのみ新規キーを挿入し、その場で
-                // `touched_classes` へ記録する（Issue #546 レビュー指摘・
-                // PR #565）。`touched_classes` が `k1_len_norm_cache` のキー集合と
-                // 1 対 1 に対応するのはこの 1 箇所だけが挿入経路であるため。
-                let kln = match k1_len_norm_cache.entry(class) {
-                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        let value = params.k1
-                            * (1.0 - params.b
-                                + params.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
-                        entry.insert(value);
-                        touched_classes.push(class);
-                        value
-                    }
+                // 文書長クラス添字の配列スロットが番兵のときだけ計算して書き込み、
+                // その場で `touched_classes` へ記録する（Issue #546 レビュー指摘・
+                // PR #565・Issue #3222）。`touched_classes` が番兵以外のスロット
+                // 集合と 1 対 1 に対応するのはこの 1 箇所だけが書き込み経路で
+                // あるため。範囲外は fail-closed で当該ヒットを棄却する。
+                let Some(slot) = k1_len_norm.get_mut(class as usize) else {
+                    continue;
+                };
+                let kln = if slot.to_bits() == LEN_NORM_UNSET_BITS {
+                    let value = params.k1
+                        * (1.0 - params.b
+                            + params.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
+                    *slot = value;
+                    touched_classes.push(class);
+                    value
+                } else {
+                    *slot
                 };
                 let f = f64::from(tf);
                 let numerator = f * k1_plus_1;
@@ -2283,24 +2431,30 @@ impl SparseIndex {
         // レビュー指摘・PR #565: 以前は空 `Vec::new()` から `push` で育てており、
         // 標準ライブラリの倍々戦略により最終容量が `N` を超えうる〔`N` が
         // 2 の冪+1 付近だと最大で概ね `2N` 弱まで〕過小計上の余地があった）・
-        // `k1_len_norm_cache`（`HashMap<u32, f64>`。相異なる文書長クラス数 =
-        // `len_classes.len()` が上限）。`N = MAX_CORPUS_DOCS`（100,000）のとき
-        // 1 本あたり概算 (8 + 4 + 4 + 8) × 100,000 ≈ 2.4 MB、
-        // `MAX_SCORE_SCRATCH_POOL`（4 本）で約 9.6 MB／索引。
+        // `visited_epoch`（8）・`k1_len_norm`（`Vec<f64>`。長さ =
+        // `len_classes.len()` で `new_for` が確保前に固定する。Issue #3222）。
+        // `N = MAX_CORPUS_DOCS`（100,000）・全文書長が相異なる最悪ケースで
+        // 1 本あたり概算 (8 + 4 + 8 + 4 + 8 + 8) × 100,000 ≈ 4.0 MB、
+        // `MAX_SCORE_SCRATCH_POOL`（4 本）で約 16 MB／索引。
         // `MAX_SPARSE_CACHE_TOTAL_BYTES`（= `MAX_ARENA_TOTAL_BYTES` = 1 GiB）に
         // 対し十分小さい桁に収まる。
         let n = self.doc_ids.len();
         let scratch_acc = n.saturating_mul(std::mem::size_of::<f64>());
         let scratch_touched = n.saturating_mul(std::mem::size_of::<u32>());
         let scratch_visible_hits = n.saturating_mul(std::mem::size_of::<(u32, u32)>());
-        let scratch_touched_classes = n.saturating_mul(std::mem::size_of::<u32>());
+        let scratch_touched_classes = self
+            .len_classes
+            .len()
+            .min(n)
+            .saturating_mul(std::mem::size_of::<u32>());
         // `touched` への重複記録防止用の世代カウンタ（[`ScoreScratch::
         // visited_epoch`]。codex-review 指摘・PR #565）。`touched` と同じ `n`
         // 要素だが `u64` のため 1 要素あたり 8 バイト。
         let scratch_visited_epoch = n.saturating_mul(std::mem::size_of::<u64>());
-        let scratch_len_norm_cache = self.len_classes.len().saturating_mul(
-            std::mem::size_of::<(u32, f64)>().saturating_add(Self::HASHMAP_ENTRY_OVERHEAD_BYTES),
-        );
+        let scratch_len_norm_cache = self
+            .len_classes
+            .len()
+            .saturating_mul(std::mem::size_of::<f64>());
         let scratch_one = scratch_acc
             .saturating_add(scratch_touched)
             .saturating_add(scratch_visible_hits)
@@ -3589,7 +3743,7 @@ mod tests {
     #[test]
     fn scratch_pool_returns_all_zero_and_bounded() {
         // ヒットありクエリを複数回実行した後、プール内に残る全スクラッチの
-        // `acc` が全ゼロ・`touched`/`visible_hits`/`k1_len_norm_cache` が空・
+        // `acc` が全ゼロ・`touched`/`visible_hits` が空・`k1_len_norm` が全番兵・
         // プール長が MAX_SCORE_SCRATCH_POOL 以下であることを検証する
         // （release_scratch がゼロ戻し・clear を確実に行っている根拠）。
         let docs: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma")];
@@ -3608,7 +3762,14 @@ mod tests {
             );
             assert!(scratch.touched.is_empty());
             assert!(scratch.visible_hits.is_empty());
-            assert!(scratch.k1_len_norm_cache.is_empty());
+            assert_eq!(scratch.k1_len_norm.len(), idx.len_classes.len());
+            assert!(
+                scratch
+                    .k1_len_norm
+                    .iter()
+                    .all(|v| v.to_bits() == LEN_NORM_UNSET_BITS),
+                "プールへ返却されたスクラッチの k1_len_norm が全番兵でない"
+            );
             assert!(scratch.touched_classes.is_empty());
         }
     }
@@ -3714,7 +3875,10 @@ mod tests {
 
         {
             let mut pool = idx.scratch_pool.lock().unwrap();
-            pool.push(ScoreScratch::new_for(idx.doc_ids.len() + 1));
+            pool.push(ScoreScratch::new_for(
+                idx.doc_ids.len() + 1,
+                idx.len_classes.len(),
+            ));
         }
 
         let result = idx.search("alpha beta", 10).unwrap();
@@ -4914,6 +5078,87 @@ mod tests {
         }
     }
 
+    /// Issue #3222: 1 本の索引（プールのスクラッチを再利用）で可視集合・params を
+    /// 変えながら連続採点しても、各回の結果が新規 build 直後の索引とビット一致する
+    /// （`k1_len_norm` のスロットがパスをまたいで残り、可視外の母数統計が混入しない
+    /// ことの回帰。RLS 縮約契約）。
+    #[test]
+    fn len_norm_slots_do_not_leak_across_passes() {
+        let corpus = generate_mixed_corpus(400);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let reused = SparseIndex::build(&refs).unwrap();
+        let all: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+        let half: BTreeSet<DocId> = refs
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|i| i % 2 == 0)
+            .collect();
+        let third: BTreeSet<DocId> = refs
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|i| i % 3 == 0)
+            .collect();
+        let none: BTreeSet<DocId> = BTreeSet::new();
+        let bits = |s: &SparseScored| -> Vec<(DocId, u64)> {
+            s.candidates
+                .iter()
+                .map(|c| (c.doc_id, c.score.to_bits()))
+                .collect()
+        };
+        let params = [
+            reused.params(),
+            Bm25Params::new(0.0, 0.5).unwrap(),
+            Bm25Params::new(1.5, 0.0).unwrap(),
+            Bm25Params::new(1.5, 1.0).unwrap(),
+            Bm25Params::new(MAX_QUERY_K1, 0.75).unwrap(),
+        ];
+        for round in 0..2 {
+            for vis in [&all, &half, &third, &none, &half] {
+                for p in params {
+                    for q in ["alpha beta", "alpha", "gamma delta alpha"] {
+                        let fresh = SparseIndex::build(&refs).unwrap();
+                        let got = reused.score_within_with_params(q, vis, p).unwrap();
+                        let want = fresh.score_within_with_params(q, vis, p).unwrap();
+                        assert_eq!(bits(&got), bits(&want), "round={round} q={q} p={p:?}");
+                    }
+                }
+            }
+        }
+        let pool = reused.scratch_pool.lock().unwrap();
+        for scratch in pool.iter() {
+            assert!(scratch.touched_classes.is_empty());
+            assert!(scratch
+                .k1_len_norm
+                .iter()
+                .all(|v| v.to_bits() == LEN_NORM_UNSET_BITS));
+        }
+    }
+
+    /// Issue #3222: 配列長は確保前の上限検査で `classes <= n` に抑えられ、
+    /// 違反時は空配列（ヒット棄却の fail-closed）になる。長さの合わない
+    /// スクラッチはプールから再利用されない。
+    #[test]
+    fn scratch_len_norm_array_is_bounded_by_len_classes() {
+        assert_eq!(ScoreScratch::new_for(10, 3).k1_len_norm.len(), 3);
+        assert_eq!(ScoreScratch::new_for(10, 11).k1_len_norm.len(), 0);
+        assert_eq!(
+            ScoreScratch::new_for(MAX_CORPUS_DOCS + 1, 1)
+                .k1_len_norm
+                .len(),
+            0
+        );
+        let docs: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma delta")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        {
+            let mut pool = idx.scratch_pool.lock().unwrap();
+            pool.push(ScoreScratch::new_for(idx.doc_ids.len(), 0));
+        }
+        let got = idx.search("beta", 10).unwrap();
+        assert_eq!(got.len(), 2);
+        let s = idx.acquire_scratch();
+        assert_eq!(s.k1_len_norm.len(), idx.len_classes.len());
+    }
+
     /// Issue #2121: `Bm25Params::new` の定義域・数値安全上限・境界値。
     #[test]
     fn bm25_params_new_validates_domain_and_safety_cap() {
@@ -4970,5 +5215,158 @@ mod tests {
         let mut scored = idx.score_within_with_params("apple", &visible, p).unwrap();
         let ids: Vec<DocId> = scored.top(3).iter().map(|d| d.doc_id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    // ---------- Issue #3221: 全可視（SlotRange）経路の等価性 ----------
+
+    /// 欠番（本文 NULL 行を模す）を含む DocId で `n` 件のコーパスを作る。
+    fn slot_corpus(n: usize, gap_every: usize) -> Vec<(DocId, String)> {
+        let words = ["alpha", "beta", "gamma", "delta"];
+        let mut out = Vec::new();
+        let mut id: DocId = 0;
+        for i in 0..n {
+            if gap_every > 0 && i % gap_every == 0 {
+                id += 1; // 欠番
+            }
+            let text = format!(
+                "{} {} {}",
+                words[i % 4],
+                words[(i / 2) % 4],
+                "w ".repeat(i % 5)
+            );
+            out.push((id, text));
+            id += 1;
+        }
+        out
+    }
+
+    fn build_slot_index(corpus: &[(DocId, String)]) -> SparseIndex {
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(i, t)| (*i, t.as_str())).collect();
+        SparseIndex::build(&refs).unwrap()
+    }
+
+    fn score_bits(s: &mut SparseScored) -> Vec<(DocId, u64)> {
+        s.top(usize::MAX)
+            .iter()
+            .map(|d| (d.doc_id, d.score.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn slot_range_bitmap_matches_set_bitmap_for_all_lens() {
+        for &n in &[1usize, 63, 64, 65, 130] {
+            for &gap in &[0usize, 3] {
+                let corpus = slot_corpus(n, gap);
+                let idx = build_slot_index(&corpus);
+                let max_id = corpus.last().map(|(i, _)| *i).unwrap();
+                for len in [0u64, 1, 2, max_id / 2, max_id, max_id + 1, max_id + 5] {
+                    let set: BTreeSet<DocId> = (0..len).collect();
+                    let a = VisibleBitmap::build(&idx, &set);
+                    let b = VisibleBitmap::build_docs(&idx, VisibleDocs::SlotRange { len });
+                    assert_eq!(a.n, b.n, "n n={n} gap={gap} len={len}");
+                    assert_eq!(a.total_len, b.total_len, "total_len n={n} len={len}");
+                    for d in 0..(idx.doc_ids.len() as u32 + 70) {
+                        assert_eq!(a.contains(d), b.contains(d), "contains {d} n={n} len={len}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slot_range_scoring_is_bit_identical_to_set_scoring() {
+        let corpus = slot_corpus(70, 4);
+        let idx = build_slot_index(&corpus);
+        let max_id = corpus.last().map(|(i, _)| *i).unwrap();
+        let overridden = Bm25Params::new(2.5, 0.3).unwrap();
+        for len in [0u64, 10, max_id, max_id + 1, max_id + 9] {
+            let set: BTreeSet<DocId> = (0..len).collect();
+            for params in [idx.params(), overridden] {
+                for q in ["alpha", "alpha beta", "gamma w", "zzz"] {
+                    let mut a = idx.score_within_with_params(q, &set, params).unwrap();
+                    let mut b = idx
+                        .score_within_docs_with_params(q, VisibleDocs::SlotRange { len }, params)
+                        .unwrap();
+                    assert_eq!(score_bits(&mut a), score_bits(&mut b), "q={q:?} len={len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slot_range_overflowing_params_are_rejected_like_set_path() {
+        let corpus = slot_corpus(8, 0);
+        let idx = build_slot_index(&corpus);
+        let set: BTreeSet<DocId> = (0..8).collect();
+        let bad = Bm25Params {
+            k1: f64::MAX,
+            b: 0.5,
+        };
+        let a = idx.score_within_with_params("alpha", &set, bad);
+        let b = idx.score_within_docs_with_params("alpha", VisibleDocs::SlotRange { len: 8 }, bad);
+        assert!(a.is_err());
+        assert!(b.is_err());
+    }
+
+    #[test]
+    fn full_visible_stats_are_per_index_and_not_shared_across_tenants() {
+        // テナント・世代ごとに別の索引（キャッシュの別エントリ）になる前提で、
+        // 全可視の統計が各索引自身のコーパスだけから決まることを確認する。
+        let a = build_slot_index(&slot_corpus(5, 0));
+        let b = build_slot_index(&slot_corpus(40, 2));
+        assert_eq!(a.max_doc_id, 4);
+        assert_ne!(a.max_doc_id, b.max_doc_id);
+        let a_len: u64 = a.doc_len.iter().map(|&l| u64::from(l)).sum();
+        let b_len: u64 = b.doc_len.iter().map(|&l| u64::from(l)).sum();
+        assert_eq!(a.full_visible_total_len, a_len);
+        assert_eq!(b.full_visible_total_len, b_len);
+        let ba = VisibleBitmap::build_docs(&a, VisibleDocs::SlotRange { len: 5 });
+        let bb = VisibleBitmap::build_docs(&b, VisibleDocs::SlotRange { len: 1000 });
+        assert_eq!(ba.n, 5);
+        assert_eq!(bb.n, 40);
+        // 一方で全可視経路を使っても他方の結果は変わらない。
+        let all_a: BTreeSet<DocId> = (0..5).collect();
+        let before = a.search_within("alpha", 10, &all_a).unwrap();
+        let _ = b.score_within_docs_with_params(
+            "alpha",
+            VisibleDocs::SlotRange { len: 1000 },
+            b.params(),
+        );
+        let after = a.search_within("alpha", 10, &all_a).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn slot_range_text_query_matches_set_path() {
+        use crate::sparse::text_query::parse_text_query;
+        use crate::text_query_limits::TextQueryLimits;
+        let corpus = slot_corpus(70, 4);
+        let idx = build_slot_index(&corpus);
+        let max_id = corpus.last().map(|(i, _)| *i).unwrap();
+        let limits = TextQueryLimits::default();
+        for len in [0u64, 12, max_id + 1] {
+            let set: BTreeSet<DocId> = (0..len).collect();
+            for q in [
+                "alpha beta",
+                "alpha OR gamma",
+                "\"alpha beta\"",
+                "alp*",
+                "alpha -beta",
+            ] {
+                let parsed = parse_text_query(q).unwrap();
+                let mut a = idx
+                    .score_text_query_within(&parsed, &set, idx.params(), &limits)
+                    .unwrap();
+                let mut b = idx
+                    .score_text_query_within_docs(
+                        &parsed,
+                        VisibleDocs::SlotRange { len },
+                        idx.params(),
+                        &limits,
+                    )
+                    .unwrap();
+                assert_eq!(score_bits(&mut a), score_bits(&mut b), "q={q:?} len={len}");
+            }
+        }
     }
 }

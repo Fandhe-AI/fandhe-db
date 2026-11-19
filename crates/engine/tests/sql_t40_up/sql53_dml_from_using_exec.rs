@@ -3,7 +3,8 @@
 //! 契約: autocommit（暗黙トランザクション）と明示トランザクションで `UPDATE n`／`DELETE n` が一致する。
 //! 多重一致は対象行ごとに 1 回だけ、走査順で最初の source 行を採る。他テナントの Private な行は
 //! source にも対象にもならない。`PARTITIONED` 併用は構文段で `42601`、`READ ONLY` Tx は `25006`。
-//! 網羅的な受け入れは #3205 の担当で、本ファイルは dispatch の最小固定に留める。
+//! 本ファイルは dispatch の最小固定に留め、網羅的な受け入れ（上限・再送冪等・明示 Tx・自己結合・
+//! fail-closed）は `sql53_dml_from_using_acceptance.rs`（Issue #3205）が担う。
 //! ポインタ: `docs/design/update-from-delete-using.md`。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -233,4 +234,356 @@ fn read_only_transaction_rejects_joined_dml() {
             .expect("rollback");
     }
     assert_eq!(before, xs(&core, &alice));
+}
+// ---- RETURNING（Issue #3204）----
+
+fn returning(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    sql: &str,
+) -> Result<engine::sql::exec::ReturningOutcome, SqlSurfaceError> {
+    match core.execute_sql_in_session(ctx, &mut SessionState::default(), sql)? {
+        engine::sql::SqlOutcome::Returning(r) => Ok(r),
+        other => panic!("{sql}: expected Returning, got {other:?}"),
+    }
+}
+
+fn names(r: &engine::sql::exec::ReturningOutcome) -> Vec<String> {
+    use engine::sql::exec::ColumnMeta;
+    r.result
+        .columns
+        .iter()
+        .map(|c| match c {
+            ColumnMeta::Id => "id".to_string(),
+            ColumnMeta::Scalar { name, .. }
+            | ColumnMeta::Computed { name, .. }
+            | ColumnMeta::AliasedId { name } => name.clone(),
+            other => panic!("unexpected column {other:?}"),
+        })
+        .collect()
+}
+
+fn int(n: i64) -> engine::sql::exec::Cell {
+    engine::sql::exec::Cell::SignedInteger(n)
+}
+
+fn id_cell(n: u64) -> engine::sql::exec::Cell {
+    engine::sql::exec::Cell::Integer(n)
+}
+
+/// 対象表は更新後の値、FROM 表は SET に使った一致行の値を返す。修飾あり・なしの列参照・`;` 付き。
+#[test]
+fn update_from_returning_returns_new_target_and_matched_source_values() {
+    let alice = ctx("alice");
+    for sql in [
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.id, s.v, x",
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.id, s.v, x;",
+    ] {
+        let (core, _g) = new_core("sql53-ret-upd");
+        seed(&core, &alice);
+        let r = returning(&core, &alice, sql).expect(sql);
+        assert_eq!(r.rows_affected, 2, "{sql}");
+        assert_eq!(names(&r), vec!["id", "v", "x"], "{sql}");
+        let rows: Vec<_> = r.result.rows.iter().map(|r| r.cells.clone()).collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![id_cell(1), int(100), int(100)],
+                vec![id_cell(2), int(200), int(200)],
+            ],
+            "{sql}"
+        );
+    }
+}
+
+/// `*` は対象表 → FROM 表の宣言順（PG 17 と同じ）。`s.*` は FROM 表だけ。DELETE は削除前の値。
+#[test]
+fn star_expands_target_then_from_and_delete_returns_pre_delete_values() {
+    let alice = ctx("alice");
+    let (core, _g) = new_core("sql53-ret-star");
+    seed(&core, &alice);
+    let r = returning(
+        &core,
+        &alice,
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING *",
+    )
+    .expect("delete returning");
+    assert_eq!(r.rows_affected, 2);
+    assert_eq!(
+        names(&r),
+        vec!["id", "embedding", "k", "x", "id", "embedding", "k", "v"]
+    );
+    let first = &r.result.rows[0].cells;
+    assert_eq!(first[0], id_cell(1));
+    assert_eq!(first[2], engine::sql::exec::Cell::Text("a".into()));
+    assert_eq!(first[3], int(10));
+    assert_eq!(first[4], id_cell(1));
+    assert_eq!(first[7], int(100));
+    assert!(!xs(&core, &alice).contains("10"));
+
+    let (core, _g) = new_core("sql53-ret-qstar");
+    seed(&core, &alice);
+    let r = returning(
+        &core,
+        &alice,
+        "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING s.*",
+    )
+    .expect("qualified star");
+    assert_eq!(names(&r), vec!["id", "embedding", "k", "v"]);
+    assert_eq!(r.result.rows.len(), 2);
+}
+
+/// `RETURNING` 専用の source 列（VECTOR）は SET の式評価ビューを通らない。SET が source の
+/// 整数列を読む UPDATE・対象表の式だけの UPDATE・DELETE のいずれでも、非 NULL の VECTOR 列を返せる。
+#[test]
+fn returning_source_vector_column_does_not_enter_set_expression_view() {
+    use engine::sql::exec::Cell;
+    let alice = ctx("alice");
+    for sql in [
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING s.*",
+        "UPDATE t SET x = x + 1 FROM s WHERE t.k = s.k RETURNING s.*",
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.*",
+    ] {
+        let (core, _g) = new_core("sql53-ret-vec");
+        seed(&core, &alice);
+        let r = returning(&core, &alice, sql).expect(sql);
+        assert_eq!(r.rows_affected, 2, "{sql}");
+        assert_eq!(names(&r), vec!["id", "embedding", "k", "v"], "{sql}");
+        assert_eq!(r.result.rows.len(), 2, "{sql}");
+        for row in &r.result.rows {
+            assert!(
+                !matches!(row.cells.get(1), Some(Cell::Null) | None),
+                "{sql}: embedding cell must be returned"
+            );
+        }
+    }
+}
+
+/// 明示 Tx でも同じ結果になり、ROLLBACK で巻き戻る。Describe は Execute と同じ列を返す。
+#[test]
+fn explicit_transaction_and_describe_agree_with_autocommit() {
+    let alice = ctx("alice");
+    let sql = "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.id, s.v";
+    let (c1, _g1) = new_core("sql53-ret-auto");
+    seed(&c1, &alice);
+    let auto = returning(&c1, &alice, sql).expect("auto");
+    let (c2, _g2) = new_core("sql53-ret-txn");
+    seed(&c2, &alice);
+    let before = xs(&c2, &alice);
+    let mut session = SessionState::default();
+    let mut txn = c2.new_session_transaction();
+    c2.execute_sql_in_txn(&alice, &mut session, &mut txn, "BEGIN")
+        .expect("begin");
+    let out = c2
+        .execute_sql_in_txn(&alice, &mut session, &mut txn, sql)
+        .expect("txn");
+    assert_eq!(out, engine::sql::SqlOutcome::Returning(auto.clone()));
+    c2.execute_sql_in_txn(&alice, &mut session, &mut txn, "ROLLBACK")
+        .expect("rollback");
+    assert_eq!(before, xs(&c2, &alice));
+
+    let parsed = c2.parse_sql(sql).expect("parse");
+    let meta = c2
+        .describe_parsed_in_session(&SessionState::default(), &parsed)
+        .expect("describe")
+        .expect("columns");
+    assert_eq!(meta, auto.result.columns);
+}
+
+/// RLS-10: 他テナントの Private な source 行は一致せず返却にも現れない。他テナントの対象行も返らない。
+#[test]
+fn returning_never_exposes_other_tenant_private_rows() {
+    let (core, _g) = new_core("sql53-ret-tenant");
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    seed(&core, &alice);
+    insert(&core, &bob, "s", 10, "c", 777);
+    insert(&core, &bob, "t", 1, "a", 5);
+    let r = returning(
+        &core,
+        &alice,
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.x, s.v",
+    )
+    .expect("update");
+    assert_eq!(r.rows_affected, 2);
+    let rows: Vec<_> = r.result.rows.iter().map(|r| r.cells.clone()).collect();
+    assert_eq!(
+        rows,
+        vec![vec![int(100), int(100)], vec![int(200), int(200)]]
+    );
+    let r = returning(
+        &core,
+        &alice,
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.v",
+    )
+    .expect("delete");
+    assert_eq!(r.rows_affected, 2);
+    assert!(xs(&core, &bob).contains('5'), "bob's row must remain");
+}
+
+/// 併用（`RETURNING ... USING OPERATION_ID`）は台帳結線済み（#3203）: 返却行と確定記録が同時に得られ、
+/// 同一内容の再送は 23505、別文への再利用は 22023 で副作用なく拒否される。
+#[test]
+fn returning_with_operation_id_commits_ledger_and_rejects_resend() {
+    let (core, _g) = new_core("sql53-ret-opid");
+    let alice = ctx("alice");
+    seed(&core, &alice);
+    let sql =
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.id, s.v USING OPERATION_ID 'r-ok'";
+    let r = returning(&core, &alice, sql).expect("first");
+    assert_eq!(r.rows_affected, 2);
+    assert_eq!(r.result.rows.len(), 2);
+    let after = xs(&core, &alice);
+    let err = run(&core, &alice, sql).expect_err("resend");
+    assert_eq!(err.wire_code(), "23505");
+    let err = run(
+        &core,
+        &alice,
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.v USING OPERATION_ID 'r-ok'",
+    )
+    .expect_err("reuse");
+    assert_eq!(err.wire_code(), "22023");
+    assert_eq!(after, xs(&core, &alice));
+}
+
+/// 未対応の形は fail-closed（副作用ゼロ）: FROM 側の列を含む式・項目なし・曖昧な列・句順の誤り。
+// tracked: #3296（FROM／USING 側の列を式の中で参照する RETURNING）
+#[test]
+fn unsupported_returning_forms_fail_closed_without_side_effects() {
+    let (core, _g) = new_core("sql53-ret-reject");
+    let alice = ctx("alice");
+    seed(&core, &alice);
+    let before = xs(&core, &alice);
+    for (sql, code) in [
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING lower(s.k)",
+            "0A000",
+        ),
+        (
+            "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.v + 1",
+            "0A000",
+        ),
+        // 非修飾の `v` は FROM 側だけの列（式の中での参照は未対応）。
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING v + 1",
+            "0A000",
+        ),
+        // 式の非修飾名が両表に該当すれば曖昧。
+        (
+            "DELETE FROM t USING s WHERE t.k = s.k RETURNING upper(k)",
+            "42702",
+        ),
+        (
+            "DELETE FROM t USING s WHERE t.k = s.k RETURNING t.*  AS q",
+            "42601",
+        ),
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING (SELECT 1)",
+            "42601",
+        ),
+        ("DELETE FROM t USING s WHERE t.k = s.k RETURNING", "42601"),
+        ("DELETE FROM t USING s WHERE t.k = s.k RETURNING k", "42702"),
+        (
+            "DELETE FROM t USING s WHERE t.k = s.k RETURNING z.k",
+            "42P01",
+        ),
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k RETURNING s.nope",
+            "42703",
+        ),
+        // 句順が逆（`USING OPERATION_ID` の後ろの `RETURNING`）は余剰トークンで 42601。
+        (
+            "UPDATE t SET x = 1 FROM s WHERE t.k = s.k USING OPERATION_ID 'r2' RETURNING s.v",
+            "42601",
+        ),
+    ] {
+        let err = run(&core, &alice, sql).expect_err(sql);
+        assert_eq!(err.wire_code(), code, "{sql}");
+    }
+    assert_eq!(before, xs(&core, &alice));
+}
+
+/// 別名つきの列参照（任意の relation の列・疑似列 `id`）と対象表の式・組み込み関数を受理する（Issue #3251）。
+/// 対象表の値は UPDATE が更新後、DELETE が削除前。出力名は別名・既定名で、`;` 付きの単独送信でも同じ。
+#[test]
+fn update_from_and_delete_using_returning_accept_aliases_and_target_expressions() {
+    let alice = ctx("alice");
+    for sql in [
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k \
+         RETURNING t.id AS rid, s.v AS w, upper(t.k) AS u, t.x + 1 AS y, lower(t.k)",
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k \
+         RETURNING t.id AS rid, s.v AS w, upper(t.k) AS u, t.x + 1 AS y, lower(t.k);",
+    ] {
+        let (core, _g) = new_core("sql53-ret-expr-upd");
+        seed(&core, &alice);
+        let r = returning(&core, &alice, sql).expect(sql);
+        assert_eq!(r.rows_affected, 2, "{sql}");
+        assert_eq!(names(&r), vec!["rid", "w", "u", "y", "lower"], "{sql}");
+        let rows: Vec<_> = r.result.rows.iter().map(|r| r.cells.clone()).collect();
+        let text = |s: &str| engine::sql::exec::Cell::Text(s.into());
+        assert_eq!(
+            rows,
+            vec![
+                vec![id_cell(1), int(100), text("A"), int(101), text("a")],
+                vec![id_cell(2), int(200), text("B"), int(201), text("b")],
+            ],
+            "{sql}"
+        );
+    }
+    let (core, _g) = new_core("sql53-ret-expr-del");
+    seed(&core, &alice);
+    let r = returning(
+        &core,
+        &alice,
+        "DELETE FROM t USING s WHERE t.k = s.k RETURNING s.v AS w, t.x * 2 AS dbl;",
+    )
+    .expect("delete");
+    assert_eq!(names(&r), vec!["w", "dbl"]);
+    let rows: Vec<_> = r.result.rows.iter().map(|r| r.cells.clone()).collect();
+    assert_eq!(rows, vec![vec![int(100), int(20)], vec![int(200), int(40)]]);
+}
+
+/// 評価時エラー（ゼロ除算）は書き込みを残さず元の SQLSTATE（`22012`）で失敗する（Issue #3251）。
+#[test]
+fn returning_expression_runtime_error_leaves_no_side_effects() {
+    let alice = ctx("alice");
+    let (core, _g) = new_core("sql53-ret-expr-err");
+    seed(&core, &alice);
+    let before = xs(&core, &alice);
+    let err = run(
+        &core,
+        &alice,
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING t.x / 0",
+    )
+    .expect_err("division by zero");
+    assert_eq!(err.wire_code(), "22012");
+    assert_eq!(before, xs(&core, &alice));
+}
+
+/// 他テナントの Private 行は式つき `RETURNING` にも影響行数にも現れない（RLS-10。Issue #3251）。
+#[test]
+fn returning_expressions_do_not_expose_other_tenant_rows() {
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let (core, _g) = new_core("sql53-ret-expr-rls");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO t (id, embedding, k, x) VALUES (1, '[0.1,0.2]', 'a', 10)",
+    )
+    .expect("alice t");
+    run(
+        &core,
+        &alice,
+        "INSERT INTO s (id, embedding, k, v) VALUES (1, '[0.1,0.2]', 'a', 100)",
+    )
+    .expect("alice s");
+    let r = returning(
+        &core,
+        &bob,
+        "UPDATE t SET x = s.v FROM s WHERE t.k = s.k RETURNING upper(t.k) AS u, s.v AS w",
+    )
+    .expect("bob");
+    assert_eq!(r.rows_affected, 0);
+    assert!(r.result.rows.is_empty());
 }

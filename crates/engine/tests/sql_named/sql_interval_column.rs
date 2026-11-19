@@ -429,7 +429,8 @@ fn features_not_yet_enabled_are_rejected_fail_closed() {
     assert_eq!(values(&core, "SELECT id, v FROM t LIMIT 5").len(), 2);
 }
 
-/// `INTERVAL(p)`・フィールド制限・`INTERVAL[]` は構文段で `0A000`。
+/// `INTERVAL(p)`・フィールド制限（配列版を含む）は構文段で `0A000`。`INTERVAL[]`・`INTERVAL[n]` は
+/// Issue #3234 で配列要素型として受理する。
 #[test]
 fn unsupported_interval_type_spellings_are_rejected() {
     let (_p, _g, core) = open("iv-spellings");
@@ -437,11 +438,19 @@ fn unsupported_interval_type_spellings_are_rejected() {
         "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL(3))",
         "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL YEAR)",
         "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL DAY TO SECOND)",
-        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL[])",
-        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL[3])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL(3)[])",
+        "CREATE TABLE a (id BIGINT PRIMARY KEY, v INTERVAL YEAR[])",
     ] {
         assert_eq!(code(&core, sql), "0A000", "{sql}");
     }
+    ok(
+        &core,
+        "CREATE TABLE ia (id BIGINT PRIMARY KEY, v INTERVAL[])",
+    );
+    ok(
+        &core,
+        "CREATE TABLE ib (id BIGINT PRIMARY KEY, v INTERVAL[3])",
+    );
     ok(&core, "CREATE TABLE b (id BIGINT PRIMARY KEY, v INTERVAL)");
     assert_eq!(
         code(&core, "ALTER TABLE b ADD COLUMN w INTERVAL(6)"),

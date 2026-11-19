@@ -27,8 +27,28 @@ use std::rc::Rc;
 use crate::catalog::CatalogError;
 use crate::sql::allowlist::WherePredicate;
 
+/// 振り分け時に「INSTEAD OF トリガ無し」と判定した前提（書き込みテナント・イベント）。書き込み txn の
+/// 冒頭で同じ前提を照合し、判定後に commit した並行 `CREATE TRIGGER` を検出する（Issue #3193。
+/// 指紋はトリガを含まないため別に持つ）。
+#[derive(Clone)]
+pub(crate) struct InsteadOfGuard {
+    tenant: String,
+    event: u8,
+}
+
+impl InsteadOfGuard {
+    pub(crate) fn new(tenant: &str, event: u8) -> Self {
+        Self {
+            tenant: tenant.to_string(),
+            event,
+        }
+    }
+}
+
 /// 現在の書き込み区間が張るビュー書き込みの情報。
 struct Active {
+    instead_of_guard: Option<InsteadOfGuard>,
+    trigger_appeared: Rc<Cell<bool>>,
     view_name: String,
     fingerprint: Vec<u8>,
     mismatch: Rc<Cell<bool>>,
@@ -46,6 +66,7 @@ thread_local! {
 pub(crate) struct ViewWriteScope {
     prev: Option<Active>,
     mismatch: Rc<Cell<bool>>,
+    trigger_appeared: Rc<Cell<bool>>,
 }
 
 impl ViewWriteScope {
@@ -65,7 +86,10 @@ impl ViewWriteScope {
         check_predicates: Vec<Vec<WherePredicate>>,
     ) -> Self {
         let mismatch = Rc::new(Cell::new(false));
+        let trigger_appeared = Rc::new(Cell::new(false));
         let active = Active {
+            instead_of_guard: None,
+            trigger_appeared: Rc::clone(&trigger_appeared),
             view_name: view_name.to_string(),
             fingerprint,
             mismatch: Rc::clone(&mismatch),
@@ -73,7 +97,25 @@ impl ViewWriteScope {
             check_predicates: Rc::new(check_predicates),
         };
         let prev = CURRENT.with(|c| c.replace(Some(active)));
-        ViewWriteScope { prev, mismatch }
+        ViewWriteScope {
+            prev,
+            mismatch,
+            trigger_appeared,
+        }
+    }
+
+    /// 書き込み txn の冒頭で、`guard` のイベントの INSTEAD OF トリガが無いことを照合させる。
+    pub(crate) fn require_no_instead_of(&self, guard: InsteadOfGuard) {
+        CURRENT.with(|c| {
+            if let Some(a) = c.borrow_mut().as_mut() {
+                a.instead_of_guard = Some(guard);
+            }
+        });
+    }
+
+    /// 区間中の照合が、振り分け後に現れた INSTEAD OF トリガを検出したか。
+    pub(crate) fn trigger_appeared(&self) -> bool {
+        self.trigger_appeared.get()
     }
 
     /// 区間中に書き込み txn 内の指紋照合が不一致を検出したか。
@@ -94,6 +136,17 @@ pub(crate) fn current_view_name() -> Option<String> {
     CURRENT.with(|c| c.borrow().as_ref().map(|a| a.view_name.clone()))
 }
 
+/// 現スレッドがビュー経由の書き込み区間にいて、その書き込み先の基表が `table_name` か。生成列の
+/// 計算点（`sql::generated_column::write_wired`・Issue #3329）が、ビュー経由で基表へ流れた書き込みだけを
+/// 結線済みとみなすために読む。基表名が一致しない書き込み（FK の参照アクションの連鎖等）は偽。
+pub(crate) fn current_view_base_table_is(table_name: &str) -> bool {
+    CURRENT.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|a| !a.base_table.is_empty() && a.base_table == table_name)
+    })
+}
+
 /// 現スレッドがビュー経由の書き込み区間にいて、書き込み先が `table_name`（基表）のとき、
 /// `WITH CHECK OPTION` の検査対象の述語を返す（検査対象が無ければ `None`）。表名が一致しない
 /// 書き込み（FK の参照アクションの連鎖等）には適用しない。
@@ -110,12 +163,14 @@ pub(crate) fn current_view_checks(table_name: &str) -> Option<Rc<Vec<Vec<WherePr
 /// [`CatalogError::ViewDefinitionChanged`] を返す（書き込み前のため副作用はゼロ）。
 /// 指紋の再計算に失敗した場合もそのまま返し、「一致」側へは倒さない（fail-closed）。
 pub(crate) fn verify_in_txn(write_txn: &redb::WriteTransaction) -> Result<(), CatalogError> {
-    let Some((view_name, expected, mismatch)) = CURRENT.with(|c| {
+    let Some((view_name, expected, mismatch, guard, appeared)) = CURRENT.with(|c| {
         c.borrow().as_ref().map(|a| {
             (
                 a.view_name.clone(),
                 a.fingerprint.clone(),
                 Rc::clone(&a.mismatch),
+                a.instead_of_guard.clone(),
+                Rc::clone(&a.trigger_appeared),
             )
         })
     }) else {
@@ -125,6 +180,18 @@ pub(crate) fn verify_in_txn(write_txn: &redb::WriteTransaction) -> Result<(), Ca
     if actual != expected {
         mismatch.set(true);
         return Err(CatalogError::ViewDefinitionChanged(view_name));
+    }
+    if let Some(g) = guard {
+        // 読み取りに失敗したときは「無し」側へ倒さず、そのまま返す（fail-closed）。
+        let defs = crate::catalog::trigger::list_triggers_in_txn(write_txn, &g.tenant, &view_name)?;
+        if defs.iter().any(|t| {
+            t.timing == crate::catalog::trigger::TriggerTiming::InsteadOf
+                && t.level == crate::catalog::trigger::TriggerLevel::Row
+                && t.events.contains(g.event)
+        }) {
+            appeared.set(true);
+            return Err(CatalogError::ViewDefinitionChanged(view_name));
+        }
     }
     Ok(())
 }

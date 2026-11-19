@@ -127,7 +127,8 @@ impl EngineCore {
                     },
                 })?;
         // RETURNING は評価より前に束縛する（未知の列は SELECT を走らせる前に `42703`）。
-        let returning = crate::sql::parser::bind_returning(req.returning, &schema)?;
+        let returning =
+            crate::sql::parser::bind_returning_with_udfs(req.returning, &schema, session.udfs())?;
         let targets = resolve_target_columns(&schema, req.columns)?;
 
         // `ON CONFLICT` の静的束縛（対象解決・SET 右辺）は台帳照合・内側 SELECT の評価より前に行う
@@ -265,14 +266,25 @@ impl EngineCore {
                 req.operation_id.as_ref(),
                 self.ledger_mode,
                 &req.statement_hash,
-                // INSERT 文トリガは 0 行でも 1 回発火する（Issue #1726）。RETURNING 付きは未結線
-                // （INSERT トリガがあれば `0A000`）。
-                // `ON CONFLICT` 付きは非空と同じく UPSERT 未結線として INSERT・UPDATE トリガを
-                // `0A000` にする（台帳より前）。
-                if upsert_plan.is_some() {
-                    crate::tenant::LedgerOnlyTriggers::Upsert
-                } else if returning.is_some() {
-                    crate::tenant::LedgerOnlyTriggers::Insert(None)
+                // INSERT 文トリガは 0 行でも 1 回発火する（Issue #1726）。RETURNING 付きでも同様で、
+                // 0 行を返しつつ文トリガを発火する（非空経路と同じ runtime を渡す）。
+                // `ON CONFLICT` 付きは非空と同じく INSERT 文トリガと（`DO UPDATE` なら）UPDATE 文トリガを
+                // 1 回ずつ発火する（Issue #3191）。`RETURNING` 付きは未結線（トリガがあれば `0A000`）。
+                if let Some((_, conflict_action)) = &upsert_plan {
+                    crate::tenant::LedgerOnlyTriggers::Upsert {
+                        triggers: if returning.is_some() {
+                            None
+                        } else {
+                            Some(&bound_triggers)
+                        },
+                        update_set_columns: match conflict_action {
+                            crate::sql::parser::BoundConflictAction::DoUpdate {
+                                assignments,
+                                ..
+                            } => Some(assignments.iter().map(|(idx, _)| *idx).collect()),
+                            crate::sql::parser::BoundConflictAction::DoNothing => None,
+                        },
+                    }
                 } else {
                     crate::tenant::LedgerOnlyTriggers::Insert(Some(&bound_triggers))
                 },
@@ -293,6 +305,9 @@ impl EngineCore {
             });
         }
 
+        // 生成列（TABLE-50・Issue #3328）の計算点が結線された SQL 表層の書き込み区間（`INSERT ... SELECT`）。
+        let _generated_scope =
+            crate::sql::generated_column::GeneratedComputeScope::enter(req.table_name);
         // `ON CONFLICT` 付きは同じ結果行を UPSERT 経路へ流す（第 2 の書き込み経路を作らない）。
         // 文内重複の扱い（`DO UPDATE` は `21000`、`DO NOTHING` は先勝ち）は束縛側で書き込み前に決まり、
         // 台帳は上で張ったスコープの文ハッシュ（`ON CONFLICT` 句を含む）で照合・記録される。
@@ -314,6 +329,8 @@ impl EngineCore {
                     &bound,
                     self.ledger_mode,
                     &schema,
+                    // INSERT・UPDATE トリガを発火する（Issue #3191）。
+                    Some(&self.trigger_runtime.bind(self)),
                 )
                 .map(SqlOutcome::Insert),
                 Some(projection) => crate::sql::exec::execute_upsert_returning_in(
@@ -323,6 +340,8 @@ impl EngineCore {
                     self.ledger_mode,
                     &projection,
                     &schema,
+                    // `RETURNING` 付きのトリガ発火は未結線（トリガがあれば `0A000`）。
+                    None,
                 )
                 .map(SqlOutcome::Returning),
             };
@@ -360,6 +379,7 @@ impl EngineCore {
                 self.ledger_mode,
                 &projection,
                 &schema,
+                Some(&self.trigger_runtime.bind(self)),
             )
             .map(SqlOutcome::Returning),
         }

@@ -342,6 +342,8 @@ pub(crate) fn body_output(
     let parsed = match kind {
         ViewBodyKind::Buffered { stmt, .. } => return Ok(BodyOutput::Statement(stmt)),
         ViewBodyKind::Simple(parsed) => parsed,
+        // 実カタログの検証（`Resolved`）は保留を返さない。到達しない（fail-closed）。
+        ViewBodyKind::LateralDeferred { .. } => return Err(corrupt_view_error()),
     };
     // 親の出力列は `SELECT *` のときだけ必要（明示列の本文は星の展開を行わない）。
     let need_star = matches!(parsed.projection, Projection::All);
@@ -501,7 +503,9 @@ fn reparse_buffered_body(
     };
     match classify_view_body(&tokens, &guarded, ViewBodyCheck::Resolved) {
         Ok(ViewBodyKind::Buffered { stmt, .. }) => Ok(*stmt),
-        Ok(ViewBodyKind::Simple(_)) => Err(corrupt_view_error()),
+        Ok(ViewBodyKind::Simple(_) | ViewBodyKind::LateralDeferred { .. }) => {
+            Err(corrupt_view_error())
+        }
         // 入れ子の深さ超過は規則に基づく拒否として呼び出し元へ伝える。
         Err(e @ SqlSurfaceError::PayloadTooLarge { .. }) => Err(e),
         Err(_) => Err(corrupt_view_error()),
@@ -854,9 +858,15 @@ fn check_predicate_columns_within(
         WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none() => {
             expr_columns_within(columns, lhs)
         }
-        WherePredicate::Not(inner) if matches!(inner.as_ref(), WherePredicate::Prefix { lhs, .. } if lhs.as_bare_column().is_none()) => {
-            check_predicate_columns_within(columns, inner)
-        }
+        // Issue #3239: `NOT` は内側を常に再帰検査する。構文段は否定を葉まで押し下げるため
+        // `Not(Expression)`／`Not(Or)` は通常生成されないが、現れても否定越しに非公開列を
+        // 素通りさせない（fail-closed。DROP COLUMN／ALTER TYPE の依存検査にも効く）。
+        WherePredicate::Not(inner) => check_predicate_columns_within(columns, inner),
+        // 行値比較（#3255）: 全成分の列参照を検査する（非公開列の漏えい防止。評価は束縛段で展開）。
+        WherePredicate::RowCompare { lhs, rhs, .. } => lhs
+            .iter()
+            .chain(rhs.iter())
+            .try_for_each(|e| expr_columns_within(columns, e)),
         WherePredicate::Or(branches) => {
             for branch in branches {
                 for leaf in branch {
@@ -922,7 +932,14 @@ pub(crate) fn expr_columns_within(columns: &[String], expr: &Expr) -> Result<(),
             }
             Ok(())
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                expr_columns_within(columns, operand)?;
+            }
             for (cond, result) in whens {
                 expr_columns_within(columns, cond)?;
                 expr_columns_within(columns, result)?;
@@ -1038,6 +1055,9 @@ fn predicate_column(pred: &WherePredicate) -> Option<&str> {
         WherePredicate::Exists { .. } => None,
         // 解決段が生成する内部専用の葉（疑似列 `id` の比較）。列参照を持たない。
         WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => None,
+        // 行値比較は VIEW 本文の形状検査（`check_view_body_pred_leaf` 等）が先に拒否するため
+        // 到達しない。万一到達しても単純列を持たない（None）。tracked: #3254
+        WherePredicate::RowCompare { .. } => None,
     }
 }
 
@@ -1083,6 +1103,34 @@ mod tests {
         )
         .expect_err("NOT-wrapped reference to a hidden column must be rejected");
         assert!(matches!(err, SqlSurfaceError::UndefinedColumn { .. }));
+    }
+
+    /// 手で組んだ `Not(Expression)`／`Not(Or)`（構文段は生成しない形）でも、否定越しに
+    /// 非公開列を参照すれば拒否する（Issue #3239・堅牢化）。
+    #[test]
+    fn check_columns_within_view_rejects_hidden_column_through_not_of_compound() {
+        let view_columns = vec!["id".to_string()];
+        let hidden_eq = || WherePredicate::Equality {
+            column: "hidden".to_string(),
+            value: "x".to_string(),
+        };
+        let not_expr = WherePredicate::Not(Box::new(WherePredicate::Expression(Expr::Binary {
+            op: crate::sql::udf_call::BinOp::Gt,
+            lhs: Box::new(Expr::Ident("hidden".to_string())),
+            rhs: Box::new(Expr::Number("1".to_string())),
+        })));
+        let not_or = WherePredicate::Not(Box::new(WherePredicate::Or(vec![
+            vec![WherePredicate::BoolColumn {
+                column: "id".to_string(),
+            }],
+            vec![hidden_eq()],
+        ])));
+        for pred in [not_expr, not_or] {
+            let err =
+                check_columns_within_view(Some(&view_columns), &Projection::All, &[pred], &[])
+                    .expect_err("hidden column behind NOT must be rejected");
+            assert!(matches!(err, SqlSurfaceError::UndefinedColumn { .. }));
+        }
     }
 
     /// 固定のビュー定義群を返すテスト用 lookup（テーブルは `docs` のみ）。

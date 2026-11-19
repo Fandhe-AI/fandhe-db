@@ -146,15 +146,37 @@
 - `UPDATE OF <列>` は列が `SET` の対象として書かれているときだけ発火する。BEFORE トリガに
   よる書き換えは判定に含めない。UPSERT では `DO UPDATE SET` の列で判定する
 
+> Issue #3190 の実装記録（行トリガの `WHEN`）:
+>
+> - 構文段 `sql/allowlist/trigger.rs` が `WHEN ( <式> )` を読み、トークン検査（`validate_when_tokens`）で
+>   サブクエリ・非組み込み関数・現在時刻関数・`NEW`／`OLD` 以外の修飾名・裸の列名・`;`・`$n` を拒否し
+>   （`0A000`／`42601`）、括弧の深さとトークン数に上限を置く。正規化テキストを `TriggerDef.when_sql` に保存する
+>   （blob の版は変えない）。
+> - 定義時の意味検査 `core/trigger_when.rs` が `42P17`（INSERT と OLD・DELETE と NEW・文トリガと列参照）・
+>   存在しない列（`42703`）・合成本体の分類を行う。
+> - 発火時は `BEGIN IF (<条件>) THEN RETURN NEW; END IF; RETURN NULL; END`（DELETE は `RETURN OLD`）を既存の
+>   PL/pgSQL の条件評価で `may_write: false` として実行する。`Proceed` が TRUE、`Skip` が FALSE・NULL。
+>   評価の前に保存値を再度字句解析して構造を検査する（改ざんされても本体の構造を壊さない）。
+>   BEFORE ROW は直前の NEW、AFTER ROW は行の変更の時点の NEW／OLD で評価する。評価エラーは文全体を失敗させる。
+> - 既知の制限: 文トリガの `WHEN` は参照の有無にかかわらず定義時に `0A000`（本 ADR の D7 より狭い。追跡候補）。
+>   評価器（PL/pgSQL の条件評価）が扱えない形（`IS DISTINCT FROM` 等）は定義時には止められず、発火時に
+>   `0A000` で文を取り消す（fail-closed。黙って不発火にしない）。`WHEN` 付きの UPSERT のトリガは #3189 の範囲。
+
 ### D8. 経路ごとの扱いと「未結線の経路」ガード
 
 > Issue #1723 の実装記録: [trigger-before-insert.md](trigger-before-insert.md)（INSERT の BEFORE ROW 経路・
 > 経路ごとのガード・PostgreSQL との差分）。
 >
 > Issue #1725 の実装記録: [trigger-update-delete.md](trigger-update-delete.md)（UPDATE／DELETE の行トリガ・
-> `UPDATE OF`・分割実行と未結線経路のガード）。UPSERT の発火・`WHEN` の評価・D6（`27000`）は今回見送り、
-> UPSERT は INSERT・UPDATE のどちらかのトリガがあれば `0A000` のまま。ビュー経由・データ変更 CTE の副文は
-> 共有のフォーム関数を通るため INSERT と同様に発火する。
+> `UPDATE OF`・分割実行と未結線経路のガード）。`WHEN` の評価・D6（`27000`）は今回見送り。ビュー経由・
+> データ変更 CTE の副文は共有のフォーム関数を通るため INSERT と同様に発火する。UPSERT の発火は
+> Issue #3191 で結線した（下記「Issue #3191 の実装記録」）。
+>
+> Issue #3191 の実装記録: [trigger-upsert.md](trigger-upsert.md)（UPSERT の発火順序・DO NOTHING／DO UPDATE の
+> 分岐・PostgreSQL との差分。`RETURNING` 付き・NoSQL・COPY・分割実行は `0A000` のまま）。
+>
+> Issue #3186 の実装記録: [plpgsql-subset.md](plpgsql-subset.md)「Issue #3186 追記」（窓口の UPDATE と、D6 の
+> 安全弁としての表単位の `0A000`。`27000` の variant 追加は見送り）。
 >
 > Issue #1726 の実装記録: [trigger-statement-truncate.md](trigger-statement-truncate.md)（段 2・段 7 の文トリガ・
 > 対象 0 行での発火・TRUNCATE トリガの順序と PostgreSQL との差分）。
@@ -169,19 +191,22 @@
 | ---- | ---- |
 | `INSERT ... VALUES`／`INSERT ... SELECT` | 結線（#1723・#1724） |
 | 単一行・述語形の `UPDATE`／`DELETE`、`UPDATE ... FROM`／`DELETE ... USING`、サブクエリ形 | 結線（#1725） |
-| UPSERT | 結線（#1725） |
+| UPSERT（SQL 表層の `INSERT ... ON CONFLICT`。`INSERT ... SELECT ... ON CONFLICT` の 0 行も含む） | 結線（#3191）。`RETURNING` 付きは `0A000`（#3192） |
 | `TRUNCATE` | 文トリガだけ（#1726）。行トリガは定義時に `0A000`、DELETE トリガは発火しない（PG と同じ）。複数表・`CASCADE` では対象表ごとに発火 |
-| 分割実行 DML（SQL-32 ポインタ） | 対象表に該当イベントのトリガが 1 つでもあれば（行・文を問わず）`0A000`。文の途中で commit するため文トリガも原子性を保てず、行トリガだけを拒否するより厳しい側に倒す |
-| FK の参照アクションが、該当イベントのトリガを持つ子表に及ぶ形 | 文の開始時にカタログから静的に判定して `0A000`（PG は子表のトリガを発火させる。差分として記録） |
-| `COPY ... FROM`・NoSQL 表層の書き込み・ビュー経由の書き込み・データ変更 CTE の副文 | 初版はガードにより `0A000`。結線は追跡候補 |
+| 分割実行 DML（SQL-32 ポインタ） | 行トリガ（BEFORE／AFTER ROW）はチャンクごとに発火し、文トリガ・子表のトリガ・NoSQL は `0A000`（Issue #3283。[trigger-partitioned-dml.md](trigger-partitioned-dml.md)）。文の途中で commit するため文トリガは原子性を保てない |
+| FK の参照アクションが、該当イベントのトリガを持つ子表に及ぶ形 | 子表の ROW トリガは子行ごとに発火（Issue #3284。親にトリガが無くても。NoSQL の単一行／述語形 `update`・`delete` も同じ経路で発火する。`constraint/referential_triggers.rs`）。結線の無い経路（結合形の RETURNING 付き・分割実行・UPSERT の `DO UPDATE`・NoSQL の `RETURNING`／分割実行／UPSERT・生の行 API）と、子表の FOR EACH STATEMENT トリガは `0A000` |
+| `COPY ... FROM STDIN`（永続表） | 結線（#3281）。セッション入口 `commit_copy_in_txn_in_session` だけが主体の写しと通過証を渡す。セッションなしの公開入口（`commit_copy_in`・ダンプ復元）は `0A000` のまま |
+| NoSQL（HTTP）表層の `insert`・単一行／述語形の `update`・`delete`（Issue #3282） | 結線済み。入口が `Some(&runtime.bind(self))` と発火元の主体の写し（`TriggerSubjectScope`）を渡す。`RETURNING` 付き・分割実行・UPSERT は未結線で `0A000`（SQL 表層の `RETURNING` 付きは Issue #3192 で結線済み） |
+| ビュー経由の書き込み・データ変更 CTE の副文 | 初版はガードにより `0A000`。結線は追跡候補 |
 | `ALTER TABLE` による行の書き換え・CTAS・マテリアライズドビューの更新 | 発火しない（PG と同じ。ガード対象外と明示） |
 
 - UPSERT の順序（PG と同じ）: INSERT の BEFORE ROW を呼んでから衝突を判定し、衝突すれば
-  UPDATE の BEFORE／AFTER ROW、衝突しなければ INSERT の AFTER ROW を呼ぶ。文トリガの
-  発火の細部は PG 17 の挙動と突き合わせて #1725 で確定する
-- 定義対象の制限: ビューの行トリガとマテリアライズドビューへの定義は `42809`（PG と同じ）、
-  ビューの文トリガは `0A000`（PG との差分）、INSTEAD OF・REFERENCING・CONSTRAINT TRIGGER・
-  DEFERRABLE は `0A000`、一時表へのトリガは初版では `0A000`、NoSQL 表層からは定義できない
+  UPDATE の BEFORE／AFTER ROW、衝突しなければ INSERT の AFTER ROW を呼ぶ（#3191 で結線。
+  文トリガは BEFORE INSERT → BEFORE UPDATE（`DO UPDATE` のみ）、AFTER UPDATE → AFTER INSERT の順）
+- 定義対象の制限: ビューへの BEFORE／AFTER の行トリガとマテリアライズドビューへの定義は `42809`（PG と同じ）、
+  ビューの文トリガは `0A000`（PG との差分）、REFERENCING・CONSTRAINT TRIGGER・
+  DEFERRABLE は `0A000`。ビューへの `INSTEAD OF ... FOR EACH ROW` は Issue #3193 で受理した
+  （発火は書き込みテナントの scope のトリガだけ。[trigger-instead-of.md](trigger-instead-of.md)）、一時表へのトリガは初版では `0A000`、NoSQL 表層からは定義できない
 
 ### D9. Tx・テナント文脈（RLS）
 
@@ -192,7 +217,9 @@
   の中で実行する。作成者の文脈へは切り替えない。`SECURITY DEFINER` は #2223 ADR のとおり
   `0A000`
 - 共有の `public` 表のトリガは全テナントの書き込みで発火し、それぞれ書き込んだテナントの
-  文脈で実行する
+  文脈で実行する（**Issue #3361 で改訂**: 共有 `public` 表のトリガは定義時に `0A000` で拒否する。
+  カタログに残った定義は、本番の invoker が発火時に固定文言の `0A000` で拒否する保険を持つ。
+  [trigger-catalog.md](trigger-catalog.md)「Issue #3361 の改訂」）
 - トリガ内でエラーが起きた場合、autocommit では文全体を取り消し、txn 内の永続的な変更
   （行・索引・台帳）の副作用はゼロにする。明示 Tx では `Failed`／`25P02` になる。
   例外として、SEQUENCE のカウンタ状態・採番の欠番・セッション単位のカウンタ状態は取り消し
@@ -220,6 +247,13 @@
   （欠番は許容。行・索引・台帳の取り消しとは別扱いで、D9 のエラー時の例外と同じ）
 - `--require-operation-id` 構成での `operation_id` 省略は、外側の文の段階で従来どおり `23502`
 
+> Issue #3281 の実装記録: `COPY ... FROM STDIN` の確定処理（`commit_copy_in_txn_in_session`）が発火元の主体の写し
+> （`TriggerSubjectScope`）と通過証を張り、INSERT と同じ実行器・同じ順序で BEFORE／AFTER の行・文トリガを発火させる。
+> 台帳・原子性・テナント境界は INSERT と共通。明示 Tx ではトリガが書いた表も遅延 FK 検査の対象にする。
+> 一時表の COPY・セッションなしの入口は通過証なし（`0A000`）。
+> トリガ本体の `now()` 等は、COPY 開始時に確定した単一の文時刻（明示 Tx はトランザクション開始時刻。
+> SQL-37）を全発火で共有する。0 行の COPY は `finish()` が `22000` で拒否するため文トリガは発火しない。
+>
 > Issue #1728 の実装記録: [trigger-ledger-consistency.md](trigger-ledger-consistency.md)
 > （再送・越境・クラッシュ注入のテストで D10 を固定。本番コードの変更なし）。
 
@@ -275,18 +309,21 @@
 | 差分 | 理由・追跡先 |
 | ---- | ------------ |
 | FK の検査と参照アクションを AFTER ROW のユーザートリガより前にまとめて行う | 単一検査点の維持（#1724・#1725） |
-| 参照アクションが及ぶ子表のトリガは `0A000` | 結線が未定のため。追跡候補 |
-| COPY・NoSQL・ビュー経由・データ変更 CTE の経路は `0A000` | 黙って発火しない経路を作らない（D8）。追跡候補 |
-| 分割実行 DML では文トリガも `0A000` | 文の途中 commit で原子性を保てない |
+| 参照アクションが及ぶ子表の FOR EACH STATEMENT トリガは `0A000` | PG は RI の内部クエリごとに文トリガを発火させ、親の行数に比例して回数が変わる。この回数を再現できないため ROW だけを対象にする（Issue #3284） |
+| 子表の AFTER ROW は、参照アクションの連鎖と事後検証がすべて済んだ後に適用順で発火する（子の AFTER が親の AFTER より先） | 単一検査点の維持（#3284） |
+| 子表の BEFORE ROW が `NULL` を返して子行が残ると、事後検証が `23503` で文全体を取り消す | 孤児を黙って残さない fail-closed。専用の `wire_code` は足さない。PG 17 の実測は未実施で、差分の有無は未確認（#3284） |
+| ビュー経由・データ変更 CTE の経路と、NoSQL の `RETURNING`・結合形の `RETURNING`・UPSERT・生の行 API は `0A000` | 黙って発火しない経路を作らない（D8）。追跡候補 |
+| 分割実行 DML では文トリガは `0A000`（行トリガは発火。Issue #3283） | 文の途中 commit で原子性を保てない |
+| 0 行の COPY では文トリガが発火しない（`finish()` が `22000` で拒否するため。PG は 0 行でも発火） | 既存の空 COPY 拒否を変えない（#3281）。追跡候補 |
 | ビューの文トリガ・一時表へのトリガは `0A000` | 初版の範囲外。追跡候補 |
-| `WHEN` でユーザー関数・揮発性関数を受理しない | 宣言的な式に限定。追跡候補 |
+| `WHEN` でユーザー関数・揮発性関数・サブクエリを受理しない。文トリガの `WHEN` も受理しない | 宣言的な式に限定（Issue #3190）。追跡候補 |
 
 ## セキュリティ観点（OWASP Top 10）
 
 | 観点 | 対応 |
 | ---- | ---- |
 | アクセス制御（テナント境界） | 書き込んだセッションの `PolicyContext` と同じ Tx で実行し、作成者の文脈へ切り替えない。NEW／OLD は自テナントの利用者列だけで、キー・rowid・可視性は出さず書き換えもできない |
-| 不安全な設計（fail-open） | 未結線の経路ガード（D8）でカタログだけから静的に `0A000`。分割実行 DML・参照アクションの子表も拒否 |
+| 不安全な設計（fail-open） | 未結線の経路ガード（D8）でカタログだけから静的に `0A000`。分割実行 DML・結線の無い経路での参照アクションの子表・子表の文トリガも拒否 |
 | 不安全な設計（DoS） | トリガ深さ（`54001`）・関数呼び出し深さ・文数／ループ予算（`54000`）・行ごとのキャンセル（`57014`）。上限は下げる方向だけ |
 | インジェクション | `WHEN` は束縛済みの式で評価し、`TG_ARGV` は値として渡して SQL テキストへ連結しない |
 | 整合性（台帳・crash） | 事前照合を BEFORE STATEMENT より前に置き、再送では発火しない。単一 redb commit |
@@ -297,9 +334,10 @@
 
 ## 既知の制限・追跡候補（起票は要承認）
 
-- COPY／NoSQL／ビュー経由の経路の結線
+- ビュー経由の経路の結線
+- NoSQL（HTTP）表層から SCHEMA 修飾の表を指定する手段（HTTP の `table` は裸の識別子だけで、共有 `public` 表へのトリガ定義は定義時に `0A000` のため、HTTP から実際にトリガ付き表へ到達できる経路は現状ほぼ無い。結線は engine 入口で完結し、engine の in-process テストが内部キー直渡しで検証する）
 - データ変更 CTE の副文での発火
-- FK の参照アクションによる子表のトリガの発火
+- 参照アクションが及ぶ子表の文トリガの発火（ROW は #3284 で結線済み）
 - 一時表・ビューの文トリガ
 - `WHEN` での関数呼び出しの拡大
 - トリガ経由の 3 テナント越境マトリクス（親 #1720 の受け入れ条件。#1728 と #2229 の分担を確認）
@@ -308,6 +346,7 @@
 
 | Issue | 前提とする決定 |
 | ----- | -------------- |
+| #3185 | 既定 invoker の本番化（D8 の経路ガードは不変）。INSERT 発火の SQL・wire E2E |
 | #2228 | D1（`TriggerCall` に渡す変数）・D2（NEW／OLD に出さない列）・D3（戻り値の意味） |
 | #2226 | D9・D10（トリガ内の文は台帳に記録しない。台帳モードのスコープ共通化） |
 | #1722 | D8 の定義対象の制限・D12・D2 の型検査・D7 の `WHEN` の定義時検査（#2228・PR #2775 に依存） |

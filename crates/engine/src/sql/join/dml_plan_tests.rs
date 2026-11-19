@@ -197,29 +197,153 @@ fn assert_rejected(sql: &str, code: &str) {
 }
 
 // intentional: docs/design/update-from-delete-using.md
+// tracked: #3295
 #[test]
 fn unsupported_shapes_are_rejected_with_feature_not_supported() {
     for sql in [
-        // WHERE 省略・等値キー無し
-        "DELETE FROM docs USING langs",
-        "DELETE FROM docs USING langs WHERE langs.flag",
-        "DELETE FROM docs USING langs WHERE docs.n = '1' AND langs.cnt = '2'",
-        // relation をまたぐ非等値・OR
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n < langs.cnt",
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND (docs.n = '1' OR langs.cnt = '2')",
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang OR docs.n = '1'",
-        // 同じ relation 内の列比較
-        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.lang = docs.lang",
-        // FROM／USING が 2 表以上
-        "DELETE FROM docs USING langs, langs AS l2 WHERE docs.lang = langs.lang",
-        // キー化できない型
-        "DELETE FROM docs USING langs WHERE docs.w = langs.w",
+        // 畳み込み source（FROM／USING が 2 表以上・JOIN 段あり）では、対象とまたぐ非等値は拒否のまま
+        "DELETE FROM docs USING langs, langs AS l2 WHERE docs.lang = langs.lang AND docs.n < l2.cnt",
+        "DELETE FROM docs USING langs JOIN langs AS l2 ON langs.lang = l2.lang \
+         WHERE docs.lang = l2.lang AND docs.n < l2.cnt",
         // source の疑似列 id・写像できない型を SET の右辺に使う
         "UPDATE docs SET n = langs.id FROM langs WHERE docs.lang = langs.lang",
         "UPDATE docs SET embedding = langs.v FROM langs WHERE docs.lang = langs.lang",
+        // 残余（Issue #3295）の fail-closed: source の疑似列 id・VECTOR 列の参照
+        "DELETE FROM docs USING langs WHERE docs.n < langs.id",
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND (docs.n = 1 OR langs.id = 2)",
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.embedding < langs.v",
     ] {
         assert_rejected(sql, "0A000");
     }
+}
+
+/// 非等値・`OR` をまたぐ述語・キー化できない型の等値・同じ relation 内の列比較は、拒否せず
+/// 残余／押し下げへ振り分ける（Issue #3295）。
+#[test]
+fn non_equi_and_or_shapes_are_planned_as_residual() {
+    // キー無しの非等値はネストループの残余だけで計画できる。
+    let p = del("DELETE FROM docs USING langs WHERE docs.n < langs.cnt").unwrap();
+    assert!(p.keys.is_empty());
+    let r = p.residual.as_ref().expect("residual");
+    assert_eq!(r.source_columns, vec![5]);
+    // 残余が参照する source 列は走査投影の末尾へ載る（SET ビューの添字を動かさない）。
+    assert_eq!(p.scan_columns(), vec![5]);
+
+    let p = del(
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND (docs.n = 1 OR langs.cnt = 2)",
+    )
+    .unwrap();
+    assert_eq!(p.keys, vec![key(Some(1), Some(0))]);
+    assert!(p.residual.is_some());
+
+    let p = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang OR docs.n = 1").unwrap();
+    assert!(p.keys.is_empty());
+    assert_eq!(p.residual.as_ref().unwrap().source_columns, vec![0]);
+
+    // キー化できない型（DOUBLE）の等値は残余へ回る。
+    let p = del("DELETE FROM docs USING langs WHERE docs.w = langs.w").unwrap();
+    assert!(p.keys.is_empty());
+    assert!(p.residual.is_some());
+
+    // 同じ relation 内の列比較は対象側／source 側へ押し下げる。
+    let p =
+        del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.lang = docs.lang")
+            .unwrap();
+    assert_eq!(p.keys.len(), 1);
+    assert!(p.residual.is_none());
+    assert_eq!(target_filter_count(&p), 1);
+
+    // DML 専用の葉: 数値リテラル・IS [NOT] NULL は対象側・source 側へ押し下げる。
+    let p = del(
+        "DELETE FROM docs USING langs WHERE docs.lang = langs.lang AND docs.n > 5 \
+         AND langs.label IS NULL AND docs.w IS NOT NULL",
+    )
+    .unwrap();
+    assert!(p.residual.is_none());
+    assert_eq!(target_filter_count(&p), 2);
+    assert_eq!(p.source.where_predicates.len(), 1);
+}
+
+/// SET を持つ UPDATE でも残余の source 列は SET／キー列の後ろへ追記される。
+#[test]
+fn residual_columns_follow_set_columns() {
+    let p = upd(
+        "UPDATE docs SET n = langs.cnt FROM langs WHERE docs.n < langs.cnt AND docs.w < langs.w",
+    )
+    .unwrap();
+    assert_eq!(p.source_columns(), vec![5]);
+    assert_eq!(p.scan_columns(), vec![5, 3]);
+    assert!(p.keys.is_empty());
+}
+
+/// 結合キーが無い形（WHERE 省略・source だけの述語）は純粋な交差結合として変換できる（Issue #3294）。
+/// 一致ペア数の上限は実行時に効く。
+#[test]
+fn keyless_forms_are_planned_as_cross_joins() {
+    for sql in [
+        "DELETE FROM docs USING langs",
+        "DELETE FROM docs USING langs WHERE langs.flag",
+        "DELETE FROM docs USING langs WHERE docs.n = '1' AND langs.cnt = '2'",
+    ] {
+        let p = del(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        assert!(p.keys.is_empty(), "{sql}");
+        assert!(p.source.fold.is_none(), "{sql}");
+    }
+    let p = upd("UPDATE docs SET n = langs.cnt FROM langs").unwrap();
+    assert!(p.keys.is_empty());
+    assert_eq!(p.source.columns, vec![5]);
+}
+
+/// FROM／USING が 2 表以上、または `JOIN ... ON` の形は source 側が畳み込まれ、畳み込みスキーマの添字で
+/// 結合キー・SET・`RETURNING` が組まれる（Issue #3294）。
+#[test]
+fn multi_source_forms_are_folded_into_one_source() {
+    let p = upd(
+        "UPDATE docs SET n = b.cnt FROM langs a JOIN langs b ON a.lang = b.lang \
+         WHERE docs.lang = a.lang RETURNING a.label, b.id",
+    )
+    .unwrap();
+    let fold = p.source.fold.as_ref().expect("folded");
+    assert_eq!(p.source_relation_count(), 2);
+    // 初出順: キー a.lang → 畳み込み列 0。SET は b.cnt → 畳み込み列 1。`RETURNING` は a.label・b.id。
+    assert_eq!(p.keys, vec![key(Some(1), Some(0))]);
+    assert_eq!(p.source.columns, vec![1]);
+    assert_eq!(fold.cols[0], (0, ColumnSlot::Column(0)));
+    assert_eq!(fold.cols[1], (1, ColumnSlot::Column(5)));
+    assert!(!p.source.schema.has_pseudo_id());
+    assert_eq!(p.source.returning_columns.len(), 2);
+    assert!(p.source.table.is_empty());
+
+    // カンマ区切りの 3 表（WHERE の source だけの述語は合成 JOIN 文へ渡る）。
+    let p = del("DELETE FROM docs USING langs a, langs b, langs c \
+         WHERE docs.lang = a.lang AND a.lang = b.lang AND b.lang = c.lang AND c.label = 'x'")
+    .unwrap();
+    let fold = p.source.fold.as_ref().expect("folded");
+    assert_eq!(fold.join.relations.len(), 3);
+    assert!(fold.join.where_clause.is_some());
+    assert!(p.source.where_predicates.is_empty());
+}
+
+/// 畳み込み source でも、何も取り出さない形（キーも `RETURNING` も無い `DELETE`）は走査投影が空にならない。
+#[test]
+fn folded_source_without_any_column_gets_a_dummy_projection() {
+    let p = del("DELETE FROM docs USING langs a, langs b").unwrap();
+    assert!(p.keys.is_empty());
+    assert_eq!(p.scan_columns().len(), 1);
+}
+
+/// ON が対象表を参照する形は PG と同じく拒否される（修飾参照は `42P01`、対象表にしか無い列は `42703`）。
+#[test]
+fn join_on_cannot_reference_the_target() {
+    assert_rejected(
+        "DELETE FROM docs USING langs a JOIN langs b ON docs.lang = b.lang WHERE docs.lang = a.lang",
+        "42P01",
+    );
+    assert_rejected(
+        "DELETE FROM docs USING langs a JOIN langs b ON a.lang = b.lang AND n = '1' \
+         WHERE docs.lang = a.lang",
+        "42703",
+    );
 }
 
 #[test]
@@ -286,4 +410,50 @@ fn plain_set_copy_of_non_expression_types_is_planned_as_copy() {
         assert_eq!(u.copies[0].target_ty, ty);
         assert_eq!(p.source.columns, vec![1]);
     }
+}
+
+/// `RETURNING` が参照する source 列は SET の列の後ろへ重複なしで追記され、SET の位置は動かない
+/// （Issue #3204）。セル位置は走査投影の並び（疑似列 `id` を使うときは先頭）に一致する。
+#[test]
+fn returning_appends_source_columns_after_set_without_moving_them() {
+    let p = upd(
+        "UPDATE docs SET n = langs.cnt FROM langs WHERE docs.lang = langs.lang \
+         RETURNING langs.cnt, langs.label, langs.id, docs.n",
+    )
+    .unwrap();
+    // SET 由来の cnt(5) だけが式評価ビューの列。RETURNING 専用の列は別に持つ。
+    assert_eq!(p.source.columns, vec![5]);
+    assert_eq!(p.source.returning_columns, vec![5, 1]);
+    assert!(p.source.include_pseudo_id);
+    // 式評価ビューの並びは SET + キー（lang(0)）。走査投影はその後ろへ RETURNING 専用の label(1)。
+    assert_eq!(p.source_columns(), vec![5, 0]);
+    assert_eq!(p.scan_columns(), vec![5, 0, 1]);
+    let ret = p.returning.as_ref().expect("returning");
+    let cells: Vec<Option<usize>> = ret
+        .columns
+        .iter()
+        .map(|c| {
+            p.source_cell_position(c.slot)
+                .ok()
+                .filter(|_| c.relation == 1)
+        })
+        .collect();
+    // 疑似列 id が位置 0、列は +1（cnt = 1、label = 3）。対象表の列は None。
+    assert_eq!(cells, vec![Some(1), Some(3), Some(0), None]);
+    assert_eq!(p.update.as_ref().expect("update").items[0].column_index, 2);
+}
+
+/// DELETE でも RETURNING の列だけが走査へ載り、使わない列は載らない。
+#[test]
+fn delete_returning_projects_only_referenced_source_columns() {
+    let p = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang RETURNING langs.label")
+        .unwrap();
+    assert!(p.source.columns.is_empty());
+    assert_eq!(p.source.returning_columns, vec![1]);
+    assert_eq!(p.scan_columns(), vec![0, 1]);
+    assert!(!p.source.include_pseudo_id);
+    assert!(p.returning.is_some());
+    let none = del("DELETE FROM docs USING langs WHERE docs.lang = langs.lang").unwrap();
+    assert!(none.source.columns.is_empty());
+    assert!(none.returning.is_none());
 }

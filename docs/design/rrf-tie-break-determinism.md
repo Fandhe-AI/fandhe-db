@@ -30,6 +30,7 @@ RRF 融合スコアの同点タイブレークに関する非決定性の懸念�
 | 融合結果の `LIMIT` 適用 | `hybrid.rs`（`hybrid_search`） | `rrf_fuse` が返す順序をそのまま `truncate(k)` するのみで、`truncate` 自体は順序を変えない |
 | 再ランク | `rerank.rs` | 同様に `BTreeMap` 累積 + `sort_by_key`（安定） |
 | SQL-4 実行 | `sql/exec.rs` | `hybrid_search`/`rrf_fuse` の順序をそのまま `LIMIT` 相当の件数へ切り詰めるのみ |
+| SQL `DISTINCT ON` グループ代表 | `sql/scan.rs`（経路 (B) の `groups`） | 整列済み `Vec` + `binary_search_by`。同点は id 昇順 → tenant_id バイト順で決まり、不安定ソートは使わない（Issue #3262。`select-distinct-on.md` §6） |
 
 `crates/engine/src` に `sort_unstable_by`／`sort_unstable_by_key`／
 `select_nth_unstable_by(_key)` の使用は 0 件（`scripts/check_sort_determinism.sh` で

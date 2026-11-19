@@ -243,6 +243,23 @@ pub enum ArrayValue {
     Text(Vec<Option<String>>),
     Bool(Vec<Option<bool>>),
     Integer(Vec<Option<i32>>),
+    /// `SMALLINT[]`（Issue #3230）。`Integer` と別 variant にして型の区別（OID 1005）を保つ。
+    SmallInt(Vec<Option<i16>>),
+    /// `TIME[]`（Issue #3232）。0 時起点のマイクロ秒。`Timestamp` と別 variant にして型の区別
+    /// （OID 1183）を保つ。
+    Time(Vec<Option<i64>>),
+    /// `BIT(n)[]`（Issue #3235・TABLE-48）。各要素は宣言長 `n` ビットの [`BitString`]。`Text` と別
+    /// variant にして型の区別（OID 1561）を保つ。`n` は値自体では保持せず（空配列・全 NULL 配列から
+    /// 復元できない）、正は列宣言の [`ArrayElemType::Bit`] 側にある。
+    Bit(Vec<Option<crate::bit_string::BitString>>),
+    /// `INTERVAL[]`（Issue #3234・TABLE-14・TABLE-34）。各要素は月・日・マイクロ秒を独立に持つ
+    /// [`crate::datetime::Interval`]。`Text` と別 variant にして型の区別（OID 1187）を保つ。
+    /// 派生 `PartialEq` は生の三要素の一致（codec の往復用）で、SQL の等価（`1 mon` = `30 days`）は
+    /// [`ArrayValue::equality_payload`] の正規化キーが担う。
+    Interval(Vec<Option<crate::datetime::Interval>>),
+    /// `TIMESTAMPTZ[]`（Issue #3233）。UTC 起点のマイクロ秒。`Timestamp` と別 variant にして
+    /// 型の区別（OID 1185）を保つ。テキスト出力だけがセッション TimeZone に依存する。
+    TimestampTz(Vec<Option<i64>>),
     BigInt(Vec<Option<i64>>),
     Real(Vec<Option<f32>>),
     Double(Vec<Option<f64>>),
@@ -367,14 +384,34 @@ impl ArrayValue {
     /// 一致するものは `"..."` で囲み `"`・`\` をバックスラッシュでエスケープするため、文字列
     /// `NULL` は NULL 要素と区別される。出力は `sql::parser::parse_array_literal` で同じ値へ
     /// 往復できる。
+    ///
+    /// `TIMESTAMPTZ` 要素は UTC（`+00`）で描画する。セッション TimeZone で描画する版は
+    /// [`Self::to_pg_text_in_tz`]（Issue #3233）。他の要素型の出力は TimeZone に依存しない。
     pub fn to_pg_text(&self) -> String {
-        self.to_pg_text_bounded(usize::MAX).unwrap_or_default()
+        self.to_pg_text_in_tz(&crate::datetime::SessionTimeZone::utc())
+    }
+
+    /// [`Self::to_pg_text`] の TimeZone 指定版。`TIMESTAMPTZ` 要素だけが `tz` に従う
+    /// （wire-server の DataRow 描画が接続のセッション TimeZone を渡す。Issue #3233）。
+    pub fn to_pg_text_in_tz(&self, tz: &crate::datetime::SessionTimeZone) -> String {
+        self.to_pg_text_bounded_in_tz(usize::MAX, tz)
+            .unwrap_or_default()
     }
 
     /// [`Self::to_pg_text`] の長さ上限つき版。描画結果が `max_len` バイトを超えると確定した
     /// 時点で打ち切って `None` を返す（BYTEA 要素を多数含む配列の文字列化が巨大な確保にならない
     /// ようにするため。呼び出し元は `None` を上限超過として拒否する）。
     pub fn to_pg_text_bounded(&self, max_len: usize) -> Option<String> {
+        self.to_pg_text_bounded_in_tz(max_len, &crate::datetime::SessionTimeZone::utc())
+    }
+
+    /// [`Self::to_pg_text_bounded`] の TimeZone 指定版（`TIMESTAMPTZ` 要素のみ `tz` に従う。
+    /// `CAST(<timestamptz[]> AS text)` がセッション TimeZone で描画するために使う。Issue #3233）。
+    pub fn to_pg_text_bounded_in_tz(
+        &self,
+        max_len: usize,
+        tz: &crate::datetime::SessionTimeZone,
+    ) -> Option<String> {
         // `dims` に従い入れ子の `{}` を描画する（1 次元は `[要素数]`）。要素の整形は
         // `f`、NULL 要素は引用なしの `NULL`。出力が `max_len` を超えた時点で打ち切る。
         fn write_level<T>(
@@ -429,6 +466,7 @@ impl ArrayValue {
                 if *b { "t" } else { "f" }.to_string()
             }),
             ArrayValue::Integer(items) => bounded(items, dims, max_len, |v| v.to_string()),
+            ArrayValue::SmallInt(items) => bounded(items, dims, max_len, |v| v.to_string()),
             ArrayValue::BigInt(items) => bounded(items, dims, max_len, |v| v.to_string()),
             ArrayValue::Real(items) => bounded(items, dims, max_len, |v| {
                 crate::scalar_float::format_real(*v)
@@ -441,6 +479,17 @@ impl ArrayValue {
             }
             ArrayValue::Timestamp(items) => bounded(items, dims, max_len, |v| {
                 quote_pg_array_text_elem(&crate::datetime::format_timestamp(*v))
+            }),
+            ArrayValue::Time(items) => bounded(items, dims, max_len, |v| {
+                quote_pg_array_text_elem(&crate::datetime::format_time(*v))
+            }),
+            ArrayValue::Interval(items) => bounded(items, dims, max_len, |v| {
+                quote_pg_array_text_elem(&crate::datetime::format_interval(v))
+            }),
+            // `0`・`1` だけなので引用は不要。
+            ArrayValue::Bit(items) => bounded(items, dims, max_len, |v| v.format_text()),
+            ArrayValue::TimestampTz(items) => bounded(items, dims, max_len, |v| {
+                quote_pg_array_text_elem(&crate::datetime::format_timestamptz(*v, tz))
             }),
             ArrayValue::Uuid(items) => bounded(items, dims, max_len, |v| v.to_string()),
             // NUMERIC は正規テキスト（引用不要）、BYTEA は `\x` 16 進（`\` を含むため常に引用・
@@ -478,6 +527,13 @@ impl ArrayValue {
             (ArrayValue::Text(a), ArrayValue::Text(b)) => ArrayValue::Text(join(a, b)),
             (ArrayValue::Bool(a), ArrayValue::Bool(b)) => ArrayValue::Bool(join(a, b)),
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => ArrayValue::Integer(join(a, b)),
+            (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => ArrayValue::SmallInt(join(a, b)),
+            (ArrayValue::Time(a), ArrayValue::Time(b)) => ArrayValue::Time(join(a, b)),
+            (ArrayValue::Bit(a), ArrayValue::Bit(b)) => ArrayValue::Bit(join(a, b)),
+            (ArrayValue::Interval(a), ArrayValue::Interval(b)) => ArrayValue::Interval(join(a, b)),
+            (ArrayValue::TimestampTz(a), ArrayValue::TimestampTz(b)) => {
+                ArrayValue::TimestampTz(join(a, b))
+            }
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => ArrayValue::BigInt(join(a, b)),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => ArrayValue::Real(join(a, b)),
             (ArrayValue::Double(a), ArrayValue::Double(b)) => ArrayValue::Double(join(a, b)),
@@ -509,6 +565,10 @@ impl ArrayValue {
                 .iter()
                 .flatten()
                 .fold(0usize, |acc, b| acc.saturating_add(b.len())),
+            ArrayValue::Bit(v) => v
+                .iter()
+                .flatten()
+                .fold(0usize, |acc, b| acc.saturating_add(b.as_bytes().len())),
             _ => 0,
         }
     }
@@ -540,6 +600,14 @@ impl ArrayValue {
             | (ArrayValue::Enum(a), ArrayValue::Enum(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Bool(a), ArrayValue::Bool(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Integer(a), ArrayValue::Integer(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::SmallInt(a), ArrayValue::SmallInt(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Time(a), ArrayValue::Time(b)) => eq(a, i, b, |x, y| x == y),
+            (ArrayValue::Bit(a), ArrayValue::Bit(b)) => eq(a, i, b, |x, y| x == y),
+            // スカラー INTERVAL と同じ正規化キー（`1 mon` = `30 days`）で比較する。
+            (ArrayValue::Interval(a), ArrayValue::Interval(b)) => eq(a, i, b, |x, y| {
+                crate::datetime::interval_cmp_key(x) == crate::datetime::interval_cmp_key(y)
+            }),
+            (ArrayValue::TimestampTz(a), ArrayValue::TimestampTz(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::BigInt(a), ArrayValue::BigInt(b)) => eq(a, i, b, |x, y| x == y),
             (ArrayValue::Real(a), ArrayValue::Real(b)) => {
                 eq(a, i, b, |x, y| x == y || (x.is_nan() && y.is_nan()))
@@ -602,6 +670,11 @@ impl ArrayValue {
             ArrayValue::Text(v) => ArrayValue::Text(pick(v, keep)),
             ArrayValue::Bool(v) => ArrayValue::Bool(pick(v, keep)),
             ArrayValue::Integer(v) => ArrayValue::Integer(pick(v, keep)),
+            ArrayValue::SmallInt(v) => ArrayValue::SmallInt(pick(v, keep)),
+            ArrayValue::Time(v) => ArrayValue::Time(pick(v, keep)),
+            ArrayValue::Bit(v) => ArrayValue::Bit(pick(v, keep)),
+            ArrayValue::Interval(v) => ArrayValue::Interval(pick(v, keep)),
+            ArrayValue::TimestampTz(v) => ArrayValue::TimestampTz(pick(v, keep)),
             ArrayValue::BigInt(v) => ArrayValue::BigInt(pick(v, keep)),
             ArrayValue::Real(v) => ArrayValue::Real(pick(v, keep)),
             ArrayValue::Double(v) => ArrayValue::Double(pick(v, keep)),
@@ -631,6 +704,14 @@ impl ArrayValue {
             | ArrayValue::Enum(v) => v.clone(),
             ArrayValue::Bool(v) => map(v, |b| if *b { "t" } else { "f" }.to_string()),
             ArrayValue::Integer(v) => map(v, |x| x.to_string()),
+            ArrayValue::SmallInt(v) => map(v, |x| x.to_string()),
+            ArrayValue::Time(v) => map(v, |x| crate::datetime::format_time(*x)),
+            ArrayValue::Bit(v) => map(v, |x| x.format_text()),
+            ArrayValue::Interval(v) => map(v, crate::datetime::format_interval),
+            // `array_to_string` 等の入力。`CAST(.. AS text)` と同じくセッション TimeZone で整形する。
+            ArrayValue::TimestampTz(v) => crate::datetime::with_current_session_time_zone(|tz| {
+                map(v, |x| crate::datetime::format_timestamptz(*x, tz))
+            }),
             ArrayValue::BigInt(v) => map(v, |x| x.to_string()),
             ArrayValue::Real(v) => map(v, |x| crate::scalar_float::format_real(*x)),
             ArrayValue::Double(v) => map(v, |x| crate::scalar_float::format_double(*x)),
@@ -676,6 +757,11 @@ macro_rules! array_dispatch {
             ArrayValue::Text($items) => $body,
             ArrayValue::Bool($items) => $body,
             ArrayValue::Integer($items) => $body,
+            ArrayValue::SmallInt($items) => $body,
+            ArrayValue::Time($items) => $body,
+            ArrayValue::Bit($items) => $body,
+            ArrayValue::Interval($items) => $body,
+            ArrayValue::TimestampTz($items) => $body,
             ArrayValue::BigInt($items) => $body,
             ArrayValue::Real($items) => $body,
             ArrayValue::Double($items) => $body,
@@ -693,6 +779,16 @@ macro_rules! array_dispatch {
     };
 }
 
+#[cfg(test)]
+impl ArrayValue {
+    /// テスト用: 行バイトと同形の要素本文（`write_array_elements_payload` の出力）。
+    fn flat_element_bytes_for_test(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_array_elements_payload(&mut buf, self).expect("payload");
+        buf
+    }
+}
+
 impl ArrayValue {
     /// この値の要素型（`ColumnType::Array` の `ArrayType::elem()` と突合する
     /// ために使う。`pub(crate)`: `tenant::validate_set_assignments` が UPDATE
@@ -707,6 +803,19 @@ impl ArrayValue {
             ArrayValue::Text(_) => ArrayElemType::Text,
             ArrayValue::Bool(_) => ArrayElemType::Bool,
             ArrayValue::Integer(_) => ArrayElemType::Integer,
+            ArrayValue::SmallInt(_) => ArrayElemType::SmallInt,
+            ArrayValue::Time(_) => ArrayElemType::Time,
+            // `n` は代表値（先頭の非 NULL 要素の長さ。無ければ 1）。長さの正は列宣言側にあり、
+            // 照合は種別比較（[`array_elem_kind_eq`]）と [`validate_array_elements`] が担う。
+            ArrayValue::Bit(items) => ArrayElemType::Bit(
+                items
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map_or(1, crate::bit_string::BitString::bit_len),
+            ),
+            ArrayValue::Interval(_) => ArrayElemType::Interval,
+            ArrayValue::TimestampTz(_) => ArrayElemType::TimestampTz,
             ArrayValue::BigInt(_) => ArrayElemType::BigInt,
             ArrayValue::Real(_) => ArrayElemType::Real,
             ArrayValue::Double(_) => ArrayElemType::Double,
@@ -758,6 +867,11 @@ impl ArrayValue {
             ArrayValue::Text(v) => cut!(Text, v),
             ArrayValue::Bool(v) => cut!(Bool, v),
             ArrayValue::Integer(v) => cut!(Integer, v),
+            ArrayValue::SmallInt(v) => cut!(SmallInt, v),
+            ArrayValue::Time(v) => cut!(Time, v),
+            ArrayValue::Bit(v) => cut!(Bit, v),
+            ArrayValue::Interval(v) => cut!(Interval, v),
+            ArrayValue::TimestampTz(v) => cut!(TimestampTz, v),
             ArrayValue::BigInt(v) => cut!(BigInt, v),
             ArrayValue::Real(v) => cut!(Real, v),
             ArrayValue::Double(v) => cut!(Double, v),
@@ -826,6 +940,22 @@ impl ArrayValue {
                 .saturating_mul(std::mem::size_of::<Option<Decimal>>()),
             ArrayValue::Bool(v) => v.len().saturating_mul(std::mem::size_of::<Option<bool>>()),
             ArrayValue::Integer(v) => v.len().saturating_mul(std::mem::size_of::<Option<i32>>()),
+            ArrayValue::SmallInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i16>>()),
+            ArrayValue::Time(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
+            ArrayValue::Bit(items) => {
+                let payload: usize = items.iter().flatten().map(|b| b.as_bytes().len()).sum();
+                payload.saturating_add(
+                    items
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Option<crate::bit_string::BitString>>()),
+                )
+            }
+            ArrayValue::Interval(v) => v
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<crate::datetime::Interval>>()),
+            ArrayValue::TimestampTz(v) => {
+                v.len().saturating_mul(std::mem::size_of::<Option<i64>>())
+            }
             ArrayValue::BigInt(v) => v.len().saturating_mul(std::mem::size_of::<Option<i64>>()),
             ArrayValue::Real(v) => v.len().saturating_mul(std::mem::size_of::<Option<f32>>()),
             ArrayValue::Double(v) => v.len().saturating_mul(std::mem::size_of::<Option<f64>>()),
@@ -857,6 +987,16 @@ impl ArrayValue {
             ArrayValue::Json(_) => 11,
             ArrayValue::Jsonb(_) => 12,
             ArrayValue::Enum(_) => 13,
+            // Issue #3230 の新規採番。
+            ArrayValue::SmallInt(_) => 14,
+            // Issue #3232 の新規採番。
+            ArrayValue::Time(_) => 15,
+            // Issue #3235 の新規採番（TIMESTAMPTZ・INTERVAL の採番値と重ならない 18）。
+            ArrayValue::Bit(_) => 18,
+            // Issue #3234 の新規採番（`constraint::array_elem_tag` と同じ 17）。
+            ArrayValue::Interval(_) => 17,
+            // Issue #3233 の新規採番。
+            ArrayValue::TimestampTz(_) => 16,
             // `flat()` は `Multi` を返さない。
             ArrayValue::Multi(_) => {
                 return Err(RowCodecError::Invalid(
@@ -907,6 +1047,24 @@ impl ArrayValue {
                     buf.extend_from_slice(canonical.as_bytes());
                 }
             }
+            // 行バイトは宣言長 `n` から幅が決まるため要素ごとの長さを持たないが、`bit(4)` の
+            // `1000` と `bit(8)` の `10000000` は同じ 0x80 になる。等価ペイロードには要素ごとに
+            // ビット長（u32 LE）を積み、長さ違いの衝突を防ぐ（新規タグのため既存バイト列は不変）。
+            ArrayValue::Bit(items) => {
+                write_array_null_bitmap(&mut buf, self);
+                for b in items.iter().flatten() {
+                    buf.extend_from_slice(&b.bit_len().to_le_bytes());
+                    buf.extend_from_slice(b.as_bytes());
+                }
+            }
+            // 行バイトは生の三要素（`1 mon` と `30 days` は別バイト）だが、SQL の等価は同値なので、
+            // 等価ペイロードはスカラー INTERVAL と同じ正規化キー（i128 BE 16 バイト）にする。
+            ArrayValue::Interval(items) => {
+                write_array_null_bitmap(&mut buf, self);
+                for v in items.iter().flatten() {
+                    buf.extend_from_slice(&crate::datetime::interval_cmp_key(v).to_be_bytes());
+                }
+            }
             _ => write_array_elements_payload(&mut buf, self)?,
         }
         Ok(buf)
@@ -917,9 +1075,11 @@ impl ArrayValue {
     /// は実際のペイロードを組み立てて長さを返す（予算見積もりと実バイト数を一致させる）。
     pub(crate) fn canonical_payload_len(&self) -> Result<usize> {
         match self {
-            ArrayValue::Numeric(_) | ArrayValue::Json(_) | ArrayValue::Jsonb(_) => {
-                Ok(self.equality_payload()?.len())
-            }
+            ArrayValue::Numeric(_)
+            | ArrayValue::Json(_)
+            | ArrayValue::Jsonb(_)
+            | ArrayValue::Interval(_)
+            | ArrayValue::Bit(_) => Ok(self.equality_payload()?.len()),
             ArrayValue::Multi(m) => Ok(self
                 .dims_header_len()
                 .saturating_add(m.inner.canonical_payload_len()?)),
@@ -1343,10 +1503,30 @@ impl<'a> ArrayRef<'a> {
     /// （呼び出し元が fail-closed に扱う）。
     pub(crate) fn equality_payload(&self) -> Result<std::borrow::Cow<'a, [u8]>> {
         match self.elem {
-            ArrayElemType::Numeric { .. } | ArrayElemType::Json | ArrayElemType::Jsonb => Ok(
-                std::borrow::Cow::Owned(self.to_value()?.equality_payload()?),
-            ),
-            _ => Ok(std::borrow::Cow::Borrowed(self.bytes)),
+            // `BIT(n)` は等価ペイロードへ要素ごとのビット長を積むため、値へ復号して正準化する。
+            ArrayElemType::Numeric { .. }
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Interval
+            | ArrayElemType::Bit(_) => Ok(std::borrow::Cow::Owned(
+                self.to_value()?.equality_payload()?,
+            )),
+            ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::SmallInt
+            | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
+            | ArrayElemType::Bytea
+            | ArrayElemType::Enum => Ok(std::borrow::Cow::Borrowed(self.bytes)),
         }
     }
 
@@ -1958,22 +2138,44 @@ const MAX_ARRAY_PAYLOAD_LEN: u32 = MAX_TEXT_FIELD_LEN;
 /// [`ArrayValue::elem`] が `NUMERIC` で代表値しか返せないため、列宣言との照合は
 /// 完全一致ではなく種別一致で行う。
 pub(crate) fn array_elem_kind_eq(a: ArrayElemType, b: ArrayElemType) -> bool {
-    std::mem::discriminant(&a) == std::mem::discriminant(&b)
+    std::mem::discriminant(&array_elem_storage_kind(a))
+        == std::mem::discriminant(&array_elem_storage_kind(b))
+}
+
+/// 要素型を「格納種別」へ正規化する（Issue #3231）。`VARCHAR`／`CHAR(n)` は TEXT と同じ
+/// 物理表現（`ArrayValue::Text`）を共有するため、種別照合では `Text` として扱う。文字数の
+/// 上限・空白詰めは [`normalize_char_array_value`]・[`validate_array_elements`] が守る。
+fn array_elem_storage_kind(e: ArrayElemType) -> ArrayElemType {
+    match e {
+        ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => ArrayElemType::Text,
+        other => other,
+    }
 }
 
 /// 固定長要素型の 1 要素あたりのバイト幅（`TEXT` は可変長なので `None`）。
 fn array_fixed_width(elem: ArrayElemType) -> Option<usize> {
     match elem {
         ArrayElemType::Text
+        | ArrayElemType::Varchar(_)
+        | ArrayElemType::Bpchar(_)
         | ArrayElemType::Bytea
         | ArrayElemType::Json
         | ArrayElemType::Jsonb
         | ArrayElemType::Enum => None,
         ArrayElemType::Numeric { .. } => Some(16),
         ArrayElemType::Bool => Some(1),
+        ArrayElemType::SmallInt => Some(2),
         ArrayElemType::Integer | ArrayElemType::Real | ArrayElemType::Date => Some(4),
-        ArrayElemType::BigInt | ArrayElemType::Double | ArrayElemType::Timestamp => Some(8),
+        ArrayElemType::BigInt
+        | ArrayElemType::Double
+        | ArrayElemType::Timestamp
+        | ArrayElemType::Time
+        | ArrayElemType::TimestampTz => Some(8),
         ArrayElemType::Uuid => Some(16),
+        // `INTERVAL`（Issue #3234）: months(i32 LE)・days(i32 LE)・micros(i64 LE) の 16 バイト。
+        ArrayElemType::Interval => Some(16),
+        // `BIT(n)`（Issue #3235）: MSB 先頭で `ceil(n / 8)` バイト（詰め物ビットは 0）。
+        ArrayElemType::Bit(n) => crate::bit_string::byte_len_for_bits(n),
     }
 }
 
@@ -2024,6 +2226,15 @@ fn array_elements_byte_len(elem: ArrayElemType, value: &ArrayValue) -> Result<u3
                     RowCodecError::Invalid("array element length overflow".to_string())
                 })?;
                 total = total.checked_add(entry).ok_or_else(|| {
+                    RowCodecError::Invalid("array payload length overflow".to_string())
+                })?;
+            }
+        }
+        // `BIT(n)[]`: 要素ごとの実バイト長を数える（宣言幅との一致は
+        // [`validate_array_elements`] が検査する。確保前に累計を `u32` で打ち切る）。
+        ArrayValue::Bit(items) => {
+            for item in items.iter().flatten() {
+                total = total.checked_add(item.as_bytes().len()).ok_or_else(|| {
                     RowCodecError::Invalid("array payload length overflow".to_string())
                 })?;
             }
@@ -2159,7 +2370,68 @@ fn validate_array_elements(array_ty: &ArrayType, value: &ArrayValue) -> Result<(
                 })?;
             }
         }
-        _ => {}
+        // `VARCHAR(n)[]`／`CHAR(n)[]`（Issue #3231）。書き込み経路は
+        // [`normalize_char_array_value`] で切り詰め・空白詰め済みにしてから encode へ渡す。
+        // ここは切り詰めなしの厳格判定で、未正規化の値を永続化させない最後の砦。
+        // エラーには型と n だけを含め、値は反射しない。
+        (ArrayElemType::Varchar(Some(n)), ArrayValue::Text(items)) => {
+            let limit = usize::try_from(n).unwrap_or(usize::MAX);
+            for text in items.iter().flatten() {
+                if text.len() > limit && text.chars().nth(limit).is_some() {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array element too long for type character varying({n})"
+                    )));
+                }
+            }
+        }
+        (ArrayElemType::Bpchar(n), ArrayValue::Text(items)) => {
+            let limit = usize::try_from(n).unwrap_or(usize::MAX);
+            for text in items.iter().flatten() {
+                if text.len() < limit || text.chars().count() != limit {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array element of type character({n}) is not blank-padded"
+                    )));
+                }
+            }
+        }
+        // `BIT(n)[]`（Issue #3235）。各要素は宣言長 `n` ビットちょうどで、詰め物ビットは 0
+        // （`BitString` の構築時不変条件）。長さ違いは永続化させない。値は文言へ反射しない。
+        (ArrayElemType::Bit(n), ArrayValue::Bit(items)) => {
+            for b in items.iter().flatten() {
+                if b.bit_len() != n {
+                    return Err(RowCodecError::Invalid(format!(
+                        "array element length does not match type bit({n})"
+                    )));
+                }
+            }
+        }
+        // 検査対象なしの組。全要素型を列挙し、要素型の追加時にコンパイルエラーで
+        // 検証要否の判断を強制する（Issue #3229）。
+        (
+            ArrayElemType::Varchar(None)
+            | ArrayElemType::Varchar(Some(_))
+            | ArrayElemType::Bpchar(_)
+            | ArrayElemType::Text
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Bytea
+            | ArrayElemType::Json
+            | ArrayElemType::Jsonb
+            | ArrayElemType::SmallInt
+            | ArrayElemType::Time
+            | ArrayElemType::Interval
+            | ArrayElemType::Bit(_)
+            | ArrayElemType::TimestampTz
+            | ArrayElemType::Enum,
+            _,
+        ) => {}
     }
     Ok(())
 }
@@ -2262,6 +2534,11 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
+        ArrayValue::SmallInt(items) => {
+            for v in items.iter().flatten() {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         ArrayValue::BigInt(items) => {
             for v in items.iter().flatten() {
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -2307,7 +2584,46 @@ pub(crate) fn write_array_elements_payload(buf: &mut Vec<u8>, value: &ArrayValue
                 buf.extend_from_slice(&v.to_le_bytes());
             }
         }
+        ArrayValue::Time(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_time_micros(*v) {
+                    return Err(RowCodecError::Invalid(
+                        "array TIME element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        ArrayValue::TimestampTz(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_timestamptz_micros(*v) {
+                    return Err(RowCodecError::Invalid(
+                        "array TIMESTAMPTZ element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
         ArrayValue::Uuid(items) => {
+            for v in items.iter().flatten() {
+                buf.extend_from_slice(v.as_bytes());
+            }
+        }
+        // 番兵（±infinity の予約値）は永続化させない（fail-closed。値は文言へ反射しない）。
+        ArrayValue::Interval(items) => {
+            for v in items.iter().flatten() {
+                if !crate::datetime::validate_interval(v) {
+                    return Err(RowCodecError::Invalid(
+                        "array INTERVAL element out of range".to_string(),
+                    ));
+                }
+                buf.extend_from_slice(&v.months.to_le_bytes());
+                buf.extend_from_slice(&v.days.to_le_bytes());
+                buf.extend_from_slice(&v.micros.to_le_bytes());
+            }
+        }
+        // 幅は列宣言の `n` が決める。要素の長さ照合は [`validate_array_elements`] が担う。
+        ArrayValue::Bit(items) => {
             for v in items.iter().flatten() {
                 buf.extend_from_slice(v.as_bytes());
             }
@@ -2498,12 +2814,14 @@ fn decode_array_elements(
     }
     let (nulls, rest) = split_array_null_bitmap(bytes, count as usize, flags)?;
     match elem {
-        ArrayElemType::Text => decode_var_array_elements(rest, &nulls, |b| {
-            std::str::from_utf8(b).map(str::to_string).map_err(|_| {
-                RowCodecError::Invalid("array text element is not valid UTF-8".to_string())
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => {
+            decode_var_array_elements(rest, &nulls, |b| {
+                std::str::from_utf8(b).map(str::to_string).map_err(|_| {
+                    RowCodecError::Invalid("array text element is not valid UTF-8".to_string())
+                })
             })
-        })
-        .map(ArrayValue::Text),
+            .map(ArrayValue::Text)
+        }
         ArrayElemType::Json => {
             decode_var_array_elements(rest, &nulls, decode_array_utf8).map(ArrayValue::Json)
         }
@@ -2545,6 +2863,10 @@ fn decode_array_elements(
             Ok(i32::from_le_bytes(array_le_bytes::<4>(c)?))
         })
         .map(ArrayValue::Integer),
+        ArrayElemType::SmallInt => decode_fixed_array_elements(rest, &nulls, 2, |c| {
+            Ok(i16::from_le_bytes(array_le_bytes::<2>(c)?))
+        })
+        .map(ArrayValue::SmallInt),
         ArrayElemType::BigInt => decode_fixed_array_elements(rest, &nulls, 8, |c| {
             Ok(i64::from_le_bytes(array_le_bytes::<8>(c)?))
         })
@@ -2589,10 +2911,66 @@ fn decode_array_elements(
             Ok(v)
         })
         .map(ArrayValue::Timestamp),
+        ArrayElemType::Time => decode_fixed_array_elements(rest, &nulls, 8, |c| {
+            let v = i64::from_le_bytes(array_le_bytes::<8>(c)?);
+            if !crate::datetime::validate_time_micros(v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array TIME element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::Time),
+        ArrayElemType::TimestampTz => decode_fixed_array_elements(rest, &nulls, 8, |c| {
+            let v = i64::from_le_bytes(array_le_bytes::<8>(c)?);
+            if !crate::datetime::validate_timestamptz_micros(v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array TIMESTAMPTZ element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::TimestampTz),
         ArrayElemType::Uuid => decode_fixed_array_elements(rest, &nulls, 16, |c| {
             Ok(Uuid::from_bytes(array_le_bytes::<16>(c)?))
         })
         .map(ArrayValue::Uuid),
+        ArrayElemType::Interval => decode_fixed_array_elements(rest, &nulls, 16, |c| {
+            let b = array_le_bytes::<16>(c)?;
+            let (months, rest) = b.split_at(4);
+            let (days, micros) = rest.split_at(4);
+            let v = crate::datetime::Interval {
+                months: i32::from_le_bytes(months.try_into().map_err(|_| {
+                    RowCodecError::Invalid("persisted array INTERVAL element is malformed".into())
+                })?),
+                days: i32::from_le_bytes(days.try_into().map_err(|_| {
+                    RowCodecError::Invalid("persisted array INTERVAL element is malformed".into())
+                })?),
+                micros: i64::from_le_bytes(micros.try_into().map_err(|_| {
+                    RowCodecError::Invalid("persisted array INTERVAL element is malformed".into())
+                })?),
+            };
+            if !crate::datetime::validate_interval(&v) {
+                return Err(RowCodecError::Invalid(
+                    "persisted array INTERVAL element out of range".to_string(),
+                ));
+            }
+            Ok(v)
+        })
+        .map(ArrayValue::Interval),
+        // `BIT(n)`: 幅は宣言長から決まる。詰め物ビットが非 0 の破損データは `from_parts` が
+        // 拒否する（黙って受理しない）。
+        ArrayElemType::Bit(n) => {
+            let width = crate::bit_string::byte_len_for_bits(n).ok_or_else(|| {
+                RowCodecError::Invalid("array BIT element width overflow".to_string())
+            })?;
+            decode_fixed_array_elements(rest, &nulls, width, |c| {
+                crate::bit_string::BitString::from_parts(n, c.to_vec()).map_err(|_| {
+                    RowCodecError::Invalid("persisted array BIT element is malformed".to_string())
+                })
+            })
+            .map(ArrayValue::Bit)
+        }
     }
 }
 
@@ -4598,15 +4976,71 @@ pub(crate) fn convert_char_family<'a>(
     fit_pad_char_length(to, source, limit)
 }
 
-/// [`fit_pad_char_length`] を `Value::Text` へその場適用する（切り詰め・空白詰め）。
+/// [`fit_pad_char_length`] を `Value::Text`／`Value::Array`（`VARCHAR(n)[]`・`CHAR(n)[]`）へ
+/// その場適用する（切り詰め・空白詰め）。
 pub(crate) fn normalize_char_length_value(
     column: &crate::catalog::ColumnDef,
     value: &mut Value,
 ) -> std::result::Result<(), CharLengthExceeded> {
-    if let Value::Text(t) = value {
-        let limit = usize::try_from(MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
-        let fitted = fit_pad_char_length(&column.ty, t, limit)?.into_owned();
-        *t = fitted;
+    match value {
+        Value::Text(t) => {
+            let limit = usize::try_from(MAX_TEXT_FIELD_LEN).unwrap_or(usize::MAX);
+            let fitted = fit_pad_char_length(&column.ty, t, limit)?.into_owned();
+            *t = fitted;
+        }
+        Value::Array(av) => {
+            if let ColumnType::Array(array_ty) = &column.ty {
+                normalize_char_array_value(array_ty, av)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `VARCHAR(n)[]`／`CHAR(n)[]` 列へ書き込む配列値の各要素を、スカラーの
+/// [`fit_pad_char_length`] と同じ規則で列の格納形へ正規化する（Issue #3231・TABLE-14・
+/// TABLE-31）。超過は `22001` 相当（超過部分が U+0020 のみなら切り詰め）、`CHAR(n)` は
+/// n 文字へ空白詰め。他の要素型・`Text` 以外の値は素通しする。多次元は平坦な要素列へ適用する。
+/// 詰め後の要素の累計バイト数を**確保の前に**配列ペイロード上限（`54000` 相当）で打ち切り、
+/// `CHAR(10485760)[]` への多数要素による巨大確保（DoS）を防ぐ。SQL 束縛段
+/// （`sql::parser::convert_array_elements`）と SET 式評価（`tenant`）が共有する単一の変換点。
+pub(crate) fn normalize_char_array_value(
+    array_ty: &ArrayType,
+    value: &mut ArrayValue,
+) -> std::result::Result<(), CharLengthExceeded> {
+    let (n, bpchar, elem_ty) = match array_ty.elem() {
+        ArrayElemType::Varchar(Some(n)) => (n, false, ColumnType::Varchar(Some(n))),
+        ArrayElemType::Bpchar(n) => (n, true, ColumnType::Bpchar(n)),
+        _ => return Ok(()),
+    };
+    let items = match value {
+        ArrayValue::Text(items) => items,
+        ArrayValue::Multi(m) => match m.inner.as_mut() {
+            ArrayValue::Text(items) => items,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let mut budget = usize::try_from(MAX_ARRAY_PAYLOAD_LEN).unwrap_or(usize::MAX);
+    let over = || CharLengthExceeded {
+        bpchar,
+        n,
+        pad_limit: true,
+    };
+    for slot in items.iter_mut() {
+        let Some(text) = slot else { continue };
+        let fitted = fit_pad_char_length(&elem_ty, text, budget)?;
+        let (len, owned) = match fitted {
+            std::borrow::Cow::Owned(s) => (s.len(), Some(s)),
+            std::borrow::Cow::Borrowed(b) => (b.len(), None),
+        };
+        budget = budget.checked_sub(len).ok_or_else(over)?;
+        match owned {
+            Some(s) => *text = s,
+            // 末尾空白の切り詰め（借用）。
+            None => text.truncate(len),
+        }
     }
     Ok(())
 }
@@ -6736,6 +7170,78 @@ mod tests {
         );
     }
 
+    /// `normalize_char_array_value`（Issue #3231）: 要素ごとの切り詰め・空白詰め・`22001`・
+    /// NULL 要素・多次元・累計上限（確保前の `54000`）。他の要素型・他の値は素通し。
+    #[test]
+    fn normalize_char_array_value_rules() {
+        let text = |items: &[Option<&str>]| {
+            ArrayValue::Text(items.iter().map(|s| s.map(str::to_string)).collect())
+        };
+        let varchar3 = ArrayType::new(ArrayElemType::Varchar(Some(3)), 8).expect("ty");
+        let bpchar3 = ArrayType::new(ArrayElemType::Bpchar(3), 8).expect("ty");
+
+        let mut v = text(&[Some("ab"), None, Some("abc   ")]);
+        normalize_char_array_value(&varchar3, &mut v).expect("fits");
+        assert_eq!(v, text(&[Some("ab"), None, Some("abc")]));
+        let mut v = text(&[Some("abcd")]);
+        let e = normalize_char_array_value(&varchar3, &mut v).expect_err("too long");
+        assert!(!e.to_string().contains("abcd"));
+
+        let mut c = text(&[Some("a"), None, Some("abc  ")]);
+        normalize_char_array_value(&bpchar3, &mut c).expect("fits");
+        assert_eq!(c, text(&[Some("a  "), None, Some("abc")]));
+        let mut c = text(&[Some("日")]);
+        normalize_char_array_value(&bpchar3, &mut c).expect("fits");
+        assert_eq!(c, text(&[Some("日  ")]));
+        assert!(normalize_char_array_value(&bpchar3, &mut text(&[Some("abcd")])).is_err());
+
+        // 多次元は平坦な要素列へ適用する。
+        let mut m = ArrayValue::with_dims(text(&[Some("a"), Some("b")]), vec![1, 2]).expect("dims");
+        normalize_char_array_value(&bpchar3, &mut m).expect("fits");
+        assert_eq!(m.flat(), &text(&[Some("a  "), Some("b  ")]));
+
+        // 要素型が文字系でない・値が Text でない場合は素通し。
+        let plain = ArrayType::new(ArrayElemType::Text, 8).expect("ty");
+        let mut t = text(&[Some("longer than three")]);
+        normalize_char_array_value(&plain, &mut t).expect("pass-through");
+        assert_eq!(t, text(&[Some("longer than three")]));
+
+        // 空白詰めの累計が配列ペイロード上限を超えるなら確保前に拒否する。
+        let big = ArrayType::new(ArrayElemType::Bpchar(MAX_TEXT_FIELD_LEN / 2), 8).expect("ty");
+        let mut b = text(&[Some("a"), Some("b"), Some("c")]);
+        let e = normalize_char_array_value(&big, &mut b).expect_err("over the payload limit");
+        assert!(e.pad_limit);
+    }
+
+    /// `validate_array_elements`（Issue #3231）の最後の砦: 未詰めの `CHAR(n)`・超過した
+    /// `VARCHAR(n)` は encode で拒否する（値は文言へ反射しない）。
+    #[test]
+    fn char_array_elements_are_rejected_when_not_normalized() {
+        let text =
+            |items: &[&str]| ArrayValue::Text(items.iter().map(|s| Some(s.to_string())).collect());
+        let varchar3 = ArrayType::new(ArrayElemType::Varchar(Some(3)), 8).expect("ty");
+        let bpchar3 = ArrayType::new(ArrayElemType::Bpchar(3), 8).expect("ty");
+        assert!(validate_array_elements(&varchar3, &text(&["ab", "abc"])).is_ok());
+        let e = validate_array_elements(&varchar3, &text(&["abcd"])).expect_err("too long");
+        assert!(!e.to_string().contains("abcd"));
+        assert!(validate_array_elements(&bpchar3, &text(&["ab "])).is_ok());
+        assert!(validate_array_elements(&bpchar3, &text(&["ab"])).is_err());
+        assert!(validate_array_elements(&bpchar3, &text(&["abcd"])).is_err());
+        // 種別照合は TEXT 系で共有する。
+        assert!(array_elem_kind_eq(
+            ArrayElemType::Text,
+            ArrayElemType::Varchar(Some(3))
+        ));
+        assert!(array_elem_kind_eq(
+            ArrayElemType::Text,
+            ArrayElemType::Bpchar(3)
+        ));
+        assert!(!array_elem_kind_eq(
+            ArrayElemType::Bytea,
+            ArrayElemType::Bpchar(3)
+        ));
+    }
+
     /// `fit_char_length`（TABLE-31・Issue #1564）: 境界・マルチバイト・空白切り詰め・素通し。
     #[test]
     fn fit_char_length_rules() {
@@ -7736,6 +8242,435 @@ mod tests {
         let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
         let decoded = decode_row(&schema, &encoded).expect("decode");
         assert_eq!(decoded.values, values);
+    }
+
+    /// Issue #3230: `SMALLINT[]` は固定幅 2 バイトで往復する（NULL 要素・空配列・境界値・2 次元）。
+    /// 壊れたフレーム（幅の不一致）は Invalid で fail-closed。
+    #[test]
+    fn smallint_array_roundtrips_with_fixed_two_byte_width() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "a",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::SmallInt, 8).expect("array ty"),
+                    ),
+                    true,
+                ),
+                ColumnDef::new(
+                    "b",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::SmallInt, 8)
+                            .and_then(|a| a.with_ndims(2))
+                            .expect("array ty"),
+                    ),
+                    true,
+                ),
+            ],
+        );
+        let flat = ArrayValue::SmallInt(vec![Some(i16::MIN), None, Some(0), Some(i16::MAX)]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::SmallInt(vec![Some(1), Some(2), Some(3), Some(4)]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::SmallInt(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        // 要素幅 2 バイトの本文: NULL ビットマップ 1 バイト + 非 NULL 3 要素 x 2 バイト。
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 14);
+        assert_eq!(payload.len(), 1 + 3 * 2);
+        // 型違い（Integer の値を SMALLINT[] 列へ）は拒否する。
+        let bad = vec![
+            Value::Array(ArrayValue::Integer(vec![Some(1)])),
+            Value::Null,
+        ];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 幅 2 の列として壊れた長さ（奇数バイト）は復号で Invalid になる。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::SmallInt, &[0u8, 1, 2], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    /// Issue #3232: `TIME[]` は固定幅 8 バイトで往復する（NULL 要素・空配列・境界値・2 次元）。
+    /// 範囲外・型違い・壊れたフレームは encode／decode とも Invalid で fail-closed。
+    #[test]
+    fn time_array_roundtrips_with_fixed_eight_byte_width() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "a",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Time, 8).expect("array ty")),
+                    true,
+                ),
+                ColumnDef::new(
+                    "b",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Time, 8)
+                            .and_then(|a| a.with_ndims(2))
+                            .expect("array ty"),
+                    ),
+                    true,
+                ),
+            ],
+        );
+        let flat = ArrayValue::Time(vec![Some(0), None, Some(86_400_000_000), Some(1)]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::Time(vec![Some(1), Some(2), Some(3), Some(4)]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::Time(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        // 要素幅 8 バイトの本文: NULL ビットマップ 1 バイト + 非 NULL 3 要素 x 8 バイト。
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 15);
+        assert_eq!(payload.len(), 1 + 3 * 8);
+        // 型違い（Timestamp の値を TIME[] 列へ）は拒否する。
+        let bad = vec![
+            Value::Array(ArrayValue::Timestamp(vec![Some(1)])),
+            Value::Null,
+        ];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 範囲外のマイクロ秒は encode で Invalid。
+        for micros in [-1_i64, 86_400_000_001] {
+            let out_of_range = vec![
+                Value::Array(ArrayValue::Time(vec![Some(micros)])),
+                Value::Null,
+            ];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &out_of_range),
+                Err(RowCodecError::Invalid(_))
+            ));
+            // 範囲外の永続バイト列は decode でも Invalid（破損データを黙って受理しない）。
+            let mut body = vec![0u8];
+            body.extend_from_slice(&micros.to_le_bytes());
+            assert!(matches!(
+                decode_array_elements(ArrayElemType::Time, &body, 1, 0),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+        // 幅 8 の列として壊れた長さ（7 バイト）は復号で Invalid になる。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Time, &[0u8, 1, 2, 3, 4, 5, 6, 7], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    /// Issue #3234: `INTERVAL[]` は固定幅 16 バイト（months・days・micros の LE）で往復する
+    /// （NULL 要素・空配列・境界値・2 次元）。番兵・型違い・壊れた幅は encode／decode とも Invalid
+    /// で fail-closed。行バイトは生の三要素だが、等価ペイロードは正規化キー（`1 mon` = `30 days`）。
+    #[test]
+    fn interval_array_roundtrips_with_fixed_sixteen_byte_width() {
+        use crate::datetime::Interval as I;
+        let iv = |months, days, micros| I {
+            months,
+            days,
+            micros,
+        };
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new(
+                    "a",
+                    ColumnType::Array(ArrayType::new(ArrayElemType::Interval, 8).expect("ty")),
+                    true,
+                ),
+                ColumnDef::new(
+                    "b",
+                    ColumnType::Array(
+                        ArrayType::new(ArrayElemType::Interval, 8)
+                            .and_then(|a| a.with_ndims(2))
+                            .expect("ty"),
+                    ),
+                    true,
+                ),
+            ],
+        );
+        let flat = ArrayValue::Interval(vec![
+            Some(iv(i32::MIN, i32::MIN, i64::MIN + 1)),
+            None,
+            Some(iv(i32::MAX, i32::MAX, i64::MAX - 1)),
+            Some(iv(1, -2, 3)),
+        ]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::Interval(vec![
+                Some(iv(0, 1, 0)),
+                Some(iv(0, 2, 0)),
+                Some(iv(0, 3, 0)),
+                Some(iv(0, 4, 0)),
+            ]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::Interval(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        // 要素幅 16 バイトの本文: NULL ビットマップ 1 バイト + 非 NULL 3 要素 x 16 バイト。
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 17);
+        assert_eq!(payload.len(), 1 + 3 * 16);
+        // 型違いは拒否する。
+        let bad = vec![Value::Array(ArrayValue::Time(vec![Some(1)])), Value::Null];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 番兵（±infinity の予約値）は encode で Invalid。
+        for sentinel in [
+            iv(i32::MAX, i32::MAX, i64::MAX),
+            iv(i32::MIN, i32::MIN, i64::MIN),
+        ] {
+            let values = vec![
+                Value::Array(ArrayValue::Interval(vec![Some(sentinel)])),
+                Value::Null,
+            ];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &values),
+                Err(RowCodecError::Invalid(_))
+            ));
+            // 番兵の永続バイト列は decode でも Invalid。
+            let mut body = vec![0u8];
+            body.extend_from_slice(&sentinel.months.to_le_bytes());
+            body.extend_from_slice(&sentinel.days.to_le_bytes());
+            body.extend_from_slice(&sentinel.micros.to_le_bytes());
+            assert!(matches!(
+                decode_array_elements(ArrayElemType::Interval, &body, 1, 0),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+        // 幅 16 の列として壊れた長さ（15 バイト）は復号で Invalid になる。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Interval, &[0u8; 15], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // `1 mon` と `30 days` は等価ペイロードが一致し、行バイト（要素列）は異なる。
+        let month = ArrayValue::Interval(vec![Some(iv(1, 0, 0))]);
+        let days = ArrayValue::Interval(vec![Some(iv(0, 30, 0))]);
+        assert_eq!(
+            month.equality_payload().expect("eq"),
+            days.equality_payload().expect("eq")
+        );
+        assert_ne!(month, days);
+        assert!(month.element_equals(0, &days).expect("eq"));
+        let mut raw_month = Vec::new();
+        let mut raw_days = Vec::new();
+        write_array_elements_payload(&mut raw_month, &month).expect("payload");
+        write_array_elements_payload(&mut raw_days, &days).expect("payload");
+        assert_ne!(raw_month, raw_days);
+    }
+
+    /// Issue #3235: `BIT(n)[]` は要素ごとに固定幅 `ceil(n / 8)` バイトで往復する（NULL 要素・空配列・
+    /// 端数ビット・2 次元）。長さ違い・型違い・詰め物ビット非 0・壊れた幅は encode／decode とも
+    /// Invalid で fail-closed。等価ペイロードはビット長を含み、同じバイト列でも長さ違いは別になる。
+    #[test]
+    fn bit_array_roundtrips_with_fixed_width_and_rejects_corruption() {
+        use crate::bit_string::BitString as B;
+        let bit = |s: &str| B::parse_text(s, s.len() as u32).expect("bit");
+        for n in [4u32, 9] {
+            let schema = TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new(
+                        "a",
+                        ColumnType::Array(ArrayType::new(ArrayElemType::Bit(n), 8).expect("ty")),
+                        true,
+                    ),
+                    ColumnDef::new(
+                        "b",
+                        ColumnType::Array(
+                            ArrayType::new(ArrayElemType::Bit(n), 8)
+                                .and_then(|a| a.with_ndims(2))
+                                .expect("ty"),
+                        ),
+                        true,
+                    ),
+                ],
+            );
+            let one = |c: char| c.to_string().repeat(n as usize);
+            let flat = ArrayValue::Bit(vec![Some(bit(&one('1'))), None, Some(bit(&one('0')))]);
+            let multi = ArrayValue::with_dims(
+                ArrayValue::Bit(vec![
+                    Some(bit(&one('1'))),
+                    Some(bit(&one('0'))),
+                    Some(bit(&one('1'))),
+                    Some(bit(&one('0'))),
+                ]),
+                vec![2, 2],
+            )
+            .expect("dims");
+            for values in [
+                vec![Value::Array(flat.clone()), Value::Array(multi)],
+                vec![Value::Array(ArrayValue::Bit(vec![])), Value::Null],
+            ] {
+                let encoded =
+                    encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+                let decoded = decode_row(&schema, &encoded).expect("decode");
+                assert_eq!(decoded.values, values);
+            }
+            // 本文: NULL ビットマップ 1 バイト + 非 NULL 2 要素 x ceil(n/8) バイト。
+            let width = usize::try_from(n.div_ceil(8)).expect("width");
+            let payload = flat.equality_payload().expect("payload");
+            assert_eq!(payload.len(), 1 + 2 * (4 + width));
+            assert_eq!(
+                array_elements_byte_len(ArrayElemType::Bit(n), &flat).expect("len") as usize,
+                1 + 2 * width
+            );
+            // 長さ違いの要素・型違いの値は encode で拒否する。
+            for bad in [
+                ArrayValue::Bit(vec![Some(bit("1"))]),
+                ArrayValue::Text(vec![Some("1".to_string())]),
+            ] {
+                let values = vec![Value::Array(bad), Value::Null];
+                assert!(matches!(
+                    encode_row(&schema, "tenant-a", Visibility::Public, &values),
+                    Err(RowCodecError::Invalid(_))
+                ));
+            }
+        }
+        // 詰め物ビットが非 0 の永続バイト列（bit(4) の 0x0F）は decode で Invalid。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Bit(4), &[0x0F], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+        assert!(decode_array_elements(ArrayElemType::Bit(4), &[0xF0], 1, 0).is_ok());
+        // 幅が合わない本文（bit(9) は 2 バイト必要）は Invalid。
+        assert!(matches!(
+            decode_array_elements(ArrayElemType::Bit(9), &[0xFF], 1, 0),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // `bit(4)` の `1000` と `bit(8)` の `10000000` は同じ 0x80 でも等価ペイロードが異なる。
+        let a = ArrayValue::Bit(vec![Some(bit("1000"))]);
+        let b = ArrayValue::Bit(vec![Some(bit("10000000"))]);
+        assert_eq!(
+            a.flat_element_bytes_for_test(),
+            b.flat_element_bytes_for_test()
+        );
+        assert_ne!(
+            a.equality_payload().expect("a"),
+            b.equality_payload().expect("b")
+        );
+        // 保存側（ArrayRef）の等価ペイロードは値側と一致する。
+        let mut raw = Vec::new();
+        write_array_elements_payload(&mut raw, &a).expect("payload");
+        let r = ArrayRef::from_owned(ArrayElemType::Bit(4), 1, 0, &raw);
+        assert_eq!(
+            r.equality_payload().expect("ref").into_owned(),
+            a.equality_payload().expect("a")
+        );
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` は固定幅 8 バイトで往復する（NULL 要素・空配列・境界値・
+    /// 2 次元）。範囲外・型違い・壊れたフレームは encode／decode とも Invalid で fail-closed。
+    /// テキスト出力は UTC・非 UTC とも offset 付きで引用される。
+    #[test]
+    fn timestamptz_array_roundtrips_with_fixed_eight_byte_width() {
+        let ty = |nd: bool| {
+            let a = ArrayType::new(ArrayElemType::TimestampTz, 8).expect("array ty");
+            ColumnType::Array(if nd {
+                a.with_ndims(2).expect("array ty")
+            } else {
+                a
+            })
+        };
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("a", ty(false), true),
+                ColumnDef::new("b", ty(true), true),
+            ],
+        );
+        let flat = ArrayValue::TimestampTz(vec![Some(0), None, Some(1_000_000), Some(-1)]);
+        let multi = ArrayValue::with_dims(
+            ArrayValue::TimestampTz(vec![Some(1), Some(2), Some(3), Some(4)]),
+            vec![2, 2],
+        )
+        .expect("dims");
+        for values in [
+            vec![Value::Array(flat.clone()), Value::Array(multi)],
+            vec![Value::Array(ArrayValue::TimestampTz(vec![])), Value::Null],
+        ] {
+            let encoded =
+                encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
+            let decoded = decode_row(&schema, &encoded).expect("decode");
+            assert_eq!(decoded.values, values);
+        }
+        let (ordinal, _flags, payload) = flat.canonical_parts().expect("canonical");
+        assert_eq!(ordinal, 16);
+        assert_eq!(payload.len(), 1 + 3 * 8);
+        // 型違い（Timestamp の値を TIMESTAMPTZ[] 列へ）は拒否する。
+        let bad = vec![
+            Value::Array(ArrayValue::Timestamp(vec![Some(1)])),
+            Value::Null,
+        ];
+        assert!(matches!(
+            encode_row(&schema, "tenant-a", Visibility::Public, &bad),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // 範囲外は encode／decode とも Invalid。
+        for micros in [i64::MIN, i64::MAX] {
+            assert!(!crate::datetime::validate_timestamptz_micros(micros));
+            let out_of_range = vec![
+                Value::Array(ArrayValue::TimestampTz(vec![Some(micros)])),
+                Value::Null,
+            ];
+            assert!(matches!(
+                encode_row(&schema, "tenant-a", Visibility::Public, &out_of_range),
+                Err(RowCodecError::Invalid(_))
+            ));
+            let mut body = vec![0u8];
+            body.extend_from_slice(&micros.to_le_bytes());
+            assert!(matches!(
+                decode_array_elements(ArrayElemType::TimestampTz, &body, 1, 0),
+                Err(RowCodecError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            decode_array_elements(
+                ArrayElemType::TimestampTz,
+                &[0u8, 1, 2, 3, 4, 5, 6, 7],
+                1,
+                0
+            ),
+            Err(RowCodecError::Invalid(_))
+        ));
+        // テキスト出力: UTC 既定は `+00`、非 UTC は offset 付き。いずれも空白を含むため引用する。
+        let v = ArrayValue::TimestampTz(vec![Some(0), None]);
+        assert_eq!(v.to_pg_text(), r#"{"1970-01-01 00:00:00+00",NULL}"#);
+        let tokyo = crate::datetime::SessionTimeZone::parse_setting("Asia/Tokyo").expect("tz");
+        assert_eq!(
+            v.to_pg_text_in_tz(&tokyo),
+            r#"{"1970-01-01 09:00:00+09",NULL}"#
+        );
     }
 
     #[test]

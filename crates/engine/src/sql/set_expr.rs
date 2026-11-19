@@ -149,6 +149,33 @@ pub(crate) fn bind_set_default(
     })
 }
 
+/// 式の代入を受理する列型か（[`bind_set_expr`] の許可リスト。`UPDATE ... SET` の右辺式と、生成列
+/// `GENERATED ALWAYS AS (<式>) STORED` の式〔TABLE-50・Issue #3327。`sql::generated_column`〕が
+/// 共有する唯一の判定）。NUMERIC・JSON・UUID・BYTEA・ENUM・ベクトル系は対象外。
+pub(crate) fn column_type_accepts_expression(ty: &ColumnType) -> bool {
+    matches!(
+        ty,
+        ColumnType::SmallInt
+            | ColumnType::Integer
+            | ColumnType::BigInt
+            | ColumnType::Real
+            | ColumnType::Double
+            | ColumnType::Text
+            | ColumnType::Varchar(_)
+            | ColumnType::Bpchar(_)
+            | ColumnType::Boolean
+            | ColumnType::Date
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Interval
+            | ColumnType::Time
+            // 配列列（TABLE-35・Issue #1602）。右辺は配列式（コンストラクタ・スライス・CAST・配列列）。
+            | ColumnType::Array(_)
+            // BIT 列（TABLE-48 (3)・Issue #2023）。右辺は `binary_quantize(<VECTOR 列>)` だけが生成する bit 式。
+            | ColumnType::Bit(_)
+    )
+}
+
 /// `expr` を対象列 `column` への代入として束縛する。スキーマだけを参照し、行には触れない。
 /// 呼び出し元は `sql::parser::bind_set_assignments`。
 pub(crate) fn bind_set_expr(
@@ -168,30 +195,10 @@ pub(crate) fn bind_set_expr(
         ));
     }
     // 式を受理しない列型。リテラル経路（`bind_set_assignments` の既存分岐）は無変更。
-    match &column.ty {
-        ColumnType::SmallInt
-        | ColumnType::Integer
-        | ColumnType::BigInt
-        | ColumnType::Real
-        | ColumnType::Double
-        | ColumnType::Text
-        | ColumnType::Varchar(_)
-        | ColumnType::Bpchar(_)
-        | ColumnType::Boolean
-        | ColumnType::Date
-        | ColumnType::Timestamp
-        | ColumnType::TimestampTz
-        | ColumnType::Interval
-        | ColumnType::Time
-        // 配列列（TABLE-35・Issue #1602）。右辺は配列式（コンストラクタ・スライス・CAST・配列列）。
-        | ColumnType::Array(_)
-        // BIT 列（TABLE-48 (3)・Issue #2023）。右辺は `binary_quantize(<VECTOR 列>)` だけが生成する bit 式。
-        | ColumnType::Bit(_) => {}
-        _ => {
-            return Err(SqlSurfaceError::FeatureNotSupported {
-                detail: format!("column {name:?} does not support an expression in SET"),
-            })
-        }
+    if !column_type_accepts_expression(&column.ty) {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!("column {name:?} does not support an expression in SET"),
+        });
     }
 
     let registry = UdfRegistry::default();
@@ -386,11 +393,14 @@ pub(crate) fn expr_value_to_column_value(
         },
         // 配列値（TABLE-35・Issue #1602）。束縛段が要素型を列に合わせ済みで、ここでは要素型の一致と
         // 要素数・フレーム長の上限を行ごとの評価結果に対して再検証する（`54000`。encode と同じ上限）。
-        ExprValue::Array(a) => match target_ty {
+        ExprValue::Array(mut a) => match target_ty {
             ColumnType::Array(at) => {
                 if !crate::row_codec::array_elem_kind_eq(a.elem(), at.elem()) {
                     return Err(internal());
                 }
+                // `VARCHAR(n)[]`／`CHAR(n)[]` 列への代入は要素ごとに切り詰め・空白詰め・
+                // `22001` 判定を行う（Issue #3231）。他の要素型では素通し。
+                crate::row_codec::normalize_char_array_value(at, &mut a)?;
                 if a.len() as u64 > u64::from(at.max_len()) {
                     return Err(SqlSurfaceError::payload_too_large(
                         "array element count exceeds the column limit",

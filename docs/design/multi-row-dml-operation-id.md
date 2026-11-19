@@ -208,7 +208,8 @@ args }` を呼び出し先の名前・引数のみで直列化すると、`WHERE
   引数件数プレフィクス（u32 LE）・各引数を再帰的に直列化
 - `Binary { op, lhs, rhs }`＝タグ 4・`BinOp` を 1 バイトへ写像（`Add`＝1・
   `Sub`＝2・`Mul`＝3・`Div`＝4・`Gt`＝5・`Lt`＝6・`Ge`＝7・`Le`＝8・
-  `Eq`＝9）・lhs を再帰的に直列化・rhs を再帰的に直列化
+  `Eq`＝9・`Rem`＝10）・lhs を再帰的に直列化・rhs を再帰的に直列化。`Rem`（`%`。Issue #3273）は
+  追記のみのタグで、既存の 1〜9 は付け替えない（既存の golden・台帳との互換を保つ）
 
 呼び出し先の名前（`push_bytes(name を小文字化したもの)`）は不変のまま
 残す——組み込み関数呼び出しとの区別が不要になるうえ、4.4.1 節の UDF
@@ -263,6 +264,9 @@ origin/main 取り込み時の是正: 並行実装していた Issue #921 のタ
 - `IsDistinctFrom{negated, lhs, rhs}`＝タグ 20・`negated` 1 バイト（`0`＝`IS DISTINCT FROM`・`1`＝`IS NOT DISTINCT FROM`）・
   `lhs`・`rhs`（Issue #1783・SQL-54。述語形の WHERE に入りうるためハッシュする。否定の有無・左右の入れ替えは
   別ハッシュ。既存タグは不変）
+
+- 単純 `CASE`（Issue #3279・SQL-26）＝タグ 23・被演算子・`whens` の件数（u32 LE）・各（比較値, 結果）・ELSE 有無
+  フラグ・ELSE 本体。検索形のタグ 6 のバイト列は不変（既存の golden・台帳との互換）。同値の検索形とは別ハッシュ
 
 述語（`WherePredicate`）側のタグ: 式左辺の `LIKE`／`ILIKE`（`Prefix { lhs: <裸の列でない式> }`）＝
 タグ 17・`case_insensitive` 1 バイト・`lhs`（式）・長さ前置のパターン（Issue #1782・SQL-54。
@@ -725,6 +729,8 @@ SQL-53 (5)・RECOVER-11 のポインタ。#1752 の申し送り（台帳の事�
 
 ## Issue #1757 追記（UPDATE … FROM／DELETE … USING の台帳 content_hash）
 
+MERGE の `OpTag`（`DataModifyingCte = 29` の続番）の予約と材料は [sql-merge.md](sql-merge.md) の D11（Issue #3350）で決めた。
+
 SQL-53 (5)・RECOVER-10/11 ポインタ。結合形 DML の `USING OPERATION_ID` を台帳へ結線した。
 
 - **タグ**: `OpTag::UpdateFrom = 27`・`DeleteUsing = 28`。述語形（9・10）・`InsertSelect`・`CreateTableAs` と
@@ -753,3 +759,7 @@ SQL-53 (5)・RECOVER-10/11 ポインタ。結合形 DML の `USING OPERATION_ID`
 - `docs/design/delete-predicate-form.md`（Issue #870）
 - `docs/design/sql-multi-row-insert.md`（TASK-190・SQL-16）
 - `docs/design/scalar-secondary-index.md`（Issue #472。ADR 判断記録の書式先例）
+
+## Issue #3357 追記（MERGE）
+
+`OpTag::Merge = 30` を足した（`for_merge`。ポインタ: SQL-79・RECOVER-10/11）。材料は `USING OPERATION_ID`・末尾 `;`・最上位の `RETURNING` を除いたトークン列。`UPDATE ... FROM` は `RETURNING` を材料に含めるが、MERGE は含めない点が異なる。詳細は [sql-merge.md](sql-merge.md) の §13。

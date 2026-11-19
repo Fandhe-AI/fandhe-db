@@ -1,0 +1,49 @@
+d2-corr	base	MERGE INTO t USING (SELECT * FROM s WHERE s.k = t.k) s ON t.k = s.k WHEN MATCHED THEN DELETE	err:42P01	n/a	-	-
+d4-target-cond-refs-t	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED AND t.x > 1 THEN DO NOTHING	err:42P01	n/a	-	-
+d4-target-insert-refs-t	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT (k, x) VALUES (t.k, s.v)	err:42P01	n/a	-	-
+d4-source-cond-refs-s	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED BY SOURCE AND s.v > 1 THEN DELETE	err:42P01	n/a	-	-
+d4-source-set-refs-s	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED BY SOURCE THEN UPDATE SET x = s.v	err:42P01	n/a	-	-
+d4-target-unqualified-t-only	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED AND x > 1 THEN DO NOTHING	err:42703	n/a	-	-
+d4-target-insert-unqualified-t-only	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT (k, x) VALUES (k, x)	err:42703	n/a	-	-
+d4-source-unqualified-s-only	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED BY SOURCE AND v > 1 THEN DELETE	err:42703	n/a	-	-
+d4-source-set-unqualified-s-only	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED BY SOURCE THEN UPDATE SET x = v	err:42703	n/a	-	-
+d4-matched-sees-both	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND t.x < s.v THEN UPDATE SET x = t.x + s.v	merge:2	1:110 2:220 3:30 5:50 NULL:60	-	-
+d5-nothing-then-update	dup	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v < 220 THEN DO NOTHING WHEN MATCHED THEN UPDATE SET x = s.v	merge:1	1:10 2:250 3:30 5:50 NULL:60	-	-
+d5-update-twice	dup	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v	err:21000	n/a	-	MERGE command cannot affect row a second time
+d5-update-delete	dup	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v = 200 THEN UPDATE SET x = s.v WHEN MATCHED THEN DELETE	err:21000	n/a	-	MERGE command cannot affect row a second time
+d5-delete-twice	dup	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE	err:21000	n/a	-	MERGE command cannot affect row a second time
+d5-nothing-only	dup	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DO NOTHING	merge:0	1:10 2:20 3:30 5:50 NULL:60	-	-
+d5-cond-picks-one	dup	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v = 250 THEN UPDATE SET x = s.v	merge:1	1:10 2:250 3:30 5:50 NULL:60	-	-
+d13-select	base	SELECT merge_action() FROM t	err:42601	n/a	-	-
+d13-where	base	SELECT k FROM t WHERE merge_action() = 'x'	err:42601	n/a	-	-
+d13-update-returning	base	UPDATE t SET x = x + 1 WHERE k = 1 RETURNING merge_action()	err:42601	n/a	-	-
+d13-delete-returning	base	DELETE FROM t WHERE k = 1 RETURNING merge_action()	err:42601	n/a	-	-
+d13-insert-returning	base	INSERT INTO t (k, x) VALUES (9, 9) RETURNING merge_action()	err:42601	n/a	-	-
+d13-when-cond	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND merge_action() = 'UPDATE' THEN DELETE	err:42601	n/a	-	-
+d13-set-rhs	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = merge_action()::int	err:42601	n/a	-	-
+d13-on	base	MERGE INTO t USING s ON merge_action() = 'x' WHEN MATCHED THEN DELETE	err:42601	n/a	-	-
+d13-star	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING *	merge:2	3:30 5:50 NULL:60	1,100,1,10;2,200,2,20	k,v,k,x
+d13-t-star	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING t.*	merge:2	3:30 5:50 NULL:60	1,10;2,20	k,x
+d13-s-star	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING s.*	merge:2	3:30 5:50 NULL:60	1,100;2,200	k,v
+d13-star-action	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING *, merge_action() AS act	merge:2	3:30 5:50 NULL:60	1,100,1,10,DELETE;2,200,2,20,DELETE	k,v,k,x,act
+d13-alias	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING merge_action() AS a, t.k AS tk, s.v	merge:2	3:30 5:50 NULL:60	DELETE,1,100;DELETE,2,200	a,tk,v
+d13-by-source-null-s	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED BY SOURCE THEN DELETE RETURNING merge_action(), s.k, s.v, t.k	merge:3	1:10 2:20	DELETE,NULL,NULL,3;DELETE,NULL,NULL,5;DELETE,NULL,NULL,NULL	merge_action,k,v,k
+d13-by-target-null-t	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT (k, x) VALUES (s.k, s.v) RETURNING merge_action(), t.k, t.x, s.k	merge:3	1:10 2:20 3:30 4:400 5:50 6:600 NULL:60 NULL:700	INSERT,4,400,4;INSERT,6,600,6;INSERT,NULL,700,NULL	merge_action,k,x,k
+d13-nothing-no-row	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DO NOTHING RETURNING merge_action()	merge:0	1:10 2:20 3:30 5:50 NULL:60	-	merge_action
+d13-no-clause-hit-zero	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND s.v > 9999 THEN DELETE RETURNING merge_action()	merge:0	1:10 2:20 3:30 5:50 NULL:60	-	merge_action
+syn-no-when	base	MERGE INTO t USING s ON t.k = s.k	err:42601	n/a	-	-
+syn-nothing-insert-default	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT DEFAULT VALUES	merge:3	1:10 2:20 3:30 5:50 NULL:60 NULL:NULL NULL:NULL NULL:NULL	-	-
+syn-insert-in-matched	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN INSERT (k, x) VALUES (1, 1)	err:42601	n/a	-	-
+syn-update-in-not-matched	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN UPDATE SET x = 1	err:42601	n/a	-	-
+syn-delete-in-not-matched	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN DELETE	err:42601	n/a	-	-
+syn-insert-in-by-source	base	MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED BY SOURCE THEN INSERT (k, x) VALUES (1, 1)	err:42601	n/a	-	-
+syn-unknown-target-col	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET nope = 1	err:42703	n/a	-	-
+syn-unknown-source-col	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET x = s.nope	err:42703	n/a	-	-
+syn-unknown-table	base	MERGE INTO nope USING s ON nope.k = s.k WHEN MATCHED THEN DELETE	err:42P01	n/a	-	-
+syn-unknown-using	base	MERGE INTO t USING nope ON t.k = nope.k WHEN MATCHED THEN DELETE	err:42P01	n/a	-	-
+syn-set-qualified-lhs	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET t.x = 1	err:42703	n/a	-	-
+syn-aggregate-in-cond	base	MERGE INTO t USING s ON t.k = s.k WHEN MATCHED AND count(*) > 1 THEN DELETE	err:42803	n/a	-	-
+view-simple-update	base	MERGE INTO tv USING s ON tv.k = s.k WHEN MATCHED THEN UPDATE SET x = s.v	merge:1	1:10 2:200 3:30 5:50 NULL:60	-	-
+view-simple-delete	base	MERGE INTO tv USING s ON tv.k = s.k WHEN MATCHED THEN DELETE	merge:1	1:10 3:30 5:50 NULL:60	-	-
+view-simple-insert	base	MERGE INTO tv USING s ON tv.k = s.k WHEN NOT MATCHED THEN INSERT (k, x) VALUES (s.k, s.v)	merge:4	1:10 1:100 2:20 3:30 4:400 5:50 6:600 NULL:60 NULL:700	-	-
+view-aggregate	base	MERGE INTO av USING s ON av.k = s.k WHEN MATCHED THEN DELETE	err:55000	n/a	-	-

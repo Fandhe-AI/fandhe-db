@@ -560,8 +560,18 @@ fn shapes() -> Vec<Shape> {
             check: Check::StatisticOnly,
         },
         Shape {
+            axis: "set_intersect_all",
+            sql: "SELECT lang FROM documents INTERSECT ALL SELECT lang FROM other_docs",
+            check: Check::StatisticOnly,
+        },
+        Shape {
             axis: "set_except",
             sql: "SELECT lang FROM documents EXCEPT SELECT lang FROM other_docs",
+            check: Check::StatisticOnly,
+        },
+        Shape {
+            axis: "set_except_all",
+            sql: "SELECT lang FROM documents EXCEPT ALL SELECT lang FROM other_docs",
             check: Check::StatisticOnly,
         },
         Shape {
@@ -755,7 +765,9 @@ fn shape_matrix_is_accepted_and_covers_each_axis() {
         "set_union",
         "set_union_all",
         "set_intersect",
+        "set_intersect_all",
         "set_except",
+        "set_except_all",
         "window_row_number",
         "window_count",
         "view",
@@ -1216,10 +1228,10 @@ fn error_responses_are_identical_with_and_without_other_tenant_private_rows() {
         ("SELECT id, title FROM documents WHERE author_id = ANY (SELECT id FROM authors WHERE authors.id = documents.author_id) LIMIT 50", "42601"),
         ("SELECT id, title FROM documents WHERE author_id <> ALL (SELECT id FROM authors WHERE authors.id = documents.author_id) LIMIT 50", "42601"),
         ("SELECT documents.id, (SELECT count(*) FROM authors WHERE authors.id = documents.author_id) FROM documents JOIN langs ON documents.lang = langs.lang LIMIT 5", "42601"),
-        ("SELECT id, (SELECT title || 'x' FROM documents WHERE documents.author_id = authors.id) FROM authors LIMIT 5", "0A000"),
+        ("SELECT id, (SELECT title || 'x' FROM documents WHERE documents.author_id = authors.id) FROM authors LIMIT 5", "42601"), // Issue #3276: 連結は text として束縛できるが、相関サブクエリの式射影は未対応のまま（構文段で 42601）
         ("SELECT id, title FROM documents WHERE EXISTS (SELECT 1 FROM authors WHERE authors.id = nosuch.author_id) LIMIT 5", "42P01"),
         ("SELECT title FROM (SELECT title FROM documents) t WHERE lang IN (SELECT lang FROM langs) LIMIT 5", "42601"),
-        ("SELECT t.title FROM (SELECT title FROM documents) t, LATERAL (SELECT 1) x LIMIT 5", "0A000"),
+        ("SELECT t.title FROM (SELECT title FROM documents) t, LATERAL (SELECT 1) x LIMIT 5", "42601"), // Issue #3321: LATERAL を受理し、FROM なしの本文は非 LATERAL の `(SELECT 1) x` と同じ構文段の拒否
         ("SELECT nosuch FROM (SELECT title FROM documents) t LIMIT 5", "42703"),
         ("SELECT documents.title FROM (SELECT title FROM documents) t LIMIT 5", "42P01"),
     ];

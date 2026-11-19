@@ -615,6 +615,7 @@ fn bind_copy_record(
     operation_id: &Option<OperationId>,
     schema: &TableSchema,
     clock: crate::sql::time_fn::StatementClock,
+    defer_not_null: bool,
 ) -> Result<BoundInsert, SqlSurfaceError> {
     // 疑似列 `id` を持つのは従来方式の表だけ（TABLE-23・Issue #2199）。採番方式の表では行の識別子は
     // 書き込み段が払い出し、`BoundInsert.id` は使われない固定値 0。
@@ -641,6 +642,8 @@ fn bind_copy_record(
 
     let mut bound_values: Vec<Value> = vec![Value::Null; schema.columns.len()];
     let mut provided = vec![false; schema.columns.len()];
+    // `defer_not_null` の区間で `\N` を受けた NOT NULL 列（`VolatileColumn::DeferredNull` として運ぶ）。
+    let mut deferred_null_columns: Vec<usize> = Vec::new();
 
     for (name, field) in columns.iter().zip(fields.iter()) {
         if has_pseudo_id && name == "id" {
@@ -655,6 +658,12 @@ fn bind_copy_record(
             .columns
             .get(col_idx)
             .ok_or_else(|| SqlSurfaceError::undefined_column(name))?;
+        // 多層防御（TABLE-50・Issue #3329）: 列リストの生成列は事前検証が止めるため通常は到達しない。
+        if column.generated.is_some() {
+            return Err(SqlSurfaceError::GeneratedAlways {
+                column: column.name.clone(),
+            });
+        }
         // HALFVEC の COPY は担当 Issue 未定まで未対応（fail-closed。Issue #2014・TABLE-46）。
         // NULL マーカー・空欄でも素通りしないよう、値の有無を見る前に列型で拒否する。
         if matches!(column.ty, ColumnType::HalfVec(_)) {
@@ -681,7 +690,15 @@ fn bind_copy_record(
                 // 列を丸ごと省略した場合〔下の省略列補完ループ〕とは異なる
                 // 経路として区別する）。
                 if !column.nullable {
-                    return Err(SqlSurfaceError::not_null_violation(name.clone()));
+                    // BEFORE ROW INSERT トリガのある表（`defer_not_null`）は、トリガが補えるよう
+                    // 最終 NEW の NOT NULL 検査（`tenant` の書き込み段。`23502`）へ遅らせる。
+                    // 明示 NULL は DEFAULT を適用しないため DEFAULT の有無は問わず遅らせる。
+                    // VECTOR 列は INSERT と同じく遅らせない（Issue #3281）。
+                    if defer_not_null && !matches!(column.ty, ColumnType::Vector(_)) {
+                        deferred_null_columns.push(col_idx);
+                    } else {
+                        return Err(SqlSurfaceError::not_null_violation(name.clone()));
+                    }
                 }
                 Value::Null
             }
@@ -765,13 +782,18 @@ fn bind_copy_record(
         }
     }
 
-    let volatile_default_columns = crate::sql::parser::fill_omitted_columns(
+    let mut volatile_default_columns = crate::sql::parser::fill_omitted_columns(
         &schema.columns,
         &mut bound_values,
         &provided,
         Some(clock),
-        false,
+        defer_not_null,
     )?;
+    volatile_default_columns.extend(
+        deferred_null_columns
+            .into_iter()
+            .map(crate::sql::parser::VolatileColumn::DeferredNull),
+    );
     // `DEFAULT nextval` の列は COPY では採番しない（TABLE-24・Issue #1690。fail-closed）。
     if volatile_default_columns.iter().any(|c| {
         matches!(
@@ -942,7 +964,7 @@ pub enum CopyColumnKind {
 
 /// COPY のレコード単位の束縛状態。`CopyInSession` が所有し、text/csv の分割器が確定した
 /// レコードと binary 形式で wire-server が変換済みのレコードを、同一の経路
-/// （フィールド数照合 → ① → ④ → [`bind_copy_record`] → ②）で取り込む。
+/// （フィールド数照合 → `--max-insert-rows` → ④ → [`bind_copy_record`] → ②）で取り込む。
 #[derive(Debug)]
 struct RecordSink {
     table: String,
@@ -951,6 +973,9 @@ struct RecordSink {
     // `Box`: `TableSchema` へ墓標スロット（TABLE-19・TASK-203・Issue #901）が加わりサイズが増えたため。
     schema: Box<TableSchema>,
     limits: BatchLimits,
+    /// `--max-insert-rows`（`DmlLimits::max_insert_rows_per_statement`）。指定時だけ COPY の行数上限になる
+    /// （INDEX-4 ① は COPY の行数に掛けない。Issue #3309）。未指定なら実効上限は ④ になる。
+    max_rows: Option<std::num::NonZeroUsize>,
     /// `HEADER` 指定（Issue #1764）。`False` 以外のとき最初の 1 レコードをヘッダ行として扱う。
     header: CopyHeader,
     /// 最初のレコード（ヘッダ行）をまだ処理していないか。
@@ -969,11 +994,15 @@ struct RecordSink {
     /// またがり RAII のスレッドローカルスコープが届かないため、`clock` と同じく開始時に値（`Copy`）を
     /// 保持し、各 `feed`／行の取り込みと commit 経路（`CopyInBatch` 経由）で評価する。
     deadline: crate::interrupt::StatementDeadline,
+    /// BEFORE ROW INSERT トリガのある表か（COPY 開始時に確定。Issue #3281）。真なら NOT NULL 検査を
+    /// トリガ適用後の書き込み段（最終 NEW）へ遅らせる。INSERT の省略列の遅延と同じ契約。
+    defer_not_null: bool,
 }
 
 impl RecordSink {
     /// 1 レコード分のフィールドを取り込む。判定順序は ヘッダ処理 → フィールド数照合 →
-    /// ①（行数）→ ④（チャンク数）→ 列型照合・束縛 → ②（行あたりのバイト量）。
+    /// `--max-insert-rows`（指定時のみ）→ ④（チャンク数）→ 列型照合・束縛 → ②（行あたりのバイト量）。
+    /// ①（`max_files_per_batch`）は COPY の行数に掛けない（Issue #3309）。
     fn push_record(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
         // 協調キャンセルポイント（Issue #1953）。時計の読み出しは 1024 行に 1 回に間引く
         // （`bounds` が空の最初の行では必ず評価する）。
@@ -985,7 +1014,7 @@ impl RecordSink {
             self.deadline.check()?;
         }
         // 最初に確定したレコードはヘッダ行。破棄（または照合）するだけで、
-        // 行数①・チャンク数④・束縛の対象に含めない。
+        // 行数・チャンク数④・束縛の対象に含めない。
         if std::mem::take(&mut self.header_pending) {
             return check_header_record(self.header, &self.columns, &fields);
         }
@@ -997,7 +1026,15 @@ impl RecordSink {
             )));
         }
         let next_count = self.bounds.len().saturating_add(1);
-        batch_limits::check_row_count(next_count, &self.limits).map_err(map_batch_err)?;
+        // 運用者が `--max-insert-rows` を明示したときだけ行数の上限にする（束縛より前に件数だけで判定）。
+        // メッセージには件数の上限値だけを入れる（本文・他テナント情報は入れない）。
+        if let Some(max) = self.max_rows {
+            if next_count > max.get() {
+                return Err(SqlSurfaceError::payload_too_large(format!(
+                    "COPY exceeds the allowed row count ({max})"
+                )));
+            }
+        }
         batch_limits::validate_chunk_total(next_count, &self.limits).map_err(map_batch_err)?;
         let bound = bind_copy_record(
             &self.table,
@@ -1006,6 +1043,7 @@ impl RecordSink {
             &self.operation_id,
             &self.schema,
             self.clock,
+            self.defer_not_null,
         )?;
         let row_bytes = bound_insert_byte_len(&bound)?;
         batch_limits::check_row_body_len(self.bounds.len(), row_bytes, &self.limits)
@@ -1040,6 +1078,7 @@ impl CopyInSession {
     fn validate_columns_against_schema(
         columns: &[String],
         schema: &TableSchema,
+        defer_not_null: bool,
     ) -> Result<(), SqlSurfaceError> {
         // 従来方式の表は疑似列 `id` が必須（採番方式の表は `id` を要求しない。Issue #2199。移行済み表は
         // 省略でき、書き込み段が所有 SEQUENCE から採番する。Issue #1700）。
@@ -1053,16 +1092,31 @@ impl CopyInSession {
             if schema.has_pseudo_id() && name == "id" {
                 continue;
             }
-            if !schema.columns.iter().any(|c| &c.name == name) {
+            let Some(column) = schema.columns.iter().find(|c| &c.name == name) else {
                 return Err(SqlSurfaceError::undefined_column(name));
+            };
+            // 生成列（TABLE-50・Issue #3329）は値を書けない。CopyInResponse の前に `428C9` で拒否する
+            // （IDENTITY ALWAYS 列は COPY が値を書ける既存契約のため、生成列だけを見る）。
+            if column.generated.is_some() {
+                return Err(SqlSurfaceError::GeneratedAlways {
+                    column: column.name.clone(),
+                });
             }
         }
         for column in &schema.columns {
+            // 生成列の NOT NULL は書き込み段が計算後に検査する（列リストの被覆は要求しない）。
+            if column.generated.is_some() {
+                continue;
+            }
             // `DEFAULT`（TABLE-16・TASK-204、Issue #904）を持つ列は列リストに
             // 無くても [`bind_copy_record`]（`fill_omitted_columns` 経由）が
             // 補うため、事前検証の対象から外す。
+            // BEFORE ROW INSERT トリガのある表（`defer_not_null`）は、トリガが補えるよう被覆検査を
+            // 書き込み段の最終 NEW 検査へ遅らせる（VECTOR 列は INSERT と同じく遅らせない。Issue #3281）。
+            let deferrable = defer_not_null && !matches!(column.ty, ColumnType::Vector(_));
             if !column.nullable
                 && column.default_expr.is_none()
+                && !deferrable
                 && !columns.iter().any(|c| c == &column.name)
             {
                 // `bind_copy_record`（`fill_omitted_columns` 経由）・INSERT・行内
@@ -1073,6 +1127,37 @@ impl CopyInSession {
             }
         }
         Ok(())
+    }
+
+    /// 列リスト省略の `COPY <t> FROM STDIN` の全列補完（Issue #3252・WIRE-17・WIRE-22・SQL-34）。
+    /// 並びは COPY TO のテーブル形（`SELECT *`）から生成列を除いたもの（疑似列 `id` が先頭、続けて宣言順）で、
+    /// 生成列を持たない表では出力をそのまま取り込める（Issue #3329）。列を持たない表と、疑似列 `id` と実カラム `id` が衝突する表は、
+    /// 解釈が曖昧になるため 0A000 で拒否する（fail-closed）。`new` からのみ呼ばれる。
+    fn expand_all_columns(schema: &TableSchema) -> Result<Vec<String>, SqlSurfaceError> {
+        // 生成列（TABLE-50・Issue #3329）は列リスト省略の取り込み対象から除く（値は書き込み段が計算する）。
+        // 生成列を持つ表では COPY TO（`SELECT *` と同じ並び）の出力と列数が揃わず、そのまま流すと
+        // 列数の不一致で拒否される（fail-closed。PG17 との突き合わせは #3332）。
+        let columns: Vec<String> = crate::catalog::lookup_star_columns_of(schema)
+            .into_iter()
+            .filter(|name| {
+                !schema
+                    .columns
+                    .iter()
+                    .any(|c| &c.name == name && c.generated.is_some())
+            })
+            .collect();
+        if columns.is_empty() {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY without a column list requires at least one column",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if !columns.iter().all(|c| seen.insert(c.as_str())) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "COPY without a column list is ambiguous for this table",
+            ));
+        }
+        Ok(columns)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1086,6 +1171,8 @@ impl CopyInSession {
         limits: BatchLimits,
         clock: crate::sql::time_fn::StatementClock,
         time_zone: crate::datetime::SessionTimeZone,
+        defer_not_null: bool,
+        max_rows: Option<std::num::NonZeroUsize>,
     ) -> Result<Self, SqlSurfaceError> {
         // csv で QUOTE／ESCAPE が改行系だとレコード終端と曖昧になるため、未対応として
         // CopyInResponse 前に拒否する（PostgreSQL は検査しないが拒否側に倒す既知の相違）。
@@ -1098,7 +1185,14 @@ impl CopyInSession {
                 "COPY quote or escape cannot be newline or carriage return",
             ));
         }
-        Self::validate_columns_against_schema(&columns, &schema)?;
+        // 列リスト省略（Issue #3252）は束縛段で全列へ補う。事前検証・HEADER 照合・binary の列数は
+        // すべて補完後の列を見る。
+        let columns = if columns.is_empty() {
+            Self::expand_all_columns(&schema)?
+        } else {
+            columns
+        };
+        Self::validate_columns_against_schema(&columns, &schema, defer_not_null)?;
         Ok(Self {
             splitter: Box::new(RecordSplitter::with_options(format, &options)),
             sink: Box::new(RecordSink {
@@ -1107,6 +1201,7 @@ impl CopyInSession {
                 operation_id,
                 schema: Box::new(schema),
                 limits,
+                max_rows,
                 header: options.header(),
                 header_pending: options.header() != CopyHeader::False,
                 bounds: Vec::new(),
@@ -1115,6 +1210,7 @@ impl CopyInSession {
                 time_zone: Box::new(time_zone),
                 // `begin_copy*` が呼ぶ区間のスレッドの期限（無効なら無効のまま）。
                 deadline: crate::interrupt::current_deadline(),
+                defer_not_null,
             }),
             format,
             running_bytes: 0,
@@ -1123,6 +1219,17 @@ impl CopyInSession {
             row_security: crate::sql::policy_applicability::current_row_security(),
             privilege_recheck: None,
         })
+    }
+
+    /// 1 回の COPY が受理できる行数の実効上限（`--max-insert-rows` と ④ の小さい方。1 以上）。
+    /// `dump_restore` が COPY を分割する幅に使う（INDEX-4 ① は掛からない。Issue #3309）。
+    #[must_use]
+    pub fn max_rows_per_batch(&self) -> usize {
+        let chunks = self.sink.limits.max_batch_chunks;
+        self.sink
+            .max_rows
+            .map_or(chunks, |m| chunks.min(m.get()))
+            .max(1)
     }
 
     /// commit 時の権限再判定値を持たせる（`begin_copy_validated` の `FROM` 腕が呼ぶ。Issue #1969）。
@@ -1209,7 +1316,7 @@ impl CopyInSession {
     /// 1 個の CopyData メッセージ本文を取り込む（text/csv 形式）。判定順序:
     /// 1. ③（生 CopyData バイト量の累計）を `pending` へ追加する前に判定
     ///    （`54000`。超過時点で拒否し、それ以降のバイトは一切保持しない）。
-    /// 2. 完了したレコードごとに、①（行数）→④（生成チャンク数。1 行=1
+    /// 2. 完了したレコードごとに、`--max-insert-rows`（指定時のみ）→④（生成チャンク数。1 行=1
     ///    チャンクと読み替える。既存の単文 INSERT 経路と同じ読み替え規則）→
     ///    フィールド分割・エスケープ解決・列型照合（`22000`）→②（当該行の
     ///    デコード後バイト量）の順に判定する。
@@ -1223,7 +1330,7 @@ impl CopyInSession {
     }
 
     /// binary 形式で型変換済みの 1 レコード分のフィールド（正規テキスト。`None` = NULL）を取り込む。
-    /// text/csv の [`Self::feed`] と同じ束縛経路（①→④→束縛→②）を共有する（第 2 の書き込み経路を
+    /// text/csv の [`Self::feed`] と同じ束縛経路（`--max-insert-rows`→④→束縛→②）を共有する（第 2 の書き込み経路を
     /// 作らない。WIRE-23・Issue #1769）。呼び出しは `wire-server::copy::run_copy_from` から。
     pub fn feed_fields(&mut self, fields: Vec<Option<String>>) -> Result<(), SqlSurfaceError> {
         self.sink.deadline.check()?;
@@ -1261,6 +1368,7 @@ impl CopyInSession {
             bounds: sink.bounds,
             schema: *sink.schema,
             evaluated_at: sink.clock_used.then_some(sink.clock.txn_start_micros),
+            clock: sink.clock,
             temp,
             row_security,
             privilege_recheck,
@@ -1279,6 +1387,9 @@ pub struct CopyInBatch {
     pub(crate) schema: TableSchema,
     /// 時刻 DEFAULT を評価した場合の台帳 v3 評価時刻（トランザクション開始時刻。Issue #2188）。
     pub(crate) evaluated_at: Option<i64>,
+    /// COPY 開始時に確定した文・トランザクション時刻（明示 Tx ではトランザクション開始時刻。
+    /// SQL-37・Issue #3281）。トリガ発火時に全発火で共有させるため commit 経路へ引き継ぐ。
+    pub(crate) clock: crate::sql::time_fn::StatementClock,
     /// 一時表向けのバッチなら対象ストアと準備時の一時カタログ世代（`CopyInSession::with_temp`）。
     pub(crate) temp: Option<crate::sql::temp_rows::TempCopyTarget>,
     /// COPY 開始時のセッションの `row_security`（[`CopyInSession`] から引き継ぐ。RLS-13・Issue #2278）。
@@ -1575,8 +1686,8 @@ mod tests {
         let schema = text_schema();
         let columns = vec!["id".to_string(), "body".to_string()];
         let fields = vec![Some("1".to_string()), None];
-        let err =
-            bind_copy_record("t", &columns, &fields, &None, &schema, test_clock()).unwrap_err();
+        let err = bind_copy_record("t", &columns, &fields, &None, &schema, test_clock(), false)
+            .unwrap_err();
         // TABLE-16・TASK-204、Issue #904: NOT NULL 違反は `23502`
         // （`NotNullViolation`）へ写像する（旧 `22000` から契約変更）。
         assert_eq!(err.wire_code(), "23502");
@@ -1587,7 +1698,8 @@ mod tests {
         let schema = text_schema();
         let columns = vec!["id".to_string(), "body".to_string(), "note".to_string()];
         let fields = vec![Some("1".to_string()), Some("hello".to_string()), None];
-        let bound = bind_copy_record("t", &columns, &fields, &None, &schema, test_clock()).unwrap();
+        let bound =
+            bind_copy_record("t", &columns, &fields, &None, &schema, test_clock(), false).unwrap();
         assert_eq!(bound.id, 1);
         assert_eq!(
             bound.values,
@@ -1600,8 +1712,8 @@ mod tests {
         let schema = text_schema();
         let columns = vec!["body".to_string()];
         let fields = vec![Some("hello".to_string())];
-        let err =
-            bind_copy_record("t", &columns, &fields, &None, &schema, test_clock()).unwrap_err();
+        let err = bind_copy_record("t", &columns, &fields, &None, &schema, test_clock(), false)
+            .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
     // ---- Issue #1764: WITH オプションの適用 ----

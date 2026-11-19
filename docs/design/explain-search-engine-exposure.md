@@ -402,9 +402,10 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
   （結合 → WHERE 残余 → 集計／並べ替え → OFFSET／LIMIT）の逆。`join` は left-deep で、段 k の子は
   [段 k-1 の `join`（k = 0 なら relation 1 の `scan`）, relation k+2 の `scan`] の順。
 - **語彙（閉じている・安定契約）**:
-  - `join`: `join_method: hash|nested_loop|cross`（実行器と同じ判定 `StepPlan::method` を共有）、
+  - `join`: `join_method: hash|nested_loop|cross|lateral`（実行器と同じ判定 `StepPlan::method` を共有）、
     `join_type: inner|left|right|full`（外部結合の簡約後の実効値）、`join_keys: <n>`、
-    `join_filter: present|none`（ON 残余の有無）。
+    `join_filter: present|none`（ON 残余の有無）。`join_method: lateral` の段（外側参照のある LATERAL。Issue #3324）だけに
+    `reevaluation: per_outer_row`（外側行ごとの右側の再評価。値・行数は出さない）を足す。
   - `scan`: `relation: <n>`（FROM での 1 始まりの序数）に続けて、単一表の広域取得と同一の
     `scalar_plan:`／`access_path:`（PK 点検索 → GIN → 全走査。`scan_explain_lines` を共有）。
   - `filter`: `residual_predicates: <n>`。`aggregate`: `group_keys`・`aggregates`・`having: present|none`。
@@ -429,9 +430,13 @@ JOIN を含む `SELECT` の `EXPLAIN` を受理する（従来は単一表の文
 - **段の重ね方（外側から。該当しない段は出さない）**: 全体 `limit`（`LIMIT`／`OFFSET` があるときだけ）→
   `set_operation`（入れ子は演算子の優先順位と括弧どおり。子は左、右の順）→ 葉。葉は、通常の枝が `scan`、
   括弧付きの枝が `limit` → `sort` → `scan`、集計の枝が `limit` → `sort` → `aggregate` → `scan`。
-- **語彙（JOIN と同じ閉じた集合・安定契約）**: `set_operation` の属性は `set_operator: union|union_all|intersect|except`。
+- **語彙（JOIN と同じ閉じた集合・安定契約）**: `set_operation` の属性は `set_operator: union|union_all|intersect|intersect_all|except|except_all`。
   `scan` は `relation: <n>`（葉の左からの 1 始まりの序数）に続けて `scalar_plan:`／`access_path:`
   （`scan_explain_lines` を共有。枝ごとに PK 点検索 → GIN → 全走査）。ほかは JOIN の段と同じ意味。
+- **式射影の枝・定数枝（Issue #3271）**: 式射影の枝は通常の `scan`（射影の中身は単一表の `EXPLAIN` と同じく
+  描画しない）。`FROM` なしの定数枝は葉 `result`（`source: constant`。`cte_explain` と共通で、リテラル値・式・
+  表名は出さない）。`relation:` の序数は位置ベースで、定数枝も葉の位置を 1 つ消費する（`result` 葉自体は
+  `relation:` を持たない）。全枝が定数の木は構文段が `0A000`。
 - **集計の枝の走査分類**: 実行器は可視ビットマップのキャッシュ・arena・スカラー索引を渡さない（常に全走査）ため、
   `plain_scan`／`full_scan` に固定する。実行器の隣（`set_op::aggregate_branch_explain_lines`）に置き、
   実行器へキャッシュや索引を配線するときは一緒に変える（矛盾した出力を出さない）。
@@ -553,7 +558,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   トランザクションでも実行できる。未知の列・型不一致・不存在表は実行と同じ `wire_code`。
 - **権限**: 実行した場合と同じ DELETE／UPDATE 権限を write gate で要求する（`42501`。SQL-40）。
 - **対象外（`42601`、一時表は `0A000`）**: 採番でない表の単一行形（物理キー直接指定の語彙が未定義）、
-  `UPDATE ... FROM`／`DELETE ... USING`、自動更新可能なビュー、WHERE の部分クエリ、一時表、セッション無しの入口。
+  自動更新可能なビュー、WHERE の部分クエリ、一時表、セッション無しの入口。
   `$n` 付きの拡張クエリの EXPLAIN は既存の EXPLAIN の規則どおり。
 
 ## #2059 追記: `EXPLAIN (FORMAT JSON)`（SQL-76 (1)(6) ポインタ）
@@ -660,7 +665,7 @@ INSERT は #2051 が担当する。`EXPLAIN ... PARTITIONED` は従来の出力�
   （`RETURNING` の RLS 適用後の可視行。無ければ 0）。変更行数（`rows_affected`）は出さない（PostgreSQL の ModifyTable 段と
   同じ。件数の出し方を `RETURNING` に一本化し、SQL-76 (3) の境界を保つ）。`RETURNING` の行そのものは返さない。
 - **fail-closed**: 実行時のエラーは通常の DML と同じ `wire_code` で返し、計画は返さない。分割実行（`PARTITIONED`）は
-  非原子・autocommit 専用のため `0A000`。一時表・単一行の id 形・ビュー・`UPDATE ... FROM`／`DELETE ... USING`・WHERE の
+  非原子・autocommit 専用のため `0A000`。一時表・単一行の id 形・ビュー・WHERE の
   部分クエリは静的な `EXPLAIN` と同じ拒否のまま。`$n` 付きは Parse で `42601`、セッション無しの入口は `42601`。
 - **対象外**: 子の段（`scan`／`result`）の実測（#2053）、HNSW の可視化（#2056）、`FORMAT JSON`（#2059）、`VERBOSE`（#2060）。
 
@@ -752,3 +757,13 @@ EXPLAIN ANALYZE（親 #2052）の「計測の土台」を実行器へ入れた�
 - **JSON**: `"rerank"` という 1 属性になる。値に `": "` を含めない。
 - `USING PLAN` の EXPLAIN は対象外（`LIMIT + OFFSET` が届かない。rerank-wiring-policy.md 第 10 節）。
 - 融合方式は `hybrid_rrf:`（#3051）で表すため、融合の行は追加していない。
+
+## 追記（Issue #3293）
+
+`EXPLAIN [ANALYZE] UPDATE ... FROM`／`DELETE ... USING` を受理した。静的な `EXPLAIN` は結合計画の木（`join` と 2 つの `scan`）を返し、行数・見積もりは出さない（JOIN の `EXPLAIN` と同じ SQL-75 (5) の契約）。`ANALYZE` は DML ANALYZE（#2055）と同じ契約。詳細は [update-from-delete-using.md](update-from-delete-using.md) の「EXPLAIN（Issue #3293）」節。
+
+## Issue #3324 追記: LATERAL 派生表の EXPLAIN（SQL-62 (7)・SQL-75 のポインタ）
+
+- 受理: INNER／CROSS／コンマ／LEFT の LATERAL（相関あり・なし）。`ANALYZE`・`VERBOSE`・`COSTS OFF`・`FORMAT JSON`（`FORMAT JSON` と `ANALYZE`／`VERBOSE` の併用は従来どおり `0A000`）も非 LATERAL の派生表 JOIN と同じ範囲で受理する。非 EXPLAIN と同じ検証本体を通す（第 2 の実装を持たない）
+- 語彙: 外側参照のある段だけ `join_method: lateral` に `reevaluation: per_outer_row` を足す。外側参照の無い LATERAL は通常の派生表の段（`cross` 等）で、この行は出ない。LATERAL の側の `cte` 節の下に基底の `cte_source: with` が 1 段入る（基底 slot の内部名。値は出ない）。表名・別名・列名・予約内部名・行数・LIMIT 値は出さず、全テナントで同一（`sql62_lateral_explain.rs`・`rls10_lateral_paths.rs`）
+- 未知の列は EXPLAIN でも束縛段で実行と同じ `42703`。`EXPLAIN` と `$n` の併用は従来どおり `42601`

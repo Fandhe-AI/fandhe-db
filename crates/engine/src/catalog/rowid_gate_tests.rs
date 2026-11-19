@@ -253,10 +253,12 @@ fn table23_allocator_state_survives_reopen() {
     assert_eq!(r.start().raw_for_state(), 4);
 }
 
-/// `v15` 以外で `rowmode:` を持てる版は無い。後続の版が `rowmode:` を持つ場合は
-/// `require_legacy_row_identity_read` の判定（先頭行の一致）も更新が要る。
+/// `rowmode:` を持てる版は v15 と v16（生成列を持つ表。TABLE-50・Issue #3327）だけで、どちらも
+/// `require_legacy_row_identity_read` の判定（先頭行の一致）に掛かる。後続の版が `rowmode:` を持つ場合は
+/// 判定の更新が要る（漏れると採番方式の表を行 API・走査へ通す fail-open になる）。v16 の読み取りゲートの
+/// 検査は `generated_column_catalog_tests` が担う。
 #[test]
-fn table23_only_v15_carries_rowmode_and_is_caught_by_read_gate() {
+fn table23_only_v15_and_v16_carry_rowmode_and_are_caught_by_read_gate() {
     let schema = TableSchema::new(
         "docs",
         vec![ColumnDef::new("kind", ColumnType::Text, false)],
@@ -264,15 +266,28 @@ fn table23_only_v15_carries_rowmode_and_is_caught_by_read_gate() {
     .with_row_identity(RowIdentity::Allocated);
     let bytes = crate::catalog::encode_schema(&schema).expect("encode");
     assert!(bytes.starts_with(b"v15\n"));
+    let mut generated = ColumnDef::new("g", ColumnType::Integer, true);
+    generated.generated = Some(crate::catalog::GeneratedColumnDef {
+        expression: "1 + 1".to_string(),
+        referenced_columns: Vec::new(),
+    });
+    let schema = TableSchema::new(
+        "docs",
+        vec![ColumnDef::new("kind", ColumnType::Text, false), generated],
+    )
+    .with_row_identity(RowIdentity::Allocated);
+    let bytes = crate::catalog::encode_schema(&schema).expect("encode");
+    assert!(bytes.starts_with(b"v16\n"));
 }
 
 /// 採番方式の親を `id` で参照する FK は、DDL 段で `0A000` の固定文言により拒否される
 /// （`id` の値から親行を引く解決が従来方式の表でしか成立しないため。親が宣言した `id` 列を持つ場合も、
 /// 永続化する参照先列名が物理キーの `id` 参照と区別できないため未対応。Issue #2194・#2199・TABLE-23）。
-/// 主キーを持たない採番方式の親への列省略 FK は PG と同じ `42830`（`InvalidForeignKey`）。
-/// 列参照 FK（`id` 以外の主キー・UNIQUE を参照）は本ゲートの対象外で、このテストでは扱わない。
+/// 採番方式の親への FK の DDL 束縛（TABLE-17・TABLE-23、Issue #3178）。主キーを持たない親への列省略
+/// FK は PG と同じ `42830`。宣言した `id` 列（主キー）を持つ親への `id` 参照は普通の列参照として
+/// 受理され、永続化した参照先列名 `["id"]` は再オープン後も読める。子の存在検査は列参照経路で行う（Issue #3179）。
 #[test]
-fn table23_id_reference_foreign_key_to_allocated_parent_is_rejected() {
+fn table23_id_reference_foreign_key_to_allocated_parent_is_accepted() {
     use crate::catalog::{CatalogError, ForeignKeyDef, ReferentialAction};
     let (storage, _guard) = allocated_table("table23-fk-id-ref-allocated");
     let child = |parent_columns: Vec<String>| {
@@ -294,28 +309,94 @@ fn table23_id_reference_foreign_key_to_allocated_parent_is_rejected() {
         .expect_err("omitted columns need a primary key on the allocated parent");
     assert!(matches!(err, CatalogError::InvalidForeignKey(_)), "{err:?}");
     assert_redacted(&err.to_string());
-    // 宣言した `id` 列（主キー）を持つ採番方式の親への `id` 参照は未対応の固定文言。
+    // 宣言した `id` 列（主キー）を持つ採番方式の親への `id` 参照は受理される。
     let path = crate::test_util::temp_db::unique_db_path("table23-fk-id-column-allocated");
     let _guard2 = crate::test_util::temp_db::CleanupGuard(path.clone());
     let storage2 = Storage::open(&path).expect("open");
+    let parent = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("id", ColumnType::BigInt, false),
+            ColumnDef::new("kind", ColumnType::Text, false),
+        ],
+    )
+    .with_primary_key(vec!["id".to_string()])
+    .with_row_identity(RowIdentity::Allocated);
     storage2
-        .create_table(
-            &TableSchema::new(
-                "docs",
-                vec![
-                    ColumnDef::new("id", ColumnType::BigInt, false),
-                    ColumnDef::new("kind", ColumnType::Text, false),
-                ],
-            )
+        .create_table(&parent)
+        .expect("create allocated parent with a declared id column");
+    storage2
+        .create_table(&child(vec!["id".to_string()]))
+        .expect("explicit id reference to an allocated parent is bound as a column reference");
+    // 列省略は主キー `["id"]` へ解決する。
+    let mut omitted = child(Vec::new());
+    omitted.name = "kids2".to_string();
+    storage2
+        .create_table(&omitted)
+        .expect("omitted columns resolve to the declared id primary key");
+    drop(storage2);
+    // 再オープン後も（decode の再検証を通って）読める。
+    let reopened = Storage::open(&path).expect("reopen");
+    for name in ["kids", "kids2"] {
+        let schema = reopened.get_table_schema(name).expect("schema");
+        let fk = &schema.foreign_keys()[0];
+        assert_eq!(fk.parent_columns(), ["id".to_string()]);
+        // 採番方式の親では疑似列参照ではない（従来方式の親なら真）。
+        let parent = reopened.get_table_schema("docs").expect("parent");
+        assert!(fk.references_parent_id());
+        assert!(!fk.references_parent_pseudo_id(&parent));
+    }
+}
+
+/// 採番方式の親の `id` が主キーでも UNIQUE でもない・型が合わない・整数でないときは `42830`。
+#[test]
+fn table23_id_reference_to_allocated_parent_still_validates_the_column() {
+    use crate::catalog::{CatalogError, ForeignKeyDef, ReferentialAction};
+    let child = |ty: ColumnType| {
+        TableSchema::new("kids", vec![ColumnDef::new("pid", ty, true)]).with_foreign_keys(vec![
+            ForeignKeyDef::new(
+                vec!["pid".to_string()],
+                "docs".to_string(),
+                vec!["id".to_string()],
+                ReferentialAction::NoAction,
+                ReferentialAction::NoAction,
+            ),
+        ])
+    };
+    let invalid = |parent: TableSchema, ty: ColumnType| {
+        let path = crate::test_util::temp_db::unique_db_path("table23-fk-id-ref-invalid");
+        let _g = crate::test_util::temp_db::CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open");
+        storage.create_table(&parent).expect("parent");
+        let err = storage
+            .create_table(&child(ty))
+            .expect_err("invalid id reference");
+        assert!(matches!(err, CatalogError::InvalidForeignKey(_)), "{err:?}");
+        assert_redacted(&err.to_string());
+    };
+    // `id` が主キーでも UNIQUE でもない。
+    invalid(
+        TableSchema::new("docs", vec![ColumnDef::new("id", ColumnType::BigInt, true)])
+            .with_row_identity(RowIdentity::Allocated),
+        ColumnType::BigInt,
+    );
+    // 型不一致（親 BIGINT・子 TEXT）。
+    invalid(
+        TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("id", ColumnType::BigInt, false)],
+        )
+        .with_primary_key(vec!["id".to_string()])
+        .with_row_identity(RowIdentity::Allocated),
+        ColumnType::Text,
+    );
+    // 親が整数でない `id`（TEXT 主キー）を宣言している。
+    invalid(
+        TableSchema::new("docs", vec![ColumnDef::new("id", ColumnType::Text, false)])
             .with_primary_key(vec!["id".to_string()])
             .with_row_identity(RowIdentity::Allocated),
-        )
-        .expect("create allocated parent with a declared id column");
-    let err = storage2
-        .create_table(&child(vec!["id".to_string()]))
-        .expect_err("id reference to an allocated parent must be rejected");
-    assert!(is_row_identity_unsupported(&err), "{err:?}");
-    assert_redacted(&err.to_string());
+        ColumnType::Text,
+    );
 }
 
 /// 採番方式かつベクトル列を持つ表（検索入口のゲート確認用）。

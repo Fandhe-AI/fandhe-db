@@ -407,6 +407,49 @@ fn join_cursor_is_checked_on_every_relation_at_declare() {
     }
 }
 
+/// Issue #3176: 内側が集合演算・CTE 入力の JOIN の DECLARE も、全枝・CTE 本文の基底表・JOIN の
+/// 相手表の SELECT 権限を DECLARE の時点で検査する（1 つでも欠ければ `42501`。FETCH では再検査しない）。
+#[test]
+fn set_operation_and_cte_join_cursor_is_checked_on_every_relation_at_declare() {
+    let f = fx("selpriv-cursor-setop-cte");
+    let mut s = bound(f.alice, A, false);
+    for decl in [
+        "DECLARE c CURSOR FOR SELECT id FROM ca UNION ALL SELECT id FROM cb",
+        "DECLARE c CURSOR FOR SELECT id FROM ca INTERSECT SELECT id FROM cb",
+        "DECLARE c CURSOR FOR WITH w AS (SELECT id FROM ca LIMIT 5) SELECT w.id FROM w JOIN cb ON w.id = cb.id LIMIT 5",
+        "DECLARE c CURSOR FOR WITH w AS (SELECT id FROM cb LIMIT 5) SELECT w.id FROM w JOIN ca ON w.id = ca.id LIMIT 5",
+    ] {
+        f.admin_run("GRANT SELECT ON ca TO alice");
+        let mut txn = f.core.new_session_transaction();
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        let r = f.core.execute_sql_in_txn(&ctx(A), &mut s, &mut txn, decl);
+        assert_eq!(code(r), "42501", "{decl}");
+        assert_eq!(txn.status(), TransactionStatus::Failed);
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+
+        f.admin_run("GRANT SELECT ON cb TO alice");
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "BEGIN")
+            .expect("begin");
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, decl)
+            .expect("declare with every relation granted");
+        f.admin_run("REVOKE SELECT ON ca FROM alice");
+        f.admin_run("REVOKE SELECT ON cb FROM alice");
+        let r = f
+            .core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "FETCH 1 FROM c");
+        assert_eq!(code(r), "ok", "{decl}");
+        f.core
+            .execute_sql_in_txn(&ctx(A), &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+}
+
 #[test]
 fn extended_query_is_checked_at_parse_bind_and_describe() {
     let f = fx("selpriv-extended");

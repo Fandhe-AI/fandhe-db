@@ -28,7 +28,8 @@ use crate::sql::array_expr::{
     unsupported, ItemClass,
 };
 use crate::sql::cast::{
-    bind_cast, bind_operand, cast_bound, charge_node, source_cast_kind, CastType, SourceKind,
+    bind_cast, bind_operand, cast_bound, charge_node, source_cast_kind, CastKind, CastType,
+    SourceKind,
 };
 use crate::sql::cast_value::values_to_array;
 use crate::sql::udf_call::{
@@ -156,6 +157,10 @@ fn bind_array_arg<'e>(
         SourceKind::Array(None) => Err(unsupported(
             "an array function on an array of this element type is not supported",
         )),
+        // `BIT(n)[]` の配列関数は未対応（Issue #3235）。配列でない引数の `42883` と区別して `0A000`。
+        SourceKind::Bit if ty == ExprType::Array => Err(unsupported(
+            "an array function on an array of this element type is not supported",
+        )),
         _ => Err(no_such_function(name)),
     }
 }
@@ -182,6 +187,13 @@ fn resolve_target(
         .collect();
     if kinds.is_empty() {
         return Err(polymorphic_unresolved());
+    }
+    // `CHAR(n)[]` 列の要素だけを扱う配列関数（`array_append(c, 'x')` 等）は、結果を `text[]` として
+    // 評価する（Issue #3231。要素は末尾空白を除いた TEXT になり、`CHAR(n)[]` 列へ代入するとき
+    // 列の格納形へ空白詰めされる）。`ARRAY[...]` 構築子の `bpchar` のみの要素は従来どおり
+    // `common_element_type` が `0A000` にする。
+    if kinds.iter().all(|k| *k == CastKind::Bpchar) {
+        return Ok((CastType::Text, ArrayElemType::Text));
     }
     let target = common_element_type(&kinds).map_err(|e| match e {
         SqlSurfaceError::DatatypeMismatch { .. } => no_such_function(name),

@@ -4,6 +4,8 @@
 //! の構造検証済みの形（[`ValidatedViewInsert`]）を、基表への [`ValidatedInsert`] へ名前の写像だけで
 //! 書き換える。SQL 文字列は組み立てず、書き換え後の束縛・実行・制約・RLS・台帳は既存の基表 INSERT
 //! 経路（`core.rs` の `execute_insert_form` 等）にそのまま乗る（第 2 の書き込み経路を作らない）。
+//! INSTEAD OF トリガ（TABLE-45・Issue #3193）を持つビューへの書き込みは本モジュールを通らずトリガへ振り分けられる
+//! （`core::view_instead_of`。自動更新可能でもトリガを優先する）。トリガの無いビューの挙動は変えない。
 //! 呼び出し元は `core.rs`: Parse 時は [`check_view_insert`]（判定だけ）、Execute／Describe 時は
 //! [`rewrite_view_insert`]（現在のカタログで書き換え）を呼ぶ。Parse 時の写像は持ち越さない。
 //!
@@ -22,13 +24,27 @@
 //! セッションの `PolicyContext` が決め、ビュー作成者の可視性は引き継がれない。
 
 use super::allowlist::{
-    ConflictTargetSpec, OnConflictAction, OnConflictClause, Projection, SqlSurfaceError,
-    TableLookup, UpsertAddOperand, UpsertValue, ValidatedInsert, ValidatedViewInsert, ViewWriteOp,
-    WherePredicate,
+    ConflictTargetSpec, OnConflictAction, OnConflictClause, Projection, SelectItem,
+    SqlSurfaceError, TableLookup, UpsertAddOperand, UpsertValue, ValidatedInsert,
+    ValidatedViewInsert, ViewWriteOp, WherePredicate,
 };
 use super::exec::ColumnMeta;
+use super::udf_call::Expr;
 use super::view::{resolve_from, Resolved};
 use super::view_updatable::{view_updatability, ViewUpdatability};
+
+/// 別名で疑似列 `id` へ写る公開名への書き込みの拒否文言（自動書き換え固有。INSTEAD OF トリガ経路では
+/// 公開名は `NEW`／`OLD` の独立した列なので不要）。
+const ID_ALIAS_WRITE_UNSUPPORTED: &str =
+    "writing to a view column aliased to the row id is not supported";
+
+/// `e` が [`ID_ALIAS_WRITE_UNSUPPORTED`] か。構文解析段は、この拒否を実行段（トリガ有無の確定後）へ回す
+/// （トリガが無ければ実行段の書き換えが同じ拒否を返す）。
+pub(crate) fn is_id_alias_rejection(e: &SqlSurfaceError) -> bool {
+    matches!(e, SqlSurfaceError::FeatureNotSupported { detail }
+        if detail == ID_ALIAS_WRITE_UNSUPPORTED
+            || detail == crate::sql::view_dml::ID_USER_COLUMN_WHERE_UNSUPPORTED)
+}
 
 /// 書き換え結果。
 #[derive(Debug)]
@@ -250,9 +266,15 @@ pub(crate) fn rewrite_returning(
 ) -> Result<(Option<Projection>, Option<Vec<String>>), SqlSurfaceError> {
     match returning {
         None => Ok((None, None)),
-        Some(Projection::Items(_)) => Err(SqlSurfaceError::unsupported(
-            "RETURNING does not support function-call items",
-        )),
+        // 別名付き列参照・式（Issue #3248・#3249・#3251）。基表 DML と同じ束縛段へ渡すため、
+        // 公開名での検査を先に行ってから物理名へ写し、出力名は別名で運ぶ（`public_names` は `None`）。
+        Some(Projection::Items(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(rewrite_returning_item(mapper, item)?);
+            }
+            Ok((Some(Projection::Items(out)), None))
+        }
         Some(Projection::All) => match mapper.columns {
             None => Ok((Some(Projection::All), None)),
             Some(public) => {
@@ -272,6 +294,62 @@ pub(crate) fn rewrite_returning(
                 .map(|c| mapper.physical(c))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((Some(Projection::Columns(physical)), Some(cols.clone())))
+        }
+    }
+}
+
+/// `RETURNING` の式項目 1 件を物理名へ写す（[`rewrite_returning`] の `Items` 腕）。
+/// 公開列の範囲検査（非公開列は `42703`。filter oracle を避けるため写像より前）→ 既定出力名の確定
+/// （書き換え前の式から）→ 物理名への写像（疑似列 `id` へ別名で写る公開名は `0A000`）の順。
+fn rewrite_returning_item(
+    mapper: &Mapper<'_>,
+    item: &SelectItem,
+) -> Result<SelectItem, SqlSurfaceError> {
+    match item {
+        SelectItem::Column(c) => {
+            let physical = mapper.physical(c)?;
+            Ok(if physical == *c {
+                SelectItem::Column(physical)
+            } else {
+                SelectItem::Expr {
+                    expr: Expr::Ident(physical),
+                    alias: Some(c.clone()),
+                }
+            })
+        }
+        SelectItem::Expr {
+            expr: Expr::Ident(name),
+            alias,
+        } => {
+            let physical = mapper.physical(name)?;
+            let alias = alias
+                .clone()
+                .or_else(|| (physical != *name).then(|| name.clone()));
+            Ok(match alias {
+                Some(a) => SelectItem::Expr {
+                    expr: Expr::Ident(physical),
+                    alias: Some(a),
+                },
+                None => SelectItem::Column(physical),
+            })
+        }
+        SelectItem::Expr { expr, alias } => {
+            if let Some(columns) = mapper.columns {
+                crate::sql::view::expr_columns_within(columns, expr)?;
+            }
+            let alias = Some(
+                alias
+                    .clone()
+                    .unwrap_or_else(|| crate::sql::parser::default_expr_alias(expr)),
+            );
+            let expr = match mapper.map {
+                Some(map) => crate::sql::view_alias::rewrite_set_value(
+                    &crate::sql::view_alias::ColumnMap::new(map, !mapper.base_allocated),
+                    expr,
+                )?,
+                None => expr.clone(),
+            };
+            Ok(SelectItem::Expr { expr, alias })
         }
     }
 }
@@ -330,7 +408,7 @@ impl Mapper<'_> {
         };
         if !self.base_allocated && physical == "id" && public != "id" {
             return Err(SqlSurfaceError::feature_not_supported(
-                "writing to a view column aliased to the row id is not supported",
+                ID_ALIAS_WRITE_UNSUPPORTED,
             ));
         }
         Ok(physical)

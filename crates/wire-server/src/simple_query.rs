@@ -925,6 +925,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         SqlOutcome::Delete(outcome) => OutcomeResponse::Command {
             tag: format!("DELETE {}", outcome.rows_affected),
         },
+        // SQL-79（Issue #3353）: `MERGE` は UPDATE と DELETE の実変更行数の合計を `MERGE <n>` で返す。
+        SqlOutcome::Merge(outcome) => OutcomeResponse::Command {
+            tag: format!("MERGE {}", outcome.rows_affected),
+        },
         // Issue #873（SQL-21）: `RETURNING` 句付き `INSERT`／`DELETE` の応答。
         // `RowDescription`／`DataRow`* は通常の検索 SELECT・`EXPLAIN` と同じ
         // 経路で組み立てるが、`CommandComplete` タグの件数は
@@ -942,6 +946,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
                 }
                 engine::sql::returning::DmlCommand::Delete => {
                     format!("DELETE {}", outcome.rows_affected)
+                }
+                // SQL-79（Issue #3356）: `MERGE ... RETURNING` も `RETURNING` なしと同じ `MERGE <n>`。
+                engine::sql::returning::DmlCommand::Merge => {
+                    format!("MERGE {}", outcome.rows_affected)
                 }
             };
             OutcomeResponse::Rows {
@@ -1019,6 +1027,10 @@ pub(crate) fn map_outcome(outcome: SqlOutcome) -> OutcomeResponse {
         }
         SqlOutcome::CloseCursor => OutcomeResponse::Command {
             tag: "CLOSE CURSOR".to_string(),
+        },
+        // Issue #3336（WIRE-27）: `MOVE` は行を返さず `CommandComplete` タグ `MOVE <n>` のみ。
+        SqlOutcome::Move(n) => OutcomeResponse::Command {
+            tag: format!("MOVE {n}"),
         },
         // TASK-202（SQL-23。Issue #900）: `ALTER TABLE ADD COLUMN` の応答を
         // pg 互換の `CommandComplete` タグ `ALTER TABLE`（件数を持たない固定

@@ -232,7 +232,14 @@ fn prescan(expr: &Expr) -> Result<(), SqlSurfaceError> {
             prescan(lhs)?;
             prescan(rhs)
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                prescan(o)?;
+            }
             for (c, r) in whens {
                 prescan(c)?;
                 prescan(r)?;
@@ -366,8 +373,16 @@ fn check_intermediate_precision(expr: &Expr, numeric: bool) -> Result<(), SqlSur
         }
         // CASE も短絡評価に沿い、条件を順に評価して選ばれる分岐だけを検査する。
         // 条件が評価不能なら以降は最終評価側に報告させる。
-        Expr::Case { whens, else_result } => {
-            for (c, r) in whens {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                check_intermediate_precision(o, numeric)?;
+            }
+            let conds = crate::sql::udf_call::case_condition_exprs(operand.as_deref(), whens);
+            for (c, (_, r)) in conds.iter().zip(whens.iter()) {
                 check_intermediate_precision(c, numeric)?;
                 match eval_node(c, numeric) {
                     Some(ExprValue::Bool(true)) => return check_intermediate_precision(r, numeric),
@@ -414,8 +429,10 @@ fn pg_float_typed(expr: &Expr) -> bool {
     match expr {
         Expr::Call { name, .. } => crate::sql::udf_call::is_typed_float_name(name),
         Expr::Binary { op, lhs, rhs } => {
-            matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
-                && (pg_float_typed(lhs) || pg_float_typed(rhs))
+            matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+            ) && (pg_float_typed(lhs) || pg_float_typed(rhs))
         }
         _ => false,
     }
@@ -453,8 +470,16 @@ fn check_untyped_decimal_leaves(expr: &Expr) -> Result<(), SqlSurfaceError> {
             }
             Ok(())
         }
-        Expr::Case { whens, else_result } => {
-            for (c, r) in whens {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                check_untyped_decimal_leaves(o)?;
+            }
+            let conds = crate::sql::udf_call::case_condition_exprs(operand.as_deref(), whens);
+            for (c, (_, r)) in conds.iter().zip(whens.iter()) {
                 check_untyped_decimal_leaves(c)?;
                 match eval_node(c, false) {
                     Some(ExprValue::Bool(true)) => return check_untyped_decimal_leaves(r),
@@ -627,6 +652,7 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
         // `INTERVAL` は `NULLIF` が比較を要する（#1580 まで未対応）ため、分岐なしの
         // `CASE WHEN 1 = 0 THEN INTERVAL '0' END` で型付き NULL を表す（Issue #1581）。
         ExprType::Interval => Expr::Case {
+            operand: None,
             whens: vec![(
                 Expr::Binary {
                     op: BinOp::Eq,
@@ -642,6 +668,7 @@ fn typed_null(ty: ExprType) -> Result<Expr, SqlSurfaceError> {
             else_result: None,
         },
         ExprType::Bool => Expr::Case {
+            operand: None,
             whens: vec![(
                 Expr::Binary {
                     op: BinOp::Eq,
@@ -681,7 +708,11 @@ fn null_kind(e: &Expr) -> Option<Option<ExprType>> {
             } => Some(Some(ExprType::TimestampTz)),
             _ => None,
         },
-        Expr::Case { whens, else_result } if else_result.is_none() && whens.len() == 1 => {
+        Expr::Case {
+            operand: None,
+            whens,
+            else_result,
+        } if else_result.is_none() && whens.len() == 1 => {
             if *e == typed_null(ExprType::Bool).ok()? {
                 Some(Some(ExprType::Bool))
             } else if *e == typed_null(ExprType::Interval).ok()? {
@@ -885,7 +916,15 @@ fn propagate_null(expr: &Expr, numeric: bool) -> Result<Expr, SqlSurfaceError> {
             Box::new(propagate_null(l, numeric)?),
             Box::new(propagate_null(r, numeric)?),
         ),
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: match operand {
+                Some(o) => Some(Box::new(propagate_null(o, numeric)?)),
+                None => None,
+            },
             whens: whens
                 .iter()
                 .map(|(c, r)| Ok((propagate_null(c, numeric)?, propagate_null(r, numeric)?)))
@@ -1220,6 +1259,7 @@ mod tests {
     fn unselected_branches_do_not_trigger_precision_error() {
         let p54 = || call("power", vec![num("2"), num("54")]);
         let case = Expr::Case {
+            operand: None,
             whens: vec![(bin(BinOp::Eq, num("1"), num("1")), num("1"))],
             else_result: Some(Box::new(p54())),
         };
@@ -1272,6 +1312,7 @@ mod tests {
             Err(SqlSurfaceError::DatatypeMismatch { .. })
         ));
         let case = Expr::Case {
+            operand: None,
             whens: vec![(bin(BinOp::Eq, num("1"), num("1")), nul_plus_1())],
             else_result: Some(Box::new(Expr::String("x".into()))),
         };
@@ -1336,6 +1377,7 @@ mod tests {
         // CASE も選ばれない ELSE 枝は検査しない。
         assert_eq!(
             fold_const_literal(&Expr::Case {
+                operand: None,
                 whens: vec![(bin(BinOp::Eq, num("1"), num("1")), num("1"))],
                 else_result: Some(Box::new(big())),
             })
@@ -1438,6 +1480,7 @@ mod tests {
             "1.5000000000000000"
         );
         let case = Expr::Case {
+            operand: None,
             whens: vec![(
                 bin(BinOp::Gt, num("1"), num("0")),
                 bin(BinOp::Add, n("3"), num("1")),
@@ -1463,6 +1506,7 @@ mod tests {
         // 非 numeric 文脈でも 22003 で拒否する（fail-closed。誤った丸め値を返さない）。
         let big = "100000000000000000000";
         let case = Expr::Case {
+            operand: None,
             whens: vec![(bin(BinOp::Gt, num("1"), num("0")), num(big))],
             else_result: Some(Box::new(num("1"))),
         };
@@ -1541,6 +1585,23 @@ mod tests {
         assert_eq!(fold_text(&bin(BinOp::Div, num("7"), num("2"))), "3");
     }
 
+    /// Issue #3273: 整数モードの剰余は符号が被除数に従い、`i64::MIN % -1` は 0、2^53 超でも厳密。
+    #[test]
+    fn exact_int_remainder_is_exact_and_fail_closed() {
+        assert_eq!(fold_text(&bin(BinOp::Rem, num("7"), num("2"))), "1");
+        let neg = |v: &str| bin(BinOp::Sub, num("0"), num(v));
+        assert_eq!(fold_text(&bin(BinOp::Rem, neg("7"), num("2"))), "-1");
+        assert_eq!(fold_text(&bin(BinOp::Rem, num("7"), neg("2"))), "1");
+        assert_eq!(code(&bin(BinOp::Rem, num("7"), num("0"))), "22012");
+        let min = || bin(BinOp::Sub, num("0"), num("9223372036854775808"));
+        assert_eq!(fold_text(&bin(BinOp::Rem, min(), neg("1"))), "0");
+        // 2^53 + 1 は f64 では表せないが、整数モードでは厳密に計算する。
+        assert_eq!(
+            fold_text(&bin(BinOp::Rem, num("9007199254740993"), num("10"))),
+            "3"
+        );
+    }
+
     #[test]
     fn exact_int_comparison_is_exact() {
         let cmp = |op, l: &str, r: &str| fold_const_literal(&bin(op, num(l), num(r))).unwrap();
@@ -1572,6 +1633,7 @@ mod tests {
             bin(
                 BinOp::Add,
                 Expr::Case {
+                    operand: None,
                     whens: vec![(bin(BinOp::Gt, num("1"), num("0")), big())],
                     else_result: Some(Box::new(num("1"))),
                 },
@@ -1668,6 +1730,7 @@ mod tests {
         );
         // CASE の未選択結果は検査せず、選択される分岐は検査する。
         let case = |cond_true: bool| Expr::Case {
+            operand: None,
             whens: vec![(
                 bin(BinOp::Eq, num("1"), num(if cond_true { "1" } else { "2" })),
                 big(),

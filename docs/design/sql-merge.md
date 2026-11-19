@@ -1,0 +1,443 @@
+# MERGE の実行方式
+
+Issue #3350（親 #3349）・対象ビヘイビア: SQL-79。関連ポインタ: SQL-53・TABLE-43・TABLE-45・TABLE-50・TASK-352・RLS-10・RECOVER-10・RECOVER-11・SQL-21・SQL-28・SQL-32・SQL-46。
+
+spec 本文は転記せず、ID のポインタのみを記す（`.claude/rules/spec-confidentiality.md` 準拠）。本ドキュメントは本リポ側の実装判断・設計記録だけを扱う。
+
+## ステータス
+
+方式は決定済み・実装済み（#3351〜#3357）。**#3358 で PG17 実測との突き合わせ・3 テナントの越境・psql 経由の結合試験を追加済み**（下の §14）。**#3351 で構文解析を実装済み**（`sql::allowlist::merge`・`ParsedSql::Merge`）。解析を通った MERGE は Execute・Describe・明示 Tx のいずれも固定文言の `0A000`（`MERGE is not supported yet`）で止まり、行・台帳・writer・世代に触れない（`USING OPERATION_ID` も台帳に参加させない）。従来 `42601` だった形のうち、構文を通るものが `0A000` に変わる。束縛は #3352 で入った（下の §8）。実行・`RETURNING`・台帳・`EXPLAIN` は後続（#3353〜#3357）が入れる。**#3357 で台帳（再送）・`EXPLAIN`・crash 耐性の段を実装済み**（下の §13）。
+
+**#3353 で `WHEN MATCHED`（UPDATE・DELETE・DO NOTHING）の実行と多重一致の `21000` を実装済み**（下の §9）。`WHEN NOT MATCHED`・`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシーの形は固定文言の `0A000` のまま止まる（#3354 で NOT MATCHED は実行される。次の段落）。
+
+**#3354 で `WHEN NOT MATCHED [BY TARGET]` の INSERT と `WHEN NOT MATCHED BY SOURCE` の実行を実装済み**（下の §10）。外部保持の列挙は第 1 段の対象候補の列挙に一致フラグを足して行い、適用順は UPDATE → DELETE → INSERT。`RETURNING`・台帳記録・ビュー対象・文トリガ・利用者ポリシー（INSERT 側を含む）の形は固定文言の `0A000` のまま止まる。
+
+**#3355 で MERGE と制約・生成列・トリガ・ビュー・RLS の規則を実装済み**（下の §11）。対象がビュー・対象表に文トリガ・対象表に利用者ポリシーの形は実行される。`RETURNING`・台帳記録・INSTEAD OF トリガを持つビュー（対応しない）は固定文言の `0A000` のまま止まる。
+
+**#3356 で `RETURNING` と `merge_action()`、`RETURNING` 側のコマンドタグを実装済み**（下の §12）。`RETURNING` つきの MERGE は Execute・明示 Tx・Describe で実行され、台帳記録・INSTEAD OF トリガを持つビュー（対応しない）・該当トリガを持つ表との `RETURNING` の併用は固定文言の `0A000` のまま止まる。
+
+**#3352 で束縛を実装済み**（`sql::merge_bind`・`core::merge_exec`。下の「#3352 の束縛」節）。束縛エラー（`42703`・`42702`・`42P01`・`42804`・`22000`・`55000` 等）は書き込みより前に返り、束縛を通った Execute・明示 Tx は固定文言の `0A000` のまま、Describe は `RETURNING` なしなら結果列なしで成功する（`RETURNING` つきは `0A000`）。
+
+`$n` の受理範囲（#3352）: `USING OPERATION_ID $n` に加え、`WHEN ... THEN UPDATE SET <列> = $n` の右辺と `INSERT ... VALUES (...)` の要素の単独の `$n`（括弧で包んだ形を含む）を受理する。`ON`・`WHEN ... AND` の条件内、式の内側（`SET x = $1 + 1`）、`RETURNING` 内、元が部分クエリの形の `$n` は引き続き Parse 段で `42601`（UPDATE FROM の `$n`〔#3297〕と同じ段階的な制限）。
+
+各決定は「決定・理由・アンカー」で書く。アンカーは行番号でなく関数名・モジュール名で指す。
+
+## 1. 実行方式
+
+### D1: 構文の範囲
+
+- 決定: 次を受理する
+  - `MERGE INTO <対象> [[AS] <別名>] USING <元> [[AS] <別名>] ON <条件> <WHEN 句>+ [RETURNING ...] [USING OPERATION_ID '<id>' | NULL]`
+  - `WHEN MATCHED [AND c] THEN {UPDATE SET ... | DELETE | DO NOTHING}`
+  - `WHEN NOT MATCHED [BY TARGET] [AND c] THEN {INSERT [(cols)] {VALUES (...) | DEFAULT VALUES} | DO NOTHING}`
+  - `WHEN NOT MATCHED BY SOURCE [AND c] THEN {UPDATE SET ... | DELETE | DO NOTHING}`
+- `USING` は 2 回現れる。元を示す `USING` は対象（と別名）の直後に 1 回だけ置く。`USING OPERATION_ID` は文末（`RETURNING` の後）だけで受理し、他の DML と同じ位置にする。構文段はキーワードの並び（`USING` `OPERATION_ID`）で区別する。`strip_operation_id_clause` は末尾の句だけを対象にする
+- 条件なしの WHEN の後に同じ種類の WHEN が来たら、到達できない句として `42601`（PG17 と同じ。#3358 で実機確認）
+- `UPDATE SET` は単一表 UPDATE と同じ規則（非修飾の列名・行値代入・`DEFAULT`・生成列への代入の拒否）に従う。`INSERT` は単独 INSERT と同じ規則（列リスト・`DEFAULT`・IDENTITY・`OVERRIDING`）に従う。単独 INSERT で受理しない形は MERGE でも受理しない
+- `$n`（拡張クエリ）は条件・値・元の中で許す（#3351）。型推論は結合 DML の Parse 段の機構（#3472）に揃える。#3352 は値位置（SET 右辺・INSERT 値）の単独の `$n` だけを受理し、条件・式の内側・元の部分クエリの中は UPDATE FROM と同じく Parse 段で `42601`（§8）
+- 理由: 既存の DML と同じ入口・規則を再利用し、MERGE 固有の構文を WHEN 句に閉じる
+
+### D2: 元の形
+
+- 決定: 受理する元は 3 種類
+  - 単一の表
+  - 単純形のビュー（`dml_from_exec::apply_view_source` の前例。列別名ビューと評価後射影形は `0A000`）
+  - 部分クエリ `( SELECT ... ) [AS] s[(cols)]`
+- 部分クエリは、書き込むセッションの `PolicyContext` で既存の読み取り経路（`execute_read_statement_with_limits`。`core::insert_select_exec` の前例）に通して実体化し、build 側の行源にする。上限は可視行数（`cap+1` 超過の検出）と結合の共有バイト予算。列の型は結果の列記述から取り、疑似列 `id` は持たない
+- 元が対象を参照する形（相関・LATERAL 相当）は `42P01`（PG17 と同じ。#3358 で確認）
+- 元にベクトル順位付けを含む形は `42601`（SQL-28 と同じ扱い）
+- `USING` に JOIN の連鎖・カンマ区切りの複数表を書く形は `0A000`。部分クエリで書ける。畳み込み source の残余が未対応なため
+- 理由: 元の評価を既存の読み取り経路に寄せると、RLS・上限・型付けを再実装せずに済む
+
+### D3: 結合の形（実行方式の中心）
+
+- 決定: 対象を probe 側、元を build 側とする既存のハッシュ結合を使う。第 2 の結合実行器は作らない（`sql::join::dml`・`execute_joined_dml_in`・`core::dml_from_exec`）
+- build 側の各行に「一致した」フラグを持たせる
+  - MATCHED の組: probe が真の組
+  - NOT MATCHED BY TARGET: 一致フラグが立たなかった元の行
+  - NOT MATCHED BY SOURCE: probe で一致が 0 件だった対象行
+- 外部結合の種類は WHEN 句の構成で決まる。BY TARGET があれば元を保持し、BY SOURCE があれば対象を保持し、両方あれば完全外部結合相当にする。実行器は構成に関わらず同じ走査で列挙する
+- ON の振り分けは UPDATE FROM の変換器（`sql::join::dml_plan`）と同じく、列同士の等値を結合キー、それ以外を残余（`sql::join::dml_residual`）に分ける。ただし片側だけを参照する conjunct の扱いは UPDATE FROM と意図的に異なる
+  - 対象だけの conjunct は、BY SOURCE の句が無いときに限って候補の絞り込みへ押し下げてよい。ある場合は一致判定の残余にする
+  - 元だけの conjunct は、BY TARGET の句が無いときに限って元の走査へ押し下げてよい。ある場合は残余にする
+  - 理由: 一致しない行が INSERT・BY SOURCE の操作を受けるため、絞り込むと書き込みの範囲が変わる
+- 等値キーが 0 本の形は、既存と同じく全行を 1 バケットに入れ、一致ペアの上限で抑える
+
+### D4: 1 行ごとの WHEN 選択
+
+- 決定: 各組について、該当する種類の WHEN を宣言順に評価し、`AND` 条件が真になった最初の句を採る。真になる句が無ければ何もしない
+- `AND` 条件の束縛は残余と同じく、合成スキーマ上の `bind_where_predicates` と `BoundConjunction::matches` で行い、NULL の三値論理・型強制・照合を通常の WHERE と一致させる
+- 参照できる側は句の種類で決まる
+  - MATCHED: 両側
+  - BY TARGET の条件と INSERT の値: 元だけ
+  - BY SOURCE の条件と SET: 対象だけ
+  - 反対側を参照したら `42P01`（PG17 と同じ。#3358 で確認）
+
+### D5: 段階と `21000`（多重一致）
+
+- 決定: 3 段で実行する
+  1. 全組の操作を決めて操作列を作る
+  2. `21000` と各上限を判定する
+  3. 1 つの書き込みトランザクションに適用する
+- 第 1・第 2 段は行を書かない
+- `21000` の条件は、同じ対象行について UPDATE か DELETE を選んだ組が 2 つ以上あること
+  - DO NOTHING を選んだ組と、どの WHEN も真にならなかった組は数えない
+  - 対象行が元の複数行と一致しても、変更する組が 1 つ以下なら受理する
+  - PG17 の挙動（2 回目の変更を試みたときに拒否する）に揃える。先が DO NOTHING で後が UPDATE の境界は #3358 の突き合わせ表に必ず入れる
+- 既存の「一致位置の先頭の source 行を採る」一意化は MERGE では使わない。全組を評価して操作列を作る。`54000` の判定は UPDATE FROM と同じく、一意化の前の一致ペアの累計で行う
+- 判定はすべて第 3 段より前に終える。`21000`・`54000` は副作用ゼロ（write txn を commit しない）で、台帳も消費しない
+
+### D6: 適用の順序
+
+- 決定: 操作列の順は、対象候補の走査順（MATCHED と BY SOURCE）の後に、元の走査順（BY TARGET の INSERT）とする。決定的にする
+- 第 3 段は操作列を先頭から読み、同じ種類が続く区間ごとに既存の書き込み経路へ渡す
+  - UPDATE: `tenant::update_rows_joined_unchecked`
+  - DELETE: `delete_rows_where_unchecked`
+  - INSERT: `sql::insert_select::rows_to_bound_inserts` から `sql::exec::execute_insert_*_in`
+  - 第 2 の書き込み経路は作らない
+- 区間ごとの書き込み経路は、台帳の記録を行わない形で呼ぶ（記録の抑止を引数で受け、既存の単独 DML の挙動は変えない）。台帳の事前照合と確定記録は MERGE 全体で 1 回だけ行う（D11）。区間ごとに記録すると、複数の action 種別を持つ MERGE に `USING OPERATION_ID` を付けたとき 2 つ目の区間が `23505`・`22023` になるため
+- UNIQUE などの即時検査が途中の状態で衝突するかは適用順に依存する。PG17 でも計画に依存して不定なので、突き合わせ（#3358）は順序に依存しない入力で行う
+- 第 3 段の挿入行・更新行は、同じ文の一致判定には現れない（文の開始時点のスナップショット）
+- #3353 の実装は適用を UPDATE の句ごと → DELETE の最大 1 回（呼び出しは UPDATE 句数 + 1 回以内）にした（理由と申し送りは §9）
+
+## 2. WHEN 句の範囲と上限
+
+### D7: WHEN 句の数と資源の上限
+
+- WHEN 句の数の上限 `MAX_MERGE_WHEN_CLAUSES = 16`。値は `MAX_CTE_DEFINITIONS`・`MAX_SET_OP_BRANCHES` と揃える。構文段で積む前に検査し、超過は `54000`（#3351）
+- 全 WHEN の `UPDATE SET` の代入数は、累計で既存の `MAX_UPDATE_SET_ASSIGNMENTS` を上限にする
+- 結合の上限は UPDATE FROM と共有する（いずれも超過は `54000`・副作用ゼロ）
+  - リレーション数、元の可視行数、一致ペアの累計、NLJ の比較回数、共有バイト予算
+  - 対象側の走査行数（BY SOURCE があるときは対象の全候補を走査しうるため、この上限で数える）
+  - 影響行数（操作列の UPDATE・DELETE・INSERT の合計）。既存の DML 上限と INSERT のバッチ上限（INDEX-4）
+- 内側のループで協調的中断（`57014`）に応じる
+
+## 3. 台帳（content_hash）
+
+### D11: 操作種別と材料
+
+- 決定: `OpTag` に MERGE の操作種別を 1 つ足す。番号は base 時点の次の空き番号で、7c8be8464 時点は 30（`DataModifyingCte = 29` の続番）。#3357 の着手時に open PR と照合し直す。既存タグのバイト列は変えない
+- 材料は `UpdateFrom` と同じく、送られた文のトークン列から `USING OPERATION_ID` 句・最上位の `RETURNING` 句・末尾の `;` を除いたもの（`for_merge`）。`RETURNING` は応答の投影だけを決めるため、有無や投影を変えた再送も同じ文として扱う（D13 と同じ）。結合結果・操作列・行の値は含めない
+- 算出位置は構文検証の入口（全検証の後）。事前照合（`precheck_in_write_txn`）は、元の走査・部分クエリの実体化より前に行う
+  - 同じ内容の再送は `23505`、別の文への再利用は `22023`
+  - 確定記録は書き込み本体と同じ txn で行う
+  - 台帳エントリは MERGE 1 文につき 1 件。D6 の各区間（UPDATE・DELETE・INSERT）は台帳を記録せず、全区間の書き込みの後、commit の前に 1 回だけ記録する。区間ごとのキー導出は採らない（再送の判定が文単位でなくなるため）
+- 束縛・`21000`・`54000` のエラーは txn を commit しないので台帳を消費しない。省略時は台帳に記録しない（RECOVER-1 のポインタ）
+- 残余リスク（UDF 定義が材料に入らない）は UPDATE FROM と同じ（`multi-row-dml-operation-id.md` の Issue #1757 追記）
+
+## 4. RLS・権限・実行文脈
+
+### D8: RLS とテナント境界（P0）
+
+- 一致に使う対象行は、DML の候補列挙（`tenant::enumerate_dml_candidates_with`）が返す「所有かつ可視」の行だけ。他テナントの行は一致・BY SOURCE のどちらの判定にも入らないため、UPDATE・DELETE・BY SOURCE の操作を受けない
+- 元は書き込むセッションの `PolicyContext` で独立に走査する。可視性は SELECT の JOIN と同じで、UPDATE FROM と同じ非対称性を引き継ぐ。部分クエリの中の表も同じ読み取り経路で暗黙適用を受ける
+- 一致相手が他テナントの行、または自テナントの不可視行だけのときは「一致なし」として扱う。BY TARGET の INSERT は単独 INSERT と同じ経路と検査を通すので、観測できる結果（`23505` 等を含む）は単独 INSERT と同じになり、新たな存在情報の経路を作らない（前例: `sql-upsert.md` の衝突検出スコープ、`sql-returning.md` の UPSERT の衝突先が不可視の場合）
+- INSERT 行の所有はセッションのテナントにする（書き込み段が `ctx` で固定する）
+- エラー文言は固定文言と入力された名前だけにする。行の値・件数・他テナントの存在を含めない
+
+### D9: 明示 Tx・writer・Describe
+
+- 明示 Tx では共有 write txn 上で実行し、対象表とトリガが書いた表へ `mark_written` する
+- writer は最初の書き込み文として `ensure_writer_with` で取得する
+- `READ ONLY` Tx は `25006`
+- `parsed_operation_id` は実値を返す。同じ Tx 内での再利用は既存 DML と同じく拒否する
+- 暗黙 Tx を通らない経路（`execute_parsed_statement` のネスト実行等）は固定文言の `0A000`
+- Describe は Execute と同じ準備段（構文・束縛・変換）を通して SQLSTATE をそろえる。`RETURNING` があればその列を、無ければ結果列なしを返す
+
+### D10: 権限
+
+- `classify_write` に MERGE の腕を足す（網羅 match）
+- 対象に課すビットは、WHEN 句に現れた操作の種類の和（`PRIV_INSERT`・`PRIV_UPDATE`・`PRIV_DELETE`）に `PRIV_SELECT` を加えたもの。実際に実行されたかどうかは問わない。`PRIV_SELECT` は ON・条件で対象を読むため
+- 列単位の精密化はせず、表単位で全列を要求する（UPDATE FROM と同じ。`column-level-privilege.md` の対象外の項と対応）
+- 元の SELECT はトークン走査の読み取りゲートで判定する。対象がビューのときはビュー自身の権限を判定する
+- 違反は固定文言の `42501`。UPDATE 権限だけのロールが MERGE を経由して INSERT・DELETE できる経路を作らない
+
+## 5. 周辺規則
+
+### D12: トリガ・生成列・制約・ビュー
+
+- 行トリガは、各操作が既存の書き込み経路を通ることで、操作ごとの種類のトリガとして発火する
+- 文トリガは、MERGE の入口が WHEN 句に現れた操作の種類ごとに 1 回ずつ発火し、各区間の書き込み呼び出しでは抑止する
+  - BEFORE は INSERT → UPDATE → DELETE、AFTER は DELETE → UPDATE → INSERT（#3355 で訂正。当初の記述は AFTER を UPDATE → DELETE → INSERT としていたが、PG のソースの `fireASTriggers` の MERGE の腕に合わせて BEFORE の逆順にした。#3358 で実機確認）
+  - 発火の単位は WHEN 句に現れた操作の種類ごと（DO NOTHING は数えない）で、実際に行を書いたかは問わない。#3355 の本文は「実行した操作の種類ごと」と読めるが、PG17 との互換を優先して前者を決定とした（§11）
+- 結合形 DML の `RETURNING` とトリガの併用は、`trigger-update-delete.md` の現行の契約（`0A000`）に従う
+- 対象ビューの INSTEAD OF トリガを経由する MERGE は `0A000`（対応しない形。#3355 で確定。§11）
+- 生成列は、#3326（TABLE-50）の設計記録が定める「符号化直前の単一計算点」を各書き込み経路が通る。MERGE で別の計算点は作らない（#3355 で結線済み。`GeneratedComputeScope` は基底表名で張る）
+- CHECK・UNIQUE・FK（`23514`・`23505`・`23503`）は単独 DML と同じ検査点を通る
+- 対象が自動更新可能なビューのときは、ビュー DML（`create-view.md`）と同じく基底表とビュー述語へ書き換え、単独のビュー書き込みと同じ規則と SQLSTATE に従う（#3352）
+- 一時表の関与と更新不可のビューは D14（第 6 節の表）に従う
+
+### D13: RETURNING・タグ・EXPLAIN
+
+- `RETURNING` は変更した行を返す。INSERT・UPDATE は新しい値、DELETE は削除した行を返す。元の列も参照でき、BY SOURCE の行では元の列が NULL になる
+- `merge_action()` は `'INSERT'`／`'UPDATE'`／`'DELETE'` を返す。MERGE の `RETURNING` の外での使用は PG17 と同じ SQLSTATE（#3356・#3358 で確認）
+- `RETURNING` は content_hash に影響しない
+- コマンドタグは `MERGE n`。n は UPDATE・DELETE・INSERT の行数の合計で、DO NOTHING は含めない。wire 側のタグ写像の要否は #3356 で確認する
+- EXPLAIN は既存の結合 DML の EXPLAIN（`update-from-delete-using.md` の EXPLAIN 節）と同じ契約に従う（#3357）
+  - 表示するのは、結合の方式（ハッシュかネストループか、外部保持の向き）と WHEN の構成（種類・操作・条件の有無）
+  - 見積もり・行数・表名・値は載せない（テナントの存在情報を漏らさないため）
+  - ANALYZE は実際に実行する。実装までは `0A000`
+
+## 6. 扱わない形（D14）
+
+文言は英語の固定文字列とする（例: `MERGE in a data-modifying CTE is not supported`）。「受け皿なし」は受け皿の Issue が未起票であることを示す（起票はユーザー承認が要る）。
+
+| 形 | SQLSTATE | 受け皿・理由 |
+| -- | -------- | ------------ |
+| データ変更 CTE の中の MERGE | `0A000` | 対応しない。`data-modifying-cte.md` の経路が単独 DML 前提のため |
+| MERGE の前に置く WITH | `0A000` | 受け皿なし |
+| 入れ子の MERGE（部分クエリ・元の中） | `42601` | 構文上、MERGE は問い合わせではないため |
+| 分割実行（`PARTITIONED`） | `0A000` | SQL-32 の対象外（SQL-79 のポインタ） |
+| NoSQL 表層 | op を追加しない（`0A000`） | 対象外（SQL-79 のポインタ） |
+| 一時表が対象・元のどちらかに関与する形 | `0A000` | 受け皿なし。`temp_dispatch` に MERGE が無い |
+| 元が JOIN の連鎖・複数表 | `0A000` | 部分クエリで代替できる。受け皿なし |
+| 元の LATERAL・対象への相関参照 | `0A000`／`42P01` | lateral-derived-table（#3320）は DML を対象外にしている |
+| 元のベクトル順位付け | `42601` | SQL-28 と同じ |
+| 対象ビューの INSTEAD OF 経由 | `0A000` | 対応しない（#3355 で確定。3 種の操作を INSTEAD OF の行トリガへ振り分ける経路は第 2 の実行器になる。要望が出た時点で別途起票する） |
+| PL/pgSQL 本体・DO の中の MERGE | `0A000` | 受け皿なし |
+| 暗黙 Tx を通らない経路 | `0A000` | fail-closed |
+| 結合 DML の RETURNING とトリガの併用（MERGE の `RETURNING` を含む） | `0A000` | `trigger-update-delete.md` の現行の契約。MERGE は該当トリガ（行・文・参照アクション先の子表）が 1 つでもあれば BEFORE STATEMENT の発火より前に固定文言で拒否する（#3356） |
+| `merge_action()` を式の内側に置く形 | `0A000` | 対応しない。操作の種類を式の評価器へ渡す基盤が無い。最上位の項目だけ受理する（#3356） |
+| `RETURNING` で元の列を式の中で参照する形 | `0A000` | 対応しない。既存の結合 DML の `RETURNING`・SET 右辺と同じ境界（#3356） |
+| WHEN 句の数の超過 | `54000` | D7 |
+| 到達できない WHEN 句 | `42601` | D1 |
+
+## 7. 担当の割り当て
+
+| 決定 | 担当 |
+| ---- | ---- |
+| D1・D7 の構文段 | #3351 |
+| D2・D4 の束縛と参照できる側・ビュー対象・`$n` | #3352 |
+| D3・D5・D6 の MATCHED と `21000`（実装済み。§9。コマンドタグ `MERGE n` と `SqlOutcome::Merge` を前倒しで含む） | #3353 |
+| D3・D6 の BY TARGET の INSERT と BY SOURCE（実装済み。§10） | #3354 |
+| D8・D10・D12（実装済み。§11） | #3355 |
+| D13 の RETURNING・`merge_action()`・タグ（実装済み。§12） | #3356 |
+| D9・D11・D13 の EXPLAIN・crash 耐性の段 | #3357 |
+| PG17 の突き合わせ（D1・D4・D5・D12・D13 の要確認点）・越境・psql の結合試験 | 実施済み（§14。未実施分は §14 末尾） |
+| D14 の扱わない形（第 6 節の表） | 各形に近い担当（構文段は #3351、それ以外は #3355・#3357） |
+
+## 8. #3352 の束縛
+
+束縛は `sql::merge_bind::bind_merge`（純関数。スキーマだけを読み、行・台帳・writer・世代・RLS に触れない）で、入口は `core::merge_exec::bind_merge_stmt`（同一の読み取りスナップショットから対象・元のスキーマを取る）。権限ゲート（`42501`）は束縛より前なので、権限の無い主体には列の存在が見えない。
+
+- 束縛結果の relation 添字は **0 = 対象、1 = 元**（#3353・#3354 はこの規約で消費する）
+- 参照できる側（D4）: `ON`・MATCHED は両方、NOT MATCHED [BY TARGET] は元だけ、NOT MATCHED BY SOURCE は対象だけ。見えない側への修飾参照は `42P01`、見えない側にしか無い非修飾の列は `42703`、両側にある非修飾の列は `42702`。解決した参照は公開名で修飾し直してから型を照合する（狭いスコープで一意だった名前が両側スコープで曖昧にならない）
+- `ON`・`WHEN ... AND` の条件: 最上位の `AND` の conjunct ごとに、対象と元をまたぐ列同士の等値は型クラスを照合して結合キー候補にし（比較できない型は `42804`。`t.id = s.id` も受理）、それ以外は「対象 ++ 参照される元の列」の合成スキーマで通常の WHERE と同じ束縛器に通す。元の疑似列 `id` を残余で参照する形は固定文言の `0A000`。押し下げの決定は #3353
+- `UPDATE SET`: 左辺は常に対象の列（重複 `22000`・疑似列 `42601`・未知列 `42703`・`GENERATED ALWAYS`）。右辺の列参照は `assignable` で照合し（`42804`）、元の列を含む式は合成スキーマで `bind_set_expr` に通す
+- `INSERT`: 単独の INSERT と同じ規則。列リストの重複 `22000`・未知列 `42703`・従来方式の表で疑似列 `id` を省くと `22000`（採番方式は省略可）・個数不一致 `42601`・型不一致 `42804`。`DEFAULT VALUES` に列リストを付けると `42601`。値は元だけを参照できる
+- 部分クエリの元: 内側を Describe して列記述だけを得る（**実行しない**）。疑似列 `id` なしの採番方式の合成スキーマにする。列別名が出力列より多ければ `42P10`、静的な型を持てない列・不正な列名は固定文言の `0A000`、出力名の重複は `42701`（PG は参照時に `42702` とするが、本実装は合成の時点で拒否する。fail-closed）。内側から対象を相関参照すると構文段が `42P01`。内側の表の RLS は実行時（#3353 以降）に書き込むセッションの `PolicyContext` で読み取り経路が適用する
+- 対象がビュー（TABLE-43）: 単独のビュー書き込みと同じ規則（`view_dml::resolve_merge_target`）。自動更新できなければ `55000`（文言 `cannot merge into view`）、公開していない基底列は `42703`。列別名つきのビュー・利用者列を `id` として公開するビューは固定文言の `0A000`。Issue 本文は「`0A000`／PG17 と同じ SQLSTATE」と書くが、既存のビュー書き込み（D12）に揃えて `55000` にした。PG17 との突き合わせは #3358 の確認項目に加える（`55000` の可否・`42P01`／`42703` の側の規則・ParameterDescription の OID）。INSTEAD OF トリガを持つビューの判定は #3355
+- 判定順（決定的）: 構文 → 権限 → スキーマ取得（`42P01`）→ ビュー対象の形 → スコープ構築（`42712`・`54000`）→ `ON`（列解決の後に型）→ WHEN 句を宣言順に（条件の後に操作）
+- `$n`: `sql::params_merge`（`looks_like_merge` で分岐する専用の走査）。型は SET が対象の列、INSERT が句の列リスト（省略時は対象表の `*` 展開）の序数の列。Describe 用ダミーフラグの並びは「WHEN 句ごとに SET の代入／INSERT の値の宣言順」で、個数が合わなければ全て検証側へ倒す
+
+対象外（受け皿）: 条件内・式の内側の `$n`、元が部分クエリの形の `$n`（対応しない（現行の制限として固定する。要望が出た時点で別途起票する）。#3472 と同じ制限）、列別名つきのビューを対象にする形（対応しない（現行の制限として固定する。要望が出た時点で別途起票する））、`RETURNING` の束縛（#3356）、実行・押し下げ（#3353・#3354）。
+
+## 9. #3353 の実行（`WHEN MATCHED`）
+
+実装は `core::merge_exec`（3 段の実行）・`sql::join::merge_plan`（計画への変換と組ごとの評価）・`sql::join::dml`（全一致の列挙と実体化した元の受け口）・`tenant`（読み取り専用の候補列挙と事前判定）。
+
+### 実行する形と対象外（固定文言の `0A000`）
+
+- 実行する形: 対象は実表（自テナントの「所有かつ可視」の行だけ）。元は実表・単純形ビュー・部分クエリ。WHEN 句は MATCHED だけ（UPDATE・DELETE・DO NOTHING。`AND` 条件の有無を問わず複数可）。autocommit は暗黙 Tx、明示 Tx は共有 write txn の上で実行する。生成列・行トリガ・制約は既存の書き込み経路を通る
+- 対象外の形は writer の取得・台帳・行に触れる前（または write txn 内の事前判定。行は書かない）に固定文言で文全体を拒否する。受け皿は、その形を担当する open の兄弟 Issue
+
+| 形 | 受け皿 | 判定の位置 |
+| -- | ------ | ---------- |
+| `WHEN NOT MATCHED [BY TARGET]`・`BY SOURCE` の句を 1 つでも含む（#3354 で実行する形になった。§10） | 実装済み | — |
+| `RETURNING` つき | #3356 | 同上 |
+| 台帳へ記録する構成（`USING OPERATION_ID` つき） | #3357 で実装済み | §13 |
+| 対象がビュー | 実装済み（#3355。§11） | — |
+| 対象表に文トリガがある | 実装済み（#3355。§11） | — |
+| 対象表に利用者ポリシーが適用される | 実装済み（#3355。§11） | — |
+
+- 台帳: #3357 で結線済み（§13）。`Ledgered` 構成で `operation_id` を欠くと `23502`、`USING OPERATION_ID` つきは文全体を 1 エントリで記録し、再送は `23505`／`22023`
+- 文トリガのある表を拒否する理由: DELETE の経路は呼び出しごとに文トリガを発火し、D12 の「操作の種類ごとに 1 回」と合わない。UPDATE の経路は結合形で既に文トリガを `0A000` で拒否している
+- 利用者ポリシーのある表を拒否する理由: UPDATE と DELETE で `PolicyCmd` が異なり、第 1 段の列挙と第 3 段の列挙が同じ行集合になる保証を作れないため
+- 暗黙 Tx を通らない経路（ネストした実行）は束縛を通してから「この経路では未対応」の固定文言の `0A000`（D9）。一時表の関与・PL/pgSQL 本体と DO の中・データ変更 CTE の中は D14 のとおり `0A000` のまま
+
+### 3 段の実行（D5・D6 の具体化）
+
+1. 束縛（#3352）→ 対象外の形の判定 → writer 取得 → 計画への変換 → 事前判定（スキーマ照合・`row_security = off`〔`42501`〕・利用者ポリシー・文トリガ）
+2. 第 1 段（行を書かない）: 元を走査（部分クエリは書き込むセッションの `PolicyContext` で既存の読み取り経路へ通して実体化）してハッシュ表にし、対象の候補列挙（`tenant::enumerate_merge_candidates_readonly`。テナントのキー範囲・走査上限・所有かつ可視の選定は UPDATE・DELETE と同一）の述語の中で、候補ごとに全一致を走査順に辿る。各組で MATCHED の句を宣言順に評価し、最初に条件が真になった句を採る。UPDATE か DELETE を採った組が 2 つ目になった時点で `21000`（DO NOTHING と、どの句も真にならなかった組は数えない）。UPDATE の SET 値は採った組から評価して保持する（予算に計上）
+3. 第 2 段: 影響行数（UPDATE と DELETE の合計）の上限を判定する（`54000`）。一致ペアの累計・比較回数・共有バイト予算・可視行数・走査行数は第 1 段の中で UPDATE FROM と同じ計上で判定済み。ここまでの失敗は write txn を commit しないため副作用ゼロ
+4. 第 3 段: `GeneratedComputeScope`・`TriggerWrittenTablesScope` の中で、UPDATE の区間（`tenant::update_rows_joined_unchecked`。述語は id をキーにした取り出し）→ DELETE（`tenant::delete_rows_where_with_triggers`。述語は id 集合への所属。最大 1 回）を、UPDATE は選択句ごとに分けて既存の書き込み経路へ渡す（呼び出しは UPDATE 句数 + DELETE 最大 1 回）。BEFORE ROW トリガによる行のスキップ・削除は正常動作として許容し、計画 id の全消費は検査しない（適用結果は実変更行数を使う）。DELETE の計画も共有バイト予算へ確保前に計上する。`rows_affected` は UPDATE と DELETE の実変更行数の合計（DO NOTHING は含めない）。コマンドタグは `MERGE n`
+
+### 意図的な変更・見送り（後続への申し送り）
+
+- **適用順（D6 からの変更）**: D6 は「同じ種類が続く区間ごと」に渡すとしていたが、本実装は UPDATE の選択句ごと → DELETE の最大 1 回（UPDATE 句数 + 1 回以内。`UPDATE OF` トリガの発火判定が SET 列の和集合で行われるため句ごとに分ける）にする。各区間は対象表を候補列挙で走査し直すため、区間ごとに呼ぶと区間数 × 走査行数の計算量になり（UPDATE と DELETE が交互なら DoS になる）、`21000` の判定により UPDATE と DELETE の対象行は互いに素になるため。即時の UNIQUE などの検査が適用順に依存することは、D6 自体が「PG17 でも計画依存」と認めている。#3354 の INSERT 区間は §10（UPDATE → DELETE → INSERT）、#3355 の行トリガ順の再判断に申し送る
+- **押し下げ（D3）の見送り**: `ON` の等値キー以外（片側だけを参照する conjunct を含む）はすべて残余に残す。正しさが押し下げの有無に依存しないため。BY TARGET／BY SOURCE の有無を見ても押し下げは入れない（#3354 の判断は §10）
+- **条件内の結合キー**: `WHEN ... AND` の条件で束縛器が結合キーへ振り分けた「対象と元をまたぐ列同士の等値」は、残余と別に評価する（`ON` と同じ正準バイト列の一致。どちらかが NULL なら真にしない）。落とすと条件が黙って広がるため
+- **評価ビューの並び**: 各条件の残余と各 SET 式の元の列リストは独自の並びを持つため、評価ビューは評価単位ごとに「対象の走査結果 ++ その単位が参照する元の列」を組み立てる。走査の投影は全評価単位の参照列の和集合
+- **コマンドタグの前倒し**: D13 の担当は #3356 だが、件数（`MERGE n`）を観測するために `SqlOutcome::Merge` と wire のタグ写像を本 Issue で先に入れた。#3356 は `RETURNING` 側のタグと `merge_action()` を担う
+- **PG17 との突き合わせ（#3358 の確認項目に加える）**: `21000` の文言、UPDATE → DELETE の適用順が即時の UNIQUE／FK 検査に与える差（入力は順序に依存しないものを使う）、行トリガの発火順（#3355 が再判断）、コマンドタグ `MERGE n`（拡張クエリを含む）
+
+## 10. #3354 の実行（`WHEN NOT MATCHED [BY TARGET]` の INSERT と `BY SOURCE`）
+
+実装は `core::merge_exec`（外部保持の列挙と INSERT 区間）・`sql::join::merge_plan`（句の種類ごとの評価・INSERT 値の評価）・`sql::insert_select::finish_bound_insert`（INSERT ... SELECT と共有する `BoundInsert` の組み立て）・`tenant::merge_target_preflight`（INSERT ポリシーの拒否）。第 2 の結合実行器・第 2 の挿入経路は作らない。
+
+### 外部保持の列挙（D3・D4 の具体化）
+
+- 第 1 段の対象候補の述語の中で、`matches_of` が返した全位置に「元の行が一致した」フラグを立てる。一致の定義は `ON`（等値キーと残余）が真であることだけで、どの句が選ばれたか（DO NOTHING・どの句も真にならない場合を含む）には依存しない。フラグは BY TARGET の句があるときだけ確保し、確保前に共有バイト予算へ計上する
+- 対象候補ごとの振り分け: 一致が 1 件以上なら MATCHED の句だけを評価する（従来どおり。`21000` の判定もここ）。一致が 0 件なら BY SOURCE の句だけを評価する。対象の結合キーが NULL の行は一致 0 件になり BY SOURCE 側へ入る。一致があるのに MATCHED の句がどれも発火しない行は BY SOURCE を受けない
+- BY SOURCE の句は宣言順で最初に条件が真になった句を採る（UPDATE は SET を評価して保持、DELETE は id を保持）。一致 0 件なので `21000` は起きない。MATCHED の対象行と BY SOURCE の対象行は互いに素なので、第 3 段の UPDATE・DELETE の区間をそのまま共有する
+- 対象候補の列挙が終わった後、フラグの立っていない元の行（結合キーが NULL の行を含む）を走査順に辿り、BY TARGET の句を宣言順に評価する。INSERT が選ばれたら値を評価して句ごとに保持する。1024 行ごとに中断要求（`57014`）を確認し、条件評価の回数（行数 × BY TARGET の句数）・保持する値は既存の比較回数・共有バイト予算へ計上する
+- 対象の走査は省略しない。BY TARGET だけの MERGE でも一致フラグのために対象候補を列挙し、走査行数の上限（`54000`）は BY SOURCE の有無によらず同じ列挙で数える
+- 評価ビュー: BY SOURCE は対象行だけ（元の列は空）、BY TARGET は対象側を全列 NULL で埋めた「対象 ++ 元の列」。束縛段が各句の可視範囲を片側に限っているので、反対側を参照する計画は存在しない
+
+### INSERT 句の評価と書き込み
+
+- 値の 4 種（列参照・リテラル・定数式・元の列を含む式）は `UPDATE SET` と同じ計画と評価関数を共有する。裸の `DEFAULT`・列リストにない列は「省略列」として `finish_bound_insert`（`fill_omitted_columns`）が補完する（DEFAULT・生成列・IDENTITY／`DEFAULT nextval` の印）。`DEFAULT nextval` と IDENTITY の採番は複数行 VALUES と同じく書き込み段が文の中で行う
+- 列参照のコピー: 式経路が受けない代入先の型（NUMERIC・ENUM・JSONB 等）への、型が異なる列参照（`assignable` な組。例: 整数 → NUMERIC）は、`INSERT ... SELECT` と同じ代入変換（`sql::insert_select::ConversionPlan::convert_single`）で運ぶ。`UPDATE SET` は従来どおり型が一致する組だけ（異なる組は `42804`）
+- 疑似列 `id`: 元の整数列・疑似列 `id` は `INSERT ... SELECT` と同じ規則（NULL・負数は `22000`）、リテラルはその値、移行済み表の省略は書き込み段が採番する
+- 影響行数の上限は UPDATE・DELETE・INSERT の計画件数の合計で判定する（DO NOTHING は数えない）。INSERT の行数上限とバッチの上限（INDEX-4）も第 3 段より前に判定する。いずれも超過は `54000` で副作用ゼロ
+- 書き込みは句ごとに `sql::exec::execute_insert_batch_with_schema_in`（共有 write txn）へ渡す。バッチは `id` 省略の一様性を要求し、句ごとに列リストが異なるため。挿入は対象を走査し直さないので、句数（構文段の上限）× 行数のコストにはならない。台帳は記録しない（`operation_id` は渡さない。#3357）
+- `rows_affected` は UPDATE・DELETE の実変更行数に挿入行数を足した値（DO NOTHING は含めない）
+- 採番・DEFAULT 時刻のスコープ（`core.rs` の `insert_sequence_scope`・`insert_default_clock_scope`）: INSERT 句を含む MERGE だけが許可リストに入る（UPDATE・DELETE だけの MERGE は張らない）。文の時刻は先頭で 1 度だけ確定し、SET・VALUES の時刻関数と省略列の `DEFAULT now()` で共有する（`INSERT ... SELECT` と同じ）
+
+### 意図的な変更・見送り（後続への申し送り）
+
+- **適用順（D6 からの変更）**: UPDATE の句ごと → DELETE の最大 1 回 → INSERT の句ごと（句の添字の昇順。各句の中は元の走査順）。PG17 の元の行順の逐次適用と異なり、即時の UNIQUE などの検査が適用順に依存する形（同じキーを DELETE と INSERT が触れる等）は結果が異なり得る。D6 が「PG17 でも計画依存」と認める範囲で、突き合わせは順序に依存しない入力で行う（#3358）
+- **押し下げ（D3）は対応しない**: 片側だけを参照する `ON` の conjunct を押し下げると、BY TARGET／BY SOURCE で「未一致」になる行の集合が変わる。残余に残せば、BY TARGET／BY SOURCE の有無によらず正しい。最適化のみで正しさに影響しないため、実装しない
+- **INSERT 側の利用者ポリシー（#3355 で撤去。§11）**: 対象表に INSERT 側のポリシーが適用される（RLS 有効）場合は、INSERT 句があるとき `tenant::merge_target_preflight` が固定文言の `0A000`（既存の「row-level security policies is not supported yet」と同じ文言）で拒否する。書き込み段も挿入時に同じ検査を持つが、MERGE 全体のポリシーの合成は #3355 が担うため、RLS 相当を緩めない fail-closed の多層防御にした
+- **PG17 との突き合わせ（#3358 の確認項目に加える）**: 適用順の差、未一致の元行が重複するときの挙動（両方挿入・UNIQUE があれば `23505`）、NULL キーの扱い、`MERGE n` の件数（INSERT を含む）
+
+### 対象外（受け皿）
+
+| 項目 | 受け皿 |
+| ---- | ------ |
+| `RETURNING`・`merge_action()` | #3356 |
+| 台帳記録（`USING OPERATION_ID`）・`OpTag`・`EXPLAIN MERGE`・crash 耐性 | #3357 |
+| ビュー対象・文トリガ・利用者ポリシー（INSERT ポリシーを含む）・行トリガ順の再判断 | 実装済み（#3355。§11） |
+| PG17 との突き合わせ・3 テナントの越境の網羅 | 実施済み（§14。未実施分は §14 末尾） |
+| ON の片側 conjunct の押し下げ | 対応しない（上記） |
+| 元の疑似列 `id` を `id` 以外の列の値にする形（`INSERT (id, x) VALUES (s.id, s.id)` 等） | 対応しない（現行の制限として固定する。固定文言の `0A000`。要望が出た時点で別途起票する）。UPDATE の SET の同じ形と同じ制限 |
+
+## 11. #3355 の実装（制約・生成列・トリガ・ビュー・RLS の規則）
+
+実装は `core::merge_exec`（結線）・`tenant::merge_triggers`（文トリガの計画・発火・抑止）・`trigger::plan::plan_row_triggers`（抑止の唯一の点）・`sql::policy_eval`（既存行の DELETE 側の USING）・`tenant`（SELECT 側の USING で絞る候補列挙・子側 FK 検査の先送り）・`catalog::view_write_fingerprint_in_read_txn`（束縛と同じスナップショットの指紋）。第 2 の書き込み経路は作らない。
+
+### 決定
+
+- **文トリガ**（D12 の確定）: WHEN 句に現れた操作の種類ごとに 1 回。DO NOTHING は種類に数えず、書いた行が 0 件でも発火する。BEFORE は INSERT → UPDATE → DELETE、AFTER は DELETE → UPDATE → INSERT。入口（事前判定の後・元の走査より前）で BEFORE、全区間の書き込みと先送りした FK の補完検査の後で AFTER を発火する。第 3 段の間は `MergeStatementTriggerScope`（表名とトリガの深さが鍵）が `plan_row_triggers` に対象表の文トリガ群を空で返させる。トリガ本体が同じ表へ書く入れ子の DML は深さが違うので抑止されない（fail-open の防止）。`UPDATE OF` の文トリガは全 UPDATE 句の SET 列の和集合で判定する。`TriggerWrittenTablesScope` は BEFORE の前に張り、文トリガが書いた表も `mark_written` する
+- **利用者ポリシー**（D8 の具体化。RLS-13）: 第 1 段の候補列挙は SELECT 側の USING で対象を絞る（隠れた行は一致にも BY SOURCE にも入らない）。UPDATE か DELETE を選んだ行（MATCHED・BY SOURCE の両方）には UPDATE 側または DELETE 側の USING を評価し、満たさなければ行を黙って飛ばさず文全体を `42501` で拒否する（行を書く前なので副作用ゼロ。`ON CONFLICT DO UPDATE` の既存行検査と同じ規則）。新しい行の WITH CHECK は第 3 段の既存の検査点。公開 enum に variant は足さず、既存の `RowSecurityPolicyViolation`（USING 側の文言）を使う。`row_security = off` の `42501` は従来どおり事前判定が担う
+- **ビュー対象**（TABLE-43）: 基底表へ書き換えて実行する。ビュー述語は第 1 段の対象候補の絞り込みとして評価し、`ON` の残余には入れない（入れると BY SOURCE の DELETE・UPDATE がビューの外の基底行に及ぶ）。`WITH CHECK OPTION` は第 3 段を `ViewWriteScope` で包み、既存の検査点が `44000` にする。束縛と同じ読み取りスナップショットで指紋を取り、writer 取得後・第 1 段より前に write txn で照合する（0 行の MERGE でも並行 DDL を検出する）。列別名つき・利用者列を `id` として公開するビューは従来どおり `0A000`
+- **INSTEAD OF トリガを持つビュー**（D14 の再判断の結論）: 対応しない。WHEN 句に現れたイベントのどれか 1 つでも INSTEAD OF の行トリガがあれば固定文言の `0A000`。束縛時（自動更新可能性の判定より前）と write txn 内（writer 取得後）の両方で判定する
+- **生成列・CHECK・UNIQUE・FK**: 各操作が既存の書き込み経路の検査点を通る。UPDATE 句と INSERT 句が両方ある（または INSERT 句が 2 つ以上ある）ときは、子側の FK 検査を `MergeFkDeferScope`（#3354 の `InsertFkDeferScope` を一般化）で先送りし、全区間の後に走査で 1 回検査する。先送りの対象は子側の検査だけで、参照先側の検査は区間ごとの即時検査のまま
+- **権限**（D10 の検証）: 元の表・ビュー・部分クエリの中の表の SELECT は、既存の write ゲート（対象表を差し引いた残りの参照へ SELECT を課す）が判定することを結合テストで確かめた。ゲートの変更は不要だった
+
+### 意図的な差・対応しない形（#3358 の確認項目に加える）
+
+- AFTER STATEMENT の順（DELETE → UPDATE → INSERT）と `UPDATE OF` の文トリガの和集合判定
+- 行トリガは今の区間方式（UPDATE の句ごと → DELETE → INSERT。AFTER ROW は各区間の終わりに発火）を維持する。PG17 は AFTER ROW を文の終わりにまとめて発火するが、適用順そのものが §9・§10 のとおり PG17 と異なり、同じ部類の差のため変えない（対応しない）
+- 親側 FK の NO ACTION の区間差（DELETE した親と同じキーを INSERT で作り直す形）は扱わない。参照先側の検査は区間ごとの即時検査で、文末へ回す仕組みが無い（対応しない）
+- RLS の USING 違反の文言は「new row violates ... (USING expression)」で、PG17 の「target row ...」と異なる（SQLSTATE は同じ `42501`）
+- ビュー対象のエラー: 指紋の不一致は固定文言（`invalid_input`）で書き込まずに拒否する
+
+### 対象外（受け皿）
+
+| 項目 | 受け皿 |
+| ---- | ------ |
+| `RETURNING`・`merge_action()`（#3356 で実装済み。§12）、結合形 DML の RETURNING とトリガの併用（対応しない。§12） | #3356 |
+| 台帳記録・BEFORE STATEMENT と台帳の事前照合の順序・ビュー経由の台帳ドメイン・EXPLAIN・crash 耐性 | #3357 |
+| PG17 との突き合わせ（上記の確認項目） | 実施済み（§14。未実施分は §14 末尾） |
+| INSTEAD OF トリガを持つビューを対象にする MERGE | 対応しない（上記） |
+| AFTER ROW を文末にまとめて発火する形・親側 FK の NO ACTION を文末へ回す形 | 対応しない（上記。突き合わせは #3358） |
+
+## 12. #3356 の実装（RETURNING・`merge_action()`・タグ）
+
+PostgreSQL 17 の文書（merge.sgml の output_expression）・ソース（`transformMergeSupportFunc`）・回帰テスト（merge.out）で確認した決定。
+
+- **`*` の展開順**: 元の全列に続けて対象の全列（`UPDATE ... FROM` の「対象 → FROM」とは逆）。`bind_merge_returning` が展開順を切り替える。ビューは公開列だけを展開する
+- **`merge_action()`**: 列名 `merge_action`・型 text。値は `INSERT`／`UPDATE`／`DELETE`。`AS` 別名を付けられる。MERGE の `RETURNING` の外（SELECT・WHERE・単独 DML・UPDATE FROM・DELETE USING の `RETURNING`・MERGE の ON・WHEN の条件・SET 右辺）は `42601`（PG17 の `ERRCODE_SYNTAX_ERROR`。`42883` に落とさない）。MERGE の `RETURNING` の中でも最上位の項目でなければ固定文言の `0A000`
+- **行の内容**: INSERT・UPDATE は書いた後の値（DEFAULT・採番・生成列を反映。既存の書き込み経路の最終行を commit 前に受け取る）、DELETE は削除前の値。元の行が無い BY SOURCE の行では元の列が NULL。採番方式の表は行 id を隠す
+- **行の並び**: 対象候補の走査順（UPDATE・DELETE。テナント内 id 昇順）→ 元の走査順の INSERT。PG17 の出力順は結合の計画に依存して決まらないため、本実装は固定した契約を持つ（merge.out の例と同じ並びになる入力で一致する）。完全な突き合わせは #3358
+- **件数・タグ**: `RETURNING` の有無によらず `MERGE n`（n は UPDATE・DELETE・INSERT の実変更行数の合計。DO NOTHING は含めない）。応答は `SqlOutcome::Returning`（`DmlCommand::Merge`）で、`RETURNING` なしは従来の `SqlOutcome::Merge`
+- **実行**: 第 1 段が選んだ元の走査位置を記録し（確保前に共有バイト予算へ計上）、第 3 段の既存の書き込み経路の capturing 版（UPDATE は `update_rows_joined_unchecked` の `project`、DELETE は `delete_rows_where_capturing_unchecked`、INSERT は `execute_insert_batch_with_schema_in_projecting`）が書き込み txn の中で `MergeReturningSink` へ行を積む。第 2 の書き込み経路は作らない。収集中の失敗（式の評価エラー・`54000`・`XX000`）は commit しないので副作用ゼロ
+- **束縛**: 束縛エラー（`42703`・`42702`・`42P01`・`42601`・`0A000`）は writer・台帳・行より前に返る。Describe は束縛結果から Execute と同じ列を返す
+- **トリガとの併用（対応しない）**: 該当トリガがあれば固定文言の `0A000`（D14）。BEFORE STATEMENT が書いた後に拒否する経路を作らない
+- **テナント境界**: 対象側は既存の候補列挙（所有かつ可視・RLS-13 の SELECT USING）に閉じ、元側は書き込むセッションの `PolicyContext` で走査した行だけ。収集器でも RLS を再判定する（不可視の更新・削除行は積まず、不可視の挿入行は `XX000`）
+
+### 対象外（受け皿）
+
+| 項目 | 受け皿 |
+| ---- | ------ |
+| 台帳記録（`USING OPERATION_ID`）・`for_merge` の材料・EXPLAIN・crash 耐性 | #3357 |
+| PG17 との行順・境界の完全な突き合わせ、psql 経由の越境試験 | 実施済み（§14。未実施分は §14 末尾） |
+| トリガを持つ表での `RETURNING` の発火 | 対応しない（上記。`trigger-update-delete.md` の現行の契約） |
+| 式の内側の `merge_action()`・元の列を式の中で参照する `RETURNING` | 対応しない（上記。要望が出た時点で別途起票する） |
+
+## 13. #3357 の実装（台帳・EXPLAIN・crash 耐性）
+
+### 決定
+
+- 台帳（D9・D11）: `OpTag::Merge = 30`、`for_merge`。材料は文のトークン列から末尾の `;`・`USING OPERATION_ID` 句・最上位の `RETURNING` を除いたもの。除去は解析器が `RETURNING` を読み始めた位置を記録して行い、判定を二重に持たない。`UPDATE ... FROM` は `RETURNING` を材料に含めるが、MERGE は含めない（RETURNING の有無・投影が違う再送も `23505`）。残余リスクとして UDF 定義は材料に入らない（UPDATE FROM と同じ）
+- 順序（D10）: 束縛 → writer 取得 → 台帳の事前照合 → ビュー指紋・INSTEAD OF の照合 → 計画 → BEFORE STATEMENT → 第 1〜3 段 → AFTER STATEMENT → 確定記録（1 回）。再送はトリガ・採番・走査より前に `23505`／`22023` で止まる。失敗した文は commit されず台帳を消費しない。0 行の MERGE も記録する
+- 区間: UPDATE・DELETE・INSERT の各区間は記録しない台帳モード（`LedgerMode::substatement_mode`。データ変更 CTE の副文と同じ写像）で書く。区間ごとに記録すると 2 つ目の区間が `23505`／`22023` になるため
+- ビュー対象（TABLE-43）: 文ハッシュをビュー名のドメインで包み、事前照合と確定記録の両方に使う。台帳のキー（表名）は基底表のまま。ビュー経由の再送は `23505`、同じ id を基底表への MERGE に使うと `22023`
+- `parsed_operation_id` に参加させ、同一 Tx 内の再利用検査・`READ ONLY`（`25006`）・一時表・PL/pgSQL・DO・データ変更 CTE の各ゲートを既存 DML とそろえる
+- EXPLAIN（D13）: `EXPLAIN [ANALYZE|VERBOSE] MERGE` を `ExplainDml::Merge` として同じ構文入口で受理する。木は根 `merge`（`when_clauses`・句ごとの `when: <kind> <action> condition=<present|none>`・`returning`・`operation_id`）の下に `join`（`join_method: hash`・`join_type`・`join_keys`・`join_filter`）と 2 つの `scan`。`join_type` は BY SOURCE の句があれば `left`、BY TARGET の句があれば `right`、両方なら `full`、なければ `inner`。元が部分クエリのときは実行せず `source_kind: subquery`。ANALYZE は実際に実行し台帳へ記録する。権限ビットは非 EXPLAIN と共通。`$n` は `42601`、一時表・INSTEAD OF つきビュー・分割実行は `0A000`。トリガ依存の拒否（`RETURNING` とトリガの併用）は実行時にだけ出る（UPDATE FROM の EXPLAIN と同じ）
+- crash 耐性: `crash_tool_cross_table` の `merge` モード。1 文の MERGE が 3 区間を書き、途中 kill 後に全区間が残るか全く残らないか、台帳と行の一致、再送の `23505` を検査する。`self-check` が世代の混在・行の欠け・台帳の欠落を検出できることを確かめる
+
+### テスト
+
+- `sql79_merge_ledger.rs`・`sql79_merge_explain.rs`（engine）、`wire_sql79_merge_ledger.rs`（wire）、`scripts/crash_test_cross_table.sh` の merge 段。拒否を固定していた既存テストは再送の固定へ書き換えた
+
+### 対象外（受け皿）
+
+| 項目 | 受け皿 |
+| ---- | ------ |
+| PG17 との突き合わせ・3 テナントの越境の網羅・psql 経由の越境試験 | 実施済み（§14。未実施分は §14 末尾） |
+| INSTEAD OF 経由・データ変更 CTE 内・PL/pgSQL や DO 内・一時表関与・分割実行・NoSQL 表層 | 対応しない（D14 の現行契約） |
+| EXPLAIN でのトリガ依存の拒否の事前表示 | 対応しない（UPDATE FROM の EXPLAIN と同じ契約） |
+
+## 14. #3358 の突き合わせ（PG17 実測・3 テナントの越境・psql 経由）
+
+Issue #3358（親 #3349）。ポインタ: SQL-79・SQL-53・TABLE-43・TABLE-45・TABLE-50・RLS-10・RLS-13・TASK-352。本番コード・依存・unsafe・CI 構成の変更なし（テストと文書のみ）。
+
+### 採取環境と表
+
+- PostgreSQL 17.12（Debian 17.12-1.pgdg13+1）の実機で採取した。期待値は実機の値だけで、engine の出力・回帰テストの期待値・記憶からは書かない。採取スクリプトはリポに置かず、再採取の手順を各テストの冒頭コメントに書く
+- `crates/engine/tests/data/merge_when_pg17.tsv`（832 件）: 句 16 種（MATCHED／NOT MATCHED／NOT MATCHED BY SOURCE × 条件の有無 × DO NOTHING を含む操作）の長さ 1・2 の全順列を `base`・`dup`（元に同じキーの行が 2 つ）の両方で、長さ 3（MATCHED・NOT MATCHED・BY SOURCE を 1 句ずつ）を `RETURNING` なし・ありで流した件数・最終状態・`RETURNING` 行・SQLSTATE。制約・索引を持たせず、適用順に依存しない入力にしてある（D6）
+- `crates/engine/tests/data/merge_boundaries_pg17.tsv`（49 件）: D2（元が対象を相関参照）・D4（反対側の参照は `42P01`、反対側にしか無い非修飾の列は `42703`）・D5（`21000` と文言 `MERGE command cannot affect row a second time`）・D13（`merge_action()` を使えない場所は `42601`、`RETURNING *`・`t.*`・`s.*` の列名の並び）・構文の拒否・ビュー対象（自動更新できるビューは成功、集約ビューは `55000`）
+- 照合は `sql79_merge_pg17_parity.rs`。全件を明示 Tx（BEGIN → MERGE → SELECT → ROLLBACK）で流し、末尾 `;` の有無でも同じ結果になること、失敗後・ROLLBACK 後に状態が初期のままであることを確かめる。不一致は集めて 1 回で失敗にする
+
+### 結果
+
+- WHEN の組み合わせ 832 件はすべて PG17 と一致した（直した点は無い）。D1（到達できない句は `42601`。種類をまたぐ並びは受理）・D2・D4・D5（先が DO NOTHING で後が UPDATE の形は、実際に更新した行だけが 2 回目の変更に数えられ `21000` にならない。`21000` の文言は一致）・D13 の各 SQLSTATE と列名の並びも一致した
+- 未解消の差（`INTENDED_DIFFS` に engine 側の現行値と 1 対 1 で固定。差が消えたら失敗する）。いずれも fail-closed の拒否で、SQLSTATE だけが異なる
+  - 修飾付きの SET 左辺（`SET t.x = 1`）: PG17 は `42703`、本実装は `42601`。UPDATE と共通の構文層の拒否コードなので MERGE 単独では直さない
+  - WHEN 条件内の集約（`AND count(*) > 1`）: PG17 は `42803`、本実装は `42601`
+- ParameterDescription: 値位置の `$n`（`SET x = $1`・`INSERT ... VALUES ($1, $2)`）は INTEGER 列へ束縛され PG17 と同じ int4（23）。条件内の `$n`（`AND s.v > $1`）は PG17 が受理するが本実装は未対応で、`42601` の fail-closed 拒否のまま（`wire_sql79_merge_pg17_parity.rs` で固定。意図した差）
+- コマンドタグ `MERGE n` は簡易（末尾 `;` なし・あり）と拡張クエリで PG17 の件数と一致する（`wire_sql79_merge_pg17_parity.rs`）
+
+### 3 テナントの越境（`sql79_merge_cross_tenant.rs`）
+
+- alice・bob・carol が対象 `t` と元 `s` の両方に行を持ち、両表に利用者ポリシー（SELECT・UPDATE・DELETE・INSERT）を置く。他テナントの行は、同じキーの元の複数行（漏れれば `21000`）・WITH CHECK に反する値（漏れれば `42501`）・BY SOURCE の対象になる行にしてある
+- 句の種類ごと（MATCHED の UPDATE・DELETE、BY TARGET の INSERT、BY SOURCE の UPDATE・DELETE、DO NOTHING、`RETURNING merge_action()`、`USING OPERATION_ID`、部分クエリの元、ポリシー違反）を autocommit・明示 Tx・末尾 `;` の有無で流す。alice の結果（件数・最終状態・`RETURNING` 行・SQLSTATE と文言）が「alice の行だけを持つ世界」と一致すること、bob・carol の全行が前後で同一であること、エラー文言に他テナントの値・テナント id が出ないことを固定する
+- D8 の非対称性: 他テナントの Public の対象行は一致・BY SOURCE のどちらでも書き込まれない（`another_tenants_public_target_rows_are_never_written`）
+
+### wire・psql 経由
+
+- 層 A（`wire_sql79_merge_pg17_parity.rs`。常時 `make ci`）: PG17 の実測値を直書きした代表ケースを、簡易（末尾 `;` なし・あり）・拡張クエリで 3 テナントから流し、タグ・列名・行・ErrorResponse の SQLSTATE・ReadyForQuery の状態・拒否応答のテナント間バイト一致を固定する
+- 層 B（`three_client_e2e.rs` の `three_clients_run_merge_across_three_tenants`。opt-in・`make e2e-three-client`）: psql・psycopg・node `pg` の無改造クライアントで、psql の `-c "MERGE ...;"` の単独送信・タグ `MERGE 6`・`RETURNING` の行・他テナント不変・拒否の SQLSTATE を確かめる。実行記録は [three-client-e2e-harness.md](three-client-e2e-harness.md)
+
+### 未実施（要対応）
+
+今回の突き合わせに含めなかった確認項目。いずれも §11・§9・§10 の現行契約のまま。
+
+- 文トリガの発火順（BEFORE は INSERT → UPDATE → DELETE、AFTER は DELETE → UPDATE → INSERT）と `UPDATE OF` の文トリガの和集合判定の実機照合
+- RLS の PG17 実機照合（非 superuser ロールでの USING 違反の文言差の実測）。越境は engine 内の差分オラクルで固定した
+- 適用順が即時の UNIQUE／FK 検査に与える差・AFTER ROW の発火時点・親側 FK の NO ACTION の区間差の実測（§9〜§11 が宣言済みの意図した差）
+- ビュー対象の ParameterDescription の OID（PG17 実測は int4）
+
+## セキュリティ
+
+- アクセス制御: D8 の「所有かつ可視」の一致集合で、他テナントの行に BY SOURCE の DELETE・UPDATE が及ぶ経路を構造的に塞ぐ。D10 で WHEN に現れた操作の種類ごとの権限を課し、MERGE 経由の権限昇格を防ぐ
+- インジェクション: 構文段はトークン列だけを扱い、未検証の入力を文字列連結で SQL・計画へ組み立てない。台帳の材料もトークン列だけにする
+- 不安全な設計: 判定をすべて書き込みの前に行う 3 段構成で、`21000`・`54000` を副作用ゼロにする。WHEN 句の数・代入数・結合の上限で無制限の資源確保を防ぐ。扱わない形は fail-closed
+- ログ・エラー: 固定文言と入力された名前だけにし、件数・他テナントの存在を出さない。EXPLAIN に見積もり・値を載せない
+- 依存の変更なし
+
+## テスト方針
+
+各子 Issue の結合テストは `crates/engine/tests/sql_t40_up/` の束ね方に従う（`coding-rust.md` のテスト節・README「engine の結合テストの束ね方と個別実行」）。PG17 との突き合わせは §14（#3358）が担う。

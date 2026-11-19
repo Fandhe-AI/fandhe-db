@@ -211,6 +211,10 @@ enum OpTag {
     /// （全副文と主クエリ）を 1 つの台帳エントリで扱うため、送られた文のトークン列だけを材料にし、
     /// 単独の DML や [`OpTag::InsertSelect`] とは別ドメインに分離する。
     DataModifyingCte = 29,
+    /// `MERGE`（Issue #3357・SQL-79・RECOVER-10/11。設計記録 `docs/design/sql-merge.md` D11）。文全体
+    /// （全 WHEN 句）を 1 つの台帳エントリで扱うため、送られた文のトークン列だけを材料にし、
+    /// [`OpTag::UpdateFrom`] 等の単独の DML とは別ドメインに分離する。
+    Merge = 30,
 }
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
@@ -453,7 +457,7 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
             let has_null = array_value.has_null();
             let mark: u8 = if has_null { 0x80 } else { 0 };
             // 2 次元以上（Issue #1605）は要素型タグの前に未使用のマーカー 0x40・次元数・各次元長を
-            // 積む。1 次元の先頭バイトは要素型タグ（0..=13）または NULL 印付き（0x80 以上）で
+            // 積む。1 次元の先頭バイトは要素型タグ（0..=18）または NULL 印付き（0x80 以上）で
             // 0x40 とは衝突せず、`{{1,2},{3,4}}` と `{1,2,3,4}` が別ハッシュになる。1 次元の
             // 入力バイト列は従来と同一。
             if let crate::row_codec::ArrayValue::Multi(m) = array_value {
@@ -497,6 +501,76 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
                         }
                         if let Some(item) = item {
                             b.push_u64(i64::from(*item) as u64);
+                        }
+                    }
+                }
+                // Issue #3230 の新規採番（既存タグのバイト列は不変）。
+                crate::row_codec::ArrayValue::SmallInt(items) => {
+                    b.push_u8(14 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(i64::from(*item) as u64);
+                        }
+                    }
+                }
+                // Issue #3232 の新規採番（既存タグのバイト列は不変）。
+                crate::row_codec::ArrayValue::Time(items) => {
+                    b.push_u8(15 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(*item as u64);
+                        }
+                    }
+                }
+                // Issue #3234 の新規採番（既存タグのバイト列は不変）。生の三要素を固定順に積む
+                // （`1 mon` と `30 days` は等価でもバイト列が異なる。interval.rs の契約どおり）。
+                crate::row_codec::ArrayValue::Interval(items) => {
+                    b.push_u8(17 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(i64::from(item.months) as u64);
+                            b.push_u64(i64::from(item.days) as u64);
+                            b.push_u64(item.micros as u64);
+                        }
+                    }
+                }
+                // Issue #3235 の新規採番（既存タグのバイト列は不変）。ビット長を要素ごとに積み、
+                // `bit(4)` の `1000` と `bit(8)` の `10000000`（同じバイト列）を別ハッシュにする。
+                crate::row_codec::ArrayValue::Bit(items) => {
+                    b.push_u8(18 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(u64::from(item.bit_len()));
+                            b.push_bytes(item.as_bytes())?;
+                        }
+                    }
+                }
+                // Issue #3233 の新規採番（既存タグのバイト列は不変）。
+                crate::row_codec::ArrayValue::TimestampTz(items) => {
+                    b.push_u8(16 | mark);
+                    b.push_u64(items.len() as u64);
+                    for item in items {
+                        if has_null {
+                            b.push_u8(u8::from(item.is_some()));
+                        }
+                        if let Some(item) = item {
+                            b.push_u64(*item as u64);
                         }
                     }
                 }
@@ -1500,6 +1574,18 @@ pub(crate) fn for_data_modifying_cte(
     token_statement_hash(OpTag::DataModifyingCte, statement_tokens)
 }
 
+/// `MERGE` の台帳照合ハッシュ（Issue #3357。ポインタ: SQL-79・RECOVER-10・RECOVER-11・設計記録 D11）。
+///
+/// 材料は呼び出し元が渡す文のトークン列**だけ**で、`USING OPERATION_ID` 句・末尾 `;`・最上位の
+/// `RETURNING` 句は含めない（除去は `sql::allowlist::merge` の検証入口が解析器の記録した位置で行う）。
+/// 行・結合結果の値は材料にしないため、再送時にデータが変わっていても同一文なら同一ハッシュになる
+/// （`23505`）。未束縛の [`Token::Param`] が残っていれば `Err`（fail-closed）。
+pub(crate) fn for_merge(
+    statement_tokens: &[crate::sql::lexer::Token],
+) -> Result<ContentHash, StorageError> {
+    token_statement_hash(OpTag::Merge, statement_tokens)
+}
+
 /// 文のトークン列を長さプレフィクス付きで直列化したハッシュ（結合形 DML 用の共通本体）。
 fn token_statement_hash(
     tag: OpTag,
@@ -1932,6 +2018,19 @@ fn update_where_with_tag(
     Ok(b.finish())
 }
 
+/// CAST の変換先が `TIMESTAMPTZ` を要素に含む配列型（入れ子配列を含む）か。
+/// `push_dml_expr` の `Expr::Cast` 腕が TZ 依存の印を付ける判定に使う。
+fn cast_target_is_timestamptz_array(ty: &crate::sql::cast::CastType) -> bool {
+    use crate::sql::cast::CastType;
+    match ty {
+        CastType::Array(inner) => {
+            matches!(inner.as_ref(), CastType::TimestampTz)
+                || cast_target_is_timestamptz_array(inner)
+        }
+        _ => false,
+    }
+}
+
 /// 分割実行（再開で別接続から同一 operation_id が再送される）の内容照合へ、セッション TimeZone を
 /// 含める。再開時に別の TimeZone で残りの行へ別の条件・値を適用しないための fail-closed
 /// （Issue #1575・#1576 レビュー指摘）。含めるのは TZ に依存しうる文だけ: 表が `TIMESTAMPTZ` 列を持つ、
@@ -1943,10 +2042,14 @@ fn push_partitioned_time_zone(
     schema: &crate::catalog::TableSchema,
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
     let depends = b.is_tz_dependent()
-        || schema
-            .columns
-            .iter()
-            .any(|c| matches!(c.ty, crate::catalog::ColumnType::TimestampTz));
+        || schema.columns.iter().any(|c| match &c.ty {
+            crate::catalog::ColumnType::TimestampTz => true,
+            // `TIMESTAMPTZ[]` の offset なしリテラルも既定 TZ で解釈される（Issue #3233）。
+            crate::catalog::ColumnType::Array(a) => {
+                a.elem() == crate::catalog::ArrayElemType::TimestampTz
+            }
+            _ => false,
+        });
     if depends {
         let tz = crate::datetime::current_session_time_zone();
         if tz.display() != "UTC" {
@@ -2134,9 +2237,24 @@ fn push_dml_assignments(
 ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
     use crate::sql::allowlist::{InsertLiteral, SetValue};
 
+    // 生成列への `SET g = DEFAULT`（TABLE-50・Issue #3328）は何も代入しない受理だけの項で、束縛段が
+    // 捨てる（`bind_set_assignments`）。`id` 指定形 UPDATE は束縛後の SET 列でハッシュするため、
+    // 述語形・結合形も同じ材料（生成列の DEFAULT 項を除く）でハッシュして 2 形の同値判定を揃える
+    // （INSERT が生成列を材料から除くのと同じ方針。RECOVER-11 のポインタ）。
+    let is_generated_default = |name: &str, value: &SetValue| {
+        matches!(value, SetValue::Default)
+            && schema
+                .columns
+                .iter()
+                .any(|c| c.name == name && c.generated.is_some())
+    };
+    let assignments: Vec<&(&str, &SetValue)> = assignments
+        .iter()
+        .filter(|(name, value)| !is_generated_default(name, value))
+        .collect();
     let count = u32::try_from(assignments.len()).map_err(|_| dml_hash_field_too_large())?;
     b.push_raw(&count.to_le_bytes());
-    for (name, value) in assignments {
+    for (name, value) in assignments.into_iter().map(|&(n, v)| (n, v)) {
         b.push_bytes(name.as_bytes())
             .map_err(|_| dml_hash_field_too_large())?;
         // 式（Issue #1544・SQL-45 のポインタ）はタグ 6 ＋ 構文木の直列化
@@ -2164,7 +2282,7 @@ fn push_dml_assignments(
             InsertLiteral::String(s) => {
                 let vector_dim = if repr == DmlVectorRepr::Canonical {
                     schema.columns.iter().find_map(|c| {
-                        if &c.name == name {
+                        if c.name == name {
                             match c.ty {
                                 crate::catalog::ColumnType::Vector(dim) => Some(dim),
                                 _ => None,
@@ -2555,6 +2673,22 @@ fn push_dml_where_predicate(
             });
             push_dml_subquery_tokens(b, inner_tokens)?;
         }
+        // 行値比較（SQL-9・Issue #3255）。述語形 DML は束縛ゲート（行値は束縛段で展開される）より先に
+        // content hash が計算されうるため、Internal にせず新タグ 19（変更禁止）で直列化する。
+        // 直列化順は「演算子の判別子（`ArrayCmpOp::hash_tag`）→ 左辺成分数（u32 LE）→ 左辺の各成分式
+        // → 右辺成分数（u32 LE）→ 右辺の各成分式」。演算子・成分順・成分数の違いは別ハッシュになる。
+        WherePredicate::RowCompare { lhs, op, rhs } => {
+            b.push_u8(19);
+            b.push_u8(op.hash_tag());
+            for side in [lhs, rhs] {
+                let count = u32::try_from(side.len()).map_err(|_| dml_hash_field_too_large())?;
+                b.push_raw(&count.to_le_bytes());
+                for expr in side {
+                    push_dml_expr(b, expr, None)?;
+                    collect_referenced_udfs(expr, udf_registry, referenced)?;
+                }
+            }
+        }
         // `IdCompare` は `sql::subquery` が解決段で生成する内部専用の葉で、構文解析
         // からは作られない（述語形 DML の content hash 対象へ到達しない防御的経路）。
         WherePredicate::IdCompare { .. } | WherePredicate::CorrelatedExists(_) => {
@@ -2679,7 +2813,14 @@ fn collect_referenced_udfs(
             }
             Ok(())
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_referenced_udfs(operand, udf_registry, out)?;
+            }
             for (cond, result) in whens {
                 collect_referenced_udfs(cond, udf_registry, out)?;
                 collect_referenced_udfs(result, udf_registry, out)?;
@@ -2837,7 +2978,14 @@ fn push_set_expr(
                     }
                 }
             }
-            Expr::Case { whens, else_result } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    walk(b, o);
+                }
                 for (c, r) in whens {
                     walk(b, c);
                     walk(b, r);
@@ -2960,8 +3108,20 @@ fn push_dml_expr(
         Expr::Null => {
             b.push_u8(5);
         }
-        Expr::Case { whens, else_result } => {
-            b.push_u8(6);
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            // 検索形はタグ 6 のまま（既存の golden・台帳と互換）。単純形（Issue #3279）は別タグ 23 で
+            // 被演算子を先頭に直列化し、同値の検索形とは別内容として扱う。
+            match operand {
+                None => b.push_u8(6),
+                Some(operand) => {
+                    b.push_u8(23);
+                    push_dml_expr(b, operand, params)?;
+                }
+            }
             let count = u32::try_from(whens.len()).map_err(|_| dml_hash_field_too_large())?;
             b.push_raw(&count.to_le_bytes());
             for (cond, result) in whens {
@@ -3183,6 +3343,11 @@ fn push_dml_expr(
             b.push_u8(16);
             b.push_bytes(ty.to_sql().as_bytes())
                 .map_err(|_| dml_hash_field_too_large())?;
+            // `CAST(... AS timestamptz[])` は offset なしの要素をセッション TimeZone で解釈するため、
+            // 対象表の列型に依らず TZ 依存と印を付ける（Issue #3233 レビュー指摘）。
+            if cast_target_is_timestamptz_array(ty) {
+                b.mark_tz_dependent();
+            }
             push_dml_expr(b, expr, params)?;
         }
         // タグ 17・18（対象ビヘイビア: TABLE-35。Issue #1602。変更禁止）。17 は
@@ -3246,6 +3411,8 @@ fn dml_binop_tag(op: crate::sql::udf_call::BinOp) -> u8 {
         BinOp::Sub => 2,
         BinOp::Mul => 3,
         BinOp::Div => 4,
+        // 追記のみのタグ。既存 1〜9 は不変（golden 互換。Issue #3273）。
+        BinOp::Rem => 10,
         BinOp::Gt => 5,
         BinOp::Lt => 6,
         BinOp::Ge => 7,
@@ -5425,18 +5592,22 @@ mod tests {
             rhs: Box::new(Expr::Number("1".to_string())),
         };
         let with_else = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_gt.clone(), Expr::Number("1".to_string()))],
             else_result: Some(Box::new(Expr::Number("0".to_string()))),
         });
         let without_else = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_gt.clone(), Expr::Number("1".to_string()))],
             else_result: None,
         });
         let different_branch_order = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_lt, Expr::Number("1".to_string()))],
             else_result: Some(Box::new(Expr::Number("0".to_string()))),
         });
         let same_as_with_else = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
             whens: vec![(cond_gt, Expr::Number("1".to_string()))],
             else_result: Some(Box::new(Expr::Number("0".to_string()))),
         });
@@ -5450,6 +5621,44 @@ mod tests {
         assert_ne!(h_with_else, h_without_else);
         assert_ne!(h_with_else, h_different_order);
         assert_eq!(h_with_else, h_same);
+    }
+
+    /// 単純 CASE（Issue #3279）は同値の検索形とは別のハッシュになり（別内容として扱う）、
+    /// 被演算子・比較値の違いも反映される。検索形（`operand: None`）のバイト列は不変。
+    #[test]
+    fn simple_case_hash_differs_from_equivalent_searched_case() {
+        use crate::sql::udf_call::{BinOp, Expr, UdfRegistry};
+
+        let registry = UdfRegistry::default();
+        let simple = |operand: &str, v: &str| {
+            where_predicate_id_gt_zero(Expr::Case {
+                operand: Some(Box::new(Expr::Ident(operand.to_string()))),
+                whens: vec![(Expr::Number(v.to_string()), Expr::Number("1".to_string()))],
+                else_result: None,
+            })
+        };
+        let searched = where_predicate_id_gt_zero(Expr::Case {
+            operand: None,
+            whens: vec![(
+                Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(Expr::Ident("id".to_string())),
+                    rhs: Box::new(Expr::Number("1".to_string())),
+                },
+                Expr::Number("1".to_string()),
+            )],
+            else_result: None,
+        });
+        let h_simple = for_delete_where("t", &[simple("id", "1")], &registry).unwrap();
+        let h_simple_again = for_delete_where("t", &[simple("id", "1")], &registry).unwrap();
+        let h_other_operand = for_delete_where("t", &[simple("n", "1")], &registry).unwrap();
+        let h_other_value = for_delete_where("t", &[simple("id", "2")], &registry).unwrap();
+        let h_searched = for_delete_where("t", &[searched], &registry).unwrap();
+
+        assert_eq!(h_simple, h_simple_again);
+        assert_ne!(h_simple, h_searched);
+        assert_ne!(h_simple, h_other_operand);
+        assert_ne!(h_simple, h_other_value);
     }
 
     /// `Expr::Null`／`Expr::Coalesce`／`Expr::NullIf` がそれぞれ他タグ・互いに
@@ -6184,15 +6393,109 @@ mod tests {
         );
     }
 
-    /// SQL-42・Issue #1521: 文字列リテラルの外の `%`／単独 `#` を含む DELETE は
+    /// SQL-42・Issue #3273: `%` の二項演算を含む DELETE は構文段を通ってハッシュ計算へ到達し、
+    /// `/` を含む同形の文とは別の operation_id になる（`Rem` はタグ 10）。
+    #[test]
+    fn percent_delete_is_accepted_and_hashed_apart_from_division() {
+        use crate::recovery::required_op_id::LedgerMode;
+        use crate::sql::allowlist::{validate_delete_statement, StructuralOnlyLookup};
+
+        let validate = |sql: &str| {
+            validate_delete_statement(
+                sql,
+                &StructuralOnlyLookup,
+                LedgerMode::CompareOnlyWithoutLedger,
+            )
+            .unwrap_or_else(|e| panic!("sql={sql:?} err={e:?}"))
+        };
+        let rem = validate("DELETE FROM t WHERE n % 2 = 0");
+        let div = validate("DELETE FROM t WHERE n / 2 = 0");
+        assert_ne!(rem, div);
+    }
+
+    /// SQL-42・Issue #3274: `dml_binop_tag` の全 variant のタグ値を exact に固定する。
+    /// 既存テストは「互いに異なる」ことしか保証しないため、既存の 1〜9 が付け替えられて
+    /// いないこと（追記のみ。`Rem` は 10）をここで直接固定する。値が変わった場合は永続化済みの
+    /// 台帳との互換を壊したことを意味するため、期待値を更新しない。
+    #[test]
+    fn dml_binop_tag_table_is_golden() {
+        use crate::sql::udf_call::BinOp;
+        for (op, tag) in [
+            (BinOp::Add, 1u8),
+            (BinOp::Sub, 2),
+            (BinOp::Mul, 3),
+            (BinOp::Div, 4),
+            (BinOp::Gt, 5),
+            (BinOp::Lt, 6),
+            (BinOp::Ge, 7),
+            (BinOp::Le, 8),
+            (BinOp::Eq, 9),
+            (BinOp::Rem, 10),
+        ] {
+            assert_eq!(dml_binop_tag(op), tag, "{op:?}");
+        }
+    }
+
+    /// SQL-42・Issue #3274: `%` を含む文の `content_hash` をバイト単位で固定する（DELETE 述語形・
+    /// UPDATE SET 式の単一行形／述語形／分割実行形）。値が変わった場合は永続化済みの台帳との
+    /// 互換を壊したことを意味するため、期待値を更新しない。
+    #[test]
+    fn rem_hash_layouts_are_golden() {
+        use crate::recovery::required_op_id::LedgerMode;
+        use crate::sql::allowlist::{
+            validate_delete_statement, DeleteStatement, StructuralOnlyLookup,
+        };
+        use crate::sql::udf_call::{BinOp, UdfRegistry};
+
+        let delete = validate_delete_statement(
+            "DELETE FROM t WHERE n % 2 = 0",
+            &StructuralOnlyLookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("accepted");
+        let DeleteStatement::Predicate(p) = delete else {
+            panic!("predicate form expected");
+        };
+        let del =
+            for_delete_where("t", &p.where_predicates, &UdfRegistry::default()).expect("hash");
+        assert_eq!(
+            to_hex_1545(del.as_bytes()),
+            "4cda55d9b3324024442e810652dd35067886b6f67a9a855582973912631324b3",
+            "DELETE ... WHERE n % 2 layout changed"
+        );
+
+        let [single, atomic, part] = set_expr_hashes(&bin(BinOp::Rem, ident("n"), num("3")));
+        assert_eq!(
+            to_hex_1545(single.as_bytes()),
+            "8c1c402b138483451c007c56593685d1aa864c494325524e8209a6e8bf572a29",
+            "single-row SET n % 3 layout changed"
+        );
+        assert_eq!(
+            to_hex_1545(atomic.as_bytes()),
+            "b96390d3e3a93c86a654ad32b0e4380a4a03284326bd8d27f9ca756b564fc829",
+            "predicate-form SET n % 3 layout changed"
+        );
+        assert_eq!(
+            to_hex_1545(part.as_bytes()),
+            "dda83443bb9b43c425fd012ef05de50d4514d57c8ff1f932222864d1cb1b038b",
+            "partitioned SET n % 3 layout changed"
+        );
+
+        // `%` と `/` が同形の文は 3 経路すべてで別ハッシュ（再送の取り違えを 22023 で検出できる）。
+        let div = set_expr_hashes(&bin(BinOp::Div, ident("n"), num("3")));
+        for (a, b) in [single, atomic, part].iter().zip(div.iter()) {
+            assert_ne!(a, b);
+        }
+    }
+
+    /// SQL-42・Issue #1521: 文字列リテラルの外の単独 `#`・右辺の無い末尾 `%` を含む DELETE は
     /// 構文段で `42601` となり、ハッシュ計算（`for_*_where`）へ到達しない。
     #[test]
-    fn percent_and_hash_outside_literals_are_rejected_before_hashing() {
+    fn hash_and_dangling_percent_outside_literals_are_rejected_before_hashing() {
         use crate::recovery::required_op_id::LedgerMode;
         use crate::sql::allowlist::{validate_delete_statement, StructuralOnlyLookup};
 
         for sql in [
-            "DELETE FROM t WHERE n % 2 = 0",
             "DELETE FROM t WHERE n # 1 = 0",
             "DELETE FROM t WHERE id = 1 %",
         ] {
@@ -6531,6 +6834,42 @@ mod tests {
         assert_eq!(hash_in("Asia/Tokyo", &without), hash_in("UTC", &without));
     }
 
+    /// TIMESTAMPTZ 列を持たない表でも、`CAST(... AS timestamptz[])` を含む分割実行 UPDATE の
+    /// SET 式はセッション TimeZone が違えば別ハッシュ（Issue #3233 レビュー指摘）。
+    #[test]
+    fn partitioned_update_hash_includes_time_zone_for_timestamptz_array_cast() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::datetime::{SessionTimeZone, SessionTimeZoneScope};
+        use crate::sql::allowlist::SetValue;
+        use crate::sql::cast::CastType;
+        use crate::sql::udf_call::{Expr, UdfRegistry};
+        let registry = UdfRegistry::default();
+        let predicates = partitioned_test_predicates();
+        let schema = TableSchema::new(
+            "t".to_string(),
+            vec![ColumnDef::new("note", ColumnType::Text, true)],
+        );
+        let cast = |ty: CastType| {
+            SetValue::Expr(Expr::Cast {
+                expr: Box::new(Expr::Cast {
+                    expr: Box::new(Expr::String("{2026-01-01 09:00:00}".to_string())),
+                    ty: CastType::Array(Box::new(ty)),
+                }),
+                ty: CastType::Text,
+            })
+        };
+        let tz_arr = cast(CastType::TimestampTz);
+        let int_arr = cast(CastType::Int4);
+        let hash_in = |tz: &str, v: &SetValue| {
+            let _scope =
+                SessionTimeZoneScope::enter(SessionTimeZone::parse_setting(tz).expect("tz"));
+            for_update_where_partitioned("t", &[("note", v)], &predicates, &registry, &schema)
+                .expect("hash")
+        };
+        assert_ne!(hash_in("Asia/Tokyo", &tz_arr), hash_in("UTC", &tz_arr));
+        assert_eq!(hash_in("Asia/Tokyo", &int_arr), hash_in("UTC", &int_arr));
+    }
+
     /// TIMESTAMP 列のみの表でも、3 引数 `date_trunc` を含む分割実行 UPDATE は
     /// セッション TimeZone が違えば別ハッシュ（Issue #1576 レビュー指摘）。
     #[test]
@@ -6835,9 +7174,17 @@ mod tests {
             rhs: Box::new(r),
         }
     }
-    use crate::sql::udf_call::{ArrayCmpOp, Quantifier};
+    use crate::sql::udf_call::{ArrayCmpOp, QuantifiedOp, Quantifier};
     fn quantified(
         op: ArrayCmpOp,
+        quantifier: Quantifier,
+        l: crate::sql::udf_call::Expr,
+        r: crate::sql::udf_call::Expr,
+    ) -> crate::sql::udf_call::Expr {
+        quantified_op(QuantifiedOp::Cmp(op), quantifier, l, r)
+    }
+    fn quantified_op(
+        op: QuantifiedOp,
         quantifier: Quantifier,
         l: crate::sql::udf_call::Expr,
         r: crate::sql::udf_call::Expr,
@@ -7048,10 +7395,12 @@ mod tests {
             (
                 "case when order",
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1"), when_gt("2", "2")],
                     else_result: None,
                 },
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("2", "2"), when_gt("1", "1")],
                     else_result: None,
                 },
@@ -7059,10 +7408,12 @@ mod tests {
             (
                 "case else presence",
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1")],
                     else_result: None,
                 },
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1")],
                     else_result: Some(Box::new(num("0"))),
                 },
@@ -7070,10 +7421,12 @@ mod tests {
             (
                 "case then value",
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "1")],
                     else_result: Some(Box::new(num("0"))),
                 },
                 Expr::Case {
+                    operand: None,
                     whens: vec![when_gt("1", "2")],
                     else_result: Some(Box::new(num("0"))),
                 },
@@ -7207,6 +7560,63 @@ mod tests {
                 "quantified lt vs ge",
                 quantified(ArrayCmpOp::Lt, Quantifier::All, n(), text("{1}")),
                 quantified(ArrayCmpOp::Ge, Quantifier::All, n(), text("{1}")),
+            ),
+            // SQL-9・Issue #3258: LIKE 系の量化形は互いに・比較演算子の量化形とも区別される
+            // （タグ 19 の演算子バイト 7〜10。既存の 1〜6 は不変）。
+            (
+                "quantified like vs ilike",
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: true,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+            ),
+            (
+                "quantified like vs not like",
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: true,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+            ),
+            (
+                "quantified like vs eq",
+                quantified_op(
+                    QuantifiedOp::Like {
+                        negated: false,
+                        case_insensitive: false,
+                    },
+                    Quantifier::Any,
+                    n(),
+                    text("{1}"),
+                ),
+                quantified(ArrayCmpOp::Eq, Quantifier::Any, n(), text("{1}")),
             ),
             (
                 "quantified operand swap",
@@ -7506,6 +7916,7 @@ mod tests {
             BinOp::Sub,
             BinOp::Mul,
             BinOp::Div,
+            BinOp::Rem,
             BinOp::Gt,
             BinOp::Lt,
             BinOp::Ge,
@@ -7625,6 +8036,53 @@ mod tests {
         let mut toks = crate::sql::lexer::tokenize(DM_CTE).expect("tokenize");
         toks.push(crate::sql::lexer::Token::Param(1));
         assert!(for_data_modifying_cte(&toks).is_err());
+    }
+
+    // ---- Issue #3357: MERGE の content_hash（SQL-79・RECOVER-10/11）----
+
+    const MERGE_SQL: &str = "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE";
+
+    fn merge_hash(sql: &str) -> ContentHash {
+        let toks = crate::sql::lexer::tokenize(sql).expect("tokenize");
+        for_merge(strip_operation_id_clause(&toks)).expect("hash")
+    }
+
+    #[test]
+    fn merge_hash_ignores_operation_id_whitespace_and_comments() {
+        let base = merge_hash(MERGE_SQL);
+        assert_eq!(
+            base,
+            merge_hash(&format!("{MERGE_SQL} USING OPERATION_ID 'a';"))
+        );
+        assert_eq!(
+            base,
+            merge_hash(
+                "MERGE  INTO t /* c */ USING s ON t.k = s.k\nWHEN MATCHED THEN DELETE USING OPERATION_ID 'b'"
+            )
+        );
+    }
+
+    #[test]
+    fn merge_hash_is_sensitive_to_statement_and_domain() {
+        let base = merge_hash(MERGE_SQL);
+        for other in [
+            "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DO NOTHING",
+            "MERGE INTO t USING s ON t.k = s.k AND s.k = 'a' WHEN MATCHED THEN DELETE",
+            "MERGE INTO t USING u ON t.k = u.k WHEN MATCHED THEN DELETE",
+        ] {
+            assert_ne!(base, merge_hash(other), "{other}");
+        }
+        // 同じトークン列でも `UPDATE ... FROM` のドメインとは別（タグが違う）。
+        let toks = crate::sql::lexer::tokenize(MERGE_SQL).expect("tokenize");
+        assert_ne!(base, for_update_from(&toks).expect("hash"));
+        assert_ne!(base, for_data_modifying_cte(&toks).expect("hash"));
+    }
+
+    #[test]
+    fn merge_hash_rejects_unbound_param() {
+        let mut toks = crate::sql::lexer::tokenize(MERGE_SQL).expect("tokenize");
+        toks.push(crate::sql::lexer::Token::Param(1));
+        assert!(for_merge(&toks).is_err());
     }
 
     const SEL: &str = "INSERT INTO t (a) SELECT a FROM s WHERE b = 'x' LIMIT 3";
@@ -7996,6 +8454,56 @@ mod tests {
                 b.push_u8(4);
             })
         );
+    }
+
+    /// Issue #3255（SQL-9）: 行値比較の述語形 DML の content hash。演算子・成分順・成分数・
+    /// 左右の入れ替えが別ハッシュで、同一の述語は同一ハッシュ（Internal にしない）。
+    #[test]
+    fn row_compare_where_hash_distinguishes_shape() {
+        use crate::sql::allowlist::WherePredicate;
+        use crate::sql::udf_call::{ArrayCmpOp, Expr};
+        let id = |n: &str| Expr::Ident(n.to_string());
+        let rc = |lhs: Vec<Expr>, op: ArrayCmpOp, rhs: Vec<Expr>| {
+            del_hash(&[WherePredicate::RowCompare { lhs, op, rhs }])
+        };
+        let base = rc(
+            vec![id("a"), id("b")],
+            ArrayCmpOp::Lt,
+            vec![id("c"), id("d")],
+        );
+        assert_eq!(
+            base,
+            rc(
+                vec![id("a"), id("b")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d")]
+            )
+        );
+        let variants = [
+            rc(
+                vec![id("a"), id("b")],
+                ArrayCmpOp::Le,
+                vec![id("c"), id("d")],
+            ),
+            rc(
+                vec![id("b"), id("a")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d")],
+            ),
+            rc(
+                vec![id("c"), id("d")],
+                ArrayCmpOp::Lt,
+                vec![id("a"), id("b")],
+            ),
+            rc(
+                vec![id("a"), id("b"), id("e")],
+                ArrayCmpOp::Lt,
+                vec![id("c"), id("d"), id("f")],
+            ),
+        ];
+        for v in &variants {
+            assert_ne!(&base, v);
+        }
     }
 
     /// 未束縛 `$n` と解決済みの内部の葉（`IdCompare`）は fail-closed。

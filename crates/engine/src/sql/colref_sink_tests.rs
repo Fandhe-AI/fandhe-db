@@ -314,7 +314,7 @@ fn every_literal_accepting_identifier_position_is_recorded() {
 /// 列専用位置（記録済みなのにリテラルへ置き換えると受理されない位置）の既知一覧。
 /// 左辺が列の `IS [NOT] NULL`・`[NOT] IN (list)`・`[NOT] BETWEEN` は、左辺が式の形を受理する
 /// SQL-24 の拡張で列専用ではなくなった。残るのは、サブクエリ連動（`IN (SELECT)`・`ANY`・
-/// スカラー比較）の左辺と、列名がそのまま出力名・構造になる位置（集合演算の枝・DISTINCT・
+/// スカラー比較）の左辺と、列名がそのまま出力名・構造になる位置（DISTINCT・
 /// 窓の PARTITION BY／ORDER BY・RETURNING など）。変数を置くと置換後に構文エラー（42601）になる。
 const COLUMN_ONLY: &[&str] = &[
     "SELECT DISTINCT a FROM t @2 SelectItemBare",
@@ -322,8 +322,6 @@ const COLUMN_ONLY: &[&str] = &[
     "SELECT sum(n) OVER (PARTITION BY a ORDER BY m) FROM t @9 Value",
     "SELECT sum(n) OVER (PARTITION BY a ORDER BY m) FROM t @12 Value",
     "SELECT * FROM t WHERE a IN (SELECT a FROM u) @5 WhereHead",
-    "SELECT a FROM t UNION SELECT a FROM u @1 SelectItemBare",
-    "SELECT a FROM t UNION SELECT a FROM u @6 SelectItemBare",
     "WITH c AS (SELECT a FROM t) SELECT a FROM c @5 SelectItemBare",
     "SELECT * FROM t WHERE n = ANY (SELECT n FROM u) @5 WhereHead",
     "SELECT DISTINCT a, b FROM t ORDER BY a @2 SelectItemBare",
@@ -333,21 +331,9 @@ const COLUMN_ONLY: &[&str] = &[
     "SELECT a, row_number() OVER (PARTITION BY b ORDER BY n DESC) AS rn FROM t @10 Value",
     "SELECT a, row_number() OVER (PARTITION BY b ORDER BY n DESC) AS rn FROM t @13 Value",
     "SELECT a, lag(n) OVER (ORDER BY m) FROM t @11 Value",
-    "SELECT a FROM t WHERE n > 1 UNION ALL SELECT a FROM u WHERE n < 5 @1 SelectItemBare",
-    "SELECT a FROM t WHERE n > 1 UNION ALL SELECT a FROM u WHERE n < 5 @11 SelectItemBare",
-    "SELECT a FROM t INTERSECT SELECT a FROM u @1 SelectItemBare",
-    "SELECT a FROM t INTERSECT SELECT a FROM u @6 SelectItemBare",
-    "UPDATE t SET n = n + 1 WHERE n BETWEEN 1 AND 5 RETURNING a, n @15 SelectItemBare",
-    "UPDATE t SET n = n + 1 WHERE n BETWEEN 1 AND 5 RETURNING a, n @17 SelectItemBare",
     "DELETE FROM t WHERE a IN (SELECT a FROM u) @4 WhereHead",
     "DELETE FROM t WHERE n > (SELECT max(n) FROM u) @4 WhereHead",
-    "DELETE FROM t WHERE a = 'x' AND n BETWEEN 1 AND 5 RETURNING a, n @14 SelectItemBare",
-    "DELETE FROM t WHERE a = 'x' AND n BETWEEN 1 AND 5 RETURNING a, n @16 SelectItemBare",
     "DELETE FROM t WHERE n = (SELECT max(n) FROM u) RETURNING n @4 WhereHead",
-    "DELETE FROM t WHERE n = (SELECT max(n) FROM u) RETURNING n @16 SelectItemBare",
-    "INSERT INTO t (a) VALUES ('x') RETURNING a @11 SelectItemBare",
-    "UPDATE t SET n = 5 WHERE a = 'x' RETURNING n @11 SelectItemBare",
-    "DELETE FROM t WHERE a = 'x' RETURNING a @8 SelectItemBare",
 ];
 
 #[test]

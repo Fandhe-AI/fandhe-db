@@ -5,6 +5,8 @@
 //! [`ValidatedUpdateForm`]・[`DeleteStatement`] へ名前の写像と述語の合成だけで書き換える。SQL 文字列は
 //! 組み立てず、書き換え後の束縛・RLS・制約・影響行数の上限・台帳・`RETURNING` の捕捉は既存の基表 DML
 //! 経路（`core.rs` の `execute_*_form` 系）にそのまま乗る（第 2 の書き込み経路を作らない）。
+//! INSTEAD OF トリガ（TABLE-45・Issue #3193）を持つビューへの書き込みは本モジュールを通らずトリガへ振り分けられる
+//! （`core::view_instead_of`。自動更新可能でもトリガを優先する）。
 //! 呼び出し元は `core.rs`: Parse 時は [`check_view_update`]／[`check_view_delete`]（判定だけ）、
 //! Execute／Describe 時は [`rewrite_view_update`]／[`rewrite_view_delete`]（現在のカタログで書き換え）
 //! を呼ぶ。Parse 時の写像は持ち越さない。INSERT 側は `sql::view_insert` で、写像器と `RETURNING` の
@@ -127,9 +129,61 @@ fn resolve_for_write(
     }
 }
 
+/// `MERGE` の対象がビューのときの解決結果（Issue #3352）。束縛段（`sql::merge_bind`）が、単独のビュー
+/// 書き込みと同じ規則（自動更新可能性 → 連鎖の解決）で基底表・述語・公開列を得る入口。行・台帳には触れない。
+pub(crate) struct MergeTargetView {
+    /// 連鎖を辿った先の実表名。
+    pub(crate) base_table: String,
+    /// ビュー定義由来の述語（基底表の物理列名。内側の段が先）。
+    pub(crate) view_predicates: Vec<WherePredicate>,
+    /// ビューの公開列（`None` は全列）。
+    pub(crate) view_columns: Option<Vec<String>>,
+    /// 列別名の写像（`Some` は本 Issue では `0A000`。束縛段が判定する）。
+    pub(crate) has_column_map: bool,
+    /// 利用者列を公開名 `id` で公開しているか。
+    pub(crate) exposes_user_column_as_id: bool,
+    /// `WITH CHECK OPTION` の検査対象の述語（#3353 以降の実行段が使う）。
+    pub(crate) check_predicates: Vec<Vec<WherePredicate>>,
+    /// 基底表が採番方式か。
+    pub(crate) base_allocated: bool,
+}
+
+/// `MERGE` の対象ビューを書き込み用に解決する（自動更新できなければ `55000`。Issue #3352）。
+pub(crate) fn resolve_merge_target(
+    lookup: &impl TableLookup,
+    view_name: &str,
+) -> Result<MergeTargetView, SqlSurfaceError> {
+    let rv = resolve_for_write(lookup, view_name, ViewWriteOp::Merge)?;
+    Ok(MergeTargetView {
+        exposes_user_column_as_id: rv.exposes_user_column_as_id(),
+        has_column_map: rv.column_map.is_some(),
+        base_table: rv.base_table,
+        view_predicates: rv.view_predicates,
+        view_columns: rv.view_columns,
+        check_predicates: rv.check_predicates,
+        base_allocated: rv.base_allocated,
+    })
+}
+
 /// `PARTITIONED` 修飾はビュー経由では未対応（固定文言。fail-closed）。
 fn reject_partitioned() -> SqlSurfaceError {
     SqlSurfaceError::feature_not_supported("PARTITIONED is not supported on views")
+}
+
+/// ビュー経由の DML の `WHERE` 内サブクエリを拒否する固定文言（自動書き換え固有の検証。
+/// INSTEAD OF トリガ〔Issue #3193〕の経路ではこの制限は掛からない）。
+const WHERE_SUBQUERY_UNSUPPORTED: &str =
+    "subquery in WHERE is not supported for DML through a view";
+
+/// 利用者列を公開名 `id` で公開するビューの単一行形（`WHERE id = <n>`）の拒否文言（自動書き換え固有）。
+pub(crate) const ID_USER_COLUMN_WHERE_UNSUPPORTED: &str =
+    "WHERE id = <n> on a view that exposes a user column as id is not supported";
+
+/// `e` が [`merge_predicates`] の `WHERE` 内サブクエリ拒否か。構文解析段は、この拒否を実行段へ回す
+/// （トリガの有無は書き込みテナントの scope の確定済みカタログでしか決まらず、トリガが有れば自動書き換えの
+/// 検証は不要なため。トリガが無ければ実行段の書き換えが同じ拒否を返す）。
+pub(crate) fn is_where_subquery_rejection(e: &SqlSurfaceError) -> bool {
+    matches!(e, SqlSurfaceError::UnsupportedSyntax { detail } if detail == WHERE_SUBQUERY_UNSUPPORTED)
 }
 
 /// 述語形 `WHERE` を公開名で検査してから物理名へ写し、ビューの述語を前に合成する。
@@ -143,9 +197,7 @@ fn merge_predicates(
         .iter()
         .any(crate::sql::subquery::predicate_contains_subquery)
     {
-        return Err(SqlSurfaceError::unsupported(
-            "subquery in WHERE is not supported for DML through a view",
-        ));
+        return Err(SqlSurfaceError::unsupported(WHERE_SUBQUERY_UNSUPPORTED));
     }
     check_columns_within_view(
         rv.view_columns.as_deref(),
@@ -185,7 +237,7 @@ fn rewrite_id_form(
     }
     if rv.exposes_user_column_as_id() {
         return Err(SqlSurfaceError::feature_not_supported(
-            "WHERE id = <n> on a view that exposes a user column as id is not supported",
+            ID_USER_COLUMN_WHERE_UNSUPPORTED,
         ));
     }
     // 基表が採番方式（暗黙の `id` を持たない。TABLE-23・Issue #2199）なら、`id` は基表の通常の列なので

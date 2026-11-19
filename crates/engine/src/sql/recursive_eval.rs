@@ -1116,6 +1116,36 @@ fn static_integer_type(m: &ColumnMeta) -> Option<&ColumnType> {
     }
 }
 
+/// 配列要素型が等価比較を持たないか（recursive UNION の行キー判定。Json のみ true）。
+/// 網羅 match で、要素型の追加時に判断を強制する（Issue #3229）。
+#[deny(clippy::wildcard_enum_match_arm)]
+fn array_elem_lacks_equality(elem: crate::catalog::ArrayElemType) -> bool {
+    use crate::catalog::ArrayElemType as E;
+    match elem {
+        E::Json => true,
+        E::Text
+        | E::Varchar(_)
+        | E::Bpchar(_)
+        | E::Bool
+        | E::Integer
+        | E::SmallInt
+        | E::BigInt
+        | E::Real
+        | E::Double
+        | E::Date
+        | E::Timestamp
+        | E::Time
+        | E::Interval
+        | E::TimestampTz
+        | E::Uuid
+        | E::Numeric { .. }
+        | E::Bytea
+        | E::Jsonb
+        | E::Bit(_)
+        | E::Enum => false,
+    }
+}
+
 /// 重複除去版 `UNION` の列に、PostgreSQL が等値・ハッシュを持たない型（`JSON` と `JSON` の配列）が
 /// 無いことを計画時に検査する（固定 `0A000`。PostgreSQL では recursive UNION を実装できない型）。
 /// 行キーはこれらを文字列として比べてしまうため、黙って同値判定せず拒否する（fail-closed）。
@@ -1127,7 +1157,7 @@ fn check_union_equality_types(columns: &[ColumnMeta]) -> Result<(), SqlSurfaceEr
         };
         let no_equality = match ty {
             ColumnType::Json => true,
-            ColumnType::Array(a) => matches!(a.elem(), crate::catalog::ArrayElemType::Json),
+            ColumnType::Array(a) => array_elem_lacks_equality(a.elem()),
             _ => false,
         };
         if no_equality {

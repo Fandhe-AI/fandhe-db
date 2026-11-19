@@ -420,3 +420,549 @@ fn wire_multi_dimensional_array_roundtrips_and_rejects_ragged_literals() {
     expect_error_response_with_sqlstate(&mut stream, "22P02");
     read_ready_for_query(&mut stream);
 }
+/// Issue #3229（要素型追加の土台）の回帰: 既存の全 13 種の配列要素型が、末尾 `;` 付きの単独
+/// 簡易クエリ（psql と同じ送り方）で往復し、`RowDescription` が要素型ごとの配列 OID を公告する
+/// （TABLE-14・TABLE-35・WIRE-13）。別テナントからは 0 行で、OID は同じ（RLS 相当の境界は不変）。
+#[test]
+fn wire_all_existing_array_elem_types_roundtrip_with_oids_and_tenant_isolation() {
+    // (列名, 要素型, 期待 OID, 挿入リテラル, 期待テキスト)
+    let cases: Vec<(&str, ArrayElemType, i32, &str, &str)> = vec![
+        ("c_text", ArrayElemType::Text, 1009, "{a,b}", "{a,b}"),
+        ("c_bool", ArrayElemType::Bool, 1000, "{t,f}", "{t,f}"),
+        ("c_int", ArrayElemType::Integer, 1007, "{1,2}", "{1,2}"),
+        ("c_big", ArrayElemType::BigInt, 1016, "{3,4}", "{3,4}"),
+        ("c_real", ArrayElemType::Real, 1021, "{1.5}", "{1.5}"),
+        ("c_dbl", ArrayElemType::Double, 1022, "{2.5}", "{2.5}"),
+        (
+            "c_date",
+            ArrayElemType::Date,
+            1182,
+            "{2024-01-02}",
+            "{2024-01-02}",
+        ),
+        (
+            "c_ts",
+            ArrayElemType::Timestamp,
+            1115,
+            r#"{"2024-01-02 03:04:05"}"#,
+            r#"{"2024-01-02 03:04:05"}"#,
+        ),
+        (
+            "c_uuid",
+            ArrayElemType::Uuid,
+            2951,
+            "{00000000-0000-0000-0000-000000000001}",
+            "{00000000-0000-0000-0000-000000000001}",
+        ),
+        (
+            "c_num",
+            ArrayElemType::Numeric {
+                precision: 10,
+                scale: 2,
+            },
+            1231,
+            "{1.5}",
+            "{1.50}",
+        ),
+        (
+            "c_bytea",
+            ArrayElemType::Bytea,
+            1001,
+            r#"{"\\x0102"}"#,
+            r#"{"\\x0102"}"#,
+        ),
+        (
+            "c_json",
+            ArrayElemType::Json,
+            199,
+            r#"{"{\"a\":1}"}"#,
+            r#"{"{\"a\":1}"}"#,
+        ),
+        (
+            "c_jsonb",
+            ArrayElemType::Jsonb,
+            3807,
+            r#"{"{\"a\":1}"}"#,
+            r#"{"{\"a\":1}"}"#,
+        ),
+    ];
+
+    let path = temp_db::unique_db_path("wire-array-all-elem-types");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let mut columns = vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)];
+    for (name, elem, ..) in &cases {
+        columns.push(ColumnDef::new(
+            *name,
+            ColumnType::Array(ArrayType::new(*elem, 4).expect("array ty")),
+            true,
+        ));
+    }
+    storage
+        .create_table(&TableSchema::new("allarr", columns))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addrs = spawn_with_users(
+        core,
+        &[
+            ("alice", "tenant-alice", "pw-alice"),
+            ("bob", "tenant-bob", "pw-bob"),
+        ],
+    );
+    let names: Vec<&str> = cases.iter().map(|c| c.0).collect();
+    let select = format!(
+        "SELECT {} FROM allarr WHERE id = 1 LIMIT 1;",
+        names.join(", ")
+    );
+
+    let mut alice = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+    let insert = format!(
+        "INSERT INTO allarr (id, embedding, {}) VALUES (1, '[0.1,0.2]', {}) USING OPERATION_ID 'op-all'",
+        names.join(", "),
+        cases
+            .iter()
+            .map(|c| format!("'{}'", c.3))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    send_simple_query(&mut alice, &insert);
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(&mut alice, &select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(desc.len(), cases.len());
+    for ((name, oid), case) in desc.iter().zip(&cases) {
+        assert_eq!(name, case.0);
+        assert_eq!(*oid, case.2, "OID of {name}");
+    }
+    let row = read_data_row(&mut alice);
+    for (cell, case) in row.iter().zip(&cases) {
+        assert_eq!(cell.as_deref(), Some(case.4), "value of {}", case.0);
+    }
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    // 別テナントは同じ OID を見るが行は見えない。
+    let mut bob = authenticate_to_ready_for_query(addrs[0], "bob", "pw-bob");
+    send_simple_query(&mut bob, &select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}
+
+/// Issue #3231: `VARCHAR[]`・`VARCHAR(n)[]`・`CHAR(n)[]` 列は末尾 `;` 付きの単独簡易クエリ
+/// （psql と同じ送り方）で往復し、`RowDescription` が OID 1015（`_varchar`）／1014（`_bpchar`）と
+/// typmod（`n + 4`。長さなしは -1）を公告する。要素の長さ検査（`22001`）・`CHAR(n)` の空白詰めは
+/// engine の規則どおりで、別テナントには行が見えない（TABLE-14・TABLE-31・WIRE-13）。
+#[test]
+fn wire_varchar_and_char_arrays_advertise_oids_and_typmods() {
+    let path = temp_db::unique_db_path("wire-array-char-elems");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let array = |elem| ColumnType::Array(ArrayType::new(elem, 4).expect("array ty"));
+    storage
+        .create_table(&TableSchema::new(
+            "chars",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("v3", array(ArrayElemType::Varchar(Some(3))), true),
+                ColumnDef::new("vn", array(ArrayElemType::Varchar(None)), true),
+                ColumnDef::new("c3", array(ArrayElemType::Bpchar(3)), true),
+            ],
+        ))
+        .expect("create table");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let addrs = spawn_with_users(
+        core,
+        &[
+            ("alice", "tenant-alice", "pw-alice"),
+            ("bob", "tenant-bob", "pw-bob"),
+        ],
+    );
+    let select = "SELECT v3, vn, c3 FROM chars WHERE id = 1 LIMIT 1;";
+
+    let mut alice = authenticate_to_ready_for_query(addrs[0], "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO chars (id, embedding, v3, vn, c3) VALUES (1, '[0.1,0.2]', '{abc,NULL}', '{a long value}', '{ab}') USING OPERATION_ID 'op-c1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    // 要素が長さを超える INSERT は 22001。値は文言へ反射しない。
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO chars (id, embedding, v3) VALUES (2, '[0.1,0.2]', '{abcd}') USING OPERATION_ID 'op-c2';",
+    );
+    expect_error_response_with_sqlstate(&mut alice, "22001");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(&mut alice, select);
+    let cols = read_row_description_with_typmods(&mut alice);
+    assert_eq!(
+        cols,
+        vec![
+            ("v3".to_string(), 1015, -1, 7),
+            ("vn".to_string(), 1015, -1, -1),
+            ("c3".to_string(), 1014, -1, 7),
+        ]
+    );
+    let row = read_data_row(&mut alice);
+    assert_eq!(row[0].as_deref(), Some("{abc,NULL}"));
+    assert_eq!(row[1].as_deref(), Some(r#"{"a long value"}"#));
+    assert_eq!(row[2].as_deref(), Some(r#"{"ab "}"#));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    // 別テナントは同じ公告を見るが行は見えない。
+    let mut bob = authenticate_to_ready_for_query(addrs[0], "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let cols_bob = read_row_description_with_typmods(&mut bob);
+    assert_eq!(cols_bob, cols);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}
+
+/// Issue #3232: `TIME[]` 列を SQL の `CREATE TABLE`（末尾 `;` 付き単独の簡易クエリ。psql と
+/// 同じ送り方）で作り、INSERT・SELECT が往復して `RowDescription` が `_time`（1183）と添字結果の
+/// `time`（1083）を公告する（TABLE-14・TABLE-35・WIRE-13）。範囲外は `22008`、別テナントは同じ OID で
+/// 0 行（RLS 相当の境界は不変）。
+#[test]
+fn wire_time_array_created_via_sql_roundtrips_with_time_array_oid() {
+    let path = temp_db::unique_db_path("wire-time-array");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-alice", "pw-alice"),
+        ("bob", "tenant-bob", "pw-bob"),
+    ]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice", "bob"]);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "CREATE TABLE ta (id BIGINT PRIMARY KEY, embedding VECTOR(2), t TIME[]);",
+    );
+    assert_eq!(read_command_complete(&mut alice), "CREATE TABLE");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ta (id, embedding, t) VALUES (1, '[0.1,0.2]', '{10:00:00,NULL,24:00:00}') USING OPERATION_ID 'op-ta1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ta (id, embedding, t) VALUES (2, '[0.1,0.2]', '{24:00:01}') USING OPERATION_ID 'op-ta2';",
+    );
+    expect_error_response_with_sqlstate(&mut alice, "22008");
+    read_ready_for_query(&mut alice);
+
+    let select = "SELECT t, t[1] FROM ta WHERE id = 1 LIMIT 1;";
+    send_simple_query(&mut alice, select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        desc.iter().map(|d| d.1).collect::<Vec<_>>(),
+        vec![1183, 1083]
+    );
+    let row = read_data_row(&mut alice);
+    assert_eq!(row[0].as_deref(), Some("{10:00:00,NULL,24:00:00}"));
+    assert_eq!(row[1].as_deref(), Some("10:00:00"));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}
+
+/// Issue #3233: `TIMESTAMPTZ[]` 列を SQL の `CREATE TABLE`（末尾 `;` 付き単独の簡易クエリ。psql と
+/// 同じ送り方）で作り、INSERT・SELECT が往復して `RowDescription` が `_timestamptz`（1185）と添字結果の
+/// `timestamptz`（1184）を公告する（TABLE-14・TABLE-35・WIRE-13）。DataRow はセッション TimeZone の
+/// offset 付きで描画される。範囲外は `22008`、別テナントは同じ OID で 0 行（RLS 相当の境界は不変）。
+#[test]
+fn wire_timestamptz_array_created_via_sql_roundtrips_with_timestamptz_array_oid() {
+    let path = temp_db::unique_db_path("wire-timestamptz-array");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-alice", "pw-alice"),
+        ("bob", "tenant-bob", "pw-bob"),
+    ]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice", "bob"]);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "CREATE TABLE ta (id BIGINT PRIMARY KEY, embedding VECTOR(2), t TIMESTAMPTZ[]);",
+    );
+    assert_eq!(read_command_complete(&mut alice), "CREATE TABLE");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ta (id, embedding, t) VALUES (1, '[0.1,0.2]', '{\"2026-01-01 10:00:00+00\",NULL,\"2026-01-01 19:00:00+09\"}') USING OPERATION_ID 'op-ta1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ta (id, embedding, t) VALUES (2, '[0.1,0.2]', '{\"2026-13-01 00:00:00Z\"}') USING OPERATION_ID 'op-ta2';",
+    );
+    expect_error_response_with_sqlstate(&mut alice, "22008");
+    read_ready_for_query(&mut alice);
+
+    let select = "SELECT t, t[1] FROM ta WHERE id = 1 LIMIT 1;";
+    send_simple_query(&mut alice, select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        desc.iter().map(|d| d.1).collect::<Vec<_>>(),
+        vec![1185, 1184]
+    );
+    let row = read_data_row(&mut alice);
+    assert_eq!(
+        row[0].as_deref(),
+        Some("{\"2026-01-01 10:00:00+00\",NULL,\"2026-01-01 10:00:00+00\"}")
+    );
+    assert_eq!(row[1].as_deref(), Some("2026-01-01 10:00:00+00"));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    // セッション TimeZone を切り替えると同じ瞬間が `+09` で表示され、添字結果も追随する。
+    send_simple_query(&mut alice, "SET TIME ZONE 'Asia/Tokyo';");
+    loop {
+        // CommandComplete・ParameterStatus を読み飛ばして ReadyForQuery まで進める。
+        let (tag, _) = read_message(&mut alice);
+        if tag == b'Z' {
+            break;
+        }
+    }
+    send_simple_query(&mut alice, select);
+    let _ = read_row_description_with_oids(&mut alice);
+    let row = read_data_row(&mut alice);
+    assert_eq!(
+        row[0].as_deref(),
+        Some("{\"2026-01-01 19:00:00+09\",NULL,\"2026-01-01 19:00:00+09\"}")
+    );
+    assert_eq!(row[1].as_deref(), Some("2026-01-01 19:00:00+09"));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}
+
+/// Issue #3230: `SMALLINT[]` 列を SQL の `CREATE TABLE`（末尾 `;` 付き単独の簡易クエリ。psql と
+/// 同じ送り方）で作り、INSERT・SELECT が往復して `RowDescription` が `_int2`（1005）と添字結果の
+/// `int2`（21）を公告する（TABLE-14・TABLE-35・WIRE-13）。範囲外は `22003`、別テナントは同じ OID で
+/// 0 行（RLS 相当の境界は不変）。
+#[test]
+fn wire_smallint_array_created_via_sql_roundtrips_with_int2_array_oid() {
+    let path = temp_db::unique_db_path("wire-smallint-array");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-alice", "pw-alice"),
+        ("bob", "tenant-bob", "pw-bob"),
+    ]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice", "bob"]);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "CREATE TABLE sa (id BIGINT PRIMARY KEY, embedding VECTOR(2), n SMALLINT[]);",
+    );
+    assert_eq!(read_command_complete(&mut alice), "CREATE TABLE");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO sa (id, embedding, n) VALUES (1, '[0.1,0.2]', '{1,NULL,-3}') USING OPERATION_ID 'op-sa1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO sa (id, embedding, n) VALUES (2, '[0.1,0.2]', '{32768}') USING OPERATION_ID 'op-sa2';",
+    );
+    expect_error_response_with_sqlstate(&mut alice, "22003");
+    read_ready_for_query(&mut alice);
+
+    let select = "SELECT n, n[1] FROM sa WHERE id = 1 LIMIT 1;";
+    send_simple_query(&mut alice, select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(desc.iter().map(|d| d.1).collect::<Vec<_>>(), vec![1005, 21]);
+    let row = read_data_row(&mut alice);
+    assert_eq!(row[0].as_deref(), Some("{1,NULL,-3}"));
+    assert_eq!(row[1].as_deref(), Some("1"));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}
+
+/// Issue #3235: `BIT(n)[]` 列を SQL の `CREATE TABLE`（末尾 `;` 付き単独の簡易クエリ。psql と
+/// 同じ送り方）で作り、INSERT・SELECT が往復して `RowDescription` が `_bit`（1561）と添字結果の
+/// `bit`（1560）を公告する（TABLE-14・TABLE-35・TABLE-48・WIRE-13）。文字種違反は `22P02`、長さ不一致は
+/// `22026`、別テナントは同じ OID で 0 行（RLS 相当の境界は不変）。
+#[test]
+fn wire_bit_array_created_via_sql_roundtrips_with_bit_array_oid() {
+    let path = temp_db::unique_db_path("wire-bit-array");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-alice", "pw-alice"),
+        ("bob", "tenant-bob", "pw-bob"),
+    ]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice", "bob"]);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "CREATE TABLE ba (id BIGINT PRIMARY KEY, embedding VECTOR(2), b BIT(4)[]);",
+    );
+    assert_eq!(read_command_complete(&mut alice), "CREATE TABLE");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ba (id, embedding, b) VALUES (1, '[0.1,0.2]', '{1010,NULL,0101}') USING OPERATION_ID 'op-ba1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    for (lit, want) in [("'{10x0}'", "22P02"), ("'{101}'", "22026")] {
+        send_simple_query(
+            &mut alice,
+            &format!(
+                "INSERT INTO ba (id, embedding, b) VALUES (2, '[0.1,0.2]', {lit}) USING OPERATION_ID 'op-ba2';"
+            ),
+        );
+        expect_error_response_with_sqlstate(&mut alice, want);
+        read_ready_for_query(&mut alice);
+    }
+
+    let select = "SELECT b, b[1] FROM ba WHERE id = 1 LIMIT 1;";
+    send_simple_query(&mut alice, select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        desc.iter().map(|d| d.1).collect::<Vec<_>>(),
+        vec![1561, 1560]
+    );
+    let row = read_data_row(&mut alice);
+    assert_eq!(row[0].as_deref(), Some("{1010,NULL,0101}"));
+    assert_eq!(row[1].as_deref(), Some("1010"));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}
+/// Issue #3234: `INTERVAL[]` 列を SQL の `CREATE TABLE`（末尾 `;` 付き単独の簡易クエリ。psql と
+/// 同じ送り方）で作り、INSERT・SELECT が往復して `RowDescription` が `_interval`（1187）と添字結果の
+/// `interval`（1186）を公告する（TABLE-14・TABLE-34・TABLE-35・WIRE-13）。書式不正は `22007`、
+/// 別テナントは同じ OID で 0 行（RLS 相当の境界は不変）。
+#[test]
+fn wire_interval_array_created_via_sql_roundtrips_with_interval_array_oid() {
+    let path = temp_db::unique_db_path("wire-interval-array");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let core = Arc::new(EngineCore::from_storage(
+        storage,
+        Box::new(CpuScalarProvider),
+    ));
+    let users_path = write_user_store_file(&[
+        ("alice", "tenant-alice", "pw-alice"),
+        ("bob", "tenant-bob", "pw-bob"),
+    ]);
+    let addr = spawn_server_with_engine_ddl_users(&users_path, core, &["alice", "bob"]);
+
+    let mut alice = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    send_simple_query(
+        &mut alice,
+        "CREATE TABLE ia (id BIGINT PRIMARY KEY, embedding VECTOR(2), v INTERVAL[]);",
+    );
+    assert_eq!(read_command_complete(&mut alice), "CREATE TABLE");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ia (id, embedding, v) VALUES (1, '[0.1,0.2]', '{\"1 day\",NULL,\"1 mon 02:00:00\"}') USING OPERATION_ID 'op-ia1';",
+    );
+    assert_eq!(read_command_complete(&mut alice), "INSERT 0 1");
+    read_ready_for_query(&mut alice);
+
+    send_simple_query(
+        &mut alice,
+        "INSERT INTO ia (id, embedding, v) VALUES (2, '[0.1,0.2]', '{x}') USING OPERATION_ID 'op-ia2';",
+    );
+    expect_error_response_with_sqlstate(&mut alice, "22007");
+    read_ready_for_query(&mut alice);
+
+    let select = "SELECT v, v[1] FROM ia WHERE id = 1 LIMIT 1;";
+    send_simple_query(&mut alice, select);
+    let desc = read_row_description_with_oids(&mut alice);
+    assert_eq!(
+        desc.iter().map(|d| d.1).collect::<Vec<_>>(),
+        vec![1187, 1186]
+    );
+    let row = read_data_row(&mut alice);
+    assert_eq!(
+        row[0].as_deref(),
+        Some("{\"1 day\",NULL,\"1 mon 02:00:00\"}")
+    );
+    assert_eq!(row[1].as_deref(), Some("1 day"));
+    let _ = read_command_complete(&mut alice);
+    read_ready_for_query(&mut alice);
+
+    let mut bob = authenticate_to_ready_for_query(addr, "bob", "pw-bob");
+    send_simple_query(&mut bob, select);
+    let desc_bob = read_row_description_with_oids(&mut bob);
+    assert_eq!(desc_bob, desc);
+    assert_eq!(read_command_complete(&mut bob), "SELECT 0");
+    read_ready_for_query(&mut bob);
+}

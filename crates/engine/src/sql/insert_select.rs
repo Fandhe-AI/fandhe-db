@@ -173,6 +173,14 @@ pub(crate) fn cell_to_insert_value(
         (ColumnType::Double, Cell::SignedInteger(i)) => Ok(Value::Double(i as f64)),
         (ColumnType::Real, Cell::Integer(u)) => Ok(Value::Real(u as f32)),
         (ColumnType::Real, Cell::SignedInteger(i)) => Ok(Value::Real(i as f32)),
+        // `BIT(n)[]` 列へは、同じ宣言の `BIT(n)[]` の値だけを恒等として受け取る（Issue #3235。要素の
+        // CAST が無いため代入変換へ回せない。宣言の一致は [`is_direct_pair`] が保証し、要素の長さは
+        // encode の検証が最後に守る）。
+        (ColumnType::Array(at), Cell::Array(a))
+            if matches!(at.elem(), crate::catalog::ArrayElemType::Bit(_)) =>
+        {
+            Ok(Value::Array(a))
+        }
         // 配列は要素型の照合規則を持たないため対象外（fail-closed）。
         (ColumnType::Array(_), _) => Err(unsupported_pair()),
         (ty, cell) => match super::matview::cell_to_value(cell, ty) {
@@ -214,6 +222,13 @@ fn is_direct_pair(src: &ColumnType, dst: &ColumnType) -> bool {
     use ColumnType as T;
     let int_like = |t: &ColumnType| matches!(t, T::SmallInt | T::Integer | T::BigInt);
     let json_like = |t: &ColumnType| matches!(t, T::Json | T::Jsonb);
+    // `BIT(n)[]` は要素の CAST が無く代入変換へ回せないため、宣言が同一のときだけ直接変換する
+    // （Issue #3235。宣言が異なる組は代入変換の束縛が `0A000` で拒否する）。
+    if let (T::Array(s), T::Array(d)) = (src, dst) {
+        if matches!(d.elem(), crate::catalog::ArrayElemType::Bit(_)) && s == d {
+            return true;
+        }
+    }
     // 配列は直接変換が常に拒否するため、同型でも代入変換（要素ごとの変換）へ回す。
     if matches!(dst, T::Array(_)) || matches!(src, T::Array(_)) {
         return false;
@@ -312,6 +327,30 @@ impl ConversionPlan {
             slots,
             src_schema: Some(src_schema),
         })
+    }
+
+    /// 1 列だけの計画（`targets`・`source` が 1 要素）で、セル 1 つを挿入先の列の値へ変換する
+    /// （`MERGE ... WHEN NOT MATCHED THEN INSERT` の列参照コピー。Issue #3354）。`INSERT ... SELECT` の
+    /// [`rows_to_bound_inserts`] の行内ループと同じ規則（代入変換 → 直接変換。NULL は非 nullable 列で `23502`）。
+    pub(crate) fn convert_single(
+        &self,
+        cell: Cell,
+        column: &ColumnDef,
+    ) -> Result<Value, SqlSurfaceError> {
+        let mut assigned = if self.has_assign() {
+            self.convert_assigned(std::slice::from_ref(&cell))?
+        } else {
+            Vec::new()
+        };
+        match assigned.get_mut(0).and_then(Option::take) {
+            Some(v) => {
+                if matches!(v, Value::Null) && !column.nullable {
+                    return Err(SqlSurfaceError::not_null_violation(column.name.clone()));
+                }
+                Ok(v)
+            }
+            None => cell_to_insert_value(cell, column),
+        }
     }
 
     /// 代入変換が 1 列でもあるか（無ければ行ごとの encode を省く）。
@@ -425,15 +464,17 @@ pub(crate) fn rows_to_bound_inserts(
                 }
             }
         }
-        let volatile_default_columns: Vec<VolatileColumn> =
-            crate::sql::parser::fill_omitted_columns(
-                &schema.columns,
-                &mut values,
-                &provided,
-                Some(clock),
-                false,
-            )?;
-        if volatile_default_columns.iter().any(|c| {
+        let bound = finish_bound_insert(
+            table_name,
+            schema,
+            id,
+            values,
+            &provided,
+            id_omitted,
+            operation_id,
+            clock,
+        )?;
+        if bound.volatile_default_columns.iter().any(|c| {
             matches!(
                 c,
                 VolatileColumn::DefaultSequence(_) | VolatileColumn::Sequence(..)
@@ -441,20 +482,46 @@ pub(crate) fn rows_to_bound_inserts(
         }) {
             return Err(crate::sql::parser::reject_sequence_call_literal());
         }
-        out.push(BoundInsert {
-            table: table_name.to_string(),
-            id,
-            values,
-            operation_id: operation_id.cloned(),
-            volatile_default_columns,
-            id_omitted,
-        });
+        out.push(bound);
     }
     Ok(out)
 }
 
+/// 1 行分の値（`provided` が真の列だけが呼び出し元の値）から `BoundInsert` を組み立てる。省略列へ
+/// `DEFAULT` を補完し、採番・時刻の印（[`VolatileColumn`]）を載せる（SQL-51・SQL-79）。
+/// `INSERT ... SELECT`（[`rows_to_bound_inserts`]）と `MERGE ... WHEN NOT MATCHED THEN INSERT`
+/// （`core::merge_exec`。Issue #3354）が共有し、第 2 の挿入経路を作らない。`DefaultSequence`／`Sequence` の
+/// 印をどう扱うか（拒否するか、書き込み段へ運ぶか）は呼び出し元が決める。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_bound_insert(
+    table_name: &str,
+    schema: &TableSchema,
+    id: u64,
+    mut values: Vec<Value>,
+    provided: &[bool],
+    id_omitted: bool,
+    operation_id: Option<&OperationId>,
+    clock: crate::sql::time_fn::StatementClock,
+) -> Result<BoundInsert, SqlSurfaceError> {
+    let volatile_default_columns: Vec<VolatileColumn> = crate::sql::parser::fill_omitted_columns(
+        &schema.columns,
+        &mut values,
+        provided,
+        Some(clock),
+        false,
+    )?;
+    Ok(BoundInsert {
+        table: table_name.to_string(),
+        id,
+        values,
+        operation_id: operation_id.cloned(),
+        volatile_default_columns,
+        id_omitted,
+    })
+}
+
 /// 疑似列 `id` へ流すセルを `u64` にする（非負整数のみ。NULL・負数は `22000`、他の型は `0A000`）。
-fn cell_to_row_id(cell: Cell) -> Result<u64, SqlSurfaceError> {
+pub(crate) fn cell_to_row_id(cell: Cell) -> Result<u64, SqlSurfaceError> {
     match cell {
         Cell::Integer(u) => Ok(u),
         Cell::SignedInteger(i) => u64::try_from(i).map_err(|_| {
@@ -531,6 +598,7 @@ pub(crate) fn bind(
     stmt: &ValidatedInsertSelect,
     schema: &TableSchema,
     source: &[ColumnMeta],
+    udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundInsertSelectTarget, SqlSurfaceError> {
     // 列リスト省略（Issue #2613）は、内側の出力列数に応じて表の宣言順の先頭列へ展開する
     // （`VALUES` 形と同じ共有ヘルパー。束縛と同じスキーマのスナップショットで展開する）。
@@ -614,7 +682,8 @@ pub(crate) fn bind(
         .enumerate()
         .filter_map(|(i, p)| (!*p).then_some(i))
         .collect();
-    let returning = crate::sql::parser::bind_returning(stmt.returning.as_ref(), schema)?;
+    let returning =
+        crate::sql::parser::bind_returning_with_udfs(stmt.returning.as_ref(), schema, udfs)?;
     Ok(BoundInsertSelectTarget {
         columns,
         slots,
@@ -756,6 +825,20 @@ mod tests {
 #[cfg(test)]
 mod bind_tests {
     use super::*;
+
+    /// テスト用の薄い包み（UDF を解決しない空のレジストリで `super::bind` を呼ぶ）。
+    fn bind(
+        stmt: &ValidatedInsertSelect,
+        schema: &TableSchema,
+        source: &[ColumnMeta],
+    ) -> Result<BoundInsertSelectTarget, SqlSurfaceError> {
+        super::bind(
+            stmt,
+            schema,
+            source,
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
     use crate::catalog::{ColumnDef, RowIdentity};
     use crate::sql::allowlist::{InsertSelectShape, Statement};
 

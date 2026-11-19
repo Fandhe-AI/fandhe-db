@@ -88,8 +88,9 @@ pub enum CastDst {
     Jsonb,
     Uuid,
     Bytea,
-    /// 配列（要素型は [`CastSrc::Array`] と同じ運び方。`varchar(n)[]` 等の対応要素型の無い
-    /// 変換先は束縛段が `0A000` にするため、ここへは来ない）。
+    /// 配列（要素型は [`CastSrc::Array`] と同じ運び方。`smallint[]` 等の対応要素型の無い
+    /// 変換先は束縛段が `0A000` にするため、ここへは来ない。`varchar(n)[]`・`char(n)[]` は
+    /// Issue #3231 で対応済み）。
     Array(ArrayElemType),
 }
 
@@ -132,20 +133,27 @@ impl CastDst {
 /// 配列の要素型から、要素の変換元の記述子を導く（`enum` 要素は対象外で `None`）。
 pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
     Some(match e {
-        ArrayElemType::Text => CastSrc::Text,
+        // `VARCHAR`／`CHAR(n)` 要素も文字列として扱う。`CHAR(n)` の末尾空白除去は
+        // [`cast_array`] が変換先に応じて行う（Issue #3231）。
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => CastSrc::Text,
         ArrayElemType::Bool => CastSrc::Bool,
+        ArrayElemType::SmallInt => CastSrc::Int2,
         ArrayElemType::Integer => CastSrc::Int4,
         ArrayElemType::BigInt => CastSrc::Int8,
         ArrayElemType::Real => CastSrc::Float4,
         ArrayElemType::Double => CastSrc::Float8,
         ArrayElemType::Date => CastSrc::Date,
         ArrayElemType::Timestamp => CastSrc::Timestamp,
+        ArrayElemType::Time => CastSrc::Time,
+        ArrayElemType::Interval => CastSrc::Interval,
+        ArrayElemType::TimestampTz => CastSrc::TimestampTz,
         ArrayElemType::Uuid => CastSrc::Uuid,
         ArrayElemType::Numeric { .. } => CastSrc::Numeric,
         ArrayElemType::Bytea => CastSrc::Bytea,
         ArrayElemType::Json => CastSrc::Json,
         ArrayElemType::Jsonb => CastSrc::Jsonb,
-        ArrayElemType::Enum => return None,
+        // `BIT(n)` 要素もスカラー BIT と同じく CAST 未対応（Issue #3235）。
+        ArrayElemType::Enum | ArrayElemType::Bit(_) => return None,
     })
 }
 
@@ -153,19 +161,25 @@ pub(crate) fn elem_cast_src(e: ArrayElemType) -> Option<CastSrc> {
 pub(crate) fn elem_cast_dst(e: ArrayElemType) -> Option<CastDst> {
     Some(match e {
         ArrayElemType::Text => CastDst::Text,
+        ArrayElemType::Varchar(len) => CastDst::Varchar(len),
+        ArrayElemType::Bpchar(n) => CastDst::Bpchar(n),
         ArrayElemType::Bool => CastDst::Bool,
+        ArrayElemType::SmallInt => CastDst::Int2,
         ArrayElemType::Integer => CastDst::Int4,
         ArrayElemType::BigInt => CastDst::Int8,
         ArrayElemType::Real => CastDst::Float4,
         ArrayElemType::Double => CastDst::Float8,
         ArrayElemType::Date => CastDst::Date,
         ArrayElemType::Timestamp => CastDst::Timestamp,
+        ArrayElemType::Time => CastDst::Time,
+        ArrayElemType::Interval => CastDst::Interval,
+        ArrayElemType::TimestampTz => CastDst::TimestampTz,
         ArrayElemType::Uuid => CastDst::Uuid,
         ArrayElemType::Numeric { precision, scale } => CastDst::Numeric(Some((precision, scale))),
         ArrayElemType::Bytea => CastDst::Bytea,
         ArrayElemType::Json => CastDst::Json,
         ArrayElemType::Jsonb => CastDst::Jsonb,
-        ArrayElemType::Enum => return None,
+        ArrayElemType::Enum | ArrayElemType::Bit(_) => return None,
     })
 }
 
@@ -570,7 +584,10 @@ fn decimal_to_float(d: &Decimal, single: bool) -> Result<f64, SqlSurfaceError> {
 
 /// 型修飾子の適用結果の文字列（切り詰め・空白埋め）。`varchar(n)`／`char(n)` への明示的な変換は
 /// 文字数 `n` で黙って切り詰める（代入と違い `22001` にならない）。
-fn apply_char_typmod(s: Cow<'_, str>, to: CastDst) -> Result<Cow<'_, str>, SqlSurfaceError> {
+pub(crate) fn apply_char_typmod(
+    s: Cow<'_, str>,
+    to: CastDst,
+) -> Result<Cow<'_, str>, SqlSurfaceError> {
     let (n, pad) = match to {
         CastDst::Varchar(Some(n)) => (n, false),
         CastDst::Bpchar(n) => (n, true),
@@ -911,14 +928,19 @@ fn render_to_text<'a>(from: CastSrc, v: ExprValue<'a>) -> Result<Cow<'a, str>, S
             }
             Ok(Cow::Owned(crate::bytea::format_hex_text(&b)))
         }
-        (CastSrc::Array(_), ExprValue::Array(a)) => a
-            .to_pg_text_bounded(max_text)
-            .map(Cow::Owned)
-            .ok_or_else(|| {
-                SqlSurfaceError::payload_too_large(
-                    "array text exceeds the maximum TEXT field length",
-                )
-            }),
+        // TIMESTAMPTZ 要素だけはセッション TimeZone で描画する（PostgreSQL と同じ。Issue #3233）。
+        // 他の要素型では TimeZone を読まない（式の再 parse 判定の `SESSION_TZ_READ` を立てない）。
+        (CastSrc::Array(_), ExprValue::Array(a)) => (if a.elem() == ArrayElemType::TimestampTz {
+            crate::datetime::with_current_session_time_zone(|tz| {
+                a.to_pg_text_bounded_in_tz(max_text, tz)
+            })
+        } else {
+            a.to_pg_text_bounded(max_text)
+        })
+        .map(Cow::Owned)
+        .ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("array text exceeds the maximum TEXT field length")
+        }),
         _ => Err(mismatch()),
     }
 }
@@ -1178,6 +1200,7 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Text(v) => map(v, text),
         ArrayValue::Bool(v) => map(v, |b| Ok(ExprValue::Bool(*b))),
         ArrayValue::Integer(v) => map(v, |i| Ok(ExprValue::Scalar(f64::from(*i)))),
+        ArrayValue::SmallInt(v) => map(v, |i| Ok(ExprValue::Scalar(f64::from(*i)))),
         ArrayValue::BigInt(v) => map(v, |i| {
             if i.unsigned_abs() > EXACT_INT_MAX as u64 {
                 return Err(out_of_range(
@@ -1190,12 +1213,18 @@ pub(crate) fn array_to_values(a: &ArrayValue) -> Result<Vec<ExprValue<'static>>,
         ArrayValue::Double(v) => map(v, |x| Ok(ExprValue::Scalar(*x))),
         ArrayValue::Date(v) => map(v, |d| Ok(ExprValue::Date(*d))),
         ArrayValue::Timestamp(v) => map(v, |t| Ok(ExprValue::Timestamp(*t))),
+        ArrayValue::Time(v) => map(v, |t| Ok(ExprValue::Time(*t))),
+        ArrayValue::Interval(v) => map(v, |x| Ok(ExprValue::Interval(*x))),
+        ArrayValue::TimestampTz(v) => map(v, |t| Ok(ExprValue::TimestampTz(*t))),
         ArrayValue::Uuid(v) => map(v, |u| Ok(ExprValue::Uuid(*u))),
         ArrayValue::Numeric(v) => map(v, |d| Ok(ExprValue::Numeric(*d))),
         ArrayValue::Bytea(v) => map(v, |b| Ok(ExprValue::Bytes(Cow::Owned(b.clone())))),
         ArrayValue::Json(v) => map(v, |s| Ok(ExprValue::JsonText(Cow::Owned(s.clone())))),
         ArrayValue::Jsonb(v) => map(v, |s| Ok(ExprValue::Json(Cow::Owned(s.clone())))),
         ArrayValue::Enum(_) => Err(internal("enum array reached an array cast")),
+        // 添字（`v[1]`）の結果は `ExprValue::Bit`（Issue #3235）。CAST 経路へは要素型の写像が
+        // 無いため到達しない。
+        ArrayValue::Bit(v) => map(v, |b| Ok(ExprValue::Bit(b.clone()))),
         ArrayValue::Multi(_) => Err(SqlSurfaceError::unsupported(
             "this operation on multi-dimensional arrays is not supported",
         )),
@@ -1227,16 +1256,21 @@ pub(crate) fn values_to_array(
         )),
     };
     Ok(match to {
-        ArrayElemType::Text => ArrayValue::Text(collect(values, |v| match v {
-            ExprValue::Text(s) => Ok(s.into_owned()),
-            _ => Err(bad()),
-        })?),
+        ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_) => {
+            ArrayValue::Text(collect(values, |v| match v {
+                ExprValue::Text(s) => Ok(s.into_owned()),
+                _ => Err(bad()),
+            })?)
+        }
         ArrayElemType::Bool => ArrayValue::Bool(collect(values, |v| match v {
             ExprValue::Bool(b) => Ok(b),
             _ => Err(bad()),
         })?),
         ArrayElemType::Integer => ArrayValue::Integer(collect(values, |v| {
             i32::try_from(int_of(v)?).map_err(|_| out_of_range("integer out of range"))
+        })?),
+        ArrayElemType::SmallInt => ArrayValue::SmallInt(collect(values, |v| {
+            i16::try_from(int_of(v)?).map_err(|_| out_of_range("smallint out of range"))
         })?),
         ArrayElemType::BigInt => ArrayValue::BigInt(collect(values, int_of)?),
         ArrayElemType::Real => ArrayValue::Real(collect(values, |v| match v {
@@ -1253,6 +1287,24 @@ pub(crate) fn values_to_array(
         })?),
         ArrayElemType::Timestamp => ArrayValue::Timestamp(collect(values, |v| match v {
             ExprValue::Timestamp(t) => Ok(t),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Time => ArrayValue::Time(collect(values, |v| match v {
+            // 防御: 変換経路は範囲検査済みの値だけを渡すが、範囲外は格納せず拒否する（fail-closed）。
+            ExprValue::Time(t) if crate::datetime::validate_time_micros(t) => Ok(t),
+            ExprValue::Time(_) => Err(out_of_range("time out of range")),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::Interval => ArrayValue::Interval(collect(values, |v| match v {
+            // 防御: 変換経路は検査済みの値だけを渡すが、番兵は格納せず拒否する（fail-closed）。
+            ExprValue::Interval(iv) if crate::datetime::validate_interval(&iv) => Ok(iv),
+            ExprValue::Interval(_) => Err(out_of_range("interval out of range")),
+            _ => Err(bad()),
+        })?),
+        ArrayElemType::TimestampTz => ArrayValue::TimestampTz(collect(values, |v| match v {
+            // 防御: 変換経路は範囲検査済みの値だけを渡すが、範囲外は格納せず拒否する（fail-closed）。
+            ExprValue::TimestampTz(t) if crate::datetime::validate_timestamptz_micros(t) => Ok(t),
+            ExprValue::TimestampTz(_) => Err(out_of_range("timestamptz out of range")),
             _ => Err(bad()),
         })?),
         ArrayElemType::Uuid => ArrayValue::Uuid(collect(values, |v| match v {
@@ -1276,6 +1328,14 @@ pub(crate) fn values_to_array(
             _ => Err(bad()),
         })?),
         ArrayElemType::Enum => return Err(internal("enum array is not a cast target")),
+        // 要素の長さが宣言長 `n` と一致する `bit` 値だけを受理する（不一致は `22026`）。
+        ArrayElemType::Bit(n) => ArrayValue::Bit(collect(values, |v| match v {
+            ExprValue::Bit(b) if b.bit_len() == n => Ok(b),
+            ExprValue::Bit(_) => Err(SqlSurfaceError::string_data_length_mismatch(
+                "bit string length does not match type bit(n)",
+            )),
+            _ => Err(bad()),
+        })?),
     })
 }
 
@@ -1290,10 +1350,38 @@ fn cast_array(
         return Err(internal("array element type is not supported for casts"));
     };
     let element = CastFn { from: src, to: dst };
+    // `CHAR(n)` への変換は、要素ごとに n 文字へ空白詰めされる。要素数 × n が配列ペイロード上限を
+    // 超えるなら変換前に `54000` で拒否する（`CHAR(10485760)[]` 等による巨大確保の防止。
+    // Issue #3231）。
+    if let ArrayElemType::Bpchar(n) = to {
+        // NULL 要素は空白詰めされないため数えない（`ARRAY[...]` 経路と同じ契約）。
+        let non_null = array_to_values(a.flat())?
+            .iter()
+            .filter(|e| !matches!(e, ExprValue::Null))
+            .count();
+        let total = (non_null as u64).saturating_mul(u64::from(n));
+        if total > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN) {
+            return Err(SqlSurfaceError::payload_too_large(
+                "array of character(n) elements exceeds the maximum array payload length",
+            ));
+        }
+    }
+    // `CHAR(n)` 要素は空白詰めで保存されるため、`CHAR(n)` 以外へ変換するときは各要素の末尾の
+    // U+0020 を除く（スカラーの `bpchar` → `text` と同じ。Issue #3231）。
+    let rtrim_source =
+        matches!(from, ArrayElemType::Bpchar(_)) && !matches!(to, ArrayElemType::Bpchar(_));
     // 多次元は平坦な要素列を変換してから次元を与え直す（次元を保つ。Issue #1605）。
     let converted = array_to_values(a.flat())?
         .into_iter()
-        .map(|v| apply_cast(element, v))
+        .map(|v| {
+            let v = match v {
+                ExprValue::Text(t) if rtrim_source => {
+                    ExprValue::Text(Cow::Owned(t.trim_end_matches(' ').to_string()))
+                }
+                other => other,
+            };
+            apply_cast(element, v)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let flat = values_to_array(converted, to)?;
     ArrayValue::with_dims(flat, a.dims())

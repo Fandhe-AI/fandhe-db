@@ -133,19 +133,13 @@ pub(crate) fn to_static_column_type_with_array_default(
             };
             let elem_ty = match elem_ty {
                 ColumnType::Text => ArrayElemType::Text,
-                // `varchar[]` は別 OID（1015）のため Text へ写さず拒否する（Issue #2305。
-                // 写すと型の区別が失われ、後で受理へ広げたときに不可逆になる）。
-                ColumnType::Varchar(_) | ColumnType::Bpchar(_) => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "this array element type is not supported yet".to_string(),
-                    })
-                }
-                // `smallint[]` は別 OID（1005）のため拒否する（Issue #1558。`varchar[]` と同じ理由）。
-                ColumnType::SmallInt => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "this array element type is not supported yet".to_string(),
-                    })
-                }
+                // `varchar[]`・`varchar(n)[]`・`char(n)[]` は別 OID（1015／1014）の専用要素型として
+                // 受理する（Issue #3231。Text へ写すと型の区別が失われるため写さない）。
+                ColumnType::Varchar(len) => ArrayElemType::Varchar(len),
+                ColumnType::Bpchar(n) => ArrayElemType::Bpchar(n),
+                // `smallint[]` は別 OID（1005）を持つ専用の要素型へ写す（Issue #3230。Integer へ丸めると
+                // 型の区別が失われる。Issue #1558 で拒否していた形を受理へ反転した）。
+                ColumnType::SmallInt => ArrayElemType::SmallInt,
                 ColumnType::Boolean => ArrayElemType::Bool,
                 ColumnType::Integer => ArrayElemType::Integer,
                 ColumnType::BigInt => ArrayElemType::BigInt,
@@ -153,18 +147,19 @@ pub(crate) fn to_static_column_type_with_array_default(
                 ColumnType::Double => ArrayElemType::Double,
                 ColumnType::Date => ArrayElemType::Date,
                 ColumnType::Timestamp => ArrayElemType::Timestamp,
-                // `time[]` は別 OID（1183）のため拒否する（Issue #1569。`smallint[]` と同じ理由）。
-                // `timestamptz[]` も別 OID（1185）のため拒否する（Issue #1574）。
-                // `interval[]` も別 OID（1187）のため拒否する（Issue #1579）。
-                // `bit[]` も別 OID（1561）のため拒否する（Issue #2021）。
-                ColumnType::Time
-                | ColumnType::TimestampTz
-                | ColumnType::Interval
-                | ColumnType::Bit(_) => {
-                    return Err(SqlSurfaceError::FeatureNotSupported {
-                        detail: "this array element type is not supported yet".to_string(),
-                    })
-                }
+                // `time[]` は別 OID（1183）を持つ専用の要素型へ写す（Issue #3232。Timestamp 等へ丸めると
+                // 型の区別が失われる。Issue #1569 で拒否していた形を受理へ反転した）。
+                ColumnType::Time => ArrayElemType::Time,
+                // `timestamptz[]` も別 OID（1185）を持つ専用の要素型へ写す（Issue #3233。Issue #1574
+                // で拒否していた形を受理へ反転した。`TIMESTAMPTZ(p)[]` はスカラー側が未対応で 0A000）。
+                ColumnType::TimestampTz => ArrayElemType::TimestampTz,
+                // `interval[]` は別 OID（1187）を持つ専用の要素型へ写す（Issue #3234。Text 等へ丸めると
+                // 型の区別が失われる。Issue #1579 で拒否していた形を受理へ反転した）。
+                ColumnType::Interval => ArrayElemType::Interval,
+                // `bit[]`・`bit(n)[]` は別 OID（1561）を持つ専用の要素型へ写す（Issue #3235。Text へ
+                // 丸めると型の区別が失われる。長さなしの `BIT[]` は `BIT(1)[]`。`VARBIT[]`・
+                // `BIT VARYING[]` はスカラーの VARBIT が構文段で `0A000` のため未対応のまま）。
+                ColumnType::Bit(n) => ArrayElemType::Bit(n),
                 ColumnType::Uuid => ArrayElemType::Uuid,
                 ColumnType::Numeric { precision, scale } => {
                     ArrayElemType::Numeric { precision, scale }
@@ -312,7 +307,8 @@ pub enum SqlColumnTypeName {
     /// `TIMESTAMP(p) WITH TIME ZONE`・配列は構文段で `0A000` のため精度付きには到達しない。
     TimestampTz,
     /// `INTERVAL`（TABLE-34・Issue #1579）。`INTERVAL(p)`・フィールド制限付き
-    /// （`INTERVAL YEAR TO MONTH` 等）・配列は構文段で `0A000` のため修飾付きには到達しない。
+    /// （`INTERVAL YEAR TO MONTH` 等）は構文段で `0A000` のため修飾付きには到達しない。配列
+    /// （`INTERVAL[]`）は Issue #3234 で受理（要素型の段で `ArrayElemType::Interval` へ写す）。
     Interval,
     /// `BIT(n)`（TABLE-48・Issue #2021）。長さ省略の `BIT` は `BIT(1)`（構文段で確定）。
     /// `BIT VARYING`・`VARBIT` は構文段で `0A000`、配列は要素型の段で `0A000`。
@@ -1196,10 +1192,18 @@ mod tests {
             let e = parse_type(raw).expect_err(raw);
             assert_eq!(e.wire_code(), "42601", "for {raw:?}");
         }
-        for raw in ["VARCHAR(3)[]", "CHAR(3)[]"] {
+        // 配列要素としての長さ付き型は専用の要素型として受理する（Issue #3231）。
+        for (raw, elem) in [
+            ("VARCHAR(3)[]", ArrayElemType::Varchar(Some(3))),
+            ("CHAR(3)[]", ArrayElemType::Bpchar(3)),
+        ] {
             let (ty, _) = parse_type(raw).expect(raw);
-            let e = to_static_column_type(&ty).expect_err(raw);
-            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), elem, "for {raw:?}")
+                }
+                other => panic!("{raw}: unexpected {other:?}"),
+            }
         }
     }
 
@@ -1215,11 +1219,78 @@ mod tests {
                 "for {raw:?}"
             );
         }
-        // 配列要素としては別 OID のため拒否する（構文は通り、静的写像で 0A000）。
+        // 配列要素としては専用の要素型 `SmallInt` へ写る（Issue #3230）。
         for raw in ["INT2[]", "SMALLINT[3]"] {
             let (ty, _) = parse_type(raw).expect(raw);
-            let e = to_static_column_type(&ty).expect_err(raw);
-            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::SmallInt, "for {raw:?}");
+                }
+                other => panic!("unexpected static type for {raw:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #3232: `TIME[]` 系の綴りは専用の要素型 `Time` へ写る。`TIME(p)[]`・`TIMETZ[]` は
+    /// 従来どおり構文段で `0A000`。
+    #[test]
+    fn time_array_spellings_map_to_time_element_type() {
+        for raw in ["TIME[]", "TIME[3]", "TIME WITHOUT TIME ZONE[]"] {
+            let (ty, _) = parse_type(raw).expect(raw);
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::Time, "for {raw:?}");
+                }
+                other => panic!("unexpected static type for {raw:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #3235: `BIT[]`・`BIT(n)[]` は専用の要素型 `Bit(n)` へ写る（長さなしは `BIT(1)`。`[N]` は
+    /// 要素数の上限、`[][]` は次元数）。`VARBIT[]`・`BIT VARYING[]` は構文段で `0A000` のまま。
+    #[test]
+    fn bit_array_spellings_map_to_bit_element_type() {
+        for (raw, n, max_len, ndims) in [
+            ("BIT[]", 1, 1024, 1),
+            ("BIT(4)[]", 4, 1024, 1),
+            ("BIT(4)[3]", 4, 3, 1),
+            ("BIT(4)[][]", 4, 1024, 2),
+        ] {
+            let (ty, _) = parse_type(raw).expect(raw);
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::Bit(n), "for {raw:?}");
+                    assert_eq!(a.max_len(), max_len, "for {raw:?}");
+                    assert_eq!(a.ndims(), ndims, "for {raw:?}");
+                }
+                other => panic!("{raw}: unexpected {other:?}"),
+            }
+        }
+        for raw in ["VARBIT[]", "BIT VARYING[]", "BIT VARYING(4)[]"] {
+            assert!(
+                parse_type(raw)
+                    .and_then(|(ty, _)| to_static_column_type(&ty))
+                    .is_err(),
+                "{raw} must stay unsupported"
+            );
+        }
+    }
+
+    /// Issue #3233: `TIMESTAMPTZ[]` 系の綴りは専用の要素型 `TimestampTz` へ写る。
+    #[test]
+    fn timestamptz_array_spellings_map_to_timestamptz_element_type() {
+        for raw in [
+            "TIMESTAMPTZ[]",
+            "TIMESTAMPTZ[3]",
+            "TIMESTAMP WITH TIME ZONE[]",
+        ] {
+            let (ty, _) = parse_type(raw).expect(raw);
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::TimestampTz, "for {raw:?}");
+                }
+                other => panic!("unexpected static type for {raw:?}: {other:?}"),
+            }
         }
     }
 
@@ -1241,13 +1312,19 @@ mod tests {
         }
     }
 
-    /// `varchar[]` は別 OID のため配列要素としては受理せず `0A000`（Issue #2305）。
+    /// `varchar[]` は別 OID（1015）の専用要素型として受理する（Issue #3231。Issue #2305 では
+    /// `0A000` だった）。`[N]` は要素数の上限になる。
     #[test]
-    fn varchar_array_is_rejected_with_0a000() {
-        for raw in ["VARCHAR[]", "CHARACTER VARYING[3]"] {
+    fn varchar_array_is_accepted_as_a_dedicated_element_type() {
+        for (raw, max_len) in [("VARCHAR[]", 1024), ("CHARACTER VARYING[3]", 3)] {
             let (ty, _) = parse_type(raw).expect(raw);
-            let e = to_static_column_type(&ty).expect_err(raw);
-            assert_eq!(e.wire_code(), "0A000", "for {raw:?}");
+            match to_static_column_type(&ty).expect(raw) {
+                StaticColumnType::Resolved(ColumnType::Array(a)) => {
+                    assert_eq!(a.elem(), ArrayElemType::Varchar(None), "for {raw:?}");
+                    assert_eq!(a.max_len(), max_len, "for {raw:?}");
+                }
+                other => panic!("{raw}: unexpected {other:?}"),
+            }
         }
     }
 

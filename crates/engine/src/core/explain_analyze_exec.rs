@@ -90,6 +90,13 @@ fn exec_parsed(ea: &ExplainAnalyzeDml) -> ParsedSql {
         ExplainAnalyzeDmlTarget::Dml(ExplainDml::Update(v)) => {
             ParsedSql::Update(ValidatedUpdateForm::Predicate(v.clone()))
         }
+        // 結合形（Issue #3293）。通常の `UPDATE ... FROM`／`DELETE ... USING` と同じ値で実行する。
+        ExplainAnalyzeDmlTarget::Dml(ExplainDml::UpdateFrom(v)) => ParsedSql::UpdateFrom(v.clone()),
+        ExplainAnalyzeDmlTarget::Dml(ExplainDml::DeleteUsing(v)) => {
+            ParsedSql::DeleteUsing(v.clone())
+        }
+        // `MERGE`（Issue #3357）。通常の `MERGE` と同じ値で実行する（台帳にも記録される）。
+        ExplainAnalyzeDmlTarget::Dml(ExplainDml::Merge(v)) => ParsedSql::Merge(v.clone()),
         ExplainAnalyzeDmlTarget::Insert(t) => match &**t {
             ExplainInsertTarget::Values(v) => ParsedSql::Insert((**v).clone()),
             ExplainInsertTarget::Select { insert, .. } => {
@@ -118,6 +125,10 @@ impl EngineCore {
         if Self::is_subquery_predicate_dml(&exec) {
             return Err(internal());
         }
+        // 結合形（Issue #3293）は暗黙 Tx への振り分け（`core.rs` の autocommit 腕が
+        // `is_joined_explain_analyze` で行う）か明示 Tx の共有 write txn が要る。非 Tx の腕
+        // （`execute_parsed_statement`）は結合形を `0A000` で拒否するため、そこへ流れる経路は
+        // 実行の段で fail-closed になる（黙って書かない）。
         let planning_start = Instant::now();
         let plan = match run(session, &plan_parsed(ea))? {
             SqlOutcome::Explain(plan) => plan,
@@ -129,7 +140,10 @@ impl EngineCore {
         let observe = crate::sql::hnsw_observe::enter();
         let rows = match run(session, &exec)? {
             SqlOutcome::Returning(o) => o.result.rows.len(),
-            SqlOutcome::Insert(_) | SqlOutcome::Update(_) | SqlOutcome::Delete(_) => 0,
+            SqlOutcome::Insert(_)
+            | SqlOutcome::Update(_)
+            | SqlOutcome::Delete(_)
+            | SqlOutcome::Merge(_) => 0,
             _ => return Err(internal()),
         };
         let execution_ms = exec_start.elapsed().as_secs_f64() * 1000.0;

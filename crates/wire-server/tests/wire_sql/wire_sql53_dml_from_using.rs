@@ -35,6 +35,12 @@ fn new_core() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             vec![ColumnDef::new("lang", ColumnType::Text, false)],
         ))
         .expect("create langs");
+    storage
+        .create_table(&TableSchema::new(
+            "tags",
+            vec![ColumnDef::new("lang", ColumnType::Text, false)],
+        ))
+        .expect("create tags");
     (
         Arc::new(EngineCore::from_storage(
             storage,
@@ -129,4 +135,272 @@ fn explicit_transaction_commits_and_rolls_back() {
     expect_tag(&mut stream, UPD, "UPDATE 2", b'T');
     expect_tag(&mut stream, "COMMIT;", "COMMIT", b'I');
     assert_eq!(count(&mut stream, UPDATED), 2);
+}
+
+/// 非等値・`OR` をまたぐ述語・`IS NOT NULL`・数値リテラル（Issue #3295）も、末尾 `;` 付きの単独送信で
+/// 正確なタグを返す。以前は `0A000` で拒否していた形。docs = ja/en/fr、langs = ja/en。
+#[test]
+fn residual_predicates_report_exact_tags_with_trailing_semicolon() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    // en < ja・fr < ja の 2 行（ja はどの langs.lang よりも小さくない）。
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = 9 FROM langs WHERE docs.lang < langs.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, UPDATED), 2);
+    // OR をまたぐ述語（等値 OR 数値リテラル）。ja・en の 2 行。
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = 1 FROM langs WHERE docs.lang = langs.lang OR docs.n > 100;",
+        "UPDATE 2",
+        b'I',
+    );
+    expect_tag(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.lang < langs.lang AND langs.lang IS NOT NULL;",
+        "DELETE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, ALL), 1);
+}
+
+/// 末尾 `;` 付き単独送信（psql 形）の `USING OPERATION_ID`（Issue #3203・RECOVER-10/11）: 初回は正確なタグ、
+/// 再送は `23505`、別文への再利用は `22023` で、エラー後も接続は ReadyForQuery（`I`）へ戻り使い続けられる。
+#[test]
+fn operation_id_forms_report_tags_resend_and_reuse_errors() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    let upd =
+        "UPDATE docs SET n = 9 FROM langs WHERE docs.lang = langs.lang USING OPERATION_ID 'w-x';";
+    let del = "DELETE FROM docs USING langs WHERE docs.lang = langs.lang USING OPERATION_ID 'w-y';";
+    expect_tag(&mut stream, upd, "UPDATE 2", b'I');
+    // 再送は再適用されない（再送の間に一致行を増やしても n=9 の行数は変わらない）。
+    expect_tag(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang, n) VALUES (4, '[0.4,0.1]', 'ja', 0) USING OPERATION_ID 'doc-4';",
+        "INSERT 0 1",
+        b'I',
+    );
+    send_simple_query(&mut stream, upd);
+    expect_error_response_with_sqlstate(&mut stream, "23505");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count(&mut stream, UPDATED), 2);
+
+    // 別文へ同じ ID を再利用すると 22023。
+    send_simple_query(&mut stream, &del.replace("'w-y'", "'w-x'"));
+    expect_error_response_with_sqlstate(&mut stream, "22023");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    expect_tag(&mut stream, del, "DELETE 3", b'I');
+    send_simple_query(&mut stream, del);
+    expect_error_response_with_sqlstate(&mut stream, "23505");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count(&mut stream, ALL), 1);
+}
+
+/// FROM／USING 内の `JOIN ... ON` と 3 表の形（Issue #3294）も、末尾 `;` 付き単独送信（psql 形）で正確な
+/// タグを返し、明示トランザクションの ROLLBACK で巻き戻る。未対応の結合形（`JOIN ... USING`）は
+/// `0A000` で拒否され、接続は ReadyForQuery（`I`）へ戻って使い続けられる。
+#[test]
+fn join_on_and_three_table_forms_report_exact_tags() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+    expect_tag(
+        &mut stream,
+        "INSERT INTO tags (id, lang) VALUES (1, 'ja') USING OPERATION_ID 'tag-1';",
+        "INSERT 0 1",
+        b'I',
+    );
+
+    let upd_join = "UPDATE docs SET n = 9 FROM langs JOIN tags ON langs.lang = tags.lang \
+                    WHERE docs.lang = langs.lang;";
+    expect_tag(&mut stream, upd_join, "UPDATE 1", b'I');
+    assert_eq!(count(&mut stream, UPDATED), 1);
+
+    let del_three =
+        "DELETE FROM docs USING langs, tags WHERE docs.lang = langs.lang AND langs.lang = tags.lang;";
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    expect_tag(&mut stream, del_three, "DELETE 1", b'T');
+    expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
+    assert_eq!(count(&mut stream, ALL), 3);
+    expect_tag(&mut stream, del_three, "DELETE 1", b'I');
+    assert_eq!(count(&mut stream, ALL), 2);
+
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs JOIN tags USING (lang);",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count(&mut stream, ALL), 2);
+}
+
+/// `EXPLAIN ...` の応答（`QUERY PLAN` 単一列・行・`EXPLAIN` タグ）を読み、行本文を連結して返す。
+fn expect_explain(stream: &mut std::net::TcpStream, sql: &str, status: u8) -> String {
+    send_simple_query(stream, sql);
+    assert_eq!(
+        read_row_description(stream),
+        vec!["QUERY PLAN".to_string()],
+        "{sql}"
+    );
+    let mut body = String::new();
+    loop {
+        let (kind, payload) = read_message(stream);
+        match kind {
+            b'D' => body.push_str(&String::from_utf8_lossy(&payload)),
+            b'C' => {
+                assert!(
+                    String::from_utf8_lossy(&payload).starts_with("EXPLAIN"),
+                    "{sql}"
+                );
+                break;
+            }
+            other => panic!("unexpected message {other}: {sql}"),
+        }
+    }
+    assert_eq!(read_ready_for_query_status(stream), status, "{sql}");
+    body
+}
+
+/// 静的な `EXPLAIN`（Issue #3293）は末尾 `;` 付きの単独送信でも結合計画を返し、行を変えない。
+#[test]
+fn static_explain_returns_the_join_plan_without_writing() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    for sql in [format!("EXPLAIN {UPD}"), format!("EXPLAIN {DEL}")] {
+        let body = expect_explain(&mut stream, &sql, b'I');
+        assert!(body.contains("join_method: hash"), "{sql}: {body}");
+    }
+    assert_eq!(count(&mut stream, UPDATED), 0);
+    assert_eq!(count(&mut stream, ALL), 3);
+}
+
+/// `EXPLAIN ANALYZE`（Issue #3293）は autocommit では書き込みが残り、明示 Tx では `ROLLBACK` で戻る。
+#[test]
+fn explain_analyze_writes_and_follows_transaction_state() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    expect_tag(&mut stream, "BEGIN;", "BEGIN", b'T');
+    let body = expect_explain(&mut stream, &format!("EXPLAIN ANALYZE {DEL}"), b'T');
+    assert!(body.contains("actual_rows"), "{body}");
+    expect_tag(&mut stream, "ROLLBACK;", "ROLLBACK", b'I');
+    assert_eq!(count(&mut stream, ALL), 3);
+
+    expect_explain(&mut stream, &format!("EXPLAIN ANALYZE {UPD}"), b'I');
+    assert_eq!(count(&mut stream, UPDATED), 2);
+}
+
+/// 管理用セッションで DDL を 1 文実行する（wire 経由の DDL 権限とは独立）。
+fn admin_ddl(core: &EngineCore, sql: &str) {
+    let mut session = engine::sql::mode::SessionState::default();
+    session.allow_ddl();
+    let ctx = engine::policy::PolicyContext::new("tenant-a").expect("valid tenant id");
+    core.execute_sql_in_session(&ctx, &mut session, sql)
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+/// Issue #3292: FROM／USING 側の単純形ビューは、末尾 `;` 付き単独送信でも `UPDATE n`／`DELETE n` を返す。
+#[test]
+fn view_source_reports_exact_tags_with_trailing_semicolon() {
+    let (core, _g) = new_core();
+    admin_ddl(&core, "CREATE VIEW lv AS SELECT id, lang FROM langs");
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = 9 FROM lv WHERE docs.lang = lv.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, UPDATED), 2);
+    expect_tag(
+        &mut stream,
+        "DELETE FROM docs USING lv WHERE docs.lang = lv.lang;",
+        "DELETE 2",
+        b'I',
+    );
+    assert_eq!(count(&mut stream, ALL), 1);
+}
+
+/// Issue #3296: SET の行値代入と FROM 側の列を含む式は、末尾 `;` 付き単独送信でも `UPDATE n` を返し、
+/// 値が変わる（拒否されていた形が通る）。列数の不一致は `42601` で拒否される。
+#[test]
+fn set_row_value_and_source_expression_report_exact_tags() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET n = length(langs.lang) + 7 FROM langs WHERE docs.lang = langs.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(
+        count(&mut stream, "SELECT id FROM docs WHERE n = 9 LIMIT 10"),
+        2
+    );
+    expect_tag(
+        &mut stream,
+        "UPDATE docs SET (n, lang) = (length(langs.lang) + 1, langs.lang) FROM langs \
+         WHERE docs.lang = langs.lang;",
+        "UPDATE 2",
+        b'I',
+    );
+    assert_eq!(
+        count(&mut stream, "SELECT id FROM docs WHERE n = 3 LIMIT 10"),
+        2
+    );
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET (n, lang) = (langs.lang) FROM langs WHERE docs.lang = langs.lang;",
+    );
+    let (kind, _) = read_message(&mut stream);
+    assert_eq!(kind, b'E');
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+}
+
+/// Issue #3292: 一時表だけの形は同じ接続の簡易クエリで通る（同名の永続表には作用しない）。
+#[test]
+fn temp_only_joined_dml_reports_exact_tags() {
+    let (core, _g) = new_core();
+    let mut stream = connect(core);
+    seed(&mut stream);
+    for sql in [
+        "CREATE TEMP TABLE docs (id BIGINT PRIMARY KEY, lang TEXT, n INTEGER);",
+        "CREATE TEMP TABLE langs (id BIGINT PRIMARY KEY, lang TEXT);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        let _ = read_command_complete(&mut stream);
+        assert_eq!(read_ready_for_query_status(&mut stream), b'I', "{sql}");
+    }
+    expect_tag(
+        &mut stream,
+        "INSERT INTO docs (id, lang, n) VALUES (1, 'ja', 0), (2, 'en', 0), (3, 'fr', 0);",
+        "INSERT 0 3",
+        b'I',
+    );
+    expect_tag(
+        &mut stream,
+        "INSERT INTO langs (id, lang) VALUES (1, 'ja'), (2, 'en');",
+        "INSERT 0 2",
+        b'I',
+    );
+    expect_tag(&mut stream, UPD, "UPDATE 2", b'I');
+    assert_eq!(count(&mut stream, UPDATED), 2);
+    expect_tag(&mut stream, DEL, "DELETE 2", b'I');
+    assert_eq!(count(&mut stream, ALL), 1);
 }

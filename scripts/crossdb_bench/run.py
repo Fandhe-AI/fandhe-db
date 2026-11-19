@@ -26,7 +26,13 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from common import load_jsonl, write_result  # noqa: E402
-from recall import build_ground_truth, recall_at_k, recall_at_k_tie_tolerant  # noqa: E402
+from hybrid_depth import DEPTH_ARMS, overlap_at_k, summary_line, topic_hit_rate  # noqa: E402
+from recall import (  # noqa: E402
+    build_ground_truth,
+    fixture_norm_stats,
+    recall_at_k,
+    recall_at_k_tie_tolerant,
+)  # noqa: E402
 
 DB_MODULES = [
     "self",
@@ -301,10 +307,24 @@ def main() -> int:
 
     # --- recall_at_10: vector_knn フェーズが ids_per_query を返していれば ground truth と照合 ---
     docs_file = resolve_docs_file(args)
+    # 自作 DB の `<=>`（コサイン）と内積正解の順位一致の前提（単位ノルム）を記録する（Issue #3224）。
+    if os.path.exists(docs_file):
+        norm = fixture_norm_stats(docs_file, queries)
+        meta["fixture_norm"] = norm
+        if norm["max_abs_norm_deviation"] > 1e-3 or norm["zero_norm_docs"] or norm["zero_norm_queries"]:
+            print(f"warning: fixture is not unit-norm: {norm}", file=sys.stderr)
     knn_phase = phases.get("vector_knn", {})
     ids_per_query = knn_phase.get("ids_per_query") if isinstance(knn_phase, dict) else None
+    # dense 正解集合は docs_file・queries・k が共通なので 1 度だけ構築して全 arm で再利用する
+    gt_cache: list = []
+
+    def ground_truth():
+        if not gt_cache:
+            gt_cache.append(build_ground_truth(docs_file, queries, k=10))
+        return gt_cache[0]
+
     if ids_per_query and os.path.exists(docs_file):
-        strict_top_k, tie_boundaries = build_ground_truth(docs_file, queries, k=10)
+        strict_top_k, tie_boundaries = ground_truth()
         recall_strict = recall_at_k(ids_per_query, strict_top_k)
         recall_tie = recall_at_k_tie_tolerant(ids_per_query, tie_boundaries, k=10)
         # recall_at_10 は同点許容版を主指標とする（同点境界の順序差で exact
@@ -321,9 +341,57 @@ def main() -> int:
             "reason": "vector_knn が unsupported、または docs ファイルが見つからない",
         }
 
+    # --- hybrid 深さ arm の品質指標（Issue #3225。定義は hybrid_depth.py・README 参照） ---
+    # いずれも hybrid の BM25 関連性 recall ではない。算出不能は 0 とせず quality_unsupported に理由を残す。
+    # 深さ arm が 1 つも無い DB（pgvector・MySQL 等）では docs を読まない。読む場合も
+    # 行単位で id と topic だけを保持し、embedding を含む全文書をメモリへ二重展開しない。
+    doc_topic: dict[int, str] = {}
+    has_depth_arm = any(
+        isinstance(phases.get(a), dict) and not phases[a].get("unsupported") and phases[a].get("ids_per_query")
+        for a in DEPTH_ARMS
+    )
+    if has_depth_arm and os.path.exists(docs_file):
+        import json as _json
+
+        with open(docs_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = _json.loads(line)
+                if d.get("topic") is not None and d.get("id") is not None:
+                    doc_topic[int(d["id"])] = d["topic"]
+    query_topics = [q.get("topic") for q in queries]
+    depth200_ids = (phases.get("hybrid_rrf_depth200") or {}).get("ids_per_query")
+    for arm in DEPTH_ARMS:
+        ph = phases.get(arm)
+        if not isinstance(ph, dict) or ph.get("unsupported"):
+            continue
+        arm_ids = ph.get("ids_per_query")
+        if not arm_ids:
+            ph["quality_unsupported"] = "ids_per_query が無い"
+            continue
+        if os.path.exists(docs_file):
+            strict_top_k, tie_boundaries = ground_truth()
+            ph["dense_gt_recall_at_10"] = recall_at_k_tie_tolerant(arm_ids, tie_boundaries, k=10)
+            ph["dense_gt_recall_at_10_strict"] = recall_at_k(arm_ids, strict_top_k)
+        else:
+            ph["quality_unsupported"] = "docs ファイルが見つからない"
+        rate, reason = topic_hit_rate(arm_ids, doc_topic, query_topics, k=10)
+        ph["topic_hit_rate_at_10"] = rate
+        if reason:
+            ph["topic_hit_rate_reason"] = reason
+        if arm == "hybrid_rrf_depth50":
+            ph["overlap_at_10_vs_depth200"] = overlap_at_k(arm_ids, depth200_ids or [], k=10)
+
     # ids_per_query は正解照合専用の中間データであり、結果 JSON を肥大化させるため保存しない。
     if isinstance(knn_phase, dict) and "ids_per_query" in knn_phase:
         del knn_phase["ids_per_query"]
+    for arm in DEPTH_ARMS:
+        ph = phases.get(arm)
+        if isinstance(ph, dict):
+            ph.pop("ids_per_query", None)
+            print(summary_line(arm, ph))
 
     out_path = write_result(args.out_dir, args.db, args.config, meta, phases)
     print(f"wrote: {out_path}")

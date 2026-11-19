@@ -47,6 +47,15 @@ CREATE TABLE <table> (
 ラッパー。空の `UdfRegistry` で呼び、セッションの UDF を解決させない）で行う
 ため、評価器は完全に既存のものを再利用する（第 2 の実装を作らない）。
 
+**受け付ける `IN`／`BETWEEN`／`IS [NOT] NULL`（Issue #3244・TABLE-16・SQL-24 ポインタ）**:
+列を左辺にとる `IN`（文字列・数値）・`NOT IN`・`BETWEEN`（数値・型付きリテラル）・
+`NOT BETWEEN`・`IS NULL`・`IS NOT NULL` を受理する。数値の `IN`／`BETWEEN` は WHERE と同じ展開で
+保持・永続化する（`n IN (1, 2)` は `(n = 1 OR n = 2)`、`n BETWEEN 1 AND 3` は
+`n >= 1 AND n <= 3` として保存される。PG も `BETWEEN` は展開して保存する）。この展開で生じる
+`Or` は許可し、`reject_forbidden_elements` は各分岐へ再帰して `visible()`・非組み込み関数・
+サブクエリが分岐に隠れても拒否する。利用者が書いた `OR`・`NOT` も受理済みで
+ある（#3243）。
+
 **数値列の式参照（Issue #1075・TABLE-16 ポインタ）**: `sql::udf_call::
 bind_expr_in` の `Expr::Ident` 分岐は、束縛環境の列参照ポリシー
 （`ColumnRefPolicy`）に応じて INTEGER/BIGINT/REAL/DOUBLE 列の式内参照を許可
@@ -72,16 +81,49 @@ TEXT／VECTOR／INTEGER／BIGINT 列のみ宣言できる（REAL/DOUBLE 列は R
 ## D1. 三値論理（SQL 標準・PostgreSQL 準拠）
 
 CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NULL）は通過させる
-（AND 連結のため「いずれかの連言が FALSE なら違反」と同値）。
+（Issue #3242。TABLE-16・SQL-24・SQL-26 のポインタ）。評価は述語木
+（AND の連言と入れ子の `OR` 群）を Kleene の三値論理で行う
+（`sql::where_tree::BoundConjunction::eval_three_valued`）。
 
-- 宣言的フィルタ: 参照列の値が `None`（NULL）なら UNKNOWN としてスキップし、
-  非 NULL で `matches() == false` のときのみ違反とする（`matches_all` は NULL
-  を不一致扱いするため使わず、`MetadataFilter::matches` を連言ごとに直接
-  呼ぶ）。
-- 式フィルタ: `VECTOR` 列を参照する式は、その行の embedding が NULL
-  （`dim == 0`）なら UNKNOWN としてスキップする（`sql/scan.rs` の `WHERE` 式
-  評価と同じ判断。現状 CREATE TABLE の `VECTOR` 列は常に non-null のため
-  実際には到達しないが、将来の拡張に備えた防御的処理）。
+- 葉の評価器は WHERE と共有する（宣言的フィルタは `MetadataFilter::eval`、式は
+  `ExprProgram::eval`。第 2 の葉評価器を作らない）。WHERE 側の二値 `matches` は
+  UNKNOWN の葉で打ち切るため、三値版は別メソッドとして並べ、WHERE 側の評価順・
+  エラー順序は変えない。
+- 連言は `metadata_filters` → `expr_filters` → `or_groups` の順に評価し、FALSE で
+  打ち切る。UNKNOWN は記録して評価を続ける（旧評価と同じ順序のため、許可形の
+  合否・違反した制約名・式評価エラーの `wire_code` は置換前後で一致する）。
+- 「列が NULL なら合格」という列単位の短絡は持たない。NULL は葉へ渡して評価する
+  （`IS NULL`／`IS NOT NULL` などを正しく扱うための前提）。
+- 非 NULL の値に対して葉が UNKNOWN になる場合（型不一致・壊れた格納値）と、列
+  インデックスが復号範囲外の場合は、合格にも `23514` にもせず `Internal`（`XX000`）
+  で拒否する。UNKNOWN＝合格にすると黙って通り、FALSE に写すと `NOT` を付けたとき
+  TRUE へ反転し得るため。単一検査点からは到達しない不変条件違反で、旧実装は
+  型不一致を `23514` にしていたが、正常な入力の結果は変わらない。
+- 式が Bool／NULL 以外を返した場合も `XX000`。式評価エラー（0 除算等）は元の
+  `wire_code` のまま透過する（D1'）。
+- `bind_check_predicates` が返す `OR` 群は捨てずに保持し、`column_mask` へ
+  再帰的に反映する（マスク漏れはマスク外＝NULL 扱いで合格する fail-open）。
+  `IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL` は #3244 で解禁した（下記）。
+- **`OR`・`NOT` の受理（Issue #3243）**: 構文段の拒否（`OR`・`NOT (...)`・裸の
+  `NOT <式比較>`）を外し、WHERE と同じ経路へ流す。否定は構文段の `negate_conjunction`
+  （De Morgan・演算子反転。Kleene の三値論理でも厳密に成り立つ）で葉まで押し下げ、
+  束縛木（`BoundConjunction`／`BoundOrGroup`）に `Not` 節点を足さない。したがって
+  第 2 の評価器は作らず、`Truth::not` は葉の宣言的フィルタ（`FilterOp::Not`）の内側で
+  既に効いており、群の上に Not を置く経路は不要（#3242 の申し送りへの回答）。例:
+  `NOT (a = 0)` は `a < 0 OR a > 0`、`NOT (a = 0 OR b = 0)` は連言 `[NOT a = 0, NOT b = 0]`、
+  `<>`／`!=` も同様に脱糖する。表示・永続形は正規化テキストで、往復一致は
+  `build_check_constraint` が検証する（カタログ版の変更なし。旧バイナリが新形式の述語を
+  読むと `compile` が `XX000` で fail-closed になるため、ダウングレード時は注意）。
+  `reject_forbidden_elements` は `OR` の各分岐・`NOT` の内側へ再帰し（ワイルドカードなしの
+  `match`）、UDF・`visible()`・式左辺の LIKE が紛れて通る経路を作らない。
+- **NULL の扱い（#3244）**: `IS NOT NULL` だけが NULL を違反にする。`IN`／`NOT IN`／
+  `BETWEEN`／`NOT BETWEEN` は NULL で UNKNOWN になり合格する。`IS NULL` は非 NULL を違反にする。
+- **依存列の OR 網羅（Issue #3243）**: `referenced_column_names` は `OR` 群の内側
+  （脱糖された `NOT (n = 0)`・`n <> 0` を含む）の列も依存列に含める。取りこぼすと
+  `DROP COLUMN` の依存検査・`RENAME COLUMN` の追随・`ALTER COLUMN TYPE` の再計算を
+  すり抜け、CHECK を黙って壊す（fail-open）ため。
+- `VECTOR` 列を参照する式は、その行の embedding が NULL（`dim == 0`）なら
+  `ExprProgram::eval` が NULL（UNKNOWN）を返す（`ExprStep::PushVector`）。
 
 ## D1'. 数値列比較の評価規則（Issue #1075・TABLE-16 ポインタ）
 
@@ -238,6 +280,9 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - `alter_table_add_column`／`alter_table_widen_numeric_precision`：
   再エンコード時に `checks` を保持する（`decode_schema_with_resolver` →
   変更 → `encode_schema` の往復で自動的に保存される）。
+- 依存列の収集は OR 群（数値の `IN`／`BETWEEN` の展開。#3244）の内側の参照列も含める
+  （束縛済みの OR 群は評価側の列マスクと同じ `mark_scalar_column_mask`、未束縛の式述語は
+  `Or` の分岐を再帰して識別子を集める。取りこぼすと `DROP COLUMN` の依存検査をすり抜ける）。
 - 依存列（`CheckConstraint::columns`）は、宣言的フィルタの参照列に加え、式述語
   （組み込み関数の引数・算術式の内側を含む）が参照する列も集める（`vec_norm(embedding)`
   の `VECTOR` 列等。PR #1055 codex P1 の是正）。`ALTER TABLE` の依存検査は記録された
@@ -258,6 +303,15 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   変わらない。加えて同一 txn 内で変更列を参照する CHECK を新スキーマで再コンパイルし、
   全テナント・全可視性の既存行を再検証する（違反は `23514`、評価エラーは透過、
   拒否時は commit しない）。
+- 新しい述語形の追随（Issue #3245）：`IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL`／`OR`／`NOT`
+  の `ADD CONSTRAINT` 再検証・`RENAME COLUMN`・`ALTER COLUMN TYPE` は、三値評価（Issue #3242）
+  と同じ経路で全テナント・全可視性の既存行を再検証する（UNKNOWN は合格、`IS NOT NULL` だけが
+  NULL を違反にする）。述語形の走査（`reject_vector_family_null_tests`・`referenced_column_names`
+  の内部走査・`normalize_session_local_predicates`）はワイルドカード腕を使わず variant を列挙し、
+  述語形の追加時の追随漏れをコンパイルエラーにする。`referenced_column_names` が宣言的な葉で
+  列名を重ねて push しないのは、束縛済みフィルタと OR 群が依存列を収集するため（記録列の網羅
+  検査と順序を変えない）。束縛できない型変更（INTEGER→TEXT 等）は `XX000` ではなく束縛エラー
+  （`42883`・`22000`）で拒否され表は変わらない。
 - 索引宣言（TASK-206・INDEX-7、Issue #908）との関係: `alter_table_drop_column` は
   削除列を含む索引宣言を同一 write トランザクションで掃除するが、CHECK 参照列の
   拒否はその掃除より前に判定し commit しないため、拒否時は索引宣言も一切変わら
@@ -272,6 +326,13 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 
 ## 対象外（申し送り）
 
+- #3244 で fail-closed のまま残す形（拒否固定テストは `intentional:` でこの節を指す）。
+  - 式を左辺にとる `IN`／`BETWEEN`／`IS NULL`（`n + 1 IS NULL` 等。`42601`。評価経路の保証範囲外）。
+  - TEXT 列の `BETWEEN`（束縛段が TEXT 範囲を受け付けず `22000`。CHECK は範囲書き換えを行わない）。
+  - 数値列 × 文字列要素の `IN`（`n IN ('1', '2')`。書き換えは WHERE 文脈だけで `22000`）。
+  - `HALFVEC`／`INT8VEC`／`SPARSEVEC` 列の `IS [NOT] NULL`（各列型の Issue が固定した拒否で `42601`。
+    `build_check_constraint` と `CompiledChecks::compile` の列型ガード）。
+  - 受け皿 Issue は無い（対応しない判断。要否は別途判断）。
 - レーン A（`WHERE`／`SELECT`／集計での INTEGER/BIGINT/REAL/DOUBLE 列の式
   参照。未起票）。`CHECK` は Issue #1075 で `ColumnRefPolicy::
   AllowNumericColumns` による opt-in 拡張として対応済みだが、汎用の
@@ -285,8 +346,11 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
 - `qty > '5'`（INTEGER 列に文字列リテラルの `Compare` 形）の受理。
 - `ALTER TABLE ADD/DROP CONSTRAINT CHECK` の `NOT VALID`／`VALIDATE
   CONSTRAINT` 形（Issue #1068 のスコープ外。同 Issue の設計ドキュメント参照）。
-- NoSQL 表層への DDL op（`create_table` 相当。CHECK の ALTER も同様に対象外）。
-- `CHECK` 参照列への `ALTER COLUMN TYPE` の許可（現状は安全側で拒否）。
+- NoSQL 表層の CHECK: `create_table` の CHECK は Issue #1199 で結線済みで、Issue #3246 で
+  SQL と同じ拡張述語形（IN／BETWEEN／IS [NOT] NULL／OR／NOT／`<>`／LIKE）を受理する
+  （[nosql-ddl-mapping.md](nosql-ddl-mapping.md)）。NoSQL での CHECK の ALTER（`alter_table` の
+  add／drop constraint 相当）は受け皿 Issue なしの対象外のまま（要否は別途判断）。
+- `CHECK` 参照列への `ALTER COLUMN TYPE`: 拡大変換・一般変換は再束縛と全行再検証つきで受理済み（Issue #1427・#1637）。カタログのみの変更（VARCHAR(n) の拡大等）で CHECK 依存がある場合は述語の意味不変を論証していないため `2BP01` のまま（意図的に維持）。
 - `catalog.rs` の生書き込み API（`#[cfg(test)]` 限定・production では到達不能）は
   検査点を経由しない。Issue #1078 で、これら 3 API 自身が `CHECK` を含む制約付き
   テーブルへの書き込みを fail-closed に拒否するガードを追加したため、検査点を
@@ -314,6 +378,24 @@ CHECK が違反になるのは述語が FALSE のときだけで、UNKNOWN（NUL
   compile/enforce・三値論理・数値列比較〔INTEGER/BIGINT/REAL/DOUBLE の
   合否・列マスク OR の fail-open 回帰ガード・BIGINT 精度超過・0 除算の
   fail-closed・数値列以外は引き続き拒否〕）。
+- Issue #3244: `check_constraint.rs` の単体テスト（受理形の描画と往復一致・NULL を含む
+  三値評価・OR 展開の依存列と列マスク・未対応形の `wire_code` 固定）、
+  `tests/table_rls/table16_check_constraint.rs`（INSERT・UPDATE・`ALTER TABLE ADD CHECK`・
+  DROP／RENAME COLUMN の依存）、wire-server の `wire_create_table.rs`（末尾 `;` 付き単独文）。
+- Issue #3245: `sql_alter_table_check_constraint.rs`（新しい述語形の ADD 再検証・別テナント行・
+  NULL の逆向きケース・エラー文言の非漏えい）、`sql_alter_column_type_check_columns.rs`
+  （拡大・一般変換・CharFamily の ALTER TYPE）、`table16_check_constraint.rs`（RENAME 追随と再オープン）、
+  `wire_create_table.rs`（末尾 `;` 付きの ADD CONSTRAINT・RENAME・ALTER TYPE）。
+- Issue #3246: wire-server の `http/query/ddl.rs` 単体テスト（SQL とのパリティ行列・形の拒否の
+  `wire_code`）、`tests/http_nosql/nosql13_ddl.rs`（NoSQL `create_table` の拡張述語形・三値論理・
+  テナント越境・engine 拒否の SQL パリティ・末尾 `;` 付き SQL INSERT との混在）、
+  `tests/table_rls/table16_check_constraint.rs`（拡張述語形の越境・RLS 述語名の `OR`／`NOT`
+  への紛れ込み拒否・テナント列参照の `42703`）。
+- `crates/engine/src/sql/where_tree.rs`（三値評価器。Kleene の真理値表・`OR`
+  群の短絡と UNKNOWN の伝播・非 NULL で UNKNOWN の葉と範囲外 index の
+  `Internal`）。`check_constraint.rs` には置換前の `enforce`（連言ごとの NULL
+  短絡）を参照実装としてテスト内に残し、許可形の行列（NULL・充足・違反・境界値・
+  UNKNOWN の後の評価エラー）で新旧の結果が一致することを差分テストで固定する。
 - `crates/engine/src/sql/udf_call.rs`・`crates/engine/src/sql/
   expr_program.rs`（`ColumnRefPolicy`・`BoundExpr::ColumnRef` の束縛・
   評価差分テスト。既定ポリシーでの回帰確認を含む）。

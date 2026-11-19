@@ -71,8 +71,33 @@ pub(crate) const TRIGGER_FUNCTION_NOT_FOUND_MESSAGE: &str = "trigger function do
 /// 関数はあるが `RETURNS trigger` ではないときの `Invalid` 文言（`42P17`）。
 pub(crate) const TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE: &str = "function is not a trigger function";
 
+/// 共有 `public` 表へのトリガ定義を拒む `Invalid` 文言。`sql::trigger_ddl` が `0A000` へ写す。発火時の
+/// 保険（`trigger::call::PlpgsqlTriggerInvoker`）も同じ文言を使う（Issue #3361）。固定で、内部キー・
+/// tenant_id・他テナントの定義の有無を含めない。
+pub(crate) const TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE: &str =
+    "triggers on shared public tables are not supported";
+
 /// 件数上限超過の `ViewLimitExceeded` 文言（`54000`）。
 pub(crate) const TRIGGER_LIMIT_MESSAGE: &str = "too many triggers";
+
+/// 表キーが共有 `public` 表（裸の名前）か。解析に失敗するキーも拒否側（`true`）に倒す（fail-closed）。
+/// 定義時の拒否と発火時の保険（`trigger::call`）が同じ判定を使う。
+pub(crate) fn is_shared_public_table_key(table_key: &str) -> bool {
+    !matches!(
+        super::namespace::RelationKey::parse(table_key),
+        Ok(super::namespace::RelationKey::InSchema { .. })
+    )
+}
+
+/// `create_trigger_inner` が共有 `public` 表をどう扱うか。本番経路は常に `Reject`。
+/// `AllowLegacyForTest` は「この拒否の導入前にカタログへ残った定義」を模すテスト専用の注入口で、
+/// テストコードからしか作らない（本番に bypass を作らない）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedPublicTables {
+    Reject,
+    #[cfg(test)]
+    AllowLegacyForTest,
+}
 
 /// 所有者の予約値（ロール機構が入るまで常に 0）。
 const OWNER_TAG_NONE: u8 = 0;
@@ -82,6 +107,11 @@ const OWNER_TAG_NONE: u8 = 0;
 pub(crate) enum TriggerTiming {
     Before,
     After,
+    /// `INSTEAD OF`（ビューへの行トリガ。TABLE-45・Issue #3193）。ビューにだけ定義でき、ビューへの
+    /// INSERT／UPDATE／DELETE を行ごとにトリガ関数へ振り替える。blob の版は据え置きの加法的な追加で、
+    /// このタグを知らない旧バイナリは [`corrupt`] で fail-closed に拒否する
+    /// （設計記録: `docs/design/trigger-instead-of.md`）。
+    InsteadOf,
 }
 
 impl TriggerTiming {
@@ -89,6 +119,7 @@ impl TriggerTiming {
         match self {
             Self::Before => 0,
             Self::After => 1,
+            Self::InsteadOf => 2,
         }
     }
 
@@ -96,6 +127,7 @@ impl TriggerTiming {
         match tag {
             0 => Ok(Self::Before),
             1 => Ok(Self::After),
+            2 => Ok(Self::InsteadOf),
             _ => Err(corrupt()),
         }
     }
@@ -169,8 +201,8 @@ pub(crate) struct TriggerDef {
     pub(crate) function_key: String,
     /// `EXECUTE FUNCTION f('a', 1)` の引数（`TG_ARGV`。値として保存し SQL へ連結しない）。
     pub(crate) tg_args: Vec<String>,
-    /// `WHEN` 条件の正規化テキスト。現状の SQL 表層は `WHEN` を受理しない（`0A000`）ため常に `None`
-    /// だが、保存形式は将来のために持つ。
+    /// `WHEN` 条件の正規化テキスト（括弧の内側。Issue #3190）。構文段が検査・正規化して保存し、
+    /// 発火側が行ごとに NEW／OLD で評価する（`None` は条件なし）。
     pub(crate) when_sql: Option<String>,
 }
 
@@ -216,6 +248,17 @@ fn validate_shape(def: &TriggerDef) -> Result<()> {
     }
     if def.level == TriggerLevel::Row && def.events.contains(TriggerEvents::TRUNCATE) {
         return Err(invalid("TRUNCATE triggers must be statement-level"));
+    }
+    if def.timing == TriggerTiming::InsteadOf {
+        // INSTEAD OF は行トリガだけ（PostgreSQL と同じ）。`UPDATE OF`・`WHEN` は未対応（定義の段で `0A000`）。
+        if def.level != TriggerLevel::Row {
+            return Err(invalid("INSTEAD OF triggers must be row-level"));
+        }
+        if !def.update_of.is_empty() || def.when_sql.is_some() {
+            return Err(invalid(
+                "INSTEAD OF triggers do not support UPDATE OF or WHEN",
+            ));
+        }
     }
     if !def.update_of.is_empty() {
         if !def.events.contains(TriggerEvents::UPDATE) {
@@ -642,6 +685,7 @@ pub(crate) fn remove_triggers_referencing_function_in_txn(
 }
 
 /// 表 `table_key` のいずれかのテナントのトリガが `UPDATE OF` で列 `column` を参照しているか
+/// または `WHEN` 条件の `NEW`／`OLD` 参照で列 `column` を使っているか
 /// （`RENAME COLUMN`・`DROP COLUMN`・`ALTER COLUMN TYPE` の暫定ガード用。表が無ければ `false`）。
 pub(crate) fn triggers_referencing_column_in_txn<R: ReadSource>(
     src: &R,
@@ -659,12 +703,23 @@ pub(crate) fn triggers_referencing_column_in_txn<R: ReadSource>(
         if t != table_key {
             break;
         }
-        if decode_trigger_def(name, v.value())?
-            .update_of
-            .iter()
-            .any(|c| c == column)
-        {
+        let def = decode_trigger_def(name, v.value())?;
+        if def.update_of.iter().any(|c| c == column) {
             return Ok(true);
+        }
+        // WHEN 条件が NEW／OLD 経由で参照する列も依存として扱う（Issue #3190）。
+        if let Some(w) = def.when_sql.as_deref() {
+            match crate::sql::lexer::tokenize(w) {
+                Ok(ts) => {
+                    if ts.iter().any(|t| {
+                        matches!(t, crate::sql::lexer::Token::QualifiedIdent { name, .. } if name == column)
+                    }) {
+                        return Ok(true);
+                    }
+                }
+                // 字句解析できない保存値は fail-closed で依存ありとみなす。
+                Err(_) => return Ok(true),
+            }
         }
     }
     Ok(false)
@@ -674,12 +729,16 @@ impl Storage {
     /// `scope` のテナントとして、表 `table_key` にトリガを作り、内部 ID を返す。単一 write txn・1 回の
     /// commit で行い、判定順は次のとおり（すべて commit 前に返るため副作用ゼロ）。
     ///
-    /// 形状 → SCHEMA の現存 → 対象の種別（ビュー・索引・SEQUENCE・マテリアライズドビューは
-    /// `WrongObjectKind`）→ 表の存在（`TableNotFound`）→ `UPDATE OF` の列（`ColumnNotFound`）→ 関数
+    /// 形状 → SCHEMA の現存 → 対象の種別（索引・SEQUENCE・マテリアライズドビューは `WrongObjectKind`。
+    /// BEFORE／AFTER のビュー、INSTEAD OF の表も `WrongObjectKind`。Issue #3193）→ 対象の存在
+    /// （INSTEAD OF はビュー、他は表。`TableNotFound`）→ 共有 `public` 表
+    /// （`Invalid(TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE)`。Issue #3361。同名・上限・関数の判定より前で
+    /// 止め、他テナントの定義の有無で応答を変えない）→ `UPDATE OF` の列（`ColumnNotFound`）→ 関数
     /// （`Invalid(TRIGGER_FUNCTION_NOT_FOUND_MESSAGE)`／`Invalid(TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE)`）→
     /// 同名の既存（`or_replace` でなければ `Invalid(TRIGGER_ALREADY_EXISTS_MESSAGE)`）→ 件数上限
     /// （`ViewLimitExceeded`）。`or_replace` の置き換えは既存の内部 ID を引き継ぐ。成功時は対象表の世代を進める。
     /// `def.id` は無視される。呼び出し元は `sql::trigger_ddl`。
+    #[cfg(test)]
     pub(crate) fn create_trigger(
         &self,
         scope: &str,
@@ -687,26 +746,46 @@ impl Storage {
         def: &TriggerDef,
         or_replace: bool,
     ) -> Result<u64> {
+        self.create_trigger_in(None, scope, table_key, def, or_replace)
+    }
+
+    /// [`Self::create_trigger`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn の上で
+    /// 実行し commit しない。トリガ関数は同じ txn から解決するため、同じ Tx で作った関数も見える。
+    /// SQL-80・Issue #3316）。
+    pub(crate) fn create_trigger_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        scope: &str,
+        table_key: &str,
+        def: &TriggerDef,
+        or_replace: bool,
+    ) -> Result<u64> {
         self.create_trigger_inner(
+            target,
             scope,
             table_key,
             def,
             or_replace,
             MAX_TRIGGERS_PER_TABLE,
             returns_trigger,
+            SharedPublicTables::Reject,
         )
     }
 
     /// [`Self::create_trigger`] の本体。件数上限とトリガ関数の判定を引数にし、テストが小さい上限と
     /// 「`RETURNS trigger` の関数がある」状況（保存形式の追加は #2228）を注入できるようにする。
+    // 件数上限・関数判定・共有 public 表の扱いはテストの注入口で、本番の呼び出し元は `create_trigger` だけ。
+    #[allow(clippy::too_many_arguments)]
     fn create_trigger_inner(
         &self,
+        target: Option<&redb::WriteTransaction>,
         scope: &str,
         table_key: &str,
         def: &TriggerDef,
         or_replace: bool,
         max_triggers: usize,
         is_trigger_fn: fn(&FunctionDef) -> bool,
+        shared_public: SharedPublicTables,
     ) -> Result<u64> {
         validate_scope(scope)?;
         validate_relation_key(table_key)?;
@@ -714,72 +793,96 @@ impl Storage {
         stored.function_key = normalize_function_key(&def.function_key)?;
         stored.id = 1;
         validate_shape(&stored)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        // 名前解決後に `DROP SCHEMA` が完了しても、削除済み ID 配下の表へ定義を残さない。
-        super::namespace::ensure_tenant_key_schema_alive_in_txn(&*write_txn, scope, table_key)?;
-        let in_views = match ReadSource::open_table(&*write_txn, VIEWS_TABLE) {
-            Ok(t) => t.get(table_key)?.is_some(),
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if in_views
-            || index_name_exists_in_txn(&write_txn, table_key)?
-            || materialized_view_exists_in_txn(&write_txn, table_key)?
-            || super::sequence::sequence_exists_in_txn(&write_txn, table_key)?
-        {
-            return Err(CatalogError::WrongObjectKind(table_key.to_string()));
-        }
-        let table_exists = match ReadSource::open_table(&*write_txn, CATALOG_TABLE) {
-            Ok(t) => t.get(table_key)?.is_some(),
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !table_exists {
-            return Err(CatalogError::TableNotFound(table_key.to_string()));
-        }
-        if !stored.update_of.is_empty() {
-            let schema = require_table_schema_write_any_identity(&write_txn, table_key)?;
-            for col in &stored.update_of {
-                if !schema.columns.iter().any(|c| &c.name == col) {
-                    return Err(CatalogError::ColumnNotFound(col.clone()));
+        self.run_catalog_write(target, |write_txn| {
+            // 名前解決後に `DROP SCHEMA` が完了しても、削除済み ID 配下の表へ定義を残さない。
+            super::namespace::ensure_tenant_key_schema_alive_in_txn(write_txn, scope, table_key)?;
+            let in_views = match ReadSource::open_table(write_txn, VIEWS_TABLE) {
+                Ok(t) => t.get(table_key)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            let table_exists = match ReadSource::open_table(write_txn, CATALOG_TABLE) {
+                Ok(t) => t.get(table_key)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            // 対象の種別: INSTEAD OF はビューだけ、それ以外のタイミングは（実体を持つ）表だけ。
+            let is_instead_of = stored.timing == TriggerTiming::InsteadOf;
+            if index_name_exists_in_txn(write_txn, table_key)?
+                || materialized_view_exists_in_txn(write_txn, table_key)?
+                || super::sequence::sequence_exists_in_txn(write_txn, table_key)?
+                || (is_instead_of && table_exists)
+                || (!is_instead_of && in_views)
+            {
+                return Err(CatalogError::WrongObjectKind(table_key.to_string()));
+            }
+            let target_exists = if is_instead_of {
+                in_views
+            } else {
+                table_exists
+            };
+            if !target_exists {
+                return Err(CatalogError::TableNotFound(table_key.to_string()));
+            }
+            // 共有 public 表は全テナントの書き込みが通るため、特定テナントのトリガを持たせない（Issue #3361）。
+            if shared_public == SharedPublicTables::Reject && is_shared_public_table_key(table_key)
+            {
+                return Err(invalid(TRIGGER_ON_SHARED_PUBLIC_TABLE_MESSAGE));
+            }
+            if !stored.update_of.is_empty() || stored.when_sql.is_some() {
+                let schema = require_table_schema_write_any_identity(write_txn, table_key)?;
+                for col in &stored.update_of {
+                    if !schema.columns.iter().any(|c| &c.name == col) {
+                        return Err(CatalogError::ColumnNotFound(col.clone()));
+                    }
+                }
+                // WHEN 条件が NEW／OLD 経由で参照する列も同じ write txn で再検査する（Issue #3190。D7）。
+                // 事前検査（`core::trigger_when`）と保存の間に並行する DROP／RENAME COLUMN が commit しても、
+                // 存在しない列を参照するトリガを保存しない。字句解析できない保存値は fail-closed で拒否する。
+                if let Some(w) = stored.when_sql.as_deref() {
+                    let tokens = crate::sql::lexer::tokenize(w)
+                        .map_err(|_| invalid("trigger WHEN condition is not supported"))?;
+                    for t in &tokens {
+                        if let crate::sql::lexer::Token::QualifiedIdent { name, .. } = t {
+                            if !schema.columns.iter().any(|c| &c.name == name) {
+                                return Err(CatalogError::ColumnNotFound(name.clone()));
+                            }
+                        }
+                    }
                 }
             }
-        }
-        // トリガ関数は同じ scope の引数なし関数に限る（設計記録 §関数の解決）。
-        let signature = arg_signature(&[])?;
-        match get_function_in_txn(&*write_txn, scope, &stored.function_key, &signature)? {
-            None => return Err(invalid(TRIGGER_FUNCTION_NOT_FOUND_MESSAGE)),
-            Some(f) if !is_trigger_fn(&f) => {
-                return Err(invalid(TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE));
-            }
-            Some(_) => {}
-        }
-        let existing = get_in_txn(&*write_txn, table_key, scope, &stored.name)?;
-        match existing {
-            Some(prev) if or_replace => stored.id = prev.id,
-            Some(_) => return Err(invalid(TRIGGER_ALREADY_EXISTS_MESSAGE)),
-            None => {
-                if list_in_txn(&*write_txn, table_key, scope)?.len() >= max_triggers {
-                    return Err(CatalogError::ViewLimitExceeded(
-                        TRIGGER_LIMIT_MESSAGE.to_string(),
-                    ));
+            // トリガ関数は同じ scope の引数なし関数に限る（設計記録 §関数の解決）。
+            let signature = arg_signature(&[])?;
+            match get_function_in_txn(write_txn, scope, &stored.function_key, &signature)? {
+                None => return Err(invalid(TRIGGER_FUNCTION_NOT_FOUND_MESSAGE)),
+                Some(f) if !is_trigger_fn(&f) => {
+                    return Err(invalid(TRIGGER_FUNCTION_NOT_TRIGGER_MESSAGE));
                 }
-                stored.id = allocate_id_in_txn(&write_txn)?;
+                Some(_) => {}
             }
-        }
-        let blob = encode_trigger_def(&stored)?;
-        {
-            let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
-            table.insert((table_key, scope, stored.name.as_str()), blob.as_slice())?;
-        }
-        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, table_key);
-        bump_table_generation_in_txn(&write_txn, table_key)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(stored.id)
+            let existing = get_in_txn(write_txn, table_key, scope, &stored.name)?;
+            match existing {
+                Some(prev) if or_replace => stored.id = prev.id,
+                Some(_) => return Err(invalid(TRIGGER_ALREADY_EXISTS_MESSAGE)),
+                None => {
+                    if list_in_txn(write_txn, table_key, scope)?.len() >= max_triggers {
+                        return Err(CatalogError::ViewLimitExceeded(
+                            TRIGGER_LIMIT_MESSAGE.to_string(),
+                        ));
+                    }
+                    stored.id = allocate_id_in_txn(write_txn)?;
+                }
+            }
+            let blob = encode_trigger_def(&stored)?;
+            {
+                let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
+                table.insert((table_key, scope, stored.name.as_str()), blob.as_slice())?;
+            }
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, table_key);
+            bump_table_generation_in_txn(write_txn, table_key)?;
+            Ok((stored.id, true))
+        })
     }
 
     /// テスト専用: 「どの関数もトリガ関数」と見なして定義を作る（トリガ関数の保存形式〔#2228〕が未整備で、
@@ -792,41 +895,63 @@ impl Storage {
         table_key: &str,
         def: &TriggerDef,
     ) -> Result<u64> {
-        self.create_trigger_inner(scope, table_key, def, false, MAX_TRIGGERS_PER_TABLE, |_| {
-            true
-        })
+        self.create_trigger_inner(
+            None,
+            scope,
+            table_key,
+            def,
+            false,
+            MAX_TRIGGERS_PER_TABLE,
+            |_| true,
+            SharedPublicTables::AllowLegacyForTest,
+        )
     }
 
     /// `scope` のトリガ `name` を削除し、存在して削除したら `true`。表が無ければ `TableNotFound`、トリガが
     /// 無ければ（他テナントにしか無い場合を含む）`Ok(false)`。削除と対象表の世代更新は同一 write txn。
+    #[cfg(test)]
     pub(crate) fn drop_trigger(&self, scope: &str, table_key: &str, name: &str) -> Result<bool> {
+        self.drop_trigger_in(None, scope, table_key, name)
+    }
+
+    /// [`Self::drop_trigger`] の書き込み先を選べる版（`target` の扱いは [`Self::create_trigger_in`] と同じ）。
+    pub(crate) fn drop_trigger_in(
+        &self,
+        target: Option<&redb::WriteTransaction>,
+        scope: &str,
+        table_key: &str,
+        name: &str,
+    ) -> Result<bool> {
         validate_scope(scope)?;
         validate_relation_key(table_key)?;
         validate_identifier(name)?;
-        let write_txn = self
-            .begin_write_txn()
-            .map_err(super::convert_storage_error)?;
-        let table_exists = match ReadSource::open_table(&*write_txn, CATALOG_TABLE) {
-            Ok(t) => t.get(table_key)?.is_some(),
-            Err(redb::TableError::TableDoesNotExist(_)) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !table_exists {
-            return Err(CatalogError::TableNotFound(table_key.to_string()));
-        }
-        if get_in_txn(&*write_txn, table_key, scope, name)?.is_none() {
-            return Ok(false);
-        }
-        {
-            let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
-            table.remove((table_key, scope, name))?;
-        }
-        // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
-        crate::storage::commit_log::note_ddl(&write_txn, table_key);
-        bump_table_generation_in_txn(&write_txn, table_key)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(true)
+        self.run_catalog_write(target, |write_txn| {
+            let table_exists = match ReadSource::open_table(write_txn, CATALOG_TABLE) {
+                Ok(t) => t.get(table_key)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            // INSTEAD OF トリガの対象はビュー（Issue #3193）。表・ビューのどちらでもなければ不在。
+            let view_exists = match ReadSource::open_table(write_txn, VIEWS_TABLE) {
+                Ok(t) => t.get(table_key)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(e) => return Err(e.into()),
+            };
+            if !table_exists && !view_exists {
+                return Err(CatalogError::TableNotFound(table_key.to_string()));
+            }
+            if get_in_txn(write_txn, table_key, scope, name)?.is_none() {
+                return Ok((false, false));
+            }
+            {
+                let mut table = write_txn.open_table_logged(TRIGGERS_TABLE)?;
+                table.remove((table_key, scope, name))?;
+            }
+            // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログ・実体を変える書き込みは DDL として記録する。
+            crate::storage::commit_log::note_ddl(write_txn, table_key);
+            bump_table_generation_in_txn(write_txn, table_key)?;
+            Ok((true, true))
+        })
     }
 
     /// `scope` の表 `table_key` のトリガを名前の昇順で返す（読み取り専用。発火側〔#1723〕が引く入口）。

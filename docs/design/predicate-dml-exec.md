@@ -273,6 +273,17 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   ——`batch_limits.max_files_per_batch` は本 Issue 以前から常に適用されて
   きた既存の暗黙上限であり、フラグ未指定という「何も選択していない」状態を
   毎回警告すると通常起動のたびにノイズになるため）。
+- **Issue #3310 追記（上の二重ゲート・警告の記述より優先）**: INDEX-4 ①
+  （`max_files_per_batch`）は Issue #3308・#3309 で行の形（複数行 `VALUES`・UPSERT・NoSQL
+  `rows[]`・COPY FROM）から外れたため、「二重ゲート」は ① ではなく ④（`max_batch_chunks`。
+  1 行 = 1 チャンク）との組になり、実効行数上限は「`--max-insert-rows`（指定時）と ④ の
+  小さい方」である。`insert_rows_cap_warning` も ④ の超過だけを判定し、引き上げ手段として
+  `FANDHE_DB_BATCH_MAX_CHUNKS` だけを案内する（① の `--batch-max-files` は案内しない）。
+  NoSQL `insert` op も `--max-insert-rows` の対象で、`core.rs` の判定と一致する。
+  CLI の `--batch-max-files` > 環境変数 > 既定の優先順位は `resolve_batch_limits` の単体試験が
+  固定する（wire から ① は観測できない）。SQL テキストでは文長・トークン数の上限が ④ より先に
+  効く場合があり、その拒否は `42601`（[sql-multi-row-insert.md](sql-multi-row-insert.md) の
+  「Issue #3310 追記」）。
 - **NoSQL（HTTP）表層の `insert` op・単一行 `update`／`delete`・ファイル形
   INSERT は `max_affected_rows`／`max_insert_rows_per_statement` の対象外
   （理由）**: NoSQL `update`／`delete` op は `TargetForm::Predicate`（`filter`
@@ -285,9 +296,9 @@ Issue #997 でこれを解消した。オーナー判断は本 Issue の実装�
   `execute_update_with_schema` を経由し、`max_affected_rows` は無関係
   （単一行形は常に `rows_affected` が `0`／`1` のいずれかで、複数行への
   上限判定自体が意味を持たない）。NoSQL `insert` op は
-  `max_insert_rows_per_statement`（構文解析段の上限）自体を経由せず、既存の
-  `batch_limits.max_files_per_batch` のみで行数を制御する（SQL 表層の複数行
-  `VALUES` と同じ土俵——上記の二重ゲート注記参照）。ファイル形 INSERT
+  構文解析段の上限は経由しないが、実行時の `--max-insert-rows` と ④ の判定は SQL 表層の複数行
+  `VALUES` と同じ土俵で受ける（Issue #3310 追記参照。旧記述の `max_files_per_batch` は ① を
+  外した Issue #3308 で無効）。ファイル形 INSERT
   （`execute_file_insert`）は 1 文＝1 ファイルであり複数行 `VALUES` 構文を
   持たないため `max_insert_rows_per_statement` の対象外（チャンク数・バイト量の
   上限は `incremental.rs`／`batch_limits.rs` が別途担う）。
@@ -511,8 +522,8 @@ Issue #1757（実装済み）。
   `tenant::update_rows_joined_unchecked`（`update_rows_where_impl` と同じ処理順序）と既存の
   `delete_rows_where_unchecked`。`tenant::enumerate_dml_candidates` は述語が値を運べる
   `enumerate_dml_candidates_with<T>` へ汎用化し、既存関数は `T = ()` の薄いラッパーにした。
-- **fail-closed**: `WriteTarget::InTxn` 以外・FROM 側列を参照する RETURNINGは固定文言の
-  `0A000`。
+- **fail-closed**: `WriteTarget::InTxn` 以外は固定文言の `0A000`。FROM 側列を参照する RETURNING は
+  #3204 で結線済み。
 - **暫定事項と申し送り**:
   - 台帳（#1757・実装済み）: 構文段で算出した正規化文ハッシュ（結合結果は材料外）を `execute_joined_dml_in` が
     受け取り、source 走査の前に `precheck_in_write_txn` で事前照合する。暫定ゲートは撤去した
@@ -522,7 +533,8 @@ Issue #1757（実装済み）。
     `execute_subquery_dml_autocommit` と同じ暗黙トランザクション）、書き込み後に `mark_written` を呼ぶ。
     `PARTITIONED` との併用は構文段で拒否し、`run_partitioned_*` に結合形の多層防御を足す。SQL 文字列による
     結合テストも同時に追加する。
-  - #1756: FROM 側列の RETURNING（一致写像 `JoinedProbe::matches` を使う）と RLS 回帰の本体。
+  - #1756・#3204: FROM 側列の RETURNING と RLS 回帰は実装済み（SQL 経路の RETURNING は一致写像の共有ハンドルを
+    直接読む。`JoinedDmlOutcome::matches` は単体テスト専用で `cfg(test)`。Issue #3205）。
   - 未対応形（`0A000` で拒否する前提）: FROM／USING が 2 relation 以上、対象と source を跨ぐ非等値・`OR`
     （JOIN 拡張の範囲）、FROM 側がビュー・一時表・マテビュー。
 - **テスト**: `core/dml_join_exec_tests.rs`（手で組んだ実行入力で、多重一致の一意化・各上限の fail-closed と

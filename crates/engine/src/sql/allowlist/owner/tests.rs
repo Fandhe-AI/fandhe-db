@@ -120,9 +120,15 @@ fn create_schema_authorization_forms() {
             .wire_code(),
         "0A000"
     );
+    // 要素つき（Issue #3286）は構文段で受理して要素を保持する。所有者が現在ロール以外の場合の拒否は
+    // 実行段（`sql40_object_owner` の結合テスト）が固定する。
+    let d =
+        parse_cs("CREATE SCHEMA s AUTHORIZATION alice CREATE TABLE t (a INT)").expect("elements");
+    assert_eq!(d.authorization, Some(RoleSpec::Name("alice".to_string())));
+    assert_eq!(d.elements.len(), 1);
     assert_eq!(
-        parse_cs("CREATE SCHEMA s AUTHORIZATION alice CREATE TABLE t (a INT)")
-            .expect_err("elements")
+        parse_cs("CREATE SCHEMA s AUTHORIZATION alice CREATE INDEX i ON t (a)")
+            .expect_err("unsupported element")
             .wire_code(),
         "0A000"
     );

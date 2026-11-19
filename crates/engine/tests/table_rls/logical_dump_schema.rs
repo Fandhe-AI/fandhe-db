@@ -100,7 +100,7 @@ fn populate(core: &EngineCore, t: &str) {
          AS $q$ SELECT n, 'it''s' $q$",
         "CREATE FUNCTION app.scoped(x INTEGER) RETURNS INTEGER LANGUAGE sql AS $q$ SELECT x $q$",
         "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
-        "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF name ON parent \
+        "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF label ON app.items \
          FOR EACH ROW EXECUTE FUNCTION trg('a', 'it''s')",
         "CREATE POLICY pol_sel ON parent AS RESTRICTIVE FOR SELECT USING (id > 0)",
         "CREATE POLICY pol_ins ON parent FOR INSERT WITH CHECK (id > 0)",
@@ -419,6 +419,85 @@ fn other_tenants_schema_scoped_sequences_do_not_affect_the_dump() {
         .iter()
         .any(|(_, s)| s.contains("setval('b_secret.bq', 77")));
     assert!(!b.iter().any(|(_, s)| s.contains("app.q")));
+}
+
+/// SCHEMA 配下の ENUM 型（`CREATE TYPE s.mood`。Issue #3288）が、同名の public の型と並んで往復で一致し、
+/// SCHEMA 修飾の `CREATE TYPE` として書き出される（共有の型が先）。他テナントの同名 SCHEMA・型は自テナントの
+/// ダンプの成否にも内容にも影響しない。
+#[test]
+fn schema_scoped_enum_types_round_trip_and_other_tenants_do_not_leak() {
+    let p1 = unique_db_path("dump-scoped-enum-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-scoped-enum-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TYPE mood AS ENUM ('p')",
+        "CREATE TYPE app.zeta AS ENUM ('a', 'it''s')",
+        "CREATE TYPE app.mood AS ENUM ('s')",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let before = dump(&src, &scope).expect("dump");
+    // 他テナントの同名 SCHEMA・型は自テナントのダンプを変えない。
+    ok(&src, "tenant-b", "CREATE SCHEMA app");
+    ok(&src, "tenant-b", "CREATE TYPE app.secret AS ENUM ('b')");
+    let after = dump(&src, &scope).expect("dump with other tenant state");
+    assert_eq!(before, after);
+    let types: Vec<&str> = after
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .filter(|s| s.starts_with("CREATE TYPE "))
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "CREATE TYPE \"mood\" AS ENUM ('p')",
+            "CREATE TYPE app.mood AS ENUM ('s')",
+            "CREATE TYPE app.zeta AS ENUM ('a', 'it''s')",
+        ]
+    );
+    assert!(!after.iter().any(|(_, s)| s.contains("secret")));
+    // 空の DB へ復元して再書き出しが一致する。
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &before);
+    assert_eq!(dump(&dst, &scope).expect("dump again"), before);
+    // tenant-b 自身のダンプには自分の型が出る。
+    let b = dump(&src, &SchemaDdlScope::shared_and_tenant("tenant-b")).expect("dump b");
+    assert!(b
+        .iter()
+        .any(|(_, s)| s == "CREATE TYPE app.secret AS ENUM ('b')"));
+}
+
+/// SCHEMA 配下の ENUM 型を使う列（スカラー・配列。Issue #3289）が、公開名（`schema.name`。内部キーの `#` を
+/// 含まない）で書き出され、往復で同一のダンプになる。SCHEMA の改名後は改名後の名前で書き出される。
+#[test]
+fn schema_scoped_enum_columns_round_trip_with_public_names() {
+    let setup = [
+        "CREATE SCHEMA app",
+        "CREATE TYPE app.mood AS ENUM ('a', 'b')",
+        "CREATE TABLE app.t (id BIGINT PRIMARY KEY, m app.mood, ms app.mood[4])",
+        "INSERT INTO app.t (id, m) VALUES (1, 'a')",
+    ];
+    let first = assert_round_trip("scoped-enum-col", "tenant-a", &setup);
+    let table = first
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .find(|s| s.starts_with("CREATE TABLE app.t"))
+        .expect("table ddl");
+    assert!(table.contains("app.mood"), "{table}");
+    assert!(!first.iter().any(|(_, s)| s.contains('#')), "{first:?}");
+    // 改名後の公開名で書き出され、再往復も一致する。
+    let mut renamed: Vec<&str> = setup.to_vec();
+    renamed.push("ALTER SCHEMA app RENAME TO app2");
+    let after = assert_round_trip("scoped-enum-col-renamed", "tenant-a", &renamed);
+    assert!(
+        after.iter().any(|(_, s)| s.contains("app2.mood")),
+        "{after:?}"
+    );
+    assert!(!after.iter().any(|(_, s)| s.contains("app.mood")));
 }
 
 fn user(line: usize, name: &str, tenant: &str, ddl: bool) -> BootstrapUser {
@@ -809,6 +888,56 @@ fn logical_dump_refreshes_only_materialized_views_with_the_tenants_own_entity() 
     assert_eq!(read(&src, "SELECT a FROM mv_empty"), Err("55000"));
 }
 
+/// SCHEMA 配下の matview（Issue #3287）は `CREATE MATERIALIZED VIEW s.mv` として往復し、実体を持つものは
+/// 末尾で `REFRESH` される。復元先で内部キーが振り直されても再ダンプが一致し、public の同名とも混ざらない。
+#[test]
+fn schema_scoped_materialized_views_round_trip() {
+    let p1 = unique_db_path("dump-scoped-matview-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-scoped-matview-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
+    for sql in [
+        "CREATE SCHEMA app",
+        "CREATE TABLE app.base (a INTEGER PRIMARY KEY, b TEXT)",
+        "INSERT INTO app.base (a, b) VALUES (1, 'x'), (2, 'y')",
+        "CREATE MATERIALIZED VIEW app.mv_z (x, y) AS SELECT a, b FROM app.base",
+        "CREATE MATERIALIZED VIEW app.mv_a AS SELECT x FROM app.mv_z",
+        "CREATE MATERIALIZED VIEW app.mv_empty AS SELECT a FROM app.base WITH NO DATA",
+        "CREATE UNIQUE INDEX mv_z_uq ON app.mv_z (x)",
+        "CREATE TABLE pub_base (a INTEGER PRIMARY KEY)",
+        "CREATE MATERIALIZED VIEW mv_z AS SELECT a FROM pub_base WITH NO DATA",
+    ] {
+        ok(&src, "tenant-a", sql);
+    }
+    let scope = SchemaDdlScope::shared_and_tenant("tenant-a");
+    let first = logical(&src, &scope);
+    let text: String = first
+        .iter()
+        .map(|(_, s)| s.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("CREATE MATERIALIZED VIEW app."), "{text}");
+    assert!(!text.contains('#'), "{text}");
+    assert!(text.contains("REFRESH MATERIALIZED VIEW app."), "{text}");
+    let dst = open_core(&p2);
+    replay(&dst, "tenant-a", &first);
+    assert_eq!(first, logical(&dst, &scope), "re-dump must match");
+    let read = |core: &EngineCore, sql: &str| match run(core, "tenant-a", sql) {
+        Ok(SqlOutcome::Query(r)) => Ok(r.rows.len()),
+        Ok(other) => panic!("unexpected {other:?}"),
+        Err(e) => Err(e.wire_code()),
+    };
+    assert_eq!(read(&src, "SELECT x FROM app.mv_a LIMIT 10"), Ok(2));
+    // データは流していないので、再計算は空の基表を実体化する。
+    assert_eq!(read(&dst, "SELECT x FROM app.mv_a LIMIT 10"), Ok(0));
+    assert_eq!(
+        read(&dst, "SELECT a FROM app.mv_empty LIMIT 10"),
+        Err("55000")
+    );
+    assert_eq!(read(&dst, "SELECT a FROM mv_z LIMIT 10"), Err("55000"));
+}
+
 /// 他テナントの REFRESH・実体は、自テナントのダンプの成否にも内容にも影響しない。
 /// 共有の `populated` ではなく、自テナントの実体の有無で再計算を出すため（Issue #3097）。
 #[test]
@@ -1065,6 +1194,38 @@ fn output_order_does_not_depend_on_internal_schema_ids() {
     assert!(tables[0].starts_with("CREATE TABLE \"plain_t\""));
     assert!(tables[1].starts_with("CREATE TABLE aa.t"));
     assert!(tables[2].starts_with("CREATE TABLE zz.t"));
+}
+
+#[test]
+fn instead_of_triggers_on_views_survive_the_round_trip() {
+    // ビューへの INSTEAD OF トリガ（TABLE-45・Issue #3193）は、ビューの CREATE（PreData）の後に
+    // PostData で書き出され、復元先でも同じ定義になる。
+    let dump = assert_round_trip(
+        "instead-of",
+        "tenant-a",
+        &[
+            "CREATE SCHEMA zz",
+            "CREATE TABLE zz.t (a INTEGER, b TEXT)",
+            "CREATE VIEW zz.v AS SELECT a, b FROM zz.t LIMIT 10",
+            "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
+            "CREATE TRIGGER tg_i INSTEAD OF INSERT OR DELETE ON zz.v FOR EACH ROW EXECUTE FUNCTION trg('x')",
+        ],
+    );
+    let (section, sql) = dump
+        .iter()
+        .find(|(_, s)| s.contains("INSTEAD OF"))
+        .expect("INSTEAD OF trigger must be dumped");
+    assert_eq!(*section, DdlSection::PostData);
+    assert!(sql.contains("ON zz.v FOR EACH ROW"), "{sql}");
+    let view_pos = dump
+        .iter()
+        .position(|(_, s)| s.starts_with("CREATE VIEW zz.v"))
+        .expect("view dumped");
+    let trigger_pos = dump
+        .iter()
+        .position(|(_, s)| s.contains("INSTEAD OF"))
+        .expect("trigger dumped");
+    assert!(view_pos < trigger_pos);
 }
 
 #[test]

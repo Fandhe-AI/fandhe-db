@@ -191,13 +191,20 @@ pub(crate) mod describe;
 pub mod dml_from;
 pub(crate) mod embedded_unit;
 pub(crate) mod function_scan;
+pub(crate) mod generated_column;
+#[cfg(test)]
+mod generated_column_tests;
 #[cfg(test)]
 mod identity_column_tests;
 pub mod insert_explain;
 pub(crate) mod insert_select;
 pub(crate) mod int8vec_knn;
 pub(crate) mod interval_arith;
+pub(crate) mod json_agg;
+pub(crate) mod lateral_bind;
 pub(crate) mod matview;
+// MERGE の束縛（SQL-79・Issue #3352）。
+pub mod merge_bind;
 pub mod record_text;
 pub(crate) mod recursive_cte;
 pub(crate) mod recursive_eval;
@@ -206,6 +213,7 @@ mod serial_expansion_tests;
 pub(crate) mod set_expr;
 pub(crate) mod string_agg;
 pub(crate) mod temp_catalog;
+// DDL を積んだ Tx の文の区間だけ張る、write txn 上の表スキーマの重ね見（SQL-80・Issue #3313）。
 #[cfg(test)]
 mod temp_catalog_tests;
 #[cfg(test)]
@@ -215,6 +223,7 @@ pub(crate) mod temp_rows;
 mod temp_rows_tests;
 #[cfg(test)]
 mod truncate_restart_identity_tests;
+pub(crate) mod txn_overlay;
 // `CREATE FUNCTION`／`DROP FUNCTION` の UDF カタログ書き込み経路（SQL-66・Issue #1920）。
 pub mod udf_ddl;
 // TRIGGER DDL（TABLE-45・Issue #1722）。
@@ -241,9 +250,11 @@ mod write_time_ledger_tests;
 // `SELECT DISTINCT`・`COUNT(DISTINCT <expr>)`（SQL-25 (c)・TASK-209）が共有する
 // 正準キー化・予算管理。`allowlist`（構文の脱糖先）と `aggregate`／`group_by`
 // （`Accumulator::CountDistinct` の予算管理）の双方から参照される。
+pub(crate) mod cell_sort;
 pub(crate) mod cte_explain;
 pub(crate) mod distinct;
 pub(crate) mod dml_from_returning;
+pub(crate) mod dml_target_alias;
 pub mod exec;
 pub(crate) mod exec_stats;
 pub mod explain;
@@ -288,6 +299,8 @@ pub(crate) mod order_value;
 pub(crate) mod param_coerce;
 pub(crate) mod param_infer;
 pub mod params;
+// MERGE の `$n` 位置規則・型推論入力・Describe 用ダミーフラグ（SQL-79・Issue #3352）。
+pub(crate) mod params_merge;
 pub mod parser;
 pub mod partitioned;
 pub(crate) mod pk_point;
@@ -302,6 +315,7 @@ pub(crate) mod relation_name;
 pub mod relation_snapshot;
 pub(crate) mod rerank_stage;
 pub mod returning;
+pub(crate) mod row_compare;
 pub mod row_lock;
 pub(crate) mod row_policy;
 pub(crate) mod savepoint;
@@ -321,6 +335,7 @@ pub(crate) mod string_fn;
 pub(crate) mod subquery;
 pub(crate) mod time_fn;
 pub mod transaction;
+pub(crate) mod type_name_position;
 pub mod udf_call;
 pub(crate) mod view;
 pub(crate) mod view_alias;
@@ -550,6 +565,11 @@ pub enum SqlOutcome {
     /// variant はその [`exec::DeleteOutcome`] をそのまま運ぶ薄いラッパー
     /// （`Insert`・`Truncate` と同じ設計）。
     Delete(exec::DeleteOutcome),
+    /// `MERGE`（SQL-79・Issue #3353）が成功したことを示す応答。件数は UPDATE と DELETE の実変更行数の合計で、
+    /// 応答のコマンドタグは `MERGE <n>`（`RETURNING` つきの応答は [`SqlOutcome::Returning`] の `DmlCommand::Merge` で、タグは同じ `MERGE <n>`。Issue #3356）。
+    ///
+    /// **BREAKING CHANGE**（Issue #3353）: variant を追加した（既存の網羅的 `match` はアームの追加が必要）。
+    Merge(exec::MergeOutcome),
     /// `RETURNING` 句（Issue #873・#1182・SQL-21）付きの `INSERT`（UPSERT を含む）／
     /// `DELETE`（単一行・述語形）／`UPDATE`（単一行・述語形）がセッション
     /// 経由の実行経路で成功したことを示す応答。`RETURNING` なしの
@@ -637,7 +657,7 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     DropTable(ddl::DropTableOutcome),
-    /// `DECLARE <name> CURSOR FOR <SELECT>`（WIRE-15・TASK-218）がセッション
+    /// `DECLARE <name> [SCROLL | NO SCROLL | ...] CURSOR FOR <SELECT>`（WIRE-15・TASK-218）がセッション
     /// 経由の実行経路（`crate::core::EngineCore::execute_sql_in_txn`。カーソルは
     /// 明示トランザクション内でのみ有効）で成功したことを示す応答。
     /// `wire-server::simple_query` は `CommandComplete` タグ `DECLARE CURSOR`
@@ -648,7 +668,7 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query`）はすべて更新済み。クレート外で `SqlOutcome`
     /// を網羅的にマッチするコードがあれば追随が必要。
     DeclareCursor,
-    /// `FETCH [ NEXT | [FORWARD] <n> ] { FROM | IN } <name>`（WIRE-15・TASK-218）が成功したことを
+    /// `FETCH [ NEXT | ALL | [FORWARD] { <n> | ALL } ] { FROM | IN } <name>`（WIRE-15・TASK-218）が成功したことを
     /// 示す応答。内側 `DECLARE` 時点で確定済みの行から未取得分を払い出すのみで
     /// 検索本体は再実行しない。`wire-server::simple_query` は `RowDescription`／
     /// `DataRow`* に続けて `CommandComplete` タグ `FETCH <実際に送出した行数>`
@@ -658,6 +678,10 @@ pub enum SqlOutcome {
     /// `wire-server::simple_query` は `CommandComplete` タグ `CLOSE CURSOR`
     /// （件数を持たない固定タグ）を返す。
     CloseCursor,
+    /// `MOVE [<向き>] { FROM | IN } <name>`（Issue #3336・WIRE-27）が成功したことを示す応答。
+    /// 値は同じ向きの `FETCH` が返す行数。行は返さず、`wire-server::simple_query` は
+    /// `CommandComplete` タグ `MOVE <n>` のみを送出する。BREAKING CHANGE: 公開 enum への variant 追加。
+    Move(u64),
     /// `ALTER TABLE <table> ADD COLUMN <column> <type>`（TASK-202・SQL-23。
     /// Issue #900）がセッション経由の実行経路で成功したことを示す応答。DDL
     /// 権限ゲート（`sql::ddl::require_ddl_permission`）・実行本体

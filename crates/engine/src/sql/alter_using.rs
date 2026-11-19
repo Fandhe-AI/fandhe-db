@@ -360,6 +360,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         E::NegativeRowCount { .. }
         | E::CardinalityViolation
         | E::UpsertCardinalityViolation
+        | E::MergeCardinalityViolation
         | E::MissingOperationId
         | E::IdConflict
         | E::DuplicateOperationId
@@ -391,12 +392,14 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::SerializationFailure
         | E::ReadOnlySqlTransaction
         | E::MaterializedViewNotPopulated
+        | E::CursorCanOnlyScanForward
         | E::SequenceNotYetDefined
         | E::LastvalNotYetDefined
         | E::SequenceGeneratorLimitExceeded { .. }
         | E::DuplicateSchema { .. }
         | E::InvalidSchemaName { .. }
         | E::ReservedName { .. }
+        | E::InvalidSchemaDefinition { .. }
         | E::DuplicateRole { .. }
         | E::UndefinedRole { .. }
         | E::RoleHasDependents { .. }
@@ -416,6 +419,7 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InvalidCursorName
         | E::InvalidSavepointSpecification
         | E::RecordNotAssigned
+        | E::ColumnNotGenerated
         | E::NoDataFound
         | E::TooManyRows
         | E::CaseNotFound
@@ -438,11 +442,13 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::InvalidViewReplacement { .. }
         | E::DuplicateColumn { .. }
         | E::InvalidColumnReference
+        | E::LateralReferenceInvalidJoinType
         | E::WindowFrameOffsetHasVariables { .. }
         | E::CteColumnListTooLong { .. }
         | E::DerivedTableColumnListTooLong { .. }
         | E::OrderByPositionNotInSelectList { .. }
         | E::AggregateOrderByNotInArguments
+        | E::DistinctOnOrderByMismatch
         | E::DependentObjectsStillExist { .. }
         | E::WrongObjectType { .. }
         | E::NotNullViolation { .. }
@@ -454,7 +460,8 @@ pub(crate) fn redact_row_conversion_error(e: SqlSurfaceError) -> SqlSurfaceError
         | E::UndefinedColumn { .. }
         | E::CheckViolation { .. }
         | E::WithCheckOptionViolation
-        | E::AmbiguousColumn { .. } => e,
+        | E::AmbiguousColumn { .. }
+        | E::DuplicateAlias { .. } => e,
         // 式評価では到達しない想定で、文言が値を含みうる残りの variant は固定文言の
         // `Internal` へ丸める（到達しても fail-closed）。
         E::CannotCoerce { .. }

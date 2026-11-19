@@ -297,10 +297,15 @@ fn ctas_copies_null_vector_rows() {
     assert_eq!(rows.len(), 1);
 }
 
-/// INSERT トリガー（BEFORE／AFTER ROW）のある表でも nullable VECTOR の省略・明示 NULL を
-/// 受理する（トリガーの有無で NULL 保存契約が変わらないこと。PR #2963 レビュー指摘）。
+/// INSERT トリガーの対象は SCHEMA 配下の表に限る（共有 public 表への `CREATE TRIGGER` は定義時に `0A000`。
+/// Issue #3361）。トリガのある表で nullable VECTOR の省略・明示 NULL を受理する検査（PR #2963 レビュー指摘）は、
+/// 本番の invoker を注入できる `core::plpgsql_trigger_invoker_tests`（`nullable_vector_accepted_on_trigger_tables`）
+/// へ移した。ここでは public 表への定義が拒否されることだけを固定する。
+///
+/// intentional: docs/design/trigger-catalog.md
+/// 作成後に書き込みだけが失敗する状態を作らないため、共有 public 表へのトリガは定義時に拒否する。
 #[test]
-fn nullable_vector_accepted_on_insert_trigger_tables() {
+fn trigger_on_shared_public_table_is_rejected_at_definition() {
     let (core, _g) = new_core("t26-trigger");
     ok(
         &core,
@@ -312,25 +317,12 @@ fn nullable_vector_accepted_on_insert_trigger_tables() {
         "sys",
         "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
     );
-    ok(
-        &core,
-        "sys",
-        "CREATE TRIGGER tb BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()",
+    assert_eq!(
+        code(
+            &core,
+            "sys",
+            "CREATE TRIGGER tb BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()"
+        ),
+        "0A000"
     );
-    ok(
-        &core,
-        "sys",
-        "CREATE TRIGGER ta AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()",
-    );
-    ok(
-        &core,
-        "alice",
-        "INSERT INTO t (id, n) VALUES (1, 'omitted') USING OPERATION_ID 'o1'",
-    );
-    ok(
-        &core,
-        "alice",
-        "INSERT INTO t (id, v, n) VALUES (2, NULL, 'null') USING OPERATION_ID 'o2'",
-    );
-    assert_eq!(null_vector_rows(&core, "alice", "t"), 2);
 }

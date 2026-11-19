@@ -245,6 +245,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// 剰余（`%`。`* /` と同じ優先度・左結合。Issue #3273・SQL-42 ポインタ）。
+    Rem,
     Gt,
     Lt,
     Ge,
@@ -278,11 +280,18 @@ pub enum Expr {
     /// それ以外の位置（`id + NULL` 等）は型を決められない形として
     /// `FeatureNotSupported`（`0A000`）で拒否する。
     Null,
-    /// 検索形 `CASE WHEN <cond> THEN <result> {WHEN ...} [ELSE <result>] END`
-    /// （対象ビヘイビア: SQL-26）。単純 CASE（`CASE x WHEN v ...`）・`cond` 中の
-    /// 論理演算（`AND`/`OR`/`IS NULL` 等）は許可リスト（`sql::allowlist::Parser`）が
-    /// 構文段で拒否するため、`cond` は常に比較の [`Expr::Binary`] になる。
+    /// `CASE` 式（対象ビヘイビア: SQL-26。単純形は Issue #3279）。
+    ///
+    /// - `operand == None`（検索形 `CASE WHEN <cond> THEN <result> ... [ELSE <result>] END`）:
+    ///   `whens[i].0` は条件で、`cond` 中の論理演算（`AND`/`OR`/`IS NULL` 等）は許可リスト
+    ///   （`sql::allowlist::Parser`）が構文段で拒否するため、常に比較の [`Expr::Binary`] になる。
+    /// - `operand == Some(x)`（単純形 `CASE x WHEN v THEN <result> ... END`）: `whens[i].0` は
+    ///   条件ではなく比較値 `v_i` で、意味は各分岐 `x = v_i`（NULL は一致しない）。被演算子 `x` は
+    ///   構文段で複製せず AST に 1 回だけ保持する（`routine_fold` が副作用を持つ呼び出しを
+    ///   1 回だけ起動できるようにするため）。条件を解釈する箇所は
+    ///   [`simple_case_conditions`] で検索形の条件列へ下げてから処理する。
     Case {
+        operand: Option<Box<Expr>>,
         whens: Vec<(Expr, Expr)>,
         else_result: Option<Box<Expr>>,
     },
@@ -408,7 +417,7 @@ pub enum Expr {
     /// 構文段（`allowlist::Parser::parse_expression_predicate`）が WHERE の式述語の頂点としてだけ生成し、
     /// `SOME` は `ANY` に正規化する。束縛・評価は `sql::array_ops`。サブクエリ形は構文段が `0A000` で拒否する。
     Quantified {
-        op: ArrayCmpOp,
+        op: QuantifiedOp,
         quantifier: Quantifier,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
@@ -463,6 +472,89 @@ impl ArrayCmpOp {
             ArrayCmpOp::Le => "<=",
             ArrayCmpOp::Gt => ">",
             ArrayCmpOp::Ge => ">=",
+        }
+    }
+}
+
+/// 量化比較 `<lhs> <op> ANY|SOME|ALL (<array>)` の演算子（[`Expr::Quantified`]・
+/// [`BoundExpr::ArrayQuantified`]）。比較演算子 [`ArrayCmpOp`] に加え、`LIKE`／`ILIKE`／
+/// `NOT LIKE`／`NOT ILIKE`（`~~` 系の演算子名を含む）を持つ。`ArrayCmpOp` は配列どうしの比較とも
+/// 共有するため LIKE は足さず、量化専用の本列挙に分ける（SQL-9・Issue #3258）。
+///
+/// 破壊的変更（Issue #3258）: `Expr::Quantified.op`・`BoundExpr::ArrayQuantified.op` の型を
+/// `ArrayCmpOp` から本列挙へ変更した。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifiedOp {
+    /// 比較演算子（`=` `<>` `<` `<=` `>` `>=`）。
+    Cmp(ArrayCmpOp),
+    /// `[NOT] LIKE|ILIKE`。`negated` は `x NOT LIKE ANY (a)`（一致しない要素が 1 つでもある）の
+    /// 後置 NOT で、量化子の反転（外側の前置 NOT）とは別物。
+    Like {
+        negated: bool,
+        case_insensitive: bool,
+    },
+}
+
+impl QuantifiedOp {
+    /// 演算子の否定。量化子の反転と組で `where_negation` が使う（`NOT (x LIKE ANY a)` =
+    /// `x NOT LIKE ALL a`。三値論理でも成り立つ）。
+    pub fn negated(self) -> Self {
+        match self {
+            QuantifiedOp::Cmp(c) => QuantifiedOp::Cmp(c.negated()),
+            QuantifiedOp::Like {
+                negated,
+                case_insensitive,
+            } => QuantifiedOp::Like {
+                negated: !negated,
+                case_insensitive,
+            },
+        }
+    }
+
+    /// `content_hash` 用の安定した 1 バイト識別子（変更禁止）。比較演算子は
+    /// [`ArrayCmpOp::hash_tag`]（1〜6）をそのまま使い、既存の内容ハッシュを変えない。
+    pub(crate) fn hash_tag(self) -> u8 {
+        match self {
+            QuantifiedOp::Cmp(c) => c.hash_tag(),
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: false,
+            } => 7,
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: true,
+            } => 8,
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: false,
+            } => 9,
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: true,
+            } => 10,
+        }
+    }
+
+    /// SQL 表記（CHECK／ポリシー式の再解析可能な描画用）。
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            QuantifiedOp::Cmp(c) => c.as_sql(),
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: false,
+            } => "LIKE",
+            QuantifiedOp::Like {
+                negated: false,
+                case_insensitive: true,
+            } => "ILIKE",
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: false,
+            } => "NOT LIKE",
+            QuantifiedOp::Like {
+                negated: true,
+                case_insensitive: true,
+            } => "NOT ILIKE",
         }
     }
 }
@@ -1172,7 +1264,7 @@ pub enum BoundExpr {
     /// 量化比較 `lhs op ANY|ALL (array)`（TABLE-35・Issue #1603）。`lhs` は要素型 `elem` と
     /// 比較できる型へ束縛済み。`all` が真なら ALL、偽なら ANY。
     ArrayQuantified {
-        op: ArrayCmpOp,
+        op: QuantifiedOp,
         all: bool,
         elem: crate::catalog::ArrayElemType,
         lhs: Box<BoundExpr>,
@@ -1884,6 +1976,10 @@ pub enum BuiltinFn {
     /// `concat(a: Text, b: Text) -> Text`。可変長 `CONCAT` は束縛段
     /// （[`bind_call`]）でこの 2 引数版の左畳み込みへ展開する。
     Concat2,
+    /// `a || b`（text 連結演算子。Issue #3276・SQL-42）。`concat` と違い strict
+    /// （NULL が 1 つでもあれば NULL）。演算子専用で関数名からは呼べない
+    /// （`builtin_from_name` は返さない）。結果長は確保前に検査する。
+    TextConcat,
     /// `trim(s: Text) -> Text`（半角空白のみ除去。PostgreSQL 既定）。
     Trim,
     /// `replace(s: Text, from: Text, to: Text) -> Text`。
@@ -2117,10 +2213,15 @@ pub(crate) fn contains_typed_numeric(expr: &Expr) -> bool {
         | Expr::VectorDistance { lhs, rhs, .. } => {
             contains_typed_numeric(lhs) || contains_typed_numeric(rhs)
         }
-        Expr::Case { whens, else_result } => {
-            whens
-                .iter()
-                .any(|(c, r)| contains_typed_numeric(c) || contains_typed_numeric(r))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(contains_typed_numeric)
+                || whens
+                    .iter()
+                    .any(|(c, r)| contains_typed_numeric(c) || contains_typed_numeric(r))
                 || else_result.as_deref().is_some_and(contains_typed_numeric)
         }
         Expr::Coalesce(args) => args.iter().any(contains_typed_numeric),
@@ -2272,11 +2373,19 @@ pub(crate) fn first_non_builtin_call_with(
                 .into_iter()
                 .find_map(|c| first_non_builtin_call_with(c, allow_current_time, allow_json_fns))
         }
-        Expr::Case { whens, else_result } => whens
-            .iter()
-            .find_map(|(c, r)| {
-                first_non_builtin_call_with(c, allow_current_time, allow_json_fns)
-                    .or_else(|| first_non_builtin_call_with(r, allow_current_time, allow_json_fns))
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => operand
+            .as_deref()
+            .and_then(|o| first_non_builtin_call_with(o, allow_current_time, allow_json_fns))
+            .or_else(|| {
+                whens.iter().find_map(|(c, r)| {
+                    first_non_builtin_call_with(c, allow_current_time, allow_json_fns).or_else(
+                        || first_non_builtin_call_with(r, allow_current_time, allow_json_fns),
+                    )
+                })
             })
             .or_else(|| {
                 else_result.as_deref().and_then(|e| {
@@ -2436,7 +2545,9 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
             &[ExprType::Text, ExprType::Text, ExprType::Scalar],
             ExprType::Text,
         ),
-        BuiltinFn::Concat2 => (&[ExprType::Text, ExprType::Text], ExprType::Text),
+        BuiltinFn::Concat2 | BuiltinFn::TextConcat => {
+            (&[ExprType::Text, ExprType::Text], ExprType::Text)
+        }
         BuiltinFn::Trim => (&[ExprType::Text], ExprType::Text),
         BuiltinFn::Replace => (
             &[ExprType::Text, ExprType::Text, ExprType::Text],
@@ -2604,6 +2715,7 @@ pub(crate) fn is_foldable_builtin(f: BuiltinFn) -> bool {
         | BuiltinFn::Rpad3
         | BuiltinFn::SplitPart
         | BuiltinFn::Concat2
+        | BuiltinFn::TextConcat
         | BuiltinFn::Trim
         | BuiltinFn::Replace
         | BuiltinFn::Position
@@ -3333,13 +3445,21 @@ fn expr_reaches_function(
             .children()
             .into_iter()
             .any(|c| expr_reaches_function(c, target, registry, visited)),
-        Expr::Case { whens, else_result } => {
-            whens.iter().any(|(c, r)| {
-                expr_reaches_function(c, target, registry, visited)
-                    || expr_reaches_function(r, target, registry, visited)
-            }) || else_result
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            operand
                 .as_deref()
-                .is_some_and(|e| expr_reaches_function(e, target, registry, visited))
+                .is_some_and(|o| expr_reaches_function(o, target, registry, visited))
+                || whens.iter().any(|(c, r)| {
+                    expr_reaches_function(c, target, registry, visited)
+                        || expr_reaches_function(r, target, registry, visited)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(|e| expr_reaches_function(e, target, registry, visited))
         }
         Expr::Coalesce(args) => args
             .iter()
@@ -3417,7 +3537,14 @@ fn collect_call_names(expr: &Expr, out: &mut Vec<String>) {
                 collect_call_names(c, out);
             }
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(o) = operand.as_deref() {
+                collect_call_names(o, out);
+            }
             for (c, r) in whens {
                 collect_call_names(c, out);
                 collect_call_names(r, out);
@@ -4165,7 +4292,14 @@ fn validate_closed_expr(
             validate_closed_expr(rhs, params, registry, node_budget)
         }
         Expr::Null => Ok(()),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                validate_closed_expr(operand, params, registry, node_budget)?;
+            }
             for (cond, result) in whens {
                 validate_closed_expr(cond, params, registry, node_budget)?;
                 validate_closed_expr(result, params, registry, node_budget)?;
@@ -5935,6 +6069,11 @@ pub(crate) fn expr_result_column_type(
                 .ok()
                 .map(ColumnType::Array);
         }
+        // `BIT(n)[]` の添字の結果は `bit(n)`（Issue #3235。`n` は要素型が持つ宣言長）。
+        BoundExpr::ArrayIndex {
+            elem: crate::catalog::ArrayElemType::Bit(n),
+            ..
+        } => return Some(ColumnType::Bit(*n)),
         BoundExpr::ArrayIndex { elem, .. } => {
             return crate::sql::cast::elem_cast_type(*elem)
                 .and_then(|t| t.result_column_type())
@@ -6241,10 +6380,79 @@ fn unify_branch_type(
     Ok(())
 }
 
-/// 検索形 `CASE` を束縛する（対象ビヘイビア: SQL-26。`sql::allowlist::Parser`
-/// が構文段で単純 CASE・WHEN 内の論理演算を拒否済みのため、`cond` は常に
-/// 比較の [`Expr::Binary`] である）。
+/// 単純 CASE（`CASE x WHEN v_i ...`。Issue #3279）の各分岐を検索形の条件 `x = v_i` へ下げる
+/// （対象ビヘイビア: SQL-26）。被演算子の構文木は分岐ごとに複製されるため、呼び出し側は
+/// 複製前に [`expr_node_count`](crate::sql::where_negation::expr_node_count) を自分のノード予算から
+/// 差し引くこと（束縛段 [`bind_case`] は束縛自体の `node_budget` 課金で有界にする）。
+/// 被演算子か比較値が裸の `NULL` の分岐は PostgreSQL の `x = NULL`（常に不明）と同じく一致しない
+/// ため、条件を `None`（決して真にならない）として返す。
+pub(crate) fn simple_case_conditions(operand: &Expr, whens: &[(Expr, Expr)]) -> Vec<Option<Expr>> {
+    whens
+        .iter()
+        .map(|(v, _)| {
+            if matches!(operand, Expr::Null) || matches!(v, Expr::Null) {
+                None
+            } else {
+                Some(Expr::Binary {
+                    op: BinOp::Eq,
+                    lhs: Box::new(operand.clone()),
+                    rhs: Box::new(v.clone()),
+                })
+            }
+        })
+        .collect()
+}
+
+/// `CASE` の各分岐の条件を検索形の式として取り出す（検索形はそのまま借用し、単純形は
+/// [`simple_case_conditions`] で `operand = v_i`（NULL を含む分岐は常に不明な `NULL`）へ下げる。
+/// Issue #3279）。定数畳み込み・型推論など、条件の意味を解釈する箇所が共有する。
+pub(crate) fn case_condition_exprs<'a>(
+    operand: Option<&Expr>,
+    whens: &'a [(Expr, Expr)],
+) -> Vec<std::borrow::Cow<'a, Expr>> {
+    match operand {
+        None => whens.iter().map(|(c, _)| Cow::Borrowed(c)).collect(),
+        Some(op) => simple_case_conditions(op, whens)
+            .into_iter()
+            .map(|c| Cow::Owned(c.unwrap_or(Expr::Null)))
+            .collect(),
+    }
+}
+
+thread_local! {
+    /// `clock_timestamp()` を束縛した累計回数（Issue #3279）。単純 CASE の被演算子が（宣言的 UDF の
+    /// 本体経由を含め）壁時計を読むかを、束縛の前後の差で判定する。束縛は同期・同一スレッド内で完結する。
+    static CLOCK_TIMESTAMP_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 展開中の UDF 本体で、`clock_timestamp()` を含む実引数に束縛されたパラメータ名（小文字。
+    /// Issue #3279 のレビュー指摘）。束縛済み実引数は本体のパラメータ参照で複製されるだけで
+    /// `clock_timestamp()` の束縛を通らないため、参照時に [`CLOCK_TIMESTAMP_BINDS`] を加算して
+    /// 単純 CASE の被演算子判定へ伝える。UDF 呼び出しごとに差し替え・復元する（字句スコープ）。
+    static CLOCK_PARAMS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// 単純 CASE の一致しない分岐の片側を束縛する（裸の `NULL` は [`BoundExpr::Null`]。1 ノード課金）。
+fn bind_null_side(
+    e: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    if matches!(e, Expr::Null) {
+        *node_budget = node_budget
+            .checked_sub(1)
+            .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+        Ok(BoundExpr::Null)
+    } else {
+        Ok(bind_expr_in(e, env, node_budget)?.0)
+    }
+}
+
+/// 束縛段で `CASE` を束縛する（対象ビヘイビア: SQL-26）。`sql::allowlist::Parser` が構文段で
+/// WHEN 内の論理演算を拒否済みのため、検索形の `cond` は常に比較の [`Expr::Binary`] である。
+/// 単純形（`operand` が `Some`。Issue #3279）は各分岐を [`simple_case_conditions`] の規則で
+/// `operand = v_i` として束縛する（NULL を含む分岐は一致しない条件 [`BoundExpr::Null`]）。
 fn bind_case(
+    operand: Option<&Expr>,
     whens: &[(Expr, Expr)],
     else_result: &Option<Box<Expr>>,
     env: &mut BindEnv<'_>,
@@ -6255,12 +6463,65 @@ fn bind_case(
             "CASE has too many WHEN branches",
         ));
     }
+    if let Some(op) = operand {
+        // 被演算子は分岐ごとに束縛し直す。壁時計を読む被演算子（宣言的 UDF の本体経由を含む）は
+        // 1 回評価の契約と食い違うため、束縛を 1 度試行して `clock_timestamp()` の束縛有無で判定する。
+        if whens.len() > 1 && !matches!(op, Expr::Null) {
+            let before = CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get);
+            let mut probe_budget = *node_budget;
+            bind_expr_in(op, env, &mut probe_budget)?;
+            if CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get) != before {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "clock_timestamp() as a simple CASE operand with multiple WHEN branches is not supported".to_string(),
+                });
+            }
+        }
+    }
     bind_with_case_nesting(env, |env| {
         let mut bound_whens = Vec::with_capacity(whens.len());
         let mut unified: Option<ExprType> = None;
         let mut branch_tys: Vec<Option<ExprType>> = Vec::new();
-        for (cond, result) in whens {
-            let (cond_bound, cond_ty) = bind_expr_in(cond, env, node_budget)?;
+        let simple_conds = operand.map(|op| simple_case_conditions(op, whens));
+        for (idx, (cond, result)) in whens.iter().enumerate() {
+            let (cond_bound, cond_ty) = match (&simple_conds, operand) {
+                (Some(conds), Some(op)) => match conds.get(idx).and_then(Option::as_ref) {
+                    Some(lowered) => {
+                        // 被演算子が文字列リテラル（unknown）で比較値が文字列リテラルでない場合、
+                        // PostgreSQL は被演算子を先に text へ確定して比較するため、比較値の型が
+                        // text でなければ拒否する（分岐ごとに比較相手の型へ再解釈しない）。
+                        if matches!(op, Expr::String(_)) && !matches!(cond, Expr::String(_)) {
+                            let mut probe_budget = *node_budget;
+                            let (_, vty) = bind_expr_in(cond, env, &mut probe_budget)?;
+                            if vty != ExprType::Text {
+                                return Err(SqlSurfaceError::DatatypeMismatch {
+                                    detail: "simple CASE operand of unknown type is resolved as text and cannot be compared with a non-text value".to_string(),
+                                });
+                            }
+                        }
+                        bind_expr_in(lowered, env, node_budget)?
+                    }
+                    None => {
+                        // 一致しない分岐（NULL を含む）でも、NULL でない側を束縛して列の存在・型・
+                        // 権限を検査し、評価時も `x = NULL`／`NULL = v` として両辺を評価する
+                        // （`eval_binary` は両辺の評価後に NULL を伝播するため、被演算子の実行時
+                        // エラー〔22012 等〕を検索形と同じく保つ）。
+                        let l = bind_null_side(op, env, node_budget)?;
+                        let r = bind_null_side(cond, env, node_budget)?;
+                        *node_budget = node_budget.checked_sub(1).ok_or_else(|| {
+                            SqlSurfaceError::payload_too_large("expression is too large")
+                        })?;
+                        (
+                            BoundExpr::Binary {
+                                op: BinOp::Eq,
+                                lhs: Box::new(l),
+                                rhs: Box::new(r),
+                            },
+                            ExprType::Bool,
+                        )
+                    }
+                },
+                _ => bind_expr_in(cond, env, node_budget)?,
+            };
             if cond_ty != ExprType::Bool {
                 return Err(SqlSurfaceError::DatatypeMismatch {
                     detail: "CASE WHEN condition must be a boolean comparison".to_string(),
@@ -6869,6 +7130,10 @@ pub(super) fn bind_expr_any(
             // （`validate_closed_expr` の参照検証と一貫させる。外側コンテキストでは
             // `env.params` が常に空のため、列名の大文字小文字扱いには影響しない）。
             if let Some((bound, ty)) = env.params.get(name.to_ascii_lowercase().as_str()) {
+                // 壁時計を含む実引数のパラメータ参照は、複製のたびに束縛カウンタを進める。
+                if CLOCK_PARAMS.with(|c| c.borrow().contains(name.to_ascii_lowercase().as_str())) {
+                    CLOCK_TIMESTAMP_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
+                }
                 // パラメータ参照の展開は、構文上は 1 ノードでも実際には既に展開済みの
                 // `BoundExpr` 部分木をまるごとクローンする（UDF 連鎖・多重参照時に
                 // 展開結果が指数的に膨張しうる経路）。構文ノード数（直前の
@@ -7169,7 +7434,10 @@ pub(super) fn bind_expr_any(
             // Issue #1812: 集計式項目では NUMERIC 値を算術の被演算子に使える。ゲート
             // （`reject_json_operand`）を被演算子の束縛後へ遅らせ、NUMERIC を含まない組は従来どおり拒否する。
             let numeric_mode = env.numeric_arith
-                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+                && matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                );
             // codex-review 指摘対応（Issue #1812）: NUMERIC 算術の数値リテラルは、相手が NUMERIC
             // 式なら `f64` 経由（`parse_number_literal` の 2^53 検証）を通さず `Decimal` へ直接
             // 束縛する（`sum(b) + 9007199254740993`）。そのため非リテラル側を先に束縛する。
@@ -7231,6 +7499,39 @@ pub(super) fn bind_expr_any(
                 reject_json_operand(lt)?;
                 reject_json_operand(rt)?;
             }
+            // Issue #3273・SQL-42: `%` の f64 レーンは、両被演算子が整数値と判定できる組だけを
+            // 受理する。PG の `%` は整数・numeric のみで、小数リテラル（`0.3 % 0.1` は numeric で 0）を
+            // f64 の fmod へ流すと値が変わり、float8 の式（CASE／COALESCE／NULLIF 経由を含む）は
+            // `42883` になるべきなので、束縛後の判定で整数と証明できない組は fail-closed で拒否する。
+            if *op == BinOp::Rem
+                && lt == ExprType::Scalar
+                && rt == ExprType::Scalar
+                && !(rem_integer_operand(lhs, &l, env) && rem_integer_operand(rhs, &r, env))
+            {
+                return Err(
+                    if matches!(&**lhs, Expr::Number(_)) && !rem_integer_operand(lhs, &l, env)
+                        || matches!(&**rhs, Expr::Number(_)) && !rem_integer_operand(rhs, &r, env)
+                    {
+                        SqlSurfaceError::FeatureNotSupported {
+                            detail:
+                                "remainder with a non-integer literal requires a numeric operand"
+                                    .to_string(),
+                        }
+                    } else {
+                        rem_operator_error()
+                    },
+                );
+            }
+            // `%` の被演算子の中間演算（`+ - * / %`）は f64 の丸めを剰余へ持ち込まないため、
+            // 各演算を整数の checked 演算（|v| <= 2^53 を超えれば 22003）へ置き換える。
+            let (l, r) = if *op == BinOp::Rem && lt == ExprType::Scalar && rt == ExprType::Scalar {
+                (
+                    rem_harden_operand(Some(lhs), l, env),
+                    rem_harden_operand(Some(rhs), r, env),
+                )
+            } else {
+                (l, r)
+            };
             // Issue #1539・SQL-42: 投影モードの `Scalar` 同士の算術は、オペランドの数値
             // 種別（整数／単精度／倍精度）から結果型を PostgreSQL に揃える。
             // Issue #2881: 整数モードの整数どうしの比較は i128 で丸めなく比較する。
@@ -7252,7 +7553,10 @@ pub(super) fn bind_expr_any(
                 }
             }
             if env.typed_arith
-                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+                && matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                )
                 && lt == ExprType::Scalar
                 && rt == ExprType::Scalar
             {
@@ -7286,7 +7590,11 @@ pub(super) fn bind_expr_any(
         Expr::Null => Err(SqlSurfaceError::FeatureNotSupported {
             detail: "NULL is only allowed as a CASE/COALESCE/NULLIF operand".to_string(),
         }),
-        Expr::Case { whens, else_result } => bind_case(whens, else_result, env, node_budget),
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => bind_case(operand.as_deref(), whens, else_result, env, node_budget),
         Expr::Coalesce(args) => bind_coalesce(args, env, node_budget),
         Expr::NullIf(lhs, rhs) => bind_nullif(lhs, rhs, env, node_budget),
         Expr::IsDistinctFrom { negated, lhs, rhs } => {
@@ -7655,7 +7963,7 @@ fn is_int4_expr(expr: &Expr, env: &BindEnv<'_>) -> bool {
                 .is_some_and(|c| matches!(c.ty, ColumnType::Integer))
         }),
         Expr::Binary {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div,
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem,
             lhs,
             rhs,
         } => is_int4_expr(lhs, env) && is_int4_expr(rhs, env),
@@ -7800,43 +8108,321 @@ fn bind_json_access(
     ))
 }
 
-/// `||` の jsonb オペランドを束縛する。`json` 列は PostgreSQL では text 連結になるが
-/// 本実装に文字列連結は無いため `0A000`（fail-closed）。それ以外は通常の式として束縛する。
+/// `||` のオペランドを通常の式として束縛する（`json` 列・json 値も拒否せず型を返す）。
+/// 型の組の可否は束縛後に [`reject_concat_pair`] が静的な型だけで決める。ここで json を先に
+/// 弾くと、反対側の束縛エラー（`42703` 等）より前に `0A000` が出て、PG の演算子解決順
+/// （被演算子の解決 → 演算子の有無）とずれる（Issue #3277・SQL-42）。
 fn bind_json_concat_operand(
     expr: &Expr,
     env: &mut BindEnv<'_>,
     node_budget: &mut usize,
 ) -> Result<(BoundExpr, ExprType), SqlSurfaceError> {
-    if let Expr::Ident(name) = expr {
-        if !env.params.contains_key(name.to_ascii_lowercase().as_str()) {
-            let is_json_column = env.schema.is_some_and(|sc| {
-                sc.columns
-                    .iter()
-                    .any(|c| &c.name == name && matches!(c.ty, ColumnType::Json))
-            });
-            if is_json_column {
-                return Err(concat_not_supported());
-            }
-        }
-    }
-    // json 値（関数結果・パス演算子の結果）も json 列と同じく text 連結に当たるため `0A000`
-    // に揃える（PR #2390 指摘。型で 42883／0A000 が割れないようにする）。
-    let (bound, ty) = bind_expr_any(expr, env, node_budget)?;
-    if ty == ExprType::JsonText {
-        return Err(concat_not_supported());
-    }
-    Ok((bound, ty))
+    bind_expr_any(expr, env, node_budget)
 }
 
-fn concat_not_supported() -> SqlSurfaceError {
-    SqlSurfaceError::FeatureNotSupported {
-        detail: "the || operator is only supported on jsonb operands".to_string(),
+/// `||` の被演算子の分類（Issue #3277・SQL-42）。[`reject_concat_pair`] の入力。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConcatClass {
+    /// text／varchar／bpchar・型なし文字列リテラル・裸の NULL。
+    Text,
+    /// jsonb。
+    Jsonb,
+    /// json（原文保持）。
+    JsonText,
+    /// 配列。
+    Array,
+    /// bytea。
+    Bytea,
+    /// vector。
+    Vector,
+    /// bit。
+    Bit,
+    /// 上記以外のスカラー（数値・bool・日時・interval・uuid 等）。
+    Other,
+}
+
+/// 束縛済みの式型を `||` の被演算子の分類へ写す。`ExprType` に variant が増えたら
+/// コンパイルエラーにして、未知の型を通す側へ倒さない。
+fn concat_class(ty: ExprType) -> ConcatClass {
+    match ty {
+        ExprType::Text => ConcatClass::Text,
+        ExprType::Json => ConcatClass::Jsonb,
+        ExprType::JsonText => ConcatClass::JsonText,
+        ExprType::Array => ConcatClass::Array,
+        ExprType::Bytea => ConcatClass::Bytea,
+        ExprType::Vector => ConcatClass::Vector,
+        ExprType::Bit => ConcatClass::Bit,
+        ExprType::Scalar
+        | ExprType::Bool
+        | ExprType::Date
+        | ExprType::Timestamp
+        | ExprType::Time
+        | ExprType::TimestampTz
+        | ExprType::Interval
+        | ExprType::Numeric
+        | ExprType::Uuid => ConcatClass::Other,
     }
+}
+
+/// `||` で連結に束縛できなかった型の組の拒否 SQLSTATE を 1 箇所で決める
+/// （Issue #3277・SQL-42。分類表は `docs/design/json-expr-type-mapping.md`）。
+/// PG が受理するが本実装が未実装の組は `0A000`、PG に演算子が無い組は `42883`。
+/// 判定は束縛時の静的な型だけで行い、行の値・他テナントの有無で結果を変えない。
+/// 非 text の暗黙連結（Issue #3278）は [`try_bind_text_concat`] が先に連結へ束縛するため、
+/// ここへ届く `Text × 非 Text` は配列・bytea・vector・bit・jsonb の組だけ。
+/// `array_compatible` は、配列を含む組で配列の要素型と反対側の型が PG の演算子解決で
+/// 成立し得るか（[`concat_array_pair_compatible`]）。成立しない組（`integer[] || boolean[]` 等）は `42883`。
+fn reject_concat_pair(l: ConcatClass, r: ConcatClass, array_compatible: bool) -> SqlSurfaceError {
+    use ConcatClass::*;
+    let unimplemented_pair = match (l, r) {
+        // PG の配列の `||`（TABLE-35）。解決できる組だけ未実装（`0A000`）。
+        (Array, _) | (_, Array) => array_compatible,
+        // PG の `anynonarray || text`（非 text の暗黙連結。#3278）。
+        (Text, other) | (other, Text) => other != Text,
+        // bytea／vector／bit 同士の連結演算子は PG／pgvector にあるが未実装。
+        (Bytea, Bytea) | (Vector, Vector) | (Bit, Bit) => true,
+        _ => false,
+    };
+    if unimplemented_pair {
+        SqlSurfaceError::FeatureNotSupported {
+            detail: "the || operator is not supported for these operand types".to_string(),
+        }
+    } else {
+        SqlSurfaceError::undefined_function(
+            "operator does not exist: the operand types do not match the || operator".to_string(),
+        )
+    }
+}
+
+/// 配列を含む `||` の組で、配列の要素型と反対側（配列なら要素型、スカラーならその型）が
+/// PG の演算子解決で成立し得るかを静的な型だけで判定する（Issue #3277 の PR 指摘）。
+/// 型なしリテラル・裸の NULL（`None`）と、型を表せない要素（ENUM 等）は成立し得る側（`0A000`）へ倒す。
+/// json・jsonb・bytea・bit のスカラーは、反対側が同じ要素型の配列（`jsonb[] || jsonb` 等）のときだけ
+/// 成立し得る。vector は配列要素型にならないので常に成立しない。
+/// 日付・時刻系の要素型（date／timestamp／timestamptz）は PG の暗黙変換で互いに成立し得る。
+fn concat_array_pair_compatible(
+    lhs: &Expr,
+    l: &Option<(BoundExpr, ExprType)>,
+    rhs: &Expr,
+    r: &Option<(BoundExpr, ExprType)>,
+    env: &BindEnv<'_>,
+) -> bool {
+    use crate::sql::cast::{source_cast_kind, CastKind, SourceKind};
+    let is_special = |ty: &ExprType| {
+        matches!(
+            ty,
+            ExprType::Json | ExprType::JsonText | ExprType::Bytea | ExprType::Bit
+        )
+    };
+    let mut kinds: Vec<CastKind> = Vec::new();
+    let sides = [(lhs, l, r), (rhs, r, l)];
+    for (expr, side, other) in sides {
+        let Some((bound, ty)) = side else { continue };
+        if matches!(ty, ExprType::Vector) {
+            return false;
+        }
+        let other_expr = if std::ptr::eq(expr, lhs) { rhs } else { lhs };
+        // `BIT(n)[]` はスカラー BIT と同じ `SourceKind::Bit` になるため、`ExprType` で配列側を区別する
+        // （Issue #3277 の PR 指摘）。BIT 配列は反対側が BIT スカラー・BIT 配列のときだけ成立し得る。
+        let is_bit_array = |e: &Expr, b: &BoundExpr, t: &ExprType| {
+            *t == ExprType::Array
+                && matches!(source_cast_kind(e, b, *t, env.schema()), SourceKind::Bit)
+        };
+        if is_bit_array(expr, bound, ty) {
+            return match other {
+                None => true,
+                Some((ob, oty)) => *oty == ExprType::Bit || is_bit_array(other_expr, ob, oty),
+            };
+        }
+        if is_special(ty) {
+            // 反対側が同じ要素型の配列のときだけ成立し得る（`bytea[] || bytea` 等）。
+            let Some((other_bound, other_ty)) = other else {
+                return false;
+            };
+            if is_bit_array(other_expr, other_bound, other_ty) {
+                return *ty == ExprType::Bit;
+            }
+            return match source_cast_kind(other_expr, other_bound, *other_ty, env.schema()) {
+                SourceKind::Array(None) => true,
+                SourceKind::Array(Some(t)) => {
+                    match source_cast_kind(expr, bound, *ty, env.schema()) {
+                        SourceKind::Known(k) => k == t.kind(),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+        }
+        match source_cast_kind(expr, bound, *ty, env.schema()) {
+            SourceKind::Known(k) => kinds.push(k),
+            SourceKind::Array(Some(t)) => kinds.push(t.kind()),
+            SourceKind::UnknownNumeric => kinds.push(CastKind::Int4),
+            SourceKind::Array(None) | SourceKind::Outside | SourceKind::Bit => return true,
+        }
+    }
+    // date／timestamp／timestamptz は PG が暗黙変換で成立させる。ARRAY 構築の共通型判定
+    // （`common_element_type`）は timestamp と timestamptz を不一致にするため別に判定する。
+    let all_datetime = !kinds.is_empty()
+        && kinds.iter().all(|k| {
+            matches!(
+                k,
+                CastKind::Date | CastKind::Timestamp | CastKind::TimestampTz
+            )
+        });
+    all_datetime
+        || !matches!(
+            crate::sql::array_expr::common_element_type(&kinds),
+            Err(SqlSurfaceError::DatatypeMismatch { .. })
+        )
+}
+
+/// [`try_bind_text_concat`] の結果。text 連結に束縛できたか、従来経路へ流すかを表す。
+enum TextConcatBind {
+    /// text 連結として束縛済み。
+    Done((BoundExpr, ExprType)),
+    /// text 連結ではない。葉（リテラル・識別子・数値リテラル）以外の束縛済みオペランドを
+    /// 従来の jsonb 経路へ引き渡す（再束縛しない）。葉は `None`（従来経路が束縛し直す。葉なので
+    /// 束縛時間は増えない）。
+    Fallback {
+        lhs: Option<(BoundExpr, ExprType)>,
+        rhs: Option<(BoundExpr, ExprType)>,
+    },
+}
+
+/// `||` のオペランドの束縛結果（[`try_bind_text_concat`] の内部表現）。
+enum ConcatOperand {
+    /// 型なし文字列リテラル・裸の NULL（束縛は text 判明後）。
+    Literal,
+    /// 数値リテラル（葉。`bind_cast` で正確な numeric 定数として text へ変換する）。
+    Number,
+    /// 束縛済みの式。`leaf` は識別子（従来経路へ戻すとき再束縛する）。
+    Bound {
+        bound: BoundExpr,
+        ty: ExprType,
+        leaf: bool,
+    },
+}
+
+/// `||` のオペランドを 1 回だけ束縛して [`ConcatOperand`] にする。
+fn classify_concat_operand(
+    e: &Expr,
+    env: &mut BindEnv<'_>,
+    budget: &mut usize,
+) -> Result<ConcatOperand, SqlSurfaceError> {
+    match e {
+        Expr::String(_) | Expr::Null => Ok(ConcatOperand::Literal),
+        Expr::Number(_) => Ok(ConcatOperand::Number),
+        Expr::Ident(name) => {
+            if let Some((bound, ty)) = crate::sql::cast::bind_cast_operand_column(name, env) {
+                crate::sql::cast::charge_node(budget)?;
+                return Ok(ConcatOperand::Bound {
+                    bound,
+                    ty,
+                    leaf: true,
+                });
+            }
+            let (bound, ty) = bind_expr_any(e, env, budget)?;
+            Ok(ConcatOperand::Bound {
+                bound,
+                ty,
+                leaf: true,
+            })
+        }
+        _ => {
+            let (bound, ty) = bind_expr_any(e, env, budget)?;
+            Ok(ConcatOperand::Bound {
+                bound,
+                ty,
+                leaf: false,
+            })
+        }
+    }
+}
+
+/// `||` の text 連結束縛（Issue #3276・#3278・SQL-42）。片側が text（型なしリテラル・裸の NULL を
+/// 含む）で、他方が text か `CAST(.. AS text)` で変換できる型（数値・boolean・日時・interval・uuid・
+/// json）のときだけ [`BuiltinFn::TextConcat`] に束縛して返す。変換は `sql::cast` の規則に従い、
+/// 種別を静的に決められない数値と CHECK 本体は `CAST` と同じく `0A000`。jsonb が絡む組は
+/// 従来経路（[`TextConcatBind::Fallback`]）、text と配列・bytea・vector・bit の組も同じく
+/// 従来経路へ流し、拒否 SQLSTATE は [`reject_concat_pair`] が決める（Issue #3277）。葉でないオペランドは必ず 1 回だけ束縛する
+/// （左結合の `||` 連鎖で部分木を二重に束縛すると束縛時間が指数的になるため。PR #3453 指摘）。
+fn try_bind_text_concat(
+    lhs: &Expr,
+    rhs: &Expr,
+    env: &mut BindEnv<'_>,
+    node_budget: &mut usize,
+) -> Result<TextConcatBind, SqlSurfaceError> {
+    let l = classify_concat_operand(lhs, env, node_budget)?;
+    let r = classify_concat_operand(rhs, env, node_budget)?;
+    let is_text = |o: &ConcatOperand| match o {
+        ConcatOperand::Literal => true,
+        ConcatOperand::Bound { ty, .. } => *ty == ExprType::Text,
+        ConcatOperand::Number => false,
+    };
+    // 0: text 相当 / 1: text へ変換できる / 2: jsonb / 3: 自前の `||` を持つ型（拒否）。
+    let kind_of = |o: &ConcatOperand| match o {
+        ConcatOperand::Literal => 0u8,
+        ConcatOperand::Number => 1,
+        ConcatOperand::Bound { ty, .. } => match ty {
+            ExprType::Text => 0,
+            ExprType::Json => 2,
+            ExprType::Array | ExprType::Bytea | ExprType::Vector | ExprType::Bit => 3,
+            _ => 1,
+        },
+    };
+    let (lk, rk) = (kind_of(&l), kind_of(&r));
+    let text_pair = lk == 0 && rk == 0;
+    let convert_pair = (is_text(&l) && rk == 1) || (is_text(&r) && lk == 1);
+    if !(text_pair || convert_pair) {
+        let into_fallback = |o: ConcatOperand| match o {
+            ConcatOperand::Bound {
+                bound,
+                ty,
+                leaf: false,
+            } => Some((bound, ty)),
+            _ => None,
+        };
+        return Ok(TextConcatBind::Fallback {
+            lhs: into_fallback(l),
+            rhs: into_fallback(r),
+        });
+    }
+    let finish = |o: ConcatOperand,
+                  expr: &Expr,
+                  env: &mut BindEnv<'_>,
+                  budget: &mut usize|
+     -> Result<BoundExpr, SqlSurfaceError> {
+        let text = crate::sql::cast::CastType::Text;
+        match o {
+            ConcatOperand::Literal => Ok(bind_null_aware(expr, env, budget)?.0),
+            ConcatOperand::Number => Ok(crate::sql::cast::bind_cast(expr, &text, env, budget)?.0),
+            ConcatOperand::Bound {
+                bound,
+                ty: ExprType::Text,
+                ..
+            } => Ok(bound),
+            ConcatOperand::Bound { bound, ty, .. } => {
+                Ok(crate::sql::cast::cast_bound(expr, bound, ty, &text, env, budget)?.0)
+            }
+        }
+    };
+    let lb = finish(l, lhs, env, node_budget)?;
+    let rb = finish(r, rhs, env, node_budget)?;
+    *node_budget = node_budget
+        .checked_sub(1)
+        .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
+    Ok(TextConcatBind::Done((
+        BoundExpr::Builtin {
+            f: BuiltinFn::TextConcat,
+            args: vec![lb, rb],
+        },
+        ExprType::Text,
+    )))
 }
 
 /// jsonb の連結・パス削除演算子（`||` `#-`。Issue #2181・TABLE-25）の束縛。
-/// `||` は両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として解釈）のみ受理し、
-/// 文字列連結に当たる組は `0A000`、型の合わない組は `42883`。`#-` は左辺 jsonb（`json` 列は
+/// `||` は text 連結（Issue #3276）、両辺 jsonb（型なしリテラルは反対側が jsonb のとき jsonb として
+/// 解釈）のみ受理し、拒否する組の SQLSTATE は [`reject_concat_pair`] が決める（Issue #3277）。`#-` は左辺 jsonb（`json` 列は
 /// `42883`）・右辺 text[] リテラル（NULL 要素は `22004` の分類が未実装のため `0A000`）。
 fn bind_json_modify(
     op: JsonAccessOp,
@@ -7896,42 +8482,41 @@ fn bind_json_modify(
             ExprType::Json,
         ));
     }
-    // `||`。
-    let lhs_is_literal = matches!(lhs, Expr::String(_));
-    let rhs_is_literal = matches!(rhs, Expr::String(_));
-    if lhs_is_literal && rhs_is_literal {
-        return Err(operator_missing());
-    }
-    // 型なしリテラルの反対側の型を確定させる。jsonb ならリテラルを jsonb として解釈、
-    // text なら文字列連結（未実装）、それ以外は演算子なし。
-    let (l_bound, r_bound) = if lhs_is_literal || rhs_is_literal {
-        let (other_expr, literal_expr) = if lhs_is_literal {
-            (rhs, lhs)
-        } else {
-            (lhs, rhs)
-        };
-        let (other, other_ty) = bind_json_concat_operand(other_expr, env, node_budget)?;
-        match other_ty {
-            ExprType::Json => {}
-            ExprType::Text => return Err(concat_not_supported()),
-            _ => return Err(operator_missing()),
-        }
-        let lit = bind_json_predicate_literal(literal_expr, node_budget)?;
-        if lhs_is_literal {
-            (lit, other)
-        } else {
-            (other, lit)
-        }
-    } else {
-        let (l, l_ty) = bind_json_concat_operand(lhs, env, node_budget)?;
-        let (r, r_ty) = bind_json_concat_operand(rhs, env, node_budget)?;
-        match (l_ty, r_ty) {
-            (ExprType::Json, ExprType::Json) => (l, r),
-            (ExprType::Json, ExprType::Text) | (ExprType::Text, ExprType::Json) => {
-                return Err(concat_not_supported())
-            }
-            (ExprType::Json, _) | (_, ExprType::Json) => return Err(operator_missing()),
-            _ => return Err(concat_not_supported()),
+    // `||`。text／varchar／型なしリテラル／NULL だけの組は strict な text 連結
+    // （Issue #3276・SQL-42）。jsonb が絡む組・非 text の組は従来の jsonb 経路へ流す。
+    let (pre_l, pre_r) = match try_bind_text_concat(lhs, rhs, env, node_budget)? {
+        TextConcatBind::Done(done) => return Ok(done),
+        TextConcatBind::Fallback { lhs, rhs } => (lhs, rhs),
+    };
+    // `||`（text 連結に束縛できなかった組）。jsonb 同士・jsonb と型なしリテラルだけが jsonb 連結で、
+    // それ以外は静的な型の組から [`reject_concat_pair`] が拒否の SQLSTATE を決める。
+    // 束縛済みのオペランドは再束縛しない。型なしリテラルは葉として扱い、jsonb 側が確定してから束縛する。
+    let is_str = |e: &Expr| matches!(e, Expr::String(_));
+    let l = match pre_l {
+        Some(done) => Some(done),
+        None if is_str(lhs) => None,
+        None => Some(bind_json_concat_operand(lhs, env, node_budget)?),
+    };
+    let r = match pre_r {
+        Some(done) => Some(done),
+        None if is_str(rhs) => None,
+        None => Some(bind_json_concat_operand(rhs, env, node_budget)?),
+    };
+    let (l_bound, r_bound) = match (l, r) {
+        (Some((lb, ExprType::Json)), Some((rb, ExprType::Json))) => (lb, rb),
+        (Some((ob, ExprType::Json)), None) => (ob, bind_json_predicate_literal(rhs, node_budget)?),
+        (None, Some((ob, ExprType::Json))) => (bind_json_predicate_literal(lhs, node_budget)?, ob),
+        (l, r) => {
+            let class_of = |o: &Option<(BoundExpr, ExprType)>| {
+                o.as_ref()
+                    .map_or(ConcatClass::Text, |(_, ty)| concat_class(*ty))
+            };
+            let array_compatible = concat_array_pair_compatible(lhs, &l, rhs, &r, env);
+            return Err(reject_concat_pair(
+                class_of(&l),
+                class_of(&r),
+                array_compatible,
+            ));
         }
     };
     Ok((
@@ -8269,7 +8854,9 @@ fn exact_mode_kind(expr: &Expr, bound: &BoundExpr, schema: Option<&TableSchema>)
             None => ProjKind::Other,
         },
         (
-            Expr::Case { whens, else_result },
+            Expr::Case {
+                whens, else_result, ..
+            },
             BoundExpr::Case {
                 whens: bound_whens,
                 else_result: bound_else,
@@ -8337,7 +8924,9 @@ pub(crate) fn projection_kind(
     match (expr, bound) {
         (Expr::Null, _) => return ProjKind::Null,
         (
-            Expr::Case { whens, else_result },
+            Expr::Case {
+                whens, else_result, ..
+            },
             BoundExpr::Case {
                 whens: bound_whens,
                 else_result: bound_else,
@@ -8472,10 +9061,28 @@ fn scalar_numeric_kind(
         BoundExpr::ArrayFn(f) if f.result_is_int4() => Some(NumericKind::Int4),
         // 整数・real 要素の添字は要素型どおりの整数演算にする（TABLE-35・Issue #1602）。
         BoundExpr::ArrayIndex { elem, .. } => match elem {
+            crate::catalog::ArrayElemType::SmallInt => Some(NumericKind::Int2),
             crate::catalog::ArrayElemType::Integer => Some(NumericKind::Int4),
             crate::catalog::ArrayElemType::BigInt => Some(NumericKind::Int8),
             crate::catalog::ArrayElemType::Real => Some(NumericKind::Float4),
-            _ => None,
+            // 残りは静的な数値種別を持たない（要素型の追加時にここで判断を強制する。Issue #3229）。
+            crate::catalog::ArrayElemType::Text
+            | crate::catalog::ArrayElemType::Varchar(_)
+            | crate::catalog::ArrayElemType::Bpchar(_)
+            | crate::catalog::ArrayElemType::Bool
+            | crate::catalog::ArrayElemType::Double
+            | crate::catalog::ArrayElemType::Date
+            | crate::catalog::ArrayElemType::Timestamp
+            | crate::catalog::ArrayElemType::Time
+            | crate::catalog::ArrayElemType::Interval
+            | crate::catalog::ArrayElemType::TimestampTz
+            | crate::catalog::ArrayElemType::Uuid
+            | crate::catalog::ArrayElemType::Numeric { .. }
+            | crate::catalog::ArrayElemType::Bytea
+            | crate::catalog::ArrayElemType::Json
+            | crate::catalog::ArrayElemType::Jsonb
+            | crate::catalog::ArrayElemType::Bit(_)
+            | crate::catalog::ArrayElemType::Enum => None,
         },
         // `jsonb_array_length` は int4 なので、算術でも整数演算に解決する（Issue #1599）。
         BoundExpr::JsonFn {
@@ -9296,6 +9903,14 @@ fn bind_binary(
                 "'/' requires scalar operands, or a vector divided by a scalar",
             )),
         },
+        // 剰余（Issue #3273・SQL-42 ポインタ）。PostgreSQL の `%` は整数・numeric だけで、
+        // Scalar 以外の組は `operator does not exist`（42883）。値・列名は含めない固定文言。
+        BinOp::Rem => match (lt, rt) {
+            (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Scalar)),
+            (ExprType::Text, _) | (_, ExprType::Text) => Err(text_arithmetic_error()),
+            (ExprType::Interval, _) | (_, ExprType::Interval) => Err(interval_operator_error()),
+            _ => Err(rem_operator_error()),
+        },
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => match (lt, rt) {
             (ExprType::Scalar, ExprType::Scalar) => Ok((mk(op, l, r), ExprType::Bool)),
             // Issue #919・SQL-26: TEXT 同士の比較（バイト順＝UTF-8 コードポイント順。
@@ -9353,6 +9968,186 @@ fn bind_binary(
 /// `operator does not exist` 相当で `42883`。値・列名は含めない固定文言）。
 fn text_arithmetic_error() -> SqlSurfaceError {
     SqlSurfaceError::undefined_function("operator does not exist: arithmetic on text operand")
+}
+
+/// `%` の未対応の被演算子型の組（VECTOR・DATE・BOOL 等）のエラー。PostgreSQL の
+/// `operator does not exist` と同じ `42883`。値・列名は含めない固定文言（Issue #3273）。
+fn rem_operator_error() -> SqlSurfaceError {
+    SqlSurfaceError::undefined_function("operator does not exist: unsupported operand types for %")
+}
+
+/// `%` の f64 レーンの被演算子が整数値と証明できるか（Issue #3273）。束縛済みの数値種別
+/// （[`projection_kind`]。CASE／COALESCE／NULLIF の分岐型を透過する）が整数なら真。それ以外は
+/// 構文で、整数リテラル・整数列・疑似列 `id`・整数型への CAST と、それらの `+ - * %` だけを真とする
+/// （`/` は f64 の真の除算になりうるため含めない）。float8・小数リテラル・不明な型は偽（fail-closed）。
+fn rem_integer_operand(expr: &Expr, bound: &BoundExpr, env: &BindEnv<'_>) -> bool {
+    if matches!(
+        projection_kind(expr, bound, env.schema),
+        ProjKind::Num(NumericKind::Int2 | NumericKind::Int4 | NumericKind::Int8)
+    ) {
+        return true;
+    }
+    rem_integer_syntax(expr, env)
+}
+
+/// `%` の被演算子に含まれる `+ - * / %` の [`BoundExpr::Binary`] を、整数の checked 演算
+/// （[`BuiltinFn::TypedArith`] の `Int8`。各演算の結果が 2^53 を超えれば `22003`）へ再帰的に
+/// 置き換える（Issue #3273）。f64 レーンでは `((b*b+1)-(b*b)) % 2` のように、最終値だけを見ても
+/// 中間の丸めを検出できないため、各中間演算で精度を保証する。葉（列・リテラル・CAST 等）は不変。
+fn rem_harden_operand(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> BoundExpr {
+    match e {
+        BoundExpr::Binary {
+            op: op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem),
+            lhs,
+            rhs,
+        } => {
+            let (le, re) = match expr {
+                Some(Expr::Binary { lhs: a, rhs: b, .. }) => (Some(&**a), Some(&**b)),
+                _ => (None, None),
+            };
+            BoundExpr::Builtin {
+                f: BuiltinFn::TypedArith(op, NumericKind::Int8),
+                args: vec![
+                    rem_harden_operand(le, *lhs, env),
+                    rem_harden_operand(re, *rhs, env),
+                ],
+            }
+        }
+        // 整数型への CAST の内部の整数算術も f64 の丸めを持ち込むため再帰的に硬化する。
+        // 内側が整数と証明できない CAST（float8 から整数への丸め等）は CAST 自身の意味論に任せる。
+        BoundExpr::Builtin {
+            f: f @ BuiltinFn::Cast(_),
+            mut args,
+        } => {
+            if let (Some(Expr::Cast { expr: inner, .. }), 1) = (expr, args.len()) {
+                if rem_integer_syntax(inner, env) {
+                    let a = args.remove(0);
+                    args.push(rem_harden_operand(Some(inner), a, env));
+                }
+            }
+            BoundExpr::Builtin { f, args }
+        }
+        // CASE／COALESCE／NULLIF／abs の内部も同様に硬化する（整数と証明できる枝・引数だけ。
+        // 丸めを持つ中間 f64 が最終値だけ小さくなって誤一致するのを防ぐ。CASE の条件部は値に
+        // ならないため対象外）。構文木と束縛木の形が対応しない場合は硬化せず `Cast` と同じ扱い。
+        BoundExpr::Case { whens, else_result } => {
+            let (ws, els) = match expr {
+                Some(Expr::Case {
+                    whens: ws,
+                    else_result: els,
+                    ..
+                }) if ws.len() == whens.len() => (Some(ws), els.as_deref()),
+                _ => (None, None),
+            };
+            let whens = whens
+                .into_iter()
+                .enumerate()
+                .map(|(i, (c, r))| {
+                    let r = rem_harden_checked(ws.map(|w| &w[i].1), r, env);
+                    (c, r)
+                })
+                .collect();
+            let else_result = Box::new(rem_harden_checked(els, *else_result, env));
+            BoundExpr::Case { whens, else_result }
+        }
+        BoundExpr::Coalesce(args) => {
+            let src = match expr {
+                Some(Expr::Coalesce(a)) if a.len() == args.len() => Some(a),
+                _ => None,
+            };
+            BoundExpr::Coalesce(
+                args.into_iter()
+                    .enumerate()
+                    .map(|(i, a)| rem_harden_checked(src.map(|s| &s[i]), a, env))
+                    .collect(),
+            )
+        }
+        BoundExpr::NullIf { lhs, rhs } => {
+            let (le, re) = match expr {
+                Some(Expr::NullIf(a, b)) => (Some(&**a), Some(&**b)),
+                _ => (None, None),
+            };
+            BoundExpr::NullIf {
+                lhs: Box::new(rem_harden_checked(le, *lhs, env)),
+                rhs: Box::new(rem_harden_checked(re, *rhs, env)),
+            }
+        }
+        BoundExpr::Builtin {
+            f: BuiltinFn::Abs,
+            mut args,
+        } => {
+            if let (Some(Expr::Call { args: src, .. }), 1) = (expr, args.len()) {
+                if src.len() == 1 {
+                    let a = args.remove(0);
+                    args.push(rem_harden_checked(src.first(), a, env));
+                }
+            }
+            BoundExpr::Builtin {
+                f: BuiltinFn::Abs,
+                args,
+            }
+        }
+        // GREATEST／LEAST の各引数も同様に硬化する（整数と証明できる引数だけ。構文木と束縛木の
+        // 引数個数が対応しない場合は硬化せず、そのまま返す）。
+        BoundExpr::MinMax { op, args } => {
+            let src = match expr {
+                Some(Expr::Call { args: a, .. }) if a.len() == args.len() => Some(a),
+                _ => None,
+            };
+            BoundExpr::MinMax {
+                op,
+                args: args
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, a)| rem_harden_checked(src.and_then(|s| s.get(i)), a, env))
+                    .collect(),
+            }
+        }
+        other => other,
+    }
+}
+
+/// ラッパー内部の枝・引数用: 整数と証明できる場合だけ [`rem_harden_operand`] を適用する。
+fn rem_harden_checked(expr: Option<&Expr>, e: BoundExpr, env: &BindEnv<'_>) -> BoundExpr {
+    match expr {
+        Some(x) if rem_integer_operand(x, &e, env) => rem_harden_operand(Some(x), e, env),
+        _ => e,
+    }
+}
+
+fn rem_integer_syntax(expr: &Expr, env: &BindEnv<'_>) -> bool {
+    use crate::sql::cast::CastType;
+    match expr {
+        Expr::Number(raw) => classify_exact_int_literal(raw).is_some(),
+        Expr::Ident(name) => {
+            // UDF 引数は宣言型（`param_decl`）が整数型のときだけ整数と証明する。型なし引数は
+            // 偽（fail-closed）。型付き引数は呼び出し時に宣言型へ代入変換済みで整数値になる。
+            let lower = name.to_ascii_lowercase();
+            if env.params.contains_key(lower.as_str()) {
+                return matches!(
+                    env.param_decl.get(lower.as_str()),
+                    Some(CastType::Int2 | CastType::Int4 | CastType::Int8)
+                );
+            }
+            match env
+                .schema
+                .and_then(|s| s.columns.iter().find(|c| &c.name == name))
+            {
+                Some(c) => matches!(
+                    c.ty,
+                    ColumnType::SmallInt | ColumnType::Integer | ColumnType::BigInt
+                ),
+                None => name.eq_ignore_ascii_case("id"),
+            }
+        }
+        Expr::Cast { ty, .. } => matches!(ty, CastType::Int2 | CastType::Int4 | CastType::Int8),
+        Expr::Binary {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Rem,
+            lhs,
+            rhs,
+        } => rem_integer_syntax(lhs, env) && rem_integer_syntax(rhs, env),
+        _ => false,
+    }
 }
 
 /// INTERVAL を含む未対応の算術の組のエラー（PostgreSQL の `operator does not exist` 相当で
@@ -9754,6 +10549,9 @@ fn bind_call(
     }
 
     if let Some(builtin) = builtin_from_name(name) {
+        if matches!(builtin, BuiltinFn::ClockTimestamp) {
+            CLOCK_TIMESTAMP_BINDS.with(|c| c.set(c.get().wrapping_add(1)));
+        }
         let (param_types, ret) = builtin_signature(builtin);
         if args.len() != param_types.len() {
             return Err(SqlSurfaceError::undefined_function(format!(
@@ -9853,14 +10651,24 @@ fn bind_call(
         // 型注釈つきパラメータ（SQL-66 (1)）は実引数を宣言型へ暗黙変換する。型なしは従来どおり。
         // `param_types.len() == params.len()` は `define_function_with_types` が確立する不変条件。
         let mut bound_args = Vec::with_capacity(args.len());
+        let mut clock_flags = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
+            let before = CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get);
             match def.param_types.get(i).and_then(Option::as_ref) {
                 Some(declared) => {
                     bound_args.push(bind_typed_udf_arg(name, a, declared, env, node_budget)?)
                 }
                 None => bound_args.push(bind_expr_in(a, env, node_budget)?),
             }
+            clock_flags.push(CLOCK_TIMESTAMP_BINDS.with(std::cell::Cell::get) != before);
         }
+        let inner_clock_params: std::collections::HashSet<String> = def
+            .params
+            .iter()
+            .zip(&clock_flags)
+            .filter(|(_, f)| **f)
+            .map(|(p, _)| p.to_ascii_lowercase())
+            .collect();
         let mut inner_params = std::collections::HashMap::new();
         let mut inner_decl = std::collections::HashMap::new();
         for (i, (pname, bound)) in def.params.iter().zip(bound_args).enumerate() {
@@ -9891,10 +10699,13 @@ fn bind_call(
             exact_int: false,
         };
         // RETURNS 付きは本体の結果を戻り値型へ変換して返す（定義時に型検査済み。Issue #1916）。
-        return match &def.return_type {
+        let saved_clock_params = CLOCK_PARAMS.with(|c| c.replace(inner_clock_params));
+        let result = match &def.return_type {
             Some(ret) => bind_udf_return(&def.body, ret, &mut inner_env, node_budget),
             None => bind_expr_in(&def.body, &mut inner_env, node_budget),
         };
+        CLOCK_PARAMS.with(|c| c.replace(saved_clock_params));
+        return result;
     }
 
     if let Some(backend) = env.registry.get_wasm(name).cloned() {
@@ -12136,6 +12947,19 @@ pub(crate) fn apply_builtin<'a>(
                 _ => Ok(ExprValue::Null),
             }
         }
+        BuiltinFn::TextConcat => {
+            // strict: NULL は冒頭の一律ガードで返済み。長さは確保前に検査する（#3276）。
+            match (
+                take_text_or_null_arg(args, 0)?,
+                take_text_or_null_arg(args, 1)?,
+            ) {
+                (Some(a), Some(b)) => {
+                    let out = string_fn::concat_strict(&a, &b)?;
+                    Ok(ExprValue::Text(Cow::Owned(out)))
+                }
+                _ => Ok(ExprValue::Null),
+            }
+        }
         BuiltinFn::Concat2 => {
             let a = take_text_or_null_arg(args, 0)?.unwrap_or(Cow::Borrowed(""));
             let b = take_text_or_null_arg(args, 1)?.unwrap_or(Cow::Borrowed(""));
@@ -12371,7 +13195,7 @@ pub(crate) fn apply_builtin<'a>(
                 BinOp::Ge => a >= b,
                 BinOp::Le => a <= b,
                 BinOp::Eq => a == b,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "arithmetic operator in exact integer comparison".to_string(),
                     });
@@ -12400,7 +13224,7 @@ pub(crate) fn apply_builtin<'a>(
                         BinOp::Ge => ord.is_ge(),
                         BinOp::Le => ord.is_le(),
                         BinOp::Eq => a == b,
-                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                             return Err(SqlSurfaceError::Internal {
                                 detail: "non-comparison operator in collated comparison"
                                     .to_string(),
@@ -12445,6 +13269,14 @@ fn typed_arith(op: BinOp, kind: NumericKind, a: f64, b: f64) -> Result<f64, SqlS
                     }
                     a / b
                 }
+                // PG の `%` は float4 を受け付けない。束縛段（`rem_operator_error`）が 42883 で
+                // 拒否するため到達しない不変条件（fail-closed）。
+                BinOp::Rem => {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "remainder operator on a float kind in typed arithmetic"
+                            .to_string(),
+                    });
+                }
                 BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
                     return Err(SqlSurfaceError::Internal {
                         detail: "comparison operator in typed arithmetic evaluation".to_string(),
@@ -12484,6 +13316,13 @@ fn int_arith_checked(
                 return Err(SqlSurfaceError::division_by_zero("/"));
             }
             x.checked_div(y)
+        }
+        // 符号は被除数に従う。`i64::MIN % -1` は i128 で計算するため 0（PG も 0）。
+        BinOp::Rem => {
+            if y == 0 {
+                return Err(SqlSurfaceError::division_by_zero("%"));
+            }
+            x.checked_rem(y)
         }
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
             return Err(SqlSurfaceError::Internal {
@@ -12584,6 +13423,7 @@ fn numeric_arith_eval(
         BinOp::Sub => DecimalOp::Sub,
         BinOp::Mul => DecimalOp::Mul,
         BinOp::Div => DecimalOp::Div,
+        BinOp::Rem => DecimalOp::Rem,
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
             return Err(SqlSurfaceError::Internal {
                 detail: "comparison operator in numeric arithmetic evaluation".to_string(),
@@ -12591,7 +13431,9 @@ fn numeric_arith_eval(
         }
     };
     decimal_arith(dop, a, b).map_err(|e| match e {
-        DecimalArithError::DivisionByZero => SqlSurfaceError::division_by_zero("/"),
+        DecimalArithError::DivisionByZero => {
+            SqlSurfaceError::division_by_zero(if op == BinOp::Rem { "%" } else { "/" })
+        }
         DecimalArithError::OutOfRange => {
             SqlSurfaceError::numeric_out_of_range("numeric field overflow")
         }
@@ -12603,6 +13445,10 @@ fn numeric_arith_eval(
 fn exact_int(v: f64) -> Result<i64, SqlSurfaceError> {
     if v.is_finite() && v.fract() == 0.0 && v.abs() <= TYPED_INT_EXACT_MAX as f64 {
         Ok(v as i64)
+    } else if v.is_finite() && v.fract() == 0.0 {
+        // 整数値だが f64 で厳密に運べない大きさ（|v| > 2^53）は、不変条件違反ではなく
+        // 値域外として 22003 にする（`%` の被演算子が大きな BIGINT／id を含む場合。Issue #3273）。
+        Err(SqlSurfaceError::numeric_out_of_range("bigint out of range"))
     } else {
         Err(SqlSurfaceError::Internal {
             detail: "typed integer arithmetic received a non-integer operand".to_string(),
@@ -12822,6 +13668,15 @@ pub(crate) fn eval_binary<'a>(
         return Ok(ExprValue::Null);
     }
     match op {
+        // 剰余（Issue #3273）。束縛段（`bind_binary`）が受理する Scalar 同士だけが到達する。
+        BinOp::Rem => match (l, r) {
+            (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
+                apply_scalar_op(op, a, b).map(ExprValue::Scalar)
+            }
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "operand type mismatch at evaluation time".to_string(),
+            }),
+        },
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (l, r) {
             (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
                 let v = apply_scalar_op(op, a, b)?;
@@ -12920,7 +13775,7 @@ pub(crate) fn eval_binary<'a>(
                     (BinOp::Ge, None) => a >= b,
                     (BinOp::Le, None) => a <= b,
                     (BinOp::Eq, None) => a == b,
-                    (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, _) => {
+                    (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem, _) => {
                         return Err(SqlSurfaceError::Internal {
                             detail: "non-comparison operator in comparison evaluation".to_string(),
                         });
@@ -12942,7 +13797,7 @@ pub(crate) fn eval_binary<'a>(
                     BinOp::Ge => ord.is_ge(),
                     BinOp::Le => ord.is_le(),
                     BinOp::Eq => a == b,
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         return Err(SqlSurfaceError::Internal {
                             detail: "non-comparison operator in comparison evaluation".to_string(),
                         });
@@ -13016,7 +13871,7 @@ fn compare<T: PartialOrd>(op: BinOp, a: T, b: T) -> Result<bool, SqlSurfaceError
         BinOp::Ge => a >= b,
         BinOp::Le => a <= b,
         BinOp::Eq => a == b,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
             return Err(SqlSurfaceError::Internal {
                 detail: "non-comparison operator in comparison evaluation".to_string(),
             });
@@ -13034,6 +13889,27 @@ fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
                 return Err(SqlSurfaceError::division_by_zero("/"));
             }
             a / b
+        }
+        // f64 運び手レーンの剰余（`fmod`。符号は被除数に従う）。|v| <= 2^53 の整数どうしでは
+        // 整数剰余と厳密に一致する。`-0.0` は `0` へ正規化する（PG の整数剰余は符号なしの 0）。
+        BinOp::Rem => {
+            if b == 0.0 {
+                return Err(SqlSurfaceError::division_by_zero("%"));
+            }
+            // 中間値（`b * b` 等）が f64 で丸められた被演算子を誤った剰余にしないため、
+            // 2^53 以上の絶対値は厳密に表せるか分からないので fail-closed で拒否する。
+            const EXACT_LIMIT: f64 = 9_007_199_254_740_992.0;
+            if a.abs() >= EXACT_LIMIT || b.abs() >= EXACT_LIMIT {
+                return Err(SqlSurfaceError::numeric_out_of_range(
+                    "remainder operand exceeds the exactly representable integer range",
+                ));
+            }
+            let r = a % b;
+            if r == 0.0 {
+                0.0
+            } else {
+                r
+            }
         }
         BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
             return Err(SqlSurfaceError::Internal {
@@ -13065,7 +13941,14 @@ fn apply_vector_scalar_op<'a>(
         let r = match op {
             BinOp::Mul => (x as f64) * s,
             BinOp::Div => (x as f64) / s,
-            BinOp::Add | BinOp::Sub | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Rem
+            | BinOp::Gt
+            | BinOp::Lt
+            | BinOp::Ge
+            | BinOp::Le
+            | BinOp::Eq => {
                 return Err(SqlSurfaceError::Internal {
                     detail: "non-mul/div operator in vector-scalar evaluation".to_string(),
                 });
@@ -13093,6 +13976,13 @@ fn apply_vector_scalar_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQL-57・Issue #3264: `json_agg`・`jsonb_agg` も集計関数名として予約される。
+    #[test]
+    fn json_agg_is_a_reserved_function_name() {
+        assert!(is_reserved_function_name("json_agg"));
+        assert!(is_reserved_function_name("JSONB_AGG"));
+    }
 
     /// SQL-57・Issue #1801: `array_agg` も集計関数名として予約され、同名の UDF は定義できない。
     #[test]
@@ -14010,6 +14900,7 @@ mod tests {
             BuiltinFn::Rpad3,
             BuiltinFn::SplitPart,
             BuiltinFn::Concat2,
+            BuiltinFn::TextConcat,
             BuiltinFn::Trim,
             BuiltinFn::Replace,
             BuiltinFn::Position,
@@ -14403,6 +15294,63 @@ mod tests {
         }
     }
 
+    /// 単純 CASE の被演算子が副作用関数（`nextval`・`setval`）を含む場合、被演算子は分岐ごとに
+    /// 再評価されるため、式位置の拒否（`0A000`）で fail-closed になる（Issue #3279 のレビュー指摘）。
+    #[test]
+    fn simple_case_operand_with_side_effect_function_is_rejected() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        for name in ["nextval", "setval"] {
+            let case = Expr::Case {
+                operand: Some(Box::new(call(name, vec![Expr::String("s".to_string())]))),
+                whens: vec![
+                    (
+                        Expr::Number("1".to_string()),
+                        Expr::Number("10".to_string()),
+                    ),
+                    (
+                        Expr::Number("2".to_string()),
+                        Expr::Number("20".to_string()),
+                    ),
+                ],
+                else_result: None,
+            };
+            let mut budget = MAX_EXPR_NODES;
+            let err = bind_expr(&case, &schema, &registry, &mut budget).unwrap_err();
+            assert_eq!(err.wire_code(), "0A000", "function {name}");
+        }
+    }
+
+    /// 単純 CASE の被演算子が文字列リテラル（unknown）のとき、数値の比較値との比較は
+    /// PostgreSQL と同じく text と数値の比較として拒否する（Issue #3279 のレビュー指摘）。
+    #[test]
+    fn simple_case_unknown_string_operand_is_not_coerced_to_numeric_when_value() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mk = |v: Expr| Expr::Case {
+            operand: Some(Box::new(Expr::String("1".to_string()))),
+            whens: vec![(v, Expr::String("yes".to_string()))],
+            else_result: Some(Box::new(Expr::String("no".to_string()))),
+        };
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(
+            &mk(Expr::Number("1".to_string())),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42804");
+        let mut budget = MAX_EXPR_NODES;
+        assert!(bind_expr(
+            &mk(Expr::String("1".to_string())),
+            &schema,
+            &registry,
+            &mut budget
+        )
+        .is_ok());
+    }
+
     #[test]
     fn calling_an_unknown_non_deterministic_function_is_rejected_with_42883() {
         let schema = schema_with_vector();
@@ -14701,6 +15649,7 @@ mod tests {
 
     fn case_expr(whens: Vec<(Expr, Expr)>, else_result: Option<Expr>) -> Expr {
         Expr::Case {
+            operand: None,
             whens,
             else_result: else_result.map(Box::new),
         }
@@ -15137,6 +16086,7 @@ mod tests {
         };
         assert_eq!(first_non_builtin_call(&arith), None);
         let case = Expr::Case {
+            operand: None,
             whens: vec![(
                 ident("a"),
                 call("round", vec![ident("x"), Expr::Number("2".into())]),
@@ -15160,11 +16110,13 @@ mod tests {
         let nested = call("lower", vec![call("myfn", vec![ident("x")])]);
         assert_eq!(first_non_builtin_call(&nested), Some("myfn"));
         let case = Expr::Case {
+            operand: None,
             whens: vec![(call("f", vec![ident("x")]), Expr::Null)],
             else_result: None,
         };
         assert_eq!(first_non_builtin_call(&case), Some("f"));
         let else_case = Expr::Case {
+            operand: None,
             whens: vec![],
             else_result: Some(Box::new(call("g", vec![]))),
         };
@@ -15199,6 +16151,95 @@ mod tests {
         assert_eq!(code(BinOp::Mul, Float4, 3.0e38, 10.0), "22003");
         assert_eq!(code(BinOp::Mul, Float4, 1.0e-30, 1.0e-30), "22003");
         assert_eq!(code(BinOp::Div, Float4, 1.0, 0.0), "22012");
+    }
+
+    /// Issue #3273・SQL-42: 剰余は符号が被除数に従い、0 除算は 22012、`MIN % -1` は 0。
+    #[test]
+    fn typed_arith_remainder_follows_postgres_semantics() {
+        use NumericKind::{Float4, Int2, Int4, Int8};
+        let ok = |op, k, a, b| typed_arith(op, k, a, b).expect("should succeed");
+        let code = |op, k, a, b| {
+            typed_arith(op, k, a, b)
+                .unwrap_err()
+                .wire_code()
+                .to_string()
+        };
+        assert_eq!(ok(BinOp::Rem, Int4, 7.0, 2.0), 1.0);
+        assert_eq!(ok(BinOp::Rem, Int4, -7.0, 2.0), -1.0);
+        assert_eq!(ok(BinOp::Rem, Int4, 7.0, -2.0), 1.0);
+        assert_eq!(ok(BinOp::Rem, Int2, 7.0, 4.0), 3.0);
+        assert_eq!(
+            ok(BinOp::Rem, Int8, 4503599627370496.0, 7.0),
+            4503599627370496.0 % 7.0
+        );
+        assert_eq!(code(BinOp::Rem, Int4, 1.0, 0.0), "22012");
+        assert_eq!(code(BinOp::Rem, Int8, 1.0, 0.0), "22012");
+        // `INT_MIN % -1` は範囲外ではなく 0（PG も 0）。
+        assert_eq!(ok(BinOp::Rem, Int4, -2147483648.0, -1.0), 0.0);
+        assert_eq!(
+            int_arith_checked(BinOp::Rem, Int8, i128::from(i64::MIN), -1).expect("rem"),
+            0
+        );
+        // float4 の剰余は束縛段が 42883 で拒否するため評価には到達しない（Internal）。
+        assert_eq!(code(BinOp::Rem, Float4, 7.0, 2.0), "XX000");
+    }
+
+    /// Issue #3273: f64 運び手レーンの剰余は fmod（符号は被除数）で、-0 は 0 へ正規化する。
+    #[test]
+    fn scalar_remainder_is_fmod_with_division_by_zero_check() {
+        assert_eq!(apply_scalar_op(BinOp::Rem, 10.5, 3.0).expect("rem"), 1.5);
+        assert_eq!(apply_scalar_op(BinOp::Rem, -7.0, 3.0).expect("rem"), -1.0);
+        let z = apply_scalar_op(BinOp::Rem, -6.0, 3.0).expect("rem");
+        assert!(z == 0.0 && z.is_sign_positive());
+        assert_eq!(
+            apply_scalar_op(BinOp::Rem, 1.0, 0.0)
+                .unwrap_err()
+                .wire_code(),
+            "22012"
+        );
+        assert_eq!(
+            apply_vector_scalar_op(BinOp::Rem, &[1.0], 2.0)
+                .unwrap_err()
+                .wire_code(),
+            "XX000"
+        );
+    }
+
+    /// Issue #3273: PG は float 型の `%` を持たない。REAL／DOUBLE 列・float 型への CAST は 42883。
+    #[test]
+    fn remainder_rejects_float_typed_operands_at_bind_time() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let rem = |l: Expr, r: Expr| {
+            let mut budget = MAX_EXPR_NODES;
+            bind_expr(&bin(BinOp::Rem, l, r), &schema, &registry, &mut budget)
+        };
+        let cast = call("float8", vec![num("1.5")]);
+        assert_eq!(rem(cast, num("2")).unwrap_err().wire_code(), "42883");
+        assert!(rem(num("7"), num("2")).is_ok());
+        // 小数リテラル（PG では numeric の剰余）は f64 の fmod へ流さず拒否する。
+        assert_eq!(
+            rem(num("0.3"), num("0.1")).unwrap_err().wire_code(),
+            "0A000"
+        );
+        assert_eq!(
+            rem(ident("id"), num("2.5")).unwrap_err().wire_code(),
+            "0A000"
+        );
+        // CASE／COALESCE／NULLIF で包んだ float8 も結果型から拒否する。
+        let f8 = || call("float8", vec![num("7")]);
+        let co = Expr::Coalesce(vec![f8(), f8()]);
+        assert_eq!(rem(co, num("2")).unwrap_err().wire_code(), "42883");
+        let ni = Expr::NullIf(Box::new(f8()), Box::new(num("0")));
+        assert_eq!(rem(ni, num("2")).unwrap_err().wire_code(), "42883");
+        let case = Expr::Case {
+            operand: None,
+            whens: vec![(bin(BinOp::Eq, num("1"), num("1")), f8())],
+            else_result: Some(Box::new(f8())),
+        };
+        assert_eq!(rem(case, num("2")).unwrap_err().wire_code(), "42883");
+        // 整数の COALESCE は受理する。
+        assert!(rem(Expr::Coalesce(vec![num("7"), num("1")]), num("2")).is_ok());
     }
 
     /// Issue #1560: smallint 同士の算術は smallint（i16 の溢れは 22003）、混在は広い方。

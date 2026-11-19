@@ -106,6 +106,16 @@ pub(super) struct StepPlan {
     pub(super) on_new: Vec<ResNode>,
     /// ON の残余のうち、両側を跨ぐ非キー比較（キー一致の候補ペアごとに評価）。
     pub(super) on_mixed: Vec<ResNode>,
+    /// 外側の行ごとに再評価する LATERAL の段なら、その外側参照（Issue #3322。設計記録 L1）。
+    /// `Some` の段は `exec::run_joins_lateral` が `lateral::lateral_step` で実行する（ハッシュ・NLJ・
+    /// 直積の経路には入らない）。
+    pub(super) lateral: Option<LateralStepPlan>,
+}
+
+/// LATERAL の段が読む外側参照（左側 relation の列）の解決結果（Issue #3322）。
+pub(super) struct LateralStepPlan {
+    /// `(列名, 解決済みの位置)`。列名は `ValidatedJoin` の `JoinLateral::outer_refs` と同じ並び。
+    pub(super) refs: Vec<(String, Col)>,
 }
 
 /// 1 段の結合方式（`exec::join_step` の振り分け結果。Issue #2046・SQL-75 (2) ポインタ）。
@@ -119,6 +129,8 @@ pub(super) enum JoinMethod {
     NestedLoop,
     /// キー無し・ON 残余も無し: 直積。
     Cross,
+    /// 外側の行ごとの再評価（LATERAL。Issue #3322）。
+    Lateral,
 }
 
 impl StepPlan {
@@ -129,7 +141,9 @@ impl StepPlan {
 
     /// この段の結合方式。`exec::join_step` の分岐と `EXPLAIN` が共有する。
     pub(super) fn method(&self) -> JoinMethod {
-        if !self.keys.is_empty() {
+        if self.lateral.is_some() {
+            JoinMethod::Lateral
+        } else if !self.keys.is_empty() {
             JoinMethod::Hash
         } else if self.has_on_residual() {
             JoinMethod::NestedLoop
@@ -155,6 +169,9 @@ pub(super) struct SingleFilter {
     /// 述語が参照するスキーマ列（添字・側スキャン結果内の位置・列型）。
     pub(super) cols: Vec<(usize, usize, ColumnType)>,
     pub(super) schema_len: usize,
+    /// NULL 補完された relation でも全列 NULL の行として評価するか。DML 専用の非 strict な葉
+    /// （`IS [NOT] NULL`。Issue #3295）を含む部分木だけが真で、それ以外は補完行を偽として扱う。
+    pub(super) eval_padded: bool,
 }
 
 pub(super) struct ColCompare {
@@ -473,7 +490,9 @@ pub(super) fn leaf_colrefs(pred: &JoinWherePredicate) -> Vec<&ColumnRef> {
         | JoinWherePredicate::Compare { column, .. }
         | JoinWherePredicate::BoolEquality { column, .. }
         | JoinWherePredicate::BoolColumn { column }
-        | JoinWherePredicate::InList { column, .. } => vec![column],
+        | JoinWherePredicate::InList { column, .. }
+        | JoinWherePredicate::NumericCompare { column, .. }
+        | JoinWherePredicate::IsNull { column, .. } => vec![column],
         JoinWherePredicate::ColumnCompare { lhs, rhs, .. } => vec![lhs, rhs],
     }
 }
@@ -491,7 +510,11 @@ pub(super) fn is_null_rejecting(pred: &JoinWherePredicate) -> bool {
         | JoinWherePredicate::BoolEquality { .. }
         | JoinWherePredicate::BoolColumn { .. }
         | JoinWherePredicate::InList { .. }
-        | JoinWherePredicate::ColumnCompare { .. } => true,
+        | JoinWherePredicate::ColumnCompare { .. }
+        // 数値リテラルとの比較も strict（DML 専用の葉。SELECT 計画器は入口で拒否する）。
+        | JoinWherePredicate::NumericCompare { .. } => true,
+        // `IS [NOT] NULL` は NULL（外部結合の補完行）に対して真になりうる。
+        JoinWherePredicate::IsNull { .. } => false,
     }
 }
 
@@ -564,6 +587,18 @@ fn has_compare(expr: &JoinWhereExpr) -> bool {
     }
 }
 
+/// 部分木に DML 専用の葉（[`JoinWherePredicate::NumericCompare`]・[`JoinWherePredicate::IsNull`]）が
+/// 含まれるか。
+pub(super) fn contains_dml_only_leaf(expr: &JoinWhereExpr) -> bool {
+    match expr {
+        JoinWhereExpr::Leaf(p) => matches!(
+            p,
+            JoinWherePredicate::NumericCompare { .. } | JoinWherePredicate::IsNull { .. }
+        ),
+        JoinWhereExpr::And(ch) | JoinWhereExpr::Or(ch) => ch.iter().any(contains_dml_only_leaf),
+    }
+}
+
 /// 最上位の `AND` を平坦化して conjunct を集める。
 pub(super) fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e JoinWhereExpr>) {
     match expr {
@@ -576,7 +611,7 @@ pub(super) fn flatten_conjuncts<'e>(expr: &'e JoinWhereExpr, out: &mut Vec<&'e J
     }
 }
 
-fn leaf_to_where(
+pub(super) fn leaf_to_where(
     pred: &JoinWherePredicate,
     name: String,
 ) -> Result<WherePredicate, SqlSurfaceError> {
@@ -604,6 +639,18 @@ fn leaf_to_where(
         JoinWherePredicate::InList { values, .. } => WherePredicate::InList {
             column: name,
             values: values.clone(),
+        },
+        JoinWherePredicate::NumericCompare { op, value, .. } => {
+            // 通常の WHERE の数値比較（`numeric_comparison`）と同じ式形にする。
+            WherePredicate::Expression(crate::sql::udf_call::Expr::Binary {
+                op: *op,
+                lhs: Box::new(crate::sql::udf_call::Expr::Ident(name)),
+                rhs: Box::new(crate::sql::udf_call::Expr::Number(value.clone())),
+            })
+        }
+        JoinWherePredicate::IsNull { negated, .. } => WherePredicate::IsNull {
+            column: name,
+            negated: *negated,
         },
         JoinWherePredicate::ColumnCompare { .. } => {
             return Err(SqlSurfaceError::Internal {
@@ -718,6 +765,7 @@ fn build_residual(
                 "JOIN WHERE predicate cannot reference a VECTOR column",
             ));
         }
+        let eval_padded = contains_dml_only_leaf(expr);
         let mut refs = Vec::new();
         collect_leaf_colrefs(expr, &mut refs);
         let mut cols: Vec<(usize, usize, ColumnType)> = Vec::new();
@@ -731,9 +779,30 @@ fn build_residual(
                 c.ty
             };
             if let (Some(idx), Some(ty)) = (c.schema_idx, ty) {
+                // 評価は `cell_scalar` と `source_scalar` の和集合（TIME・TIMESTAMPTZ・INTERVAL・JSONB を
+                // 加える。単一表の述語と同じ受理集合）を通るため、写像できない型（配列・BIT 等）は
+                // 実行時の XX000 にせず束縛段階で 0A000 にする。
+                if !super::values::cell_scalar_supports(&ty)
+                    && !matches!(
+                        ty,
+                        ColumnType::Time
+                            | ColumnType::TimestampTz
+                            | ColumnType::Interval
+                            | ColumnType::Jsonb
+                    )
+                {
+                    return Err(SqlSurfaceError::feature_not_supported(
+                        "this column type cannot be used in a JOIN WHERE predicate",
+                    ));
+                }
                 if !cols.iter().any(|(i, _, _)| *i == idx) {
                     cols.push((idx, c.pos, ty));
                 }
+            } else if eval_padded {
+                // 補完行の行 `id` は NULL を表せないため、補完行を評価する部分木では参照を拒否する。
+                return Err(SqlSurfaceError::feature_not_supported(
+                    "row id cannot be referenced together with IS NULL in this JOIN predicate",
+                ));
             }
         }
         return Ok(ResNode::Single(SingleFilter {
@@ -741,6 +810,7 @@ fn build_residual(
             group,
             cols,
             schema_len: schema.columns.len(),
+            eval_padded,
         }));
     }
     match expr {
@@ -844,6 +914,17 @@ pub(super) fn build_plan<'a>(
         return Err(SqlSurfaceError::Internal {
             detail: "JOIN relation/step count is inconsistent".to_string(),
         });
+    }
+    // 多重防御: DML 専用の葉（数値リテラル比較・`IS [NOT] NULL`。Issue #3295）は SELECT の JOIN
+    // の文法が生成しない。WHERE には畳み込み source の source 側述語（`dml_plan`）として現れうるため
+    // 受理し（非 strict な葉は下の振り分けで必ず残余へ回す）、ON 条件にはどの経路でも現れないため拒否する。
+    if validated.steps.iter().any(|st| match &st.condition {
+        crate::sql::allowlist::JoinCondition::On(e) => contains_dml_only_leaf(e),
+        _ => false,
+    }) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "numeric literal comparison and IS NULL are not supported in JOIN conditions",
+        ));
     }
     let mut rel_schemas: Vec<&'a TableSchema> = Vec::with_capacity(relations.len());
     for r in relations {
@@ -1015,8 +1096,12 @@ pub(super) fn build_plan<'a>(
             on_acc: on_res.acc,
             on_new: on_res.new,
             on_mixed: on_res.mixed,
+            lateral: None,
         });
     }
+    // LATERAL の段（Issue #3322）: 外側参照の列を左側 relation の側投影へ登録して位置を解決し、WHERE の
+    // 結合キーへの昇格を止める（昇格すると LATERAL の再評価の外で絞られ、内側の LIMIT との前後が変わる）。
+    let lateral_steps = bind_lateral_steps(&mut b, &mut steps, validated)?;
     // 以降（WHERE・投影・並べ替え・集計）は、全段適用後の統合列・可視列を持つスコープで解決する。
     let final_base = BindingScope::new(
         b.relations
@@ -1059,7 +1144,8 @@ pub(super) fn build_plan<'a>(
             if let Some(p) = promotable_where_key(c, &b.scope)? {
                 let inner = steps
                     .get(p.step)
-                    .is_some_and(|s| !s.preserve_acc && !s.preserve_new);
+                    .is_some_and(|s| !s.preserve_acc && !s.preserve_new)
+                    && !lateral_steps.get(p.step).copied().unwrap_or(false);
                 if inner {
                     let acc_col =
                         b.col_from(p.acc.relation(), p.acc.slot(), p.acc.column_type())?;
@@ -1077,7 +1163,9 @@ pub(super) fn build_plan<'a>(
                 }
             }
             let mask = refs_mask(c, &b.scope)?;
-            if mask.count_ones() == 1 && !has_compare(c) {
+            // 非 strict な式（`IS NULL` を含む `OR` 等）は補完行で真になりうるため、走査へ押し下げず
+            // 結合後の残余で評価する。
+            if mask.count_ones() == 1 && !has_compare(c) && strict & mask == mask {
                 let rel = usize::try_from(mask.trailing_zeros()).map_err(|_| {
                     SqlSurfaceError::Internal {
                         detail: "JOIN relation mask overflow".to_string(),
@@ -1117,6 +1205,7 @@ pub(super) fn build_plan<'a>(
             physical_order_keys: Vec::new(),
             embedded_scalar_subqueries: Vec::new(),
             with_ties: false,
+            distinct_on: None,
         });
     }
 
@@ -1141,6 +1230,76 @@ pub(super) fn build_plan<'a>(
         residual,
         shape,
     })
+}
+
+/// LATERAL の段の外側参照を解決する（Issue #3322）。`validated.cte_inputs.lateral` が `Some` の
+/// relation `i` の段 `i - 1` に、外側参照の列を左側 relation の側投影へ登録した位置を載せる。段が
+/// 直積（`CROSS`）または ON 条件の INNER／LEFT でなければ `0A000`、参照が左側に無い・列が見つからないのは `Internal`
+/// （束縛段が先に拒否しているため到達しない不変条件。fail-closed）。段ごとの LATERAL の有無を返す。
+fn bind_lateral_steps(
+    b: &mut Binder<'_, '_>,
+    steps: &mut [StepPlan],
+    validated: &ValidatedJoin,
+) -> Result<Vec<bool>, SqlSurfaceError> {
+    let internal = |d: &str| SqlSurfaceError::Internal {
+        detail: d.to_string(),
+    };
+    let mut flags = vec![false; steps.len()];
+    let Some(inputs) = validated.cte_inputs.as_ref() else {
+        return Ok(flags);
+    };
+    if inputs.lateral.is_empty() {
+        return Ok(flags);
+    }
+    if inputs.lateral.len() != validated.relations.len() {
+        return Err(internal("LATERAL input count is inconsistent"));
+    }
+    for (new_rel, lat) in inputs.lateral.iter().enumerate() {
+        let Some(lat) = lat else { continue };
+        let k = new_rel
+            .checked_sub(1)
+            .ok_or_else(|| internal("LATERAL relation cannot be the first"))?;
+        let vstep = validated
+            .steps
+            .get(k)
+            .ok_or_else(|| internal("LATERAL step missing"))?;
+        // 直積（`ON true` の書き換え）か ON 条件の INNER／LEFT だけを再評価できる。RIGHT／FULL は束縛段が
+        // `42P10` で拒否済みで、USING／NATURAL は `derived_table` が固定 `0A000` にするため到達しない（多重防御）。
+        let supported_condition =
+            matches!(vstep.condition, JoinCondition::Cross | JoinCondition::On(_));
+        if !supported_condition || !matches!(vstep.kind, JoinKind::Inner | JoinKind::Left) {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "this JOIN form with a LATERAL subquery referencing outer columns is not supported yet",
+            ));
+        }
+        let mut refs: Vec<(String, Col)> = Vec::with_capacity(lat.outer_refs.len());
+        for (rel, name) in &lat.outer_refs {
+            if *rel >= new_rel {
+                return Err(internal("LATERAL outer reference is not on the left"));
+            }
+            let schema = *b
+                .schemas
+                .get(*rel)
+                .ok_or_else(|| internal("LATERAL outer relation out of range"))?;
+            let (slot, ty) = match schema.columns.iter().position(|c| &c.name == name) {
+                Some(i) => (
+                    ColumnSlot::Column(i),
+                    schema.columns.get(i).map(|c| c.ty.clone()),
+                ),
+                None if name == "id" && schema.has_pseudo_id() => (ColumnSlot::Id, None),
+                None => return Err(internal("LATERAL outer column not found")),
+            };
+            let col = b.col_from(*rel, slot, ty.as_ref())?;
+            refs.push((name.clone(), col));
+        }
+        if let Some(step) = steps.get_mut(k) {
+            step.lateral = Some(LateralStepPlan { refs });
+        }
+        if let Some(f) = flags.get_mut(k) {
+            *f = true;
+        }
+    }
+    Ok(flags)
 }
 
 /// 解決済みの列から非集計 JOIN の並べ替えキーを作る（列キー・序数キー共通。並べ替え不能な型は `22000`）。

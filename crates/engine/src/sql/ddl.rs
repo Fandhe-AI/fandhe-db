@@ -50,9 +50,10 @@ use crate::sql::allowlist::{
     InsertLiteral, SqlSurfaceError, ValidatedAlterSchema, ValidatedAlterSequence,
     ValidatedAlterTable, ValidatedAlterTableAddCheck, ValidatedAlterTableAddColumn,
     ValidatedAlterTableAddUnique, ValidatedAlterTableAlterColumnDropDefault,
-    ValidatedAlterTableAlterColumnDropNotNull, ValidatedAlterTableAlterColumnSetDefault,
-    ValidatedAlterTableAlterColumnSetNotNull, ValidatedAlterTableAlterColumnType,
-    ValidatedAlterTableDropColumn, ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
+    ValidatedAlterTableAlterColumnDropExpression, ValidatedAlterTableAlterColumnDropNotNull,
+    ValidatedAlterTableAlterColumnSetDefault, ValidatedAlterTableAlterColumnSetNotNull,
+    ValidatedAlterTableAlterColumnType, ValidatedAlterTableDropColumn,
+    ValidatedAlterTableDropConstraint, ValidatedAlterTableMultiple,
     ValidatedAlterTableRenameColumn, ValidatedAlterTableRenameTable, ValidatedAlterTableSetSchema,
     ValidatedCreateIndex, ValidatedCreateSchema, ValidatedCreateSequence, ValidatedCreateTable,
     ValidatedCreateTempTable, ValidatedCreateType, ValidatedCreateView, ValidatedDropIndex,
@@ -231,6 +232,43 @@ pub(crate) fn build_table_schema(
     if !validated.unique_constraints.is_empty() {
         schema = schema.with_unique_constraints(validated.unique_constraints.clone());
     }
+    // 生成列（TABLE-50・Issue #3327）。全列がそろった定義に対して式を束縛・検証し、正規描画と
+    // 参照列を各列へ取り付ける（前方参照を許す）。CHECK・UNIQUE・FK・索引が生成列を参照できる状態に
+    // するため CHECK の束縛より前に行う。カタログを参照しないため存在オラクルにならない。
+    if !validated.generated_columns.is_empty() {
+        let names: Vec<String> = validated
+            .generated_columns
+            .iter()
+            .map(|g| g.column.clone())
+            .collect();
+        let mut bound: Vec<(usize, crate::catalog::GeneratedColumnDef)> = Vec::new();
+        for generated in &validated.generated_columns {
+            let Some(index) = schema
+                .columns
+                .iter()
+                .position(|c| c.name == generated.column)
+            else {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "internal error".to_string(),
+                });
+            };
+            let Some(column) = schema.columns.get(index) else {
+                continue;
+            };
+            let def = crate::sql::generated_column::bind_generated_column(
+                &generated.expression,
+                column,
+                &schema,
+                &names,
+            )?;
+            bound.push((index, def));
+        }
+        for (index, def) in bound {
+            if let Some(column) = schema.columns.get_mut(index) {
+                column.generated = Some(def);
+            }
+        }
+    }
     // `CHECK` 制約（TABLE-16・TASK-204、Issue #906）。意味論検証（列の存在・型・
     // 禁止要素・正規化の往復一致）は列定義だけを持つスキーマに対して行う（他の
     // `CHECK` を参照する `CHECK` は許可しない）。カタログを参照しないため、
@@ -317,6 +355,54 @@ pub(crate) fn execute_create_table(
     Ok(CreateTableOutcome {})
 }
 
+/// `CREATE TABLE` の Tx 内実行の書き込み前検査（SERIAL・IDENTITY の `0A000` を含む）。何も書かないため、
+/// 呼び出し元は DDL を積んだ印（`mark_ddl_started`）を立てる前に呼び、拒否された Tx を `ROLLBACK TO` で
+/// 戻せるままにする（Issue #3313）。検査を通った表スキーマを返す。
+pub(crate) fn precheck_create_table_in_txn(
+    storage: &Storage,
+    validated: &ValidatedCreateTable,
+    limits: &SchemaLimits,
+) -> Result<TableSchema, SqlSurfaceError> {
+    crate::sql::schema_dependency::check_create_table(validated)?;
+    let schema = build_table_schema(Some(storage), validated, limits)?;
+    if !implicit_sequences_in_column_order(&schema, validated)?.is_empty() {
+        return Err(SqlSurfaceError::transaction_feature_not_supported(
+            "SERIAL and IDENTITY columns are not supported in CREATE TABLE inside a transaction block",
+        ));
+    }
+    Ok(schema)
+}
+
+/// `CREATE TABLE` を共有 write txn（明示・暗黙 Tx）の中で作る（SQL-80・Issue #3313）。判定順・検査・
+/// エラー写像は [`execute_create_table`] と同じで、名前の存在確認は write txn で確定する（同じ Tx の
+/// 前の文で作った表・DROP した表を確定済みカタログで見誤らない）。SERIAL 系・IDENTITY 列は暗黙 SEQUENCE の
+/// 採番状態（メモリ上のカーソル）が ROLLBACK で戻らず、再利用される内部 ID と食い違いうるため `0A000`
+/// （何も作らない。fail-closed）。
+pub(crate) fn execute_create_table_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateTable,
+    limits: &SchemaLimits,
+) -> Result<CreateTableOutcome, SqlSurfaceError> {
+    let internal = || SqlSurfaceError::Internal {
+        detail: "internal error".to_string(),
+    };
+    if validated.if_not_exists
+        && crate::catalog::relation_name_exists_in_txn(write_txn, &validated.table_name)
+            .map_err(|_| internal())?
+    {
+        return Ok(CreateTableOutcome {});
+    }
+    let schema = precheck_create_table_in_txn(storage, validated, limits)?;
+    match Storage::create_table_in_shared_txn(write_txn, &schema) {
+        Err(CatalogError::TableAlreadyExists(_)) if validated.if_not_exists => {
+            Ok(CreateTableOutcome {})
+        }
+        Err(e) => Err(map_create_table_catalog_error(e)),
+        Ok(()) => Ok(CreateTableOutcome {}),
+    }
+}
+
 /// `CREATE TABLE`／`CREATE TABLE AS` が共有する、作成時の `CatalogError` から wire の
 /// SQLSTATE への写像（固定文言。内部詳細・他テナントの情報を含めない）。
 pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError {
@@ -333,7 +419,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::InvalidForeignKey(detail) => SqlSurfaceError::invalid_foreign_key(detail),
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -352,6 +438,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         // ENUM 列が参照する型が解決後〜書き込みトランザクションまでの間に削除された
         // 場合（Issue #1348）。事前解決の未登録と同じ `42704` に揃える（Issue #2306）。
         CatalogError::TypeNotFound(name) => SqlSurfaceError::UndefinedType { name },
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::ColumnAlreadyExists(_)
@@ -364,6 +451,7 @@ pub(crate) fn map_create_table_catalog_error(e: CatalogError) -> SqlSurfaceError
         // `ALTER TABLE`（Issue #901・`Storage::alter_table_drop_column` 等）
         // 専用の変種で、`Storage::create_table` からは返らない（到達不能）。
         | CatalogError::ColumnNotFound(_)
+        | CatalogError::AmbiguousColumn(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         // `ViewNotFound`／`DependentViewsExist`／`ViewLimitExceeded` は
@@ -475,6 +563,14 @@ pub(crate) fn execute_create_temp_table(
             "identity columns are not supported for temporary tables",
         ));
     }
+    // 生成列も一時表では未対応（行ストアの確保・セッションの変更・式の束縛より前に拒否する。
+    // TABLE-50・Issue #3327）。
+    // intentional: docs/design/generated-column.md
+    if !table.generated_columns.is_empty() {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "generated columns are not supported for temporary tables",
+        ));
+    }
     let schema = build_table_schema(None, table, schema_limits)?;
     // 一時表は永続 DB の SEQUENCE カタログを参照できないため、`DEFAULT nextval(...)` は
     // 作成時に `0A000` で拒否する（INSERT 時に `42P01` へ化けさせない。TABLE-24・TABLE-44）。
@@ -489,7 +585,7 @@ pub(crate) fn execute_create_temp_table(
         ));
     }
     let schema = crate::catalog::prepare_temp_table_schema(&schema).map_err(|e| match e {
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -633,6 +729,31 @@ pub(crate) fn execute_drop_table(
     }
 }
 
+/// `DROP TABLE` を共有 write txn（明示・暗黙 Tx）の中で実行する（SQL-80・Issue #3313）。判定・依存検査・
+/// 連鎖削除・エラー写像は [`execute_drop_table`] と同じ本体を通す。戻り値の第 2 要素は道連れに削除した
+/// 所有 SEQUENCE の内部 ID（呼び出し側が Tx の commit 成功後に採番器から捨てる）。
+pub(crate) fn execute_drop_table_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropTable,
+) -> Result<(DropTableOutcome, Vec<u64>), SqlSurfaceError> {
+    match storage.drop_tables_in_shared_txn(
+        write_txn,
+        &validated.table_names,
+        validated.if_exists,
+        validated.behavior,
+    ) {
+        Ok((report, ids)) => Ok((
+            DropTableOutcome {
+                skipped: report.dropped == 0,
+                cascaded: report.cascaded,
+            },
+            ids,
+        )),
+        Err(e) => Err(map_drop_table_error(e)),
+    }
+}
+
 /// `Storage::drop_table` の [`CatalogError`] を SQL 表層の契約へ写像する
 /// （`catalog::table_lookup_error` と同じ役割分担だが、`TableNotFound` を
 /// `Ok(false)` ではなく `42P01` 応答へ写像する点が異なるため独立させる）。
@@ -724,6 +845,9 @@ pub enum AlterTableAction {
     AlterColumnSetNotNull { column_name: String },
     /// `ALTER COLUMN <col> DROP NOT NULL`（TABLE-39 (4)、Issue #1632）。**BREAKING CHANGE**: variant 追加。
     AlterColumnDropNotNull { column_name: String },
+    /// `ALTER COLUMN <col> DROP EXPRESSION [IF EXISTS]`（TABLE-50 (3)、Issue #3331）。
+    /// **BREAKING CHANGE**: variant 追加。
+    AlterColumnDropExpression { column_name: String },
     /// `ALTER COLUMN <col> SET DEFAULT <式>`（TABLE-39 (1)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
     AlterColumnSetDefault { column_name: String },
     /// `ALTER COLUMN <col> DROP DEFAULT`（TABLE-39 (2)、Issue #1628）。**BREAKING CHANGE**: variant 追加。
@@ -788,6 +912,33 @@ pub(crate) fn execute_alter_table_add_column(
     if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
         return Ok(add_column_skipped_outcome(stmt));
     }
+    // 生成列（TABLE-50・RECOVER-11・Issue #3330）。fast default（O(1)）は使えず、全行を計算して
+    // 書き直す。束縛・全行の計算・世代 bump・commit は 1 つの write txn で行う（部分状態を残さない）。
+    if let Some(expr) = &stmt.generated {
+        let action = storage
+            .alter_table_in_single_txn(&stmt.table_name, |txn| {
+                let (action, apply) = add_generated_column_in_txn(
+                    storage,
+                    txn,
+                    &stmt.table_name,
+                    stmt,
+                    expr,
+                    limits,
+                )?;
+                Ok((action, apply == AlterApply::Applied, Vec::new()))
+            })
+            .map_err(|e| match e {
+                AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                    undefined_table_or_view(storage, &stmt.table_name)
+                }
+                AlterCheckError::Catalog(other) => map_add_column_error(other),
+                AlterCheckError::Sql(sql_err) => sql_err,
+            })?;
+        return Ok(AlterTableOutcome {
+            table_name: stmt.table_name.clone(),
+            action,
+        });
+    }
     let column = build_add_column_def(storage, stmt, limits)?;
     match storage.alter_table_add_column_with_limit(
         &stmt.table_name,
@@ -810,6 +961,87 @@ pub(crate) fn execute_alter_table_add_column(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// 生成列の ADD COLUMN を write txn 内で適用する共有 helper（TABLE-50・RECOVER-11・Issue #3330）。
+/// 単一アクション経路（[`execute_alter_table_add_column`]）と複数アクション経路
+/// （[`apply_alter_action_in_txn`]）が呼ぶ。呼び出し元は DDL 権限ゲートと表の存在確認を済ませている。
+///
+/// 判定順（決定的）: txn 内のスキーマ取得 → `IF NOT EXISTS` の skip → 型名解決
+/// （[`build_add_column_def`]）→ 従来の行識別方式の表は `0A000` → 列名の重複 → 候補スキーマ（新しい列を
+/// 足したもの）への式の束縛（[`crate::sql::generated_column::bind_generated_column`]。CREATE TABLE と同じ
+/// 判定と SQLSTATE）→ カタログへの追加と全テナント・全可視性の全行の計算
+/// （`Storage::alter_table_add_generated_column_in_txn`）。束縛を txn 内で行うので判定と書き込みの間に
+/// TOCTOU を作らない。評価エラーは固定文言で返り、呼び出し元は commit せず txn を破棄する。
+fn add_generated_column_in_txn(
+    storage: &Storage,
+    txn: &redb::WriteTransaction,
+    table_name: &str,
+    stmt: &ValidatedAlterTableAddColumn,
+    expr: &crate::sql::udf_call::Expr,
+    limits: &SchemaLimits,
+) -> Result<(AlterTableAction, AlterApply), AlterCheckError> {
+    let schema = crate::catalog::get_table_schema_in_txn_impl(txn, table_name, false)
+        .map_err(|e| alter_in_txn_error(e, map_add_column_error))?;
+    if stmt.if_not_exists && schema.columns.iter().any(|c| c.name == stmt.column_name) {
+        return Ok((
+            AlterTableAction::AddColumnSkipped {
+                column_name: stmt.column_name.clone(),
+            },
+            AlterApply::Unchanged,
+        ));
+    }
+    let mut column = build_add_column_def(storage, stmt, limits).map_err(AlterCheckError::Sql)?;
+    // NoSQL 表層が作る従来方式の表は、生成列の計算点が無いため CREATE TABLE と同じ `0A000`。
+    // intentional: docs/design/generated-column.md
+    if schema.row_identity() == crate::catalog::RowIdentity::LegacyId {
+        return Err(AlterCheckError::Sql(
+            SqlSurfaceError::feature_not_supported(
+                "generated columns are not supported on this table surface",
+            ),
+        ));
+    }
+    if schema.columns.iter().any(|c| c.name == stmt.column_name) {
+        return Err(alter_in_txn_error(
+            CatalogError::ColumnAlreadyExists(stmt.column_name.clone()),
+            map_add_column_error,
+        ));
+    }
+    let mut candidate = schema.clone();
+    candidate.columns.push(column.clone());
+    let mut generated_names: Vec<String> = schema
+        .columns
+        .iter()
+        .filter(|c| c.generated.is_some())
+        .map(|c| c.name.clone())
+        .collect();
+    generated_names.push(column.name.clone());
+    let def = crate::sql::generated_column::bind_generated_column(
+        expr,
+        &column,
+        &candidate,
+        &generated_names,
+    )
+    .map_err(AlterCheckError::Sql)?;
+    column.generated = Some(def);
+    // 呼び出し元の経路によらず、列数上限の判定はカタログ側（物理スロット総数）が行う。
+    Storage::alter_table_add_generated_column_in_txn(
+        txn,
+        table_name,
+        column,
+        limits.max_table_columns(),
+        true,
+    )
+    .map_err(|e| match e {
+        AlterCheckError::Catalog(c) => alter_in_txn_error(c, map_add_column_error),
+        other => other,
+    })?;
+    Ok((
+        AlterTableAction::AddColumn {
+            column_name: stmt.column_name.clone(),
+        },
+        AlterApply::Applied,
+    ))
 }
 
 /// `ADD COLUMN IF NOT EXISTS` が何もしなかったときの応答（Issue #1633）。
@@ -1008,6 +1240,7 @@ pub(crate) fn execute_alter_table(
     tenant_id: &str,
     validated: &crate::sql::allowlist::ValidatedAlterTable,
     limits: &SchemaLimits,
+    check_create: &dyn Fn(u64) -> Result<(), SqlSurfaceError>,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     match validated {
         crate::sql::allowlist::ValidatedAlterTable::Multiple(stmt) => {
@@ -1043,6 +1276,9 @@ pub(crate) fn execute_alter_table(
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropNotNull(stmt) => {
             execute_alter_table_alter_column_drop_not_null(storage, stmt)
         }
+        crate::sql::allowlist::ValidatedAlterTable::AlterColumnDropExpression(stmt) => {
+            execute_alter_table_alter_column_drop_expression(storage, stmt)
+        }
         crate::sql::allowlist::ValidatedAlterTable::AlterColumnSetDefault(stmt) => {
             execute_alter_table_alter_column_set_default(storage, stmt)
         }
@@ -1056,7 +1292,7 @@ pub(crate) fn execute_alter_table(
             execute_alter_table_rename_table(storage, stmt)
         }
         crate::sql::allowlist::ValidatedAlterTable::SetSchema(stmt) => {
-            execute_alter_table_set_schema(storage, tenant_id, stmt)
+            execute_alter_table_set_schema(storage, tenant_id, stmt, check_create)
         }
         crate::sql::allowlist::ValidatedAlterTable::RowSecurity(stmt) => {
             execute_alter_table_row_security(storage, tenant_id, stmt)
@@ -1081,68 +1317,184 @@ pub(crate) fn execute_alter_table_multiple(
     limits: &SchemaLimits,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
-    let mut order: Vec<usize> = (0..stmt.actions.len()).collect();
-    // 安定ソート: 同じ pass 内は記述順を保つ。
-    order.sort_by_key(|&i| stmt.actions.get(i).map_or(u8::MAX, alter_action_pass));
+    let actions: Vec<&ValidatedAlterTable> = stmt.actions.iter().collect();
     let results = storage
         .alter_table_in_single_txn(&stmt.table_name, |txn| {
-            let mut results: Vec<Option<AlterTableAction>> = vec![None; stmt.actions.len()];
-            let mut changed = false;
-            let mut live_checked = false;
-            // DROP COLUMN した列名。所有 SEQUENCE の削除・依存検査は全アクション適用後に行う。
-            let mut dropped_columns: Vec<String> = Vec::new();
-            for &i in &order {
-                let Some(action) = stmt.actions.get(i) else {
-                    continue;
-                };
-                // 列属性変更 pass に入る前に、DROP／ADD pass の結果として生存列が残っていることを
-                // 確かめる（0 本のまま属性変更が内部エラーにならないよう、ここで 42601 にする）。
-                if !live_checked && alter_action_pass(action) >= ALTER_PASS_ATTRIBUTES {
-                    Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
-                        .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
-                    live_checked = true;
-                }
-                let (done, apply) = apply_alter_action_in_txn(
-                    storage,
-                    txn,
-                    &stmt.table_name,
-                    action,
-                    limits,
-                    &mut dropped_columns,
-                )?;
-                changed |= apply == AlterApply::Applied;
-                if let Some(slot) = results.get_mut(i) {
-                    *slot = Some(done);
-                }
-            }
-            // DROP COLUMN の「生存列 1 本以上」検証は中間状態では保留しているため、全アクション
-            // 適用後にここで検証する（最後の列を置き換える `ADD COLUMN b, DROP COLUMN a` 等を許す。
-            // 0 本のままなら単一 DROP と同じ 42601 で txn ごと破棄）。
-            Storage::ensure_table_has_live_column_in_txn(txn, &stmt.table_name)
-                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
-            // 全アクション適用後のスキーマで、削除列が所有する SEQUENCE の依存検査・削除を行う
-            // （同じ文で DEFAULT を外した／参照列を落とした場合は依存なしとして通す）。
-            let dropped_sequence_ids = Storage::drop_owned_sequences_of_columns_in_txn(
-                txn,
-                &stmt.table_name,
-                &dropped_columns,
-            )
-            .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
-            Ok((results, changed, dropped_sequence_ids))
+            run_alter_actions_in_txn(storage, txn, &stmt.table_name, &actions, limits)
         })
-        .map_err(|e| match e {
-            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
-                undefined_table_or_view(storage, &stmt.table_name)
-            }
-            AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
-            AlterCheckError::Sql(sql_err) => sql_err,
-        })?;
+        .map_err(|e| map_alter_check_error(storage, &stmt.table_name, e))?;
     Ok(AlterTableOutcome {
         table_name: stmt.table_name.clone(),
         action: AlterTableAction::Multiple {
             actions: results.into_iter().flatten().collect(),
         },
     })
+}
+
+/// 複数アクション経路のエラー（[`AlterCheckError`]）を SQL 表層の契約へ写す。`TableNotFound` は
+/// 確定済みカタログで `42P01`／`42809` を判別する（ビュー・索引は Tx 内で作れないため、共有 write txn 版
+/// [`execute_alter_table_in_txn`] でも食い違わない）。
+fn map_alter_check_error(
+    storage: &Storage,
+    table_name: &str,
+    e: AlterCheckError,
+) -> SqlSurfaceError {
+    match e {
+        AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+            undefined_table_or_view(storage, table_name)
+        }
+        AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+        AlterCheckError::Sql(sql_err) => sql_err,
+    }
+}
+
+/// [`run_alter_actions_in_txn`] の結果（記述順の各アクションの結果・いずれかがカタログを変えたか・
+/// 道連れに削除した所有 SEQUENCE の内部 ID）。
+type AlterActionsApplied = (Vec<Option<AlterTableAction>>, bool, Vec<u64>);
+
+/// 複数アクション（単一アクションを含む）を write txn 内で pass 順に適用する共通本体
+/// （[`execute_alter_table_multiple`] の autocommit と、共有 write txn 版
+/// [`execute_alter_table_in_txn`] が共有する。第 2 の適用経路を作らない）。戻り値は
+/// （記述順の結果・いずれかがカタログを変えたか・道連れに削除した所有 SEQUENCE の内部 ID）。
+fn run_alter_actions_in_txn(
+    storage: &Storage,
+    txn: &redb::WriteTransaction,
+    table_name: &str,
+    actions: &[&ValidatedAlterTable],
+    limits: &SchemaLimits,
+) -> Result<AlterActionsApplied, AlterCheckError> {
+    let mut order: Vec<usize> = (0..actions.len()).collect();
+    // 安定ソート: 同じ pass 内は記述順を保つ。
+    order.sort_by_key(|&i| actions.get(i).map_or(u8::MAX, |a| alter_action_pass(a)));
+    let mut results: Vec<Option<AlterTableAction>> = vec![None; actions.len()];
+    let mut changed = false;
+    let mut live_checked = false;
+    // DROP COLUMN した列名。所有 SEQUENCE の削除・依存検査は全アクション適用後に行う。
+    let mut dropped_columns: Vec<String> = Vec::new();
+    for &i in &order {
+        let Some(action) = actions.get(i) else {
+            continue;
+        };
+        // 列属性変更 pass に入る前に、DROP／ADD pass の結果として生存列が残っていることを
+        // 確かめる（0 本のまま属性変更が内部エラーにならないよう、ここで 42601 にする）。
+        if !live_checked && alter_action_pass(action) >= ALTER_PASS_ATTRIBUTES {
+            Storage::ensure_table_has_live_column_in_txn(txn, table_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            live_checked = true;
+        }
+        let (done, apply) = apply_alter_action_in_txn(
+            storage,
+            txn,
+            table_name,
+            action,
+            limits,
+            &mut dropped_columns,
+        )?;
+        changed |= apply == AlterApply::Applied;
+        if let Some(slot) = results.get_mut(i) {
+            *slot = Some(done);
+        }
+    }
+    // DROP COLUMN の「生存列 1 本以上」検証は中間状態では保留しているため、全アクション
+    // 適用後にここで検証する（最後の列を置き換える `ADD COLUMN b, DROP COLUMN a` 等を許す。
+    // 0 本のままなら単一 DROP と同じ 42601 で txn ごと破棄）。
+    Storage::ensure_table_has_live_column_in_txn(txn, table_name)
+        .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+    // 全アクション適用後のスキーマで、削除列が所有する SEQUENCE の依存検査・削除を行う
+    // （同じ文で DEFAULT を外した／参照列を落とした場合は依存なしとして通す）。
+    let dropped_sequence_ids =
+        Storage::drop_owned_sequences_of_columns_in_txn(txn, table_name, &dropped_columns)
+            .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+    Ok((results, changed, dropped_sequence_ids))
+}
+
+/// 共有 write txn で適用できる `ALTER TABLE` の形なら対象の表名を返す（`ADD COLUMN`・`DROP COLUMN`・
+/// `ALTER COLUMN SET/DROP NOT NULL`・`SET/DROP DEFAULT` と、それらだけの複数アクション）。それ以外は `None`
+/// （呼び出し元が writer を取る前に `0A000` で拒否する。SQL-80・Issue #3313）。
+pub(crate) fn alter_table_in_txn_target(validated: &ValidatedAlterTable) -> Option<&str> {
+    match validated {
+        // 複数アクションの各アクションにも単独 ALTER と同じ形式フィルタを適用する（DROP EXPRESSION 等を
+        // 複数アクションの中から Tx 内へ持ち込ませない）。入れ子の Multiple は構文段で作られないため拒否する。
+        ValidatedAlterTable::Multiple(stmt) => stmt
+            .actions
+            .iter()
+            .all(|a| {
+                !matches!(a, ValidatedAlterTable::Multiple(_))
+                    && alter_table_in_txn_target(a).is_some()
+            })
+            .then_some(stmt.table_name.as_str()),
+        ValidatedAlterTable::AddColumn(stmt) => Some(stmt.table_name.as_str()),
+        ValidatedAlterTable::DropColumn(stmt) => Some(stmt.table_name.as_str()),
+        ValidatedAlterTable::AlterColumnSetNotNull(stmt) => Some(stmt.table_name.as_str()),
+        ValidatedAlterTable::AlterColumnDropNotNull(stmt) => Some(stmt.table_name.as_str()),
+        ValidatedAlterTable::AlterColumnSetDefault(stmt) => Some(stmt.table_name.as_str()),
+        ValidatedAlterTable::AlterColumnDropDefault(stmt) => Some(stmt.table_name.as_str()),
+        _ => None,
+    }
+}
+
+/// `ALTER TABLE` を共有 write txn（明示・暗黙 Tx）の中で適用する（SQL-80・Issue #3313）。受理するのは
+/// `ADD COLUMN`・`DROP COLUMN`・`ALTER COLUMN SET/DROP NOT NULL`・`SET/DROP DEFAULT` と、それらだけの
+/// 複数アクション。適用の本体は複数アクション経路（[`run_alter_actions_in_txn`]）と同じで、スキーマは
+/// 常に write txn 内のもの（同じ Tx で作った表・前の文の変更を含む）を読む。それ以外の形
+/// （制約の追加・削除、型変更、改名、`SET SCHEMA`、行セキュリティ）は `0A000`（何も適用しない）。
+/// 戻り値の第 2 要素は DROP COLUMN が道連れに削除した所有 SEQUENCE の内部 ID（commit 成功後に採番器から捨てる）、
+/// 第 3 要素は全アクションのうちカタログを変えたものがあったか（`false` は全て冪等な no-op。呼び出し元が
+/// DDL を積んだ印を巻き戻すのに使う）。
+pub(crate) fn execute_alter_table_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedAlterTable,
+    limits: &SchemaLimits,
+) -> Result<(AlterTableOutcome, Vec<u64>, bool), SqlSurfaceError> {
+    let Some(table_name) = alter_table_in_txn_target(validated) else {
+        return Err(SqlSurfaceError::transaction_feature_not_supported(
+            "this ALTER TABLE action is not supported inside a transaction block",
+        ));
+    };
+    let actions: Vec<&ValidatedAlterTable> = match validated {
+        ValidatedAlterTable::Multiple(stmt) => stmt.actions.iter().collect(),
+        _ => vec![validated],
+    };
+    // 対象表の存在確認は write txn で行う（同じ Tx で作った表を確定済みカタログの 42P01 で見失わない）。
+    match crate::catalog::get_table_schema_in_txn_impl(write_txn, table_name, false) {
+        Ok(_) => {}
+        Err(CatalogError::TableNotFound(_)) => {
+            return Err(undefined_table_or_view_in_txn(write_txn, table_name));
+        }
+        Err(other) => return Err(map_drop_alter_column_error(other)),
+    }
+    let changed = std::cell::Cell::new(false);
+    let (results, dropped_sequence_ids) =
+        Storage::alter_table_in_shared_txn(write_txn, table_name, |txn| {
+            let applied = run_alter_actions_in_txn(storage, txn, table_name, &actions, limits)?;
+            changed.set(applied.1);
+            Ok(applied)
+        })
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view_in_txn(write_txn, table_name)
+            }
+            other => map_alter_check_error(storage, table_name, other),
+        })?;
+    let done: Vec<AlterTableAction> = results.into_iter().flatten().collect();
+    let action = match validated {
+        ValidatedAlterTable::Multiple(_) => AlterTableAction::Multiple { actions: done },
+        _ => done
+            .into_iter()
+            .next()
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "internal error".to_string(),
+            })?,
+    };
+    Ok((
+        AlterTableOutcome {
+            table_name: table_name.to_string(),
+            action,
+        },
+        dropped_sequence_ids,
+        changed.get(),
+    ))
 }
 
 /// 複数アクションの列属性変更 pass の番号（[`alter_action_pass`] 参照）。
@@ -1152,7 +1504,8 @@ const ALTER_PASS_ATTRIBUTES: u8 = 2;
 /// 複数アクションに含められない種別は構文段で拒否済みのため最後尾（到達しない）に置く。
 fn alter_action_pass(action: &ValidatedAlterTable) -> u8 {
     match action {
-        ValidatedAlterTable::DropColumn(_) => 0,
+        // `DROP EXPRESSION` も PostgreSQL の `AT_PASS_DROP` と同じ pass（同じ pass 内は記述順）。
+        ValidatedAlterTable::DropColumn(_) | ValidatedAlterTable::AlterColumnDropExpression(_) => 0,
         ValidatedAlterTable::AddColumn(_) => 1,
         // 列属性変更（SET／DROP NOT NULL・SET／DROP DEFAULT）は ADD COLUMN の後に記述順で適用する
         // （同一 pass 内は安定ソートで記述順を保つ）。
@@ -1203,6 +1556,10 @@ fn apply_alter_action_in_txn(
                     AlterApply::Unchanged,
                 ));
             }
+            // 生成列は全行の計算を伴うため、専用の helper（単一アクション経路と共有）で適用する。
+            if let Some(expr) = &stmt.generated {
+                return add_generated_column_in_txn(storage, txn, table_name, stmt, expr, limits);
+            }
             let column =
                 build_add_column_def(storage, stmt, limits).map_err(AlterCheckError::Sql)?;
             let max_columns =
@@ -1222,20 +1579,46 @@ fn apply_alter_action_in_txn(
             Storage::validate_alter_column_target(table_name, &stmt.column_name)
                 .map_err(|e| alter_in_txn_error(e, map))?;
             // 所有 SEQUENCE は削除せず、列名だけ記録する（全アクション適用後に呼び出し元が一括処理）。
-            Storage::alter_table_drop_column_core_in_txn(
+            // `CASCADE` で連鎖削除した生成列も記録する（Issue #3331）。
+            let (_, cascaded) = Storage::alter_table_drop_column_with_behavior_in_txn(
                 txn,
                 table_name,
                 &stmt.column_name,
+                stmt.behavior,
                 true,
                 false,
             )
             .map_err(|e| alter_in_txn_error(e, map))?;
+            dropped_columns.extend(cascaded);
             dropped_columns.push(stmt.column_name.clone());
             Ok((
                 AlterTableAction::DropColumn {
                     column_name: stmt.column_name.clone(),
                 },
                 AlterApply::Applied,
+            ))
+        }
+        ValidatedAlterTable::AlterColumnDropExpression(stmt) => {
+            Storage::validate_alter_column_target(table_name, &stmt.column_name)
+                .map_err(|e| alter_in_txn_error(e, map_drop_alter_column_error))?;
+            let apply = Storage::alter_table_drop_expression_in_txn(
+                txn,
+                table_name,
+                &stmt.column_name,
+                stmt.if_exists,
+            )
+            .map_err(|e| match e {
+                // `TableNotFound` は txn 破棄後に `42P01`／`42809` を判別するため未変換で返す。
+                AlterCheckError::Catalog(c @ CatalogError::TableNotFound(_)) => {
+                    AlterCheckError::Catalog(c)
+                }
+                other => AlterCheckError::Sql(map_drop_expression_error(other)),
+            })?;
+            Ok((
+                AlterTableAction::AlterColumnDropExpression {
+                    column_name: stmt.column_name.clone(),
+                },
+                apply,
             ))
         }
         ValidatedAlterTable::AlterColumnSetNotNull(stmt) => {
@@ -1364,6 +1747,18 @@ pub(crate) fn execute_alter_table_add_foreign_key(
                 &schema.columns,
                 std::slice::from_ref(&stmt.foreign_key),
             )?;
+            // 生成列を参照元に含む FK の禁止アクションは `CREATE TABLE` と同じ検査・同じ `42601`
+            // （TABLE-50・Issue #3327）。
+            let generated_names: Vec<&str> = schema
+                .columns
+                .iter()
+                .filter(|c| c.generated.is_some())
+                .map(|c| c.name.as_str())
+                .collect();
+            crate::sql::allowlist::reject_generated_fk_referential_actions(
+                std::slice::from_ref(&stmt.foreign_key),
+                &generated_names,
+            )?;
         }
         Err(CatalogError::TableNotFound(_)) => {
             return Err(undefined_table_or_view(storage, &stmt.table_name));
@@ -1419,6 +1814,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         CatalogError::ConstraintAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::MultiplePrimaryKeys(table) => {
             SqlSurfaceError::invalid_table_definition(table)
@@ -1438,7 +1834,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::NotNullConstraintViolation(column) => {
             SqlSurfaceError::not_null_violation(column)
         }
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -1456,6 +1852,7 @@ fn map_alter_constraint_error(e: CatalogError) -> SqlSurfaceError {
         // variant はいずれも詳細を露出しない `Internal`（`XX000`）へ丸める
         // （fail-closed。ワイルドカード腕を置かず全 variant を明示列挙する
         // ことで、将来の追加 variant をコンパイラに検出させる）。
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableAlreadyExists(_)
@@ -1500,7 +1897,7 @@ pub(crate) fn execute_alter_table_drop_column(
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
     storage
-        .alter_table_drop_column(&stmt.table_name, &stmt.column_name)
+        .alter_table_drop_column_with_behavior(&stmt.table_name, &stmt.column_name, stmt.behavior)
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
             other => map_drop_alter_column_error(other),
@@ -1594,40 +1991,57 @@ pub(crate) fn execute_alter_table_row_security(
     tenant_id: &str,
     stmt: &crate::sql::allowlist::ValidatedAlterTableRowSecurity,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
-    storage
-        .alter_table_row_security(tenant_id, &stmt.table_name, stmt.action)
+    execute_alter_table_row_security_in(storage, None, tenant_id, stmt).map(|(o, _)| o)
+}
+
+/// [`execute_alter_table_row_security`] の書き込み先を選べる版。第 2 要素は状態が変わったか
+/// （再指定の no-op は `false`。明示 Tx の呼び出し元が DDL を積んだ印を巻き戻すのに使う。SQL-80・Issue #3316）。
+pub(crate) fn execute_alter_table_row_security_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    stmt: &crate::sql::allowlist::ValidatedAlterTableRowSecurity,
+) -> Result<(AlterTableOutcome, bool), SqlSurfaceError> {
+    let applied = storage
+        .alter_table_row_security_in(target, tenant_id, &stmt.table_name, stmt.action)
         .map_err(|e| match e {
             CatalogError::TableNotFound(_) => undefined_table_or_view(storage, &stmt.table_name),
             other => map_drop_alter_column_error(other),
         })?;
-    Ok(AlterTableOutcome {
-        table_name: stmt.table_name.clone(),
-        action: AlterTableAction::RowSecurity {
-            action: stmt.action,
+    let changed = matches!(applied, crate::catalog::AlterApply::Applied);
+    Ok((
+        AlterTableOutcome {
+            table_name: stmt.table_name.clone(),
+            action: AlterTableAction::RowSecurity {
+                action: stmt.action,
+            },
         },
-    })
+        changed,
+    ))
 }
 
-/// `ALTER TABLE <table> SET SCHEMA <schema>` の実行本体（TABLE-27 のポインタ、Issue #1716。
+/// `ALTER TABLE <table> SET SCHEMA <schema>` の実行本体（TABLE-27 (7) のポインタ、Issue #1716・#3198。
 /// 設計記録 D7）。呼び出し元（`core.rs`）は [`require_ddl_permission`] を必ず先に通している前提。
+/// `check_create` は移動先 SCHEMA（内部 ID）への CREATE 権限の検査（`core.rs` が
+/// `schema_privilege::check_schema_create` を束縛して渡す）。
 ///
-/// 判定順序（決定的）: 表の存在確認（`42P01`／`42809`）→ 移動先の解決（`public` は ASCII の大小を
-/// 無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。それ以外は
+/// 判定順序（決定的。権限の無い主体へ存在情報を返さない）: 表の存在確認（`42P01`／`42809`）→ 移動先の
+/// 解決（`public` は ASCII の大小を無視。`pg_temp`・`pg_catalog`・`information_schema` は `0A000`。それ以外は
 /// `(tenant_id, name)` の 1 回 get で、無い名前〔他テナントの SCHEMA を含む〕は同一の `3F000`）→
-/// テナント境界（共有の `public` の表をテナントの SCHEMA へ移す経路は `42501`。fail-closed）→
-/// `public` から `public` は何も書かない成功（no-op）。
-///
-/// 現状はテナント SCHEMA に表を置く経路（#1717）が無く、移動元は常に `public` のため、
-/// テナント SCHEMA 間の実移動は未実装（到達不能な分岐を作らない）。
+/// 境界（`public` とテナント SCHEMA の間は双方向とも `42501`。fail-closed）→ 移動元と移動先が同じなら
+/// 何も書かない成功（no-op）→ 移動先の CREATE 権限（`42501`）→ [`Storage::alter_table_set_schema`]
+/// （表・索引・制約・`OWNED BY` の SEQUENCE を単一 txn で移す。名前の衝突は `42P07`、関数・matview の依存と
+/// SEQUENCE の外部参照は `2BP01`。ビューは移さない）。
 pub(crate) fn execute_alter_table_set_schema(
     storage: &Storage,
     tenant_id: &str,
     stmt: &ValidatedAlterTableSetSchema,
+    check_create: &dyn Fn(u64) -> Result<(), SqlSurfaceError>,
 ) -> Result<AlterTableOutcome, SqlSurfaceError> {
     ensure_table_exists(storage, &stmt.table_name)?;
     let target = stmt.schema_name.as_str();
-    let to_public = if target.eq_ignore_ascii_case("public") {
-        true
+    let target_id: Option<u64> = if target.eq_ignore_ascii_case("public") {
+        None
     } else if target.eq_ignore_ascii_case("pg_temp")
         || target.eq_ignore_ascii_case("pg_catalog")
         || target.eq_ignore_ascii_case("information_schema")
@@ -1637,7 +2051,7 @@ pub(crate) fn execute_alter_table_set_schema(
         ));
     } else {
         match storage.schema_id(tenant_id, target) {
-            Ok(Some(_)) => false,
+            Ok(Some(id)) => Some(id),
             Ok(None) => {
                 return Err(SqlSurfaceError::InvalidSchemaName {
                     name: target.to_string(),
@@ -1646,25 +2060,64 @@ pub(crate) fn execute_alter_table_set_schema(
             Err(e) => return Err(map_schema_error(e, "ALTER TABLE SET SCHEMA failed")),
         }
     };
-    if to_public {
-        // SCHEMA 配下の表を共有の `public` へ戻す経路は未実装。何も変えずに成功させず拒否する。
-        if matches!(
-            crate::catalog::namespace::RelationKey::parse(&stmt.table_name),
-            Ok(crate::catalog::namespace::RelationKey::InSchema { .. })
-        ) {
-            return Err(SqlSurfaceError::InsufficientPrivilege);
-        }
-    }
-    if !to_public {
-        // 共有の `public` の表の行をテナントの SCHEMA 側へ移さない（設計記録 D7）。
-        return Err(SqlSurfaceError::InsufficientPrivilege);
-    }
-    Ok(AlterTableOutcome {
+    let source = crate::catalog::namespace::RelationKey::parse(&stmt.table_name)
+        .map_err(crate::catalog::table_lookup_error)?;
+    let outcome = || AlterTableOutcome {
         table_name: stmt.table_name.clone(),
         action: AlterTableAction::SetSchema {
             schema_name: stmt.schema_name.clone(),
         },
-    })
+    };
+    match (source, target_id) {
+        // `public` から `public`: 何も書かない成功（PostgreSQL と同じ）。
+        (crate::catalog::namespace::RelationKey::Public(_), None) => Ok(outcome()),
+        // 意図的な拒否: 共有の `public` の表（全テナントの行を持つ）をテナントの SCHEMA へ移すと他テナントの
+        // 行の所有が移りうる。逆向き（SCHEMA 配下の表を共有の `public` へ戻す）も同じ境界の越境になるため、
+        // 両方向とも拒否する（設計記録 D7・TABLE-27 (7) のポインタ。fail-closed）。
+        (crate::catalog::namespace::RelationKey::Public(_), Some(_))
+        | (crate::catalog::namespace::RelationKey::InSchema { .. }, None) => {
+            Err(SqlSurfaceError::InsufficientPrivilege)
+        }
+        (
+            crate::catalog::namespace::RelationKey::InSchema {
+                schema_id: from_id,
+                name,
+            },
+            Some(to_id),
+        ) => {
+            // 同じ SCHEMA への移動は何も書かない成功（権限・衝突も判定しない。PostgreSQL と同じ）。
+            if from_id == to_id {
+                return Ok(outcome());
+            }
+            check_create(to_id)?;
+            let new_key = crate::catalog::namespace::RelationKey::InSchema {
+                schema_id: to_id,
+                name,
+            }
+            .encode();
+            storage
+                .alter_table_set_schema(tenant_id, &stmt.table_name, &new_key)
+                .map_err(|e| match e {
+                    AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                        undefined_table_or_view(storage, &stmt.table_name)
+                    }
+                    AlterCheckError::Catalog(CatalogError::TableAlreadyExists(name)) => {
+                        SqlSurfaceError::duplicate_table(
+                            crate::catalog::namespace::relation_name_part(&name).to_string(),
+                        )
+                    }
+                    AlterCheckError::Catalog(
+                        CatalogError::DependentObjectsStillExist(name)
+                        | CatalogError::DependentViewsExist(name),
+                    ) => SqlSurfaceError::DependentObjectsStillExist {
+                        name: crate::catalog::namespace::relation_name_part(&name).to_string(),
+                    },
+                    AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+                    AlterCheckError::Sql(sql_err) => sql_err,
+                })?;
+            Ok(outcome())
+        }
+    }
 }
 
 /// `ALTER TABLE <table> ALTER COLUMN <column> TYPE <型>` の実行本体（TABLE-19・
@@ -1803,6 +2256,41 @@ fn execute_alter_table_alter_column_drop_not_null(
             column_name: stmt.column_name.clone(),
         },
     })
+}
+
+/// `ALTER TABLE <table> ALTER COLUMN <column> DROP EXPRESSION [IF EXISTS]` の実行本体
+/// （TABLE-50 (3)、Issue #3331）。前提は [`execute_alter_table_drop_column`] と同じ（`core.rs` が
+/// [`require_ddl_permission`] を先に通す）。判定順序: テーブル存在確認 →
+/// `catalog::Storage::alter_table_drop_expression`（列の存在 `42703` → 生成列でなければ
+/// `55000`〔`IF EXISTS` は no-op〕。行は書き換えない）。
+fn execute_alter_table_alter_column_drop_expression(
+    storage: &Storage,
+    stmt: &ValidatedAlterTableAlterColumnDropExpression,
+) -> Result<AlterTableOutcome, SqlSurfaceError> {
+    ensure_table_exists(storage, &stmt.table_name)?;
+    storage
+        .alter_table_drop_expression(&stmt.table_name, &stmt.column_name, stmt.if_exists)
+        .map_err(|e| match e {
+            AlterCheckError::Catalog(CatalogError::TableNotFound(_)) => {
+                undefined_table_or_view(storage, &stmt.table_name)
+            }
+            other => map_drop_expression_error(other),
+        })?;
+    Ok(AlterTableOutcome {
+        table_name: stmt.table_name.clone(),
+        action: AlterTableAction::AlterColumnDropExpression {
+            column_name: stmt.column_name.clone(),
+        },
+    })
+}
+
+/// `DROP EXPRESSION` のカタログ層エラーを SQL 表層へ写す（`Sql` は透過、`Catalog` は
+/// [`map_drop_alter_column_error`] の契約）。
+fn map_drop_expression_error(e: AlterCheckError) -> SqlSurfaceError {
+    match e {
+        AlterCheckError::Sql(sql_err) => sql_err,
+        AlterCheckError::Catalog(other) => map_drop_alter_column_error(other),
+    }
 }
 
 /// `SET DEFAULT` の検証済み列定義（`default_expr` のみ差し替え済み）を作る。列の取得
@@ -2012,10 +2500,11 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
         CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
         CatalogError::ProtectedColumn(name) => {
             SqlSurfaceError::unsupported(format!("column {name:?} cannot be dropped or altered"))
         }
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -2035,6 +2524,7 @@ fn map_drop_alter_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::CommitFootprintUnrecordable => SqlSurfaceError::PayloadTooLarge {
             detail: "commit footprint limit exceeded".to_string(),
         },
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableAlreadyExists(_)
@@ -2116,6 +2606,33 @@ fn undefined_table_or_view(storage: &Storage, name: &str) -> SqlSurfaceError {
         SqlSurfaceError::UndefinedTable {
             name: name.to_string(),
         }
+    }
+}
+
+/// [`undefined_table_or_view`] の共有 write txn 版（明示・暗黙 Tx 内の DDL 用。Issue #3313）。種別（ビュー・
+/// 索引・実体化ビュー）を write txn から読むため、同じ Tx で作った索引・DROP した索引が `42809`／`42P01` の
+/// 判定に反映される。読み出し失敗は「存在しない」と同一視せず `catalog::table_lookup_error` で写す（fail-closed）。
+fn undefined_table_or_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    name: &str,
+) -> SqlSurfaceError {
+    let wrong_kind = crate::catalog::view_exists_in_txn(write_txn, name).and_then(|v| {
+        if v {
+            return Ok(true);
+        }
+        if crate::catalog::index_name_exists_in_txn(write_txn, name)? {
+            return Ok(true);
+        }
+        crate::catalog::materialized_view_exists_in_txn(write_txn, name)
+    });
+    match wrong_kind {
+        Ok(true) => SqlSurfaceError::WrongObjectType {
+            name: name.to_string(),
+        },
+        Ok(false) => SqlSurfaceError::UndefinedTable {
+            name: name.to_string(),
+        },
+        Err(e) => crate::catalog::table_lookup_error(e),
     }
 }
 
@@ -2709,7 +3226,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TooManyColumns { count } => {
             SqlSurfaceError::payload_too_large(format!("too many columns: {count}"))
         }
-        // 採番方式の親への `id` 参照など、行識別方式が未対応の組み合わせは固定文言の `0A000`
+        // 行識別方式が未対応の組み合わせ（採番方式の表の暗黙 id 前提の経路など）は固定文言の `0A000`
         // （TABLE-23・Issue #2199。入力不正ではない）。
         CatalogError::Invalid(detail)
             if detail == crate::catalog::ROW_IDENTITY_UNSUPPORTED_MESSAGE =>
@@ -2732,6 +3249,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         // variant はいずれも詳細を露出しない `Internal`（`XX000`）へ丸める
         // （fail-closed。ワイルドカード腕を置かず全 variant を明示列挙する
         // ことで、将来の追加 variant をコンパイラに検出させる）。
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::Backend(_)
         | CatalogError::CorruptSchema(_)
         | CatalogError::TableAlreadyExists(_)
@@ -2741,6 +3259,7 @@ fn map_add_column_error(e: CatalogError) -> SqlSurfaceError {
         | CatalogError::TypeAlreadyExists(_)
         | CatalogError::DependentObjectsStillExist(_)
         | CatalogError::ColumnNotFound(_)
+        | CatalogError::AmbiguousColumn(_)
         | CatalogError::ProtectedColumn(_)
         | CatalogError::IncompatibleTypeChange { .. }
         | CatalogError::ViewNotFound(_)
@@ -3032,9 +3551,13 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         CatalogError::TableAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::ViewLimitExceeded(detail) => SqlSurfaceError::PayloadTooLarge { detail },
-        CatalogError::Invalid(_) => {
-            SqlSurfaceError::unsupported("malformed view definition in CREATE VIEW")
-        }
+        // LATERAL を含むビュー本文の遅延再検証（Issue #3324）は未知列・曖昧列の分類を保つ。
+        CatalogError::ColumnNotFound(name) => SqlSurfaceError::UndefinedColumn { name },
+        CatalogError::AmbiguousColumn(name) => SqlSurfaceError::AmbiguousColumn { name },
+        // 原因別の固定文言（Issue #3240。TABLE-18・TABLE-41・ERR-6）。catalog 側の定数と
+        // 完全一致したものだけを写し、未知の detail は汎用文言へ丸める（fail-closed。
+        // detail は応答へ連結しない）。
+        CatalogError::Invalid(d) => view_definition_error(&d),
         // 明示トランザクション（SQL-31・TASK-221）が単一ライタを保持中で書き込み
         // ゲートの待機上限を超えた。他の書き込み入口（`CREATE TABLE`／
         // `DROP TABLE`）と同じく `55P03` を返す（`XX000` へ丸めない）。
@@ -3045,6 +3568,37 @@ fn map_create_view_error(e: CatalogError) -> SqlSurfaceError {
         _ => SqlSurfaceError::Internal {
             detail: "CREATE VIEW failed".to_string(),
         },
+    }
+}
+
+/// `CatalogError::Invalid` の detail（catalog の `VIEW_*_MESSAGE` 定数）を SQL 表層の契約へ
+/// 写像する（Issue #3240）。未対応機能は `0A000`、それ以外の定義エラーは `42601`。
+/// 定数以外の detail は汎用の固定文言にし、そのまま外へ出さない。
+fn view_definition_error(detail: &str) -> SqlSurfaceError {
+    use crate::catalog::{
+        VIEW_BASE_MISMATCH_MESSAGE, VIEW_BODY_LEXICAL_MESSAGE, VIEW_BODY_SHAPE_MESSAGE,
+        VIEW_BUFFERED_POSITION_MESSAGE, VIEW_DUPLICATE_ALIAS_MESSAGE,
+        VIEW_JOIN_REFERENCES_VIEW_MESSAGE, VIEW_OVER_ALIASED_MESSAGE,
+        VIEW_OVER_BUFFERED_LAYER_MESSAGE, VIEW_TOO_MANY_ALIASES_MESSAGE,
+        VIEW_UNSUPPORTED_FEATURE_MESSAGE,
+    };
+    if detail == VIEW_UNSUPPORTED_FEATURE_MESSAGE {
+        return SqlSurfaceError::feature_not_supported(VIEW_UNSUPPORTED_FEATURE_MESSAGE);
+    }
+    let known: [&'static str; 9] = [
+        VIEW_BODY_LEXICAL_MESSAGE,
+        VIEW_BODY_SHAPE_MESSAGE,
+        VIEW_BASE_MISMATCH_MESSAGE,
+        VIEW_JOIN_REFERENCES_VIEW_MESSAGE,
+        VIEW_BUFFERED_POSITION_MESSAGE,
+        VIEW_OVER_BUFFERED_LAYER_MESSAGE,
+        VIEW_OVER_ALIASED_MESSAGE,
+        VIEW_TOO_MANY_ALIASES_MESSAGE,
+        VIEW_DUPLICATE_ALIAS_MESSAGE,
+    ];
+    match known.iter().find(|m| **m == detail) {
+        Some(m) => SqlSurfaceError::unsupported(*m),
+        None => SqlSurfaceError::unsupported("invalid view definition"),
     }
 }
 
@@ -3149,6 +3703,61 @@ pub(crate) fn execute_create_index(
     storage: &Storage,
     validated: &ValidatedCreateIndex,
 ) -> Result<CreateIndexOutcome, SqlSurfaceError> {
+    let def = build_create_index_def(validated)?;
+    // `IF NOT EXISTS`（TABLE-36、Issue #1613）。`create_index` の write txn は名前衝突を最初に
+    // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
+    // 式要素（INDEX-10、Issue #1648）の束縛エラーは `Sql` としてそのまま透過し、カタログ側の
+    // 失敗だけを `map_create_index_error` で写像する。
+    finish_create_index(
+        storage.create_index_bound(
+            &def,
+            validated.expression_keys(),
+            validated.predicate(),
+            validated.hnsw_family(),
+        ),
+        validated,
+    )
+}
+
+/// `CREATE INDEX` を共有 write txn（明示・暗黙 Tx）の中で実行する（SQL-80・Issue #3313）。防御ゲート・
+/// 定義の組み立て・束縛・既存行の検証・エラー写像は [`execute_create_index`] と同じ本体を通る。
+/// 索引の構築ループ（既存行の走査）の期限は、呼び出し元が張る文の期限（`crate::interrupt`）が担う。
+pub(crate) fn execute_create_index_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateIndex,
+) -> Result<CreateIndexOutcome, SqlSurfaceError> {
+    let def = build_create_index_def(validated)?;
+    finish_create_index(
+        Storage::create_index_in_shared_txn(
+            write_txn,
+            &def,
+            validated.expression_keys(),
+            validated.predicate(),
+            validated.hnsw_family(),
+        ),
+        validated,
+    )
+}
+
+/// [`execute_create_index`]／[`execute_create_index_in_txn`] が共有する、カタログ書き込みの結果の写像
+/// （`IF NOT EXISTS` の同名 no-op・カタログエラーの SQLSTATE 写像）。
+fn finish_create_index(
+    result: Result<(), CreateIndexError>,
+    validated: &ValidatedCreateIndex,
+) -> Result<CreateIndexOutcome, SqlSurfaceError> {
+    match result {
+        Ok(()) => {}
+        Err(CreateIndexError::Catalog(CatalogError::IndexAlreadyExists(_)))
+            if validated.if_not_exists() => {}
+        Err(CreateIndexError::Catalog(e)) => return Err(map_create_index_error(e)),
+        Err(CreateIndexError::Sql(e)) => return Err(e),
+    }
+    Ok(CreateIndexOutcome {})
+}
+
+/// `CREATE INDEX` の構造検証済み入力から、カタログへ渡す索引定義を組み立てる（防御ゲートを含む。
+/// カタログは引かない）。autocommit・共有 write txn の両方の実行本体が使う。
+fn build_create_index_def(validated: &ValidatedCreateIndex) -> Result<IndexDef, SqlSurfaceError> {
     // 防御ゲート（INDEX-10、Issue #1648）: hnsw と式要素の組み合わせは構文段の最終ゲートで拒否
     // 済みだが、将来の経路変更で届いても、式を黙って落として列だけで保存しない（fail-closed）。
     // 式要素そのものは `create_index_bound` が書き込み txn 内で束縛する。一意索引と式要素の組
@@ -3223,23 +3832,7 @@ pub(crate) fn execute_create_index(
     .with_unique(validated.is_unique())
     // HNSW の構築パラメータ（SQL-33 (5)、Issue #2029）。`WITH` 省略は `None`（従来の永続形）。
     .with_hnsw_options(validated.hnsw_options());
-    // `IF NOT EXISTS`（TABLE-36、Issue #1613）。`create_index` の write txn は名前衝突を最初に
-    // 判定し commit・世代 bump の前に返るため、同名があれば定義を比較せず副作用なしで成功にする。
-    // 式要素（INDEX-10、Issue #1648）の束縛エラーは `Sql` としてそのまま透過し、カタログ側の
-    // 失敗だけを `map_create_index_error` で写像する。
-    match storage.create_index_bound(
-        &def,
-        validated.expression_keys(),
-        validated.predicate(),
-        validated.hnsw_family(),
-    ) {
-        Ok(()) => {}
-        Err(CreateIndexError::Catalog(CatalogError::IndexAlreadyExists(_)))
-            if validated.if_not_exists() => {}
-        Err(CreateIndexError::Catalog(e)) => return Err(map_create_index_error(e)),
-        Err(CreateIndexError::Sql(e)) => return Err(e),
-    }
-    Ok(CreateIndexOutcome {})
+    Ok(def)
 }
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
@@ -3261,6 +3854,21 @@ pub(crate) fn execute_drop_index(
     }
 }
 
+/// `DROP INDEX` を共有 write txn（明示・暗黙 Tx）の中で実行する（SQL-80・Issue #3313）。判定・削除・
+/// `IF EXISTS` の読み替え・エラー写像は [`execute_drop_index`] と同じ。
+pub(crate) fn execute_drop_index_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropIndex,
+) -> Result<DropIndexOutcome, SqlSurfaceError> {
+    match Storage::drop_index_in_shared_txn(write_txn, validated.name()) {
+        Ok(()) => Ok(DropIndexOutcome { skipped: false }),
+        Err(CatalogError::IndexNotFound(_)) if validated.if_exists() => {
+            Ok(DropIndexOutcome { skipped: true })
+        }
+        Err(e) => Err(map_drop_index_error(e)),
+    }
+}
+
 /// `Storage::create_index` の [`CatalogError`] を SQL 表層の契約へ写像する
 /// （ERR-6: 名前衝突 `42P07`、対象テーブル不存在 `42P01`、対象がビュー `42809`、
 /// 列不存在 `42703`、種別と列型の不整合 `0A000`、照合を持てない列への `COLLATE` `42804`、
@@ -3268,6 +3876,7 @@ pub(crate) fn execute_drop_index(
 /// テナント・行内容・redb 内部詳細は含めない（security.md P0）。
 fn map_create_index_error(e: CatalogError) -> SqlSurfaceError {
     match e {
+        CatalogError::Interrupted(reason) => SqlSurfaceError::QueryCanceled { reason },
         CatalogError::IndexAlreadyExists(name) => SqlSurfaceError::DuplicateTable { name },
         CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
         CatalogError::WrongObjectKind(name) => SqlSurfaceError::WrongObjectType { name },
@@ -3387,6 +3996,83 @@ pub(crate) fn execute_create_sequence(
         .create_sequence(validated.name(), &params)
         .map_err(|e| map_sequence_error(e, "CREATE SEQUENCE failed"))?;
     Ok(CreateSequenceOutcome {})
+}
+
+/// 要素つき `CREATE SCHEMA` の `CREATE TABLE` 要素を、呼び出し側（`core::schema_elements`）が開いた write txn の
+/// 中で作る（Issue #3286）。begin・commit・表の世代 bump は呼び出し側が行う。単独の
+/// [`execute_create_table`] と同じ検査（SCHEMA 越境依存の拒否・定義の意味検証・暗黙 SEQUENCE の作成）と
+/// 同じ txn 内本体を通し、第 2 の作成経路を作らない。要素側の `IF NOT EXISTS` は構文段が拒否済みのため扱わない。
+/// `Err` の場合は呼び出し側が txn を破棄する（SCHEMA・作成済みの要素を含めて何も残らない）。
+pub(crate) fn create_table_element_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateTable,
+    limits: &SchemaLimits,
+) -> Result<(), SqlSurfaceError> {
+    crate::sql::schema_dependency::check_create_table(validated)?;
+    let schema = build_table_schema(Some(storage), validated, limits)?;
+    let serials = implicit_sequences_in_column_order(&schema, validated)?;
+    let created = if serials.is_empty() {
+        Storage::create_table_in_write_txn(write_txn, &schema)
+    } else {
+        crate::catalog::sequence::create_table_with_implicit_sequences_in_txn(
+            storage.sequence_allocator(),
+            write_txn,
+            &schema,
+            &serials,
+        )
+        .map(|_| ())
+    };
+    created.map_err(map_create_table_catalog_error)?;
+    // commit 記録（SQL-38・Issue #2404）: スキーマ・カタログを変える書き込みは DDL として記録する。
+    crate::storage::commit_log::note_ddl(write_txn, &schema.name);
+    Ok(())
+}
+
+/// 要素つき `CREATE SCHEMA` の `CREATE VIEW` 要素を、呼び出し側の write txn の中で作る（Issue #3286。
+/// [`create_table_element_in_txn`] と同じ位置づけ）。単独の `CREATE VIEW` 腕と同じ SCHEMA 越境依存の拒否と
+/// 事前検証（`Storage::prepare_create_view`）・txn 内本体（`Storage::create_view_in_txn`）を通す。列別名・
+/// `WITH CHECK OPTION`・`OR REPLACE` は構文段が拒否済みで、カタログを引く追加の事前検査は要らない。
+pub(crate) fn create_view_element_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateView,
+) -> Result<(), SqlSurfaceError> {
+    crate::sql::schema_dependency::check_view_body(validated.name(), validated.body_sql())?;
+    let (encoded, shape) = Storage::prepare_create_view(
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        &[],
+        crate::catalog::ViewCheckOption::None,
+    )
+    .map_err(map_create_view_error)?;
+    Storage::create_view_in_txn(
+        write_txn,
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        &encoded,
+        &shape,
+    )
+    .map_err(map_create_view_error)
+}
+
+/// 要素つき `CREATE SCHEMA` の `CREATE SEQUENCE` 要素を、呼び出し側の write txn の中で作る（Issue #3286）。
+/// 意味検証（範囲 `22023`）と既定値の補完は単独の [`execute_create_sequence`] と同じ。
+pub(crate) fn create_sequence_element_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateSequence,
+) -> Result<(), SqlSurfaceError> {
+    let params = resolve_sequence_params(validated)?;
+    crate::catalog::sequence::create_sequence_with_default_acl_in_txn(
+        storage.sequence_allocator(),
+        write_txn,
+        validated.name(),
+        &params,
+    )
+    .map(|_| ())
+    .map_err(|e| map_sequence_error(e, "CREATE SEQUENCE failed"))
 }
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体（Issue #1688）。
@@ -3583,8 +4269,9 @@ impl DropTypeOutcome {
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （Issue #1194）。`Storage::create_enum_type`（単一 write txn 内で名前検証・
-/// 重複判定・件数上限を行う）へ委譲する。ENUM 型は全テナント共有カタログのため
-/// `PolicyContext` は取らない。
+/// 重複判定・件数上限を行う）へ委譲する。ENUM 型のカタログは全テナント共有で `PolicyContext` は取らない。
+/// 型名は裸の名前（public）か、解決器が自テナントの SCHEMA から作った内部キー `#<schema_id>.<name>`
+/// （Issue #3288。呼び出し元 `core::EngineCore` の実行腕が作成先の権限を検査済み）。
 pub(crate) fn execute_create_type(
     storage: &Storage,
     validated: &ValidatedCreateType,
@@ -3603,7 +4290,8 @@ pub(crate) fn execute_create_type(
 
 /// `require_ddl_permission` を通過したセッションに限り呼ばれる実行本体
 /// （Issue #1194）。`Storage::drop_enum_type`（同一 write txn 内で依存列を判定し、
-/// 残っていれば `DependentObjectsStillExist`）へ委譲する。
+/// 残っていれば `DependentObjectsStillExist`）へ委譲する。型名は [`execute_create_type`] と同じく
+/// 裸の名前か内部キー（Issue #3288）。
 pub(crate) fn execute_drop_type(
     storage: &Storage,
     validated: &ValidatedDropType,
@@ -3627,6 +4315,9 @@ pub(crate) fn execute_drop_type(
 fn map_create_type_error(e: CatalogError) -> SqlSurfaceError {
     match e {
         CatalogError::TypeAlreadyExists(name) => SqlSurfaceError::duplicate_type(name),
+        // 解析と実行の間に作成先の SCHEMA が消えた競合（Issue #3288。表・SEQUENCE の作成と同じ `42P01`）。
+        // 名前は内部キーのまま渡し、ctx を持つ入口の出口（`map_text`）が公開名へ戻す。
+        CatalogError::TableNotFound(name) => SqlSurfaceError::undefined_table(name),
         CatalogError::Invalid(_) => {
             SqlSurfaceError::unsupported("invalid enum type definition in CREATE TYPE")
         }
@@ -3662,9 +4353,311 @@ fn map_drop_type_error(e: CatalogError) -> SqlSurfaceError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 明示・暗黙 Tx の VIEW・SEQUENCE・SCHEMA・型の DDL（SQL-80・Issue #3315）。
+//
+// 呼び出し元は `core/txn_ddl_objects.rs`（権限ゲート・writer の取得・DDL 状態の印の後に呼ぶ）。実行本体は
+// autocommit と同じ catalog の write txn 内本体を共有し、エラーの写像も同じ `map_*` を通す。commit は
+// Tx の COMMIT が 1 回だけ行う（ここでは begin・commit・メモリ上の状態の変更をしない）。
+// ---------------------------------------------------------------------------
+
+/// `CREATE VIEW`（`OR REPLACE` を除く）を共有 write txn の中で実行する（Issue #3315）。本文の構文検証・
+/// 名前衝突・参照先の存在と深さ・件数上限は [`execute_create_view`] と同じ `Storage::prepare_create_view`・
+/// `Storage::create_view_in_txn` を通す。列別名・`WITH CHECK OPTION` の事前検査は呼び出し側が済ませる。
+pub(crate) fn execute_create_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateView,
+) -> Result<CreateViewOutcome, SqlSurfaceError> {
+    let (encoded, shape) = Storage::prepare_create_view(
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        validated.column_aliases(),
+        validated.check_option(),
+    )
+    .map_err(map_create_view_error)?;
+    Storage::create_view_in_txn(
+        write_txn,
+        validated.name(),
+        validated.base_relation(),
+        validated.body_sql(),
+        &encoded,
+        &shape,
+    )
+    .map_err(map_create_view_error)?;
+    Ok(CreateViewOutcome {})
+}
+
+/// `DROP VIEW` を共有 write txn の中で実行する（Issue #3315）。`IF EXISTS` で対象が無いときだけ
+/// `skipped` の成功にする（何も書いていない）。連鎖削除（`CASCADE`）も同じ txn に載る。
+pub(crate) fn execute_drop_view_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropView,
+) -> Result<DropViewOutcome, SqlSurfaceError> {
+    match Storage::drop_view_with_behavior_in_txn(write_txn, validated.name(), validated.behavior())
+    {
+        Ok(cascaded) => Ok(DropViewOutcome {
+            skipped: false,
+            cascaded,
+        }),
+        Err(CatalogError::ViewNotFound(_)) if validated.if_exists() => Ok(DropViewOutcome {
+            skipped: true,
+            cascaded: Vec::new(),
+        }),
+        Err(e) => Err(map_drop_view_error(e)),
+    }
+}
+
+/// `CREATE SEQUENCE` を共有 write txn の中で実行する（Issue #3315）。払い出した内部 ID のメモリ上の
+/// カーソルは作成時に捨てる（ROLLBACK で巻き戻る内部 ID の再利用対策。`catalog::sequence` の
+/// `create_sequence_in_txn_evicting`）。
+pub(crate) fn execute_create_sequence_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateSequence,
+) -> Result<CreateSequenceOutcome, SqlSurfaceError> {
+    create_sequence_element_in_txn(storage, write_txn, validated)?;
+    Ok(CreateSequenceOutcome {})
+}
+
+/// `DROP SEQUENCE` を共有 write txn の中で実行する（Issue #3315）。戻り値の内部 ID は、Tx の commit 成功後に
+/// 採番器から捨てるために呼び出し側が積む。
+pub(crate) fn execute_drop_sequence_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropSequence,
+) -> Result<(DropSequenceOutcome, u64), SqlSurfaceError> {
+    let id = crate::catalog::sequence::drop_sequence_in_txn(write_txn, validated.name())
+        .map_err(|e| map_sequence_error(e, "DROP SEQUENCE failed"))?;
+    Ok((DropSequenceOutcome {}, id))
+}
+
+/// `ALTER SEQUENCE` が `RESTART` を伴うか（明示 Tx 内では未対応のため、呼び出し側が writer を取る前に拒否する）。
+pub(crate) fn alter_sequence_restarts(validated: &ValidatedAlterSequence) -> bool {
+    matches!(&validated.action, AlterSequenceAction::Options(alter) if alter.restart.is_some())
+}
+
+/// `ALTER SEQUENCE`（`RESTART` なしのオプション変更と `RENAME TO`）を共有 write txn の中で実行する
+/// （Issue #3315）。採番器の現在値は読むだけで変えない。`RESTART` は呼び出し側が先に拒否している前提で、
+/// 万一来たら採番器のメモリを捨てられないため fail-closed の `0A000` にする。
+pub(crate) fn execute_alter_sequence_in_txn(
+    storage: &Storage,
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedAlterSequence,
+) -> Result<AlterSequenceOutcome, SqlSurfaceError> {
+    match &validated.action {
+        AlterSequenceAction::Options(alter) => {
+            if alter.restart.is_some() {
+                return Err(SqlSurfaceError::transaction_feature_not_supported(
+                    "ALTER SEQUENCE RESTART is not supported inside a transaction block yet",
+                ));
+            }
+            crate::catalog::sequence::alter_sequence_in_txn(
+                storage.sequence_allocator(),
+                write_txn,
+                validated.name(),
+                tenant_id,
+                alter,
+            )
+            .map(|_| ())
+            .map_err(|e| match e {
+                AlterSequenceError::Range(r) => {
+                    SqlSurfaceError::InvalidParameterValue { detail: r.detail() }
+                }
+                AlterSequenceError::Catalog(c) => map_sequence_error(c, "ALTER SEQUENCE failed"),
+            })?
+        }
+        AlterSequenceAction::Rename { new_name } => {
+            crate::catalog::sequence::rename_sequence_in_txn(
+                write_txn,
+                validated.name(),
+                // 改名先は同じ SCHEMA に置く（TABLE-27・Issue #1717）。
+                &crate::catalog::namespace::sibling_key(validated.name(), new_name)
+                    .map_err(|e| map_sequence_error(e, "ALTER SEQUENCE failed"))?,
+            )
+            .map_err(|e| {
+                match e {
+            // 名前参照の DEFAULT が壊れるため RENAME は拒否する（fail-closed）。
+            CatalogError::DependentObjectsStillExist(_) => SqlSurfaceError::feature_not_supported(
+                "ALTER SEQUENCE RENAME of a sequence used by a column default is not supported",
+            ),
+            other => map_sequence_error(other, "ALTER SEQUENCE failed"),
+        }
+            })?
+        }
+    }
+    Ok(AlterSequenceOutcome {})
+}
+
+/// Tx 内の SCHEMA DDL が writer を取る前に行う静的検査（識別子・予約名・組み込み名。Issue #3315）。
+/// autocommit と同じく、拒否が writer 競合（`55P03`）や Failed Tx の writer 保持に化けないようにする。
+pub(crate) fn precheck_create_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedCreateSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_create_schema(tenant_id, validated.name())
+        .map_err(|e| map_schema_error(e, "CREATE SCHEMA failed"))
+}
+
+/// [`precheck_create_schema_in_txn`] の `DROP SCHEMA` 版。
+pub(crate) fn precheck_drop_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedDropSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_schema_name_change(tenant_id, validated.name(), None)
+        .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))
+}
+
+/// [`precheck_create_schema_in_txn`] の `ALTER SCHEMA RENAME` 版。
+pub(crate) fn precheck_alter_schema_in_txn(
+    tenant_id: &str,
+    validated: &ValidatedAlterSchema,
+) -> Result<(), SqlSurfaceError> {
+    crate::catalog::namespace::precheck_schema_name_change(
+        tenant_id,
+        validated.name(),
+        Some(validated.new_name()),
+    )
+    .map_err(|e| map_schema_error(e, "ALTER SCHEMA failed"))
+}
+
+/// 要素なしの `CREATE SCHEMA` を共有 write txn の中で実行する（Issue #3315）。戻り値の真偽は「新規に作った」
+/// （`IF NOT EXISTS` で既存のときは何も書かず偽）。
+pub(crate) fn execute_create_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedCreateSchema,
+    owner: Option<u64>,
+) -> Result<(CreateSchemaOutcome, bool), SqlSurfaceError> {
+    let result = crate::catalog::namespace::create_schema_if_absent_in_txn(
+        write_txn,
+        tenant_id,
+        validated.name(),
+        validated.if_not_exists,
+        crate::catalog::namespace::MAX_SCHEMAS_PER_TENANT,
+        owner,
+    )
+    .map_err(|e| map_schema_error(e, "CREATE SCHEMA failed"))?;
+    Ok((
+        CreateSchemaOutcome {},
+        result == crate::catalog::namespace::CreateSchemaResult::Created,
+    ))
+}
+
+/// `ALTER SCHEMA ... RENAME TO` を共有 write txn の中で実行する（Issue #3315）。所有者検査は write txn 上で行う。
+pub(crate) fn execute_alter_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedAlterSchema,
+    gate: OwnerGate,
+) -> Result<AlterSchemaOutcome, SqlSurfaceError> {
+    crate::catalog::namespace::rename_schema_gated_in_txn(
+        write_txn,
+        tenant_id,
+        validated.name(),
+        validated.new_name(),
+        gate,
+    )
+    .map_err(|e| map_schema_error(e, "ALTER SCHEMA failed"))?;
+    Ok(AlterSchemaOutcome {})
+}
+
+/// `DROP SCHEMA`（`CASCADE` なし）を共有 write txn の中で実行する（Issue #3315）。戻り値の真偽は「削除した」
+/// （`IF EXISTS` で不在のときは何も書かず偽）。`CASCADE` は呼び出し側が先に拒否する。
+pub(crate) fn execute_drop_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    validated: &ValidatedDropSchema,
+    gate: OwnerGate,
+) -> Result<(DropSchemaOutcome, bool), SqlSurfaceError> {
+    if validated.cascade {
+        return Err(SqlSurfaceError::transaction_feature_not_supported(
+            "DROP SCHEMA CASCADE is not supported inside a transaction block yet",
+        ));
+    }
+    let result = crate::catalog::namespace::drop_schema_gated_in_txn(
+        write_txn,
+        tenant_id,
+        validated.name(),
+        validated.if_exists,
+        gate,
+    )
+    .map_err(|e| map_schema_error(e, "DROP SCHEMA failed"))?;
+    Ok((
+        DropSchemaOutcome {},
+        result == crate::catalog::namespace::DropSchemaResult::Dropped,
+    ))
+}
+
+/// Tx 内 `CREATE TYPE` の事前検査（Issue #3315）。ラベル数の上限と予約名・ラベルの検証だけを行い何も書かない。
+/// writer 取得・DDL 印より前に呼び、失敗しても Tx を継続できるようにする。
+pub(crate) fn precheck_create_type_in_txn(
+    validated: &ValidatedCreateType,
+    limits: &SchemaLimits,
+) -> Result<(), SqlSurfaceError> {
+    if validated.labels().len() > limits.max_enum_labels() {
+        return Err(SqlSurfaceError::payload_too_large("too many enum labels"));
+    }
+    Storage::prepare_create_enum_type(validated.name(), validated.labels())
+        .map_err(map_create_type_error)?;
+    Ok(())
+}
+
+/// `CREATE TYPE ... AS ENUM` を共有 write txn の中で実行する（Issue #3315）。ラベル数の上限と予約名は
+/// [`execute_create_type`] と同じ判定を write txn を使う前に行う。
+pub(crate) fn execute_create_type_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedCreateType,
+    limits: &SchemaLimits,
+) -> Result<CreateTypeOutcome, SqlSurfaceError> {
+    if validated.labels().len() > limits.max_enum_labels() {
+        return Err(SqlSurfaceError::payload_too_large("too many enum labels"));
+    }
+    let encoded = Storage::prepare_create_enum_type(validated.name(), validated.labels())
+        .map_err(map_create_type_error)?;
+    Storage::create_enum_type_in_txn(write_txn, validated.name(), &encoded)
+        .map_err(map_create_type_error)?;
+    Ok(CreateTypeOutcome {})
+}
+
+/// `DROP TYPE` を共有 write txn の中で実行する（Issue #3315）。`IF EXISTS` で対象が無いときだけ
+/// `skipped` の成功にする（何も書いていない）。
+pub(crate) fn execute_drop_type_in_txn(
+    write_txn: &redb::WriteTransaction,
+    validated: &ValidatedDropType,
+) -> Result<DropTypeOutcome, SqlSurfaceError> {
+    match Storage::drop_enum_type_in_txn(write_txn, validated.name()) {
+        Ok(()) => Ok(DropTypeOutcome { skipped: false }),
+        Err(CatalogError::TypeNotFound(_)) if validated.if_exists() => {
+            Ok(DropTypeOutcome { skipped: true })
+        }
+        Err(e) => Err(map_drop_type_error(e)),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3240: ビュー定義の拒否は原因別の固定文言へ写り、未知の detail は汎用文言へ丸める
+    /// （内部キー・識別子を応答へ出さない）。未対応機能だけが `0A000`。
+    #[test]
+    fn view_definition_error_maps_known_causes_and_hides_unknown_detail() {
+        use crate::catalog::{VIEW_JOIN_REFERENCES_VIEW_MESSAGE, VIEW_UNSUPPORTED_FEATURE_MESSAGE};
+        let e = map_create_view_error(CatalogError::Invalid(
+            VIEW_UNSUPPORTED_FEATURE_MESSAGE.to_string(),
+        ));
+        assert_eq!(e.wire_code(), "0A000");
+        assert!(e.to_string().ends_with(VIEW_UNSUPPORTED_FEATURE_MESSAGE));
+        let e = map_create_view_error(CatalogError::Invalid(
+            VIEW_JOIN_REFERENCES_VIEW_MESSAGE.to_string(),
+        ));
+        assert_eq!(e.wire_code(), "42601");
+        assert!(e.to_string().ends_with(VIEW_JOIN_REFERENCES_VIEW_MESSAGE));
+        let e = map_create_view_error(CatalogError::Invalid("#1.secret".to_string()));
+        assert_eq!(e.wire_code(), "42601");
+        assert!(!e.to_string().contains("secret"));
+        assert!(e.to_string().ends_with("invalid view definition"));
+    }
 
     /// ADR D7（TABLE-27・Issue #1717）の回帰: 呼び出し元が「既存名」と判断して事前検査を省いた後に
     /// 名前が消えた競合を模す（対象名が存在しない状態で `IF NOT EXISTS` を直接実行する）。
@@ -3842,6 +4835,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4038,6 +5032,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4071,6 +5066,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4126,6 +5122,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4157,6 +5154,7 @@ mod tests {
             array_len_defaulted: Vec::new(),
             serial_columns: Vec::new(),
             identity_columns: Vec::new(),
+            generated_columns: Vec::new(),
             legacy_row_identity: false,
             public_qualified: false,
             table_name: "docs".to_string(),
@@ -4218,7 +5216,7 @@ mod tests {
         let limits = SchemaLimits::default();
         let run = |sql: &str| {
             let v = validate_alter_table(sql).expect("valid shape");
-            execute_alter_table(&storage, "t", &v, &limits)
+            execute_alter_table(&storage, "t", &v, &limits, &|_| Ok(()))
         };
         let generation = || storage.table_generation("docs").expect("generation");
         let schema = || storage.get_table_schema("docs").expect("schema");

@@ -237,8 +237,8 @@ fn push_array_element(out: &mut String, text: &str, quote: bool) {
     out.push('"');
 }
 
-/// `ARRAY` 列（`TEXT`／`BOOLEAN`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
-/// `DATE`／`TIMESTAMP`／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
+/// `ARRAY` 列（`TEXT`／`BOOLEAN`／`SMALLINT`／`INTEGER`／`BIGINT`／`REAL`／`DOUBLE PRECISION`／
+/// `DATE`／`TIMESTAMP`／`TIME`／`TIMESTAMPTZ`／`BIT(n)`（JSON 文字列。文字種・長さは engine が検査）／`UUID`／`NUMERIC`／`BYTEA`／`JSON`／`JSONB`／`ENUM` の各要素型）
 /// 向け配列直列化。要素種別を
 /// `array_ty.elem()` に応じて検証したうえで `{...}` テキストを組み立てる。
 /// 要素数が [`ArrayType::max_len`] を超える場合はテキストを組み立てる**前**に
@@ -268,19 +268,31 @@ pub fn array_literal_text(
         }
         match (array_ty.elem(), item) {
             (_, JsonValue::Null) => push_array_element(&mut out, "NULL", false),
-            (ArrayElemType::Text, JsonValue::String(s)) => push_array_element(&mut out, s, true),
+            // `VARCHAR(n)`／`CHAR(n)` 要素の長さ検査・空白詰めは engine の配列リテラル束縛が担う
+            // （Issue #3231）。ここは構文を壊さないよう必ず引用する。
+            (
+                ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_),
+                JsonValue::String(s),
+            ) => push_array_element(&mut out, s, true),
             (ArrayElemType::Bool, JsonValue::Bool(b)) => {
                 push_array_element(&mut out, if *b { "true" } else { "false" }, true)
             }
             (
-                ArrayElemType::Integer
+                ArrayElemType::SmallInt
+                | ArrayElemType::Integer
                 | ArrayElemType::BigInt
                 | ArrayElemType::Real
                 | ArrayElemType::Double,
                 JsonValue::Number(n),
             ) => push_array_element(&mut out, &number_literal_text(n), false),
             (
-                ArrayElemType::Date | ArrayElemType::Timestamp | ArrayElemType::Uuid,
+                ArrayElemType::Date
+                | ArrayElemType::Timestamp
+                | ArrayElemType::Time
+                | ArrayElemType::Interval
+                | ArrayElemType::Bit(_)
+                | ArrayElemType::TimestampTz
+                | ArrayElemType::Uuid,
                 JsonValue::String(s),
             ) => push_array_element(&mut out, s, true),
             (ArrayElemType::Numeric { .. }, JsonValue::Number(n)) => {
@@ -322,7 +334,7 @@ pub fn array_literal_text(
                     "ARRAY column element must be a JSON string",
                 ))
             }
-            (ArrayElemType::Text, _) => {
+            (ArrayElemType::Text | ArrayElemType::Varchar(_) | ArrayElemType::Bpchar(_), _) => {
                 return Err(TypedJsonError::TypeMismatch(
                     "ARRAY column element must be a JSON string",
                 ))
@@ -333,7 +345,8 @@ pub fn array_literal_text(
                 ))
             }
             (
-                ArrayElemType::Integer
+                ArrayElemType::SmallInt
+                | ArrayElemType::Integer
                 | ArrayElemType::BigInt
                 | ArrayElemType::Real
                 | ArrayElemType::Double,
@@ -343,7 +356,16 @@ pub fn array_literal_text(
                     "ARRAY column element must be a JSON number",
                 ))
             }
-            (ArrayElemType::Date | ArrayElemType::Timestamp | ArrayElemType::Uuid, _) => {
+            (
+                ArrayElemType::Date
+                | ArrayElemType::Timestamp
+                | ArrayElemType::Time
+                | ArrayElemType::Interval
+                | ArrayElemType::Bit(_)
+                | ArrayElemType::TimestampTz
+                | ArrayElemType::Uuid,
+                _,
+            ) => {
                 return Err(TypedJsonError::TypeMismatch(
                     "ARRAY column element must be a JSON string",
                 ))
@@ -806,6 +828,30 @@ mod tests {
         assert_eq!(text, r#"{"a\"b\\c","plain"}"#);
     }
 
+    /// Issue #3231: `VARCHAR(n)`／`CHAR(n)` 要素も TEXT と同じく必ず引用し、JSON 文字列以外は
+    /// 拒否する（長さ検査・空白詰めは engine の配列リテラル束縛が担う）。
+    #[test]
+    fn array_literal_text_handles_varchar_and_char_elements() {
+        for elem in [
+            ArrayElemType::Varchar(None),
+            ArrayElemType::Varchar(Some(3)),
+            ArrayElemType::Bpchar(3),
+        ] {
+            let array_ty = ArrayType::new(elem, 8).expect("valid array type");
+            let items = vec![JsonValue::String("a\"b".to_string()), JsonValue::Null];
+            assert_eq!(
+                array_literal_text(&items, &array_ty).expect("ok"),
+                r#"{"a\"b",NULL}"#,
+                "{elem:?}"
+            );
+            let bad = vec![JsonValue::Bool(true)];
+            assert!(matches!(
+                array_literal_text(&bad, &array_ty),
+                Err(TypedJsonError::TypeMismatch(_))
+            ));
+        }
+    }
+
     #[test]
     fn array_literal_text_rejects_element_type_mismatch() {
         let array_ty = ArrayType::new(ArrayElemType::Bool, 8).expect("valid array type");
@@ -848,6 +894,10 @@ mod tests {
             engine::sql::parser::parse_array_literal(&text, array_ty).expect("engine parse")
         };
         assert_eq!(
+            parse(ArrayElemType::SmallInt, "[1,null,-3]"),
+            V::SmallInt(vec![Some(1), None, Some(-3)])
+        );
+        assert_eq!(
             parse(ArrayElemType::Integer, "[1,null,-3]"),
             V::Integer(vec![Some(1), None, Some(-3)])
         );
@@ -871,6 +921,38 @@ mod tests {
             parse(ArrayElemType::Timestamp, r#"["1970-01-01 00:00:01"]"#),
             V::Timestamp(vec![Some(1_000_000)])
         );
+        assert_eq!(
+            parse(ArrayElemType::Time, r#"["10:00:00",null,"24:00:00"]"#),
+            V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)])
+        );
+        assert_eq!(
+            parse(ArrayElemType::Interval, r#"["1 day",null,"2 hours"]"#),
+            V::Interval(vec![
+                Some(engine::datetime::Interval {
+                    months: 0,
+                    days: 1,
+                    micros: 0,
+                }),
+                None,
+                Some(engine::datetime::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 7_200_000_000,
+                }),
+            ])
+        );
+        // offset 付きの文字列要素は UTC マイクロ秒へ束縛される（Issue #3233）。
+        assert_eq!(
+            parse(
+                ArrayElemType::TimestampTz,
+                r#"["2026-01-01 10:00:00+09",null]"#
+            ),
+            V::TimestampTz(vec![Some(1_767_229_200_000_000), None])
+        );
+        assert!(matches!(
+            parse(ArrayElemType::Bit(4), r#"["1010",null,"0101"]"#),
+            V::Bit(items) if items.len() == 3 && items[1].is_none()
+        ));
         assert!(matches!(
             parse(
                 ArrayElemType::Uuid,
@@ -885,10 +967,16 @@ mod tests {
         let ty = |elem| ArrayType::new(elem, 8).expect("valid array type");
         for (elem, item) in [
             (ArrayElemType::Integer, JsonValue::String("1".to_string())),
+            (ArrayElemType::SmallInt, JsonValue::String("1".to_string())),
             (ArrayElemType::Double, JsonValue::Bool(true)),
             (ArrayElemType::Date, num("1")),
             (ArrayElemType::Uuid, JsonValue::Bool(false)),
             (ArrayElemType::Timestamp, num("[]")),
+            (ArrayElemType::Time, num("1")),
+            (ArrayElemType::Interval, num("1")),
+            (ArrayElemType::Bit(4), num("1010")),
+            (ArrayElemType::Bit(4), JsonValue::Bool(true)),
+            (ArrayElemType::TimestampTz, num("1")),
         ] {
             let err = array_literal_text(&[item], &ty(elem)).expect_err("reject");
             assert!(matches!(err, TypedJsonError::TypeMismatch(_)));

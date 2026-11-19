@@ -346,18 +346,33 @@ fn delete_path_follows_postgres_rules() {
     assert_eq!(select_code_for(&core, &alice, "docb #- lang", 1), "0A000");
 }
 
+// intentional: docs/design/json-expr-type-mapping.md
 #[test]
 fn type_errors_use_fixed_sqlstates() {
     let (core, path) = new_core();
     let _guard = CleanupGuard(path);
     let alice = ctx_for("alice");
     seed(&core, &alice, &[Some(r#"{"a":1}"#)]);
-    // 文字列連結は未実装（PostgreSQL では text の連結）。
-    assert_eq!(select_code(&core, &alice, "lang || 'x'"), "0A000");
+    // text 同士の連結は Issue #3276 で実装済み（strict な文字列連結）。
+    assert_eq!(
+        cell(&core, &alice, "lang || 'x'", 1),
+        Cell::Text("kx".to_string())
+    );
+    // json（原文保存）は PostgreSQL でも自前の `||` を持たず text 連結になる（Issue #3278）。
+    assert_eq!(
+        cell(&core, &alice, "doc || '{}'", 1),
+        Cell::Text("{}{}".to_string())
+    );
+    // jsonb と型付き text の組は意図的に拒否のまま。
     assert_eq!(select_code(&core, &alice, "docb || lang"), "0A000");
-    assert_eq!(select_code(&core, &alice, "doc || '{}'"), "0A000");
     // jsonb と数値は演算子なし。リテラル同士も 42883。
     assert_eq!(select_code(&core, &alice, "docb || n"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || n"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || doc"), "42883");
+    assert_eq!(select_code(&core, &alice, "doc || docb"), "42883");
+    assert_eq!(select_code(&core, &alice, "docb || doc"), "42883");
+    // 反対側の束縛エラーが先に出る。
+    assert_eq!(select_code(&core, &alice, "doc || nope_col"), "42703");
     assert_eq!(
         code(
             &core,

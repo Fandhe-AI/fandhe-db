@@ -17,6 +17,9 @@
 //! [`rewrite_rows_with_conversion_in_txn`]。評価・変換エラーは固定文言（値・テナント・行 id を
 //! 含まない）の [`ConversionOutcome::Failed`] で返し、破損（`CorruptSchema`）と区別する。
 //!
+//! 生成列の追加（`ADD COLUMN ... GENERATED ... STORED`。TABLE-50・Issue #3330）の全行バックフィルは
+//! [`backfill_generated_column_in_txn`]（TABLE-5 の O(1) の fast default は使わず全行を書き直す）。
+//!
 //! 契約（fail-closed）:
 //! - 書き換えるのは対象テーブルの行だけで、行キー `(tenant_id, id)`・tenant・
 //!   visibility・embedding は保存する（行の追加・削除・テナント移動は行わない）
@@ -225,6 +228,129 @@ pub(crate) fn rewrite_rows_with_conversion_in_txn(
                     return Ok(ConversionOutcome::Failed(SqlSurfaceError::InvalidInput {
                         detail: "converted value is not valid for the new column type".to_string(),
                     }))
+                }
+            };
+            let encoded = encode_row(&RowInput {
+                tenant_id: &row.tenant_id,
+                visibility: row.visibility,
+                embedding: &row.embedding,
+                metadata: &metadata,
+            })
+            .map_err(|_| corrupt("failed to encode row during column rewrite"))?;
+            row_table.insert((tenant.as_str(), *id), encoded.as_slice())?;
+        }
+
+        if !full {
+            return Ok(ConversionOutcome::Done);
+        }
+        resume = Some(last);
+    }
+}
+
+/// `ALTER TABLE ... ADD COLUMN <列> ... GENERATED ALWAYS AS (<式>) STORED` の全行バックフィル
+/// （TABLE-50・RECOVER-11・Issue #3330）。`catalog::Storage::alter_table_add_generated_column_in_txn`
+/// が、新しい列をカタログへ書いた直後（同一 write txn・カタログのハンドルを手放した後）に呼ぶ。
+///
+/// 全テナント・全可視性の既存行を `old_schema`（列を足す前）で読み、末尾に `Value::Null` の新しい列を
+/// 足してから、単一の計算器（[`CompiledGeneratedColumns`]。INSERT・UPDATE の計算点と同じ実装で
+/// 第 2 の評価器は作らない）で新しい列 `new_index` だけを計算し、`new_schema` で再エンコードする。
+/// 既存の生成列の値は変えない。`PolicyContext` で絞らない理由と固定文言の方針は
+/// [`rewrite_rows_with_conversion_in_txn`] と同じ（共有資源への DDL。値・テナント・行 id を載せない）。
+/// 評価エラー（`22012`・`22003`・`23502` 等）は [`ConversionOutcome::Failed`] で返し、呼び出し元は
+/// commit せず txn を破棄する（カタログ・行とも不変）。変更ログ（`open_table_logged`）に捕捉されるため、
+/// レプリカ・PITR は計算済みの値をそのまま適用する。行数に上限は置かない（キーは
+/// [`REWRITE_BATCH_KEYS`] 単位で集める）。
+pub(crate) fn backfill_generated_column_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+    old_schema: &TableSchema,
+    new_schema: &TableSchema,
+    new_index: usize,
+) -> Result<ConversionOutcome, CatalogError> {
+    use crate::tenant::TenantWriteError as W;
+    let row_table_name = user_rows_table_name(table_name);
+    let mut row_table = match write_txn.open_table_logged(user_rows_table_def(&row_table_name)) {
+        Ok(t) => t,
+        // 行ストア未作成（既存行 0 件）。
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(ConversionOutcome::Done),
+        Err(e) => return Err(map_row_table_error(e)),
+    };
+    // 保存式の再解析・再束縛は行ループの外で 1 回だけ行う。漂流は破損（`XX000`）。
+    let Some(compiled) =
+        crate::sql::generated_column::CompiledGeneratedColumns::compile_any(new_schema)
+            .map_err(|_| corrupt("generated column definition is corrupt"))?
+    else {
+        return Err(corrupt("generated column definition is corrupt"));
+    };
+    let only = [new_index];
+
+    let mut resume: Option<(String, u64)> = None;
+    loop {
+        let mut keys: Vec<(String, u64)> = Vec::new();
+        keys.try_reserve_exact(REWRITE_BATCH_KEYS)
+            .map_err(|_| corrupt("failed to reserve row rewrite batch"))?;
+        {
+            let start = match &resume {
+                Some((t, id)) => Bound::Excluded((t.as_str(), *id)),
+                None => Bound::Unbounded,
+            };
+            for entry in row_table.range::<(&str, u64)>((start, Bound::Unbounded))? {
+                let (k, _v) = entry?;
+                let (tenant, id) = k.value();
+                keys.push((tenant.to_string(), id));
+                if keys.len() >= REWRITE_BATCH_KEYS {
+                    break;
+                }
+            }
+        }
+        let Some(last) = keys.last().cloned() else {
+            return Ok(ConversionOutcome::Done);
+        };
+        let full = keys.len() >= REWRITE_BATCH_KEYS;
+
+        for (tenant, id) in &keys {
+            // Issue #3314: 既存行の走査中も文の期限・切断検出を確認する（commit 前の `Err`。副作用ゼロ）。
+            crate::interrupt::check_reason().map_err(CatalogError::Interrupted)?;
+            let raw: Vec<u8> = match row_table.get((tenant.as_str(), *id))? {
+                Some(g) => g.value().to_vec(),
+                None => return Err(corrupt("row vanished during column rewrite")),
+            };
+            // 行キーとヘッダのテナントの整合もここで検証される（不整合は破損として固定文言）。
+            let row = decode_row_for_key(
+                tenant,
+                crate::storage::rowid::RowId::from_legacy_id(*id),
+                &raw,
+            )
+            .map_err(|_| corrupt("failed to decode row during column rewrite"))?;
+            // fast default の列は `fill_value` で補われた値として得られる。
+            let mut values = decode_scalar_columns(old_schema, &row.metadata)
+                .map_err(|_| corrupt("failed to decode row payload during column rewrite"))?;
+            if values.len() != new_index {
+                return Err(corrupt("column index out of range during column rewrite"));
+            }
+            values.push(Value::Null);
+            if let Err(e) = compiled.compute_values(*id, &row.embedding, &mut values, Some(&only)) {
+                return match e {
+                    W::SetExpressionEvaluationFailed(inner) => Ok(ConversionOutcome::Failed(
+                        redact_row_conversion_error(inner),
+                    )),
+                    // 行を符号化できない（行サイズの上限など）。値を含まない固定文言にする。
+                    W::Catalog(CatalogError::Invalid(_)) => Ok(ConversionOutcome::Failed(
+                        SqlSurfaceError::payload_too_large(
+                            "generated column value exceeds the row size limit",
+                        ),
+                    )),
+                    _ => Err(corrupt("failed to compute generated column")),
+                };
+            }
+            let metadata = match encode_scalar_columns(new_schema, &values) {
+                Ok(m) => m,
+                Err(_) => {
+                    return Ok(ConversionOutcome::Failed(
+                        SqlSurfaceError::payload_too_large(
+                            "generated column value exceeds the row size limit",
+                        ),
+                    ))
                 }
             };
             let encoded = encode_row(&RowInput {

@@ -331,11 +331,9 @@ fn unimplemented_conversions_are_rejected_not_evaluated() {
     let (core, _g) = setup("cast-unimpl");
     // 数値・文字列・BOOLEAN どうしの変換は #1591 で実装済み（`sql_cast_numeric_text_bool.rs`）。
     // 日時・JSON・UUID・BYTEA・配列は #1592 で実装済み（`sql_cast_datetime_json_misc.rs`）。
-    // ここには、種別を静的に決められない数値（関数・`id` 疑似列）の変換と、対応する要素型の無い
-    // 配列への変換が評価されずに拒否されることを固定する。
+    // ここには、種別を静的に決められない数値（関数・`id` 疑似列）の変換が評価されずに拒否される
+    // ことを固定する。
     for expr in [
-        "CAST('{1}' AS smallint[])",
-        "CAST(NULL AS character varying(3)[])",
         "CAST(abs(i4) AS integer)",
         "CAST(abs(i4) AS text)",
         "CAST(id AS integer)",

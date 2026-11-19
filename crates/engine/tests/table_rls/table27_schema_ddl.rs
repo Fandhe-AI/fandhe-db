@@ -216,6 +216,8 @@ fn ddl_permission_gate_applies_regardless_of_existence() {
     ok_as(&core, "alice", &mut allowed, "DROP SCHEMA exists1");
 }
 
+/// 未対応の形は `0A000`、構文違反は `42601`（要素つき `CREATE SCHEMA` の未対応の要素を含む）。
+// intentional: docs/design/schema-tenant-namespace.md
 #[test]
 fn syntax_table() {
     let (_p, _g, core) = open_fixture("sch-syntax");
@@ -224,7 +226,13 @@ fn syntax_table() {
         // `AUTHORIZATION <ロール>` は Issue #2236 で対応した（`sql40_object_owner.rs`。ロール不在は `42704`）。
         // 名前を省略して `CURRENT_USER` 等を指定する形は名前を決められないため `0A000`。
         "CREATE SCHEMA AUTHORIZATION CURRENT_USER",
-        "CREATE SCHEMA s CREATE TABLE x (a INT)",
+        // スキーマ要素のうち `CREATE TABLE`／`VIEW`／`SEQUENCE` は Issue #3286 で対応した
+        // （`table27_schema_elements.rs`）。それ以外の要素・要素側の `IF NOT EXISTS`・`IF NOT EXISTS` との併用は
+        // 黙って無視せず `0A000`（fail-closed。設計記録の Issue #3286 実装記録 D2・D3）。
+        "CREATE SCHEMA s CREATE INDEX i ON x (a)",
+        "CREATE SCHEMA s CREATE TABLE x (a INT) GRANT SELECT ON x TO r",
+        "CREATE SCHEMA s CREATE TABLE IF NOT EXISTS x (a INT)",
+        "CREATE SCHEMA IF NOT EXISTS s CREATE TABLE x (a INT)",
         // `DROP SCHEMA ... CASCADE` は Issue #1717 で対応した（`table27_schema_objects.rs`）。
         "DROP SCHEMA a, b",
     ] {
@@ -235,6 +243,8 @@ fn syntax_table() {
         "CREATE SCHEMA a.b",
         "CREATE SCHEMA 1x",
         "CREATE SCHEMA s extra",
+        "CREATE SCHEMA s CREATE",
+        "CREATE SCHEMA s CREATE TABLE",
         "DROP SCHEMA",
         "DROP SCHEMA a.b",
         "DROP SCHEMA 1x",
@@ -247,8 +257,10 @@ fn syntax_table() {
     ok_as(&core, "alice", &mut s, "DROP SCHEMA s RESTRICT");
 }
 
+/// SQL-80・Issue #3315: 要素なしの `CREATE SCHEMA`・`DROP SCHEMA`（RESTRICT）は共有 write txn に積まれ、
+/// COMMIT で確定・ROLLBACK で消える。
 #[test]
-fn schema_ddl_inside_explicit_transaction_is_rejected() {
+fn schema_ddl_inside_explicit_transaction_commits_or_rolls_back() {
     let (p, _g, core) = open_fixture("sch-txn");
     let mut s = allowed_session();
     ok_as(&core, "alice", &mut s, "CREATE SCHEMA existing");
@@ -256,9 +268,49 @@ fn schema_ddl_inside_explicit_transaction_is_rejected() {
         let mut txn = core.new_session_transaction();
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
             .expect("begin");
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")
+            .expect("rollback");
+    }
+    let core = reopen(core, &p);
+    assert_eq!(
+        code_as(&core, "alice", &mut s, "CREATE SCHEMA existing"),
+        "42P06"
+    );
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA s9");
+    ok_as(&core, "alice", &mut s, "DROP SCHEMA s9");
+
+    let mut txn = core.new_session_transaction();
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+        .expect("begin");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "DROP SCHEMA existing")
+        .expect("drop");
+    core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "COMMIT")
+        .expect("commit");
+    let core = reopen(core, &p);
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA existing");
+}
+
+/// 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE` は明示 Tx 内では未対応で、何も作らず何も消さない
+/// （Issue #3286・#3315）。
+// tracked: #3311
+#[test]
+fn schema_elements_and_cascade_inside_explicit_transaction_are_rejected() {
+    let (p, _g, core) = open_fixture("sch-txn-unsupported");
+    let mut s = allowed_session();
+    ok_as(&core, "alice", &mut s, "CREATE SCHEMA existing");
+    for sql in [
+        // 要素つきも拒否し、何も作らない（Issue #3286）。
+        "CREATE SCHEMA s9 CREATE TABLE x (a INT)",
+        "DROP SCHEMA existing CASCADE",
+    ] {
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "BEGIN")
+            .expect("begin");
         let err = core
             .execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, sql)
-            .expect_err("schema DDL inside a transaction must be rejected");
+            .expect_err("schema DDL form must be rejected inside a transaction");
         assert_eq!(err.wire_code(), "0A000", "{sql}");
         assert_eq!(txn.status(), TransactionStatus::Failed);
         core.execute_sql_in_txn(&ctx("alice"), &mut s, &mut txn, "ROLLBACK")

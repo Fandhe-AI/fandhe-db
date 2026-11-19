@@ -49,6 +49,13 @@ pub(crate) fn bind_policy_expr(
     preds: &[WherePredicate],
     schema: &TableSchema,
 ) -> Result<BoundPolicyExpr, SqlSurfaceError> {
+    // 行値比較は評価できるが、ポリシーへの保存・描画・RLS との組み合わせは未対応のため明示的に拒否する
+    // （Issue #3256。ポリシー式での行値比較の受け皿は親 Issue #3254）。
+    if crate::sql::row_compare::contains_row_compare(preds) {
+        return Err(SqlSurfaceError::feature_not_supported(
+            "row value comparison is not supported in a policy expression",
+        ));
+    }
     let names = collect_column_names(preds)?;
     if names
         .iter()

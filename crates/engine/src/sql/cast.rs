@@ -399,8 +399,9 @@ impl CastType {
     }
 
     /// 配列の変換先・変換元としての要素型（`CastType::Array(elem)` の `elem`）を、行内表現を
-    /// 持つ `ArrayElemType` へ写す。対応が無い要素（`smallint`・`time`・`timestamptz`・
-    /// `interval`・`varchar(n)`・`char(n)`・修飾子なしの `numeric`・ENUM）と、配列でない型は
+    /// 持つ `ArrayElemType` へ写す。`varchar`／`varchar(n)`／`char(n)`（Issue #3231）・`smallint`（Issue #3230）・`time`（Issue #3232）・`timestamptz`（Issue #3233）は対応した。
+    /// 対応が無い要素（`interval`・修飾子なしの `numeric`・
+    /// ENUM）と、配列でない型は
     /// `None`（束縛段が `0A000` にする。fail-closed）。
     pub fn array_elem_type(&self) -> Option<ArrayElemType> {
         let CastType::Array(elem) = self else {
@@ -409,12 +410,16 @@ impl CastType {
         Some(match elem.as_ref() {
             CastType::Text => ArrayElemType::Text,
             CastType::Bool => ArrayElemType::Bool,
+            CastType::Int2 => ArrayElemType::SmallInt,
             CastType::Int4 => ArrayElemType::Integer,
             CastType::Int8 => ArrayElemType::BigInt,
             CastType::Float4 => ArrayElemType::Real,
             CastType::Float8 => ArrayElemType::Double,
             CastType::Date => ArrayElemType::Date,
             CastType::Timestamp => ArrayElemType::Timestamp,
+            CastType::Time => ArrayElemType::Time,
+            CastType::Interval => ArrayElemType::Interval,
+            CastType::TimestampTz => ArrayElemType::TimestampTz,
             CastType::Uuid => ArrayElemType::Uuid,
             CastType::Numeric(Some((precision, scale))) => ArrayElemType::Numeric {
                 precision: *precision,
@@ -423,7 +428,11 @@ impl CastType {
             CastType::Bytea => ArrayElemType::Bytea,
             CastType::Json => ArrayElemType::Json,
             CastType::Jsonb => ArrayElemType::Jsonb,
-            _ => return None,
+            CastType::Varchar(len) => ArrayElemType::Varchar(*len),
+            CastType::Bpchar(n) => ArrayElemType::Bpchar(*n),
+            // 対応する要素型が無い CAST 型（束縛段が `0A000` にする）。CastType の追加時・
+            // 要素型の追加時にここで対応判断を強制する（Issue #3229）。
+            CastType::Numeric(None) | CastType::Array(_) => return None,
         })
     }
 
@@ -521,19 +530,102 @@ pub(crate) fn elem_cast_type(e: ArrayElemType) -> Option<CastType> {
     Some(match e {
         ArrayElemType::Text => CastType::Text,
         ArrayElemType::Bool => CastType::Bool,
+        ArrayElemType::SmallInt => CastType::Int2,
         ArrayElemType::Integer => CastType::Int4,
         ArrayElemType::BigInt => CastType::Int8,
         ArrayElemType::Real => CastType::Float4,
         ArrayElemType::Double => CastType::Float8,
         ArrayElemType::Date => CastType::Date,
         ArrayElemType::Timestamp => CastType::Timestamp,
+        ArrayElemType::Time => CastType::Time,
+        ArrayElemType::Interval => CastType::Interval,
+        ArrayElemType::TimestampTz => CastType::TimestampTz,
         ArrayElemType::Uuid => CastType::Uuid,
         ArrayElemType::Numeric { precision, scale } => CastType::Numeric(Some((precision, scale))),
         ArrayElemType::Bytea => CastType::Bytea,
         ArrayElemType::Json => CastType::Json,
         ArrayElemType::Jsonb => CastType::Jsonb,
-        ArrayElemType::Enum => return None,
+        ArrayElemType::Varchar(len) => CastType::Varchar(len),
+        ArrayElemType::Bpchar(n) => CastType::Bpchar(n),
+        // `BIT(n)` 要素はスカラー BIT と同じく CAST の型を持たない（Issue #3235）。呼び出し側は
+        // `None` を ENUM と取り違えないこと（[`array_source_kind`] が `SourceKind::Bit` へ振る）。
+        ArrayElemType::Enum | ArrayElemType::Bit(_) => return None,
     })
+}
+
+/// 配列の要素型から CAST の変換元種別を決める。要素型を `CastType` で表せない配列のうち、
+/// `BIT(n)` 要素はスカラー BIT と同じ `SourceKind::Bit`（CAST は `0A000`）、残り（ENUM）だけが
+/// `Array(None)` になる。`Array(None)` は呼び出し側で ENUM 配列として扱われるため、BIT 配列を
+/// 取り違えて通さない（Issue #3235）。
+fn array_source_kind(elem: Option<ArrayElemType>) -> SourceKind {
+    match elem {
+        Some(ArrayElemType::Bit(_)) => SourceKind::Bit,
+        Some(e) => SourceKind::Array(elem_cast_type(e)),
+        None => SourceKind::Array(None),
+    }
+}
+
+/// 型なしリテラル（文字列・`NULL`）を `BIT(n)[]` として束縛する（Issue #3235。配列どうしの等値比較の
+/// 相手側。`BIT(n)` 要素は [`CastType`] を持たないため [`bind_string_literal_as`] を通れない）。
+/// 入力関数は実行時と同じ `CastFn`（テキスト → 配列）で、形式不正・長さ不一致は束縛時に報告する。
+pub(super) fn bind_bit_array_literal(
+    lit: &Expr,
+    elem: ArrayElemType,
+    node_budget: &mut usize,
+) -> Result<BoundExpr, SqlSurfaceError> {
+    match lit {
+        Expr::Null => {
+            charge_node(node_budget)?;
+            Ok(BoundExpr::Null)
+        }
+        Expr::String(s) => {
+            if crate::sql::udf_call::in_check_binding() {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "array operators are not supported in a CHECK constraint".to_string(),
+                });
+            }
+            if s.len() > crate::row_codec::MAX_TEXT_FIELD_LEN as usize {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "string literal exceeds the maximum TEXT field length",
+                ));
+            }
+            charge_node(node_budget)?;
+            charge_node(node_budget)?;
+            let f = CastFn {
+                from: CastSrc::Text,
+                to: CastDst::Array(elem),
+            };
+            crate::sql::cast_value::apply_cast(
+                f,
+                crate::sql::udf_call::ExprValue::Text(std::borrow::Cow::Borrowed(s)),
+            )?;
+            Ok(cast_node(f, BoundExpr::Text(s.to_string())))
+        }
+        _ => Err(SqlSurfaceError::FeatureNotSupported {
+            detail: "array predicates on this element type are not supported".to_string(),
+        }),
+    }
+}
+
+/// 束縛済みの配列式が `BIT(n)` 要素の配列なら、その要素型（`n` つき）を返す（Issue #3235）。
+/// 要素の CAST の型を持たない `BIT(n)[]` は [`source_cast_kind`] では `SourceKind::Bit` になり
+/// 要素型を取り出せないため、添字（`v[1]`）の束縛がこの関数で `n` を得る。
+pub(super) fn bit_array_elem(
+    bound: &BoundExpr,
+    schema: Option<&TableSchema>,
+) -> Option<ArrayElemType> {
+    let elem = match bound {
+        BoundExpr::ArrayColumnRef { index } => {
+            match schema.and_then(|s| s.columns.get(*index)).map(|c| &c.ty) {
+                Some(ColumnType::Array(at)) => at.elem(),
+                _ => return None,
+            }
+        }
+        BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => *elem,
+        BoundExpr::ArrayFn(f) => f.elem?,
+        _ => return None,
+    };
+    matches!(elem, ArrayElemType::Bit(_)).then_some(elem)
 }
 
 pub(crate) fn kind_of_column(ty: &ColumnType) -> Option<CastKind> {
@@ -720,20 +812,20 @@ pub(super) fn source_cast_kind(
         // 配列を生成するのは配列列の参照（CAST の被演算子の位置）と CAST の結果（上で処理済み）だけ。
         ExprType::Array => match bound {
             BoundExpr::ArrayColumnRef { index } => {
-                SourceKind::Array(schema.and_then(|s| s.columns.get(*index)).and_then(|c| {
+                array_source_kind(schema.and_then(|s| s.columns.get(*index)).and_then(|c| {
                     match &c.ty {
-                        ColumnType::Array(at) => elem_cast_type(at.elem()),
+                        ColumnType::Array(at) => Some(at.elem()),
                         _ => None,
                     }
                 }))
             }
             // 配列コンストラクタ・スライスの結果は束縛結果が持つ要素型（TABLE-35・Issue #1602）。
             BoundExpr::ArrayConstructor { elem, .. } | BoundExpr::ArraySlice { elem, .. } => {
-                SourceKind::Array(elem_cast_type(*elem))
+                array_source_kind(Some(*elem))
             }
             // 配列を返す配列関数の結果も束縛結果が持つ共通の要素型（Issue #1604）。
             BoundExpr::ArrayFn(f) => match f.elem {
-                Some(elem) => SourceKind::Array(elem_cast_type(elem)),
+                Some(elem) => array_source_kind(Some(elem)),
                 None => SourceKind::Array(None),
             },
             _ => SourceKind::Array(None),
@@ -1022,7 +1114,7 @@ fn cast_dst(target: &CastType) -> Option<CastDst> {
 }
 
 /// 変換ノードを組み立てる（引数 1 個の `BuiltinFn::Cast`）。
-fn cast_node(f: CastFn, arg: BoundExpr) -> BoundExpr {
+pub(crate) fn cast_node(f: CastFn, arg: BoundExpr) -> BoundExpr {
     BoundExpr::Builtin {
         f: BuiltinFn::Cast(f),
         args: vec![arg],
@@ -1165,6 +1257,21 @@ pub(super) fn bind_array_assignment(
     let unsupported = |detail: &str| SqlSurfaceError::FeatureNotSupported {
         detail: detail.to_string(),
     };
+    // `BIT(n)[]` 列（Issue #3235）。要素の CAST が無いため、宣言（要素の長さ・次元数・要素数上限）が
+    // 同一の `BIT(n)[]` 列の参照だけを恒等として通し、他の式（長さ違い・他の型の配列）は
+    // `0A000`（fail-closed）にする。
+    if matches!(target.elem(), ArrayElemType::Bit(_)) {
+        if let BoundExpr::ArrayColumnRef { index } = &bound {
+            if let Some(ColumnType::Array(src)) = schema.columns.get(*index).map(|c| &c.ty) {
+                if src == target {
+                    return Ok(bound);
+                }
+            }
+        }
+        return Err(unsupported(
+            "assigning this array expression to a bit array column is not supported",
+        ));
+    }
     let Some(tgt_ty) = elem_cast_type(target.elem()) else {
         return Err(unsupported(
             "assigning an array expression to this column type is not supported",
@@ -1186,6 +1293,14 @@ pub(super) fn bind_array_assignment(
             "column cannot be assigned an array with a different element type",
         ));
     }
+    // `VARCHAR(n)`／`CHAR(n)` 要素の長さは変換ノードでは扱わない。明示 CAST は n 超過を黙って
+    // 切り詰めるが、代入は `22001`（超過部分が半角空白のみなら切り詰め）・`CHAR(n)` は空白詰めで
+    // あり、評価後の列値化（`sql::set_expr::expr_value_to_column_value` の
+    // `normalize_char_array_value`）が担う（Issue #3231。`bind_scalar_assignment` のスカラーと同じ分担）。
+    let tgt_ty = match tgt_ty {
+        CastType::Varchar(Some(_)) | CastType::Bpchar(_) => CastType::Text,
+        other => other,
+    };
     let src_arr = CastType::Array(Box::new(src_ty));
     let tgt_arr = CastType::Array(Box::new(tgt_ty));
     let (Some(src), Some(dst)) = (
@@ -1767,8 +1882,8 @@ mod tests {
         assert_eq!(CastType::Bytea.expr_type(), Some(ExprType::Bytea));
         let arr = |e: CastType| CastType::Array(Box::new(e));
         assert_eq!(arr(CastType::Int4).expr_type(), Some(ExprType::Array));
+        assert_eq!(arr(CastType::Int2).expr_type(), Some(ExprType::Array));
         // 対応する要素型の無い配列は式の型を持たない（束縛段が `0A000` にする）。
-        assert_eq!(arr(CastType::Int2).expr_type(), None);
         assert_eq!(arr(CastType::Numeric(None)).expr_type(), None);
     }
 
@@ -1778,12 +1893,16 @@ mod tests {
         for (elem, want) in [
             (CastType::Text, ArrayElemType::Text),
             (CastType::Bool, ArrayElemType::Bool),
+            (CastType::Int2, ArrayElemType::SmallInt),
             (CastType::Int4, ArrayElemType::Integer),
             (CastType::Int8, ArrayElemType::BigInt),
             (CastType::Float4, ArrayElemType::Real),
             (CastType::Float8, ArrayElemType::Double),
             (CastType::Date, ArrayElemType::Date),
             (CastType::Timestamp, ArrayElemType::Timestamp),
+            (CastType::Time, ArrayElemType::Time),
+            (CastType::Interval, ArrayElemType::Interval),
+            (CastType::TimestampTz, ArrayElemType::TimestampTz),
             (CastType::Uuid, ArrayElemType::Uuid),
             (
                 CastType::Numeric(Some((10, 2))),
@@ -1795,22 +1914,17 @@ mod tests {
             (CastType::Bytea, ArrayElemType::Bytea),
             (CastType::Json, ArrayElemType::Json),
             (CastType::Jsonb, ArrayElemType::Jsonb),
+            // `varchar`／`varchar(n)`／`char(n)` は専用の要素型（Issue #3231）。
+            (CastType::Varchar(None), ArrayElemType::Varchar(None)),
+            (CastType::Varchar(Some(3)), ArrayElemType::Varchar(Some(3))),
+            (CastType::Bpchar(3), ArrayElemType::Bpchar(3)),
         ] {
             assert_eq!(arr(elem.clone()).array_elem_type(), Some(want), "{elem:?}");
             assert!(arr(elem).result_column_type().is_some());
         }
-        for elem in [
-            CastType::Int2,
-            CastType::Time,
-            CastType::TimestampTz,
-            CastType::Interval,
-            CastType::Varchar(Some(3)),
-            CastType::Bpchar(3),
-            CastType::Numeric(None),
-        ] {
-            assert_eq!(arr(elem.clone()).array_elem_type(), None, "{elem:?}");
-            assert_eq!(arr(elem).result_column_type(), None);
-        }
+        let elem = CastType::Numeric(None);
+        assert_eq!(arr(elem.clone()).array_elem_type(), None, "{elem:?}");
+        assert_eq!(arr(elem).result_column_type(), None);
         assert_eq!(CastType::Int4.array_elem_type(), None);
     }
 
@@ -1932,5 +2046,41 @@ mod tests {
                 .wire_code(),
             "54000"
         );
+    }
+
+    /// Issue #3235: `BIT(n)` 要素の配列は CAST の型を持たず、変換元の種別は `SourceKind::Bit`
+    /// （CAST は `0A000`）になる。`Array(None)` に落とすと ENUM 配列として扱われてしまう。
+    #[test]
+    fn bit_array_source_kind_is_bit_not_enum() {
+        assert_eq!(
+            array_source_kind(Some(ArrayElemType::Bit(4))),
+            SourceKind::Bit
+        );
+        assert_eq!(
+            array_source_kind(Some(ArrayElemType::Enum)),
+            SourceKind::Array(None)
+        );
+        assert_eq!(array_source_kind(None), SourceKind::Array(None));
+        assert_eq!(
+            array_source_kind(Some(ArrayElemType::Integer)),
+            SourceKind::Array(Some(CastType::Int4))
+        );
+    }
+
+    /// Issue #3229: 配列要素型 ⇔ CAST 型の写像が全要素型で往復する（Enum・Bit は対象外で `None`）。
+    #[test]
+    fn array_elem_cast_mapping_roundtrips_for_all_kinds() {
+        for elem in ArrayElemType::ALL_KINDS {
+            if matches!(elem, ArrayElemType::Enum | ArrayElemType::Bit(_)) {
+                assert!(elem_cast_type(elem).is_none());
+                assert!(crate::sql::cast_value::elem_cast_src(elem).is_none());
+                assert!(crate::sql::cast_value::elem_cast_dst(elem).is_none());
+                continue;
+            }
+            let ct = elem_cast_type(elem).expect("non-enum element has a cast type");
+            assert_eq!(CastType::Array(Box::new(ct)).array_elem_type(), Some(elem));
+            assert!(crate::sql::cast_value::elem_cast_src(elem).is_some());
+            assert!(crate::sql::cast_value::elem_cast_dst(elem).is_some());
+        }
     }
 }

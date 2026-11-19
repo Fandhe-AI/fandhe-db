@@ -51,14 +51,14 @@ create-issue-tree requirements.md --granularity 4h
 入力テキストまたはファイルから要件を読み込み、以下の観点でタスクを分解する。
 
 - **粒度基準: 1 issue は実装 `${GRANULARITY}`（既定 2h・`--granularity` で変更可）程度に収める。** 超えると判断した場合は sub-issue に再分解する
-- **人手タスクの判定:** 依頼者の回答・レビュー、対象者の聞き取り、実機・スクリーンリーダー操作、承認など自動実装できないものは `owner:human`（人手のみ）、人と Claude の協働は `owner:joint` とする。判定が曖昧なものは下の確認提示でユーザーに聞く。ラベルは付けた issue 本人にだけ効き、子孫へは継承されない。`implement-issue-tree` の `skipLabels` で自動実装の対象外にできる（Step 5 の案内と次のアクション参照）
+- **人手タスクの判定:** 依頼者の回答・レビュー、対象者の聞き取り、実機・スクリーンリーダー操作、承認など自動実装できないものは `owner:human`（人手のみ）、人とエージェントの協働は `owner:joint` とする。判定が曖昧なものは下の確認提示でユーザーに聞く。ラベルは付けた issue 本人にだけ効き、子孫へは継承されない。`implement-issue-tree` の `skipLabels` で自動実装の対象外にできる（Step 5 の案内と次のアクション参照）
 
-`--granularity` の値は代入前に Claude 側でも同じ正規表現（`^[1-9][0-9]*h$`）で検証し、
+`--granularity` の値は代入前にエージェント側でも同じ正規表現（`^[1-9][0-9]*h$`）で検証し、
 不一致なら**このフェンスを実行せず**ユーザーに再指定を求める（未信頼値を生成済みシェルへ
 埋め込まない）。優先順位は使い方節のとおり、**`--granularity` > ルートのマーカー > 既定 2h** の順。
 
 ```bash
-# --granularity で渡された時間を実際の値で代入する（実行時に Claude が置き換える）
+# --granularity で渡された時間を実際の値で代入する（実行時にエージェントが置き換える）
 # 例: --granularity 4h が指定された場合 → GRANULARITY_ARG="4h" / 未指定の場合は空文字
 GRANULARITY_ARG="<--granularity で渡された時間（未指定なら空文字）>"
 # --root で渡された Issue 番号（未指定なら空文字）。Step 2.5 で ROOT_NUMBER として
@@ -93,7 +93,7 @@ fi
 # 許可する構文は正整数 + h のみ（例: 1h / 2h / 4h）。引用符・空白・コマンド置換・0h・単位なしは
 # ここで拒否する（ROOT_GRANULARITY はマーカー抽出時点で同じ正規表現を通しているが、
 # GRANULARITY_ARG はユーザー入力の生値のため、代入元によらずこの検証を必ず通す）
-if ! printf '%s' "${GRANULARITY}" | grep -qE '^[1-9][0-9]*h$'; then
+if ! printf '%s' "${GRANULARITY}" | grep -qE '(^[1-9][0-9]*h$)'; then
   echo "エラー: --granularity の値 '${GRANULARITY}' は不正です（許可: 正整数+h、例 2h）。中止します。"
   exit 1
 fi
@@ -107,7 +107,7 @@ echo "粒度基準: ${GRANULARITY}（由来: ${GRANULARITY_SOURCE}）"
 - 各タスクの依存関係・実行順を把握する。人手タスクに依存する実装タスクは、本文に `## 前提` 節を置いて行頭に `- #N` を書く（Step 5 参照）。そのため人手 issue を先に起票する
 - タスク数を集計し、Phase 分割の要否を判断する（目安: 10 件超で Phase 分割を検討）
 
-分解結果をユーザーに提示し、Phase 構成・issue 数について確認を取る。  
+分解結果をユーザーに提示し、Phase 構成・issue 数について確認する。明示的な返答を待つ。「Issue ツリーを作って」等、このスキルを起動する依頼そのものは、この確認の承認にならない。起動時の指示にこの確認を省くことの明示（例: 「確認なしで進めてよい」）が含まれている場合に限り、確認を省いて続行してよい。承認が無く対話もできない環境では、書き込みをせず確認事項を報告して止める。起動時の指示に Phase 構成・issue 数を了承する旨（例: 「この構成で起票して」）があれば、この確認と上記の曖昧な人手タスクの確認だけを承認済みとみなす。milestone の変更・指定や Phase 親の再利用などの以降の確認は、それぞれの箇所の定めに従う（了承は引き継がない）。  
 `--phase` オプションが指定されている場合は該当 Phase のタスクのみ対象とする。
 
 ### Step 2: Phase 構成を設計する
@@ -131,7 +131,7 @@ echo "粒度基準: ${GRANULARITY}（由来: ${GRANULARITY_SOURCE}）"
 書き換えてから中断する事故を防ぐ。Step 3 側では再代入・再検証しない）。
 
 ```bash
-# --root で渡された Issue 番号を実際の値で代入する（実行時に Claude が置き換える）
+# --root で渡された Issue 番号を実際の値で代入する（実行時にエージェントが置き換える）
 # 例: --root 123 が指定された場合 → ROOT_NUMBER="123" / --root 未指定の場合 → ROOT_NUMBER=""
 ROOT_NUMBER="<--root で渡された Issue 番号（未指定なら空文字）>"
 
@@ -160,7 +160,8 @@ MILESTONE_COUNT=$(gh api "repos/{owner}/{repo}/milestones?state=all" --jq 'lengt
 
 - `--milestone` が指定されている場合: その値をそのまま `MILESTONE` として使用する
   （`--root` も同時指定されている場合、ルート側の milestone より `--milestone` を優先する。
-  ルート側と異なる値の場合は、ルートの milestone も合わせて更新してよいかユーザーに確認する。
+  ルート側と異なる値の場合は、ルートの milestone も合わせて更新してよいかユーザーに確認する
+  （起動時の指示にルートの milestone の変更・継承の指定があるときだけ確認を省ける。それ以外は対話なら確認し、非対話なら更新せず報告して止める）。
   更新しないと回答された場合はツリー内で milestone が混在する点を伝えたうえで続行する）
 - `--milestone` 未指定かつ `--root` 指定時: 既存ルートの milestone を自動継承する
   （milestone が取得できた場合のみユーザーへの確認は不要）
@@ -175,7 +176,7 @@ MILESTONE_COUNT=$(gh api "repos/{owner}/{repo}/milestones?state=all" --jq 'lengt
   冒頭の非運用ガードが先に働くため、この確認には到達しない）。
 
 - どちらも未指定の場合、または `--root` 指定時に継承すべき milestone が空だった場合:
-  milestone を割り当てるかユーザーに確認する。
+  milestone を割り当てるかユーザーに確認する（起動時の指示に milestone の指定または不要の明示があれば確認を省ける。無ければ対話なら聞き、非対話では書き込まずに報告して止める）。
   割り当てる場合はオープン中の milestone 一覧を提示して選ばせるか、新規 milestone 名の
   入力を受け付けて `MILESTONE` に設定する。割り当てないと回答されたら `MILESTONE` は
   空のまま Step 3 以降へ進む（issue は milestone なしで作成される）。
@@ -187,7 +188,7 @@ MILESTONE_COUNT=$(gh api "repos/{owner}/{repo}/milestones?state=all" --jq 'lengt
   ユーザーが一覧にない新規 milestone 名を入力した場合、`gh issue create --milestone` は
   既存の milestone 名しか受け付けないため、使用前に milestone 自体を作成する。
   同名の closed milestone が既に存在すると作成が 422（already_exists）で失敗するため、
-  その場合は reopen するか別名にするかをユーザーに確認する。
+  その場合は reopen するか別名にするかをユーザーに確認する（選択なので、起動時の指示に指定が無ければ対話なら聞き、非対話では作成せず報告して止める）。
 
   ```bash
   gh api --method POST "repos/{owner}/{repo}/milestones" -f "title=${MILESTONE}"
@@ -243,7 +244,7 @@ ROOT_URL=$(gh issue create "${ROOT_ARGS[@]}" \
 - implement-issue-tree が post-order DFS で消化可能な構造を維持する
 EOF
 )")
-ROOT_NUMBER=$(printf '%s' "${ROOT_URL}" | grep -oE '[0-9]+$')
+ROOT_NUMBER=$(printf '%s' "${ROOT_URL}" | grep -oE '([0-9]+$)')
 echo "ルート issue: ${ROOT_NUMBER}"
 ```
 
@@ -301,7 +302,7 @@ fi
 ```
 
 タイトル規約が `feat(phase-N):` と異なるツリーでは上記の自動判定に頼らず、候補をユーザーに
-提示して再利用すべき Phase 親を確認する。
+提示して再利用すべき Phase 親を確認する（起動時の指示に指定が無ければ対話なら聞き、非対話では書き込まずに報告して止める）。
 
 `PHASE_NUMBER` が空（既存の Phase 親がない）場合のみ、以下で新規作成してルートへ紐付ける。
 
@@ -326,7 +327,7 @@ PHASE_URL=$(gh issue create "${PHASE_ARGS[@]}" \
 | (子 issue 作成後に更新) | | |
 EOF
 )")
-PHASE_NUMBER=$(printf '%s' "${PHASE_URL}" | grep -oE '[0-9]+$')
+PHASE_NUMBER=$(printf '%s' "${PHASE_URL}" | grep -oE '([0-9]+$)')
 
 # ルートへ紐付け。sub_issue_id は issue 番号ではなく database id を渡す（GitHub sub-issues API 仕様）
 PHASE_ID=$(gh api "repos/{owner}/{repo}/issues/${PHASE_NUMBER}" --jq '.id')
@@ -365,7 +366,7 @@ CHILD_URL=$(gh issue create "${CHILD_ARGS[@]}" \
 - [ ] 条件2
 EOF
 )")
-CHILD_NUMBER=$(printf '%s' "${CHILD_URL}" | grep -oE '[0-9]+$')
+CHILD_NUMBER=$(printf '%s' "${CHILD_URL}" | grep -oE '([0-9]+$)')
 
 # Phase 親へ紐付け（sub_issue_id は database id）
 CHILD_ID=$(gh api "repos/{owner}/{repo}/issues/${CHILD_NUMBER}" --jq '.id')
@@ -380,7 +381,7 @@ if [[ -n "${MILESTONE}" ]]; then
   SUB_ARGS+=(--milestone "${MILESTONE}")
 fi
 SUB_URL=$(gh issue create "${SUB_ARGS[@]}" --body "...")
-SUB_NUMBER=$(printf '%s' "${SUB_URL}" | grep -oE '[0-9]+$')
+SUB_NUMBER=$(printf '%s' "${SUB_URL}" | grep -oE '([0-9]+$)')
 
 SUB_ID=$(gh api "repos/{owner}/{repo}/issues/${SUB_NUMBER}" --jq '.id')
 gh api \
@@ -593,7 +594,11 @@ gh api "repos/{owner}/{repo}/issues/${PHASE_NUMBER}/sub_issues?per_page=100" \
 - ページネーション: sub-issues が 100 件を超える場合は `per_page=100&page=N` でページングして全件取得する
 - Step 6 の本文生成は新規作成が `scripts/create-root-body.sh`、`--root` マージが `scripts/merge-root-body.sh`。本文生成ロジックを SKILL.md へ書き戻さない（肥大とヘルパー重複の再発防止）
 - シェルコマンドの変数は必ず `"${var}"` でクォートする（コマンドインジェクション対策）
-- **`gh issue create` は `--json` 非対応**。issue URL を stdout に出力するため、`| grep -oE '[0-9]+$'` で末尾の番号を抽出して変数に保持する
+- **`gh issue create` は `--json` 非対応**。issue URL を stdout に出力するため、`| grep -oE '([0-9]+$)'` で末尾の番号を抽出して変数に保持する
 - **sub_issues API の `sub_issue_id` は issue 番号ではなく database id**（GitHub 仕様）。`gh api "repos/{owner}/{repo}/issues/<number>" --jq '.id'` で id を取得してから POST する。番号をそのまま渡すと誤った issue を紐付ける／404 になる
 - 人手タスクは `owner:human` / `owner:joint` ラベルで区別し、依存する実装 issue には `## 前提` 節で `- #N` を書く。`implement-issue-tree` は `skipLabels` 付きで呼ぶ（Step 1・Step 5 参照）
 - phase ラベルは Step 4 冒頭の `gh label create "phase:${PHASE}" --color "0075ca"` で issue 作成より前に必ず作成する（作成済みリポジトリでは no-op）
+
+## sandbox 環境での実行
+
+このスキルはネットワーク越しの GitHub 操作（`gh issue create` / `gh label create` / `gh api .../sub_issues`）を必須とする。該当コマンドはコマンド単位で sandbox 無効にして実行する。ネットワーク遮断を解除できない環境では実行できない。`.git`・`.agents`・`.codex` へ書く手順は無い。Step 6 のスクリプトは本文生成のために一時ファイルを `mktemp` で作り（OS の一時ディレクトリ＝ワークスペース外への書き込み）、成否によらず削除する。`codex exec` では昇格要求が出ないため、ネットワークを使えずコマンドを実行できなかったときは、書き込みをせず、できなかった旨を報告して止める。

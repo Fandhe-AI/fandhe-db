@@ -7,7 +7,7 @@
 //! 行ごとの順序（PostgreSQL と同じ: BEFORE → 制約検査）:
 //! 1. redb の表ハンドルを 1 つも開かずにトリガを連鎖実行する（トリガ本体が同じ write txn へ再入しても
 //!    排他を壊さない。実行モデルの D5）。`NULL` 返却ならその行は書かず次の行へ
-//! 2. 最終 NEW の NOT NULL 検査（`23502`。BEFORE が補えるよう、従来の事前検査〔省略列の
+//! 2. 生成列の計算（Issue #3329。BEFORE の後に全生成列を計算し直す）→ 最終 NEW の NOT NULL 検査（`23502`。BEFORE が補えるよう、従来の事前検査〔省略列の
 //!    `MissingNotNull`〕はトリガ経路では遅らせてここで行う）
 //! 3. VECTOR 列の次元検査 → 行 codec の encode → 行ストアへ 1 行書く
 //! 4. その 1 行の制約検査（索引同期・CHECK・式索引・部分索引・UNIQUE・GIN・ビュー。FK は除く）
@@ -23,8 +23,8 @@
 //! 呼び出し元は `tenant.rs` のみ。エラーは `TenantWriteError`（トリガ由来は `TriggerFailed`）。
 
 use super::{
-    encode_row, insert_unique_row, row_key, user_rows_table_def, user_rows_table_name, RowId,
-    TenantWriteError, WriteTarget,
+    encode_row, insert_unique_row, row_key, user_rows_table_def, user_rows_table_name, CapturedRow,
+    CapturedRowOrigin, ReturningProjectFn, RowId, TenantWriteError, WriteTarget,
 };
 use crate::catalog::{map_row_table_error, CatalogError, ColumnType, TableSchema};
 use crate::policy::PolicyContext;
@@ -46,6 +46,11 @@ const ROW_ENCODE_MISMATCH: &str = "trigger function returned a row that does not
 /// `writes` は文ごとに 1 個、呼び出し元が作って BEFORE STATEMENT から共有する（文トリガ・行トリガが
 /// 書いた表をまとめて遅延 FK の確定対象にするため。Issue #1726）。BEFORE STATEMENT は呼び出し元が
 /// 台帳の記録の後・SEQUENCE の採番の前に発火済みで、本関数は AFTER STATEMENT までを担う。
+///
+/// `project`（`RETURNING`。Issue #3192）が `Some` なら、BEFORE 連鎖・制約検査を通って書いた各行の
+/// 最終 NEW を、行ごとに commit 前・この write txn の中で 1 回ずつ渡す（`NULL` 返却でスキップした行は
+/// 渡さない。AFTER の書き換えは投影に影響しない）。表ハンドルは行ごとのブロックで閉じ済みのため、
+/// 投影コールバックは再入の不変条件を壊さない。`Err` は txn の abort（行・台帳・トリガの書き込みは残らない）。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_rows_with_triggers(
     write_txn: &redb::WriteTransaction,
@@ -57,6 +62,8 @@ pub(super) fn write_rows_with_triggers(
     rows: &[(RowId, &[Value])],
     plan: &InsertTriggerPlan<'_>,
     writes: &TriggerWriteHandle<'_>,
+    mut project: Option<&mut ReturningProjectFn<'_>>,
+    generated: Option<&crate::sql::generated_column::CompiledGeneratedColumns>,
 ) -> Result<(Vec<RowId>, bool), TenantWriteError> {
     // 行数が 0 でも `row_security = off` の拒否を開始時点で適用する（RLS-13・Issue #2278）。
     crate::sql::policy_eval::reject_row_security_off_in_txn(write_txn, ctx.tenant_id(), table)?;
@@ -71,7 +78,7 @@ pub(super) fn write_rows_with_triggers(
         ))
     })?;
     // AFTER ROW に渡す最終 NEW（書いた順）。確保は行数（呼び出し元がバッチ上限で検証済み）に抑える。
-    let mut after_queue: Vec<Vec<Value>> = Vec::new();
+    let mut after_queue: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
     if !plan.after.is_empty() {
         after_queue.try_reserve_exact(rows.len()).map_err(|_| {
             TenantWriteError::Storage(crate::storage::StorageError::Codec(
@@ -79,6 +86,8 @@ pub(super) fn write_rows_with_triggers(
             ))
         })?;
     }
+    // 行ループの間は、トリガ本体が同じ表の行を消せない（`trigger::row_loop`。D6 の暫定ガード）。
+    let row_loop_guard = crate::trigger::row_loop::RowLoopGuard::enter(ctx.tenant_id(), table);
     for (row_id, values) in rows {
         crate::interrupt::check().map_err(TenantWriteError::TriggerFailed)?;
         // 表ハンドルを開く前に発火する（再入の不変条件）。
@@ -91,9 +100,18 @@ pub(super) fn write_rows_with_triggers(
             values.to_vec(),
         )
         .map_err(TenantWriteError::TriggerFailed)?;
-        let Some(final_row) = fired else {
+        let Some(mut final_row) = fired else {
             continue;
         };
+        // 生成列（TABLE-50・Issue #3329）は BEFORE ROW の連鎖の後に、最終 NEW の通常列から全生成列を計算する
+        // （トリガが NEW の生成列へ代入しても計算結果で上書きする）。NOT NULL 検査・次元検査・encode より前。
+        super::trigger_dml::apply_generated_columns(
+            generated,
+            schema,
+            row_id.legacy_id(),
+            &mut final_row,
+            None,
+        )?;
         for (col, value) in schema.columns.iter().zip(final_row.iter()) {
             if !col.nullable && matches!(value, Value::Null) {
                 return Err(TenantWriteError::Catalog(
@@ -138,10 +156,34 @@ pub(super) fn write_rows_with_triggers(
             crate::constraint::RowPolicyWrite::Insert,
         )?;
         written.push(*row_id);
+        if let Some(project) = project.as_mut() {
+            project(&CapturedRow {
+                id: row_id.legacy_id(),
+                tenant_id: ctx.tenant_id().to_string(),
+                visibility,
+                origin: CapturedRowOrigin::Inserted,
+                values: final_row.clone(),
+            })?;
+        }
+        // AFTER ROW の WHEN は行の変更時に評価し、TRUE のトリガだけをキューへ積む（D7）。
         if !plan.after.is_empty() {
-            after_queue.push(final_row);
+            let selected = crate::trigger::fire::select_after_row(
+                plan.runtime,
+                writes,
+                table,
+                schema,
+                &plan.after,
+                crate::trigger::call::TriggerOp::Insert,
+                None,
+                &final_row,
+            )
+            .map_err(TenantWriteError::TriggerFailed)?;
+            if !selected.is_empty() {
+                after_queue.push((final_row, selected));
+            }
         }
     }
+    drop(row_loop_guard);
     if !written.is_empty() {
         crate::constraint::enforce_foreign_keys_for_rows_in_txn(
             write_txn,
@@ -149,17 +191,20 @@ pub(super) fn write_rows_with_triggers(
             schema,
             ctx.tenant_id(),
             &written,
-            target.fk_check_mode(),
+            target.insert_fk_check_mode(table),
         )?;
     }
     // AFTER ROW（段 6）。変更の順（書いた順）× トリガ名のバイト順。
-    for new_row in &after_queue {
-        crate::trigger::fire::fire_after_row_insert(
+    for (new_row, selected) in &after_queue {
+        crate::trigger::fire::invoke_after_row(
             plan.runtime,
             writes,
             table,
             schema,
             &plan.after,
+            selected,
+            crate::trigger::call::TriggerOp::Insert,
+            None,
             new_row,
         )
         .map_err(TenantWriteError::TriggerFailed)?;

@@ -3,7 +3,7 @@
 //! 役割: 構造検証済みの文（`sql::allowlist::ValidatedGrantRevoke`）を権限カタログ（`catalog::privilege` の
 //! `Storage::apply_acl_changes`）への書き込み要求へ写し、`AclChangeError` を SQLSTATE の契約へ写像する。
 //! 呼び出し元は `core.rs` の `ParsedSql::GrantRevoke` 腕で、[`require_grant_principal`]（現在ロールの束縛。
-//! 未束縛は対象・ロールの有無を問わず `42501`）と明示トランザクション内の `0A000` を通過した後にだけ来る。
+//! 未束縛は対象・ロールの有無を問わず `42501`）を通過した後にだけ来る（明示トランザクション内は共有 write txn の上で同じ本体を実行する。Issue #3316）。
 //!
 //! 付与者は現在ロール（`SessionState::current_role_id`）。付与できるのは付与者が持つ GRANT OPTION の範囲
 //! だけで、DDL 権限ゲートを通過した主体は所有者の機構（#2236）までの代替として「所有者相当」に扱う。
@@ -73,6 +73,21 @@ pub(crate) fn execute_grant_revoke(
     session: &SessionState,
     stmt: &ValidatedGrantRevoke,
 ) -> Result<GrantRevokeOutcome, SqlSurfaceError> {
+    execute_grant_revoke_in(storage, None, tenant_id, session, stmt).map(|(outcome, _)| outcome)
+}
+
+/// [`execute_grant_revoke`] の書き込み先を選べる版（`target` が `Some` なら明示 Tx の共有 write txn の上で
+/// 実行し commit しない。付与者の権限・所有者・依存の判定は write txn の内容に対して行われる。
+/// SQL-80・Issue #3316）。
+pub(crate) fn execute_grant_revoke_in(
+    storage: &Storage,
+    target: Option<&redb::WriteTransaction>,
+    tenant_id: &str,
+    session: &SessionState,
+    stmt: &ValidatedGrantRevoke,
+) -> Result<(GrantRevokeOutcome, bool), SqlSurfaceError> {
+    // 第 2 要素は ACL・メンバーシップの行を実際に変更したか（既に反映済みの再実行は偽。明示 Tx が
+    // no-op の guard 印を巻き戻す判定に使う）。
     let grantor_id = require_grant_principal(session)?;
     let objects = match &stmt.target {
         GrantTarget::Roles(r) => {
@@ -106,14 +121,17 @@ pub(crate) fn execute_grant_revoke(
                 option_for: r.option_for.map(conv),
                 cascade: r.cascade,
             };
-            storage
-                .apply_membership_changes(tenant_id, &req)
+            let applied = storage
+                .apply_membership_changes_in(target, tenant_id, &req)
                 .map_err(map_membership_error)?;
-            return Ok(GrantRevokeOutcome {
-                is_revoke: !stmt.is_grant,
-                is_role: true,
-                warning: None,
-            });
+            return Ok((
+                GrantRevokeOutcome {
+                    is_revoke: !stmt.is_grant,
+                    is_role: true,
+                    warning: None,
+                },
+                applied.rows_changed > 0,
+            ));
         }
         GrantTarget::Objects(o) => o,
     };
@@ -166,13 +184,16 @@ pub(crate) fn execute_grant_revoke(
         cascade: objects.cascade,
     };
     let applied = storage
-        .apply_acl_changes(tenant_id, &req)
+        .apply_acl_changes_in(target, tenant_id, &req)
         .map_err(map_acl_error)?;
-    Ok(GrantRevokeOutcome {
-        is_revoke: !stmt.is_grant,
-        is_role: false,
-        warning: applied.warning,
-    })
+    Ok((
+        GrantRevokeOutcome {
+            is_revoke: !stmt.is_grant,
+            is_role: false,
+            warning: applied.warning,
+        },
+        applied.rows_changed > 0,
+    ))
 }
 
 /// メンバーシップ適用の失敗を SQL 表層の契約へ写像する（ロール不在 `42704`・権限なし `42501`・依存する付与

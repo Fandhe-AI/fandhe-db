@@ -307,8 +307,16 @@ fn export_rows<E>(
             ));
         }
         let table_ref = ctx.namer.qualified_required::<E>(&key)?;
+        // 生成列（TABLE-50・Issue #3327）は列リストと値から除く。復元は通常の書き込み経路で行い、
+        // 生成列は復元時に計算点で再計算される（宣言だけ往復してデータに生成列の値を残すと、明示値の
+        // 拒否〔`428C9`〕で復元できないため）。生成列の値は他の列から決まるので情報は失われない。
         let mut column_list = String::from("(");
-        for (i, c) in schema.columns.iter().enumerate() {
+        for (i, c) in schema
+            .columns
+            .iter()
+            .filter(|c| c.generated.is_none())
+            .enumerate()
+        {
             if i > 0 {
                 column_list.push_str(", ");
             }
@@ -383,7 +391,19 @@ fn export_table_rows<E>(
                 "row with a visibility that SQL cannot restore",
             ));
         }
-        let values = row_values::<E>(schema, &row.metadata, row.embedding)?;
+        // 生成列しか持たない表は、書き出せる列が無いため行があれば復元できない（固定文言）。
+        if schema.columns.iter().all(|c| c.generated.is_some()) {
+            return Err(unsupported(
+                "table data",
+                "table with only generated columns cannot be restored by SQL",
+            ));
+        }
+        let values: Vec<Value> = row_values::<E>(schema, &row.metadata, row.embedding)?
+            .into_iter()
+            .zip(&schema.columns)
+            .filter(|(_, c)| c.generated.is_none())
+            .map(|(v, _)| v)
+            .collect();
         if rows == 0 && effective == EffectiveFormat::Copy {
             line.clear();
             line.push_str("COPY ");

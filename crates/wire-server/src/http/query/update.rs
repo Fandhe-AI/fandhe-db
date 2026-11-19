@@ -412,6 +412,8 @@ fn execute_with(
                         principal.policy_context(),
                         &principal.session_state(),
                         table,
+                        // UPDATE トリガの NOT NULL 検査延期の判定用（Issue #3282）。
+                        &set.keys().map(String::as_str).collect::<Vec<_>>(),
                         operation_id.as_ref(),
                         bind,
                     )?

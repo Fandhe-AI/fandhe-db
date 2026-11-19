@@ -391,3 +391,7 @@ Issue #1636 の暫定ゲート（依存を持つ列を一律 `0A000`）を外し
   TABLE-19 の `42804` のまま
 - テスト: `crates/engine/tests/sql_alter_column_type_dependents.rs`（新規）・既存の `*_rewrite`／`*_check_columns`／
   `*_key_columns`／`sql_ddl_drop_alter_column`・wire は `wire_ddl_drop_alter_column.rs`
+
+### 生成列の依存と CASCADE（Issue #3331）
+
+- 生成列の式が参照する列の `DROP COLUMN` は `2BP01`。`CASCADE` は依存する生成列を連鎖削除する（それ以外の依存は `2BP01`）。参照列の `ALTER COLUMN TYPE` は `0A000`。詳細は [generated-column.md](generated-column.md) の「Issue #3331 で確定した事項」。

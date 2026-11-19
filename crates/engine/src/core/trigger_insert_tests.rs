@@ -392,24 +392,59 @@ fn duplicate_id_is_23505() {
     assert_eq!(count(&core, &a, "trg"), 1);
 }
 
-// 呼び出し口が未結線（既定）なら、トリガのある表への INSERT は固定文言の `0A000`・副作用ゼロ。
+// 既定の invoker は本番の `PlpgsqlTriggerInvoker`（Issue #3185）。PL/pgSQL のトリガ関数でない関数
+// （`LANGUAGE sql`）は本番ホストの検査で固定文言の `0A000` になり、副作用はゼロ。
+//
+// intentional: docs/design/plpgsql-subset.md
+// トリガ関数でない関数の拒否は fail-closed の安全弁（設計記録「Issue #3184 追記」・「Issue #3185 追記」）。
 #[test]
-fn unwired_invoker_is_0a000() {
+fn default_invoker_rejects_non_trigger_function() {
     let dir = tempdir();
     let core = EngineCore::from_storage(
         open_storage(dir.path()),
         Box::new(crate::kernel::CpuScalarProvider),
     );
     let a = ctx("tenant-a");
-    add_trigger(&core.storage, "tenant-a", "trg", &before_row("t"));
-    let err = run(&core, &a, INSERT_A1).unwrap_err();
+    // 共有 public 表のトリガは本番の invoker が先に拒否する（Issue #3361）ため、対象表はテナントの SCHEMA 配下に置く。
+    let mut ddl = SessionState::default();
+    ddl.allow_ddl();
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.trg (embedding VECTOR(2) NOT NULL, a TEXT, n BIGINT NOT NULL)",
+    ] {
+        core.execute_sql_in_session(&a, &mut ddl, sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+    let schema_id = core
+        .storage
+        .schema_id("tenant-a", "s")
+        .expect("schema id")
+        .expect("schema exists");
+    add_trigger(
+        &core.storage,
+        "tenant-a",
+        &format!("#{schema_id}.trg"),
+        &before_row("t"),
+    );
+    let err = run(
+        &core,
+        &a,
+        "INSERT INTO s.trg (embedding, a, n) VALUES ('[1.0,0.0]', 'x', 1)",
+    )
+    .unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
-    assert_eq!(count(&core, &a, "trg"), 0);
+    assert!(
+        err.to_string()
+            .contains("the function is not a PL/pgSQL trigger function"),
+        "{err}"
+    );
+    assert_eq!(count(&core, &a, "s.trg"), 0);
 }
 
 // 文トリガ（INSERT）の発火は `trigger_statement_tests.rs`（Issue #1726）で固定する。
 
-// 発火に未対応の経路（RETURNING・生の型付き挿入・UPSERT）は、INSERT トリガのある表で `0A000`。
+// 発火に未対応の経路（生の型付き挿入・RETURNING 付き UPSERT）は、INSERT トリガのある表で `0A000`。RETURNING 付きの INSERT は
+// 発火する（Issue #3192。`trigger_returning_tests.rs`）。
 // 台帳は消費されない（同じ operation_id を、トリガを消した後の経路で使える）。
 #[test]
 fn unwired_paths_are_guarded_without_consuming_ledger() {
@@ -422,16 +457,7 @@ fn unwired_paths_are_guarded_without_consuming_ledger() {
         &core,
         &a,
         "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         RETURNING id USING OPERATION_ID 'op-ret'",
-    )
-    .unwrap_err();
-    assert_eq!(err.wire_code(), "0A000");
-
-    let err = run(
-        &core,
-        &a,
-        "INSERT INTO trg (id, embedding, a, n) VALUES (1, '[1.0,0.0]', 'x', 1) \
-         ON CONFLICT (id) DO NOTHING USING OPERATION_ID 'op-ups'",
+         ON CONFLICT (id) DO NOTHING RETURNING id USING OPERATION_ID 'op-ups'",
     )
     .unwrap_err();
     assert_eq!(err.wire_code(), "0A000");
@@ -463,7 +489,7 @@ fn unwired_paths_are_guarded_without_consuming_ledger() {
         &core,
         &a,
         "INSERT INTO trg (id, embedding, a) VALUES (1, '[1.0,0.0]', 'x') \
-         USING OPERATION_ID 'op-ret'",
+         USING OPERATION_ID 'op-ups'",
     )
     .expect("operation id is not consumed by the guarded path");
 }

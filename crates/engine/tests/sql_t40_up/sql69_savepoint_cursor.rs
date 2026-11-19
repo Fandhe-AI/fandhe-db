@@ -233,3 +233,105 @@ fn rollback_to_frees_cursor_count_slots() {
         c.ok(&declare_sql(&format!("d{i}")));
     }
 }
+// --- SCROLL・MOVE と ROLLBACK TO（Issue #3337・WIRE-27 (3) のポインタ。PG17 17.11 実測と一致） ---
+
+fn declare_scroll_sql(name: &str) -> String {
+    format!("DECLARE {name} SCROLL CURSOR FOR SELECT id FROM {TABLE} LIMIT 100")
+}
+
+impl Conn<'_> {
+    fn move_n(&mut self, sql: &str) -> u64 {
+        match self.run(sql).expect("move") {
+            SqlOutcome::Move(n) => n,
+            other => panic!("expected Move, got {other:?}"),
+        }
+    }
+}
+
+/// savepoint の前に宣言した SCROLL カーソルの位置は、savepoint 内の逆方向・絶対位置の移動を
+/// `ROLLBACK TO` しても巻き戻らない（PG17 と同じ）。
+#[test]
+fn scroll_cursor_position_is_not_rolled_back_by_rollback_to() {
+    let (core, _g) = new_core("sql69-scroll-pos");
+    let mut c = Conn::begin(&core);
+    c.ok(&declare_scroll_sql("c"));
+    assert_eq!(c.fetch_ids("FETCH 2 FROM c"), vec![1, 2]);
+    c.ok("SAVEPOINT s");
+    assert_eq!(c.fetch_ids("FETCH LAST FROM c"), vec![5]);
+    assert_eq!(c.move_n("MOVE BACKWARD 2 FROM c"), 2);
+    c.ok("ROLLBACK TO s");
+    assert_eq!(c.txn.status(), TransactionStatus::InTransaction);
+    assert_eq!(c.fetch_ids("FETCH NEXT FROM c"), vec![4]);
+
+    // MOVE ABSOLUTE 0 も同様に戻らない。
+    c.ok("SAVEPOINT t");
+    assert_eq!(c.move_n("MOVE ABSOLUTE 0 FROM c"), 0);
+    c.ok("ROLLBACK TO t");
+    assert_eq!(c.fetch_ids("FETCH NEXT FROM c"), vec![1]);
+}
+
+/// savepoint より後に宣言した SCROLL カーソルは `ROLLBACK TO` で閉じ、`MOVE`・`FETCH PRIOR`・
+/// `FETCH LAST` はいずれも `34000`。同じ名前は再宣言でき、位置 0 から始まる。
+#[test]
+fn scroll_cursor_declared_after_savepoint_is_closed_for_every_statement() {
+    for stmt in [
+        "MOVE FORWARD 1 FROM c",
+        "MOVE BACKWARD ALL FROM c",
+        "FETCH PRIOR FROM c",
+        "FETCH LAST FROM c",
+    ] {
+        let (core, _g) = new_core("sql69-scroll-closed");
+        let mut c = Conn::begin(&core);
+        c.ok("SAVEPOINT s");
+        c.ok(&declare_scroll_sql("c"));
+        c.ok("FETCH 2 FROM c");
+        c.ok("ROLLBACK TO s");
+        let err = c.run(stmt).expect_err(stmt);
+        assert_eq!(err.wire_code(), "34000", "{stmt}");
+        assert_eq!(c.txn.status(), TransactionStatus::Failed, "{stmt}");
+    }
+    let (core, _g) = new_core("sql69-scroll-redeclare");
+    let mut c = Conn::begin(&core);
+    c.ok("SAVEPOINT s");
+    c.ok(&declare_scroll_sql("c"));
+    c.ok("FETCH 2 FROM c");
+    c.ok("ROLLBACK TO s");
+    c.ok(&declare_scroll_sql("c"));
+    assert_eq!(c.fetch_ids("FETCH NEXT FROM c"), vec![1]);
+}
+
+/// 別の文のエラー（存在しない表）の後の `ROLLBACK TO` でも、savepoint 前のカーソルは続きから動く。
+#[test]
+fn scroll_cursor_survives_unrelated_statement_error_and_rollback_to() {
+    let (core, _g) = new_core("sql69-scroll-other-err");
+    let mut c = Conn::begin(&core);
+    c.ok(&declare_scroll_sql("c"));
+    assert_eq!(c.fetch_ids("FETCH 3 FROM c"), vec![1, 2, 3]);
+    c.ok("SAVEPOINT s");
+    let err = c
+        .run("SELECT id FROM missing_table LIMIT 1")
+        .expect_err("missing table");
+    assert_ne!(err.wire_code(), "34000");
+    assert_eq!(c.txn.status(), TransactionStatus::Failed);
+    c.ok("ROLLBACK TO s");
+    assert_eq!(c.move_n("MOVE PRIOR FROM c"), 1);
+    assert_eq!(c.fetch_ids("FETCH NEXT FROM c"), vec![3]);
+}
+
+/// NO SCROLL の `MOVE BACKWARD` が `55000` で拒否されても位置は変わらず、`ROLLBACK TO` の後は続きから動く
+/// （`sql_cursor.rs` の `FETCH` 版と同じ契約。PG17 は同じ形でカーソルを使えなくするが、本実装は
+/// 既存の契約に従う。差は `docs/design/sql-cursor.md`「PG17 との意図した差」）。
+#[test]
+fn no_scroll_move_rejection_keeps_position_after_rollback_to() {
+    let (core, _g) = new_core("sql69-noscroll-move");
+    let mut c = Conn::begin(&core);
+    c.ok("DECLARE c NO SCROLL CURSOR FOR SELECT id FROM documents LIMIT 100");
+    assert_eq!(c.move_n("MOVE 2 FROM c"), 2);
+    c.ok("SAVEPOINT s");
+    let err = c.run("MOVE BACKWARD 1 FROM c").expect_err("no scroll");
+    assert_eq!(err.wire_code(), "55000");
+    assert_eq!(c.txn.status(), TransactionStatus::Failed);
+    c.ok("ROLLBACK TO s");
+    assert_eq!(c.move_n("MOVE NEXT FROM c"), 1);
+    assert_eq!(c.fetch_ids("FETCH NEXT FROM c"), vec![4]);
+}

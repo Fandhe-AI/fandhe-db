@@ -182,6 +182,8 @@ fn assert_full_round_trip(tag: &str, format: TableDataFormat) {
         "CREATE INDEX",
         "CREATE FUNCTION",
         "CREATE TRIGGER",
+        // Issue #3190: WHEN 条件が論理ダンプに出て、復元で再投入できる。
+        "WHEN (",
         "CREATE POLICY",
         "CREATE ROLE",
         "ROW LEVEL SECURITY",
@@ -346,29 +348,42 @@ fn restored_constraints_and_defaults_are_enforced() {
     );
 }
 
-/// 参照先の列名が `id` の外部キーは、SQL 表層が暗黙 id への参照として扱い `0A000` で拒否する
-/// （列 `id` を明示した表でも同じ）。そのためダンプには現れない外部キーの形で、fixture は参照先を
-/// `id` 以外の列にしている。受理されるようになったら、fixture に加えて往復させる（設計メモ第 13 節）。
+/// 採番方式の親の宣言済み `id` 列への外部キー（列制約と ADD CONSTRAINT の両形）は、ダンプに現れ、
+/// 空の DB へ流して再ダンプしてもバイト列が一致する（Issue #3178）。データ入りの往復は
+/// `data_filled_id_references_round_trip_and_keep_enforcing`（Issue #3182）が固定する。
 #[test]
-fn foreign_key_to_a_column_named_id_is_rejected_so_it_never_reaches_the_dump() {
-    let p = unique_db_path("dump-rt-fk-id");
-    let _g = CleanupGuard(p.clone());
-    let core = open_core(&p);
+fn foreign_key_to_a_column_named_id_round_trips_through_the_dump() {
+    let p1 = unique_db_path("dump-rt-fk-id-src");
+    let _g1 = CleanupGuard(p1.clone());
+    let p2 = unique_db_path("dump-rt-fk-id-dst");
+    let _g2 = CleanupGuard(p2.clone());
+    let src = open_core(&p1);
     ok(
-        &core,
+        &src,
         "CREATE TABLE par (id BIGINT PRIMARY KEY, code TEXT, UNIQUE (code))",
     );
+    ok(&src, "CREATE TABLE ch (cid BIGINT PRIMARY KEY, pid BIGINT)");
     ok(
-        &core,
-        "CREATE TABLE ch (cid BIGINT PRIMARY KEY, pid BIGINT)",
-    );
-    for sql in [
+        &src,
         "ALTER TABLE ch ADD CONSTRAINT fk1 FOREIGN KEY (pid) REFERENCES par (id) ON DELETE CASCADE",
+    );
+    ok(
+        &src,
         "CREATE TABLE ch2 (cid BIGINT PRIMARY KEY, pid BIGINT REFERENCES par (id))",
-    ] {
-        let err = run(&core, sql).map(|_| ()).expect_err(sql);
-        assert_eq!(err.wire_code(), "0A000", "{sql}");
-    }
+    );
+    let pieces = dump(&src, TableDataFormat::Insert).expect("dump");
+    let ddl: String = pieces
+        .iter()
+        .filter_map(|p| match p {
+            Piece::Ddl(s) => Some(s.as_str()),
+            Piece::Data(..) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(ddl.contains("FOREIGN KEY"), "{ddl}");
+    let dst = open_core(&p2);
+    replay(&dst, &pieces);
+    assert_eq!(pieces, dump(&dst, TableDataFormat::Insert).expect("redump"));
 }
 
 /// 従来方式（暗黙 id）の表が外部キーを持つ DB は、書き出しが `Unsupported` で全体を失敗させる。
@@ -399,5 +414,77 @@ fn dump_fails_closed_when_a_legacy_table_carries_a_foreign_key() {
             assert!(!u.reason.contains("legacy_"), "reason must not name tables");
         }
         other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// 採番方式の親の `id` 列を参照する外部キー（通常・CASCADE・SET NULL・自己参照）にデータが入った状態で、
+/// COPY・INSERT の両形式で往復する（Issue #3182。#3179 の実装記録が送った項目）。再ダンプのバイト列が
+/// 一致し、復元後も孤児の挿入は `23503`、連鎖は動き、親の削除は参照中なら `23503` で拒否される。
+#[test]
+fn data_filled_id_references_round_trip_and_keep_enforcing() {
+    for (tag, format) in [
+        ("copy", TableDataFormat::Copy),
+        ("insert", TableDataFormat::Insert),
+    ] {
+        let p1 = unique_db_path(&format!("dump-rt-idfk-src-{tag}"));
+        let _g1 = CleanupGuard(p1.clone());
+        let p2 = unique_db_path(&format!("dump-rt-idfk-dst-{tag}"));
+        let _g2 = CleanupGuard(p2.clone());
+        let src = open_core(&p1);
+        for ddl in [
+            "CREATE TABLE par (id BIGINT PRIMARY KEY, name TEXT)",
+            "CREATE TABLE ch_n (cid BIGINT PRIMARY KEY, pid BIGINT REFERENCES par (id))",
+            "CREATE TABLE ch_c (cid BIGINT PRIMARY KEY, pid BIGINT REFERENCES par (id) ON DELETE CASCADE)",
+            "CREATE TABLE ch_s (cid BIGINT PRIMARY KEY, pid BIGINT REFERENCES par (id) ON DELETE SET NULL)",
+            "CREATE TABLE tree (id BIGINT PRIMARY KEY, up BIGINT REFERENCES tree (id) ON DELETE CASCADE)",
+        ] {
+            ok(&src, ddl);
+        }
+        for dml in [
+            "INSERT INTO par (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "INSERT INTO ch_n (cid, pid) VALUES (10, 1)",
+            "INSERT INTO ch_c (cid, pid) VALUES (20, 2), (21, 2)",
+            "INSERT INTO ch_s (cid, pid) VALUES (30, 3), (31, NULL)",
+            "INSERT INTO tree (id, up) VALUES (1, NULL), (2, 1), (3, 2), (4, NULL)",
+        ] {
+            ok(&src, dml);
+        }
+        let pieces = dump(&src, format).expect("dump");
+        let dst = open_core(&p2);
+        replay(&dst, &pieces);
+        assert_eq!(pieces, dump(&dst, format).expect("redump"), "{tag}");
+        for table in ["par", "ch_n", "ch_c", "ch_s", "tree"] {
+            let q = format!("SELECT * FROM {table} ORDER BY 1 LIMIT 100");
+            assert_eq!(select(&src, &q), select(&dst, &q), "{tag}: {table}");
+        }
+        // 復元先でも参照整合性が効く。
+        for core in [&src, &dst] {
+            assert_fails_with(
+                core,
+                tag,
+                "INSERT INTO ch_n (cid, pid) VALUES (11, 99)",
+                "23503",
+                "",
+            );
+            assert_fails_with(core, tag, "DELETE FROM par WHERE id = 1", "23503", "");
+        }
+        ok(&dst, "DELETE FROM par WHERE id = 2");
+        ok(&dst, "DELETE FROM par WHERE id = 3");
+        ok(&dst, "DELETE FROM tree WHERE id = 1");
+        assert_eq!(
+            select(&dst, "SELECT cid FROM ch_c LIMIT 100").len(),
+            0,
+            "{tag}"
+        );
+        let nulled = select(
+            &dst,
+            "SELECT cid FROM ch_s WHERE pid IS NULL ORDER BY cid LIMIT 100",
+        );
+        assert_eq!(nulled.len(), 2, "{tag}");
+        assert_eq!(
+            select(&dst, "SELECT id FROM tree LIMIT 100").len(),
+            1,
+            "{tag}"
+        );
     }
 }

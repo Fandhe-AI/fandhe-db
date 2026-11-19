@@ -84,6 +84,7 @@ fn execute_bound_update_in_session_is_reachable_and_updates_the_targeted_row() {
             &owner,
             &engine::sql::mode::SessionState::default(),
             TABLE,
+            &[],
             Some(&operation_id),
             |schema| {
                 let validated = ValidatedUpdate {
@@ -120,6 +121,7 @@ fn execute_bound_update_in_session_requires_operation_id_before_schema_lookup() 
             &owner,
             &engine::sql::mode::SessionState::default(),
             "does_not_exist",
+            &[],
             None,
             |schema| {
                 let validated = ValidatedUpdate {
@@ -146,6 +148,7 @@ fn execute_bound_update_in_session_rejects_undefined_table_with_42p01() {
             &owner,
             &engine::sql::mode::SessionState::default(),
             "does_not_exist",
+            &[],
             Some(&operation_id),
             |schema| {
                 let validated = ValidatedUpdate {
@@ -174,6 +177,7 @@ fn execute_bound_update_in_session_rejects_bound_plan_operation_id_mismatch() {
             &owner,
             &engine::sql::mode::SessionState::default(),
             TABLE,
+            &[],
             Some(&requested),
             |schema| {
                 // `bind` closure が引数と異なる `operation_id` を持つ計画を返す
@@ -215,6 +219,7 @@ fn execute_bound_update_in_session_matches_sql_ledger_key_space_for_resend_detec
             &owner,
             &engine::sql::mode::SessionState::default(),
             TABLE,
+            &[],
             Some(&shared),
             |schema| {
                 let validated = ValidatedUpdate {
@@ -249,6 +254,7 @@ fn execute_bound_update_in_session_matches_sql_ledger_key_space_for_content_mism
             &owner,
             &engine::sql::mode::SessionState::default(),
             TABLE,
+            &[],
             Some(&shared),
             |schema| {
                 let validated = ValidatedUpdate {
@@ -279,6 +285,7 @@ fn execute_bound_update_in_session_returns_zero_rows_for_other_tenant_row() {
             &owner_a,
             &engine::sql::mode::SessionState::default(),
             TABLE,
+            &[],
             Some(&operation_id),
             |schema| {
                 let validated = ValidatedUpdate {

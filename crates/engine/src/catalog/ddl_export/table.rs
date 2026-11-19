@@ -14,15 +14,32 @@ use super::super::{
     ForeignKeyDeferrability, ForeignKeyMatch, HnswOpClassFamily, IdentityKind, IndexDef, IndexKind,
     ReferentialAction, RowIdentity, TableSchema, TimeDefault, ViewCheckOption, ViewDef,
 };
-use super::quote::{ensure_no_internal_key, ident, literal, push_collation, push_ident};
+use super::quote::{ensure_no_internal_key, literal, push_collation, push_ident, Namer};
 use super::{unsupported, Ctx, SchemaDdlError};
 use std::collections::BTreeMap;
 
 /// 暗黙 SEQUENCE の索引（SEQUENCE の relation キー → 定義と所有者）。
 pub(super) type SequenceMap = BTreeMap<String, (SequenceDef, Option<SequenceOwner>)>;
 
-/// 列型を SQL の型名へ描画する。ENUM は型名を引用符付きで出す。
+/// 列型を SQL の型名へ描画する（SCHEMA 配下の ENUM 型を含まない文脈用。含む型は `Unsupported`）。
+/// ENUM は型名を引用符付きで出す。
 pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdlError<E>> {
+    render_column_type_in::<E>(&Namer::default(), ty)
+}
+
+/// ENUM 型の SQL 上の参照名。`public` の型は `"name"`、SCHEMA 配下の型は引用符なしの修飾名
+/// `schema.name`（`CREATE TYPE` の書き出しと同じ形。列型・キャストの型名位置はこの形を受理する。
+/// Issue #3289）。選択したテナントの SCHEMA に解決できない内部キー（他テナントのもの・破損）は書き出せない
+/// ものとして `Unsupported`（存在を示す情報は含めない。内部キーの `#` も出さない）。
+fn enum_type_ref<E>(namer: &Namer, key: &str) -> Result<String, SchemaDdlError<E>> {
+    namer.qualified_required::<E>(key)
+}
+
+/// [`render_column_type`] の、SCHEMA 配下の ENUM 型を `namer` で公開名へ戻す版。
+pub(super) fn render_column_type_in<E>(
+    namer: &Namer,
+    ty: &ColumnType,
+) -> Result<String, SchemaDdlError<E>> {
     Ok(match ty {
         ColumnType::Text => "TEXT".to_string(),
         ColumnType::Varchar(None) => "VARCHAR".to_string(),
@@ -49,10 +66,10 @@ pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdl
         ColumnType::Jsonb => "JSONB".to_string(),
         ColumnType::Uuid => "UUID".to_string(),
         ColumnType::Numeric { precision, scale } => format!("NUMERIC({precision}, {scale})"),
-        ColumnType::Enum(def) => ident(def.name())?,
+        ColumnType::Enum(def) => enum_type_ref::<E>(namer, def.name())?,
         ColumnType::Array(a) => {
             let elem = match (a.elem(), a.enum_def()) {
-                (ArrayElemType::Enum, Some(def)) => ident::<E>(def.name())?,
+                (ArrayElemType::Enum, Some(def)) => enum_type_ref::<E>(namer, def.name())?,
                 (ArrayElemType::Enum, None) => {
                     return Err(unsupported("column type", "enum array without a type"));
                 }
@@ -71,6 +88,14 @@ pub(super) fn render_column_type<E>(ty: &ColumnType) -> Result<String, SchemaDdl
                 (ArrayElemType::Bytea, _) => "BYTEA".to_string(),
                 (ArrayElemType::Json, _) => "JSON".to_string(),
                 (ArrayElemType::Jsonb, _) => "JSONB".to_string(),
+                (ArrayElemType::Varchar(None), _) => "VARCHAR".to_string(),
+                (ArrayElemType::Varchar(Some(n)), _) => format!("VARCHAR({n})"),
+                (ArrayElemType::Bpchar(n), _) => format!("CHAR({n})"),
+                (ArrayElemType::SmallInt, _) => "SMALLINT".to_string(),
+                (ArrayElemType::Time, _) => "TIME".to_string(),
+                (ArrayElemType::Interval, _) => "INTERVAL".to_string(),
+                (ArrayElemType::Bit(n), _) => format!("BIT({n})"),
+                (ArrayElemType::TimestampTz, _) => "TIMESTAMPTZ".to_string(),
             };
             // 要素数の上限 `[N]` は最初の次元にだけ付ける（構文上 `[N]` は全体で高々 1 個）。
             let mut s = format!("{elem}[{}]", a.max_len());
@@ -219,7 +244,7 @@ fn render_column<E>(
                     not_null = false;
                 }
                 Some((_, None)) => {
-                    s.push_str(&render_column_type::<E>(&col.ty)?);
+                    s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?);
                     let arg = ctx.namer.sequence_arg::<E>(seq)?.ok_or_else(|| {
                         unsupported("sequence", "reference outside the dump scope")
                     })?;
@@ -260,18 +285,18 @@ fn render_column<E>(
                     "owned sequence with a non-default name",
                 ));
             }
-            s.push_str(&render_column_type::<E>(&col.ty)?);
+            s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?);
             tail.push(' ');
             tail.push_str(&render_identity(*kind, &def.params));
         }
         Some(d) => {
-            s.push_str(&render_column_type::<E>(&col.ty)?);
+            s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?);
             if let Some(expr) = render_plain_default::<E>(d)? {
                 tail.push_str(" DEFAULT ");
                 tail.push_str(&expr);
             }
         }
-        None => s.push_str(&render_column_type::<E>(&col.ty)?),
+        None => s.push_str(&render_column_type_in::<E>(&ctx.namer, &col.ty)?),
     }
     if let Some(c) = col.collation {
         s.push_str(" COLLATE ");
@@ -281,6 +306,13 @@ fn render_column<E>(
         s.push_str(" NOT NULL");
     }
     s.push_str(&tail);
+    // 生成列（TABLE-50・Issue #3327）。正規描画の式を `GENERATED ALWAYS AS (<式>) STORED` で出す
+    // （DEFAULT は出さない。復元時に構文段・束縛段が同じ正規描画へ戻す往復を保つ）。
+    if let Some(generated) = &col.generated {
+        s.push_str(" GENERATED ALWAYS AS (");
+        s.push_str(&generated.expression);
+        s.push_str(") STORED");
+    }
     Ok(s)
 }
 
@@ -381,12 +413,16 @@ fn render_action(a: ReferentialAction) -> Option<&'static str> {
 }
 
 /// 外部キー 1 件の `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` 文を作る。
+/// `parent_uses_pseudo_id` は親が `id` 疑似列（従来方式）を持つか。疑似列への参照は SQL で
+/// 宣言し直せないため戻せないが、採番方式の親の宣言済み `id` 列への参照は通常の列参照として戻す
+/// （Issue #3178。復元は `ALTER TABLE ... ADD CONSTRAINT` を流し、DDL 束縛が同じ規則で検証する）。
 pub(super) fn render_foreign_key<E>(
     ctx: &Ctx<'_>,
     table_key: &str,
     fk: &ForeignKeyDef,
+    parent_uses_pseudo_id: bool,
 ) -> Result<String, SchemaDdlError<E>> {
-    if fk.references_parent_id() {
+    if fk.references_parent_id() && parent_uses_pseudo_id {
         return Err(unsupported(
             "foreign key",
             "reference to an implicit id row identity",

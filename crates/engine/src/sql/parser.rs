@@ -609,6 +609,12 @@ pub enum VolatileColumn {
     /// NOT NULL 列の DROP DEFAULT を挟んだ同一文の再送を `23505` にするため）。
     /// 行形 INSERT（単一行・複数行 VALUES）の束縛だけが生成し、他の束縛経路は即時 `23502` のまま。
     MissingNotNull(usize),
+    /// COPY の明示 NULL（`\N`）を受けた非 nullable 列（`schema.columns` 上の位置。Issue #3281）。
+    /// NOT NULL 検査を [`VolatileColumn::MissingNotNull`] と同じく台帳照合・BEFORE ROW トリガの後へ
+    /// 遅らせる点は同じだが、明示 NULL は要求値の一部なので内容照合ハッシュの材料から**除外しない**
+    /// （省略列との区別を保ち、同一 operation_id で省略形の再送を `22023` にするため）。
+    /// COPY の束縛だけが生成する。DEFAULT 付き列にも付く（明示 NULL は DEFAULT を適用しない）。
+    DeferredNull(usize),
     /// `VALUES` の要素が単独の `nextval('<名前>')`／`currval('<名前>')` だった列（位置・関数・名前。
     /// TABLE-24・Issue #1690）。`values` の該当位置は `Null` の仮値で、`tenant` の INSERT 系書き込みが
     /// 台帳照合の後（再送では採番しないため）に書き込み txn 内で採番・解決して差し込む。
@@ -628,6 +634,7 @@ impl VolatileColumn {
             VolatileColumn::Default(i)
             | VolatileColumn::Values(i, _)
             | VolatileColumn::MissingNotNull(i)
+            | VolatileColumn::DeferredNull(i)
             | VolatileColumn::Sequence(i, _, _)
             | VolatileColumn::DefaultSequence(i) => *i,
         }
@@ -1643,7 +1650,39 @@ fn convert_array_elements(
 
     const NAME: &str = "array element";
     match elem {
-        E::Text => Ok(ArrayValue::Text(raw_elements)),
+        E::Text | E::Varchar(None) => Ok(ArrayValue::Text(raw_elements)),
+        // `VARCHAR(n)[]`／`CHAR(n)[]`（Issue #3231）。代入（INSERT・UPDATE 等）は要素ごとに
+        // スカラー列と同じ規則（超過は `22001`・末尾空白のみの超過は切り詰め・`CHAR` は空白詰め）、
+        // 明示 CAST は `n` 文字へ黙って切り詰め（`CHAR` は空白詰め）。`CHAR(n)` の空白詰めによる
+        // 巨大確保は、非 NULL 要素数 × n を確保前に配列ペイロード上限で検査して `54000` にする。
+        E::Varchar(Some(n)) | E::Bpchar(n) => {
+            let pads = matches!(elem, E::Bpchar(_));
+            if pads
+                && (raw_elements.iter().filter(|e| e.is_some()).count() as u64)
+                    .saturating_mul(u64::from(n))
+                    > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN)
+            {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "array of character(n) elements exceeds the maximum array payload length",
+                ));
+            }
+            if cast_input {
+                let dst = if pads {
+                    crate::sql::cast_value::CastDst::Bpchar(n)
+                } else {
+                    crate::sql::cast_value::CastDst::Varchar(Some(n))
+                };
+                map_all(&raw_elements, |raw| {
+                    crate::sql::cast_value::apply_char_typmod(std::borrow::Cow::Borrowed(raw), dst)
+                        .map(std::borrow::Cow::into_owned)
+                })
+                .map(ArrayValue::Text)
+            } else {
+                let mut value = ArrayValue::Text(raw_elements);
+                crate::row_codec::normalize_char_array_value(array_ty, &mut value)?;
+                Ok(value)
+            }
+        }
         E::Bool => map_all(&raw_elements, |raw| {
             if raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("t") {
                 Ok(true)
@@ -1665,6 +1704,17 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Integer),
+        // smallint は列束縛と同じ範囲検査（22003）を経てから i16 へ（Issue #3230）。
+        E::SmallInt => map_all(&raw_elements, |raw| {
+            match bind_int(raw, ColumnType::SmallInt)? {
+                Value::Integer(v) => i16::try_from(v)
+                    .map_err(|_| SqlSurfaceError::numeric_out_of_range("smallint out of range")),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "smallint array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::SmallInt),
         E::BigInt => map_all(&raw_elements, |raw| {
             match bind_int(raw, ColumnType::BigInt)? {
                 Value::BigInt(v) => Ok(v),
@@ -1694,6 +1744,58 @@ fn convert_array_elements(
             }
         })
         .map(ArrayValue::Timestamp),
+        // time は列束縛と同じ検査（範囲外 22008・書式不正 22007）を経てから格納する（Issue #3232）。
+        E::Time => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::Time, raw)? {
+                Value::Time(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "time array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Time),
+        // interval は列束縛と同じ検査（書式不正 22007・フィールドあふれ 22015・範囲外 22008・
+        // infinity 0A000）を経てから格納する（Issue #3234）。
+        E::Interval => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::Interval, raw)? {
+                Value::Interval(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "interval array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::Interval),
+        // `BIT(n)[]`（Issue #3235）。各要素はスカラー BIT 列と同じ束縛（文字種違反 `22P02`・長さ
+        // 不一致 `22026`。空白詰めはしない）。非 NULL 要素数 × 要素バイト幅が配列ペイロード上限を
+        // 超えるなら確保前に `54000` にする（巨大 `n` × 多要素の DoS 防止）。
+        E::Bit(n) => {
+            let width = crate::bit_string::byte_len_for_bits(n).unwrap_or(usize::MAX) as u64;
+            if (raw_elements.iter().filter(|e| e.is_some()).count() as u64).saturating_mul(width)
+                > u64::from(crate::row_codec::MAX_TEXT_FIELD_LEN)
+            {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "array of bit(n) elements exceeds the maximum array payload length",
+                ));
+            }
+            map_all(&raw_elements, |raw| match bind_bit_literal(NAME, n, raw)? {
+                Value::Bit(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "bit array element bound to a different value type".to_string(),
+                }),
+            })
+            .map(ArrayValue::Bit)
+        }
+        // timestamptz は列束縛と同じ検査（offset 無しはセッション TimeZone で解釈・範囲外 22008・
+        // 書式不正 22007・未知の TZ 名 22023）を経てから格納する（Issue #3233）。
+        E::TimestampTz => map_all(&raw_elements, |raw| {
+            match bind_datetime_literal(NAME, ColumnType::TimestampTz, raw)? {
+                Value::TimestampTz(v) => Ok(v),
+                _ => Err(SqlSurfaceError::Internal {
+                    detail: "timestamptz array element bound to a different value type".to_string(),
+                }),
+            }
+        })
+        .map(ArrayValue::TimestampTz),
         E::Uuid => map_all(&raw_elements, |raw| match bind_uuid_literal(raw, NAME)? {
             Value::Uuid(v) => Ok(v),
             _ => Err(SqlSurfaceError::Internal {
@@ -1943,32 +2045,73 @@ pub fn bind_column_projection(
 
 /// `RETURNING` 句（Issue #873・#1182・SQL-21）の投影束縛。`INSERT`（UPSERT を含む）・
 /// `DELETE`（単一行・述語形）・`UPDATE`（単一行・述語形）の全形が実行結線済みのため、
-/// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を
-/// [`bind_column_projection`] と同じ [`bind_projection`] へ委譲する（第 2 の
-/// 投影実装を作らない）。UDF レジストリを持たないため `Projection::Items`
-/// （関数呼び出し項目）は多層防御として `42601` で拒否する——`sql::allowlist::
-/// Parser::parse_returning_clause` が構造検証段で既に同じ判定を行っており、
-/// 通常はここへ到達しない契約。
+/// `sql::allowlist` の各 `Validated*::returning` の `Option<Projection>` を SELECT と同じ
+/// [`bind_projection_with_literals`] へ委譲する（第 2 の投影実装を作らない。Issue #3249 で
+/// スカラー式・組み込み関数まで受理）。式の型・列名・NULL 規則は SELECT と一致する。
+///
+/// - UDF は解決しない（空の UDF レジストリ。未登録扱いで `42883`＝fail-closed）。セッションの
+///   UDF レジストリで解決する SQL 表層の経路は [`bind_returning_with_udfs`]（Issue #3250）を使う。
+///   本関数の呼び出し元は UDF を解決しない経路（NoSQL）だけ。データ変更 CTE・ビュー書き込み・
+///   FROM／USING 形は Issue #3251 でセッションのレジストリ付き版へ切り替え済み。
+/// - ハイブリッド検索の詳細関数（`hybrid_*()`）・スカラーサブクエリ・集計関数は拒否する。
+///   構文段（`Parser::parse_returning_clause`）が同じ判定（[`crate::sql::allowlist::
+///   returning_item_rejection`]）を行っており、`Validated*` を経ない呼び出し元が迂回できない
+///   よう多層防御として再適用する。
+/// - 束縛エラー（`42883`・`42804`・`42703` 等）はすべて書き込みより前に返るため、行も台帳も
+///   消費しない（呼び出し順は束縛 → 権限 → 台帳 → 書き込み）。
 pub fn bind_returning(
     returning: Option<&Projection>,
     schema: &TableSchema,
 ) -> Result<Option<Vec<ProjectedColumn>>, SqlSurfaceError> {
+    bind_returning_with_udfs(
+        returning,
+        schema,
+        &crate::sql::udf_call::UdfRegistry::default(),
+    )
+}
+
+/// [`bind_returning`] のセッション UDF レジストリ付き版（Issue #3250・SQL-21 のポインタ）。
+///
+/// SQL 表層の DML 実行・Describe が、セッションの [`crate::sql::udf_call::UdfRegistry`] で
+/// RETURNING 内の UDF を解決するために呼ぶ。宣言的 UDF はインライン展開、WASM UDF は
+/// `WasmCall` として束縛される。`LANGUAGE sql|plpgsql` 関数は書き込みを伴いうるため、
+/// `udf_call::bind_call` が `0A000` で拒否する（書き込み前＝行・台帳を消費しない）。
+/// EXECUTE 権限は呼び出し元が張る `FunctionAclScope` の区間内で判定される。
+pub(crate) fn bind_returning_with_udfs(
+    returning: Option<&Projection>,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<Option<Vec<ProjectedColumn>>, SqlSurfaceError> {
     let Some(projection) = returning else {
         return Ok(None);
     };
-    if matches!(projection, Projection::Items(_)) {
-        return Err(SqlSurfaceError::unsupported(
-            "RETURNING does not support function-call items",
-        ));
+    if let Projection::Items(items) = projection {
+        if let Some(err) = items
+            .iter()
+            .find_map(crate::sql::allowlist::returning_item_rejection)
+        {
+            return Err(err);
+        }
     }
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
-    bind_projection(
+    let cols = bind_projection_with_literals(
         projection,
         schema,
-        &crate::sql::udf_call::UdfRegistry::default(),
+        udfs,
         &mut node_budget,
-    )
-    .map(Some)
+        &LiteralSkip::NONE,
+        false,
+    )?;
+    // `allow_hybrid_detail = false` のため通常は出ない（不変条件の確認。fail-closed）。
+    if cols
+        .iter()
+        .any(|c| matches!(c, ProjectedColumn::HybridDetail { .. }))
+    {
+        return Err(SqlSurfaceError::Internal {
+            detail: "hybrid detail is not supported in RETURNING".to_string(),
+        });
+    }
+    Ok(Some(cols))
 }
 
 /// NoSQL 表層（Issue #763・TASK-175・NOSQL-2）向けのベクトル値束縛ヘルパー。
@@ -2682,7 +2825,8 @@ fn declarative_leaf_to_filter(
         | WherePredicate::ScalarSubqueryCompare { .. }
         | WherePredicate::QuantifiedSubqueryCompare { .. }
         | WherePredicate::IdCompare { .. }
-        | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::Internal {
+        | WherePredicate::CorrelatedExists(_)
+        | WherePredicate::RowCompare { .. } => Err(SqlSurfaceError::Internal {
             detail: "declarative predicate binding reached a non-declarative WherePredicate"
                 .to_string(),
         }),
@@ -3187,6 +3331,26 @@ fn bind_where_predicates_recursive(
     rewrite_total: &mut usize,
     allow_text_range_rewrite: bool,
 ) -> Result<BoundWherePredicates, SqlSurfaceError> {
+    // 行値比較（SQL-9・Issue #3256）: 束縛の前に既存の述語（比較葉・`Or`・連言）へ展開し、以降は
+    // 通常の比較と同じ書き換え・束縛を通す（`sql::row_compare`）。`Or` 分岐は再帰でここへ戻る。
+    // 展開で生成した述語は元テキストの等価述語として数えられていない（`sql::params` のダミーフラグは
+    // 元トークン列の走査）ため、`equality_ordinal` を消費させず末尾で別カウンタ・空フラグで束縛する。
+    let lowered;
+    let mut generated: Vec<WherePredicate> = Vec::new();
+    let where_predicates: &[WherePredicate] = if where_predicates.iter().any(|p| {
+        matches!(
+            p,
+            WherePredicate::RowCompare { .. } | WherePredicate::Not(_)
+        )
+    }) {
+        let (kept, produced) =
+            crate::sql::row_compare::lower_top_level(where_predicates, node_budget)?;
+        lowered = kept;
+        generated = produced;
+        &lowered
+    } else {
+        where_predicates
+    };
     let mut declarative_filters = Vec::with_capacity(where_predicates.len());
     let mut filter_skip_enum_validation = Vec::with_capacity(where_predicates.len());
     let mut expr_filters = Vec::new();
@@ -3324,6 +3488,13 @@ fn bind_where_predicates_recursive(
                     )?);
                 }
             }
+            // 行値比較（SQL-9・Issue #3256）は関数先頭で `sql::row_compare` が既存の述語木へ展開済みで、
+            // ここへは届かない。届いたら不変条件違反として fail-closed にする。
+            WherePredicate::RowCompare { .. } => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "row comparison reached binding unlowered".to_string(),
+                });
+            }
             WherePredicate::Expression(expr) => {
                 // Issue #1430・SQL-24: NUMERIC 列 × 裸の数値リテラルの単純比較は宣言的
                 // レーン（`TypedCompare`）へ振り替える（WHERE 文脈限定。CHECK は従来どおり
@@ -3454,11 +3625,36 @@ fn bind_where_predicates_recursive(
             }
         }
     }
-    let metadata_filters = declarative_filter::bind_all_for_describe(
+    let mut metadata_filters = declarative_filter::bind_all_for_describe(
         &declarative_filters,
         schema,
         &filter_skip_enum_validation,
     )?;
+    if !generated.is_empty() {
+        let mut gen_ordinal = 0usize;
+        let (gen_meta, gen_expr, gen_rls, gen_or) = bind_where_predicates_recursive(
+            &generated,
+            schema,
+            udfs,
+            node_budget,
+            &[],
+            &mut gen_ordinal,
+            rewrite_total,
+            allow_text_range_rewrite,
+        )?;
+        // 展開葉は別呼び出しで束縛するため `bind_all_for_describe` の件数検査は各呼び出し単位になる。
+        // 合算が `MAX_METADATA_FILTERS` を超えるなら結合前に `54000` で拒否する（無制限 `Vec` 成長の
+        // DoS 防止・fail-closed）。
+        declarative_filter::check_filter_count(
+            metadata_filters.len().saturating_add(gen_meta.len()),
+        )?;
+        metadata_filters.extend(gen_meta);
+        expr_filters.extend(gen_expr);
+        or_filters.extend(gen_or);
+        // 生成葉の `visible()` の有無も取りこぼさない（Issue #3257。捨てると可視性の絞り込みが
+        // 呼び出し元へ伝わらない fail-open の芽になる）。
+        rls_predicate_present |= gen_rls;
+    }
     Ok((
         metadata_filters,
         expr_filters,
@@ -4068,7 +4264,9 @@ pub fn bind_insert_identity(
     stmt: &ValidatedInsert,
     schema: &TableSchema,
 ) -> Result<BoundInsert, SqlSurfaceError> {
-    bind_insert_impl(stmt, schema, false, IdOmission::Identity)
+    // NOT NULL 検査は SQL 行 INSERT と同じく書き込み段へ延期する（BEFORE ROW トリガが省略列を補えるように。
+    // トリガが無い・補われないときは書き込み段が `23502` で fail-closed。Issue #3282）。
+    bind_insert_impl(stmt, schema, true, IdOmission::Identity)
 }
 
 /// [`bind_insert`] の本体。`defer_not_null` が真なら、省略された非 nullable 列（DEFAULT なし）の
@@ -4141,6 +4339,11 @@ pub(crate) fn fill_omitted_columns(
     for (idx, column) in columns.iter().enumerate() {
         let is_provided = provided.get(idx).copied().unwrap_or(false);
         if is_provided {
+            continue;
+        }
+        // 生成列（TABLE-50・Issue #3328）は印も DEFAULT も付けずに飛ばす。値は書き込み txn 内で
+        // 行の通常列が確定した後に計算される（`tenant` の計算点。NOT NULL の生成列も計算後に検査する）。
+        if column.generated.is_some() {
             continue;
         }
         match &column.default_expr {
@@ -4334,6 +4537,13 @@ pub(crate) fn bind_column_default(
 /// スキーマだけで決まり、テナントの状態・SEQUENCE カタログを引かない（存在オラクルにならない）。
 /// COPY は PostgreSQL と同じく IDENTITY 列へ入力値をそのまま書くため呼ばない。
 pub(crate) fn reject_generated_always_value(column: &ColumnDef) -> Result<(), SqlSurfaceError> {
+    // 生成列（TABLE-50・Issue #3328）への値の指定も同じ `428C9`（`DEFAULT` だけが受理される）。
+    // 7 つの束縛経路がこの 1 か所を共有する。
+    if column.generated.is_some() {
+        return Err(SqlSurfaceError::GeneratedAlways {
+            column: column.name.clone(),
+        });
+    }
     if column
         .default_expr
         .as_ref()
@@ -5069,6 +5279,11 @@ pub(crate) fn bind_set_assignments(
         // `SET col = DEFAULT`（SQL-50・Issue #1746）。GENERATED ALWAYS の判定より前に解決し、
         // IDENTITY／SEQUENCE／時刻関数の DEFAULT は `bind_set_default` が `0A000` で拒否する。
         if matches!(set_value, crate::sql::allowlist::SetValue::Default) {
+            // 生成列への `DEFAULT` は受理して何も代入しない（式は決定的で、参照列が変わる行では
+            // 計算点が再計算し、変わらない行では値が同じ。TABLE-50・Issue #3328）。
+            if column.generated.is_some() {
+                continue;
+            }
             bound_exprs.push((
                 col_idx,
                 crate::sql::set_expr::bind_set_default(&schema.name, name, column)?,
@@ -6430,6 +6645,9 @@ fn bind_upsert_form(
         return Err(reject_sequence_call_literal());
     }
 
+    // 生成列（TABLE-50・Issue #3328）は行の通常列が確定した後に計算される。束縛段の文内重複検査と
+    // `EXCLUDED` の NULL 検査は、仮値 NULL ではなく計算後の値で行う。
+    let computed = generated_proposed_values(&rows, schema);
     let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
     seen_ids
         .try_reserve(rows.len())
@@ -6456,8 +6674,12 @@ fn bind_upsert_form(
         seen_keys.try_reserve(rows.len()).map_err(|_| {
             SqlSurfaceError::payload_too_large("failed to reserve UPSERT target key set")
         })?;
-        for row in &rows {
-            let Some(key) = crate::constraint::unique_key_from_values(indices, &row.values)
+        for (row_idx, row) in rows.iter().enumerate() {
+            // 生成列を含む対象キーは計算後の値で見る（計算できなかった行は実行段の再検査に委ねる）。
+            let Some(values) = effective_values(row, &computed, row_idx) else {
+                continue;
+            };
+            let Some(key) = crate::constraint::unique_key_from_values(indices, values)
                 .map_err(SqlSurfaceError::invalid_input)?
             else {
                 continue;
@@ -6483,7 +6705,7 @@ fn bind_upsert_form(
             if !condition.is_empty() {
                 crate::sql::upsert_where::CompiledUpsertWhere::compile(condition, schema)?;
             }
-            check_excluded_not_null(&rows, &bound_assignments, schema)?;
+            check_excluded_not_null(&rows, &computed, &bound_assignments, schema)?;
             BoundConflictAction::DoUpdate {
                 assignments: bound_assignments,
                 condition: condition.clone(),
@@ -6500,6 +6722,53 @@ fn bind_upsert_form(
     }))
 }
 
+/// UPSERT の提案行ごとに、生成列（TABLE-50・Issue #3328）を計算した後の値の列を返す（束縛段の検査専用。
+/// [`BoundInsert::values`] は変えない。書き込みの計算は実行段が行う）。生成列の無い表は空の `Vec`。
+/// 計算できない行（式の評価失敗・カタログ漂流）は `None` で、実行段が実際のエラーを返す。
+fn generated_proposed_values(
+    rows: &[BoundInsert],
+    schema: &TableSchema,
+) -> Vec<Option<Vec<crate::row_codec::Value>>> {
+    if !schema.columns.iter().any(|c| c.generated.is_some()) {
+        return Vec::new();
+    }
+    let Ok(Some(generated)) =
+        crate::sql::generated_column::CompiledGeneratedColumns::compile_any(schema)
+    else {
+        return rows.iter().map(|_| None).collect();
+    };
+    let vector_idx = schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, ColumnType::Vector(_)));
+    rows.iter()
+        .map(|row| {
+            let embedding: &[f32] = match vector_idx.and_then(|i| row.values.get(i)) {
+                Some(crate::row_codec::Value::Vector(v)) => v.as_slice(),
+                _ => &[],
+            };
+            let mut values = row.values.clone();
+            generated
+                .compute_values(row.id, embedding, &mut values, None)
+                .ok()
+                .map(|_| values)
+        })
+        .collect()
+}
+
+/// `row`（`row_idx` 番目）の検査用の値列。生成列の無い表（`computed` が空）は行の値そのもの、
+/// ある表は [`generated_proposed_values`] の計算後の値（計算できなかった行は `None`）。
+fn effective_values<'a>(
+    row: &'a BoundInsert,
+    computed: &'a [Option<Vec<crate::row_codec::Value>>],
+    row_idx: usize,
+) -> Option<&'a [crate::row_codec::Value]> {
+    if computed.is_empty() {
+        return Some(row.values.as_slice());
+    }
+    computed.get(row_idx).and_then(|v| v.as_deref())
+}
+
 /// `EXCLUDED.<col>` が参照する値が `Null` かつ代入先の列が非 nullable の組を行ごとに検出し、
 /// 固定形式の `23502` で拒否する（[`bind_upsert_form`] と [`build_upsert_from_select_rows`] が共有）。
 ///
@@ -6511,16 +6780,22 @@ fn bind_upsert_form(
 /// （TABLE-16・TASK-204、Issue #904）。
 fn check_excluded_not_null(
     rows: &[BoundInsert],
+    computed: &[Option<Vec<crate::row_codec::Value>>],
     assignments: &[(usize, BoundUpsertValue)],
     schema: &TableSchema,
 ) -> Result<(), SqlSurfaceError> {
-    for row in rows {
+    for (row_idx, row) in rows.iter().enumerate() {
+        // 生成列を参照する `EXCLUDED` は計算後の値で判定する（Issue #3328）。計算できなかった行は
+        // 仮値 NULL で誤拒否せず、実行段（計算と NOT NULL 検査）に委ねる。
+        let Some(values) = effective_values(row, computed, row_idx) else {
+            continue;
+        };
         for (col_idx, value) in assignments {
             let BoundUpsertValue::Excluded(src_idx) = value else {
                 continue;
             };
             let is_null = matches!(
-                row.values.get(*src_idx),
+                values.get(*src_idx),
                 None | Some(crate::row_codec::Value::Null)
             );
             let target_nullable = schema
@@ -6612,17 +6887,28 @@ pub(crate) fn build_upsert_from_select_rows(
     let do_update = matches!(action, BoundConflictAction::DoUpdate { .. });
 
     // 重複判定の鍵は対象ごとに決める。`None` は「判定しない」（NULL を含むキー・対象省略）。
-    let key_of = |row: &BoundInsert| -> Result<Option<Vec<u8>>, SqlSurfaceError> {
+    // `row_computed` は生成列の計算後の値（`Some(None)` は計算できなかった行で、キー判定を飛ばす。
+    // 実行段の再検査が拾う。`None` は生成列の無い表）。
+    let key_of = |row: &BoundInsert,
+                  row_computed: Option<Option<&[crate::row_codec::Value]>>|
+     -> Result<Option<Vec<u8>>, SqlSurfaceError> {
         match &target {
             BoundConflictTarget::RowId => Ok(Some(row.id.to_be_bytes().to_vec())),
             BoundConflictTarget::Unique(indices) => {
-                crate::constraint::unique_key_from_values(indices, &row.values)
+                let values = match row_computed {
+                    None => row.values.as_slice(),
+                    Some(Some(v)) => v,
+                    Some(None) => return Ok(None),
+                };
+                crate::constraint::unique_key_from_values(indices, values)
                     .map_err(SqlSurfaceError::invalid_input)
             }
             BoundConflictTarget::AnyUnique => Ok(None),
         }
     };
 
+    // 生成列は計算後の値で重複・`EXCLUDED` を判定する（Issue #3328）。`computed` は `rows` と同じ並び。
+    let mut computed = generated_proposed_values(&rows, schema);
     let rows = if matches!(target, BoundConflictTarget::AnyUnique) {
         rows
     } else {
@@ -6634,8 +6920,10 @@ pub(crate) fn build_upsert_from_select_rows(
         kept.try_reserve_exact(rows.len()).map_err(|_| {
             SqlSurfaceError::payload_too_large("failed to reserve UPSERT row batch buffer")
         })?;
-        for row in rows {
-            if let Some(key) = key_of(&row)? {
+        let mut kept_computed: Vec<Option<Vec<crate::row_codec::Value>>> = Vec::new();
+        for (row_idx, row) in rows.into_iter().enumerate() {
+            let row_computed = computed.get_mut(row_idx).map(Option::take);
+            if let Some(key) = key_of(&row, row_computed.as_ref().map(|v| v.as_deref()))? {
                 if !seen.insert(key) {
                     if do_update {
                         return Err(SqlSurfaceError::upsert_cardinality_violation());
@@ -6645,12 +6933,16 @@ pub(crate) fn build_upsert_from_select_rows(
                 }
             }
             kept.push(row);
+            if let Some(c) = row_computed {
+                kept_computed.push(c);
+            }
         }
+        computed = kept_computed;
         kept
     };
 
     if let BoundConflictAction::DoUpdate { assignments, .. } = &action {
-        check_excluded_not_null(&rows, assignments, schema)?;
+        check_excluded_not_null(&rows, &computed, assignments, schema)?;
     }
     Ok(BoundUpsert {
         table: table.to_string(),
@@ -7477,6 +7769,19 @@ pub(crate) struct ArrayAggInput {
     pub(crate) keys: Vec<StringAggOrderKey>,
     /// `DISTINCT`（重複判定は要素値の正準形。NULL 要素は 1 個だけ残す）。
     pub(crate) distinct: bool,
+    /// 確定時の出力形（`array_agg` は配列、`json_agg`・`jsonb_agg` は JSON 配列。Issue #3264）。
+    pub(crate) output: ArrayAggOutput,
+}
+
+/// [`ArrayAggInput`] の出力形（Issue #3264）。状態・束縛は共通で、確定時の写し先だけが違う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArrayAggOutput {
+    /// `array_agg`: 要素型の 1 次元配列。
+    Array,
+    /// `json_agg`: `json` 型の配列テキスト（区切りは `, `）。
+    Json,
+    /// `jsonb_agg`: `jsonb` 型の配列テキスト（正規形）。
+    Jsonb,
 }
 
 /// [`ArrayAggInput`] の要素の取得元。
@@ -7686,9 +7991,9 @@ impl BoundAggregateItem {
         }
         // `string_agg` は SQL 表層のみ（SQL-57。NoSQL 表層は対象外）。2 引数・内側 ORDER BY を
         // 持てないこの入口では構文層の拒否（`42601`）と同じ分類で拒否する。
-        if matches!(func, AggregateFunc::StringAgg | AggregateFunc::ArrayAgg) {
+        if func == AggregateFunc::StringAgg || func.uses_array_agg_state() {
             return Err(SqlSurfaceError::unsupported(
-                "string_agg and array_agg are not supported by this interface",
+                "string_agg, array_agg, json_agg and jsonb_agg are not supported by this interface",
             ));
         }
         // 分散系（SQL-57・Issue #1803）も SQL 表層のみ（NoSQL 表層は対象外）。多層防御として拒否する。
@@ -8713,7 +9018,7 @@ fn resolve_aggregate_item_input(
     if item.func == crate::sql::allowlist::AggregateFunc::StringAgg {
         return resolve_string_agg_input(item, schema, udfs, node_budget);
     }
-    if item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg {
+    if item.func.uses_array_agg_state() {
         return resolve_array_agg_input(item, schema, udfs, node_budget);
     }
     if item.func.is_bool_agg() {
@@ -8722,8 +9027,21 @@ fn resolve_aggregate_item_input(
     if item.func.is_grouping() {
         return resolve_grouping_input(item, group_by_columns, key_exprs_norm, schema);
     }
-    if item.distinct {
+    if item.distinct && item.func == crate::sql::allowlist::AggregateFunc::Count {
         resolve_count_distinct_input(&item.arg, schema, udfs, node_budget)
+    } else if item.distinct {
+        // Issue #3263: `SUM`／`AVG(DISTINCT)` は非 DISTINCT と同じ型検査で束縛し、DISTINCT キーを
+        // 定義できない VECTOR 系入力だけを `22000` で拒否する（`COUNT(DISTINCT <VECTOR>)` と同契約）。
+        let input = resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)?;
+        if matches!(
+            input,
+            AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
+        ) {
+            return Err(SqlSurfaceError::invalid_input(
+                "VECTOR has no canonical equality and cannot be used with DISTINCT aggregates",
+            ));
+        }
+        Ok(input)
     } else {
         resolve_aggregate_input(item.func, &item.arg, schema, udfs, node_budget)
     }
@@ -9027,7 +9345,7 @@ fn resolve_string_agg_input(
 ///
 /// - 裸の列: 列の値をネイティブに複製する（`bigint` を f64 へ落とさない）。対応する型は
 ///   text・varchar・boolean・integer・bigint・real・double・date・timestamp・uuid・
-///   numeric(p,s)・bytea・json・jsonb。smallint・char(n)・time・timestamptz・interval・vector・
+///   numeric(p,s)・bytea・json・jsonb。smallint・char(n)・time・interval 以外の timestamptz・vector・
 ///   配列・ENUM と疑似列 `id` は `0A000`（fail-closed。`char(n)` を text 配列へ黙って変換しない）
 /// - それ以外の式: `ARRAY[<式>]` の 1 要素と同じ型規則（[`crate::sql::udf_call::bind_array_agg_element`]）
 fn bind_array_agg_value(
@@ -9035,6 +9353,7 @@ fn bind_array_agg_value(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
     node_budget: &mut usize,
+    fname: &str,
 ) -> Result<(ArrayAggValue, crate::catalog::ArrayElemType), SqlSurfaceError> {
     use crate::catalog::ArrayElemType;
 
@@ -9049,9 +9368,9 @@ fn bind_array_agg_value(
             .find(|(_, c)| &c.name == name)
         else {
             if name == "id" && schema.has_pseudo_id() {
-                return Err(unsupported(
-                    "array_agg over the id pseudo column is not supported",
-                ));
+                return Err(unsupported(&format!(
+                    "{fname} over the id pseudo column is not supported"
+                )));
             }
             return Err(SqlSurfaceError::undefined_column(name));
         };
@@ -9072,11 +9391,11 @@ fn bind_array_agg_value(
             ColumnType::Bytea => ArrayElemType::Bytea,
             ColumnType::Json => ArrayElemType::Json,
             ColumnType::Jsonb => ArrayElemType::Jsonb,
-            ColumnType::SmallInt
-            | ColumnType::Bpchar(_)
-            | ColumnType::Time
-            | ColumnType::TimestampTz
-            | ColumnType::Interval
+            ColumnType::SmallInt => ArrayElemType::SmallInt,
+            ColumnType::Time => ArrayElemType::Time,
+            ColumnType::Interval => ArrayElemType::Interval,
+            ColumnType::TimestampTz => ArrayElemType::TimestampTz,
+            ColumnType::Bpchar(_)
             | ColumnType::Bit(_)
             | ColumnType::HalfVec(_)
             | ColumnType::Int8Vec(_)
@@ -9084,9 +9403,9 @@ fn bind_array_agg_value(
             | ColumnType::Vector(_)
             | ColumnType::Array(_)
             | ColumnType::Enum(_) => {
-                return Err(unsupported(
-                    "array_agg over this column type is not supported yet",
-                ))
+                return Err(unsupported(&format!(
+                    "{fname} over this column type is not supported yet"
+                )))
             }
         };
         *node_budget = node_budget
@@ -9133,11 +9452,32 @@ fn resolve_array_agg_input(
         }
     };
     if !item.extra_args.is_empty() {
-        return Err(SqlSurfaceError::undefined_function(
-            "function array_agg requires exactly one argument",
-        ));
+        return Err(SqlSurfaceError::undefined_function(format!(
+            "function {} requires exactly one argument",
+            item.func.default_alias()
+        )));
     }
-    let (value, elem) = bind_array_agg_value(value_expr, schema, udfs, node_budget)?;
+    let output = match item.func {
+        crate::sql::allowlist::AggregateFunc::JsonAgg => ArrayAggOutput::Json,
+        crate::sql::allowlist::AggregateFunc::JsonbAgg => ArrayAggOutput::Jsonb,
+        _ => ArrayAggOutput::Array,
+    };
+    let (value, elem) = bind_array_agg_value(
+        value_expr,
+        schema,
+        udfs,
+        node_budget,
+        item.func.default_alias(),
+    )?;
+    // TIMESTAMPTZ の JSON 化は未対応。確定時の XX000 ではなく束縛時に 0A000 で拒否する（Issue #3233）。
+    if !matches!(output, ArrayAggOutput::Array) && elem == ArrayElemType::TimestampTz {
+        return Err(SqlSurfaceError::FeatureNotSupported {
+            detail: format!(
+                "{} over timestamptz is not supported yet",
+                item.func.default_alias()
+            ),
+        });
+    }
     let orders_by_value = item.distinct || item.order_by.iter().any(|k| k.expr == *value_expr);
     if orders_by_value {
         match elem {
@@ -9148,11 +9488,45 @@ fn resolve_array_agg_input(
             }
             ArrayElemType::Bytea => {
                 return Err(SqlSurfaceError::FeatureNotSupported {
-                    detail: "DISTINCT or ORDER BY over bytea in array_agg is not supported yet"
+                    detail: format!(
+                        "DISTINCT or ORDER BY over bytea in {} is not supported yet",
+                        item.func.default_alias()
+                    ),
+                })
+            }
+            // スカラー BIT は比較・順序づけが未解禁（cast-only）。配列要素も同じ側に置く（Issue #3235）。
+            ArrayElemType::Bit(_) => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "DISTINCT or ORDER BY over bit in array_agg is not supported yet"
                         .to_string(),
                 })
             }
-            _ => {}
+            // スカラー INTERVAL の式キーによる並べ替えは未対応（`order_kind_for_expr_type`）。
+            // 配列要素も同じ側に置き、キー束縛段より前に分かりやすく拒否する（Issue #3234）。
+            ArrayElemType::Interval => {
+                return Err(SqlSurfaceError::FeatureNotSupported {
+                    detail: "DISTINCT or ORDER BY over interval in array_agg is not supported yet"
+                        .to_string(),
+                })
+            }
+            // 比較・順序づけに支障のない要素型。要素型の追加時に判断を強制する（Issue #3229）。
+            ArrayElemType::Text
+            | ArrayElemType::Varchar(_)
+            | ArrayElemType::Bpchar(_)
+            | ArrayElemType::Bool
+            | ArrayElemType::Integer
+            | ArrayElemType::SmallInt
+            | ArrayElemType::BigInt
+            | ArrayElemType::Real
+            | ArrayElemType::Double
+            | ArrayElemType::Date
+            | ArrayElemType::Timestamp
+            | ArrayElemType::Time
+            | ArrayElemType::TimestampTz
+            | ArrayElemType::Uuid
+            | ArrayElemType::Numeric { .. }
+            | ArrayElemType::Jsonb
+            | ArrayElemType::Enum => {}
         }
     }
     let mut keys: Vec<StringAggOrderKey> =
@@ -9189,6 +9563,7 @@ fn resolve_array_agg_input(
         elem,
         keys,
         distinct: item.distinct,
+        output,
     })))
 }
 
@@ -9794,7 +10169,12 @@ pub(crate) fn map_expr_children(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Expr) -
             lhs: Box::new(f(lhs)),
             rhs: Box::new(f(rhs)),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|o| Box::new(f(o))),
             whens: whens.iter().map(|(c, r)| (f(c), f(r))).collect(),
             else_result: else_result.as_ref().map(|e| Box::new(f(e))),
         },
@@ -10035,6 +10415,11 @@ pub struct BoundScan {
     /// SQL テキスト経由の [`bind_scan`] と [`Self::new`] は常に `None`（既存経路は不変）。
     /// [`Self::with_after`] だけが設定する。
     pub(crate) keyset: Option<crate::sql::keyset::BoundKeyset>,
+    /// `SELECT DISTINCT ON`（Issue #3261）のグループ前置長。`Some(k)` のとき [`Self::order_by`] の
+    /// 先頭 `k` キー（= ON キー）が等しい行を 1 グループとして、ソート順で最初の行だけを返す
+    /// （`sql::scan` の経路 (B) が重複排除を `OFFSET`／`LIMIT` より前に行う）。SQL テキスト経由の
+    /// [`bind_scan`] が `ValidatedScan` から引き継ぐ。[`Self::new`]（NoSQL 表層）は常に `None`。
+    pub(crate) distinct_on: Option<usize>,
 }
 
 /// 広域取得の式キーの `(束縛済み式, コンパイル済みプログラム)` 列（[`BoundScan::order_exprs`]）。
@@ -10806,6 +11191,7 @@ impl BoundScan {
             order_exprs: Vec::new(),
             ties_row_cap: None,
             keyset: None,
+            distinct_on: None,
             // Issue #915・SQL-25: `Self::new` 単体は既存契約どおり常に空。
             // NoSQL `sort`（NOSQL-15・Issue #946）を付与する場合は呼び出し元が
             // 続けて `with_order_by` を呼ぶ（builder 形。シグネチャは変えない）。
@@ -12123,6 +12509,12 @@ pub(crate) fn collect_where_predicate_idents(
             // 外側の列は構築時にインデックスへ解決済みで、識別子としては現れない。
             WherePredicate::CorrelatedExists(_) => {}
             WherePredicate::Expression(expr) => collect_expr_idents(expr, out),
+            // 行値比較（#3255）: 全成分の列参照を集める（取りこぼすと別名衝突判定が fail-open になる）。
+            WherePredicate::RowCompare { lhs, rhs, .. } => {
+                for e in lhs.iter().chain(rhs.iter()) {
+                    collect_expr_idents(e, out);
+                }
+            }
             // `NOT` は内側を再帰する（`sql::view::check_predicate_columns_within`
             // と同じ理由: 否定越しの列参照見落としを防ぐ）。
             WherePredicate::Not(inner) => {
@@ -12179,7 +12571,14 @@ pub(crate) fn collect_expr_idents(expr: &Expr, out: &mut std::collections::HashS
                 collect_expr_idents(c, out);
             }
         }
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_idents(operand, out);
+            }
             for (cond, result) in whens {
                 collect_expr_idents(cond, out);
                 collect_expr_idents(result, out);
@@ -12403,6 +12802,31 @@ pub(crate) fn bind_scan_with_dummy_flags(
         ));
     }
 
+    // Issue #3261: `SELECT DISTINCT ON` のグループ前置長の整合を束縛段でも確認する（多層防御。
+    // 構文段が組み立てた実効 ORDER BY の先頭 `k` キーが ON キー）。実行器へ意味を運べない併用
+    // （ウィンドウ・`WITH TIES`）と、グループ同一性の規則が未確定の INTERVAL キーは拒否する。
+    if let Some(k) = stmt.distinct_on {
+        if k == 0 || order_by.len() < k {
+            return Err(SqlSurfaceError::Internal {
+                detail: "DISTINCT ON prefix exceeds the ORDER BY keys".to_string(),
+            });
+        }
+        if !stmt.window_items.is_empty() || stmt.with_ties {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "SELECT DISTINCT ON cannot be combined with window functions or WITH TIES",
+            ));
+        }
+        if order_by
+            .iter()
+            .take(k)
+            .any(|key| key.kind == OrderKind::Interval)
+        {
+            return Err(SqlSurfaceError::feature_not_supported(
+                "SELECT DISTINCT ON over an INTERVAL key is not supported",
+            ));
+        }
+    }
+
     // Issue #353 と同じく、`expr_filters` を束縛時に 1 回だけステップ列コンパイル
     // する（行ループでの再帰評価をなくす）。
     let expr_filter_programs = compile_expr_filter_programs(&expr_filters);
@@ -12431,6 +12855,7 @@ pub(crate) fn bind_scan_with_dummy_flags(
             None
         },
         keyset: None,
+        distinct_on: stmt.distinct_on,
     })
 }
 
@@ -12976,7 +13401,9 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
             ColumnType::Boolean
         }
         // 配列は式中の列として扱えない（`array_agg(x) || ...` などは `22000`。SQL-57）。
-        AggregateFunc::ArrayAgg => EXPR_UNSUPPORTED_COLUMN_TYPE,
+        AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg => {
+            EXPR_UNSUPPORTED_COLUMN_TYPE
+        }
         // 分散系（SQL-57・Issue #1803）: numeric 結果（整数系・`id`・numeric 列）は式内で扱えない列、
         // 浮動小数列・数値式の入力は double 結果。
         AggregateFunc::Variance
@@ -13039,7 +13466,7 @@ fn aggregate_result_column_type(item: &BoundAggregateItem) -> ColumnType {
 /// SQL-57・SQL-72 (4) の範囲外。`group_by::cmp_cell_values` は未定義の組を等値として扱うため、
 /// 通すと並びが黙って崩れる。束縛時に拒否する。Issue #2038）。
 fn is_unorderable_aggregate(item: &BoundAggregateItem) -> bool {
-    item.func == crate::sql::allowlist::AggregateFunc::ArrayAgg
+    item.func.uses_array_agg_state()
         || matches!(
             item.input,
             AggregateInput::VectorColumn { .. } | AggregateInput::VectorExpr { .. }
@@ -13186,7 +13613,15 @@ fn rewrite_group_row_idents(
             lhs: Box::new(rec(lhs)?),
             rhs: Box::new(rec(rhs)?),
         },
-        Expr::Case { whens, else_result } => Expr::Case {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => Expr::Case {
+            operand: match operand {
+                Some(o) => Some(Box::new(rec(o)?)),
+                None => None,
+            },
             whens: whens
                 .iter()
                 .map(|(c, r)| Ok((rec(c)?, rec(r)?)))
@@ -14472,6 +14907,47 @@ mod tests {
             &crate::sql::udf_call::UdfRegistry::default(),
         )
         .unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    /// 元の等値条件 `plain` 件＋行値比較 `(lang, body) = (..)`（等価 2 葉へ展開）の述語削除を束縛する
+    /// （Issue #3256。展開葉は別呼び出しで束縛されるため、合算の件数上限を検査する）。
+    fn bind_delete_with_row_compare(plain: usize) -> Result<BoundPredicateDelete, SqlSurfaceError> {
+        use crate::sql::udf_call::Expr;
+        let mut where_predicates: Vec<WherePredicate> = (0..plain)
+            .map(|i| WherePredicate::Equality {
+                column: "lang".to_string(),
+                value: format!("v{i}"),
+            })
+            .collect();
+        where_predicates.push(WherePredicate::RowCompare {
+            lhs: vec![
+                Expr::Ident("lang".to_string()),
+                Expr::Ident("body".to_string()),
+            ],
+            op: crate::sql::udf_call::ArrayCmpOp::Eq,
+            rhs: vec![Expr::String("a".to_string()), Expr::String("b".to_string())],
+        });
+        let stmt = ValidatedPredicateDelete {
+            table_name: "documents".to_string(),
+            where_predicates,
+            operation_id: Some(OperationId::parse("op-0001").expect("valid operation_id")),
+            returning: None,
+            partitioned: None,
+        };
+        bind_predicate_delete(
+            &stmt,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn row_compare_expansion_counts_toward_metadata_filter_limit() {
+        let max = crate::declarative_filter::MAX_METADATA_FILTERS;
+        // 元 254 件＋展開 2 件 = 上限ちょうど（受理）、元 255 件＋展開 2 件 = 257（拒否）。
+        assert!(bind_delete_with_row_compare(max - 2).is_ok());
+        let err = bind_delete_with_row_compare(max - 1).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
     }
 

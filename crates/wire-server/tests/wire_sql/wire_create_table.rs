@@ -240,3 +240,361 @@ fn wire_select_star_on_a_table_without_id_lists_declared_columns_only() {
     expect_error_response_with_sqlstate(&mut stream, "42703");
     read_ready_for_query(&mut stream);
 }
+
+/// 親が採番方式（宣言した `id BIGINT PRIMARY KEY`）の `REFERENCES parent (id)`／`REFERENCES parent` は
+/// DDL 束縛で受理される。psql が送る末尾 `;` 付きの単独文でも通り、接続は継続して使える
+/// （TABLE-17・TABLE-23、Issue #3178）。
+#[test]
+fn wire_create_table_accepts_foreign_key_to_allocated_parent_id_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "CREATE TABLE posts2 (author BIGINT REFERENCES users);",
+            "CREATE TABLE",
+        ),
+        ("CREATE TABLE late (author BIGINT);", "CREATE TABLE"),
+        (
+            "ALTER TABLE late ADD CONSTRAINT late_fk FOREIGN KEY (author) REFERENCES users (id);",
+            "ALTER TABLE",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// 既存行（NULL 以外の子の値）を持つ表への `ADD CONSTRAINT ... FOREIGN KEY ... REFERENCES parent (id);`
+/// は採番方式の親の `id` 列を普通の列として再検証し、孤児なしなら通り、孤児ありは 23503 で拒否する。
+/// 末尾 `;` 付きの RENAME COLUMN・ALTER COLUMN TYPE も通り、接続は継続して使える（Issue #3181）。
+#[test]
+fn wire_add_foreign_key_to_allocated_parent_id_revalidates_existing_rows() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO users (id, name) VALUES (1, 'a');",
+            "INSERT 0 1",
+        ),
+        (
+            "CREATE TABLE posts (author BIGINT, body TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO posts (author, body) VALUES (1, 'x');",
+            "INSERT 0 1",
+        ),
+        (
+            "INSERT INTO posts (author, body) VALUES (99, 'orphan');",
+            "INSERT 0 1",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    let add =
+        "ALTER TABLE posts ADD CONSTRAINT posts_fk FOREIGN KEY (author) REFERENCES users (id);";
+    send_simple_query(&mut stream, add);
+    expect_error_response_with_sqlstate(&mut stream, "23503");
+    read_ready_for_query(&mut stream);
+
+    for (sql, tag) in [
+        ("DELETE FROM posts WHERE body = 'orphan';", "DELETE 1"),
+        (add, "ALTER TABLE"),
+        (
+            "ALTER TABLE posts ALTER COLUMN author TYPE INTEGER;",
+            "ALTER TABLE",
+        ),
+        (
+            "ALTER TABLE posts RENAME COLUMN author TO writer;",
+            "ALTER TABLE",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+}
+
+/// 採番方式の親への `id` 参照 FK の子 INSERT は、末尾 `;` 付きの単独文でも親の存在を検査する。
+/// 存在する親は `INSERT 0 1`、存在しない親は SQLSTATE 23503 で、接続は継続して使える
+/// （TABLE-17・TABLE-23、Issue #3179）。
+#[test]
+fn wire_insert_into_child_of_allocated_parent_id_checks_parent_existence() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "CREATE TABLE posts (author BIGINT REFERENCES users (id), body TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO users (id, name) VALUES (1, 'a');",
+            "INSERT 0 1",
+        ),
+        (
+            "INSERT INTO posts (author, body) VALUES (1, 'ok');",
+            "INSERT 0 1",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO posts (author, body) VALUES (2, 'orphan');",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "23503");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT body FROM posts LIMIT 10");
+    assert_eq!(read_row_description(&mut stream), vec!["body"]);
+    let _row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+}
+/// CHECK 付きの表は、NULL を含む比較（UNKNOWN）の行を受理し、FALSE の行だけを `23514` で拒否する
+/// （TABLE-16・SQL-26、Issue #3242）。psql が送る末尾 `;` 付きの単独文でも同じで、違反後も接続は
+/// 継続して使える。
+#[test]
+fn wire_check_constraint_accepts_null_comparison_and_rejects_false_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE ranges (lo INTEGER, hi INTEGER, CHECK (lo < hi));",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO ranges (lo, hi) VALUES (NULL, 5);",
+            "INSERT 0 1",
+        ),
+        (
+            "INSERT INTO ranges (lo, hi) VALUES (5, NULL);",
+            "INSERT 0 1",
+        ),
+        ("INSERT INTO ranges (lo, hi) VALUES (1, 2);", "INSERT 0 1"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(&mut stream, "INSERT INTO ranges (lo, hi) VALUES (9, 1);");
+    expect_error_response_with_sqlstate(&mut stream, "23514");
+    read_ready_for_query(&mut stream);
+
+    // 接続は継続して使える。
+    send_simple_query(&mut stream, "INSERT INTO ranges (lo, hi) VALUES (2, 3);");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+/// CHECK の `IN`／`NOT IN`／`BETWEEN`／`IS NOT NULL` は受理され、NULL の扱いが PG と同じ
+/// （`IS NOT NULL` だけが NULL を違反にする。TABLE-16・SQL-24、Issue #3244）。psql が送る
+/// 末尾 `;` 付きの単独文でも同じで、違反後も接続は継続して使える。
+#[test]
+fn wire_check_constraint_accepts_in_between_is_not_null_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE items (kind TEXT, n INTEGER, m INTEGER, note TEXT, \
+             CHECK (kind IN ('a', 'b')), CHECK (n BETWEEN 1 AND 10), \
+             CHECK (m NOT IN (7, 8)), CHECK (note IS NOT NULL));",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO items (kind, n, m, note) VALUES ('a', 5, 1, 'x');",
+            "INSERT 0 1",
+        ),
+        // IN／BETWEEN／NOT IN の NULL は UNKNOWN で合格する。
+        (
+            "INSERT INTO items (kind, n, m, note) VALUES (NULL, NULL, NULL, 'x');",
+            "INSERT 0 1",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    for sql in [
+        "INSERT INTO items (kind, n, m, note) VALUES ('c', 5, 1, 'x');",
+        "INSERT INTO items (kind, n, m, note) VALUES ('a', 11, 1, 'x');",
+        "INSERT INTO items (kind, n, m, note) VALUES ('a', 5, 7, 'x');",
+        // IS NOT NULL だけは NULL が違反になる。
+        "INSERT INTO items (kind, n, m, note) VALUES ('a', 5, 1, NULL);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "23514");
+        read_ready_for_query(&mut stream);
+    }
+
+    // 接続は継続して使える。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind, n, m, note) VALUES ('b', 10, 9, 'y');",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// CHECK の `OR`・`NOT` も三値論理で評価される（TABLE-16・SQL-24、Issue #3243）。psql が送る末尾 `;`
+/// 付きの単独文で、UNKNOWN は受理し FALSE だけ `23514`、違反後も接続は継続して使える。
+#[test]
+fn wire_check_constraint_accepts_or_and_not_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE t (a INTEGER, b INTEGER, CHECK (a > 0 OR b > 0));",
+            "CREATE TABLE",
+        ),
+        (
+            "CREATE TABLE u (a INTEGER, CHECK (NOT (a = 0)));",
+            "CREATE TABLE",
+        ),
+        ("INSERT INTO t (a, b) VALUES (1, NULL);", "INSERT 0 1"),
+        ("INSERT INTO t (a, b) VALUES (-1, NULL);", "INSERT 0 1"),
+        ("INSERT INTO u (a) VALUES (NULL);", "INSERT 0 1"),
+        ("INSERT INTO u (a) VALUES (1);", "INSERT 0 1"),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    for sql in [
+        "INSERT INTO t (a, b) VALUES (-1, -1);",
+        "INSERT INTO u (a) VALUES (0);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "23514");
+        read_ready_for_query(&mut stream);
+    }
+
+    // 接続は継続して使える。
+    send_simple_query(&mut stream, "INSERT INTO t (a, b) VALUES (-1, 2);");
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// 新しい述語形の CHECK に対する `ADD CONSTRAINT` の既存行再検証・`RENAME COLUMN`・`ALTER COLUMN
+/// TYPE` の追随（TABLE-16・SQL-24、Issue #3245）。psql が送る末尾 `;` 付きの単独文で、違反・束縛
+/// 不能は `XX000` 以外の SQLSTATE で拒否され、拒否の後も接続は継続して使える。
+#[test]
+fn wire_check_new_forms_follow_add_constraint_rename_and_alter_type_with_trailing_semicolon() {
+    let (core, _guard) = new_core_without_tables();
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_with_ddl_allowed_users(&users_path, core, &["alice"]);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    for (sql, tag) in [
+        (
+            "CREATE TABLE items (kind TEXT, n INTEGER, note TEXT);",
+            "CREATE TABLE",
+        ),
+        (
+            "INSERT INTO items (kind, n, note) VALUES ('a', 20, NULL);",
+            "INSERT 0 1",
+        ),
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), tag, "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    // 既存行が違反する ADD CONSTRAINT は 23514（BETWEEN は 20 が範囲外、IS NOT NULL は NULL が違反）。
+    for sql in [
+        "ALTER TABLE items ADD CONSTRAINT c_btw CHECK (n BETWEEN 1 AND 10);",
+        "ALTER TABLE items ADD CONSTRAINT c_nn CHECK (note IS NOT NULL);",
+    ] {
+        send_simple_query(&mut stream, sql);
+        expect_error_response_with_sqlstate(&mut stream, "23514");
+        read_ready_for_query(&mut stream);
+    }
+    // 適合する形（NULL は UNKNOWN で合格）は受理される。
+    for sql in [
+        "ALTER TABLE items ADD CONSTRAINT c_kind CHECK (kind IN ('a', 'b'));",
+        "ALTER TABLE items ADD CONSTRAINT c_n CHECK (n NOT IN (7, 8));",
+    ] {
+        send_simple_query(&mut stream, sql);
+        assert_eq!(read_command_complete(&mut stream), "ALTER TABLE", "{sql}");
+        read_ready_for_query(&mut stream);
+    }
+
+    // RENAME COLUMN の後も新しい列名で CHECK が強制される。
+    send_simple_query(
+        &mut stream,
+        "ALTER TABLE items RENAME COLUMN kind TO kind2;",
+    );
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind2, n, note) VALUES ('c', 1, 'x');",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "23514");
+    read_ready_for_query(&mut stream);
+
+    // ALTER COLUMN TYPE の後も NOT IN が強制される。TEXT へは束縛できず XX000 以外で拒否される。
+    send_simple_query(&mut stream, "ALTER TABLE items ALTER COLUMN n TYPE BIGINT;");
+    assert_eq!(read_command_complete(&mut stream), "ALTER TABLE");
+    read_ready_for_query(&mut stream);
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind2, n, note) VALUES ('a', 7, 'x');",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "23514");
+    read_ready_for_query(&mut stream);
+    send_simple_query(&mut stream, "ALTER TABLE items ALTER COLUMN n TYPE TEXT;");
+    expect_error_response_with_sqlstate(&mut stream, "42883");
+    read_ready_for_query(&mut stream);
+
+    // 接続は継続して使える。
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO items (kind2, n, note) VALUES ('b', 1, 'y');",
+    );
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}

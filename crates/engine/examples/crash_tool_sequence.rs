@@ -55,6 +55,12 @@
 //!   `DO ... USING OPERATION_ID` が `0A000`、新しい k がちょうど 1 回分適用されることを確かめる。
 //! - `self-check-do <db_path>`: 負の対照（オラクルの純関数と、DB へ書いた不完全な状態）。
 //!
+//! Issue #3188（TABLE-45・SQL-68・RLS-10・RECOVER-10〜12 のポインタ）の本番 invoker でのトリガ発火の段
+//! （`*-trigger` サブコマンド）は `mod trigger_fire` のドキュメントコメントを参照。
+//!
+//! Issue #3332（TABLE-50 (5)・RECOVER-11 のポインタ）の生成列の段（`*-generated` サブコマンド）は
+//! `mod generated` のドキュメントコメントを参照。
+//!
 //! Issue #1948（SQL-69・RECOVER-5 のポインタ）の savepoint の段（`*-savepoint`・`write-savepoint-pause`
 //! サブコマンド）は `mod savepoint` のドキュメントコメントを参照。
 
@@ -104,8 +110,9 @@ fn main() {
             eprintln!(
                 "usage: crash_tool_sequence <write|verify|finish|self-check|write-identity|\
                  verify-identity|finish-identity|self-check-identity|write-do|verify-do|finish-do|\
-                 self-check-do|write-savepoint|verify-savepoint|finish-savepoint|\
-                 self-check-savepoint|write-savepoint-pause> <db_path> [stage]"
+                 self-check-do|write-trigger|verify-trigger|finish-trigger|self-check-trigger|write-savepoint|verify-savepoint|finish-savepoint|\
+                 self-check-savepoint|write-savepoint-pause|write-generated|verify-generated|\
+                 finish-generated|self-check-generated> <db_path> [stage]"
             );
             std::process::exit(2);
         }
@@ -123,11 +130,19 @@ fn main() {
         "verify-do" => report(do_block::verify_inner(&path)),
         "finish-do" => report(do_block::finish_inner(&path)),
         "self-check-do" => do_block::run_self_check(&path),
+        "write-trigger" => run_write_trigger(&path),
+        "verify-trigger" => report(trigger_fire::verify_inner(&path)),
+        "finish-trigger" => report(trigger_fire::finish_inner(&path)),
+        "self-check-trigger" => trigger_fire::run_self_check(&path),
         "write-savepoint" => run_write_savepoint(&path),
         "verify-savepoint" => report(savepoint::verify_inner(&path)),
         "finish-savepoint" => report(savepoint::finish_inner(&path)),
         "self-check-savepoint" => savepoint::run_self_check(&path),
         "write-savepoint-pause" => run_write_savepoint_pause(&path, stage.as_deref()),
+        "write-generated" => run_write_generated(&path),
+        "verify-generated" => report(generated::verify_inner(&path)),
+        "finish-generated" => report(generated::finish_inner(&path)),
+        "self-check-generated" => generated::run_self_check(&path),
         other => {
             eprintln!("ERROR: unknown subcommand: {other}");
             2
@@ -1376,6 +1391,407 @@ fn run_write_do(path: &str) -> i32 {
         }
     }
 }
+/// Issue #3188（TABLE-45・SQL-68・RLS-10・RECOVER-10〜12 のポインタ）の、本番 invoker（`EngineCore` の
+/// 既定の `PlpgsqlTriggerInvoker`）でのトリガ発火の crash 耐性の段（`*-trigger` サブコマンド）。
+///
+/// `scripts/crash_test_sequence.sh` から呼ばれ、BEFORE ROW（`NEW.v` の書き換え）・AFTER ROW（監査表への本体
+/// INSERT）・AFTER STATEMENT（カウンタ表への本体 UPDATE）を持つ表 `s.trg_main` へ、1 文で 2 行を
+/// `USING OPERATION_ID 'trg-<k>'` つきで INSERT し続けるプロセス（偶数 `k` は autocommit、奇数 `k` は明示 Tx）を
+/// SIGKILL する。再オープン後に「文は全か無か（本表・監査・カウンタが一緒に残る／消える）」「適用済みの `k` は
+/// 0 からの連続接頭辞」「第 2 テナントは不変」を検証する。台帳（`s.trg_main` はテナント SCHEMA 配下で内部キーに
+/// なるため直接は照会できない）は `finish-trigger` が再送の `23505` と未適用 `k` の適用成功で検証する。
+/// - `write-trigger <db_path>`: 成功ごとに `COMMITTED op=trg-<k> rows=<2(k+1)> n=<k+1>`。
+/// - `verify-trigger <db_path>`: 読み取り専用。`RESULT` の `rows` は本表の行数、`max` は適用済み `k` の個数。
+/// - `finish-trigger <db_path>`: 全適用済み `k` の再送が `23505`、内容違いが `22023`、新しい `k` が 1 回分だけ発火。
+/// - `self-check-trigger <db_path>`: 負の対照。
+mod trigger_fire {
+    use super::*;
+
+    const MAIN: &str = "s.trg_main";
+    const AUDIT: &str = "trg_audit";
+    const CTR: &str = "trg_ctr";
+    const OTHER_TENANT: &str = "crash-tool-sequence-other";
+    /// 第 2 テナントの種行の `k`（反復番号とは重ならない負値）。
+    const SEED_K: i64 = -1;
+    /// 1 反復（1 文）が本表へ書く行数。
+    const ROWS_PER_K: u64 = 2;
+
+    fn other_ctx() -> Result<PolicyContext, String> {
+        PolicyContext::with_visibilities(OTHER_TENANT, [Visibility::Public, Visibility::Private])
+            .map_err(|e| format!("invalid tenant context: {e}"))
+    }
+
+    fn exists_error(e: &SqlSurfaceError) -> bool {
+        matches!(e.wire_code(), "42710" | "42P07" | "42P06" | "42723")
+    }
+
+    fn cell_i64(cell: Option<&Cell>) -> Result<i64, String> {
+        match cell {
+            Some(Cell::SignedInteger(v)) => Ok(*v),
+            Some(Cell::Integer(v)) => i64::try_from(*v).map_err(|_| "cell overflow".to_string()),
+            other => Err(format!("unexpected cell: {other:?}")),
+        }
+    }
+
+    /// 先頭 2 列（2 列目が無ければ 0）の整数を全件読む（`SCAN_LIMIT` へ達したら fail-closed）。
+    fn read_pairs(
+        core: &EngineCore,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<Vec<(i64, i64)>, String> {
+        let mut session = SessionState::default();
+        let out = core
+            .execute_sql_in_session(ctx, &mut session, sql)
+            .map_err(|e| format!("scan failed ({sql}): {e}"))?;
+        let SqlOutcome::Query(q) = out else {
+            return Err(format!("expected a query result for {sql}"));
+        };
+        if q.rows.len() as u64 >= SCAN_LIMIT {
+            return Err(format!(
+                "scan limit ({SCAN_LIMIT}) reached; reduce sets/iterations"
+            ));
+        }
+        q.rows
+            .iter()
+            .map(|row| {
+                let a = cell_i64(row.cells.first())?;
+                let b = match row.cells.get(1) {
+                    Some(c) => cell_i64(Some(c))?,
+                    None => 0,
+                };
+                Ok((a, b))
+            })
+            .collect()
+    }
+
+    /// スキーマ・表・関数・トリガ・カウンタ種行・第 2 テナントの種行を冪等に用意する。
+    /// 監査表・カウンタ表は public（名前空間を共有し、行だけがテナントごと）。トリガの対象表は SCHEMA 配下。
+    fn ensure_schema(core: &EngineCore) -> Result<(), String> {
+        let ddl = [
+            "CREATE SCHEMA s".to_string(),
+            format!("CREATE TABLE {MAIN} (k BIGINT, v BIGINT)"),
+            format!("CREATE TABLE {AUDIT} (k BIGINT)"),
+            format!("CREATE TABLE {CTR} (n BIGINT)"),
+            "CREATE FUNCTION trg_bump() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN NEW.v := NEW.v + 1000; RETURN NEW; END $$"
+                .to_string(),
+            format!(
+                "CREATE FUNCTION trg_log() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN INSERT INTO {AUDIT} (k) VALUES (NEW.k); RETURN NULL; END $$"
+            ),
+            format!(
+                "CREATE FUNCTION trg_count() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN UPDATE {CTR} SET n = n + 1 WHERE n >= 0; RETURN NULL; END $$"
+            ),
+            format!(
+                "CREATE TRIGGER trg_b BEFORE INSERT ON {MAIN} FOR EACH ROW EXECUTE FUNCTION trg_bump()"
+            ),
+            format!(
+                "CREATE TRIGGER trg_a AFTER INSERT ON {MAIN} FOR EACH ROW EXECUTE FUNCTION trg_log()"
+            ),
+            format!(
+                "CREATE TRIGGER trg_s AFTER INSERT ON {MAIN} FOR EACH STATEMENT EXECUTE FUNCTION trg_count()"
+            ),
+        ];
+        // 第 2 テナントは表だけを持ち、トリガは定義しない（越境して発火しないことの対照）。
+        for (ctx, stmts) in [(tenant_ctx()?, &ddl[..]), (other_ctx()?, &ddl[..2])] {
+            let mut session = SessionState::default();
+            session.allow_ddl();
+            for sql in stmts {
+                match core.execute_sql_in_session(&ctx, &mut session, sql) {
+                    Ok(_) => {}
+                    Err(e) if exists_error(&e) => {}
+                    Err(e) => return Err(format!("ddl failed ({sql}): {e}")),
+                }
+            }
+        }
+        // 種行。カウンタは両テナントで 0 から始める。
+        for ctx in [tenant_ctx()?, other_ctx()?] {
+            if read_pairs(core, &ctx, &format!("SELECT n FROM {CTR}"))?.is_empty() {
+                let mut s = SessionState::default();
+                core.execute_sql_in_session(
+                    &ctx,
+                    &mut s,
+                    &format!("INSERT INTO {CTR} (n) VALUES (0)"),
+                )
+                .map_err(|e| format!("seed failed: {e}"))?;
+            }
+        }
+        let other = other_ctx()?;
+        if read_pairs(core, &other, &format!("SELECT k FROM {MAIN}"))?.is_empty() {
+            let mut s = SessionState::default();
+            core.execute_sql_in_session(
+                &other,
+                &mut s,
+                &format!("INSERT INTO {MAIN} (k, v) VALUES ({SEED_K}, 0)"),
+            )
+            .map_err(|e| format!("seed failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// 反復 `k` の外側の文（ツール内部の整数だけを埋め込む）。
+    fn insert_sql(k: u64) -> String {
+        format!("INSERT INTO {MAIN} (k, v) VALUES ({k}, 1), ({k}, 2) USING OPERATION_ID 'trg-{k}'")
+    }
+
+    /// 反復 `k` を適用する。偶数は autocommit、奇数は明示 Tx。
+    fn apply_k(core: &EngineCore, ctx: &PolicyContext, k: u64) -> Result<(), String> {
+        let mut session = SessionState::default();
+        if k.is_multiple_of(2) {
+            core.execute_sql_in_session(ctx, &mut session, &insert_sql(k))
+                .map_err(|e| format!("insert failed at k={k}: {e}"))?;
+        } else {
+            let mut txn = core.new_session_transaction();
+            for stmt in ["BEGIN".to_string(), insert_sql(k), "COMMIT".to_string()] {
+                core.execute_sql_in_txn(ctx, &mut session, &mut txn, &stmt)
+                    .map_err(|e| format!("txn statement failed at k={k}: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// オラクル本体（純関数）。`main` = 本表の `(k, v)`、`audit` = 監査表の `k`、`ctr` = カウンタ値（種行は 0）。
+    /// 戻り値は `(本表の行数, 適用済みの k の個数)`。
+    pub(super) fn check_state(
+        main: &[(i64, i64)],
+        audit: &[i64],
+        ctr: i64,
+    ) -> Result<(u64, i64), String> {
+        use std::collections::BTreeMap;
+        let mut per_k: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for (k, v) in main {
+            per_k.entry(*k).or_default().push(*v);
+        }
+        let mut per_audit: BTreeMap<i64, u64> = BTreeMap::new();
+        for k in audit {
+            *per_audit.entry(*k).or_default() += 1;
+        }
+        // (1) 全か無か: 本表がちょうど v=1001,1002 ⟺ 監査がちょうど 2 行。
+        for (k, vs) in &per_k {
+            let mut vs = vs.clone();
+            vs.sort_unstable();
+            if vs != [1001, 1002] {
+                return Err(format!("unexpected main rows at k={k} (values={vs:?})"));
+            }
+            if per_audit.get(k) != Some(&ROWS_PER_K) {
+                return Err(format!("main rows without exactly two audit rows at k={k}"));
+            }
+        }
+        if let Some(k) = per_audit.keys().find(|k| !per_k.contains_key(k)) {
+            return Err(format!("audit rows without main rows at k={k}"));
+        }
+        // (2) 適用済みの k は 0 から連続する接頭辞。
+        let applied = i64::try_from(per_k.len()).map_err(|_| "overflow".to_string())?;
+        if per_k.keys().copied().ne(0..applied) {
+            return Err("applied k values are not a contiguous prefix from 0".to_string());
+        }
+        // (3) AFTER STATEMENT の本体 UPDATE が文ごとにちょうど 1 回。
+        if ctr != applied {
+            return Err(format!(
+                "counter {ctr} does not match applied statements {applied}"
+            ));
+        }
+        let rows = u64::try_from(applied).map_err(|_| "overflow".to_string())? * ROWS_PER_K;
+        Ok((rows, applied))
+    }
+
+    fn verify_with(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, i64), String> {
+        // 書き込みが走っていない前提（kill 後・finish 中）の連続 read。
+        let main = read_pairs(
+            core,
+            ctx,
+            &format!("SELECT k, v FROM {MAIN} LIMIT {SCAN_LIMIT}"),
+        )?;
+        let audit: Vec<i64> = read_pairs(
+            core,
+            ctx,
+            &format!("SELECT k FROM {AUDIT} LIMIT {SCAN_LIMIT}"),
+        )?
+        .into_iter()
+        .map(|p| p.0)
+        .collect();
+        let ctr_rows = read_pairs(core, ctx, &format!("SELECT n FROM {CTR}"))?;
+        let [(ctr, _)] = ctr_rows[..] else {
+            return Err(format!(
+                "counter table must hold exactly one row (got {})",
+                ctr_rows.len()
+            ));
+        };
+        let state = check_state(&main, &audit, ctr)?;
+        // (4) 第 2 テナントは種行のまま（本表・監査・カウンタ）。
+        let other = other_ctx()?;
+        let seen = read_pairs(core, &other, &format!("SELECT k, v FROM {MAIN}"))?;
+        if seen != [(SEED_K, 0)] {
+            return Err(format!(
+                "other tenant main rows changed (count={})",
+                seen.len()
+            ));
+        }
+        if !read_pairs(core, &other, &format!("SELECT k FROM {AUDIT}"))?.is_empty() {
+            return Err("other tenant audit rows appeared".to_string());
+        }
+        if read_pairs(core, &other, &format!("SELECT n FROM {CTR}"))? != [(0, 0)] {
+            return Err("other tenant counter changed".to_string());
+        }
+        Ok(state)
+    }
+
+    pub(super) fn verify_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        verify_with(&core, &tenant_ctx()?)
+    }
+
+    pub(super) fn write_inner(path: &str) -> Result<(), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        // 再開: verify が接頭辞を保証しているため、既存の行数から次の k を決める。
+        let existing = read_pairs(
+            &core,
+            &ctx,
+            &format!("SELECT k, v FROM {MAIN} LIMIT {SCAN_LIMIT}"),
+        )?;
+        let first = u64::try_from(existing.len()).map_err(|_| "overflow".to_string())? / ROWS_PER_K;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        for k in first..first.saturating_add(MAX_ROWS) {
+            apply_k(&core, &ctx, k)?;
+            let total = (k + 1) * ROWS_PER_K;
+            writeln!(handle, "COMMITTED op=trg-{k} rows={total} n={}", k + 1)
+                .map_err(|e| format!("stdout write failed: {e}"))?;
+            handle
+                .flush()
+                .map_err(|e| format!("stdout flush failed: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let (mut rows, mut max) = verify_with(&core, &ctx)?;
+        // 再送対象が無いほど短い実行でも検証が空振りしないよう、足りない分を適用する。
+        while max < 2 {
+            apply_k(
+                &core,
+                &ctx,
+                u64::try_from(max).map_err(|_| "overflow".to_string())?,
+            )?;
+            (rows, max) = verify_with(&core, &ctx)?;
+        }
+        let applied = u64::try_from(max).map_err(|_| "overflow".to_string())?;
+
+        // (i) 適用済みの全 k の再送が台帳で 23505 になり、トリガ本体は再実行されない。
+        for k in 0..applied {
+            let mut session = SessionState::default();
+            match core.execute_sql_in_session(&ctx, &mut session, &insert_sql(k)) {
+                Err(SqlSurfaceError::DuplicateOperationId) => {}
+                Err(e) => return Err(format!("resend at k={k} failed unexpectedly: {e}")),
+                Ok(_) => return Err(format!("resend at k={k} was wrongly accepted")),
+            }
+        }
+        if verify_with(&core, &ctx)? != (rows, max) {
+            return Err("resends changed the tables".to_string());
+        }
+        // (ii) 同じ operation_id・内容違いは 22023 で、何も書かない。
+        let last = applied - 1;
+        let mut session = SessionState::default();
+        let changed = format!(
+            "INSERT INTO {MAIN} (k, v) VALUES ({last}, 1), ({last}, 3) USING OPERATION_ID 'trg-{last}'"
+        );
+        match core.execute_sql_in_session(&ctx, &mut session, &changed) {
+            Err(e) if e.wire_code() == "22023" => {}
+            Err(e) => return Err(format!("unexpected error for a changed resend: {e}")),
+            Ok(_) => return Err("a changed resend was wrongly accepted".to_string()),
+        }
+        if verify_with(&core, &ctx)? != (rows, max) {
+            return Err("the rejected changed resend changed the tables".to_string());
+        }
+        // (iii) 新しい k がちょうど 1 回分だけ発火する（台帳に未適用の k が載っていれば 23505 で失敗する）。
+        apply_k(&core, &ctx, applied)?;
+        let done = verify_with(&core, &ctx)?;
+        if done != (rows + ROWS_PER_K, max + 1) {
+            return Err(format!("unexpected state after the new k: {done:?}"));
+        }
+        Ok(done)
+    }
+
+    pub(super) fn run_self_check(path: &str) -> i32 {
+        match self_check_inner(path) {
+            Ok(()) => {
+                println!("SELF-CHECK ok=true");
+                0
+            }
+            Err(reason) => {
+                println!("SELF-CHECK ok=false reason={reason}");
+                1
+            }
+        }
+    }
+
+    fn self_check_inner(path: &str) -> Result<(), String> {
+        let full = |k: i64| [(k, 1001), (k, 1002)];
+        let main: Vec<(i64, i64)> = full(0).into_iter().chain(full(1)).collect();
+        if check_state(&main, &[0, 0, 1, 1], 2) != Ok((4, 2)) {
+            return Err("oracle rejected a valid state".to_string());
+        }
+        type Case = (&'static str, Vec<(i64, i64)>, Vec<i64>, i64);
+        let bad: Vec<Case> = vec![
+            ("main only", full(0).to_vec(), vec![], 1),
+            ("audit only", vec![], vec![0, 0], 0),
+            ("missing audit row", full(0).to_vec(), vec![0], 1),
+            ("counter behind", main.clone(), vec![0, 0, 1, 1], 1),
+            ("counter ahead", main.clone(), vec![0, 0, 1, 1], 3),
+            ("gap in k", full(1).to_vec(), vec![1, 1], 1),
+            (
+                "duplicate main rows",
+                vec![(0, 1001), (0, 1001)],
+                vec![0, 0],
+                1,
+            ),
+            (
+                "BEFORE rewrite missing",
+                vec![(0, 1), (0, 2)],
+                vec![0, 0],
+                1,
+            ),
+            ("extra audit row", full(0).to_vec(), vec![0, 0, 0], 1),
+        ];
+        for (label, main, audit, ctr) in &bad {
+            if check_state(main, audit, *ctr).is_ok() {
+                return Err(format!("oracle accepted a bad state: {label}"));
+            }
+        }
+        // DB 経由: 監査表だけが書かれた状態を verify 本体が検出する。
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let mut session = SessionState::default();
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!("INSERT INTO {AUDIT} (k) VALUES (0)"),
+        )
+        .map_err(|e| format!("self-check insert failed: {e}"))?;
+        if verify_with(&core, &ctx).is_ok() {
+            return Err("oracle accepted a partial state written to the database".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn run_write_trigger(path: &str) -> i32 {
+    match trigger_fire::write_inner(path) {
+        Ok(()) => 0,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            1
+        }
+    }
+}
 /// Issue #1948（SQL-69・RECOVER-5 のポインタ）の savepoint の段（`*-savepoint` サブコマンド）。
 ///
 /// `scripts/crash_test_sequence.sh` から呼ばれ、`BEGIN` 直後（書き込み前）に作った savepoint を
@@ -1821,6 +2237,447 @@ fn run_write_savepoint_pause(path: &str, stage: Option<&str>) -> i32 {
             } else {
                 1
             }
+        }
+    }
+}
+/// Issue #3332（TABLE-50 (5)・RECOVER-11 のポインタ）の生成列の段（`*-generated` サブコマンド）。
+///
+/// `scripts/crash_test_sequence.sh` から呼ばれ、生成列（`GENERATED ALWAYS AS (...) STORED`）つきの表へ
+/// 書き続けるプロセスを SIGKILL し、再オープン後に「行・生成列の値・台帳が 1 つの write txn として全か無か」
+/// で残ることと、commit 済みの文の再送が重複しないことを検証する。engine の公開 API だけを使う。
+///
+/// 表 `gen_rows (k BIGINT, j INTEGER, a INTEGER, b TEXT, g INTEGER GENERATED ALWAYS AS (a * 2) STORED,
+/// h TEXT GENERATED ALWAYS AS (b || '!') STORED)`。反復 `k` は常にちょうど 2 行（`j = 0, 1`）を残し、
+/// 文の形は `k % 4`（0 = 生成列を省略した複数行 INSERT、1 = `DEFAULT` 形の複数行 INSERT、
+/// 2 = 明示 Tx の単一行 INSERT 2 本、3 = 明示 Tx の複数行 INSERT と述語形 UPDATE `SET a = a + 1`）。
+/// 台帳の `USING OPERATION_ID 'gen-<k>'` は各反復の最初の INSERT に付ける。第 2 テナントには種行を 1 行置く。
+/// - `write-generated <db_path>`: 成功ごとに `COMMITTED op=gen-<k> rows=<2(k+1)> n=<k+1>`。
+/// - `verify-generated <db_path>`: 読み取り専用。オラクルは (1) 全行で `g = 2a`・`h = b || '!'`、(2) `k` ごとに
+///   ちょうど `j = 0, 1` の 2 行で `k` が 0 からの連続（文は全か無か）、(3) `a` が文の形から決まる期待値
+///   （UPDATE を適用した `k` は適用後の値）、(4) 第 2 テナントの種行が不変。
+/// - `finish-generated <db_path>`: 適用済みの全 `k` の再送が `23505`（省略形と `DEFAULT` 形の入れ替えも同様）、
+///   内容違いが `22023`、新しい `k` がちょうど 1 回適用されることを確かめ、最後に verify と同じオラクルを適用する。
+/// - `self-check-generated <db_path>`: 負の対照（オラクルの純関数と、DB へ書いた不完全な状態）。
+mod generated {
+    use super::*;
+
+    const TABLE_G: &str = "gen_rows";
+    const OTHER_TENANT: &str = "crash-tool-sequence-other-gen";
+    const ROWS_PER_K: u64 = 2;
+
+    /// 1 行分の読み取り結果。
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) struct Row {
+        k: i64,
+        j: i64,
+        a: i64,
+        b: String,
+        g: i64,
+        h: String,
+    }
+
+    fn other_ctx() -> Result<PolicyContext, String> {
+        PolicyContext::with_visibilities(OTHER_TENANT, [Visibility::Public, Visibility::Private])
+            .map_err(|e| format!("invalid tenant context: {e}"))
+    }
+
+    fn cell_i64(cell: Option<&Cell>) -> Result<i64, String> {
+        match cell {
+            Some(Cell::SignedInteger(v)) => Ok(*v),
+            Some(Cell::Integer(v)) => i64::try_from(*v).map_err(|_| "cell overflow".to_string()),
+            other => Err(format!("unexpected cell: {other:?}")),
+        }
+    }
+
+    fn cell_text(cell: Option<&Cell>) -> Result<String, String> {
+        match cell {
+            Some(Cell::Text(s)) => Ok(s.clone()),
+            other => Err(format!("unexpected cell: {other:?}")),
+        }
+    }
+
+    fn read_rows(core: &EngineCore, ctx: &PolicyContext) -> Result<Vec<Row>, String> {
+        let sql = format!("SELECT k, j, a, b, g, h FROM {TABLE_G} LIMIT {SCAN_LIMIT}");
+        let mut session = SessionState::default();
+        let out = core
+            .execute_sql_in_session(ctx, &mut session, &sql)
+            .map_err(|e| format!("scan failed: {e}"))?;
+        let SqlOutcome::Query(q) = out else {
+            return Err("expected a query result".to_string());
+        };
+        if q.rows.len() as u64 >= SCAN_LIMIT {
+            return Err(format!(
+                "scan limit ({SCAN_LIMIT}) reached; reduce sets/iterations"
+            ));
+        }
+        q.rows
+            .iter()
+            .map(|r| {
+                Ok(Row {
+                    k: cell_i64(r.cells.first())?,
+                    j: cell_i64(r.cells.get(1))?,
+                    a: cell_i64(r.cells.get(2))?,
+                    b: cell_text(r.cells.get(3))?,
+                    g: cell_i64(r.cells.get(4))?,
+                    h: cell_text(r.cells.get(5))?,
+                })
+            })
+            .collect()
+    }
+
+    fn ensure_schema(core: &EngineCore) -> Result<(), String> {
+        let ddl = format!(
+            "CREATE TABLE {TABLE_G} (k BIGINT, j INTEGER, a INTEGER, b TEXT, \
+             g INTEGER GENERATED ALWAYS AS (a * 2) STORED, \
+             h TEXT GENERATED ALWAYS AS (b || '!') STORED)"
+        );
+        let mut session = SessionState::default();
+        session.allow_ddl();
+        match core.execute_sql_in_session(&tenant_ctx()?, &mut session, &ddl) {
+            Ok(_) => {}
+            Err(e) if is_already_exists(&e) => {}
+            Err(e) => return Err(format!("ddl failed: {e}")),
+        }
+        let other = other_ctx()?;
+        if read_rows(core, &other)?.is_empty() {
+            let mut s = SessionState::default();
+            core.execute_sql_in_session(
+                &other,
+                &mut s,
+                &format!("INSERT INTO {TABLE_G} (k, j, a, b) VALUES (-1, 0, 5, 'seed')"),
+            )
+            .map_err(|e| format!("seed failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn base_a(k: u64, j: u64) -> i64 {
+        i64::try_from((k * 3 + j) % 50 + 1).unwrap_or(1)
+    }
+
+    fn expected_a(k: u64, j: u64) -> i64 {
+        base_a(k, j) + i64::from(k % 4 == 3)
+    }
+
+    fn row_b(k: u64, j: u64) -> String {
+        format!("s{k}j{j}")
+    }
+
+    fn values(k: u64, with_defaults: bool) -> String {
+        (0..ROWS_PER_K)
+            .map(|j| {
+                if with_defaults {
+                    format!(
+                        "({k}, {j}, {}, '{}', DEFAULT, DEFAULT)",
+                        base_a(k, j),
+                        row_b(k, j)
+                    )
+                } else {
+                    format!("({k}, {j}, {}, '{}')", base_a(k, j), row_b(k, j))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn cols(with_defaults: bool) -> &'static str {
+        if with_defaults {
+            "(k, j, a, b, g, h)"
+        } else {
+            "(k, j, a, b)"
+        }
+    }
+
+    /// 反復 `k` の「台帳つき INSERT」（再送の対象になる文）。
+    fn op_stmt(k: u64) -> String {
+        let op = format!("USING OPERATION_ID 'gen-{k}'");
+        match k % 4 {
+            1 => format!(
+                "INSERT INTO {TABLE_G} {} VALUES {} {op}",
+                cols(true),
+                values(k, true)
+            ),
+            2 => format!(
+                "INSERT INTO {TABLE_G} {} VALUES ({k}, 0, {}, '{}') {op}",
+                cols(false),
+                base_a(k, 0),
+                row_b(k, 0)
+            ),
+            _ => format!(
+                "INSERT INTO {TABLE_G} {} VALUES {} {op}",
+                cols(false),
+                values(k, false)
+            ),
+        }
+    }
+
+    /// 0・1 の形で、省略形と `DEFAULT` 形を入れ替えた同内容の文。
+    fn swapped_stmt(k: u64) -> Option<String> {
+        let op = format!("USING OPERATION_ID 'gen-{k}'");
+        match k % 4 {
+            0 => Some(format!(
+                "INSERT INTO {TABLE_G} {} VALUES {} {op}",
+                cols(true),
+                values(k, true)
+            )),
+            1 => Some(format!(
+                "INSERT INTO {TABLE_G} {} VALUES {} {op}",
+                cols(false),
+                values(k, false)
+            )),
+            _ => None,
+        }
+    }
+
+    fn apply_k(core: &EngineCore, ctx: &PolicyContext, k: u64) -> Result<(), String> {
+        let mut session = SessionState::default();
+        match k % 4 {
+            0 | 1 => {
+                core.execute_sql_in_session(ctx, &mut session, &op_stmt(k))
+                    .map_err(|e| format!("insert failed at k={k}: {e}"))?;
+            }
+            shape => {
+                let mut stmts = vec!["BEGIN".to_string(), op_stmt(k)];
+                if shape == 2 {
+                    stmts.push(format!(
+                        "INSERT INTO {TABLE_G} (k, j, a, b) VALUES ({k}, 1, {}, '{}')",
+                        base_a(k, 1),
+                        row_b(k, 1)
+                    ));
+                } else {
+                    stmts.push(format!("UPDATE {TABLE_G} SET a = a + 1 WHERE k = {k}"));
+                }
+                stmts.push("COMMIT".to_string());
+                let mut txn = core.new_session_transaction();
+                for stmt in &stmts {
+                    core.execute_sql_in_txn(ctx, &mut session, &mut txn, stmt)
+                        .map_err(|e| format!("txn statement failed at k={k}: {e}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// オラクル本体（純関数）。`rows` は実行者テナントの全行。戻り値は `(行数, 適用済みの k の個数)`。
+    pub(super) fn check_rows(rows: &[Row]) -> Result<(u64, i64), String> {
+        use std::collections::BTreeMap;
+        let mut per_k: BTreeMap<i64, Vec<&Row>> = BTreeMap::new();
+        for r in rows {
+            per_k.entry(r.k).or_default().push(r);
+        }
+        for (k, group) in &per_k {
+            let ku = u64::try_from(*k).map_err(|_| format!("negative k={k}"))?;
+            let mut js: Vec<i64> = group.iter().map(|r| r.j).collect();
+            js.sort_unstable();
+            if js != [0, 1] {
+                return Err(format!(
+                    "statement is not all-or-nothing at k={k} (j={js:?})"
+                ));
+            }
+            for r in group {
+                let j = u64::try_from(r.j).map_err(|_| "negative j".to_string())?;
+                if r.a != expected_a(ku, j) || r.b != row_b(ku, j) {
+                    return Err(format!("unexpected base values at k={k} j={j}"));
+                }
+                if r.g != r.a * 2 {
+                    return Err(format!("generated g does not follow a at k={k} j={j}"));
+                }
+                if r.h != format!("{}!", r.b) {
+                    return Err(format!("generated h does not follow b at k={k} j={j}"));
+                }
+            }
+        }
+        let applied = i64::try_from(per_k.len()).map_err(|_| "overflow".to_string())?;
+        if per_k.keys().copied().ne(0..applied) {
+            return Err("applied k values are not a contiguous prefix from 0".to_string());
+        }
+        let n = u64::try_from(applied).map_err(|_| "overflow".to_string())?;
+        Ok((n * ROWS_PER_K, applied))
+    }
+
+    fn verify_with(core: &EngineCore, ctx: &PolicyContext) -> Result<(u64, i64), String> {
+        let state = check_rows(&read_rows(core, ctx)?)?;
+        let seen = read_rows(core, &other_ctx()?)?;
+        let seed = Row {
+            k: -1,
+            j: 0,
+            a: 5,
+            b: "seed".to_string(),
+            g: 10,
+            h: "seed!".to_string(),
+        };
+        if seen != [seed] {
+            return Err(format!("other tenant rows changed (count={})", seen.len()));
+        }
+        Ok(state)
+    }
+
+    pub(super) fn verify_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        verify_with(&core, &tenant_ctx()?)
+    }
+
+    pub(super) fn write_inner(path: &str) -> Result<(), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let existing = read_rows(&core, &ctx)?;
+        let first = u64::try_from(existing.len()).map_err(|_| "overflow".to_string())? / ROWS_PER_K;
+        let stdout = std::io::stdout();
+        let mut handle = stdout.lock();
+        for k in first..first.saturating_add(MAX_ROWS) {
+            apply_k(&core, &ctx, k)?;
+            writeln!(
+                handle,
+                "COMMITTED op=gen-{k} rows={} n={}",
+                (k + 1) * ROWS_PER_K,
+                k + 1
+            )
+            .map_err(|e| format!("stdout write failed: {e}"))?;
+            handle
+                .flush()
+                .map_err(|e| format!("stdout flush failed: {e}"))?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        Ok(())
+    }
+
+    fn expect_code(
+        core: &EngineCore,
+        ctx: &PolicyContext,
+        sql: &str,
+        want: &str,
+    ) -> Result<(), String> {
+        let mut session = SessionState::default();
+        match core.execute_sql_in_session(ctx, &mut session, sql) {
+            Err(e) if e.wire_code() == want => Ok(()),
+            Err(e) => Err(format!("expected {want}, got {}: {e}", e.wire_code())),
+            Ok(_) => Err(format!("a resend was wrongly accepted (expected {want})")),
+        }
+    }
+
+    pub(super) fn finish_inner(path: &str) -> Result<(u64, i64), String> {
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        let (mut rows, mut max) = verify_with(&core, &ctx)?;
+        // 短い実行でも省略形・DEFAULT 形の双方を再送できるよう、少なくとも 2 件を適用しておく。
+        while max < 2 {
+            apply_k(
+                &core,
+                &ctx,
+                u64::try_from(max).map_err(|_| "overflow".to_string())?,
+            )?;
+            (rows, max) = verify_with(&core, &ctx)?;
+        }
+        let applied = u64::try_from(max).map_err(|_| "overflow".to_string())?;
+        for k in 0..applied {
+            expect_code(&core, &ctx, &op_stmt(k), "23505")?;
+            if let Some(s) = swapped_stmt(k) {
+                expect_code(&core, &ctx, &s, "23505")?;
+            }
+        }
+        if verify_with(&core, &ctx)? != (rows, max) {
+            return Err("resends changed the table".to_string());
+        }
+        let last = applied - 1;
+        let changed = op_stmt(last).replacen(&format!("'{}'", row_b(last, 0)), "'changed'", 1);
+        if changed == op_stmt(last) {
+            return Err("failed to build a changed resend".to_string());
+        }
+        expect_code(&core, &ctx, &changed, "22023")?;
+        if verify_with(&core, &ctx)? != (rows, max) {
+            return Err("the rejected changed resend changed the table".to_string());
+        }
+        apply_k(&core, &ctx, applied)?;
+        let done = verify_with(&core, &ctx)?;
+        if done != (rows + ROWS_PER_K, max + 1) {
+            return Err(format!("unexpected state after the new k: {done:?}"));
+        }
+        Ok(done)
+    }
+
+    pub(super) fn run_self_check(path: &str) -> i32 {
+        match self_check_inner(path) {
+            Ok(()) => {
+                println!("SELF-CHECK ok=true");
+                0
+            }
+            Err(reason) => {
+                println!("SELF-CHECK ok=false reason={reason}");
+                1
+            }
+        }
+    }
+
+    fn mk_row(k: u64, j: u64) -> Row {
+        let a = expected_a(k, j);
+        let b = row_b(k, j);
+        Row {
+            k: i64::try_from(k).unwrap_or(0),
+            j: i64::try_from(j).unwrap_or(0),
+            a,
+            g: a * 2,
+            h: format!("{b}!"),
+            b,
+        }
+    }
+
+    fn self_check_inner(path: &str) -> Result<(), String> {
+        let good: Vec<Row> = (0..2)
+            .flat_map(|k| (0..2).map(move |j| mk_row(k, j)))
+            .collect();
+        if check_rows(&good) != Ok((4, 2)) {
+            return Err("oracle rejected a valid state".to_string());
+        }
+        let mut bad_g = good.clone();
+        bad_g[1].g += 1;
+        let mut bad_h = good.clone();
+        bad_h[2].h = "x".to_string();
+        let mut bad_a = good.clone();
+        bad_a[0].a += 1;
+        bad_a[0].g = bad_a[0].a * 2;
+        let partial: Vec<Row> = good[..3].to_vec();
+        let gap: Vec<Row> = good[2..].to_vec();
+        let dup: Vec<Row> = good.iter().cloned().chain([mk_row(0, 0)]).collect();
+        for (label, rows) in [
+            ("g mismatch", bad_g),
+            ("h mismatch", bad_h),
+            ("a mismatch", bad_a),
+            ("partial statement", partial),
+            ("gap in k", gap),
+            ("duplicate row", dup),
+        ] {
+            if check_rows(&rows).is_ok() {
+                return Err(format!("oracle accepted a bad state: {label}"));
+            }
+        }
+        // DB 経由: 文の一部の行を DELETE した状態を verify 本体が検出する。
+        let core = open_core(path)?;
+        ensure_schema(&core)?;
+        let ctx = tenant_ctx()?;
+        apply_k(&core, &ctx, 0)?;
+        verify_with(&core, &ctx)?;
+        let mut session = SessionState::default();
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            &format!("DELETE FROM {TABLE_G} WHERE k = 0 AND j = 1"),
+        )
+        .map_err(|e| format!("self-check delete failed: {e}"))?;
+        if verify_with(&core, &ctx).is_ok() {
+            return Err("oracle accepted a partial state written to the database".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn run_write_generated(path: &str) -> i32 {
+    match generated::write_inner(path) {
+        Ok(()) => 0,
+        Err(reason) => {
+            eprintln!("ERROR: {reason}");
+            1
         }
     }
 }

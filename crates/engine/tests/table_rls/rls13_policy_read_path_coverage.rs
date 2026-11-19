@@ -82,15 +82,21 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "column_rewrite.rs",
-        2,
+        3,
         Class::NonRead,
         "列の追加・削除・型変更に伴う行の書き換え（DDL）",
     ),
     (
         "constraint.rs",
-        22,
+        23,
         Class::NonRead,
-        "一意性・参照整合性・CHECK の検査。テナント内の全行で判定する（ポリシーで隠れた行も含む。親 #2272 の規則）",
+        "一意性・参照整合性・CHECK・生成列の照合（Issue #3328）の検査。テナント内の全行で判定する（ポリシーで隠れた行も含む。親 #2272 の規則）",
+    ),
+    (
+        "constraint/referential_triggers.rs",
+        3,
+        Class::NonRead,
+        "参照アクションが書き換える子行の読み書き（Issue #3284）。テナント内の全行が対象で（constraint.rs と同じ規則）、利用者へ行を返さない",
     ),
     (
         "gin_index.rs",
@@ -154,9 +160,9 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "sql/dml_from_returning.rs",
-        1,
+        2,
         Class::NonRead,
-        "UPDATE FROM・DELETE USING の RETURNING 整形。対象行は列挙段でポリシー通過済み",
+        "UPDATE FROM・DELETE USING・MERGE の RETURNING 整形。対象行は列挙段でポリシー通過済みで、収集器は可視性を再判定するだけ（Issue #3356）",
     ),
     (
         "sql/exec.rs",
@@ -166,9 +172,9 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
     ),
     (
         "tenant.rs",
-        20,
+        21,
         Class::Applied,
-        "述語形・id 形・結合形 UPDATE/DELETE の対象選択にポリシー。INSERT・UPSERT・TRUNCATE は #2277 または対象外",
+        "述語形・id 形・結合形 UPDATE/DELETE の対象選択にポリシー。MERGE の第 1 段（enumerate_merge_candidates_readonly。Issue #3353）はポリシーを反映できないため、merge_target_preflight が適用表を固定文言の 0A000 で拒否してからポリシーなしで列挙する。INSERT・UPSERT・TRUNCATE は #2277 または対象外",
     ),
     (
         "tenant/partitioned_dml.rs",
@@ -187,6 +193,12 @@ const TABLE: &[(&str, usize, Class, &str)] = &[
         1,
         Class::NonRead,
         "トリガの INSERT 書き込み窓口（#2277 の WITH CHECK で扱う）",
+    ),
+    (
+        "tenant/trigger_upsert.rs",
+        5,
+        Class::Applied,
+        "トリガ付き UPSERT の行ループ。衝突先は所有 ∩ 可視（is_visible）で判定し、利用者定義ポリシーの INSERT 側 WITH CHECK・既存行の USING を従来経路と同順で適用する（Issue #3191）",
     ),
 ];
 

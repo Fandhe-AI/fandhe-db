@@ -1025,32 +1025,224 @@ fn array_conversions() {
     assert_eq!(cell, Cell::Null);
 }
 
+/// `smallint[]` への CAST（Issue #3230）。値・結果の列型・型付き NULL・範囲外（`22003`）。
 #[test]
-fn arrays_without_a_representable_element_type_are_not_implemented() {
-    let (core, _g) = setup("cast-array-unsupported");
-    for target in [
-        "smallint[]",
-        "time[]",
-        "timestamptz[]",
-        "interval[]",
-        "character varying(3)[]",
-        "character(3)[]",
-        "character varying[]",
-    ] {
-        // 文字列型・型付き NULL は常に 0A000。整数配列は要素の組（int4 -> 変換先の要素型）が
-        // 規則表で `×` なら 42846 が先に出る（time／timestamptz／interval）。
-        for operand in ["ai", "CAST('{1}' AS text)", "NULL"] {
-            let e = err_of(&core, &format!("CAST({operand} AS {target})"));
-            let elem_is_impossible =
-                operand == "ai" && ["time[]", "timestamptz[]", "interval[]"].contains(&target);
-            let want = if elem_is_impossible { "42846" } else { "0A000" };
-            assert_eq!(e.wire_code(), want, "{operand} -> {target}");
-        }
-    }
+fn smallint_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-smallint");
+    let small_ty =
+        ColumnType::Array(ArrayType::new(ArrayElemType::SmallInt, MAX_ARRAY_ELEMENTS).expect("ty"));
+    let (cell, meta) = first(&core, "CAST(ai AS smallint[])");
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::SmallInt(vec![Some(1), None, Some(3)]))
+    );
+    assert_eq!(meta_type(&meta), Some(small_ty.clone()));
+    assert_eq!(
+        value(&core, "CAST('{1,2}' AS smallint[])"),
+        Cell::Array(ArrayValue::SmallInt(vec![Some(1), Some(2)]))
+    );
+    let (cell, meta) = first(&core, "CAST(NULL AS smallint[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(small_ty));
+    assert_eq!(
+        err_of(&core, "CAST('{70000}' AS smallint[])").wire_code(),
+        "22003"
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{a}' AS smallint[])").wire_code(),
+        "22P02"
+    );
+}
+
+/// `time[]` への CAST（Issue #3232）。値・結果の列型・型付き NULL・範囲外・書式不正・
+/// 規則表で `×` の整数配列（`42846`）。
+#[test]
+fn time_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-time");
+    let time_ty =
+        ColumnType::Array(ArrayType::new(ArrayElemType::Time, MAX_ARRAY_ELEMENTS).expect("ty"));
+    let (cell, meta) = first(&core, "CAST('{10:00,24:00:00}' AS time[])");
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::Time(vec![
+            Some(36_000_000_000),
+            Some(86_400_000_000)
+        ]))
+    );
+    assert_eq!(meta_type(&meta), Some(time_ty.clone()));
+    let (cell, meta) = first(&core, "CAST(NULL AS time[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(time_ty));
+    // 整数配列 -> time[] は規則表で `×`（42846）のまま。
+    assert_eq!(err_of(&core, "CAST(ai AS time[])").wire_code(), "42846");
+    // text 配列からは要素ごとの io 変換。
+    assert_eq!(
+        value(&core, "CAST(CAST('{01:02:03}' AS text[]) AS time[])"),
+        Cell::Array(ArrayValue::Time(vec![Some(3_723_000_000)]))
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{24:00:01}' AS time[])").wire_code(),
+        "22008"
+    );
+    assert_eq!(err_of(&core, "CAST('{x}' AS time[])").wire_code(), "22007");
+}
+
+/// `interval[]` への変換は専用の配列要素型として受理する（Issue #3234）。値は要素ごとの入力関数
+/// （書式不正 `22007`・無限大 `0A000`）で、整数配列からは規則表の `×`（`42846`）。
+#[test]
+fn interval_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-interval");
+    let iv_ty =
+        ColumnType::Array(ArrayType::new(ArrayElemType::Interval, MAX_ARRAY_ELEMENTS).expect("ty"));
+    let (cell, meta) = first(&core, "CAST('{\"1 day\",NULL,\"2 hours\"}' AS interval[])");
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::Interval(vec![
+            Some(engine::datetime::Interval {
+                months: 0,
+                days: 1,
+                micros: 0
+            }),
+            None,
+            Some(engine::datetime::Interval {
+                months: 0,
+                days: 0,
+                micros: 7_200_000_000
+            }),
+        ]))
+    );
+    assert_eq!(meta_type(&meta), Some(iv_ty.clone()));
+    let (cell, meta) = first(&core, "CAST(NULL AS interval[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(iv_ty));
+    // 整数配列 -> interval[] は規則表で `×`（42846）のまま。
+    assert_eq!(err_of(&core, "CAST(ai AS interval[])").wire_code(), "42846");
+    // text 配列からは要素ごとの io 変換。
+    assert_eq!(
+        value(&core, "CAST(CAST('{1 mon}' AS text[]) AS interval[])"),
+        Cell::Array(ArrayValue::Interval(vec![Some(
+            engine::datetime::Interval {
+                months: 1,
+                days: 0,
+                micros: 0
+            }
+        )]))
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{x}' AS interval[])").wire_code(),
+        "22007"
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{infinity}' AS interval[])").wire_code(),
+        "0A000"
+    );
+}
+
+/// `timestamptz[]` への CAST（Issue #3233）。値・結果の列型・型付き NULL・範囲外・書式不正・
+/// 規則表で `×` の整数配列（`42846`）・timestamp 配列からのセッション TZ 変換。
+#[test]
+fn timestamptz_array_cast_converts_values_and_checks_range() {
+    let (core, _g) = setup("cast-array-timestamptz");
+    let tz_ty = ColumnType::Array(
+        ArrayType::new(ArrayElemType::TimestampTz, MAX_ARRAY_ELEMENTS).expect("ty"),
+    );
+    let (cell, meta) = first(
+        &core,
+        "CAST('{2026-01-01 10:00:00+09,2026-01-01 00:00:00}' AS timestamptz[])",
+    );
+    // 2026-01-01 01:00:00 UTC と 2026-01-01 00:00:00 UTC（offset 無しはセッション既定の UTC）。
+    assert_eq!(
+        cell,
+        Cell::Array(ArrayValue::TimestampTz(vec![
+            Some(1_767_229_200_000_000),
+            Some(1_767_225_600_000_000)
+        ]))
+    );
+    assert_eq!(meta_type(&meta), Some(tz_ty.clone()));
+    let (cell, meta) = first(&core, "CAST(NULL AS timestamptz[])");
+    assert_eq!(cell, Cell::Null);
+    assert_eq!(meta_type(&meta), Some(tz_ty));
+    // 整数配列 -> timestamptz[] は規則表で `×`（42846）のまま。
+    assert_eq!(
+        err_of(&core, "CAST(ai AS timestamptz[])").wire_code(),
+        "42846"
+    );
+    // text 配列からは要素ごとの io 変換。
+    assert_eq!(
+        value(
+            &core,
+            "CAST(CAST('{2026-01-01 00:00:00+00}' AS text[]) AS timestamptz[])"
+        ),
+        Cell::Array(ArrayValue::TimestampTz(vec![Some(1_767_225_600_000_000)]))
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{x}' AS timestamptz[])").wire_code(),
+        "22007"
+    );
+    assert_eq!(
+        err_of(&core, "CAST('{2026-13-01 00:00:00Z}' AS timestamptz[])").wire_code(),
+        "22008"
+    );
+}
+
+#[test]
+fn impossible_array_element_pairs_are_rejected_by_the_rule_table() {
+    let (core, _g) = setup("cast-array-impossible");
     // 規則表の `×` は要素型が未実装でも 42846 が先
     assert_eq!(err_of(&core, "CAST(ai AS uuid[])").wire_code(), "42846");
     assert_eq!(err_of(&core, "CAST(i4 AS integer[])").wire_code(), "42846");
     assert_eq!(err_of(&core, "CAST(ai AS integer)").wire_code(), "42846");
+}
+
+/// `varchar[]`・`varchar(n)[]`・`char(n)[]` への変換は専用の配列要素型として受理する（Issue #3231）。
+/// 値は `text[]` への変換と同じ規則（型付き NULL・NULL 要素・整数配列の I/O 変換）で、`(n)` は
+/// 要素を黙って切り詰め、`char(n)` は空白詰めする。結果列の型は配列型のままである。
+#[test]
+fn varchar_and_char_arrays_are_cast_targets() {
+    let (core, _g) = setup("cast-array-char");
+    for target in [
+        "character varying(3)[]",
+        "character varying[]",
+        "varchar(3)[]",
+    ] {
+        assert_eq!(
+            value(&core, &format!("CAST(ai AS {target})")),
+            Cell::Array(ArrayValue::Text(vec![
+                Some("1".into()),
+                None,
+                Some("3".into())
+            ])),
+            "ai -> {target}"
+        );
+        assert_eq!(
+            value(&core, &format!("CAST(CAST('{{1}}' AS text) AS {target})")),
+            Cell::Array(ArrayValue::Text(vec![Some("1".into())])),
+            "text -> {target}"
+        );
+        assert_eq!(
+            value(&core, &format!("CAST(NULL AS {target})")),
+            Cell::Null,
+            "NULL -> {target}"
+        );
+    }
+    assert_eq!(
+        value(&core, "CAST(ai AS character(3)[])"),
+        Cell::Array(ArrayValue::Text(vec![
+            Some("1  ".into()),
+            None,
+            Some("3  ".into())
+        ]))
+    );
+    assert_eq!(
+        value(&core, "CAST(CAST('{abcd}' AS text) AS character(2)[])"),
+        Cell::Array(ArrayValue::Text(vec![Some("ab".into())]))
+    );
+    assert_eq!(
+        value(&core, "CAST(CAST('{abcd}' AS text) AS varchar(2)[])"),
+        Cell::Array(ArrayValue::Text(vec![Some("ab".into())]))
+    );
+    // 長さなしの `char[]` は要素型として受理しない。
+    assert_eq!(err_of(&core, "CAST(ai AS char[])").wire_code(), "0A000");
 }
 
 // --- 消費位置・テナント境界 ---

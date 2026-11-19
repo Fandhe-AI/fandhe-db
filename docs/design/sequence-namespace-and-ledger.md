@@ -274,7 +274,7 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 
 - 受理: `RESTART [[WITH] n]`・`START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・`MAXVALUE`／`NO MAXVALUE`・`CYCLE`／`NO CYCLE` の任意順（1 個以上）と、単独の `RENAME TO <新名>`。タグは `ALTER SEQUENCE`（RENAME も同じ）
 - `42601`: オプションなし・同種の重複・`RENAME TO` と他オプションの併用・小数・未知のトークン。`22003`: i64 の範囲外
-- `0A000`: `IF EXISTS`・`AS`・`CACHE`・`OWNED BY`・`SET SCHEMA`・`OWNER TO`・`SET LOGGED`／`UNLOGGED`・修飾名。明示トランザクション内の ALTER も `0A000`（既存の末尾の拒否に乗る）
+- `0A000`: `IF EXISTS`・`AS`・`CACHE`・`OWNED BY`・`SET SCHEMA`・`OWNER TO`・`SET LOGGED`／`UNLOGGED`・修飾名。明示トランザクション内の `ALTER SEQUENCE`（`RESTART` なし）・`RENAME TO` は Issue #3315 で共有 write txn に積まれる。`RESTART` だけは採番器の現在値を commit 後にしか捨てられないため `0A000`（受け皿 #3311）。内部 ID の再利用による古いカーソルの引き継ぎは、ID の払い出し時にカーソルを捨てて防ぐ（`explicit-transaction.md`「#3315 の実装記録」）
 - `22023` の検査順（PostgreSQL 17 の `init_params` と同じ）: `INCREMENT` ≠ 0 → MIN／MAX の決定（`NO MINVALUE`／`NO MAXVALUE` は変更後の INCREMENT の符号から既定値を再導出。未指定は現行値を維持）→ MIN < MAX → START ∈ [MIN, MAX]（START を指定しなくても現行値を常に検査）→ RESTART 値（値なしは START）または現在値 ∈ [MIN, MAX]。文言は値を含まない固定文言
 - 判定の順序: 構文 → DDL 権限（`42501`。対象の有無を問わない）→ 名前の解決（`42P01`／`42809`）→ RENAME 先の衝突（`42P07`。同名も）→ 範囲（`22023`）
 
@@ -443,7 +443,7 @@ ERR-6 の `428C9`）。以下は自動運転下の判断で、人間の確認が
 | 暗黙 SEQUENCE | 型は列型（`SMALLINT`／`INTEGER`／`BIGINT`）から決める。既定は昇順が MINVALUE 1・MAXVALUE 型上限・START = MINVALUE、降順が MINVALUE 型下限・MAXVALUE -1・START = MAXVALUE、NO CYCLE。利用者指定が列型の範囲外なら `22023`（固定文言）。名前・所有者・原子性は SERIAL（§12）と同じで、SERIAL と IDENTITY は列の宣言順の 1 本のリスト（`ImplicitSequence`）で渡し、`seq1` の衝突番号が列順に決まる |
 | 428C9 | ALWAYS 列への明示値・明示 NULL（INSERT・複数行 VALUES・ファイル形・UPSERT の挿入側。NoSQL の insert も同じ束縛を通る）と、UPDATE の SET（リテラル・式・述語形）・`DO UPDATE SET` を拒否する。判定は型の束縛より前（型不正な値も 22P02 より先に 428C9）で、スキーマだけで決まりテナントの状態に依存しない。txn・台帳の前なので SEQUENCE を進めない。BY DEFAULT は明示値を受け付け、明示 NULL は `23502` |
 | COPY（要確認） | PostgreSQL の COPY FROM は IDENTITY 列（ALWAYS を含む）へ入力値をそのまま書く（`OVERRIDING SYSTEM VALUE` 相当）ため、428C9 を出さない。IDENTITY 列を省略した COPY は既存の「COPY は `DEFAULT nextval` を採番しない」に従い `0A000` のまま |
-| 構文段の組み合わせ | IDENTITY と `DEFAULT`（`DEFAULT NULL` を含む。順不同）の併記・IDENTITY 句の二重指定・SERIAL 型との併用は `42601`、整数 3 型以外（配列・ENUM 候補を含む）は `22023`。IDENTITY は暗黙に `NOT NULL`。オプションの `AS`／`CACHE`／`OWNED BY`／`SEQUENCE NAME`／`RESTART` と生成列 `GENERATED ALWAYS AS (<式>) STORED` は `0A000`。オプション列の解析は `CREATE SEQUENCE` と共有ヘルパー（`parse_sequence_option_list`）にした |
+| 構文段の組み合わせ | IDENTITY と `DEFAULT`（`DEFAULT NULL` を含む。順不同）の併記・IDENTITY 句の二重指定・SERIAL 型との併用は `42601`、整数 3 型以外（配列・ENUM 候補を含む）は `22023`。IDENTITY は暗黙に `NOT NULL`。オプションの `AS`／`CACHE`／`OWNED BY`／`SEQUENCE NAME`／`RESTART` と生成列 `GENERATED ALWAYS AS (<式>) STORED` は `0A000`。生成列の設計は [generated-column.md](generated-column.md)（#3326。実装は #3327〜#3332）。オプション列の解析は `CREATE SEQUENCE` と共有ヘルパー（`parse_sequence_option_list`）にした |
 | 未対応形（fail-closed） | `INSERT ... OVERRIDING {SYSTEM\|USER} VALUE`・`ALTER TABLE ... ADD COLUMN ... IDENTITY`・`ALTER COLUMN ... ADD／SET GENERATED`／`DROP IDENTITY`／`RESTART`／`SET <SEQUENCE オプション>`・IDENTITY 列の `ALTER COLUMN TYPE`（暗黙 SEQUENCE の型変更が要るため。要確認）・一時表・FK の `ON DELETE／UPDATE SET DEFAULT` の対象列は `0A000`。IDENTITY 列の `SET DEFAULT`／`DROP DEFAULT`／`DROP NOT NULL` は `42601`（PostgreSQL と同じ分類。要確認） |
 | 依存 | `DROP SEQUENCE`（`2BP01`）・`DROP TABLE`／`DROP COLUMN` の連動削除・RENAME の追従・`TRUNCATE ... RESTART IDENTITY` は SERIAL と同じ経路で IDENTITY 列にも効く（`column_default_references_sequence` の網羅 match に腕を足した） |
 | 台帳・ハッシュ | 変更しない。省略列に適用した DEFAULT は内容照合ハッシュの材料から外れる（D2）。golden は不変 |

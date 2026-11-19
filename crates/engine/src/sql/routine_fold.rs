@@ -128,10 +128,21 @@ impl<'a, 'b> Folder<'a, 'b> {
                 lhs: Box::new(self.fold(lhs, conditional)?),
                 rhs: Box::new(self.fold(rhs, conditional)?),
             }),
-            Expr::Case { whens, else_result } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_result,
+            } => {
+                // 単純形（Issue #3279）の被演算子は最初に 1 回だけ評価される（PostgreSQL と同じ）。
+                // ここで呼び出しを 1 回だけ起動して値のリテラルに置き換えるため、束縛段が分岐ごとに
+                // 被演算子を複製しても副作用は 1 回に保たれる。
+                let operand = operand
+                    .as_deref()
+                    .map(|o| self.fold(o, conditional).map(Box::new))
+                    .transpose()?;
                 let mut out = Vec::with_capacity(whens.len());
                 for (i, (c, r)) in whens.iter().enumerate() {
-                    // 最初の条件だけは必ず評価される。それ以降の条件・結果・ELSE は条件付き。
+                    // 最初の条件（単純形では比較値）だけは必ず評価される。それ以降の条件・結果・ELSE は条件付き。
                     let c = self.fold(c, conditional || i > 0)?;
                     let r = self.fold(r, true)?;
                     out.push((c, r));
@@ -141,6 +152,7 @@ impl<'a, 'b> Folder<'a, 'b> {
                     .map(|x| self.fold(x, true).map(Box::new))
                     .transpose()?;
                 Ok(Expr::Case {
+                    operand,
                     whens: out,
                     else_result,
                 })

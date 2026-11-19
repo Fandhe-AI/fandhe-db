@@ -245,7 +245,7 @@ fn populated(label: &str, extra_alice: &[&str]) -> Fixture {
              (6, '\\N', 7, '[9,9,9]'), \
              (7, '', 8, '[8,8,8]')",
         );
-        // 1 回の COPY がバッチ上限を超える行数（復元が分割して commit できること）。
+        // 1 回の COPY が 1 バッチ分（既定 64 行の分割幅）を超える行数（復元が分割して commit できること）。
         for chunk in 0..3 {
             let values: Vec<String> = (0..50)
                 .map(|i| {
@@ -420,7 +420,7 @@ const RICH_SCHEMA: &[&str] = &[
     "CREATE FUNCTION add_one(x INTEGER, tags TEXT[]) RETURNS INTEGER LANGUAGE sql IMMUTABLE STRICT \
      PARALLEL SAFE COST 5 AS $q$ SELECT x + 1; $q$",
     "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$",
-    "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF name ON parent \
+    "CREATE TRIGGER parent_trg BEFORE INSERT OR UPDATE OF label ON app.items \
      FOR EACH ROW EXECUTE FUNCTION trg('a', 'it''s')",
     "CREATE POLICY pol_sel ON parent AS RESTRICTIVE FOR SELECT USING (id > 0)",
     "ALTER TABLE parent ENABLE ROW LEVEL SECURITY",
@@ -809,18 +809,24 @@ fn restore_enforces_frame_order() {
     let dir = dir_of(&fx.db_path_str());
     let from = s(&dir.join("o.sql")).to_string();
     let h = || header(DumpScope::Tenant("t1".into()), DumpParts::All);
-    let trg = "CREATE TRIGGER tg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()";
+    // トリガの対象は SCHEMA 配下の表（共有 public 表のトリガは定義時に `0A000`。Issue #3361）。
+    let trg = "CREATE TRIGGER tg BEFORE INSERT ON s.t FOR EACH ROW EXECUTE FUNCTION trg()";
     let func =
         "CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql AS $q$ BEGIN RETURN NEW; END $q$";
     write_dump_with(&from, h(), |w| {
-        w.statement(StmtKind::Table, T_SQL).expect("s");
+        w.statement(StmtKind::Schema, "CREATE SCHEMA s").expect("s");
+        w.statement(
+            StmtKind::Table,
+            "CREATE TABLE s.t (id BIGINT PRIMARY KEY, b TEXT)",
+        )
+        .expect("s");
         w.statement(StmtKind::Function, func).expect("s");
         w.statement(StmtKind::Trigger, trg).expect("s");
-        w.statement(StmtKind::Insert, "INSERT INTO t (id, b) VALUES (1, 'x')")
+        w.statement(StmtKind::Insert, "INSERT INTO s.t (id, b) VALUES (1, 'x')")
             .expect("s");
     });
     let err = assert_restore_rejected(&dir, &from, &[], 4, "trigger before data");
-    assert!(err.contains("dump item 4"), "{err}");
+    assert!(err.contains("dump item 5"), "{err}");
     // COPY も同じ。
     write_dump_with(&from, h(), |w| {
         w.statement(StmtKind::Table, T_SQL).expect("s");
@@ -1185,6 +1191,40 @@ fn restore_splits_copy_by_every_engine_batch_limit() {
     assert!(!Path::new(&dest).exists());
     assert_no_temp_leftovers(&dir);
 }
+/// 既定の分割幅（4096 行）を超える 1 回の COPY を、復元が複数バッチに分けて commit できる。
+/// 環境変数は変えず既定のまま検証する（分割境界の前後 4100 行がすべて復元される）。
+#[test]
+fn restore_splits_copy_beyond_default_row_width() {
+    let fx = common::TempFixtureDir::new("dump-default-width");
+    let dir = dir_of(&fx.db_path_str());
+    let from = s(&dir.join("o.sql")).to_string();
+    const N: usize = 4100;
+    write_dump_with(
+        &from,
+        header(DumpScope::Tenant("t1".into()), DumpParts::All),
+        |w| {
+            w.statement(StmtKind::Table, T_SQL).expect("s");
+            w.copy_header("COPY t (id, b) FROM STDIN").expect("c");
+            for i in 0..N {
+                w.copy_row(&format!("{i}\tv{i}")).expect("r");
+            }
+            w.copy_end().expect("e");
+        },
+    );
+    let dest = s(&dir.join("d.redb")).to_string();
+    let o = run(&["dump-restore", "--from", &from, "--db", &dest]);
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let again = s(&dir.join("d.sql")).to_string();
+    let o = run(&dump_args(&dest, &again, &["--tenant", "t1"]));
+    assert_eq!(code(&o), Some(0), "stderr: {}", stderr(&o));
+    let text = read_text(&again);
+    for i in [0, 4095, 4096, N - 1] {
+        assert!(text.contains(&format!("{i}\tv{i}\n")), "row {i}");
+    }
+    assert_eq!(text.matches("\tv").count(), N);
+    assert_no_temp_leftovers(&dir);
+}
+
 /// `dir` に `name` の通常ファイルを `mode` で置く。
 fn put_file(dir: &Path, name: &str, mode: u32) {
     let p = dir.join(name);

@@ -102,6 +102,59 @@ fn wire_insert_returning_emits_row_description_data_row_and_insert_tag() {
     read_ready_for_query(&mut stream);
 }
 
+/// Issue #3248: `RETURNING id AS doc_id, lang AS l` の `RowDescription` 列名が別名になり、
+/// `DataRow`・コマンドタグは別名なしと同じ（SQL-21・SQL-42 のポインタ）。
+#[test]
+fn wire_insert_returning_as_alias_renames_row_description_columns() {
+    let (core, _guard) = new_core_with_docs_table();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') \
+         RETURNING id AS doc_id, lang AS l USING OPERATION_ID 'wire-insert-returning-alias'",
+    );
+
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["doc_id".to_string(), "l".to_string()]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![Some("1".to_string()), Some("ja".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #3249: `RETURNING` のスカラー式・組み込み関数が wire 越しに評価される。末尾 `;` 付きの
+/// 単独送信でも通り、`RowDescription` の列名（別名・既定名）と `DataRow` が同じ式の `SELECT` と
+/// 一致する（SQL-21・SQL-42 のポインタ）。
+#[test]
+fn wire_insert_returning_scalar_expressions_match_select() {
+    let (core, _guard) = new_core_with_docs_table();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') \
+         RETURNING id + 1 AS m, upper(lang) USING OPERATION_ID 'wire-insert-returning-expr';",
+    );
+    let columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT id + 1 AS m, upper(lang) FROM docs");
+    let select_columns = read_row_description(&mut stream);
+    let select_row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    assert_eq!(columns, vec!["m".to_string(), "upper".to_string()]);
+    assert_eq!(columns, select_columns);
+    assert_eq!(row, vec![Some("2".to_string()), Some("JA".to_string())]);
+    assert_eq!(row, select_row);
+}
+
 /// `RETURNING *` で投影したベクトル列の文字列表現は、同一行を `SELECT` した
 /// 場合の `DataRow` テキストと一致する（表層を跨いだエンコードの一致）。
 #[test]
@@ -403,4 +456,334 @@ fn wire_update_returning_response_is_byte_identical_for_other_tenant_row_and_non
     assert_eq!(read_data_row(&mut bob_stream), vec![Some("en".to_string())]);
     read_command_complete(&mut bob_stream);
     read_ready_for_query(&mut bob_stream);
+}
+fn new_core_with_docs_and_langs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-returning-from-using");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create docs");
+    storage
+        .create_table(&TableSchema::new(
+            "langs",
+            vec![
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("label", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create langs");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    (Arc::new(core), guard)
+}
+
+/// `UPDATE ... FROM`／`DELETE ... USING ... RETURNING`（Issue #3204・SQL-53）が psql と同じ末尾 `;` 付きの
+/// 単独送信で、`RowDescription`→`DataRow`*→`CommandComplete`（`UPDATE n`／`DELETE n`）の順に届く。
+#[test]
+fn wire_update_from_and_delete_using_returning_emit_rows_and_tags() {
+    let (core, _guard) = new_core_with_docs_and_langs();
+    let addrs = spawn_with_users(core, &[("alice", "tenant-a", "pw-alice")]);
+    let mut stream = connect_as(addrs[0], "alice", "pw-alice");
+
+    for sql in [
+        insert_sql(1, "ja", "wire-from-1"),
+        insert_sql(2, "en", "wire-from-2"),
+        "INSERT INTO langs (id, lang, label) VALUES (1, 'ja', 'Japanese') \
+         USING OPERATION_ID 'wire-from-l1'"
+            .to_string(),
+    ] {
+        send_simple_query(&mut stream, &sql);
+        assert!(read_command_complete(&mut stream).starts_with("INSERT"));
+        read_ready_for_query(&mut stream);
+    }
+
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang \
+         RETURNING docs.id, docs.lang, langs.label;",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(
+        columns,
+        vec!["id".to_string(), "lang".to_string(), "label".to_string()]
+    );
+    let row = read_data_row(&mut stream);
+    assert_eq!(
+        row,
+        vec![
+            Some("1".to_string()),
+            Some("x".to_string()),
+            Some("Japanese".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.id = langs.id RETURNING langs.label;",
+    );
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["label".to_string()]);
+    let row = read_data_row(&mut stream);
+    assert_eq!(row, vec![Some("Japanese".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "DELETE 1");
+    read_ready_for_query(&mut stream);
+}
+// --- UDF を含む RETURNING（Issue #3250・SQL-21 のポインタ） ---
+
+fn spawn_with_ddl_user(core: Arc<EngineCore>) -> std::net::SocketAddr {
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    spawn_server_with_engine_ddl_users(&users_path, core, &["alice"])
+}
+
+fn simple_ok(stream: &mut TcpStream, sql: &str, tag: &str) {
+    send_simple_query(stream, sql);
+    assert_eq!(read_command_complete(stream), tag, "{sql}");
+    read_ready_for_query(stream);
+}
+
+/// 宣言的 UDF を RETURNING で呼ぶと、簡易クエリ（末尾 `;` の単独送信を含む）で
+/// RowDescription・DataRow・CommandComplete が同じ式の `SELECT` と一致する。
+/// 書き込みを試みうる `LANGUAGE sql` 関数は `0A000` で拒否され、接続は維持される。
+// intentional: docs/design/sql-returning.md（routine 呼び出しの 0A000）
+#[test]
+fn wire_returning_udf_simple_query_matches_select_and_routine_is_rejected() {
+    let (core, _guard) = new_core_with_docs_table();
+    let addr = spawn_with_ddl_user(core);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+
+    simple_ok(
+        &mut stream,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+        "CREATE FUNCTION",
+    );
+
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') \
+         RETURNING shout(lang) AS u USING OPERATION_ID 'wire-udf-ret-1';",
+    );
+    let columns = read_row_description(&mut stream);
+    let row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "INSERT 0 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(&mut stream, "SELECT shout(lang) AS u FROM docs");
+    let select_columns = read_row_description(&mut stream);
+    let select_row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+    assert_eq!(columns, vec!["u".to_string()]);
+    assert_eq!(columns, select_columns);
+    assert_eq!(row, vec![Some("JA".to_string())]);
+    assert_eq!(row, select_row);
+
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET lang = 'en' WHERE id = 1 RETURNING shout(lang) AS u \
+         USING OPERATION_ID 'wire-udf-ret-2';",
+    );
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("EN".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs WHERE id = 1 RETURNING shout(lang) AS u \
+         USING OPERATION_ID 'wire-udf-ret-3';",
+    );
+    let _ = read_row_description(&mut stream);
+    assert_eq!(read_data_row(&mut stream), vec![Some("EN".to_string())]);
+    assert_eq!(read_command_complete(&mut stream), "DELETE 1");
+    read_ready_for_query(&mut stream);
+
+    // LANGUAGE sql 関数（書き込みを試みうる）は書き込み前に 0A000。接続は維持される。
+    simple_ok(
+        &mut stream,
+        "CREATE FUNCTION rt(x text) RETURNS text LANGUAGE sql AS $$ SELECT x $$",
+        "CREATE FUNCTION",
+    );
+    send_simple_query(
+        &mut stream,
+        "INSERT INTO docs (id, embedding, lang) VALUES (2, '[0.1,0.2,0.3]', 'ja') \
+         RETURNING rt(lang) USING OPERATION_ID 'wire-udf-ret-4';",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
+    // 台帳は未消費で、同じ operation_id の RETURNING なし INSERT が通る。
+    simple_ok(
+        &mut stream,
+        &insert_sql(2, "ja", "wire-udf-ret-4"),
+        "INSERT 0 1",
+    );
+}
+
+/// 拡張クエリ（Parse／Describe／Bind／Execute）でも UDF 付き RETURNING の RowDescription
+/// （UDF の戻り値型）と DataRow が得られる。
+#[test]
+fn wire_returning_udf_extended_query_describes_and_executes() {
+    let (core, _guard) = new_core_with_docs_table();
+    let addr = spawn_with_ddl_user(core);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+    simple_ok(
+        &mut stream,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+        "CREATE FUNCTION",
+    );
+
+    let sql = "INSERT INTO docs (id, embedding, lang) VALUES (1, '[0.1,0.2,0.3]', 'ja') \
+               RETURNING shout(lang) AS u USING OPERATION_ID 'wire-udf-ext-1'";
+    send_length_prefixed_message(&mut stream, b'P', &parse_body("s", sql, 0));
+    let mut describe = vec![b'S'];
+    describe.extend_from_slice(b"s\0");
+    send_length_prefixed_message(&mut stream, b'D', &describe);
+    send_length_prefixed_message(&mut stream, b'B', &bind_body("", "s"));
+    send_length_prefixed_message(&mut stream, b'E', &execute_body("", 0));
+    send_length_prefixed_message(&mut stream, b'S', &[]);
+
+    let mut types = Vec::new();
+    let mut tag = String::new();
+    let mut data_rows = 0;
+    loop {
+        let (t, body) = read_message(&mut stream);
+        types.push(t);
+        match t {
+            b'D' => data_rows += 1,
+            b'C' => {
+                tag = String::from_utf8_lossy(&body)
+                    .trim_end_matches('\0')
+                    .to_string()
+            }
+            b'E' => panic!(
+                "unexpected ErrorResponse: {}",
+                String::from_utf8_lossy(&body)
+            ),
+            _ => {}
+        }
+        if t == b'Z' {
+            break;
+        }
+    }
+    assert!(types.contains(&b'T'), "RowDescription expected: {types:?}");
+    assert_eq!(data_rows, 1);
+    assert_eq!(tag, "INSERT 0 1");
+}
+// --- RETURNING の式・別名を各面へ展開（Issue #3251・SQL-21・SQL-53 のポインタ） ---
+
+/// データ変更 CTE・ビュー経由の UPDATE・`UPDATE ... FROM`・`DELETE ... USING` の `RETURNING` が、
+/// 式・別名・UDF つきでも psql と同じ末尾 `;` 付きの単独送信で `RowDescription`→`DataRow`*→
+/// `CommandComplete` の順に届く。
+#[test]
+fn wire_returning_expressions_over_cte_view_and_from_using_surfaces() {
+    let (core, _guard) = new_core_with_docs_and_langs();
+    let addr = spawn_with_ddl_user(core);
+    let mut stream = connect_as(addr, "alice", "pw-alice");
+    simple_ok(
+        &mut stream,
+        "CREATE FUNCTION shout(x) AS upper(x)",
+        "CREATE FUNCTION",
+    );
+    simple_ok(
+        &mut stream,
+        "CREATE VIEW v_docs AS SELECT * FROM docs",
+        "CREATE VIEW",
+    );
+    for sql in [
+        insert_sql(1, "ja", "wire-expr-1"),
+        insert_sql(2, "en", "wire-expr-2"),
+        "INSERT INTO langs (id, lang, label) VALUES (1, 'ja', 'Japanese') \
+         USING OPERATION_ID 'wire-expr-l1'"
+            .to_string(),
+    ] {
+        simple_ok(&mut stream, &sql, "INSERT 0 1");
+    }
+
+    // データ変更 CTE
+    send_simple_query(
+        &mut stream,
+        "WITH u AS (UPDATE docs SET lang = 'fr' WHERE id = 1 \
+         RETURNING id AS rid, shout(lang) AS s, upper(lang)) \
+         SELECT rid, s, upper FROM u USING OPERATION_ID 'wire-expr-cte';",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["rid".to_string(), "s".to_string(), "upper".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![
+            Some("1".to_string()),
+            Some("FR".to_string()),
+            Some("FR".to_string())
+        ]
+    );
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    read_ready_for_query(&mut stream);
+
+    // ビュー経由の UPDATE
+    send_simple_query(
+        &mut stream,
+        "UPDATE v_docs SET lang = 'de' WHERE id = 1 RETURNING id AS rid, shout(lang) AS s \
+         USING OPERATION_ID 'wire-expr-view';",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["rid".to_string(), "s".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("DE".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    // UPDATE ... FROM（対象表の式・別名つき列参照）
+    send_simple_query(
+        &mut stream,
+        "UPDATE docs SET lang = 'ja' FROM langs WHERE docs.id = langs.id \
+         RETURNING langs.label AS l, shout(docs.lang) AS s;",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["l".to_string(), "s".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("Japanese".to_string()), Some("JA".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "UPDATE 1");
+    read_ready_for_query(&mut stream);
+
+    // DELETE ... USING
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.id = langs.id \
+         RETURNING docs.id AS i, upper(docs.lang);",
+    );
+    assert_eq!(
+        read_row_description(&mut stream),
+        vec!["i".to_string(), "upper".to_string()]
+    );
+    assert_eq!(
+        read_data_row(&mut stream),
+        vec![Some("1".to_string()), Some("JA".to_string())]
+    );
+    assert_eq!(read_command_complete(&mut stream), "DELETE 1");
+    read_ready_for_query(&mut stream);
+
+    // FROM／USING 側の列を式の中で参照する形は 0A000（接続は維持される）。
+    send_simple_query(
+        &mut stream,
+        "DELETE FROM docs USING langs WHERE docs.id = langs.id RETURNING upper(langs.label);",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    read_ready_for_query(&mut stream);
 }

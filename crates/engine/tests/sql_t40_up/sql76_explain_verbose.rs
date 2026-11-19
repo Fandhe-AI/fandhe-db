@@ -91,6 +91,8 @@ fn verbose_adds_output_and_keeps_existing_lines() {
         ("SELECT count(*) AS n FROM a", "output: n"),
         ("SELECT x.k FROM a x JOIN a y ON x.k = y.k", "output: k"),
         ("SELECT k FROM a UNION SELECT k FROM a", "output: k"),
+        ("SELECT 7 UNION SELECT k FROM a", "output: \"?column?\""),
+        ("SELECT k+1 AS m FROM a UNION SELECT k FROM a", "output: m"),
         ("WITH c AS (SELECT k FROM a) SELECT k FROM c", "output: k"),
         ("SELECT t.k FROM (SELECT k FROM a) t", "output: k"),
         (SEARCH, "output: id"),

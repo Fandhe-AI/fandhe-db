@@ -124,9 +124,10 @@ fn wire_type_ddl_lifecycle_and_sqlstates() {
     read_ready_for_query(&mut stream);
 }
 
-/// 複数文メッセージで `CREATE TYPE` を最後以外に置くと `0A000`。
+/// 複数文メッセージで `CREATE TYPE` を最後以外に置くと、暗黙トランザクションで DDL と後続の読み取りを
+/// 1 つの Tx として実行する（SQL-80・Issue #3315）。
 #[test]
-fn wire_create_type_not_last_in_multi_statement_message_is_rejected() {
+fn wire_create_type_not_last_in_multi_statement_message_runs_in_an_implicit_transaction() {
     let (core, _guard) = new_core_with_docs_table();
     let store = allowed_store(&[("alice", "tenant-a", "correct-horse")], &["alice"]);
     let addr = spawn_server_with_engine_and_store(store, core);
@@ -136,6 +137,14 @@ fn wire_create_type_not_last_in_multi_statement_message_is_rejected() {
         &mut stream,
         "CREATE TYPE mood AS ENUM ('a'); SELECT COUNT(*) FROM docs",
     );
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    assert_eq!(read_command_complete(&mut stream), "CREATE TYPE");
+    let _columns = read_row_description(&mut stream);
+    let _row = read_data_row(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 1");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+
+    // 確定済み: 同名の作成は `42710`。
+    send_simple_query(&mut stream, "CREATE TYPE mood AS ENUM ('b')");
+    expect_error_response_with_sqlstate(&mut stream, "42710");
     read_ready_for_query(&mut stream);
 }

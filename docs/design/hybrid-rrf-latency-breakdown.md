@@ -1924,3 +1924,32 @@ warmup 20・measured 30 × rounds 5 = 250）であり、`sql_arena_hits`／
 
 3 phase とも p50 の min は変更前より下がった。k10 の改善（約 330 µs）が最も大きい。hybrid 系は
 BM25・RRF 融合などコサイン以外の段が支配的なため、下げ幅は小さい。
+
+## Issue #3217: 行ノルム² のスナップショット常駐
+
+`<=>` の全走査は各行で `dot(v, v)` を毎クエリ再計算していた。`SqlArenaSnapshot` に行ノルム²
+（`OnceLock<Option<Box<[f32]>>>`）を持たせ、初回の `<=>` 全走査で一度だけ `kernel::row_norms_sq` から
+計算し、以降の全走査は C2 入力（`CosineSearchInput::row_norms_sq`）として渡す。計算式は行ループの
+フォールバックと同じ `dot(v, v)` のため、結果はビット一致する（SQL 結合テストで距離のビット列を比較）。
+
+- 破棄の契約は arena と同じ（世代不一致・LRU・容量超過で `Arc<SqlArenaSnapshot>` と一緒に解放。別個の
+  失効ロジックなし）。キーは既存の `(table, ctx)` 完全一致で、他テナントのノルム² を共有する経路は無い
+- 追加メモリは行数 × 4 バイト（`MAX_ARENA_ROWS` で最大 4 MiB / スナップショット）。遅延確保でも
+  `approx_heap_bytes` に常に算入し、キャッシュ総量上限の判定を破らない。確保失敗は C1 へ縮退する
+- 渡すのは、キャッシュヒットのスナップショットがあり、候補マスクが無く、走査する arena が
+  `snapshot.arena()` そのもの（`std::ptr::eq`）で、長さが slot 数と一致するときだけ。
+  WHERE ありの縮約 arena・キャッシュミス時の新規 arena・スカラー索引のマスク経路・NULL VECTOR 行を
+  含む `dense_slots` 経路・HNSW 経路は従来どおり（位置が対応しない arena に別行のノルムを使う誤結果を
+  防ぐ fail-closed）
+- hybrid の密側（`CosineDenseAdapter`）も同じ条件で渡す
+
+A/B（p50 低下）は本 Issue の作業環境では計測していない（**未検証**）。変更前後の比較は
+`aggregate-regression-bisect/run_bisect_step.sh` の手順で専有環境での実測が必要。
+
+## Issue #3222: score_pass の len_norm キャッシュの配列化
+
+- `k1_len_norm_cache: HashMap<u32, f64>` を文書長クラス添字の `Vec<f64>`（番兵 NaN のビット比較で未計算を判定）へ置換。式・演算順は不変でスコアはビット一致
+- パスごとのリセットは `touched_classes` のスロットのみ番兵へ戻す `O(M)`（#391・#426 の計算量契約を維持）
+- 配列長は確保前に `classes <= n <= MAX_CORPUS_DOCS` を検査（違反時は空配列でヒット棄却）
+
+A/B（p50 低下。想定は約 0.09 ms で #3216 の base のばらつきより小さい）は本 Issue の作業環境では計測していない（**未検証**）。`aggregate-regression-bisect/run_bisect_step.sh` の手順で専有環境での実測が必要。

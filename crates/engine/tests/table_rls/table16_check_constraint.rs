@@ -176,22 +176,302 @@ fn create_table_rejects_check_calling_visible() {
     assert_eq!(err.wire_code(), "42601");
 }
 
-/// Issue #1184: WHERE で受理する `NOT ( ... )`・数値の `IN`／`BETWEEN` は、CHECK 本体
-/// （TABLE-16）では従来どおり `42601` のまま（脱糖後の形が CHECK の許可形と区別
-/// できず、受理範囲が黙って広がるのを防ぐ）。
+/// Issue #3244・TABLE-16・SQL-24: CHECK の `IN`／`NOT IN`／`BETWEEN`／`IS [NOT] NULL` は
+/// 受理され、NULL の扱いが PG と同じ（`IS NOT NULL` だけが NULL を違反にする）。
+/// 末尾 `;` 付きの単独文でも同じ。違反した文は副作用を残さず、文言に値を含めない。
 #[test]
-fn create_table_rejects_not_group_and_numeric_in_between_in_check() {
-    let (core, path) = new_core("check-1184-forms");
+fn check_in_between_is_null_forms_follow_pg_null_semantics() {
+    // (CHECK 本体, 合格する n, 違反する n, NULL が合格するか)
+    let cases: [(&str, &str, &str, bool); 6] = [
+        ("n IN (1, 2)", "1", "3", true),
+        ("n NOT IN (1, 2)", "3", "1", true),
+        ("n BETWEEN 1 AND 3", "2", "4", true),
+        ("n NOT BETWEEN 1 AND 3", "4", "2", true),
+        ("n IS NOT NULL", "1", "NULL", false),
+        ("n IS NULL", "NULL", "1", true),
+    ];
+    for (idx, (cond, ok_value, bad_value, null_passes)) in cases.into_iter().enumerate() {
+        let (core, path) = new_core(&format!("check-3244-{idx}"));
+        let _guard = CleanupGuard(path);
+        let alice = ctx("alice");
+        let mut session = granted_session();
+        core.execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            &format!("CREATE TABLE docs (n INTEGER, CHECK ({cond}));"),
+        )
+        .unwrap_or_else(|e| panic!("{cond}: CREATE TABLE must succeed: {e:?}"));
+
+        core.execute_insert_sql(
+            &alice,
+            &format!("INSERT INTO docs (id, n) VALUES (1, {ok_value}) USING OPERATION_ID 'ok-1';"),
+        )
+        .unwrap_or_else(|e| panic!("{cond}: n={ok_value} must pass: {e:?}"));
+
+        let err = core
+            .execute_insert_sql(
+                &alice,
+                &format!(
+                    "INSERT INTO docs (id, n) VALUES (2, {bad_value}) USING OPERATION_ID 'bad-2';"
+                ),
+            )
+            .expect_err("violating row must be rejected");
+        assert_eq!(err.wire_code(), "23514", "{cond}: n={bad_value}");
+        assert!(err.client_message().contains("docs_check"), "{cond}");
+
+        let null_result = core.execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, n) VALUES (3, NULL) USING OPERATION_ID 'null-3';",
+        );
+        if null_passes {
+            null_result.unwrap_or_else(|e| panic!("{cond}: NULL must pass: {e:?}"));
+        } else {
+            assert_eq!(
+                null_result.expect_err("NULL must violate").wire_code(),
+                "23514",
+                "{cond}"
+            );
+        }
+
+        // 違反した文は行を残さない（合格した行だけが見える）。
+        let expected = if null_passes { 2 } else { 1 };
+        assert_eq!(
+            select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
+            expected,
+            "{cond}"
+        );
+    }
+}
+
+/// Issue #3244: 文字列の `IN`／`NOT IN`／`IS NOT NULL`（TEXT 列）と、UPDATE 経路の強制。
+#[test]
+fn check_text_in_not_in_and_update_are_enforced() {
+    let (core, path) = new_core("check-3244-text");
     let _guard = CleanupGuard(path);
     let alice = ctx("alice");
     let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (kind TEXT, CHECK (kind IN ('a', 'b')), CHECK (kind NOT IN ('x')));",
+    )
+    .expect("create table");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, kind) VALUES (1, 'a') USING OPERATION_ID 'i1';",
+    )
+    .expect("a passes");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, kind) VALUES (2, NULL) USING OPERATION_ID 'i2';",
+    )
+    .expect("NULL passes");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, kind) VALUES (3, 'c') USING OPERATION_ID 'i3';",
+        )
+        .expect_err("c violates IN");
+    assert_eq!(err.wire_code(), "23514");
 
-    for cond in [
-        "NOT (kind = 'a')",
-        "NOT (n > 1)",
-        "NOT n > 1",
-        "n IN (1, 2)",
-        "n BETWEEN 1 AND 3",
+    let err = core
+        .execute_sql_in_session_legacy(
+            &alice,
+            &mut SessionState::default(),
+            "UPDATE docs SET kind = 'zzz' WHERE id = 1 USING OPERATION_ID 'u1'",
+        )
+        .expect_err("UPDATE to a value outside IN must be rejected");
+    assert_eq!(err.wire_code(), "23514");
+    assert_eq!(
+        select_count(
+            &core,
+            &alice,
+            "SELECT id FROM docs WHERE kind = 'a' LIMIT 100"
+        ),
+        1
+    );
+}
+
+/// Issue #3244: 数値の `IN`／`NOT BETWEEN`（OR 展開）でしか参照されない列も依存列として記録され、
+/// `ALTER TABLE ... DROP COLUMN` が拒否される（取りこぼすと fail-open）。改名後も新しい名前で強制される。
+#[test]
+fn or_expanded_check_records_dependency_and_follows_rename() {
+    let (core, path) = new_core("check-3244-deps");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER CHECK (a IN (1, 2)), b INTEGER CHECK (b NOT BETWEEN 1 AND 3))",
+    )
+    .expect("create table");
+
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN a TO a2",
+    )
+    .expect("rename column");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a2, b) VALUES (1, 9, 5) USING OPERATION_ID 'r1'",
+        )
+        .expect_err("renamed column keeps the IN check");
+    assert_eq!(err.wire_code(), "23514");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, a2, b) VALUES (2, 1, 5) USING OPERATION_ID 'r2'",
+    )
+    .expect("satisfying row");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    for column in ["a2", "b"] {
+        let err = storage
+            .alter_table_drop_column("docs", column)
+            .expect_err("dropping an OR-expanded CHECK dependency must be rejected");
+        assert!(
+            matches!(
+                err,
+                engine::catalog::CatalogError::DependentObjectsStillExist(_)
+            ),
+            "{column}"
+        );
+    }
+}
+
+/// Issue #3245: 新しい述語形（文字列 `IN`・`BETWEEN`・`IS NOT NULL`・分岐内 `IS NULL` の `OR`・
+/// `NOT LIKE`・裸の `NOT bool_col`・`NOT IN`）の参照列を `RENAME COLUMN` した後も、CHECK が新しい
+/// 列名で強制される（旧名と同じ文字列リテラル `'kind'` は置換されない）。再オープン後も同じ。
+#[test]
+fn new_predicate_forms_follow_rename_column() {
+    let (core, path) = new_core("check-3245-rename");
+    let _guard = CleanupGuard(path.clone());
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (kind TEXT CHECK (kind IN ('kind', 'x')), \
+         n INTEGER CHECK (n BETWEEN 1 AND 9), \
+         m INTEGER CHECK (m IS NOT NULL), \
+         p INTEGER CHECK (p IS NULL OR p > 0), \
+         t TEXT CHECK (t NOT LIKE 'zz%'), \
+         f BOOLEAN CHECK (NOT f), \
+         u TEXT CHECK (u NOT IN ('u')))",
+    )
+    .expect("create table");
+    for (old, new) in [
+        ("kind", "kind2"),
+        ("n", "n2"),
+        ("m", "m2"),
+        ("p", "p2"),
+        ("t", "t2"),
+        ("f", "f2"),
+        ("u", "u2"),
+    ] {
+        core.execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            &format!("ALTER TABLE docs RENAME COLUMN {old} TO {new}"),
+        )
+        .unwrap_or_else(|e| panic!("rename {old} must succeed: {e:?}"));
+    }
+
+    let check = |core: &EngineCore, tag: &str| {
+        // 列ごとに 1 つだけ違反させた VALUES 句（kind2, n2, m2, p2, t2, f2, u2 の順）。
+        let rows: [(&str, &str); 7] = [
+            ("kind2", "'zzz', 5, 1, 1, 'ok', false, 'ok'"),
+            ("n2", "'kind', 10, 1, 1, 'ok', false, 'ok'"),
+            ("m2", "'kind', 5, NULL, 1, 'ok', false, 'ok'"),
+            ("p2", "'kind', 5, 1, -1, 'ok', false, 'ok'"),
+            ("t2", "'kind', 5, 1, 1, 'zzx', false, 'ok'"),
+            ("f2", "'kind', 5, 1, 1, 'ok', true, 'ok'"),
+            ("u2", "'kind', 5, 1, 1, 'ok', false, 'u'"),
+        ];
+        for (i, (col, values)) in rows.iter().enumerate() {
+            let sql = format!(
+                "INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES ({}, {values}) USING OPERATION_ID '{tag}{i}'",
+                100 + i
+            );
+            let err = core
+                .execute_insert_sql(&alice, &sql)
+                .expect_err(&format!("{col} violation must be rejected"));
+            assert_eq!(err.wire_code(), "23514", "{col}");
+        }
+        core.execute_insert_sql(
+            &alice,
+            &format!("INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES (1, 'kind', 5, 1, NULL, 'ok', false, 'ok') USING OPERATION_ID '{tag}ok'"),
+        )
+        .expect("satisfying row");
+    };
+    check(&core, "a");
+    drop(core);
+
+    let storage = Storage::open(&path).expect("reopen storage");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    // 再オープン後も新しい列名で強制される（INSERT が id 重複でなく CHECK で拒否される）。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES (2, 'zzz', 5, 1, 1, 'ok', false, 'ok') USING OPERATION_ID 'z1'",
+        )
+        .expect_err("kind2 IN check after reopen");
+    assert_eq!(err.wire_code(), "23514");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, kind2, n2, m2, p2, t2, f2, u2) VALUES (3, 'kind', 5, NULL, 1, 'ok', false, 'ok') USING OPERATION_ID 'z2'",
+        )
+        .expect_err("m2 IS NOT NULL check after reopen");
+    assert_eq!(err.wire_code(), "23514");
+}
+
+/// Issue #3244: `ALTER TABLE ADD CHECK` も新しい形を受け付け、以降の INSERT で強制される。
+#[test]
+fn alter_table_add_check_accepts_in_between_is_null() {
+    let (core, path) = new_core("check-3244-add");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(&alice, &mut session, "CREATE TABLE docs (n INTEGER)")
+        .expect("create table");
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs ADD CHECK (n BETWEEN 1 AND 10)",
+    )
+    .expect("ADD CHECK with BETWEEN");
+    core.execute_insert_sql(
+        &alice,
+        "INSERT INTO docs (id, n) VALUES (1, 5) USING OPERATION_ID 'a1'",
+    )
+    .expect("in range");
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, n) VALUES (2, 11) USING OPERATION_ID 'a2'",
+        )
+        .expect_err("out of range");
+    assert_eq!(err.wire_code(), "23514");
+}
+
+/// Issue #3244: 未対応の形は fail-closed のまま（式を左辺にとる形・TEXT の `BETWEEN`・数値列 ×
+/// 文字列要素の `IN`・vector 系列の `IS NULL`）。
+/// intentional: docs/design/sql-check-constraint.md
+#[test]
+fn unsupported_in_between_null_forms_stay_rejected_in_check() {
+    let (core, path) = new_core("check-3244-reject");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    for (cond, code) in [
+        ("n + 1 IS NULL", "42601"),
+        ("n + 1 IN (1, 2)", "42601"),
+        ("kind BETWEEN 'a' AND 'z'", "22000"),
+        ("n IN ('1', '2')", "22000"),
     ] {
         let err = core
             .execute_sql_in_session_legacy(
@@ -199,9 +479,368 @@ fn create_table_rejects_not_group_and_numeric_in_between_in_check() {
                 &mut session,
                 &format!("CREATE TABLE docs (kind TEXT, n INTEGER, CHECK ({cond}))"),
             )
-            .expect_err("new WHERE-only forms must be rejected in CHECK");
-        assert_eq!(err.wire_code(), "42601", "{cond}");
+            .expect_err("unsupported form must be rejected");
+        assert_eq!(err.wire_code(), code, "{cond}");
     }
+}
+
+/// Issue #3243: `NOT` の 3 形（グループ・グループ内の式比較・裸の式比較）は受理する。
+#[test]
+fn create_table_accepts_not_forms_in_check() {
+    let (core, path) = new_core("check-3243-not-forms");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    for (i, cond) in [
+        "NOT (kind = 'a')",
+        "NOT (n > 1)",
+        "NOT n > 1",
+        "kind <> 'a'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        core.execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            &format!("CREATE TABLE docs{i} (kind TEXT, n INTEGER, CHECK ({cond}))"),
+        )
+        .unwrap_or_else(|e| panic!("{cond} must be accepted: {e:?}"));
+    }
+}
+
+fn sql_insert(core: &EngineCore, alice: &PolicyContext, sql: &str) -> Result<(), String> {
+    core.execute_insert_sql(alice, sql)
+        .map(|_| ())
+        .map_err(|e| e.wire_code().to_string())
+}
+
+/// Issue #3243: 末尾 `;` 付きの `OR` CHECK は三値論理で評価される。UNKNOWN は合格、FALSE だけ
+/// `23514`。違反は副作用ゼロ（同じ `operation_id` を適合行で再送できる）。
+#[test]
+fn or_check_follows_three_valued_logic_via_sql() {
+    let (core, path) = new_core("check-3243-or-truth");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, b INTEGER, CHECK (a > 0 OR b > 0));",
+    )
+    .expect("create table");
+
+    // TRUE OR UNKNOWN / FALSE OR UNKNOWN / UNKNOWN OR UNKNOWN は合格。
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (1, 1) USING OPERATION_ID 'o1';",
+    )
+    .expect("T OR U");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (2, -1) USING OPERATION_ID 'o2';",
+    )
+    .expect("F OR U");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id) VALUES (3) USING OPERATION_ID 'o3';",
+    )
+    .expect("U OR U");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (4, -1, 1) USING OPERATION_ID 'o4';",
+    )
+    .expect("F OR T");
+
+    // FALSE OR FALSE は違反。メッセージに値・id は含まない。
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (5, -1, -1) USING OPERATION_ID 'o5';",
+        )
+        .expect_err("F OR F must violate");
+    assert_eq!(err.wire_code(), "23514");
+    assert!(!err.client_message().contains("-1"));
+    // 副作用ゼロ: 同じ operation_id を適合行で再送すると成功する。
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (5, 1, -1) USING OPERATION_ID 'o5';",
+    )
+    .expect("resend with the same operation_id and a valid row must succeed");
+
+    // UPDATE で違反へ変えると 23514。
+    let mut s = SessionState::default();
+    let err = core
+        .execute_sql_in_session_legacy(
+            &alice,
+            &mut s,
+            "UPDATE docs SET a = -2 WHERE id = 5 USING OPERATION_ID 'u1';",
+        )
+        .expect_err("UPDATE into F OR F must violate");
+    assert_eq!(err.wire_code(), "23514");
+}
+
+/// Issue #3243: `NOT (a = 0)`（`a < 0 OR a > 0` へ脱糖）の三値評価。
+#[test]
+fn not_check_follows_three_valued_logic_via_sql() {
+    let (core, path) = new_core("check-3243-not-truth");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, CHECK (NOT (a = 0)));",
+    )
+    .expect("create table");
+    assert_eq!(
+        sql_insert(
+            &core,
+            &alice,
+            "INSERT INTO docs (id, a) VALUES (1, 0) USING OPERATION_ID 'o1';"
+        ),
+        Err("23514".to_string())
+    );
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id) VALUES (2) USING OPERATION_ID 'o2';",
+    )
+    .expect("NOT UNKNOWN is UNKNOWN and passes");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a) VALUES (3, 1) USING OPERATION_ID 'o3';",
+    )
+    .expect("a = 1");
+}
+
+/// Issue #3243: `OR` の内側だけで参照する列は依存列として記録され、`DROP COLUMN` は拒否される
+/// （取りこぼすと CHECK を黙って壊す fail-open）。`RENAME COLUMN`・`ALTER COLUMN TYPE` 後も
+/// CHECK は機能し続ける。
+#[test]
+fn or_check_dependency_is_tracked_for_drop_rename_and_alter_type() {
+    let (core, path) = new_core("check-3243-dependency");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (qty INTEGER, kind TEXT, note TEXT, \
+         CHECK (kind = 'a' OR qty > 0), CHECK (NOT (qty = 0)));",
+    )
+    .expect("create table");
+
+    for col in ["kind", "qty"] {
+        let err = core
+            .execute_sql_in_session_legacy(
+                &alice,
+                &mut session,
+                &format!("ALTER TABLE docs DROP COLUMN {col}"),
+            )
+            .expect_err("dropping a column referenced only inside OR must be rejected");
+        assert_eq!(err.wire_code(), "2BP01", "{col}");
+    }
+
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs RENAME COLUMN kind TO kind2",
+    )
+    .expect("rename");
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "ALTER TABLE docs ALTER COLUMN qty TYPE BIGINT",
+    )
+    .expect("alter type");
+    // FALSE OR FALSE（kind2 <> 'a' かつ qty <= 0）は NOT (qty = 0) 側の都合で qty = 0 を避ける。
+    assert_eq!(
+        sql_insert(
+            &core,
+            &alice,
+            "INSERT INTO docs (id, qty, kind2) VALUES (1, -1, 'b') USING OPERATION_ID 'o1';"
+        ),
+        Err("23514".to_string())
+    );
+    assert_eq!(
+        sql_insert(
+            &core,
+            &alice,
+            "INSERT INTO docs (id, qty, kind2) VALUES (2, 0, 'a') USING OPERATION_ID 'o2';"
+        ),
+        Err("23514".to_string())
+    );
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, qty, kind2) VALUES (3, 5, 'b') USING OPERATION_ID 'o3';",
+    )
+    .expect("satisfies both");
+}
+
+/// Issue #3243: 別テナントの行は CHECK の評価に影響しない（書き込み行のスカラー列だけを読む）。
+#[test]
+fn or_check_is_evaluated_per_row_regardless_of_other_tenants() {
+    let (core, path) = new_core("check-3243-tenant");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, b INTEGER, CHECK (a > 0 OR b > 0));",
+    )
+    .expect("create table");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, a, b) VALUES (1, 1, 1) USING OPERATION_ID 'o1';",
+    )
+    .expect("alice ok");
+    assert_eq!(
+        sql_insert(
+            &core,
+            &bob,
+            "INSERT INTO docs (id, a, b) VALUES (1, -1, -1) USING OPERATION_ID 'o1';"
+        ),
+        Err("23514".to_string())
+    );
+    sql_insert(
+        &core,
+        &bob,
+        "INSERT INTO docs (id, a, b) VALUES (1, 2, -1) USING OPERATION_ID 'o2';",
+    )
+    .expect("bob ok");
+}
+
+/// Issue #3246: IN／BETWEEN／IS NOT NULL／NOT の CHECK も書き込み行の列値だけを評価し、
+/// 別テナントの行・値・テナント名に影響されず、応答にも含めない（テナント境界）。
+#[test]
+fn extended_check_forms_are_evaluated_per_row_regardless_of_other_tenants() {
+    let (core, path) = new_core("check-3246-tenant");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let bob = ctx("bob");
+    let mut session = granted_session();
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (n INTEGER, s TEXT, \
+         CONSTRAINT n_in CHECK (n IN (1, 2, 3)), \
+         CONSTRAINT n_range CHECK (n BETWEEN 1 AND 9), \
+         CONSTRAINT s_req CHECK (s IS NOT NULL), \
+         CONSTRAINT n_not2 CHECK (NOT (n = 2)));",
+    )
+    .expect("create table");
+    sql_insert(
+        &core,
+        &alice,
+        "INSERT INTO docs (id, n, s) VALUES (1, 1, 'alice-secret') USING OPERATION_ID 'o1';",
+    )
+    .expect("alice ok");
+
+    // bob の同じ id の違反行は、他テナントの充足行の有無にかかわらず制約ごとに 23514。
+    for (op, values) in [("b-in", "(1, 4, 'x')"), ("b-not", "(1, 2, 'x')")] {
+        assert_eq!(
+            sql_insert(
+                &core,
+                &bob,
+                &format!("INSERT INTO docs (id, n, s) VALUES {values} USING OPERATION_ID '{op}';")
+            ),
+            Err("23514".to_string()),
+            "case {op}"
+        );
+    }
+    let err = core
+        .execute_insert_sql(
+            &bob,
+            "INSERT INTO docs (id, n) VALUES (1, 1) USING OPERATION_ID 'b-null';",
+        )
+        .expect_err("s IS NOT NULL must reject NULL");
+    assert_eq!(err.wire_code(), "23514");
+    let message = err.client_message();
+    assert!(message.contains("s_req"), "names the constraint: {message}");
+    for leaked in ["alice", "bob", "alice-secret"] {
+        assert!(
+            !message.contains(leaked),
+            "must not echo {leaked}: {message}"
+        );
+    }
+
+    sql_insert(
+        &core,
+        &bob,
+        "INSERT INTO docs (id, n, s) VALUES (1, 3, 'x') USING OPERATION_ID 'b-ok';",
+    )
+    .expect("bob ok");
+    // 違反した bob の書き込みの前後で alice 側の件数は不変。
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs WHERE n >= 0 LIMIT 100"),
+        1
+    );
+}
+
+/// intentional: docs/design/sql-check-constraint.md
+/// Issue #3246: RLS 述語名（`visible()`）を `OR`／`NOT` の内側へ紛れ込ませる CHECK は
+/// `42601` で拒否され、表は作られない（fail-closed。テナント境界のバイパス経路を作らない）。
+#[test]
+fn check_cannot_smuggle_rls_predicate_through_or_or_not() {
+    let (core, path) = new_core("check-3246-smuggle");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    for (i, check) in [
+        "CHECK (n > 0 OR visible())",
+        "CHECK (NOT (n = 0 OR visible()))",
+        "CHECK (NOT (visible()))",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let err = core
+            .execute_sql_in_session_legacy(
+                &alice,
+                &mut session,
+                &format!("CREATE TABLE smuggle{i} (n INTEGER, {check});"),
+            )
+            .expect_err("rls predicate in CHECK must be rejected");
+        assert_eq!(err.wire_code(), "42601", "case {check}");
+        // 副作用ゼロ: 表は作られていない。
+        let err = core
+            .execute_sql_in_session_legacy(
+                &alice,
+                &mut SessionState::default(),
+                &format!("SELECT id FROM smuggle{i} LIMIT 1"),
+            )
+            .expect_err("table must not exist");
+        assert_eq!(err.wire_code(), "42P01", "case {check}");
+    }
+}
+
+/// intentional: docs/design/sql-check-constraint.md
+/// Issue #3246: テナント列（`tenant_id`）を参照する CHECK は拒否される（列として存在しない）。
+#[test]
+fn check_referencing_tenant_column_is_rejected() {
+    let (core, path) = new_core("check-3246-tenant-col");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+    let err = core
+        .execute_sql_in_session_legacy(
+            &alice,
+            &mut session,
+            "CREATE TABLE t_tenant (n INTEGER, CHECK (tenant_id = 'alice'));",
+        )
+        .expect_err("tenant column must not be referencable in CHECK");
+    assert_eq!(err.wire_code(), "42703");
 }
 
 // --- 単一行 INSERT --------------------------------------------------------
@@ -1305,4 +1944,50 @@ fn select_where_numeric_column_expression_is_accepted() {
         "SELECT id FROM docs WHERE qty > 0 LIMIT 100",
     )
     .expect("numeric column expression in WHERE must be accepted");
+}
+/// Issue #3242・TABLE-16・SQL-26: CHECK は三値論理で評価され、NULL を含む比較は UNKNOWN で
+/// 合格し、FALSE のときだけ `23514` になる。psql が送る末尾 `;` 付きの単独文でも同じ。
+/// 違反した文は副作用（行）を残さない。
+#[test]
+fn check_null_comparison_passes_and_false_is_rejected_with_trailing_semicolon() {
+    let (core, path) = new_core("check-3242-three-valued");
+    let _guard = CleanupGuard(path);
+    let alice = ctx("alice");
+    let mut session = granted_session();
+
+    core.execute_sql_in_session_legacy(
+        &alice,
+        &mut session,
+        "CREATE TABLE docs (a INTEGER, b INTEGER, CHECK (a < b));",
+    )
+    .expect("CREATE TABLE with trailing semicolon should succeed");
+
+    for (id, values) in [
+        (1, "NULL, 5"),
+        (2, "5, NULL"),
+        (3, "NULL, NULL"),
+        (4, "1, 2"),
+    ] {
+        core.execute_insert_sql(
+            &alice,
+            &format!(
+                "INSERT INTO docs (id, a, b) VALUES ({id}, {values}) USING OPERATION_ID 'op-{id}';"
+            ),
+        )
+        .unwrap_or_else(|e| panic!("row {values} must pass (UNKNOWN or TRUE): {e:?}"));
+    }
+
+    let err = core
+        .execute_insert_sql(
+            &alice,
+            "INSERT INTO docs (id, a, b) VALUES (5, 9, 1) USING OPERATION_ID 'op-5';",
+        )
+        .expect_err("FALSE comparison must be rejected");
+    assert_eq!(err.wire_code(), "23514");
+
+    // 違反した行は残らず、合格した 4 行だけが見える。
+    assert_eq!(
+        select_count(&core, &alice, "SELECT id FROM docs LIMIT 100"),
+        4
+    );
 }

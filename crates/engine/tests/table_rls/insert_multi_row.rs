@@ -533,33 +533,90 @@ fn multi_row_insert_rejects_row_with_mismatched_literal_count() {
 // NoSQL 表層 `rows[]`（`execute_bound_insert_in_session`）と同一上限を共有する。
 // ---------------------------------------------------------------------
 
+/// Issue #3308: ①（`max_files_per_batch`）は行の形の複数行 `VALUES` には掛からない。
+/// 上限 2 でも 3 行・100 行が成功する（ファイル形の一括投入の ① は別テストで維持）。
 #[test]
-fn multi_row_insert_over_batch_limits_row_count_is_rejected_with_54000() {
-    // `sql::parser::MAX_INSERT_ROWS_PER_STATEMENT`（実装既定値 1,000）を超えない
-    // 行数（3 行）でも、運用者が絞った `self.batch_limits.max_files_per_batch`
-    // （ここでは 2）を超えれば NoSQL 表層と同じ `54000` で拒否される
-    // （`sql_insert_batch_public_api.rs::execute_bound_insert_in_session_row_count_limit_precedes_bind`
-    // と同型の上限。SQL 表層の複数行 VALUES が `batch_limits` を迂回しないことを固定）。
+fn multi_row_insert_ignores_batch_file_limit() {
     let (core, path) = open_engine_with_limits(
-        "insert-multi-row-batch-limits-row-count",
+        "insert-multi-row-ignores-file-limit",
         engine::batch_limits::BatchLimits {
             max_files_per_batch: 2,
+            max_batch_chunks: 10_000,
             ..engine::batch_limits::BatchLimits::default()
         },
     );
     let _guard = CleanupGuard(path);
     let policy = ctx("tenant-a");
 
-    let sql = multi_row_sql(TABLE, &[1, 2, 3], "op-batch-limit-rows");
+    let ids: Vec<u64> = (1..=100).collect();
+    let sql = multi_row_sql(TABLE, &ids, "op-ignores-file-limit");
+    let outcome = core
+        .execute_insert_sql(&policy, &sql)
+        .expect("100-row multi-row VALUES must succeed without the file count limit");
+    assert_eq!(outcome.rows_affected, 100);
+    assert_eq!(read_back_ids(&core, "tenant-a").len(), 100);
+}
+
+/// Issue #3308: 行の形でも④（1 行 = 1 チャンク）は働き、超過は `54000`・副作用ゼロ。
+#[test]
+fn multi_row_insert_over_chunk_limit_is_rejected_with_54000_and_no_side_effects() {
+    let (core, path) = open_engine_with_limits(
+        "insert-multi-row-chunk-limit-rows",
+        engine::batch_limits::BatchLimits {
+            max_files_per_batch: 2,
+            max_batch_chunks: 2,
+            ..engine::batch_limits::BatchLimits::default()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let sql = multi_row_sql(TABLE, &[1, 2, 3], "op-chunk-limit-rows");
     let err = core
         .execute_insert_sql(&policy, &sql)
-        .expect_err("row count over batch_limits.max_files_per_batch must be rejected");
+        .expect_err("row count over max_batch_chunks must be rejected");
     assert_eq!(err.wire_code(), "54000");
+    assert!(read_back_ids(&core, "tenant-a").is_empty());
+}
+
+/// Issue #3308: `--max-insert-rows` 指定時だけ行数上限が掛かる（70 行は成功・71 行は `54000`）。
+#[test]
+fn multi_row_insert_over_default_64_rows_honors_only_max_insert_rows() {
+    let path = unique_db_path("insert-multi-row-70-limit");
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&row_schema()).expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_dml_limits(engine::sql::parser::DmlLimits {
+            max_insert_rows_per_statement: Some(
+                std::num::NonZeroUsize::new(70).expect("70 is nonzero"),
+            ),
+            ..engine::sql::parser::DmlLimits::default()
+        })
+        .with_batch_limits(engine::batch_limits::BatchLimits {
+            max_files_per_batch: 64,
+            max_batch_chunks: 10_000,
+            ..engine::batch_limits::BatchLimits::default()
+        });
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let over: Vec<u64> = (1..=71).collect();
+    let err = core
+        .execute_insert_sql(&policy, &multi_row_sql(TABLE, &over, "op-70-over"))
+        .expect_err("71 rows over --max-insert-rows=70 must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    assert!(read_back_ids(&core, "tenant-a").is_empty());
+
+    let ok: Vec<u64> = (1..=70).collect();
+    let outcome = core
+        .execute_insert_sql(&policy, &multi_row_sql(TABLE, &ok, "op-70-ok"))
+        .expect("70 rows at the limit must succeed");
+    assert_eq!(outcome.rows_affected, 70);
 }
 
 #[test]
 fn multi_row_insert_within_batch_limits_row_count_succeeds() {
-    // 上限ちょうど（2 行）は成功する（境界値確認）。
+    // ①は行の形に掛からないため、上限 2 と同数（2 行）は当然成功する（Issue #3308。回帰確認）。
     let (core, path) = open_engine_with_limits(
         "insert-multi-row-batch-limits-row-count-ok",
         engine::batch_limits::BatchLimits {
@@ -750,4 +807,166 @@ fn execute_parsed_in_session_rejects_insert_over_configured_row_limit_even_when_
         .execute_insert_sql(&policy, &follow_up_sql)
         .expect("operation_id must be unused after the rejected over-limit statement");
     assert_eq!(outcome.rows_affected, 2);
+}
+
+// ---------------------------------------------------------------------
+// Issue #3310: 行数の上限（①）を外したあとの資源上限。`BatchLimits::default()` は環境変数を
+// 読むため使わず、既定値を明示する。副作用ゼロは「行 0 件」と「台帳 NotRecorded」の両方で見る。
+// ---------------------------------------------------------------------
+
+fn explicit_default_limits() -> engine::batch_limits::BatchLimits {
+    engine::batch_limits::BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: engine::chunking::MAX_INPUT_BYTES,
+        max_batch_total_bytes: engine::incremental::MAX_INDEX_TOTAL_BYTES,
+        max_batch_chunks: engine::incremental::MAX_CHUNKS_PER_FILE,
+    }
+}
+
+fn assert_no_side_effects(core: &EngineCore, op_id: &str) {
+    assert!(read_back_ids(core, "tenant-a").is_empty());
+    assert_eq!(
+        ledger_state(core, "tenant-a", op_id),
+        LedgerLookup::NotRecorded
+    );
+}
+
+/// 固定する上限: SQL トークン数（`lexer::MAX_TOKEN_COUNT`）。既定構成で 3 列 3 万行の VALUES は
+/// 字句解析で拒否される（1 行あたり約 8 トークンのため、④ の 4096 行より先に届く）。解析量は
+/// 定数（1 MiB・20,000 トークン）で抑えられ、束縛・書き込みには到達しない。
+/// 拒否の SQLSTATE は字句解析エラーの写像（`42601`）。
+#[test]
+fn tens_of_thousands_of_rows_are_rejected_by_token_limit_with_no_side_effects() {
+    let (core, path) =
+        open_engine_with_limits("insert-multi-row-30k-rows", explicit_default_limits());
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let ids: Vec<u64> = (1..=30_000).collect();
+    let sql = multi_row_sql(TABLE, &ids, "op-30k");
+    let err = core
+        .execute_insert_sql(&policy, &sql)
+        .expect_err("30,000 rows must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("tenant-a"),
+        "error must not echo tenant: {msg}"
+    );
+    assert_no_side_effects(&core, "op-30k");
+}
+
+/// 固定する上限: SQL 文長（`lexer::MAX_INPUT_LEN` = 1 MiB）。engine API に 1 MiB 超の文を渡すと
+/// 字句解析で拒否され（`42601`）、副作用ゼロ。wire 経由では 1 メッセージ 1 MiB の上限が先に効く。
+#[test]
+fn sql_longer_than_max_input_len_is_rejected_with_no_side_effects() {
+    let (core, path) =
+        open_engine_with_limits("insert-multi-row-long-sql", explicit_default_limits());
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let pad = "x".repeat(engine::sql::lexer::MAX_INPUT_LEN);
+    let sql = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang) VALUES (1, '[1.0,0.0]', '{pad}') \
+         USING OPERATION_ID 'op-long'"
+    );
+    let err = core
+        .execute_insert_sql(&policy, &sql)
+        .expect_err("oversized statement must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+    assert_no_side_effects(&core, "op-long");
+}
+
+/// 固定する上限: ④ が束縛より先に走る。上限 +1 行で最終行だけ次元不一致でも、束縛エラーではなく
+/// `54000`（行を束縛する前に件数だけで拒否される。入力に比例する確保が起きない）。対照として
+/// 上限ちょうどでは同じ不正な最終行が束縛側のエラーになる。
+#[test]
+fn chunk_limit_is_checked_before_binding_rows() {
+    let limit = 100usize;
+    let limits = engine::batch_limits::BatchLimits {
+        max_batch_chunks: limit,
+        ..explicit_default_limits()
+    };
+    let build = |rows: usize, op: &str| {
+        let mut values: Vec<String> = (1..rows)
+            .map(|id| format!("({id}, '[1.0,0.0]', 'ja')"))
+            .collect();
+        // 最終行だけ次元が合わない VECTOR リテラル。
+        values.push(format!("({rows}, '[1.0]', 'ja')"));
+        format!(
+            "INSERT INTO {TABLE} (id, embedding, lang) VALUES {} USING OPERATION_ID '{op}'",
+            values.join(", ")
+        )
+    };
+
+    let (core, path) = open_engine_with_limits("insert-multi-row-limit-before-bind", limits);
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let err = core
+        .execute_insert_sql(&policy, &build(limit + 1, "op-over"))
+        .expect_err("over the chunk limit");
+    assert_eq!(err.wire_code(), "54000");
+    assert_no_side_effects(&core, "op-over");
+
+    let err = core
+        .execute_insert_sql(&policy, &build(limit, "op-at"))
+        .expect_err("malformed last row must fail binding");
+    assert_ne!(
+        err.wire_code(),
+        "54000",
+        "at the limit the bind error must surface"
+    );
+    assert_no_side_effects(&core, "op-at");
+}
+
+/// 固定する上限: ③（バッチ合計バイト）が行数の増加で効く。③ を小さく・④ を大きくした構成で、
+/// ④ には届かない数百行でも `54000`・副作用ゼロ（① とは無関係）。
+#[test]
+fn total_bytes_limit_stops_many_small_rows_independent_of_row_cap() {
+    let (core, path) = open_engine_with_limits(
+        "insert-multi-row-total-bytes-many-rows",
+        engine::batch_limits::BatchLimits {
+            max_batch_total_bytes: 1024,
+            max_batch_chunks: 1_000_000,
+            ..explicit_default_limits()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let ids: Vec<u64> = (1..=300).collect();
+    let err = core
+        .execute_insert_sql(&policy, &multi_row_sql(TABLE, &ids, "op-total"))
+        .expect_err("total bytes over the limit");
+    assert_eq!(err.wire_code(), "54000");
+    assert_no_side_effects(&core, "op-total");
+}
+
+/// 固定する上限: ②（1 行のバイト量）。多数行のうち 1 行だけ大きい VALUES は `54000`・副作用ゼロ。
+#[test]
+fn single_oversized_row_among_many_is_rejected_by_row_bytes_limit() {
+    let (core, path) = open_engine_with_limits(
+        "insert-multi-row-one-big-row",
+        engine::batch_limits::BatchLimits {
+            max_file_body_bytes: 256,
+            ..explicit_default_limits()
+        },
+    );
+    let _guard = CleanupGuard(path);
+    let policy = ctx("tenant-a");
+
+    let mut values: Vec<String> = (1..=20)
+        .map(|id| format!("({id}, '[1.0,0.0]', 'ja')"))
+        .collect();
+    values.push(format!("(21, '[1.0,0.0]', '{}')", "y".repeat(4096)));
+    let sql = format!(
+        "INSERT INTO {TABLE} (id, embedding, lang) VALUES {} USING OPERATION_ID 'op-big'",
+        values.join(", ")
+    );
+    let err = core
+        .execute_insert_sql(&policy, &sql)
+        .expect_err("oversized row must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+    assert_no_side_effects(&core, "op-big");
 }

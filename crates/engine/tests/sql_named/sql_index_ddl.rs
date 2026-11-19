@@ -557,21 +557,33 @@ fn index_ddl_inside_explicit_transaction_is_rejected() {
     {
         let core = core_at(&path);
         let mut session = allowed_session();
-        for sql in [
+        // SQL-80・Issue #3313: 索引の DDL は共有 write txn へ積まれ、ROLLBACK で宣言が残らない。
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        core.execute_sql_in_txn(
+            &ctx("alice"),
+            &mut session,
+            &mut txn,
             "CREATE INDEX idx_lang ON docs (lang)",
-            "DROP INDEX idx_lang",
-        ] {
-            let mut txn = core.new_session_transaction();
-            core.execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "BEGIN")
-                .expect("begin");
-            let err = core
-                .execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, sql)
-                .expect_err("index DDL inside a transaction must be rejected");
-            assert_eq!(err.wire_code(), "0A000", "{sql}");
-            assert_eq!(txn.status(), TransactionStatus::Failed);
-            core.execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "ROLLBACK")
-                .expect("rollback");
-        }
+        )
+        .expect("CREATE INDEX is accepted inside a transaction");
+        // 同じ Tx で作った索引は `DROP INDEX` できる。
+        core.execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "DROP INDEX idx_lang")
+            .expect("DROP INDEX of an index created in this transaction");
+        assert_eq!(txn.status(), TransactionStatus::InTransaction);
+        core.execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
+        // ROLLBACK 後は索引が無い（`DROP INDEX` は `42704`）。
+        let mut txn = core.new_session_transaction();
+        core.execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "BEGIN")
+            .expect("begin");
+        let err = core
+            .execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "DROP INDEX idx_lang")
+            .expect_err("the rolled back index must not exist");
+        assert_eq!(err.wire_code(), "42704");
+        core.execute_sql_in_txn(&ctx("alice"), &mut session, &mut txn, "ROLLBACK")
+            .expect("rollback");
     }
     assert!(declared_index_names(&path).is_empty());
 }

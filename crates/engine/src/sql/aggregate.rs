@@ -238,7 +238,7 @@ fn observe_with_budgets(
     // Issue #1488: `COUNT(DISTINCT)` は専用経路で観測し、新規キー確定時にその場で
     // `DistinctBudget` へ計上する（footprint の before/after 差分は不要）。
     // 状態は `CountDistinct` の集合のみで `text_len` は常に 0 のため TEXT 予算の判定は不要。
-    if matches!(accumulator, Accumulator::CountDistinct(_)) {
+    if accumulator.uses_distinct_path() {
         return accumulator.observe_distinct(input, id, vector, scanned, scratch, distinct_budget);
     }
     let text_before = accumulator.text_len();
@@ -278,6 +278,7 @@ impl ObserveBudgetPlan {
                 matches!(
                     a,
                     Accumulator::CountDistinct(_)
+                        | Accumulator::DistinctFold(_)
                         | Accumulator::StringAgg(_)
                         | Accumulator::ArrayAgg(_)
                 )
@@ -914,6 +915,18 @@ pub(crate) struct CountDistinctState {
     bytes: usize,
 }
 
+/// `SUM`／`AVG(DISTINCT <expr>)` の集計状態（SQL-25・Issue #3263）。`seen`・`bytes` は
+/// [`CountDistinctState`] と同じ意味（正準化キーの集合と累計バイト数。新規キーのみ
+/// [`crate::sql::distinct::DistinctBudget`] へ計上）。`inner` は通常の `SUM`／`AVG` 状態で、
+/// 新規キーを初めて観測した時点の値だけを畳み込む。確定時に `seen` を反復しないため、
+/// 浮動小数の加算順は走査順（決定的）になる。
+#[derive(Clone)]
+pub(crate) struct DistinctFoldState {
+    seen: std::collections::HashSet<Vec<u8>>,
+    bytes: usize,
+    inner: Accumulator,
+}
+
 /// 集計項目 1 つの実行時アキュムレータ（TASK-166・SQL-13）。すべて O(1) 状態
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
@@ -1043,6 +1056,9 @@ pub(crate) enum Accumulator {
     /// Issue #1489: `HashSet` を inline で持つと enum 全体が 64 バイトになるため Box 化し、
     /// 最大の inline variant（`NumericAvg` 系）の 48 バイトに揃える。
     CountDistinct(Box<CountDistinctState>),
+    /// `SUM`／`AVG(DISTINCT <expr>)`（SQL-25・Issue #3263）。状態は [`DistinctFoldState`]。
+    /// `CountDistinct` と同じく [`Accumulator::observe_distinct`] 経由でのみ観測する。
+    DistinctFold(Box<DistinctFoldState>),
     /// `string_agg(<値>, <区切り> [ORDER BY ...])`（SQL-57・Issue #1800）。状態と意味論は
     /// [`crate::sql::string_agg`] が持つ。`DISTINCT` もこの variant の内部で扱う
     /// （`COUNT(DISTINCT)` の [`Accumulator::CountDistinct`] とは別物）。
@@ -1090,21 +1106,36 @@ impl Accumulator {
             // を構造的に拒否済みのため、ここへ到達する `item.func` は常に
             // `Count`。念のため多層防御として確認する（`accumulator_bug` は
             // untrusted 入力起因ではなく実装バグ検出用）。
-            if matches!(
-                item.func,
-                AggregateFunc::StringAgg | AggregateFunc::ArrayAgg
-            ) {
+            if item.func == AggregateFunc::StringAgg || item.func.uses_array_agg_state() {
                 // `string_agg`・`array_agg` の `DISTINCT` は状態の内部で重複を除く（SQL-57）。
                 return Self::new(item.func, &item.input);
             }
+            if matches!(item.func, AggregateFunc::Sum | AggregateFunc::Avg) {
+                // Issue #3263: 初出の値だけを通常の SUM／AVG 状態へ畳み込む。
+                return Ok(Accumulator::DistinctFold(Box::new(DistinctFoldState {
+                    seen: std::collections::HashSet::new(),
+                    bytes: 0,
+                    inner: Self::new(item.func, &item.input)?,
+                })));
+            }
+            // `MIN`／`MAX(DISTINCT)` は構文層が非 DISTINCT 形へ畳み済みのため到達しない。
             if item.func != AggregateFunc::Count {
                 return Err(accumulator_bug(
-                    "distinct flag set on a non-COUNT aggregate item",
+                    "distinct flag set on an unsupported aggregate item",
                 ));
             }
             return Ok(Accumulator::CountDistinct(Box::default()));
         }
         Self::new(item.func, &item.input)
+    }
+
+    /// [`Self::observe_distinct`] 経由でのみ観測するアキュムレータか（`CountDistinct`・
+    /// `DistinctFold`）。行ループの dispatch（`observe_with_budgets`・`group_by`）が使う。
+    pub(crate) fn uses_distinct_path(&self) -> bool {
+        matches!(
+            self,
+            Accumulator::CountDistinct(_) | Accumulator::DistinctFold(_)
+        )
     }
 
     /// `CountDistinct` が現在保持しているエントリ数・累計バイト数（それ以外の
@@ -1116,6 +1147,7 @@ impl Accumulator {
         DISTINCT_FOOTPRINT_CALLS.with(|c| c.set(c.get() + 1));
         match self {
             Accumulator::CountDistinct(state) => (state.seen.len(), state.bytes),
+            Accumulator::DistinctFold(state) => (state.seen.len(), state.bytes),
             Accumulator::StringAgg(state) => state.distinct_footprint(),
             Accumulator::ArrayAgg(state) => state.distinct_footprint(),
             _ => (0, 0),
@@ -1142,9 +1174,10 @@ impl Accumulator {
                 AggregateFunc::BoolOr,
                 AggregateInput::BooleanColumn(_) | AggregateInput::BoolExpr { .. },
             ) => Accumulator::BoolOr(None),
-            (AggregateFunc::ArrayAgg, AggregateInput::ArrayAgg(inp)) => {
-                Accumulator::ArrayAgg(Box::new(crate::sql::array_agg::ArrayAggState::new(inp)))
-            }
+            (
+                AggregateFunc::ArrayAgg | AggregateFunc::JsonAgg | AggregateFunc::JsonbAgg,
+                AggregateInput::ArrayAgg(inp),
+            ) => Accumulator::ArrayAgg(Box::new(crate::sql::array_agg::ArrayAggState::new(inp))),
             (AggregateFunc::StringAgg, AggregateInput::StringAgg(inp)) => {
                 Accumulator::StringAgg(Box::new(crate::sql::string_agg::StringAggState::new(inp)))
             }
@@ -1344,9 +1377,9 @@ impl Accumulator {
         // （[`crate::sql::distinct::DistinctBudget`]）は `observe_distinct` 内で行う。
         // Issue #1488: 予算計上を伴うため `observe_distinct` 経由でのみ観測する。
         // ここへ来たら呼び出し元の見落としなので fail-closed に拒否する。
-        if matches!(self, Accumulator::CountDistinct(_)) {
+        if self.uses_distinct_path() {
             return Err(accumulator_bug(
-                "COUNT(DISTINCT) accumulator must be observed via the distinct path",
+                "DISTINCT accumulator must be observed via the distinct path",
             ));
         }
         // Issue #1823: `GROUPING()` は行を観測しない（値は `finish_groups` が計算する）。
@@ -1461,7 +1494,7 @@ impl Accumulator {
             }
             _ => {
                 let value = eval_aggregate_input(input, id, vector, scanned, scratch)?;
-                self.observe_value(value)
+                self.observe_value_inline(value)
             }
         }
     }
@@ -1471,7 +1504,22 @@ impl Accumulator {
     ///
     /// ウィンドウ評価段（`sql::window`）も、行ごとに先に評価した式入力（Issue #1895）を
     /// この入口へ渡す。
+    ///
+    /// 本体は [`Self::observe_value_inline`] にあり、これは `sql::window` 向けの薄い入口。
+    /// 呼び出し元が 2 つになった #2761 で本体が集計の行ループへインライン化されなくなり
+    /// 退行したため、集計経路（[`Self::observe`] の `_` 腕）は inline 版を直接呼ぶ
+    /// （Issue #3209）。この入口へ呼び出し元を足してもインライン化は外れない。
     pub(crate) fn observe_value(
+        &mut self,
+        value: AggregateRowValue<'_>,
+    ) -> Result<(), SqlSurfaceError> {
+        self.observe_value_inline(value)
+    }
+
+    /// [`Self::observe_value`] の本体。集計の行ループへ確実にインライン化する
+    /// （Issue #3209。#2761 の是正）。意味論は `observe_value` と同一。
+    #[inline(always)]
+    fn observe_value_inline(
         &mut self,
         value: AggregateRowValue<'_>,
     ) -> Result<(), SqlSurfaceError> {
@@ -1540,16 +1588,21 @@ impl Accumulator {
                 "COUNT(DISTINCT) accumulator observed an input type that bind-time resolution should have rejected",
             ));
         }
-        let key = eval_aggregate_input(input, id, vector, scanned, scratch)?.distinct_key()?;
+        let value = eval_aggregate_input(input, id, vector, scanned, scratch)?;
+        let key = value.distinct_key()?;
 
-        let (seen, bytes) = match self {
+        let (seen, bytes, inner) = match self {
             Accumulator::CountDistinct(state) => {
                 let CountDistinctState { seen, bytes } = &mut **state;
-                (seen, bytes)
+                (seen, bytes, None)
+            }
+            Accumulator::DistinctFold(state) => {
+                let DistinctFoldState { seen, bytes, inner } = &mut **state;
+                (seen, bytes, Some(inner))
             }
             _ => {
                 return Err(accumulator_bug(
-                    "observe_distinct called on a non-CountDistinct accumulator",
+                    "observe_distinct called on a non-distinct accumulator",
                 ))
             }
         };
@@ -1557,10 +1610,14 @@ impl Accumulator {
             if seen.insert(key.clone()) {
                 let key_len = key.len();
                 *bytes = bytes.checked_add(key_len).ok_or_else(|| {
-                    accumulator_bug("COUNT(DISTINCT) accumulated byte count overflowed")
+                    accumulator_bug("DISTINCT aggregate accumulated byte count overflowed")
                 })?;
                 // 新規キー確定時のみ計上（既存キーへの再ヒットは計上しない）。
                 distinct_budget.charge(key_len)?;
+                // Issue #3263: 初出の値だけを SUM／AVG の状態へ畳み込む（重複は渡さない）。
+                if let Some(inner) = inner {
+                    inner.observe_value(value)?;
+                }
             }
         }
         Ok(())
@@ -1674,6 +1731,70 @@ impl Accumulator {
             }
             _ => Err(accumulator_bug(
                 "observe_present_n on a non-Count accumulator",
+            )),
+        }
+    }
+
+    /// Issue #3214: 可視 id スライスの畳み込み結果を反映する（`observe_id` を件数分呼ぶ結果と
+    /// 同値。id は非負なので逐次 `checked_add` の失敗は総和が u64 を超えることと同値）。
+    /// [`is_visible_id_fold`] が許す形以外のアキュムレータは実装バグとして fail-closed。
+    fn absorb_id_stats(&mut self, stats: &IdSliceStats) -> Result<(), SqlSurfaceError> {
+        match self {
+            Accumulator::Count(n) => {
+                *n = n.checked_add(stats.count).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("COUNT exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::IdSum(sum) => {
+                if stats.count == 0 {
+                    return Ok(());
+                }
+                let add = u64::try_from(stats.sum).map_err(|_| {
+                    SqlSurfaceError::numeric_out_of_range("SUM(id) exceeds u64 range")
+                })?;
+                let next = match sum {
+                    None => add,
+                    Some(cur) => cur.checked_add(add).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range("SUM(id) exceeds u64 range")
+                    })?,
+                };
+                *sum = Some(next);
+                Ok(())
+            }
+            Accumulator::IdAvg { sum, count } => {
+                if stats.count == 0 {
+                    return Ok(());
+                }
+                let add = u64::try_from(stats.sum).map_err(|_| {
+                    SqlSurfaceError::numeric_out_of_range("AVG(id) exceeds u64 range")
+                })?;
+                let next = match sum {
+                    None => add,
+                    Some(cur) => cur.checked_add(add).ok_or_else(|| {
+                        SqlSurfaceError::numeric_out_of_range("AVG(id) exceeds u64 range")
+                    })?,
+                };
+                *sum = Some(next);
+                *count = count.checked_add(stats.count).ok_or_else(|| {
+                    SqlSurfaceError::numeric_out_of_range("AVG(id) row count exceeds u64 range")
+                })?;
+                Ok(())
+            }
+            Accumulator::IdMin(m) => {
+                if let Some(v) = stats.min {
+                    *m = Some(m.map_or(v, |cur| cur.min(v)));
+                }
+                Ok(())
+            }
+            Accumulator::IdMax(m) => {
+                if let Some(v) = stats.max {
+                    *m = Some(m.map_or(v, |cur| cur.max(v)));
+                }
+                Ok(())
+            }
+            _ => Err(accumulator_bug(
+                "absorb_id_stats on an incompatible accumulator",
             )),
         }
     }
@@ -2392,6 +2513,7 @@ impl Accumulator {
             // （PostgreSQL の `COUNT(DISTINCT ...)` と同じ契約。`COUNT` 一般の
             // 「空集合で NULL ではなく 0」という既存契約とも一致する）。
             Accumulator::CountDistinct(state) => Cell::Integer(state.seen.len() as u64),
+            Accumulator::DistinctFold(state) => return state.inner.finish(),
             Accumulator::StringAgg(state) => match state.finish()? {
                 Some(text) => Cell::Text(text),
                 None => Cell::Null,
@@ -2402,7 +2524,8 @@ impl Accumulator {
             // 仮の値。`sql::group_by::finish_groups` が直後にセット番号から確定値で上書きする。
             Accumulator::Grouping => Cell::Null,
             Accumulator::ArrayAgg(state) => match state.finish()? {
-                Some(array) => Cell::Array(array),
+                Some(crate::sql::array_agg::ArrayAggFinished::Array(array)) => Cell::Array(array),
+                Some(crate::sql::array_agg::ArrayAggFinished::Json(text)) => Cell::Json(text),
                 None => Cell::Null,
             },
             Accumulator::VarianceExact {
@@ -2760,6 +2883,47 @@ pub(crate) fn execute_aggregate_with_group_limits(
                 .snapshot()
                 .and_then(|snap| access.cache.lookup(access.storage, snap, &bound.table, ctx))
             {
+                // Issue #3213: 純粋な `COUNT(*)` だけなら件数は可視 id スライス長で確定する。
+                // スライスは RLS・TABLE-12 検査済みの可視行の正確な集合で、キャッシュは同一
+                // テーブル世代・同一 ctx でのみ命中する（`VisibleCacheAccess::lookup` の契約。
+                // ポリシー適用表と書き込み Tx は上流で `visible_cache = None`）。行ごとの
+                // 観測を省き、中断確認（Issue #3208）は非空のとき先頭の 1 回だけ維持する。
+                if is_pure_count_star(bound, &accumulators) {
+                    let ids = snapshot.visible_ids();
+                    if !ids.is_empty() {
+                        crate::interrupt::RowCheck::new().tick()?;
+                    }
+                    let n = u64::try_from(ids.len())
+                        .map_err(|_| accumulator_bug("visible id count exceeds u64 range"))?;
+                    for accumulator in accumulators.iter_mut() {
+                        accumulator.observe_present_n(n)?;
+                    }
+                    return finish_aggregate_result(
+                        accumulators,
+                        bound,
+                        schema,
+                        0,
+                        max_result_bytes,
+                    );
+                }
+                // Issue #3214: `SUM`／`AVG`／`MIN`／`MAX(id)`（と `COUNT(*)`／`COUNT(id)`）だけなら
+                // 可視 id スライスを 1 パスで畳み込み、結果を項目順に各アキュムレータへ反映する。
+                // 前提（RLS・TABLE-12 検査済みの同一 ctx・同一世代）は上の Issue #3213 と同じ。
+                // 形が外れる場合（FILTER・DISTINCT・式・列・分散系など）は従来の行ループのまま。
+                if is_visible_id_fold(bound, &accumulators) {
+                    let needs = IdFoldNeeds::of(&accumulators);
+                    let stats = fold_visible_ids(snapshot.visible_ids(), needs)?;
+                    for accumulator in accumulators.iter_mut() {
+                        accumulator.absorb_id_stats(&stats)?;
+                    }
+                    return finish_aggregate_result(
+                        accumulators,
+                        bound,
+                        schema,
+                        0,
+                        max_result_bytes,
+                    );
+                }
                 let mut expr_scratch: Vec<StackValue> = Vec::new();
                 let empty_vector = RowVector {
                     dim: 0,
@@ -3239,6 +3403,8 @@ pub(crate) fn aggregate_result_type(
         ) => ColumnType::Boolean,
         // `array_agg` は入力の型の 1 次元配列（要素数の上限は `MAX_ARRAY_ELEMENTS`）。公告できない
         // 要素型（`ArrayType::new` が拒否する位取り）は `None`（wire では text フォールバック）。
+        (AggregateFunc::JsonAgg, AggregateInput::ArrayAgg(_)) => ColumnType::Json,
+        (AggregateFunc::JsonbAgg, AggregateInput::ArrayAgg(_)) => ColumnType::Jsonb,
         (AggregateFunc::ArrayAgg, AggregateInput::ArrayAgg(inp)) => ColumnType::Array(
             crate::catalog::ArrayType::new(inp.elem, crate::catalog::MAX_ARRAY_ELEMENTS).ok()?,
         ),
@@ -3420,6 +3586,111 @@ fn finish_aggregate_result(
             cells,
         }],
     })
+}
+
+/// Issue #3214: 可視 id スライスの畳み込み結果（件数・総和・最小・最大）。
+#[derive(Debug, PartialEq, Eq)]
+struct IdSliceStats {
+    count: u64,
+    sum: u128,
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
+/// Issue #3214: 畳み込みで計算が必要な統計（不要な走査を省くための要求集合）。
+#[derive(Clone, Copy)]
+struct IdFoldNeeds {
+    sum: bool,
+    minmax: bool,
+}
+
+impl IdFoldNeeds {
+    fn of(accumulators: &[Accumulator]) -> Self {
+        Self {
+            sum: accumulators
+                .iter()
+                .any(|a| matches!(a, Accumulator::IdSum(_) | Accumulator::IdAvg { .. })),
+            minmax: accumulators
+                .iter()
+                .any(|a| matches!(a, Accumulator::IdMin(_) | Accumulator::IdMax(_))),
+        }
+    }
+}
+
+/// Issue #3214: 可視 id スライスを [`ROW_CHECK_INTERVAL`] 件ごとのチャンクで 1 パスに畳み込む。
+/// 呼び出し元は `execute_aggregate_with_group_limits` の Fast 分岐（キャッシュ命中時）。
+/// 中断確認（Issue #3208・#1952）はチャンク先頭で行い、非空なら必ず 1 回評価する。
+/// 総和は `u128` で持つため（id は `u64`・件数は `usize` 上限）オーバーフローしない。
+fn fold_visible_ids(ids: &[u64], needs: IdFoldNeeds) -> Result<IdSliceStats, SqlSurfaceError> {
+    let count = u64::try_from(ids.len())
+        .map_err(|_| accumulator_bug("visible id count exceeds u64 range"))?;
+    let mut check = crate::interrupt::RowCheck::new();
+    let mut sum: u128 = 0;
+    let mut min = u64::MAX;
+    let mut max = u64::MIN;
+    for chunk in ids.chunks(crate::interrupt::ROW_CHECK_INTERVAL as usize) {
+        check.check_chunk()?;
+        if needs.sum {
+            sum += chunk.iter().map(|&id| u128::from(id)).sum::<u128>();
+        }
+        if needs.minmax {
+            for &id in chunk {
+                min = min.min(id);
+                max = max.max(id);
+            }
+        }
+    }
+    let nonempty = !ids.is_empty();
+    Ok(IdSliceStats {
+        count,
+        sum,
+        min: (nonempty && needs.minmax).then_some(min),
+        max: (nonempty && needs.minmax).then_some(max),
+    })
+}
+
+/// Issue #3214: 可視 id スライスの畳み込みで確定してよい形かの判定。全項目が `DISTINCT`・
+/// `FILTER` なしで、`COUNT(*)`／`COUNT(id)`／`SUM`／`AVG`／`MIN`／`MAX(id)` のいずれかのときだけ真。
+/// それ以外（`GROUPING()`・分散系・式・列・文字列集計など）は偽で従来経路（fail-closed）。
+fn is_visible_id_fold(
+    bound: &crate::sql::parser::BoundAggregate,
+    accumulators: &[Accumulator],
+) -> bool {
+    !bound.items.is_empty()
+        && accumulators.len() == bound.items.len()
+        && accumulators.iter().zip(&bound.items).all(|(a, item)| {
+            !item.distinct
+                && item.filter.is_none()
+                && matches!(
+                    (a, &item.input),
+                    (
+                        Accumulator::Count(_),
+                        AggregateInput::AllVisible | AggregateInput::IdU64
+                    ) | (
+                        Accumulator::IdSum(_)
+                            | Accumulator::IdAvg { .. }
+                            | Accumulator::IdMin(_)
+                            | Accumulator::IdMax(_),
+                        AggregateInput::IdU64
+                    )
+                )
+        })
+}
+
+/// Issue #3213: 可視 id キャッシュ経路で件数のみ加算してよい形かの判定。
+/// 全項目が `COUNT(*)`（`DISTINCT`・`FILTER` なし）で、アキュムレータも全て `Count` のとき
+/// だけ真。`count_star_only` が許容する `GROUPING()` はここでは除外する（厳格化）。
+fn is_pure_count_star(
+    bound: &crate::sql::parser::BoundAggregate,
+    accumulators: &[Accumulator],
+) -> bool {
+    count_star_only(&bound.items)
+        && accumulators
+            .iter()
+            .all(|a| matches!(a, Accumulator::Count(_)))
+        && bound.items.iter().all(|i| {
+            matches!(i.input, AggregateInput::AllVisible) && !i.distinct && i.filter.is_none()
+        })
 }
 
 /// Issue #475: `GROUP BY` なし・索引対応述語のみの `WHERE` を持つ集計を、
@@ -4017,6 +4288,80 @@ fn capture_scalar_index_snapshot(
 
 #[cfg(test)]
 mod tests {
+    // Issue #3214: 畳み込み＋反映が従来の逐次 observe と一致すること。
+    fn fold_via_stats(ids: &[u64], func: AggregateFunc) -> Result<Cell, SqlSurfaceError> {
+        let mut acc = Accumulator::new(func, &AggregateInput::IdU64)?;
+        let needs = IdFoldNeeds::of(std::slice::from_ref(&acc));
+        let stats = fold_visible_ids(ids, needs)?;
+        acc.absorb_id_stats(&stats)?;
+        acc.finish()
+    }
+
+    fn fold_via_rows(ids: &[u64], func: AggregateFunc) -> Result<Cell, SqlSurfaceError> {
+        let mut acc = Accumulator::new(func, &AggregateInput::IdU64)?;
+        for &id in ids {
+            acc.observe_id(id)?;
+        }
+        acc.finish()
+    }
+
+    #[test]
+    fn id_fold_matches_row_loop() {
+        let n = crate::interrupt::ROW_CHECK_INTERVAL as u64;
+        let long = |len: u64| (0..len).map(|i| i * 3 + 1).collect::<Vec<_>>();
+        let cases: Vec<Vec<u64>> = vec![
+            vec![],
+            vec![0],
+            vec![7],
+            vec![u64::MAX],
+            vec![u64::MAX, 0],
+            vec![u64::MAX - 1, 1],
+            vec![u64::MAX, 1],
+            vec![u64::MAX, u64::MAX],
+            long(n - 1),
+            long(n),
+            long(n + 1),
+            long(n * 2 + 5),
+        ];
+        for ids in &cases {
+            for func in [
+                AggregateFunc::Sum,
+                AggregateFunc::Avg,
+                AggregateFunc::Min,
+                AggregateFunc::Max,
+                AggregateFunc::Count,
+            ] {
+                let a = fold_via_stats(ids, func);
+                let b = fold_via_rows(ids, func);
+                match (a, b) {
+                    (Ok(x), Ok(y)) => assert_eq!(format!("{x:?}"), format!("{y:?}")),
+                    (Err(x), Err(y)) => assert_eq!(x.to_string(), y.to_string()),
+                    (x, y) => panic!("mismatch {func:?} len={}: {x:?} vs {y:?}", ids.len()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn id_fold_sum_and_avg_error_order_follows_item_order() {
+        let ids = [u64::MAX, 1];
+        let stats = fold_visible_ids(
+            &ids,
+            IdFoldNeeds {
+                sum: true,
+                minmax: false,
+            },
+        )
+        .unwrap();
+        let mut accs = [
+            Accumulator::new(AggregateFunc::Avg, &AggregateInput::IdU64).unwrap(),
+            Accumulator::new(AggregateFunc::Sum, &AggregateInput::IdU64).unwrap(),
+        ];
+        let first = accs[0].absorb_id_stats(&stats).unwrap_err();
+        assert_eq!(first.wire_code(), "22003");
+        assert!(first.to_string().contains("AVG(id)"), "{first}");
+    }
+
     use super::*;
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::sql::allowlist::AggregateFunc;
@@ -4272,6 +4617,146 @@ mod tests {
             .observe(&AggregateInput::IdU64, 1, &vector, &[], &mut scratch)
             .expect_err("must be rejected");
         assert!(format!("{err:?}").contains("distinct path"), "{err:?}");
+    }
+
+    fn distinct_fold(func: AggregateFunc) -> Accumulator {
+        Accumulator::DistinctFold(Box::new(DistinctFoldState {
+            seen: std::collections::HashSet::new(),
+            bytes: 0,
+            inner: Accumulator::new(func, &AggregateInput::IdU64).unwrap(),
+        }))
+    }
+
+    fn fold_ids(
+        acc: &mut Accumulator,
+        ids: &[u64],
+        budget: &mut crate::sql::distinct::DistinctBudget,
+    ) {
+        let vector = RowVector {
+            dim: 0,
+            values: None,
+        };
+        let mut scratch = Vec::new();
+        for id in ids {
+            acc.observe_distinct(
+                &AggregateInput::IdU64,
+                *id,
+                &vector,
+                &[],
+                &mut scratch,
+                budget,
+            )
+            .expect("observe_distinct");
+        }
+    }
+
+    /// Issue #3263: `DistinctFold` は `observe` 直呼びを fail-closed で拒否する。
+    #[test]
+    fn observe_rejects_distinct_fold_accumulator() {
+        let mut acc = distinct_fold(AggregateFunc::Sum);
+        let vector = RowVector {
+            dim: 0,
+            values: None,
+        };
+        let mut scratch = Vec::new();
+        let err = acc
+            .observe(&AggregateInput::IdU64, 1, &vector, &[], &mut scratch)
+            .expect_err("must be rejected");
+        assert!(format!("{err:?}").contains("distinct path"), "{err:?}");
+    }
+
+    /// Issue #3263: 重複値は inner へ渡さず、新規キーだけを計上する（`[1,1,2]` → SUM 3）。
+    #[test]
+    fn distinct_fold_feeds_only_first_occurrences() {
+        let mut budget = crate::sql::distinct::DistinctBudget::new();
+        let mut sum = distinct_fold(AggregateFunc::Sum);
+        fold_ids(&mut sum, &[1, 1, 2], &mut budget);
+        assert_eq!(sum.distinct_footprint().0, 2);
+        assert_eq!(sum.finish().unwrap(), Cell::Integer(3));
+        let mut avg = distinct_fold(AggregateFunc::Avg);
+        fold_ids(
+            &mut avg,
+            &[1, 1, 2],
+            &mut crate::sql::distinct::DistinctBudget::new(),
+        );
+        assert_eq!(
+            format!("{:?}", avg.finish().unwrap()),
+            format!("{:?}", {
+                let mut plain =
+                    Accumulator::new(AggregateFunc::Avg, &AggregateInput::IdU64).unwrap();
+                plain.observe_id(1).unwrap();
+                plain.observe_id(2).unwrap();
+                plain.finish().unwrap()
+            })
+        );
+        // 空集合は NULL。
+        assert_eq!(
+            distinct_fold(AggregateFunc::Sum).finish().unwrap(),
+            Cell::Null
+        );
+    }
+
+    /// Issue #3263: 件数上限（100,000）超過は `54000`。`CountDistinct` と同じ予算を共有する。
+    #[test]
+    fn distinct_fold_shares_the_distinct_budget() {
+        let mut budget = crate::sql::distinct::DistinctBudget::new();
+        let mut acc = distinct_fold(AggregateFunc::Sum);
+        let vector = RowVector {
+            dim: 0,
+            values: None,
+        };
+        let mut scratch = Vec::new();
+        let mut last = Ok(());
+        for id in 0..=(crate::sql::distinct::MAX_DISTINCT_VALUES as u64) {
+            last = acc.observe_distinct(
+                &AggregateInput::IdU64,
+                id,
+                &vector,
+                &[],
+                &mut scratch,
+                &mut budget,
+            );
+            if last.is_err() {
+                break;
+            }
+        }
+        assert_eq!(last.expect_err("budget exceeded").wire_code(), "54000");
+
+        // 合算で超過する: COUNT(DISTINCT) が半分、DistinctFold が残りと 1 件。
+        let mut budget = crate::sql::distinct::DistinctBudget::new();
+        let mut count = Accumulator::CountDistinct(Box::default());
+        let half = (crate::sql::distinct::MAX_DISTINCT_VALUES / 2) as u64;
+        for id in 0..half {
+            count
+                .observe_distinct(
+                    &AggregateInput::IdU64,
+                    id,
+                    &vector,
+                    &[],
+                    &mut scratch,
+                    &mut budget,
+                )
+                .expect("within budget");
+        }
+        let mut fold = distinct_fold(AggregateFunc::Sum);
+        let mut result = Ok(());
+        for id in 0..=half {
+            result = fold.observe_distinct(
+                &AggregateInput::IdU64,
+                id,
+                &vector,
+                &[],
+                &mut scratch,
+                &mut budget,
+            );
+            if result.is_err() {
+                break;
+            }
+        }
+        assert_eq!(
+            result.expect_err("shared budget exceeded").wire_code(),
+            "54000"
+        );
     }
 
     /// Issue #1488: `observe_distinct` は新規キーのときだけ予算へ計上する。

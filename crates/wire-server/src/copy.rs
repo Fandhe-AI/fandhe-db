@@ -1167,7 +1167,7 @@ pub(crate) fn run<'e, S: WireStream>(
         let _emergency_registration = (role == StatementRole::ImplicitFinal)
             .then(|| crate::simple_query::register_emergency_response(stream));
         engine
-            .begin_copy_in_txn(ctx, session, txn, sql)
+            .begin_copy_in_txn_armed(ctx, session, txn, sql)
             .and_then(|plan| {
                 if let CopyPlan::To(format, result, options) = &plan {
                     if let Err(rejection) = precheck_copy_to(*format, result, options) {

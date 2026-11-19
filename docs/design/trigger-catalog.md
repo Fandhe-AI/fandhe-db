@@ -10,14 +10,16 @@
 - 実装した: TRIGGER カタログ（`crates/engine/src/catalog/trigger.rs`）、`CREATE [OR REPLACE] TRIGGER`・
   `DROP TRIGGER [IF EXISTS]` の構文・実行（`sql/allowlist/trigger.rs`・`sql/trigger_ddl.rs`）、
   表・関数・SCHEMA のライフサイクルとの連動（下記）、wire のコマンドタグ。
-- 暫定ガードで止めた（黙って受理しない）: `WHEN`（`0A000`）、`UPDATE OF` が参照する列の
+- 暫定ガードで止めた（黙って受理しない）: `UPDATE OF` が参照する列の
   `RENAME COLUMN`・`ALTER COLUMN TYPE`（`0A000`）・`DROP COLUMN`（`2BP01`。CASCADE の連鎖削除は未対応で
   RESTRICT・CASCADE とも `2BP01`）。
 - 範囲外（後続）: 発火、`RETURNS trigger` 関数の保存形式と成功経路の E2E（#2228・#1723）、
   `DROP FUNCTION ... CASCADE` によるトリガの連鎖削除（#1917）、件数上限の CLI 設定、一時表のトリガ。
 
-> 発火側（Issue #1723）は書き込みテナント自身の scope のトリガだけを引いて発火する。共有 `public` 表への
-> 他テナントの書き込みで、別テナントが作ったトリガは発火しない（[trigger-before-insert.md](trigger-before-insert.md)）。
+> 発火側（Issue #1723）は書き込みテナント自身の scope のトリガだけを引いて発火する（[trigger-before-insert.md](trigger-before-insert.md)）。
+> **Issue #3361（オーナー判断 2026-11-13）以降、共有 `public` 表への `CREATE [OR REPLACE] TRIGGER` は定義時に
+> `0A000` で拒否する**（TABLE-45・TASK-312 ポインタ）。作成が通った後に、作成テナントの書き込みだけが発火の
+> 時点で失敗する状態を作らないため。対象はテナントの SCHEMA 配下の表（内部キー `#<id>.<name>`）に限る。
 
 ## 関数側が未整備であることの帰結
 
@@ -43,14 +45,30 @@
   他テナントの定義は引けない。他テナントにしか無いトリガは不在と同じ（`DROP` は `42704`）で、同じ共有
   `public` 表に別テナントが同名のトリガを作っても `42710` で存在を漏らさない。
 - 表キー（`table_key`）を先頭に置くのは、表の DROP・RENAME が全テナント分の定義を前方一致の範囲走査
-  だけで処理するため（共有 `public` 表には複数テナントのトリガがありうる）。
+  だけで処理するため。共有 `public` 表への定義は Issue #3361 以降は作れないが、それ以前にカタログへ残った
+  定義のため範囲走査は残す。残った定義は `DROP TRIGGER` で消せる（拒否するのは作成だけ）。
 - **トリガ関数は同じ scope の関数に限る**。UDF カタログがテナント単位で、他テナントの関数を引く経路が
   無いため。D9（`trigger-execution-model.md`）の「共有 `public` 表のトリガが全テナントの書き込みで発火
-  する」契約は本記録では変更しない。現状のカタログ（`scope` = 作成テナント）はこの契約をまだ表現できない
+  する」契約は、Issue #3361 で「共有 `public` 表のトリガは定義できない」へ改めた（下記の改訂注記）。現状のカタログ（`scope` = 作成テナント）はこの契約をまだ表現できない
   ため、**D9 の全テナント発火は未実装の残課題**として #1723（発火処理）で扱う。それまで本カタログは
   暫定的に作成テナント単位の定義だけを持ち、発火経路が未接続のため発火漏れは起きない。
   全テナント共有には予約 scope の追加等が必要で、blob の形式は変わらない。契約の確定（D9 を維持するか
   狭めるか）はオーナー・spec 側の判断事項であり、spec リポ側の課題として別途報告する。
+
+### Issue #3361 の改訂（共有 `public` 表のトリガは定義時に拒否）
+
+- 判定順（`Storage::create_trigger`。単一 write txn・commit 前に返るため副作用ゼロ）: 形状 → SCHEMA の現存 →
+  種別（`42809`）→ 表の存在（`42P01`）→ **共有 `public` 表（`0A000`）** → `UPDATE OF` の列（`42703`）→ 関数
+  （`42883`／`42P17`）→ 同名（`42710`）→ 件数上限（`54000`）。共有 `public` 表の判定は、表キーが裸の名前
+  （`RelationKey::Public`。解析に失敗するキーも拒否側）かだけで決まり、他テナントの定義を読まない。同名・上限・
+  関数より前で止めるので、他テナントや自分の既存定義の有無で応答が変わらない。文言は固定
+  （`triggers on shared public tables are not supported`）で、内部キー・tenant_id を含めない。
+- 発火の時点の保険: 既存のカタログに共有 `public` 表の定義が残っていても、本番の invoker（`PlpgsqlTriggerInvoker`）は
+  ホストへ委譲せず同じ固定文言の `0A000` を返す（fail-closed。文全体を取り消す）。作用するのは書き込みテナント
+  自身の scope の定義だけで、他テナントの書き込みの成否には影響しない。
+- 論理ダンプ: 書き出しは変えない。古い DB に残った共有 `public` 表のトリガは書き出しに載るが、復元では
+  `0A000` になる（扱いの決定は別課題）。
+- テストの注入口: テスト専用の `create_trigger_for_test` は上記の拒否を通さず、既存のカタログに残った定義を模す。
 
 ## 定義 blob v1
 
@@ -67,11 +85,13 @@ function_key / TG_ARGV リスト / WHEN の有無 + 正規化テキスト`。文
 
 単一 write txn・1 回の `commit_boundary::commit`（クラッシュしても全か無か）。成功時に対象表の世代を進める。
 
-1. 構文（`0A000`: `INSTEAD OF`・`REFERENCING`・`CONSTRAINT`・`DEFERRABLE`・`FROM`・`WHEN`・
-   `TRUNCATE` の行トリガ。`42601`: 構文違反・トリガ名の SCHEMA 修飾・イベント重複）
+1. 構文（`0A000`: `REFERENCING`・`CONSTRAINT`・`DEFERRABLE`・`FROM`・
+   `TRUNCATE` の行トリガ・`INSTEAD OF` の ROW 以外／TRUNCATE／`UPDATE OF`〔`INSTEAD OF` はビューへの
+   FOR EACH ROW だけ受理。[trigger-instead-of.md](trigger-instead-of.md)〕。`WHEN` は Issue #3190 で受理し、条件の検査は実行モデル D7 の実装記録のとおり。`42601`: 構文違反・トリガ名の SCHEMA 修飾・イベント重複）
 2. DDL 権限（`42501`。カタログ照会より前。対象の有無を問わない）
-3. 明示トランザクション内は `0A000`（既存 DDL と同じ）
-4. 以降は txn 内: SCHEMA の現存 → 対象の種別（ビュー・索引・SEQUENCE・マテリアライズドビューは `42809`）→
+3. 明示トランザクション内は `0A000`（既存 DDL と同じ）（改訂: Issue #3316 で、明示 Tx 内は共有 write txn へ積む形に変更した（`explicit-transaction.md`「#3316 の実装記録」）。）
+4. 以降は txn 内: SCHEMA の現存 → 対象の種別（索引・SEQUENCE・マテリアライズドビューは `42809`。BEFORE／AFTER のビューと
+   INSTEAD OF の表も `42809`。INSTEAD OF の対象はビュー。Issue #3193）→
    表の存在（`42P01`）→ `UPDATE OF` の列（`42703`）→ 関数（不在 `42883`・トリガ関数でない `42P17`）→
    同名（`42710`。`OR REPLACE` は既存の内部 ID を引き継いで置換）→ 件数上限（`54000`）
 

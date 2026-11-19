@@ -358,6 +358,10 @@ fn write_array(
             let _ = write!(out, "{v}");
             Ok(())
         })?,
+        ArrayValue::SmallInt(items) => each!(out, items, |out, v| {
+            let _ = write!(out, "{v}");
+            Ok(())
+        })?,
         ArrayValue::BigInt(items) => each!(out, items, |out, v| {
             if v.unsigned_abs() > MAX_SAFE_INTEGER.unsigned_abs() {
                 out.push('"');
@@ -376,6 +380,26 @@ fn write_array(
         })?,
         ArrayValue::Timestamp(items) => each!(out, items, |out, v| {
             quoted(out, &engine::datetime::format_timestamp(*v));
+            Ok(())
+        })?,
+        ArrayValue::Time(items) => each!(out, items, |out, v| {
+            quoted(out, &engine::datetime::format_time(*v));
+            Ok(())
+        })?,
+        ArrayValue::Interval(items) => each!(out, items, |out, v| {
+            quoted(out, &engine::datetime::format_interval(v));
+            Ok(())
+        })?,
+        // スカラー `timestamptz` と同じく、セッションに依らない UTC の offset 付き（`+00`）で出す
+        // （TABLE-33 (5)。HTTP 面はセッション TimeZone を持たない。Issue #3233）。
+        ArrayValue::TimestampTz(items) => each!(out, items, |out, v| {
+            quoted(
+                out,
+                &engine::datetime::format_timestamptz(
+                    *v,
+                    &engine::datetime::SessionTimeZone::utc(),
+                ),
+            );
             Ok(())
         })?,
         ArrayValue::Uuid(items) => each!(out, items, |out, v| {
@@ -404,6 +428,11 @@ fn write_array(
         })?,
         ArrayValue::Enum(items) => each!(out, items, |out, label| {
             quoted(out, label);
+            Ok(())
+        })?,
+        // `BIT(n)` 要素は `0`・`1` だけの文字列（Issue #3235）。
+        ArrayValue::Bit(items) => each!(out, items, |out, b| {
+            quoted(out, &b.format_text());
             Ok(())
         })?,
         // `flat()` は `Multi` を返さない（網羅性のための fail-closed な腕）。
@@ -483,18 +512,25 @@ fn nosql_type_name(meta: &ColumnMeta) -> &'static str {
             ColumnType::Array(array_ty) => match array_ty.elem() {
                 engine::catalog::ArrayElemType::Text => "text[]",
                 engine::catalog::ArrayElemType::Bool => "boolean[]",
+                engine::catalog::ArrayElemType::SmallInt => "smallint[]",
                 engine::catalog::ArrayElemType::Integer => "integer[]",
                 engine::catalog::ArrayElemType::BigInt => "bigint[]",
                 engine::catalog::ArrayElemType::Real => "real[]",
                 engine::catalog::ArrayElemType::Double => "double precision[]",
                 engine::catalog::ArrayElemType::Date => "date[]",
                 engine::catalog::ArrayElemType::Timestamp => "timestamp[]",
+                engine::catalog::ArrayElemType::Time => "time[]",
+                engine::catalog::ArrayElemType::TimestampTz => "timestamptz[]",
                 engine::catalog::ArrayElemType::Uuid => "uuid[]",
                 engine::catalog::ArrayElemType::Numeric { .. } => "numeric[]",
                 engine::catalog::ArrayElemType::Bytea => "bytea[]",
                 engine::catalog::ArrayElemType::Json => "json[]",
                 engine::catalog::ArrayElemType::Jsonb => "jsonb[]",
                 engine::catalog::ArrayElemType::Enum => "enum[]",
+                engine::catalog::ArrayElemType::Varchar(_) => "varchar[]",
+                engine::catalog::ArrayElemType::Bpchar(_) => "bpchar[]",
+                engine::catalog::ArrayElemType::Bit(_) => "bit[]",
+                engine::catalog::ArrayElemType::Interval => "interval[]",
             },
         },
     }
@@ -1041,6 +1077,12 @@ mod tests {
                 "[null,true]",
             ),
             (
+                ArrayElemType::SmallInt,
+                "smallint[]",
+                V::SmallInt(vec![Some(1), None, Some(-3)]),
+                "[1,null,-3]",
+            ),
+            (
                 ArrayElemType::Integer,
                 "integer[]",
                 V::Integer(vec![Some(1), None, Some(-3)]),
@@ -1075,6 +1117,40 @@ mod tests {
                 "timestamp[]",
                 V::Timestamp(vec![Some(1_000_000)]),
                 r#"["1970-01-01 00:00:01"]"#,
+            ),
+            (
+                ArrayElemType::Time,
+                "time[]",
+                V::Time(vec![Some(36_000_000_000), None, Some(86_400_000_000)]),
+                r#"["10:00:00",null,"24:00:00"]"#,
+            ),
+            (
+                ArrayElemType::Interval,
+                "interval[]",
+                V::Interval(vec![
+                    Some(engine::datetime::Interval {
+                        months: 0,
+                        days: 1,
+                        micros: 0,
+                    }),
+                    None,
+                ]),
+                r#"["1 day",null]"#,
+            ),
+            (
+                ArrayElemType::Bit(4),
+                "bit[]",
+                V::Bit(vec![
+                    engine::bit_string::BitString::parse_text("1010", 4).ok(),
+                    None,
+                ]),
+                r#"["1010",null]"#,
+            ),
+            (
+                ArrayElemType::TimestampTz,
+                "timestamptz[]",
+                V::TimestampTz(vec![Some(0), None]),
+                r#"["1970-01-01 00:00:00+00",null]"#,
             ),
             (
                 ArrayElemType::Uuid,

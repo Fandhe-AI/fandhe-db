@@ -30,6 +30,7 @@
 //! | `Expression(a ~ b)` 等の正規表現マッチ | `negated` を反転（左辺・パターンが NULL なら否定の有無に関わらず NULL のため三値論理でも同値。SQL-55・Issue #1787） |
 //! | `visible()` | `42601`（RLS-7: 否定越しに RLS 述語を扱わせない） |
 //! | `IN (SELECT)`／`EXISTS` | `Not(..)`（解決段 `sql::subquery` が NULL 規則込みで否定形を評価する。Issue #1191） |
+//! | `(a, b) <op> (c, d)`（行値比較。Issue #3255） | 演算子反転（`<`↔`>=`・`<=`↔`>`・`=`↔`<>`。結果は最初の非等価／NULL 成分で決まるため三値論理でも同値） |
 //! | `<col> <op> (SELECT)` | 演算子反転（`=`↔`<>`・`<`↔`>=`・`>`↔`<=`。Issue #1191） |
 //!
 //! 演算子反転の根拠: 束縛段の比較は同型（数値×数値・TEXT×TEXT・DATE/TIMESTAMP 系）
@@ -70,8 +71,15 @@ pub(crate) fn expr_node_count(expr: &Expr) -> usize {
             .children()
             .into_iter()
             .fold(1usize, |acc, c| acc.saturating_add(expr_node_count(c))),
-        Expr::Case { whens, else_result } => {
+        Expr::Case {
+            operand,
+            whens,
+            else_result,
+        } => {
             let mut n = 1usize;
+            if let Some(o) = operand {
+                n = n.saturating_add(expr_node_count(o));
+            }
             for (c, r) in whens {
                 n = n
                     .saturating_add(expr_node_count(c))
@@ -251,6 +259,14 @@ fn negate_one(
                 "NOT must be followed by a comparison",
             )),
         },
+        // 行値比較（#3255）: 演算子を反転する（`<`↔`>=`・`<=`↔`>`・`=`↔`<>`）。三値論理でも、
+        // 結果は最初の非等価成分（または NULL 成分）で決まり、そこでの反転が全体の反転と一致する。
+        // 全成分が等しい場合も `<`→false／`>=`→true で一致し、`=`↔`<>` は De Morgan による。
+        WherePredicate::RowCompare { lhs, op, rhs } => Ok(vec![WherePredicate::RowCompare {
+            lhs,
+            op: op.negated(),
+            rhs,
+        }]),
         WherePredicate::Expression(_)
         | WherePredicate::IdCompare { .. }
         | WherePredicate::CorrelatedExists(_) => Err(SqlSurfaceError::unsupported(
@@ -385,10 +401,11 @@ mod tests {
     /// TABLE-35・Issue #1603: 量化比較の否定は量化子の反転と演算子の否定（二重否定で元に戻る）。
     #[test]
     fn quantified_negation_flips_quantifier_and_operator() {
+        use crate::sql::udf_call::QuantifiedOp;
         use crate::sql::udf_call::{ArrayCmpOp, Quantifier};
         let q = |op, quantifier| {
             WherePredicate::Expression(Expr::Quantified {
-                op,
+                op: QuantifiedOp::Cmp(op),
                 quantifier,
                 lhs: Box::new(Expr::Number("1".into())),
                 rhs: Box::new(Expr::Ident("a".into())),
@@ -405,6 +422,32 @@ mod tests {
             assert_eq!(once, vec![q(neg, Quantifier::All)]);
             let twice = negate_conjunction(once, &mut b).expect("negate twice");
             assert_eq!(twice, vec![q(op, Quantifier::Any)]);
+        }
+    }
+
+    /// SQL-9・Issue #3258: LIKE 系の量化形の否定も量化子の反転と演算子（`negated`）の反転で、
+    /// 二重否定で元に戻る（`NOT (x LIKE ANY a)` = `x NOT LIKE ALL a`）。
+    #[test]
+    fn like_quantified_negation_flips_quantifier_and_negated() {
+        use crate::sql::udf_call::{QuantifiedOp, Quantifier};
+        let q = |negated, case_insensitive, quantifier| {
+            WherePredicate::Expression(Expr::Quantified {
+                op: QuantifiedOp::Like {
+                    negated,
+                    case_insensitive,
+                },
+                quantifier,
+                lhs: Box::new(Expr::Ident("s".into())),
+                rhs: Box::new(Expr::Ident("a".into())),
+            })
+        };
+        let mut b = 100;
+        for ci in [false, true] {
+            let once = negate_conjunction(vec![q(false, ci, Quantifier::Any)], &mut b)
+                .expect("negate once");
+            assert_eq!(once, vec![q(true, ci, Quantifier::All)]);
+            let twice = negate_conjunction(once, &mut b).expect("negate twice");
+            assert_eq!(twice, vec![q(false, ci, Quantifier::Any)]);
         }
     }
 

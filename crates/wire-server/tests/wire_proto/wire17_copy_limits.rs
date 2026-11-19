@@ -54,12 +54,22 @@ fn body_limits() -> BatchLimits {
 }
 
 fn chunk_limits() -> BatchLimits {
-    // ④ < ① にして ① が先に発火しないようにする。
+    // 行数の拒否は ④ で行う（① は COPY の行数に掛からない。Issue #3309）。
     BatchLimits {
         max_files_per_batch: 64,
         max_file_body_bytes: 1024 * 1024,
         max_batch_total_bytes: 1024 * 1024,
         max_batch_chunks: 2,
+    }
+}
+
+/// 行本文の上限を緩めた構成（① は既定の 64 のまま）。
+fn wide_row_limits() -> BatchLimits {
+    BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: 1024 * 1024,
+        max_batch_total_bytes: 1024 * 1024,
+        max_batch_chunks: 1000,
     }
 }
 
@@ -229,4 +239,182 @@ fn wire17_copy_rows_over_chunk_limit_are_detected_before_copy_done() {
         "wire-1178-chunk-early",
         b"1\t[1.0,0.0]\tja\n2\t[0.0,1.0]\tja\n3\t[1.0,1.0]\tja\n",
     );
+}
+
+// --- Issue #3309: INDEX-4 ① は COPY の行数に掛からない ---
+
+fn rows_text(from: u32, to: u32) -> Vec<u8> {
+    (from..=to)
+        .flat_map(|i| format!("{i}\t[1.0,0.0]\tja\n").into_bytes())
+        .collect()
+}
+
+fn count_docs(stream: &mut std::net::TcpStream) -> usize {
+    send_simple_query(stream, "SELECT id FROM docs LIMIT 1000");
+    let mut rows = 0;
+    loop {
+        let (kind, _) = read_message(stream);
+        match kind {
+            b'D' => rows += 1,
+            b'Z' => return rows,
+            _ => {}
+        }
+    }
+}
+
+/// 既定の ①（64）を超える 100 行が、psql 形（末尾 `;` 付きの単独送信）の text／CSV で受理される。
+#[test]
+fn wire17_copy_more_than_64_rows_are_accepted_text_and_csv() {
+    let (core, _guard) = new_core(wide_row_limits());
+    let mut stream = connect(core);
+    send_simple_query(&mut stream, "COPY docs (id, embedding, lang) FROM STDIN;");
+    let (ty, _) = read_message(&mut stream);
+    assert_eq!(ty, b'G');
+    send_copy_data(&mut stream, &rows_text(1, 100));
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 100");
+    read_ready_for_query(&mut stream);
+
+    send_simple_query(
+        &mut stream,
+        "COPY docs (id, embedding, lang) FROM STDIN WITH (FORMAT csv);",
+    );
+    let (ty, _) = read_message(&mut stream);
+    assert_eq!(ty, b'G');
+    let csv: String = (101..=200)
+        .map(|i| format!("{i},\"[1.0,0.0]\",ja\n"))
+        .collect();
+    send_copy_data(&mut stream, csv.as_bytes());
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 100");
+    read_ready_for_query(&mut stream);
+    assert_eq!(count_docs(&mut stream), 200);
+}
+
+/// 65 行目より後の ④ 超過は CopyData 受信中に `54000` になり、行は 1 件も残らない。
+#[test]
+fn wire17_copy_chunk_overrun_after_64_rows_is_54000_with_zero_side_effects() {
+    let limits = BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: 1024 * 1024,
+        max_batch_total_bytes: 1024 * 1024,
+        max_batch_chunks: 80,
+    };
+    let (core, _guard) = new_core(limits);
+    let mut stream = connect(core);
+    start_copy(&mut stream, "wire-3309-chunk-after64");
+    send_copy_data(&mut stream, &rows_text(1, 81));
+    send_copy_done(&mut stream);
+    expect_limit_error(&mut stream, "batch chunk count");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_no_rows_and_connection_alive(&mut stream);
+}
+
+/// 65 行を送った後に 1 メッセージ上限を超えるフレームを送ると `54000` で切断され、行は残らない。
+#[test]
+fn wire17_copy_oversized_frame_after_64_rows_is_54000_with_zero_rows() {
+    use std::io::Write;
+    let (core, _guard) = new_core(wide_row_limits());
+    let mut stream = connect(core.clone());
+    start_copy(&mut stream, "wire-3309-oversized");
+    send_copy_data(&mut stream, &rows_text(1, 65));
+    let declared_len = (wire_server::framing::MAX_MESSAGE_LEN + 1) as i32;
+    let mut header = vec![b'd'];
+    header.extend_from_slice(&declared_len.to_be_bytes());
+    stream.write_all(&header).expect("send oversized header");
+    let (ty, body) = read_message(&mut stream);
+    assert_eq!(ty, b'E');
+    assert!(String::from_utf8_lossy(&body).contains("54000"));
+    drop(stream);
+    let mut other = connect(core);
+    assert_no_rows_and_connection_alive(&mut other);
+}
+
+/// `--max-insert-rows` 相当の指定（`with_dml_limits`）があれば COPY もその行数で `54000`・副作用ゼロ。
+#[test]
+fn wire17_copy_respects_max_insert_rows_when_specified() {
+    let path = temp_db::unique_db_path("wire17-copy-max-insert-rows");
+    let _guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_batch_limits(wide_row_limits())
+        .with_dml_limits(engine::sql::parser::DmlLimits {
+            max_insert_rows_per_statement: std::num::NonZeroUsize::new(3),
+            ..Default::default()
+        });
+    let mut stream = connect(Arc::new(core));
+    start_copy(&mut stream, "wire-3309-mir-ok");
+    send_copy_data(&mut stream, &rows_text(1, 3));
+    send_copy_done(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "COPY 3");
+    read_ready_for_query(&mut stream);
+
+    start_copy(&mut stream, "wire-3309-mir-ng");
+    send_copy_data(&mut stream, &rows_text(11, 14));
+    send_copy_done(&mut stream);
+    expect_limit_error(&mut stream, "row count");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_eq!(count_docs(&mut stream), 3);
+}
+
+// --- Issue #3310: ① を外したあとの既定構成での資源上限 ---------------------------
+
+/// 既定構成（①64・② 16 MiB・③ 64 MiB・④ 4096）を環境変数に依らず明示した上限。
+fn explicit_default_limits() -> BatchLimits {
+    BatchLimits {
+        max_files_per_batch: 64,
+        max_file_body_bytes: engine::chunking::MAX_INPUT_BYTES,
+        max_batch_total_bytes: engine::incremental::MAX_INDEX_TOTAL_BYTES,
+        max_batch_chunks: engine::incremental::MAX_CHUNKS_PER_FILE,
+    }
+}
+
+/// 固定する上限: ④（既定 4096）。1 MiB 以内の CopyData 1 通に収まる 30,000 行は `54000` の
+/// ErrorResponse → ReadyForQuery `I` → 行 0 件で、接続は維持される。
+#[test]
+fn wire17_copy_tens_of_thousands_of_rows_are_54000_under_default_limits() {
+    let (core, _guard) = new_core(explicit_default_limits());
+    let mut stream = connect(core);
+    start_copy(&mut stream, "wire-3310-30k");
+    let rows = rows_text(1, 30_000);
+    assert!(
+        rows.len() < 1 << 20,
+        "fixture must fit in one CopyData frame"
+    );
+    send_copy_data(&mut stream, &rows);
+    send_copy_done(&mut stream);
+    expect_limit_error(&mut stream, "batch chunk count");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_no_rows_and_connection_alive(&mut stream);
+}
+
+/// 固定する上限: ②（既定 16 MiB）。1 行を 1000 KiB の CopyData 複数通に分け、最後の通で改行を
+/// 送る。行が 16 MiB を超えた時点で `54000`・行 0 件・接続維持（読み捨ての予算内）。
+#[test]
+fn wire17_copy_single_huge_row_is_54000_under_default_limits() {
+    let (core, _guard) = new_core(explicit_default_limits());
+    let mut stream = connect(core);
+    start_copy(&mut stream, "wire-3310-huge-row");
+    let piece = vec![b'q'; 1000 * 1024];
+    let mut first = b"1\t[1.0,0.0]\t".to_vec();
+    first.extend_from_slice(&piece);
+    send_copy_data(&mut stream, &first);
+    let pieces = engine::chunking::MAX_INPUT_BYTES / piece.len() + 1;
+    for _ in 0..pieces {
+        send_copy_data(&mut stream, &piece);
+    }
+    send_copy_data(&mut stream, b"\n");
+    send_copy_done(&mut stream);
+    expect_limit_error(&mut stream, "");
+    assert_eq!(read_ready_for_query_status(&mut stream), b'I');
+    assert_no_rows_and_connection_alive(&mut stream);
 }

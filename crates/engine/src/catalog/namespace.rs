@@ -389,11 +389,16 @@ pub(crate) struct SchemaObjects {
     pub(crate) tables: Vec<String>,
     /// ビュー。
     pub(crate) views: Vec<String>,
+    /// MATERIALIZED VIEW（`#<id>.<name>`。Issue #3287）。
+    pub(crate) matviews: Vec<String>,
     /// 索引（表と同じ SCHEMA に属する宣言。通常は表と一緒に消える）。
     pub(crate) indexes: Vec<String>,
     /// SEQUENCE（`#<id>.<name>`）。
     pub(crate) sequences: Vec<String>,
-    /// 現状 SCHEMA 配下には置けない種別（matview・ENUM 型）が 1 件でもあるか。あれば
+    /// ENUM 型（`#<id>.<name>`。Issue #3288）。`CASCADE` が表の後・SCHEMA 行の前に落とす。
+    pub(crate) enum_types: Vec<String>,
+    /// 現状 SCHEMA 配下には置けない種別（Issue #3287 で matview も置けるようになり、
+    /// 現在は該当する種別が無い）が 1 件でもあるか。あれば
     /// `DROP SCHEMA ... CASCADE` は不整合として拒否する（fail-closed）。
     pub(crate) unsupported_kinds: bool,
 }
@@ -435,15 +440,16 @@ pub(crate) fn enumerate_schema_objects_in_txn<R: ReadSource>(
     let mut objects = SchemaObjects {
         tables: str_keys_in_range(src, CATALOG_TABLE, &start, &end)?,
         views: str_keys_in_range(src, VIEWS_TABLE, &start, &end)?,
+        matviews: str_keys_in_range(
+            src,
+            super::materialized::MATERIALIZED_VIEWS_TABLE,
+            &start,
+            &end,
+        )?,
         indexes: str_keys_in_range(src, INDEX_CATALOG_TABLE, &start, &end)?,
+        enum_types: str_keys_in_range(src, ENUM_TYPES_TABLE, &start, &end)?,
         ..SchemaObjects::default()
     };
-    objects.unsupported_kinds = str_key_range_nonempty(
-        src,
-        super::materialized::MATERIALIZED_VIEWS_TABLE,
-        &start,
-        &end,
-    )? || str_key_range_nonempty(src, ENUM_TYPES_TABLE, &start, &end)?;
     let seq_key = sequence_schema_key(schema_id);
     match src.open_table(super::sequence::SEQUENCES_TABLE) {
         Ok(seqs) => {
@@ -495,6 +501,180 @@ pub(crate) fn schema_relation_keys_in_txn<R: ReadSource>(
     Ok(out)
 }
 
+/// `CREATE SCHEMA` の writer を取る前の静的検査（識別子 → 予約名。DB を読まない。Issue #3315）。
+/// autocommit と Tx 内の両方が writer 取得（`55P03`・Failed Tx の writer 保持）より前に呼ぶ。
+pub(crate) fn precheck_create_schema(tenant_id: &str, name: &str) -> Result<()> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_reserved_schema_name(name) {
+        return Err(CatalogError::ReservedSchemaName(name.to_string()));
+    }
+    Ok(())
+}
+
+/// `DROP SCHEMA`・`ALTER SCHEMA RENAME` の旧名について、writer を取る前の静的検査（識別子 → 組み込み名）。
+/// `new` は `ALTER SCHEMA` の新名（識別子だけ検査する）。
+pub(crate) fn precheck_schema_name_change(
+    tenant_id: &str,
+    old: &str,
+    new: Option<&str>,
+) -> Result<()> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(old)?;
+    if let Some(new) = new {
+        validate_identifier(new)?;
+    }
+    if is_builtin_schema_name(old) {
+        return Err(CatalogError::BuiltinSchema(old.to_string()));
+    }
+    Ok(())
+}
+
+/// 組み込み SCHEMA 名、または `tenant_id` に同名の SCHEMA が既にあるか（write txn 内の 1 回の get）。
+fn schema_name_taken_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+) -> Result<bool> {
+    Ok(is_builtin_schema_name(name) || schema_id_in_txn(write_txn, tenant_id, name)?.is_some())
+}
+
+/// SCHEMA を作る write txn 内本体（識別子・予約名の再検証 → 組み込み名・同名の既存 `SchemaAlreadyExists` →
+/// 件数上限 `ViewLimitExceeded` → ID 払い出しと保存 → 所有者・既定 ACL の記録。begin・commit を含まない）。
+/// 払い出した内部 ID を返す。`Err` の場合は呼び出し側が txn を破棄する。`Storage::create_schema_with_limit`
+/// と、SCHEMA と全要素を 1 回の commit で作る要素つき `CREATE SCHEMA`（`core::schema_elements`。Issue #3286）が
+/// 共有する。照会は `(tenant_id, name)` だけで、他テナントの SCHEMA は見えない。
+pub(crate) fn create_schema_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+    max_schemas: usize,
+    owner: Option<u64>,
+) -> Result<u64> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_reserved_schema_name(name) {
+        return Err(CatalogError::ReservedSchemaName(name.to_string()));
+    }
+    if schema_name_taken_in_txn(write_txn, tenant_id, name)? {
+        return Err(CatalogError::SchemaAlreadyExists(name.to_string()));
+    }
+    if count_schemas_capped(write_txn, tenant_id, max_schemas)? >= max_schemas {
+        return Err(CatalogError::ViewLimitExceeded(
+            "too many schemas".to_string(),
+        ));
+    }
+    let id = allocate_schema_id_in_txn(write_txn)?;
+    {
+        let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
+        table.insert((tenant_id, name), encode_schema_def(id).as_slice())?;
+    }
+    if let Some(owner) = owner {
+        super::privilege::owner::set_owner_in_txn(
+            write_txn,
+            tenant_id,
+            &super::privilege::PrivilegeObject::Schema(id),
+            owner,
+        )?;
+        // 所有者（作成者）の `SCHEMAS` の既定権限を同じ txn で初期 ACL へ適用する（Issue #2237）。
+        super::privilege::default_acl::apply_default_acl_to_schema_in_txn(
+            write_txn, tenant_id, owner, id,
+        )?;
+    }
+    Ok(id)
+}
+
+/// [`Storage::create_schema_owned`] の write txn 内本体（begin・commit を含まない。Issue #3315）。判定順は
+/// 識別子 → 予約名（`IF NOT EXISTS` より先。`42939`）→ 組み込み名・同名の既存（`IF NOT EXISTS` なら
+/// `AlreadyExists` の no-op、無ければ `SchemaAlreadyExists`）→ 件数上限 → ID 払い出しと保存。`AlreadyExists`
+/// のときは何も書いていない。明示・暗黙 Tx の `CREATE SCHEMA`（SQL-80）と autocommit が共有する。
+pub(crate) fn create_schema_if_absent_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+    if_not_exists: bool,
+    max_schemas: usize,
+    owner: Option<u64>,
+) -> Result<CreateSchemaResult> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_reserved_schema_name(name) {
+        return Err(CatalogError::ReservedSchemaName(name.to_string()));
+    }
+    if if_not_exists && schema_name_taken_in_txn(write_txn, tenant_id, name)? {
+        return Ok(CreateSchemaResult::AlreadyExists);
+    }
+    create_schema_in_txn(write_txn, tenant_id, name, max_schemas, owner)?;
+    Ok(CreateSchemaResult::Created)
+}
+
+/// [`Storage::drop_schema_gated`] の write txn 内本体（begin・commit を含まない。Issue #3315）。
+/// 所有者検査は存在判定の直後・空判定より前に write txn 上で行う。`NotFoundSkipped` のときは何も書いていない。
+pub(crate) fn drop_schema_gated_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    name: &str,
+    if_exists: bool,
+    gate: OwnerGate,
+) -> Result<DropSchemaResult> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(name)?;
+    if is_builtin_schema_name(name) {
+        return Err(CatalogError::BuiltinSchema(name.to_string()));
+    }
+    let Some(id) = schema_id_in_txn(write_txn, tenant_id, name)? else {
+        return if if_exists {
+            Ok(DropSchemaResult::NotFoundSkipped)
+        } else {
+            Err(CatalogError::SchemaNotFound(name.to_string()))
+        };
+    };
+    gate.check(write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
+    if schema_has_objects_in_txn(write_txn, tenant_id, id)? {
+        return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+    }
+    {
+        let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
+        table.remove((tenant_id, name))?;
+    }
+    remove_owner_in_txn(write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
+    // SCHEMA 単位の ACL 行を同じ txn で掃除する（残ると `DROP ROLE` が `2BP01` で永久に拒否される。#2234）。
+    super::privilege::remove_schema_acl_in_txn(write_txn, tenant_id, id)?;
+    // この SCHEMA 向けの既定権限（`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`）も同じ txn で消す（#2237）。
+    super::privilege::default_acl::remove_schema_default_acl_in_txn(write_txn, tenant_id, id)?;
+    Ok(DropSchemaResult::Dropped)
+}
+
+/// [`Storage::rename_schema_gated`] の write txn 内本体（begin・commit を含まない。Issue #3315）。
+pub(crate) fn rename_schema_gated_in_txn(
+    write_txn: &redb::WriteTransaction,
+    tenant_id: &str,
+    old: &str,
+    new: &str,
+    gate: OwnerGate,
+) -> Result<()> {
+    validate_tenant_id(tenant_id)?;
+    validate_identifier(old)?;
+    validate_identifier(new)?;
+    if is_builtin_schema_name(old) {
+        return Err(CatalogError::BuiltinSchema(old.to_string()));
+    }
+    let Some(id) = schema_id_in_txn(write_txn, tenant_id, old)? else {
+        return Err(CatalogError::SchemaNotFound(old.to_string()));
+    };
+    gate.check(write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
+    if is_builtin_schema_name(new) || schema_id_in_txn(write_txn, tenant_id, new)?.is_some() {
+        return Err(CatalogError::SchemaAlreadyExists(new.to_string()));
+    }
+    if is_reserved_schema_name(new) {
+        return Err(CatalogError::ReservedSchemaName(new.to_string()));
+    }
+    let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
+    table.remove((tenant_id, old))?;
+    table.insert((tenant_id, new), encode_schema_def(id).as_slice())?;
+    Ok(())
+}
+
 impl Storage {
     /// `tenant_id` に SCHEMA `name` を作る。判定順は識別子 → 予約名（`IF NOT EXISTS` より先。
     /// `42939`）→ 組み込み名・同名の既存（`IF NOT EXISTS` なら成功の no-op、無ければ
@@ -536,48 +716,25 @@ impl Storage {
         max_schemas: usize,
         owner: Option<u64>,
     ) -> Result<CreateSchemaResult> {
-        validate_tenant_id(tenant_id)?;
-        validate_identifier(name)?;
-        if is_reserved_schema_name(name) {
-            return Err(CatalogError::ReservedSchemaName(name.to_string()));
-        }
+        // writer を取る前に静的検査を行う（拒否が writer 競合 `55P03` に化けない）。
+        precheck_create_schema(tenant_id, name)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let exists = is_builtin_schema_name(name)
-            || schema_id_in_txn(&*write_txn, tenant_id, name)?.is_some();
-        if exists {
-            return if if_not_exists {
-                Ok(CreateSchemaResult::AlreadyExists)
-            } else {
-                Err(CatalogError::SchemaAlreadyExists(name.to_string()))
-            };
+        let result = create_schema_if_absent_in_txn(
+            &write_txn,
+            tenant_id,
+            name,
+            if_not_exists,
+            max_schemas,
+            owner,
+        )?;
+        // `IF NOT EXISTS` の no-op は commit せず返す（txn は破棄される）。
+        if result == CreateSchemaResult::Created {
+            crate::recovery::commit_boundary::commit(write_txn)
+                .map_err(super::convert_storage_error)?;
         }
-        if count_schemas_capped(&*write_txn, tenant_id, max_schemas)? >= max_schemas {
-            return Err(CatalogError::ViewLimitExceeded(
-                "too many schemas".to_string(),
-            ));
-        }
-        let id = allocate_schema_id_in_txn(&write_txn)?;
-        {
-            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
-            table.insert((tenant_id, name), encode_schema_def(id).as_slice())?;
-        }
-        if let Some(owner) = owner {
-            super::privilege::owner::set_owner_in_txn(
-                &write_txn,
-                tenant_id,
-                &super::privilege::PrivilegeObject::Schema(id),
-                owner,
-            )?;
-            // 所有者（作成者）の `SCHEMAS` の既定権限を同じ txn で初期 ACL へ適用する（Issue #2237）。
-            super::privilege::default_acl::apply_default_acl_to_schema_in_txn(
-                &write_txn, tenant_id, owner, id,
-            )?;
-        }
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(CreateSchemaResult::Created)
+        Ok(result)
     }
 
     /// `tenant_id` の SCHEMA `name` を削除する（`RESTRICT`）。判定順は識別子 → 組み込み名
@@ -603,45 +760,25 @@ impl Storage {
         if_exists: bool,
         gate: OwnerGate,
     ) -> Result<DropSchemaResult> {
-        validate_tenant_id(tenant_id)?;
-        validate_identifier(name)?;
-        if is_builtin_schema_name(name) {
-            return Err(CatalogError::BuiltinSchema(name.to_string()));
-        }
+        precheck_schema_name_change(tenant_id, name, None)?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let Some(id) = schema_id_in_txn(&*write_txn, tenant_id, name)? else {
-            return if if_exists {
-                Ok(DropSchemaResult::NotFoundSkipped)
-            } else {
-                Err(CatalogError::SchemaNotFound(name.to_string()))
-            };
-        };
-        gate.check(&*write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
-        if schema_has_objects_in_txn(&*write_txn, tenant_id, id)? {
-            return Err(CatalogError::DependentObjectsStillExist(name.to_string()));
+        let result = drop_schema_gated_in_txn(&write_txn, tenant_id, name, if_exists, gate)?;
+        if result == DropSchemaResult::Dropped {
+            crate::recovery::commit_boundary::commit(write_txn)
+                .map_err(super::convert_storage_error)?;
         }
-        {
-            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
-            table.remove((tenant_id, name))?;
-        }
-        remove_owner_in_txn(&write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
-        // SCHEMA 単位の ACL 行を同じ txn で掃除する（残ると `DROP ROLE` が `2BP01` で永久に拒否される。#2234）。
-        super::privilege::remove_schema_acl_in_txn(&write_txn, tenant_id, id)?;
-        // この SCHEMA 向けの既定権限（`ALTER DEFAULT PRIVILEGES ... IN SCHEMA`）も同じ txn で消す（#2237）。
-        super::privilege::default_acl::remove_schema_default_acl_in_txn(&write_txn, tenant_id, id)?;
-        crate::recovery::commit_boundary::commit(write_txn)
-            .map_err(super::convert_storage_error)?;
-        Ok(DropSchemaResult::Dropped)
+        Ok(result)
     }
 
     /// `tenant_id` の SCHEMA `name` を `CASCADE` で削除する（TABLE-27・Issue #1717、設計記録 D8）。
     /// 判定順は [`Self::drop_schema`] の存在判定まで同じ。以降は**単一の write txn・1 回の commit**で、
     /// (1) SCHEMA 配下の表・ビューを根として外部の依存（別 SCHEMA のビュー・外部キー。public からの
-    /// 依存は D7 で存在しない）を既存の依存列挙で求めて先に削除 → (2) 配下のビュー（キー昇順）→
+    /// 依存は D7 で存在しない）を既存の依存列挙で求めて先に削除 → (2) 配下の matview・ビュー（キー昇順）→
     /// (3) 配下の表（既存の `DROP TABLE ... CASCADE` 本体。索引宣言・行ストア・世代・台帳・キャッシュ
-    /// 世代・所有 SEQUENCE を継承）→ (4) 残りの SEQUENCE（キー昇順）→ (5) SCHEMA 行の順に消す。
+    /// 世代・所有 SEQUENCE を継承）→ (4) 残りの SEQUENCE（キー昇順）→ (4b) 配下の ENUM 型（キー昇順。型を使う列が
+    /// SCHEMA の外に残っていれば何も消さず `DependentObjectsStillExist`。Issue #3288）→ (5) SCHEMA 行の順に消す。
     /// 依存を正確に判定できない場合・外部の表が配下の SEQUENCE を `DEFAULT nextval` で参照している
     /// 場合は `DependentObjectsStillExist`（不可逆な連鎖削除をしない。fail-closed）。ID カウンタは
     /// 巻き戻さない。`sql::ddl::execute_drop_schema` から呼ばれる（権限ゲート通過後）。
@@ -684,7 +821,9 @@ impl Storage {
         if gate != OwnerGate::Skip
             && (!objects.tables.is_empty()
                 || !objects.views.is_empty()
+                || !objects.matviews.is_empty()
                 || !objects.sequences.is_empty()
+                || !objects.enum_types.is_empty()
                 || objects.unsupported_kinds)
         {
             return Err(CatalogError::NotObjectOwner);
@@ -703,6 +842,12 @@ impl Storage {
                     .iter()
                     .map(|v| super::dependency::DropTarget::View(v.clone())),
             )
+            .chain(
+                objects
+                    .matviews
+                    .iter()
+                    .map(|m| super::dependency::DropTarget::MaterializedView(m.clone())),
+            )
             .collect();
         if !roots.is_empty() {
             let closure = super::dependency::enumerate_drop_dependents_in_txn(&write_txn, &roots)?;
@@ -711,7 +856,12 @@ impl Storage {
             }
             super::apply_cascaded_objects_in_txn(&write_txn, closure.objects)?;
         }
-        // (2) 配下のビュー。
+        // (2) 配下の matview（キー昇順。実体・索引宣言・ACL・所有者まで同じ txn。Issue #3287）→ ビュー。
+        for mv in &objects.matviews {
+            super::materialized::drop_materialized_view_in_txn(&write_txn, mv)?;
+            crate::storage::commit_log::note_ddl(&write_txn, mv);
+            super::bump_table_generation_in_txn(&write_txn, mv)?;
+        }
         for view in &objects.views {
             super::drop_view_in_txn(&write_txn, view)?;
         }
@@ -731,6 +881,12 @@ impl Storage {
             if super::sequence::sequence_exists_in_txn(&write_txn, seq)? {
                 dropped_sequence_ids.push(super::sequence::drop_sequence_in_txn(&write_txn, seq)?);
             }
+        }
+        // (4b) 配下の ENUM 型（Issue #3288）。配下の表を落とした後の `CATALOG_TABLE` を 1 回だけ走査し、
+        // 配下の型を参照する列（配列要素を含む）が SCHEMA の外に残っていれば、型を消さず txn ごと破棄する
+        // （fail-closed。列の型が宙に浮くため）。残っていなければ型を内部キーの昇順で消す。
+        if !objects.enum_types.is_empty() {
+            super::drop_schema_enum_types_in_txn(&write_txn, &objects.enum_types)?;
         }
         // 配下に残った索引宣言（表を失った孤児。通常は無い）も消す。
         let prefix = RelationKey::schema_prefix(id);
@@ -755,7 +911,7 @@ impl Storage {
         let allocator = self.sequence_allocator();
         crate::recovery::commit_boundary::commit_and_finish(write_txn, (), |()| {
             for id in &dropped_sequence_ids {
-                allocator.evict(*id);
+                allocator.evict_dropped(*id);
             }
             // CASCADE が配下の関数行も消すため、commit 成功後に UDF カタログの世代を進める
             // （他セッションの refresh が検知する。SQL-66・#1921）。
@@ -785,30 +941,11 @@ impl Storage {
         new: &str,
         gate: OwnerGate,
     ) -> Result<()> {
-        validate_tenant_id(tenant_id)?;
-        validate_identifier(old)?;
-        validate_identifier(new)?;
-        if is_builtin_schema_name(old) {
-            return Err(CatalogError::BuiltinSchema(old.to_string()));
-        }
+        precheck_schema_name_change(tenant_id, old, Some(new))?;
         let write_txn = self
             .begin_write_txn()
             .map_err(super::convert_storage_error)?;
-        let Some(id) = schema_id_in_txn(&*write_txn, tenant_id, old)? else {
-            return Err(CatalogError::SchemaNotFound(old.to_string()));
-        };
-        gate.check(&*write_txn, tenant_id, &PrivilegeObject::Schema(id))?;
-        if is_builtin_schema_name(new) || schema_id_in_txn(&*write_txn, tenant_id, new)?.is_some() {
-            return Err(CatalogError::SchemaAlreadyExists(new.to_string()));
-        }
-        if is_reserved_schema_name(new) {
-            return Err(CatalogError::ReservedSchemaName(new.to_string()));
-        }
-        {
-            let mut table = write_txn.open_table_logged(SCHEMAS_TABLE)?;
-            table.remove((tenant_id, old))?;
-            table.insert((tenant_id, new), encode_schema_def(id).as_slice())?;
-        }
+        rename_schema_gated_in_txn(&write_txn, tenant_id, old, new, gate)?;
         crate::recovery::commit_boundary::commit(write_txn)
             .map_err(super::convert_storage_error)?;
         Ok(())
@@ -933,6 +1070,17 @@ mod tests {
             assert!(RelationKey::parse(bad).is_err(), "{bad:?} must be rejected");
         }
         assert!(RelationKey::parse("#18446744073709551615.t").is_ok());
+    }
+
+    /// `SET SCHEMA` の所有判定（`strip_prefix(schema_prefix(id))`）は接頭辞に `.` を含むため、
+    /// スキーマ 1 の判定が `#12.`・`#10.` 配下のキーを自分のものと誤認しない（Issue #3198 の回帰）。
+    #[test]
+    fn schema_prefix_strip_does_not_match_longer_ids() {
+        let p = RelationKey::schema_prefix(1);
+        assert_eq!("#1.idx".strip_prefix(p.as_str()), Some("idx"));
+        assert_eq!("#12.idx".strip_prefix(p.as_str()), None);
+        assert_eq!("#10.seq".strip_prefix(p.as_str()), None);
+        assert_eq!("#123.seq".strip_prefix(p.as_str()), None);
     }
 
     #[test]
@@ -1270,6 +1418,75 @@ mod tests {
         assert!(s.list_indexes().expect("list").is_empty());
     }
 
+    /// `alter_table_set_schema`（Issue #3198）は、移動元・移動先のどちらかが呼び出し元テナントの SCHEMA
+    /// でなければ `TableNotFound` で拒否し（他テナントの SCHEMA と不在を区別しない）、何も変えない。
+    /// 自テナントの SCHEMA 間なら索引キーも付け替わる。
+    #[test]
+    fn alter_table_set_schema_rejects_foreign_schemas_and_moves_indexes() {
+        use crate::catalog::{
+            AlterCheckError, ColumnDef, ColumnType, IndexDef, IndexKind, TableSchema,
+        };
+        let (s, _g) = tmp_storage("ns-set-schema");
+        for (tenant, name) in [("alice", "a1"), ("alice", "a2"), ("bob", "b1")] {
+            s.create_schema(tenant, name, false).expect("schema");
+        }
+        let key = |tenant: &str, schema: &str, name: &str| {
+            RelationKey::InSchema {
+                schema_id: s.schema_id(tenant, schema).expect("id").expect("exists"),
+                name: name.to_string(),
+            }
+            .encode()
+        };
+        let (a1t, a2t, b1t) = (
+            key("alice", "a1", "t"),
+            key("alice", "a2", "t"),
+            key("bob", "b1", "t"),
+        );
+        s.create_table(&TableSchema::new(
+            a1t.clone(),
+            vec![ColumnDef::new("name", ColumnType::Text, true)],
+        ))
+        .expect("table");
+        s.create_index(&IndexDef::new(
+            key("alice", "a1", "i"),
+            a1t.clone(),
+            IndexKind::Scalar,
+            vec!["name".to_string()],
+        ))
+        .expect("index");
+        let before = dump_non_schema_state(&s);
+        for (tenant, old, new) in [
+            ("bob", &a1t, &b1t),
+            ("alice", &a1t, &b1t),
+            ("bob", &a1t, &key("bob", "b1", "t")),
+        ] {
+            assert!(
+                matches!(
+                    s.alter_table_set_schema(tenant, old, new),
+                    Err(AlterCheckError::Catalog(CatalogError::TableNotFound(_)))
+                ),
+                "{tenant}: {old} -> {new}"
+            );
+        }
+        assert_eq!(
+            dump_non_schema_state(&s),
+            before,
+            "rejections must not write"
+        );
+        s.alter_table_set_schema("alice", &a1t, &a2t).expect("move");
+        let after = dump_non_schema_state(&s);
+        assert!(after
+            .iter()
+            .any(|l| l.starts_with(&format!("catalog {a2t} "))));
+        assert!(!after
+            .iter()
+            .any(|l| l.starts_with(&format!("catalog {a1t} "))));
+        assert!(after.iter().any(|l| l.contains(&key("alice", "a2", "i"))));
+        assert!(!after
+            .iter()
+            .any(|l| l.starts_with(&format!("index_catalog {} ", key("alice", "a1", "i")))));
+    }
+
     /// 全 redb 表の (名前, 件数) と、型付きで読める SCHEMA 以外のカタログ表の全 key/value を dump する。
     fn dump_non_schema_state(s: &Storage) -> Vec<String> {
         use redb::{ReadableTableMetadata, TableHandle};
@@ -1381,5 +1598,79 @@ mod tests {
         assert!(reopened.schema_id("alice", "s1").expect("id").is_some());
         assert!(reopened.schema_id("bob", "s1").expect("id").is_some());
         assert!(reopened.schema_id("alice", "s2").expect("id").is_none());
+    }
+
+    /// ENUM 型の `DROP SCHEMA ... CASCADE`（Issue #3288）: 配下の型を落とし、同名の public の型・隣接 ID の型は
+    /// 巻き込まない。型を使う列が SCHEMA の外に残る場合は何も消さず `DependentObjectsStillExist`。
+    #[test]
+    fn cascade_drops_schema_types_and_refuses_while_a_column_still_uses_one() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        let labels = |l: &[&str]| l.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (s, _g) = tmp_storage("ns-enum-cascade");
+        s.create_schema("alice", "s", false).expect("schema");
+        let id = s.schema_id("alice", "s").expect("id").expect("some");
+        let key = format!("#{id}.mood");
+        s.create_enum_type("mood", labels(&["p"])).expect("public");
+        s.create_enum_type(&key, labels(&["a", "b"]))
+            .expect("in schema");
+        // 隣接 ID（10 倍・桁違い）の型は SCHEMA `s` の持ち物ではない。ID が `id * 10 + 1` の SCHEMA が
+        // できるまで他テナントの SCHEMA を作る（`s` の ID は 1。ID は 1 始まりで再利用されない）。
+        assert_eq!(id, 1);
+        for n in 0..10 {
+            s.create_schema("bob", &format!("x{n}"), false)
+                .expect("filler");
+        }
+        assert_eq!(s.schema_id("bob", "x9").expect("id"), Some(id * 10 + 1));
+        let neighbour = format!("#{}.mood", id * 10 + 1);
+        s.create_enum_type(&neighbour, labels(&["n"]))
+            .expect("neighbour");
+        // 往復と独立性。
+        assert_eq!(s.get_enum_type(&key).expect("get").labels(), ["a", "b"]);
+        assert_eq!(s.get_enum_type("mood").expect("get").labels(), ["p"]);
+        // `#<id>.int4` 等の予約名は名前部で拒否される。
+        for bad in ["int4", "text", "INT4"] {
+            assert!(
+                matches!(
+                    s.create_enum_type(&format!("#{id}.{bad}"), labels(&["a"])),
+                    Err(CatalogError::Invalid(_))
+                ),
+                "{bad}"
+            );
+        }
+        // SQL・Storage API のどちらでも、列は SCHEMA 配下の型（内部キー）を参照できない（列の型名は厳格な
+        // 識別子検証）。CASCADE の依存走査は、その前提が将来崩れても型を孤児にしないための多層防御なので、
+        // 走査関数を直接呼んで検証する: 型を使う列が残っていれば何も消さず `DependentObjectsStillExist`。
+        let public_def = s.get_enum_type("mood").expect("public def");
+        s.create_table(&TableSchema::new(
+            "t",
+            vec![ColumnDef::new("m", ColumnType::Enum(public_def), false)],
+        ))
+        .expect("table using the public type");
+        let before = dump_non_schema_state(&s);
+        {
+            let txn = s.begin_write_txn().expect("txn");
+            let r = super::super::drop_schema_enum_types_in_txn(&txn, &["mood".to_string()]);
+            assert!(matches!(
+                r,
+                Err(CatalogError::DependentObjectsStillExist(_))
+            ));
+            // commit せず破棄する（呼び出し元の `drop_schema_cascade_gated` と同じ）。
+            drop(txn);
+        }
+        assert_eq!(before, dump_non_schema_state(&s));
+        // 配下の型（内部キー）を参照する列は無いので、CASCADE は通る。
+        s.drop_table("t").expect("drop table");
+        // CASCADE は型を落とし、public の型と隣接 ID の型は残る。
+        assert_eq!(
+            s.drop_schema_cascade("alice", "s", false).expect("cascade"),
+            DropSchemaResult::Dropped
+        );
+        assert!(matches!(
+            s.get_enum_type(&key),
+            Err(CatalogError::TypeNotFound(_))
+        ));
+        assert!(s.get_enum_type("mood").is_ok());
+        assert!(s.get_enum_type(&neighbour).is_ok());
+        assert!(s.schema_id("alice", "s").expect("id").is_none());
     }
 }

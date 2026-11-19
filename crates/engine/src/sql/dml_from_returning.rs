@@ -11,11 +11,16 @@
 //! 各表を独立に評価することで担保し、ここでは対象行の再判定
 //! （[`joined_returning_collector`]）だけを行う。
 //!
-//! 現状は #1754／#1755 の結線待ちで、`core.rs` からは未接続（結線までは未使用のため
-//! モジュール全体で `dead_code` を許可している）。未接続の入口は固定文言の `0A000` で
-//! fail-closed のまま残し、仮の成功経路は作らない。
-
-#![allow(dead_code)]
+//! 結線（Issue #3204）: 構文段（`sql::allowlist` の `parse_dml_from_returning_clause`）→ 束縛
+//! （`sql::dml_from`）→ 計画（`sql::join::dml_plan` が source 側の参照列を走査へ載せ、
+//! [`BoundFromReturning::assign_source_cells`] でセル位置を確定）→ 実行（`core::dml_join_exec` が
+//! [`joined_returning_collector`] を組み立てる）の順に使われる。
+//!
+//! 式・別名の受理範囲（Issue #3251）: 任意の relation の列参照への `AS` 別名と、**対象表の列だけ**を
+//! 参照する式・組み込み関数・UDF を受理する。式は対象表側の投影として SELECT・基表 DML と同じ束縛
+//! （`parser::bind_returning_with_udfs`）・評価（[`returning::ReturningProjector`]）へ委譲し、第 2 の
+//! 式評価器を作らない。FROM／USING 側の列を式の中で参照する形は、結合中間行を評価器へ渡す基盤が無いため
+//! 構文段が `0A000` で拒否する（fail-closed。SET の式と同じ境界）。
 
 use crate::policy::PolicyContext;
 use crate::row_codec::Value;
@@ -29,7 +34,7 @@ use crate::tenant::{CapturedRow, CapturedRowOrigin, TenantWriteError};
 /// `RETURNING` 項目数の構文段上限（無制限確保の防止。JOIN の SELECT 項目上限と同値）。
 pub(crate) const MAX_DML_FROM_RETURNING_ITEMS: usize = 4096;
 
-/// 構文段が返す `RETURNING` 項目 1 つ。式・関数呼び出し・`AS` 別名は構文段で `42601`。
+/// 構文段が返す `RETURNING` 項目 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DmlFromReturningItem {
     /// 裸の `*`（対象表に続けて FROM／USING の各表を宣言順に展開）。
@@ -38,6 +43,17 @@ pub(crate) enum DmlFromReturningItem {
     QualifiedAll(String),
     /// 列参照（修飾あり・なし）。
     Column(ColumnRef),
+    /// `AS` 別名付きの列参照（任意の relation の列・疑似列 `id`。Issue #3251）。
+    AliasedColumn(ColumnRef, String),
+    /// 対象表の列だけを参照する式項目（Issue #3251）。`item` は `SelectItem::Expr`。`unqualified` は
+    /// 構文段が集めた、実際に非修飾で書かれた識別子（FROM／USING 側にも該当する名前の検出に使う。
+    /// 対象表で修飾した参照は構文段が非修飾へ正規化済みで、FROM／USING 側の修飾参照は構文段が `0A000`）。
+    Expr {
+        item: crate::sql::allowlist::SelectItem,
+        unqualified: Vec<String>,
+    },
+    /// `merge_action()`（`MERGE ... RETURNING` の最上位項目だけ。Issue #3356。`AS` 別名つき）。
+    MergeAction { alias: Option<String> },
 }
 
 /// 構文段が返す `RETURNING` 句（FROM／USING つき UPDATE／DELETE 専用）。
@@ -52,21 +68,52 @@ pub(crate) struct FromReturningColumn {
     pub(crate) relation: usize,
     pub(crate) slot: ColumnSlot,
     pub(crate) meta: ColumnMeta,
-    /// 対象表（`relation == 0`）の列だけが持つ従来形の投影（`returning::project_row` へ委譲する）。
-    target_projection: Option<ProjectedColumn>,
+    /// 対象表（`relation == 0`）の列だけが持つ、[`BoundFromReturning::target_projection`] 内の位置。
+    target_pos: Option<usize>,
+    /// FROM／USING 側の列が読む、一致行 `cells` 内の位置。計画段（[`BoundFromReturning::assign_source_cells`]）
+    /// が確定する。未確定のまま射影すると `XX000`（fail-closed）。
+    source_cell: Option<usize>,
+    /// `merge_action()` の項目か（Issue #3356。`relation`・`slot` は意味を持たず、行ごとの操作名の text セルになる）。
+    merge_action: bool,
 }
 
 /// 束縛済みの `RETURNING`。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundFromReturning {
     pub(crate) columns: Vec<FromReturningColumn>,
-    /// relation ごとの「FROM／USING 側セル列の先頭に疑似列 `id` を持つか」
-    /// （従来方式の表だけ `true`。`FromRowRef::cells` の並び規約の判定に使う）。
-    id_offsets: Vec<bool>,
+    /// 対象表側（`relation == 0`）の出力列の投影（出力順）。式項目（`Computed`）を含みうる。
+    /// 評価は文ごとに 1 回作る [`returning::ReturningProjector`] が行う。
+    target_projection: Vec<ProjectedColumn>,
 }
 
-/// FROM／USING 側の 1 行。`cells` の並びは JOIN の `SideProjection::All` と同じ
-/// （疑似列 `id` は従来方式の表だけ位置 0、列は `id_offset + index`）。
+impl BoundFromReturning {
+    /// 対象表側の投影を評価する [`returning::ReturningProjector`] を作る（文ごとに 1 回。式は
+    /// この時点でコンパイルされ、行ごとの評価で評価スタックを使い回す）。
+    pub(crate) fn projector<'a>(
+        &'a self,
+        target_schema: &crate::catalog::TableSchema,
+    ) -> returning::ReturningProjector<'a> {
+        returning::ReturningProjector::new(&self.target_projection, target_schema)
+    }
+
+    /// FROM／USING 側（`relation >= 1`）の各出力列が読むセル位置を確定する。`locate` は
+    /// （relation, 列スロット）から一致行 `cells` 内の位置を返す（呼び出し元の走査投影の
+    /// 並びだけが知っている。ここに全列レイアウトの前提を持ち込まない）。
+    pub(crate) fn assign_source_cells(
+        &mut self,
+        mut locate: impl FnMut(usize, ColumnSlot) -> Result<usize, SqlSurfaceError>,
+    ) -> Result<(), SqlSurfaceError> {
+        for col in &mut self.columns {
+            if col.relation != 0 {
+                col.source_cell = Some(locate(col.relation, col.slot)?);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// FROM／USING 側の 1 行。`cells` の並びは走査の投影順
+/// （[`BoundFromReturning::assign_source_cells`] で確定した位置が指す）。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FromRowRef<'a> {
     pub(crate) cells: &'a [Cell],
@@ -78,10 +125,54 @@ fn bug(detail: &str) -> SqlSurfaceError {
     }
 }
 
-fn push_column(
-    out: &mut Vec<FromReturningColumn>,
+/// 出力列数の上限検査と確保を済ませてから 1 列を積む。`target` は対象表側の投影（`relation == 0` の
+/// ときだけ `Some`）。
+fn push_entry(
+    acc: &mut BoundFromReturning,
     relation: usize,
     slot: ColumnSlot,
+    meta: ColumnMeta,
+    target: Option<ProjectedColumn>,
+) -> Result<(), SqlSurfaceError> {
+    if acc.columns.len() >= MAX_DML_FROM_RETURNING_ITEMS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many RETURNING columns",
+        ));
+    }
+    acc.columns
+        .try_reserve(1)
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve RETURNING columns: {e}"),
+        })?;
+    let target_pos = match target {
+        Some(projected) => {
+            acc.target_projection
+                .try_reserve(1)
+                .map_err(|e| SqlSurfaceError::Internal {
+                    detail: format!("failed to reserve RETURNING columns: {e}"),
+                })?;
+            acc.target_projection.push(projected);
+            Some(acc.target_projection.len().saturating_sub(1))
+        }
+        None => None,
+    };
+    acc.columns.push(FromReturningColumn {
+        relation,
+        slot,
+        meta,
+        target_pos,
+        source_cell: None,
+        merge_action: false,
+    });
+    Ok(())
+}
+
+/// 列参照 1 つを積む。`alias` があれば出力名だけを別名にする（値・型は別名なしと同じ）。
+fn push_column(
+    acc: &mut BoundFromReturning,
+    relation: usize,
+    slot: ColumnSlot,
+    alias: Option<&str>,
     scope: &BindingScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
     let (_, schema) = scope
@@ -89,44 +180,42 @@ fn push_column(
         .get(relation)
         .ok_or_else(|| bug("relation index out of range"))?;
     let (meta, projected) = match slot {
-        ColumnSlot::Id => (ColumnMeta::Id, ProjectedColumn::Id),
+        ColumnSlot::Id => match alias {
+            Some(a) => (
+                crate::sql::exec::aliased_id_column_meta(a),
+                ProjectedColumn::AliasedId {
+                    name: a.to_string(),
+                },
+            ),
+            None => (ColumnMeta::Id, ProjectedColumn::Id),
+        },
         ColumnSlot::Column(index) => {
             let col = schema
                 .columns
                 .get(index)
                 .ok_or_else(|| bug("column index out of range"))?;
+            let name = alias.map_or_else(|| col.name.clone(), str::to_string);
             (
                 ColumnMeta::Scalar {
-                    name: col.name.clone(),
+                    name: name.clone(),
                     ty: col.ty.clone(),
                 },
-                ProjectedColumn::Column {
-                    index,
-                    name: col.name.clone(),
-                },
+                ProjectedColumn::Column { index, name },
             )
         }
     };
-    if out.len() >= MAX_DML_FROM_RETURNING_ITEMS {
-        return Err(SqlSurfaceError::payload_too_large(
-            "too many RETURNING columns",
-        ));
-    }
-    out.try_reserve(1).map_err(|e| SqlSurfaceError::Internal {
-        detail: format!("failed to reserve RETURNING columns: {e}"),
-    })?;
-    out.push(FromReturningColumn {
+    push_entry(
+        acc,
         relation,
         slot,
         meta,
-        target_projection: (relation == 0).then_some(projected),
-    });
-    Ok(())
+        (relation == 0).then_some(projected),
+    )
 }
 
 /// 1 relation 分の `*` 展開（従来方式の表だけ疑似列 `id` を先頭に置く）。
 fn expand_relation(
-    out: &mut Vec<FromReturningColumn>,
+    out: &mut BoundFromReturning,
     relation: usize,
     scope: &BindingScope<'_>,
 ) -> Result<(), SqlSurfaceError> {
@@ -134,11 +223,26 @@ fn expand_relation(
         .relations()
         .get(relation)
         .ok_or_else(|| bug("relation index out of range"))?;
-    if schema.has_pseudo_id() {
-        push_column(out, relation, ColumnSlot::Id, scope)?;
-    }
-    for index in 0..schema.columns.len() {
-        push_column(out, relation, ColumnSlot::Column(index), scope)?;
+    match scope.visible_columns(relation) {
+        // ビューを source にした relation（Issue #3292）は公開列だけを公開順に並べる。
+        // 疑似列 `id` は一覧に含まれ、基底表が持つときだけ展開する。
+        Some(visible) => {
+            for name in visible {
+                if name == "id" && schema.has_pseudo_id() {
+                    push_column(out, relation, ColumnSlot::Id, None, scope)?;
+                } else if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
+                    push_column(out, relation, ColumnSlot::Column(index), None, scope)?;
+                }
+            }
+        }
+        None => {
+            if schema.has_pseudo_id() {
+                push_column(out, relation, ColumnSlot::Id, None, scope)?;
+            }
+            for index in 0..schema.columns.len() {
+                push_column(out, relation, ColumnSlot::Column(index), None, scope)?;
+            }
+        }
     }
     Ok(())
 }
@@ -149,18 +253,60 @@ fn expand_relation(
 pub(crate) fn bind_from_returning(
     ret: &DmlFromReturning,
     scope: &BindingScope<'_>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundFromReturning, SqlSurfaceError> {
+    bind_returning_items(ret, scope, udfs, false)
+}
+
+/// `MERGE ... RETURNING` の束縛（Issue #3356）。裸の `*` は PostgreSQL 17 と同じく**元の全列に続けて
+/// 対象の全列**を並べ（`UPDATE ... FROM` とは逆順）、`merge_action()` 項目は列名 `merge_action`・型 text。
+/// スコープは relation 0 = 対象・1 = 元（`sql::merge_bind` の規約）。
+pub(crate) fn bind_merge_returning(
+    ret: &DmlFromReturning,
+    scope: &BindingScope<'_>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundFromReturning, SqlSurfaceError> {
+    bind_returning_items(ret, scope, udfs, true)
+}
+
+/// [`bind_from_returning`]・[`bind_merge_returning`] の共有実体。`source_first` は裸の `*` の展開順
+/// （真なら relation 1 以降を先、対象を最後）。
+fn bind_returning_items(
+    ret: &DmlFromReturning,
+    scope: &BindingScope<'_>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    source_first: bool,
 ) -> Result<BoundFromReturning, SqlSurfaceError> {
     if ret.items.len() > MAX_DML_FROM_RETURNING_ITEMS {
         return Err(SqlSurfaceError::payload_too_large(
             "too many RETURNING items",
         ));
     }
-    let mut columns = Vec::new();
+    let mut acc = BoundFromReturning {
+        columns: Vec::new(),
+        target_projection: Vec::new(),
+    };
     for item in &ret.items {
         match item {
             DmlFromReturningItem::All => {
-                for relation in 0..scope.len() {
-                    expand_relation(&mut columns, relation, scope)?;
+                if source_first {
+                    for relation in (1..scope.len()).chain(std::iter::once(0)) {
+                        expand_relation(&mut acc, relation, scope)?;
+                    }
+                } else {
+                    for relation in 0..scope.len() {
+                        expand_relation(&mut acc, relation, scope)?;
+                    }
+                }
+            }
+            DmlFromReturningItem::MergeAction { alias } => {
+                let meta = ColumnMeta::Scalar {
+                    name: alias.clone().unwrap_or_else(|| "merge_action".to_string()),
+                    ty: crate::catalog::ColumnType::Text,
+                };
+                push_entry(&mut acc, 0, ColumnSlot::Id, meta, None)?;
+                if let Some(last) = acc.columns.last_mut() {
+                    last.merge_action = true;
                 }
             }
             DmlFromReturningItem::QualifiedAll(qualifier) => {
@@ -169,23 +315,50 @@ pub(crate) fn bind_from_returning(
                     .iter()
                     .position(|(r, _)| r.matches_qualifier(qualifier))
                     .ok_or_else(|| SqlSurfaceError::undefined_table(qualifier.clone()))?;
-                expand_relation(&mut columns, relation, scope)?;
+                expand_relation(&mut acc, relation, scope)?;
             }
             DmlFromReturningItem::Column(colref) => {
                 let resolved = scope.resolve(colref)?;
-                push_column(&mut columns, resolved.relation(), resolved.slot(), scope)?;
+                push_column(&mut acc, resolved.relation(), resolved.slot(), None, scope)?;
+            }
+            DmlFromReturningItem::AliasedColumn(colref, alias) => {
+                let resolved = scope.resolve(colref)?;
+                push_column(
+                    &mut acc,
+                    resolved.relation(),
+                    resolved.slot(),
+                    Some(alias),
+                    scope,
+                )?;
+            }
+            DmlFromReturningItem::Expr { item, unqualified } => {
+                // 非修飾名のスコープ照合（FROM／USING 側だけに該当なら `0A000`、両方なら `42702`）を、
+                // 式の束縛より先に行う（SET の式と同じ順序・同じ境界）。
+                crate::sql::dml_from::check_set_expr_scope(scope, unqualified)?;
+                let (_, target_schema) = scope
+                    .relations()
+                    .first()
+                    .ok_or_else(|| bug("target relation missing"))?;
+                let projection = crate::sql::allowlist::Projection::Items(vec![item.clone()]);
+                let mut bound = crate::sql::parser::bind_returning_with_udfs(
+                    Some(&projection),
+                    target_schema,
+                    udfs,
+                )?
+                .ok_or_else(|| bug("expression item not bound"))?;
+                let (Some(projected), None) = (bound.pop(), bound.pop()) else {
+                    return Err(bug("expression item bound to an unexpected column count"));
+                };
+                let meta = returning::column_meta(std::slice::from_ref(&projected), target_schema)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| bug("expression item has no column meta"))?;
+                // 式項目は対象表側の投影（`slot` は FROM／USING 側の位置解決にだけ使うため未使用）。
+                push_entry(&mut acc, 0, ColumnSlot::Id, meta, Some(projected))?;
             }
         }
     }
-    let id_offsets = scope
-        .relations()
-        .iter()
-        .map(|(_, schema)| schema.has_pseudo_id())
-        .collect();
-    Ok(BoundFromReturning {
-        columns,
-        id_offsets,
-    })
+    Ok(acc)
 }
 
 /// 列メタデータ（`RowDescription` 相当）。
@@ -208,12 +381,14 @@ fn clone_from_cell(cell: &Cell, budget: &mut usize) -> Result<Cell, SqlSurfaceEr
 
 /// 対象行 1 行と、その SET／削除判定に使った FROM／USING 側の一致行から結果行を組む。
 /// `from_rows` の `relation - 1` 番目が relation `relation` の行（`BindingScope` の
-/// 宣言順）。対象側のセルは `returning::project_row` へ委譲する。範囲外は `XX000`。
+/// 宣言順）。対象側のセル（式項目を含む）は `eval`（[`BoundFromReturning::projector`]）が 1 回で
+/// 評価して出力位置へ配る。範囲外は `XX000`。
 pub(crate) fn project_joined_row(
     target_id: u64,
     target_values: &[Value],
     from_rows: &[FromRowRef<'_>],
     bound: &BoundFromReturning,
+    eval: &mut returning::ReturningProjector<'_>,
     budget: &mut usize,
 ) -> Result<ResultRow, SqlSurfaceError> {
     let mut cells = Vec::new();
@@ -222,22 +397,20 @@ pub(crate) fn project_joined_row(
         .map_err(|e| SqlSurfaceError::Internal {
             detail: format!("failed to reserve RETURNING cells: {e}"),
         })?;
+    // 対象表側の出力列は 1 回の投影でまとめて評価する（列が無ければ評価しない）。
+    let mut target_cells = if bound.target_projection.is_empty() {
+        Vec::new()
+    } else {
+        eval.project_row(target_id, target_values, budget)?.cells
+    };
     for col in &bound.columns {
         if col.relation == 0 {
-            let projected = col
-                .target_projection
-                .as_ref()
+            let pos = col
+                .target_pos
                 .ok_or_else(|| bug("target projection missing"))?;
-            let row = returning::project_row(
-                target_id,
-                target_values,
-                std::slice::from_ref(projected),
-                budget,
-            )?;
-            let cell = row
-                .cells
-                .into_iter()
-                .next()
+            let cell = target_cells
+                .get_mut(pos)
+                .map(|c| std::mem::replace(c, Cell::Null))
                 .ok_or_else(|| bug("empty target projection"))?;
             cells.push(cell);
             continue;
@@ -245,21 +418,9 @@ pub(crate) fn project_joined_row(
         let side = from_rows
             .get(col.relation.saturating_sub(1))
             .ok_or_else(|| bug("FROM/USING row missing"))?;
-        let pos = match col.slot {
-            ColumnSlot::Id => 0,
-            ColumnSlot::Column(index) => {
-                let id_offset = usize::from(
-                    bound
-                        .id_offsets
-                        .get(col.relation)
-                        .copied()
-                        .ok_or_else(|| bug("relation offset missing"))?,
-                );
-                index
-                    .checked_add(id_offset)
-                    .ok_or_else(|| bug("cell position overflow"))?
-            }
-        };
+        let pos = col
+            .source_cell
+            .ok_or_else(|| bug("FROM/USING cell position unresolved"))?;
         let cell = side
             .cells
             .get(pos)
@@ -273,6 +434,173 @@ pub(crate) fn project_joined_row(
     })
 }
 
+/// `MERGE ... RETURNING` の結果行を 1 行組む（Issue #3356）。対象側は `eval` で 1 回投影し、元側は
+/// `source` のセルを複製する（`None` は元の行が無い BY SOURCE の行で、元の列は NULL）。`action` は
+/// `merge_action()` 項目の値（`INSERT`／`UPDATE`／`DELETE`）。範囲外・未確定の位置は `XX000`。
+pub(crate) fn project_merge_row(
+    target_id: u64,
+    target_values: &[Value],
+    source: Option<FromRowRef<'_>>,
+    action: &str,
+    bound: &BoundFromReturning,
+    eval: &mut returning::ReturningProjector<'_>,
+    budget: &mut usize,
+) -> Result<ResultRow, SqlSurfaceError> {
+    let mut cells = Vec::new();
+    cells
+        .try_reserve(bound.columns.len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve RETURNING cells: {e}"),
+        })?;
+    let mut target_cells = if bound.target_projection.is_empty() {
+        Vec::new()
+    } else {
+        eval.project_row(target_id, target_values, budget)?.cells
+    };
+    for col in &bound.columns {
+        if col.merge_action {
+            let cell = Cell::Text(action.to_string());
+            let next = budget.saturating_add(crate::sql::join::cell_payload_bytes(&cell));
+            if next > MAX_RETURNING_RESULT_BYTES {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "RETURNING result exceeds capacity",
+                ));
+            }
+            *budget = next;
+            cells.push(cell);
+            continue;
+        }
+        if col.relation == 0 {
+            let pos = col
+                .target_pos
+                .ok_or_else(|| bug("target projection missing"))?;
+            let cell = target_cells
+                .get_mut(pos)
+                .map(|c| std::mem::replace(c, Cell::Null))
+                .ok_or_else(|| bug("empty target projection"))?;
+            cells.push(cell);
+            continue;
+        }
+        let Some(side) = source else {
+            cells.push(Cell::Null);
+            continue;
+        };
+        let pos = col
+            .source_cell
+            .ok_or_else(|| bug("MERGE source cell position unresolved"))?;
+        let cell = side
+            .cells
+            .get(pos)
+            .ok_or_else(|| bug("MERGE source cell index out of range"))?;
+        cells.push(clone_from_cell(cell, budget)?);
+    }
+    Ok(ResultRow {
+        id: target_id,
+        score: 0.0,
+        cells,
+    })
+}
+
+/// 射影のエラーを書き込み側のエラーへ写す（予算超過は `54000`、内部不整合は `XX000`、式の評価エラーは
+/// 元の SQLSTATE のまま透過する）。
+fn map_projection_error(e: SqlSurfaceError) -> TenantWriteError {
+    match e {
+        SqlSurfaceError::PayloadTooLarge { detail } => {
+            TenantWriteError::ReturningProjectionTooLarge(detail)
+        }
+        other @ SqlSurfaceError::Internal { .. } => {
+            TenantWriteError::ReturningProjectionFailed(other.to_string())
+        }
+        other => TenantWriteError::ReturningExpressionFailed(other),
+    }
+}
+
+/// `MERGE ... RETURNING` の結果行の収集器（Issue #3356）。第 3 段の 3 つの書き込み区間（UPDATE・DELETE・
+/// INSERT）が、書き込み txn の中・commit 前に行ごとに [`Self::push`] を呼ぶ。バイト予算は文全体で 1 つを
+/// 共有する（超過は `54000`）。RLS の再判定は `joined_returning_collector` と同じ（不可視の更新・削除行は
+/// 積まず、不可視の挿入行は `XX000`）。並べ替えキーつきで溜め、[`Self::finish`] が安定ソートして返す。
+pub(crate) struct MergeReturningSink<'a> {
+    ctx: &'a PolicyContext,
+    bound: &'a BoundFromReturning,
+    projector: returning::ReturningProjector<'a>,
+    mask_row_id: bool,
+    budget: usize,
+    rows: Vec<((u8, usize), ResultRow)>,
+}
+
+impl<'a> MergeReturningSink<'a> {
+    /// `mask_row_id` は採番方式の表（行 id を結果へ出さない）で真。
+    pub(crate) fn new(
+        ctx: &'a PolicyContext,
+        bound: &'a BoundFromReturning,
+        target_schema: &crate::catalog::TableSchema,
+        mask_row_id: bool,
+    ) -> Self {
+        Self {
+            ctx,
+            bound,
+            projector: bound.projector(target_schema),
+            mask_row_id,
+            budget: 0,
+            rows: Vec::new(),
+        }
+    }
+
+    /// 書いた（または削除した）対象行 1 行を積む。`key` は結果の並び順（第 1 要素が小さい順、同値は
+    /// 第 2 要素の順）、`source` はその行を生んだ元の行（無ければ `None`）。
+    pub(crate) fn push(
+        &mut self,
+        row: &CapturedRow,
+        action: &str,
+        key: (u8, usize),
+        source: Option<FromRowRef<'_>>,
+    ) -> Result<(), TenantWriteError> {
+        if !self.ctx.is_visible(&row.tenant_id, row.visibility) {
+            if row.origin == CapturedRowOrigin::Inserted {
+                return Err(TenantWriteError::ReturningProjectionFailed(
+                    "RETURNING row is not visible under the policy context".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        // 並べ替えキーつきの行の保持分も予算へ計上する（確保前）。
+        self.budget = self
+            .budget
+            .saturating_add(std::mem::size_of::<((u8, usize), ResultRow)>());
+        if self.budget > MAX_RETURNING_RESULT_BYTES {
+            return Err(TenantWriteError::ReturningProjectionTooLarge(
+                "RETURNING result exceeds capacity".to_string(),
+            ));
+        }
+        let mut result = project_merge_row(
+            row.id,
+            &row.values,
+            source,
+            action,
+            self.bound,
+            &mut self.projector,
+            &mut self.budget,
+        )
+        .map_err(map_projection_error)?;
+        if self.mask_row_id {
+            result.id = 0;
+        }
+        self.rows.try_reserve(1).map_err(|e| {
+            TenantWriteError::ReturningProjectionFailed(format!(
+                "failed to reserve RETURNING row buffer: {e}"
+            ))
+        })?;
+        self.rows.push((key, result));
+        Ok(())
+    }
+
+    /// 積んだ行をキーの安定ソートで並べて返す。
+    pub(crate) fn finish(mut self) -> Vec<ResultRow> {
+        self.rows.sort_by_key(|(k, _)| *k);
+        self.rows.into_iter().map(|(_, r)| r).collect()
+    }
+}
+
 /// 書き込み中の対象行ごとに呼ばれる収集コールバックを作る
 /// （`tenant::*_capturing_unchecked` の `project` 引数へ渡す想定）。
 /// `lookup` は対象行 id から、その行の SET／削除判定に使った FROM／USING 側の一致行群を引く。
@@ -284,11 +612,14 @@ pub(crate) fn project_joined_row(
 pub(crate) fn joined_returning_collector<'a>(
     ctx: &'a PolicyContext,
     bound: &'a BoundFromReturning,
+    target_schema: &crate::catalog::TableSchema,
     mask_row_id: bool,
     lookup: &'a dyn Fn(u64) -> Option<Vec<FromRowRef<'a>>>,
     budget: &'a mut usize,
     rows: &'a mut Vec<ResultRow>,
 ) -> impl FnMut(&CapturedRow) -> Result<(), TenantWriteError> + 'a {
+    // 式項目は文ごとに 1 回だけコンパイルし、行ごとには評価スタックを使い回す（Issue #3251）。
+    let mut projector = bound.projector(target_schema);
     move |row: &CapturedRow| {
         if row.origin == CapturedRowOrigin::Inserted {
             return Err(TenantWriteError::ReturningProjectionFailed(
@@ -303,7 +634,14 @@ pub(crate) fn joined_returning_collector<'a>(
                 "matched FROM/USING row not found for target row".to_string(),
             )
         })?;
-        match project_joined_row(row.id, &row.values, &from_rows, bound, budget) {
+        match project_joined_row(
+            row.id,
+            &row.values,
+            &from_rows,
+            bound,
+            &mut projector,
+            budget,
+        ) {
             Ok(mut result_row) => {
                 if mask_row_id {
                     result_row.id = 0;
@@ -319,9 +657,12 @@ pub(crate) fn joined_returning_collector<'a>(
             Err(SqlSurfaceError::PayloadTooLarge { detail }) => {
                 Err(TenantWriteError::ReturningProjectionTooLarge(detail))
             }
-            Err(other) => Err(TenantWriteError::ReturningProjectionFailed(
-                other.to_string(),
-            )),
+            // 内部不整合は `XX000`。式の評価エラー（`22012` 等）は元の SQLSTATE のまま透過する
+            // （基表の `returning_collector` と同じ。Issue #3251）。
+            Err(other @ SqlSurfaceError::Internal { .. }) => Err(
+                TenantWriteError::ReturningProjectionFailed(other.to_string()),
+            ),
+            Err(other) => Err(TenantWriteError::ReturningExpressionFailed(other)),
         }
     }
 }
@@ -333,6 +674,40 @@ mod tests {
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::sql::relation::TableRef;
     use crate::storage::Visibility;
+
+    /// 本番の束縛を空の UDF レジストリで呼ぶ（既存テストの呼び出し形を保つ）。
+    fn bind_from_returning(
+        ret: &DmlFromReturning,
+        scope: &BindingScope<'_>,
+    ) -> Result<BoundFromReturning, SqlSurfaceError> {
+        super::bind_from_returning(ret, scope, &crate::sql::udf_call::UdfRegistry::default())
+    }
+
+    /// 対象表側が式を持たない既存テスト向けに、空スキーマの評価器で行を組む。
+    fn project_joined_row(
+        id: u64,
+        values: &[Value],
+        from_rows: &[FromRowRef<'_>],
+        bound: &BoundFromReturning,
+        budget: &mut usize,
+    ) -> Result<ResultRow, SqlSurfaceError> {
+        let schema = TableSchema::new("t", Vec::new());
+        let mut eval = bound.projector(&schema);
+        super::project_joined_row(id, values, from_rows, bound, &mut eval, budget)
+    }
+
+    /// 同上（収集コールバック）。
+    fn joined_returning_collector<'a>(
+        ctx: &'a PolicyContext,
+        bound: &'a BoundFromReturning,
+        mask_row_id: bool,
+        lookup: &'a dyn Fn(u64) -> Option<Vec<FromRowRef<'a>>>,
+        budget: &'a mut usize,
+        rows: &'a mut Vec<ResultRow>,
+    ) -> impl FnMut(&CapturedRow) -> Result<(), TenantWriteError> + 'a {
+        let schema = TableSchema::new("t", Vec::new());
+        super::joined_returning_collector(ctx, bound, &schema, mask_row_id, lookup, budget, rows)
+    }
 
     fn schema(name: &str, cols: &[&str]) -> TableSchema {
         TableSchema::new(
@@ -352,6 +727,18 @@ mod tests {
 
     fn ret(items: Vec<DmlFromReturningItem>) -> DmlFromReturning {
         DmlFromReturning { items }
+    }
+
+    /// テスト用の位置解決: 疑似列 `id` を位置 0、列を `index + 1` に置く走査投影を想定する。
+    fn with_cells(mut b: BoundFromReturning) -> BoundFromReturning {
+        b.assign_source_cells(|_, slot| {
+            Ok(match slot {
+                ColumnSlot::Id => 0,
+                ColumnSlot::Column(i) => i + 1,
+            })
+        })
+        .expect("assign");
+        b
     }
 
     fn two_scope<'a>(t: &'a TableSchema, s: &'a TableSchema) -> BindingScope<'a> {
@@ -486,6 +873,7 @@ mod tests {
             &ret(vec![colref(Some("b"), "y"), colref(Some("b"), "id")]),
             &scope,
         )
+        .map(with_cells)
         .expect("bind");
         let cells = [Cell::Integer(5), Cell::Text("hello".into())];
         let from = [FromRowRef { cells: &cells }];
@@ -496,6 +884,12 @@ mod tests {
             vec![Cell::Text("hello".into()), Cell::Integer(5)]
         );
         assert_eq!(budget, 5);
+        // 位置が未解決の列は XX000（fail-closed）。
+        let unresolved =
+            bind_from_returning(&ret(vec![colref(Some("b"), "y")]), &scope).expect("b");
+        let err = project_joined_row(1, &[Value::Null], &from, &unresolved, &mut 0)
+            .expect_err("unresolved");
+        assert_eq!(err.wire_code(), "XX000");
         // FROM 行なし／セル範囲外は XX000。
         let err = project_joined_row(1, &[Value::Null], &[], &b, &mut 0).expect_err("missing");
         assert_eq!(err.wire_code(), "XX000");
@@ -513,7 +907,9 @@ mod tests {
         let t = schema("t", &["x"]);
         let s = schema("s", &["y"]);
         let scope = two_scope(&t, &s);
-        let b = bind_from_returning(&ret(vec![colref(Some("b"), "y")]), &scope).expect("bind");
+        let b = bind_from_returning(&ret(vec![colref(Some("b"), "y")]), &scope)
+            .map(with_cells)
+            .expect("bind");
         let ctx = PolicyContext::new("alice").expect("ctx");
         let cells = [Cell::Integer(1), Cell::Text("v".into())];
         let lookup = |id: u64| (id == 1).then(|| vec![FromRowRef { cells: &cells }]);

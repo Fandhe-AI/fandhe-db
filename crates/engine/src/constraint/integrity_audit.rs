@@ -301,9 +301,10 @@ pub(crate) struct ForeignKeyCounts {
     pub(crate) unresolved: u64,
 }
 
-/// 参照先の列がすべて参照先のスキーマに存在するか（`id` 参照は常に真）。
+/// 参照先の列がすべて参照先のスキーマに存在するか（疑似列 `id` 参照は常に真。採番方式の親の
+/// `id` は宣言した普通の列なので存在を確かめる。Issue #3179）。
 pub(crate) fn parent_columns_resolve(parent_schema: &TableSchema, fk: &ForeignKeyDef) -> bool {
-    fk.references_parent_id()
+    fk.references_parent_pseudo_id(parent_schema)
         || fk
             .parent_columns()
             .iter()
@@ -333,7 +334,7 @@ where
 {
     let mut counts = ForeignKeyCounts::default();
     let (specs, child_mask) = foreign_key_specs_for(child_schema, fk)?;
-    let by_id = fk.references_parent_id();
+    let by_id = fk.references_parent_pseudo_id(parent_schema);
     let recoder = FkKeyRecoder::new(child_schema, parent_schema, fk)?;
 
     // 参照先のキー集合（列参照のみ。このハッシュ分割に属するキーだけを持つ）。
@@ -417,7 +418,7 @@ where
             }
             continue;
         };
-        let mut required = RequiredParentKeys::new(fk);
+        let mut required = RequiredParentKeys::new(fk, parent_schema);
         match push_required_key(&spec, &values, &mut required) {
             Ok(()) => {}
             Err(TenantWriteError::ForeignKeyViolation) => {

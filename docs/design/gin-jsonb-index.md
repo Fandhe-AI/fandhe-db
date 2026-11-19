@@ -313,8 +313,9 @@ INDEX-8 ポインタ（関連: INDEX-7・TABLE-12・TABLE-16・RLS-9・RLS-10・
   FK `ON DELETE CASCADE`。TRUNCATE は自テナントの範囲を空にしてマーカーを書き直す（空の索引として完全な状態）。
   物理テーブルが無いときは作らない（`list_tables` で確かめる）。
 - 生書き込みのテスト専用 API は GIN 付きの表を拒否する（検査点を通らず D4 に反するため）。
-- DDL: `DROP INDEX`・`DROP TABLE [CASCADE]`・`DROP COLUMN` は #2206 の掃除経路で物理テーブルを消す。`RENAME TABLE`・
-  `SET SCHEMA` は物理名が索引名由来でシグネチャに表名を含めないため移動不要。他の列の追加・削除・型変更は rowid と jsonb の値を
+- DDL: `DROP INDEX`・`DROP TABLE [CASCADE]`・`DROP COLUMN` は #2206 の掃除経路で物理テーブルを消す。`RENAME TABLE` は
+  物理名が索引名由来でシグネチャに表名を含めないため移動不要。テナント SCHEMA 間の `SET SCHEMA`（Issue #3198）は
+  索引キーが `#<id>.<名>` で変わるため、同一 txn で物理テーブルを改名する（`user_gin/{旧キー}` → `user_gin/{新キー}`）。他の列の追加・削除・型変更は rowid と jsonb の値を
   変えないので索引は有効のまま。
 
 ### 8.5 診断 API
