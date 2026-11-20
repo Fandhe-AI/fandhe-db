@@ -581,6 +581,7 @@ fn alter_matview_set_schema_public_qualified_source_depends_on_temp_table() {
     let sql = "ALTER MATERIALIZED VIEW public.mv SET SCHEMA s";
     let (c, m) = err_as(&core, A, &mut s, sql);
     assert_eq!(c, "42601", "{m}");
+    assert!(!m.contains('#'), "{m}");
     ok(
         &core,
         &mut s,
