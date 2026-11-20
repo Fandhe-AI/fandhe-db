@@ -27,7 +27,9 @@ SQL-42 の項）。通常の投影では整数どうしの剰余だけを評価�
 次は PostgreSQL 17 では受理される形であり、本書では意図的な拒否として扱わない。
 
 - 小数リテラルどうしの剰余（`0.3 % 0.1`。PostgreSQL では numeric の剰余）は `0A000`
-- 精度を保てない整数式のラッパー（`22003`）
+- 精度を保てない整数式のラッパー（`22003`）。次の 2 種類に分けて扱う
+  - PostgreSQL 17 が受理する精度制限のケース: 値が 2^53 を超える BIGINT 被演算子（`where_remainder_large_bigint_operand_is_22003` の `(b + 1) % 2`）。PostgreSQL は整数のまま剰余を評価するが、本実装は f64 の精度を保てないため 22003 で拒否する
+  - 整数オーバーフローとして PostgreSQL でも同じ 22003 になるケース: `where_remainder_hardens_wrapper_interiors` の `COALESCE(CAST(b*b AS bigint), 0) % 2` など。fixture の `b = 4_000_000_000` では bigint の乗算が上限を超え、PostgreSQL 17 でも剰余の評価前に 22003 になるため、意図的な拒否ではなく PostgreSQL と一致する挙動である
 
 上の 2 件はいずれも注記の無いまま残しており、受け皿の Issue が無い（Issue #3528 の対象外節に記録した）。
 
