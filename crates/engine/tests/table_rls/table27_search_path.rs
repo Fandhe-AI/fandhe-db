@@ -461,6 +461,7 @@ fn rollback_restores_the_path_and_commit_keeps_it() {
     assert_eq!(show(&core, &mut s), "x, public");
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
 #[test]
 fn extended_query_revalidates_statements_after_the_path_changes() {
     let (core, _g, mut s) = with_table("sp-extended");
@@ -538,6 +539,7 @@ fn extended_query_revalidates_statements_after_the_path_changes() {
     assert_eq!(show(&core, &mut s), "\"$user\", public");
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
 #[test]
 fn unvalidated_parsed_statements_are_rejected_while_public_is_hidden() {
     let (core, _g, mut s) = with_table("sp-rust-api");

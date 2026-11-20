@@ -210,6 +210,7 @@ fn division_by_zero_is_22012() {
     }
 }
 
+// intentional: docs/design/modulo-operator.md
 #[test]
 fn unsupported_operand_types_are_42883() {
     let (core, ctx, _g) = setup();

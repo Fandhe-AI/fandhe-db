@@ -108,6 +108,7 @@ fn skip_stops_the_chain() {
 }
 
 // テスト専用の未結線 invoker（`cfg(test)` の `TriggerRuntime::unwired`）の単体。本番の既定ではない。
+// intentional: docs/design/trigger-execution-model.md
 #[test]
 fn unwired_runtime_is_0a000() {
     handle!(h);
@@ -263,6 +264,7 @@ fn before_when_sees_the_rewritten_new() {
 }
 
 // 評価を結線していない invoker（既定の `eval_when`）は WHEN 付きで固定文言の `0A000`（fail-closed）。
+// intentional: docs/design/trigger-execution-model.md
 #[test]
 fn invoker_without_when_support_is_0a000() {
     handle!(h);

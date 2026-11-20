@@ -356,3 +356,20 @@
 | #1726 | 段 2・7（対象 0 行でも発火）・TRUNCATE（D8）・REFERENCING／INSTEAD OF／CONSTRAINT TRIGGER の `0A000` |
 | #1727 | D11 |
 | #1728 | D10（事前照合を BEFORE STATEMENT より前に行う・単一 txn・content_hash の材料）・crash-test（既存の `crash-test-*` の流儀）・越境の回帰テスト |
+
+## 拒否の根拠（Issue #3528）: 発火の経路が結線されていない状態の拒否
+
+D8 の中核の不変条件「トリガが黙って発火しない経路を作らない」を、機構そのものの単体テストで固定している拒否の根拠を残す。
+注記書式は [rejection-pin-annotation.md](rejection-pin-annotation.md)。
+
+| 拒否する形 | SQLSTATE | 固定するテスト | 維持する理由 |
+| ---------- | -------- | -------------- | ------------ |
+| テスト専用の未結線 invoker（`TriggerRuntime::unwired()`）で、BEFORE ROW INSERT の発火点（`fire_before_row_insert`）が呼び出し体を呼ぶ | `0A000` | `unwired_runtime_is_0a000`（`trigger/tests.rs`） | トリガを実行できない invoker のまま書き込みを通すと、トリガが黙って発火しない。fail-open を避ける |
+| `WHEN` 評価に対応していない invoker で、`WHEN` 付きのトリガが発火点に達する | `0A000` | `invoker_without_when_support_is_0a000`（`trigger/tests.rs`） | 条件を無視して発火させたり不発火にしたりすると意味が変わる。評価できないなら拒否する |
+| 実行体（`TriggerRuntime`）を持たない書き込みハンドルから、INSERT トリガ（AFTER ROW）を持つ表へ `insert_row` で挿入する | `0A000` | `handle_without_runtime_keeps_0a000`（`core/trigger_depth_tests.rs`） | 通過証を持たない書き込み口からのトリガ付き表への挿入を拒否する（D8 の通過証） |
+| 実行体を持たない公開入口で、TRUNCATE トリガを持つ表を TRUNCATE する | `0A000` | `truncate_without_runtime_is_0a000`（`core/trigger_statement_tests.rs`） | 文トリガを黙って飛ばさない（テストは行が残ることも固定する） |
+
+- 上の 4 件はいずれも「機構が結線されていないときの安全弁」であり、PostgreSQL 17 に対応する状態は無い（本実装だけの内部状態）。PostgreSQL 17 との一致は根拠にしていない
+- テストが固定する範囲を超える条件（他のイベントのトリガだけの表での挙動など）は本節では断定しない
+- エラー文言は固定の英語で、値・行・他テナントの存在・件数を含めない
+- 経路ごとの未結線（結合形の `RETURNING` 付きなど）は D8 の表に別に記録しており、本節の対象外とする

@@ -449,7 +449,7 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
   Bind（wire は path が隠れているセッションで cached の `$n` なし文も `bind_prepared_in_session` で
   検証し直す）で `42P01` になる。Bind 後・Execute 前に path が変わった文と、`parse_sql` で作った
   未検証の文は、`public` が隠れている間 `0A000`（`SessionRoutedSql` の path 世代。セッション変数・
-  トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE` は免除）
+  トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE` などは免除。完全な一覧は `is_search_path_exempt`）
 - **暗黙 RLS**: path に関係なく常に掛かる（D3）。`SET search_path` は境界を越える経路にならない
   （`rls_implicit.rs` に D11 のテストを追加。セッションの無い入口の `SET search_path` は従来どおり `42601`）
 - **意図的な PostgreSQL との差**: 長すぎる要素名は切り詰めず `22023`／文字列リテラル要素は識別子形か
@@ -636,3 +636,19 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 - **論理ダンプ**: SCHEMA 配下の matview を含むダンプを固定文言で全体失敗させていた 2 か所の拒否を外した。拒否の根拠（SQL で作り直せない）が消えたため。`CREATE MATERIALIZED VIEW s.mv` の描画と本文の内部キーの逆変換は表・ビューと同じ経路
 - **意図的な拒否（`intentional`）**: `ALTER MATERIALIZED VIEW ... SET SCHEMA`（修飾・未修飾とも。fail-closed の拒否のまま。専用の Issue が必要）のみ引き続き対象外。理由は、移動の対象（所有者変更の `ALTER MATERIALIZED VIEW ... OWNER TO` とは別の文）を受ける文法そのものをまだ持たない未対応の構文だからで、SCHEMA 配置の安全弁（`0A000`）とは層が異なる。所有者相当のセッションの簡易クエリでは、移動元の修飾子が自テナントに存在しなければ `3F000`、`pg_catalog` など組み込み SCHEMA なら `0A000`、修飾子が存在するテナントの SCHEMA や未修飾名では構文解析段の `42601` になる。`public` 修飾の移動元は、セッションに同名の一時表がなければ `42601`、あれば `0A000` になる（`table27_matview_schema.rs` の `alter_matview_set_schema_stays_unsupported`・`alter_matview_set_schema_error_precedence_is_pinned`・`alter_matview_set_schema_public_qualified_source_depends_on_temp_table` が、SQLSTATE と、エラー文言に内部キー（`#`）を含まないことを固定。移動は起きない）。権限のない主体の扱い（拡張クエリの Parse を含む）は #3532 で追跡する
 - **PostgreSQL との差**: 本追記で新たに生じた差は無い（D7 による SCHEMA をまたぐ本文参照の `42501` は既存の意図的な差）
+
+## 拒否の根拠（Issue #3528）: 解決の世代が食い違う文の `0A000`
+
+注記書式は [rejection-pin-annotation.md](rejection-pin-annotation.md)。次の 2 つのテストが固定する形の根拠を残す（実装記録の対応: Bind 済みの文の Execute は「追記（Issue #3197）」の portal の項、`parse_sql` で作った文の Execute は「10. Issue #1715 実装記録」の拡張クエリの項）。
+
+| 拒否する形 | SQLSTATE | 固定するテスト | 維持する理由 |
+| ---------- | -------- | -------------- | ------------ |
+| 免除対象外の永続側の準備済み文を、`SET search_path` で Bind 後に path を変えてから Execute する（Execute 時点の path が `public` を隠している場合。明示修飾の `public.t` の文を含む）。`SET`・`SHOW` は拒否されない | `0A000` | `extended_query_revalidates_statements_after_the_path_changes` | 世代の検査は文の種別（関係名を引かない文か。`is_search_path_exempt`）だけで免除を決め、参照が修飾済みかどうかは判定しない（`SessionRoutedSql::require_current`）。このため修飾済みの文にも、Bind 時の path の世代との一致を一律に要求する。守る不変条件は、`public` が隠れている path のもとで Execute する永続側の文が、その path の世代で検証済みであること。修飾の有無の判定を誤って古い解決のまま通す経路を作らない（fail-closed。COPY の扱いは「追記（Issue #3197）」の記録を参照）。再 Bind 時の挙動は「追記（Issue #3197）」の記録を参照 |
+| `public` が隠れている間に、`parse_sql`（セッションを持たない Rust API）で作った未検証の文を実行する。`RESET search_path` などの免除文は実行できる | `0A000` | `unvalidated_parsed_statements_are_rejected_while_public_is_hidden` | 文は path を知らずに作られており、実行時の path で解決し直すと別の SCHEMA の同名表へ黙って向きうる（fail-closed） |
+| 未修飾の `t` が現在の `search_path` で見つからない状態（`public` が隠れているとき。テストは `SET search_path = nosuch` 後）での Parse・Bind・Describe | `42P01` | `extended_query_revalidates_statements_after_the_path_changes` | path 変更後は、Bind と Describe も現在の path で参照先を検証し直す。解決できない名前は拒否する（fail-closed） |
+| `public` が隠れている間に、構文が成立しない文（`SELECT FROM FROM t`）を Parse する | `42601` | `extended_query_revalidates_statements_after_the_path_changes` | 例示の SQL では、参照ゲートの `42P01` より構文エラーの `42601` を返す（観測できる応答の優先順位。内部の処理順は断定しない）。構文が成立しない文の名前の存否を応答に出さない |
+
+- 上は `search_path` に起因する拒否と、`public` が隠れているときの構文エラー（`42601`）との応答の優先順位だけの記述である。それ以外の理由（一時カタログの検査など）による `0A000` は本節の対象外で、各条件の詳細は本書では断定しない
+- PostgreSQL 17 との差は本節では未確認とする（比較して一致を根拠にしていない）。注記の根拠は fail-closed の安全弁であることに限る
+- 免除する文の正確な一覧はコード（`is_search_path_exempt`）を参照する
+- `0A000` の文言は固定で、他テナントの SCHEMA 名・内部キーを含まない。`42P01` の文言は利用者が書いた名前だけを含み、他テナントの名前・内部キーは含まない

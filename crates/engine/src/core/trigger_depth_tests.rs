@@ -367,6 +367,7 @@ fn rejection_message_is_fixed_and_leaks_nothing() {
 }
 
 // (l) 通過証の無い（未結線の）書き込み窓口では、入れ子の書き込み先のトリガは従来どおり `0A000`。
+// intentional: docs/design/trigger-execution-model.md
 #[test]
 fn handle_without_runtime_keeps_0a000() {
     let dir = tempdir();
