@@ -7,7 +7,7 @@
 ## 1. 背景
 
 `%` は `* /` と同じ優先度の二項演算子として実装されている（実装記録は `implementation-status.md` の
-SQL-42 の項）。通常の投影では整数どうしの剰余だけを評価する。集計式（`sum(n) % 4`・`avg(n) % 1` など）では `DecimalOp::Rem` により numeric の剰余も評価する（`aggregate_projection_uses_numeric_remainder` が固定する）。それ以外の型の組み合わせは束縛時に拒否する。
+SQL-42 の項）。通常の投影では整数どうしの剰余だけを評価する。集計式（`sum(n) % 4`・`avg(n) % 1` など）では `DecimalOp::Rem` により numeric の剰余も評価する（`aggregate_projection_uses_numeric_remainder` が固定する）。上記以外は束縛時に拒否する。小数リテラルの剰余・`NUMERIC` 列・`::numeric` の剰余は `0A000`、整数と証明できない浮動小数点式の剰余は `42883` である（`bind_expr_any` の剰余分岐。後者の具体形は §2 が根拠を示す）。
 本書は、拒否のうち PostgreSQL 17 と同じ結果になるものの根拠を残す。
 
 ## 2. 意図的な拒否（PostgreSQL 17 と同じ）
