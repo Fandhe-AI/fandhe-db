@@ -646,8 +646,8 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 | ---------- | -------- | -------------- | ------------ |
 | 免除対象外の永続側の準備済み文を、`SET search_path` で Bind 後に path を変えてから Execute する（Execute 時点の path が `public` を隠している場合。明示修飾の `public.t` の文を含む）。`SET`・`SHOW` は拒否されない | `0A000` | `extended_query_revalidates_statements_after_the_path_changes` | 修飾済みの文にも、Bind 時の path の世代との一致を要求する。Execute 時に `public` が隠れているとき、旧世代で Bind した portal は実行しない（fail-closed。COPY の扱いは「追記（Issue #3197）」の記録を参照）。再 Bind 時の挙動は「追記（Issue #3197）」の記録を参照 |
 | `public` が隠れている間に、`parse_sql`（セッションを持たない Rust API）で作った未検証の文を実行する。`RESET search_path` などの免除文は実行できる | `0A000` | `unvalidated_parsed_statements_are_rejected_while_public_is_hidden` | 文は path を知らずに作られており、実行時の path で解決し直すと別の SCHEMA の同名表へ黙って向きうる（fail-closed） |
-| 未修飾の `t` が現在の `search_path` で見つからない状態での Parse・Bind・Describe | `42P01` | `extended_query_revalidates_statements_after_the_path_changes` | path 変更後は、Bind と Describe も現在の path で参照先を検証し直す。解決できない名前は拒否する（fail-closed） |
-| `public` が隠れている間に、構文が成立しない文（`SELECT FROM FROM t`）を Parse する | `42601` | `extended_query_revalidates_statements_after_the_path_changes` | 構文が成立した文だけを名前解決へ進める判定順にする。構文が成立しない文の名前では、`42P01` へ応答を変えない（名前の存否を応答に出さない） |
+| 未修飾の `t` が現在の `search_path` で見つからない状態（`public` が隠れているとき。テストは `SET search_path = nosuch` 後）での Parse・Bind・Describe | `42P01` | `extended_query_revalidates_statements_after_the_path_changes` | path 変更後は、Bind と Describe も現在の path で参照先を検証し直す。解決できない名前は拒否する（fail-closed） |
+| `public` が隠れている間に、構文が成立しない文（`SELECT FROM FROM t`）を Parse する | `42601` | `extended_query_revalidates_statements_after_the_path_changes` | 例示の SQL では、参照ゲートの `42P01` より構文エラーの `42601` を返す（観測できる応答の優先順位。内部の処理順は断定しない）。構文が成立しない文の名前の存否を応答に出さない |
 
 - 上は `search_path` に起因する拒否だけの記述である。それ以外の理由（一時カタログの検査など）による `0A000` は本節の対象外で、各条件の詳細は本書では断定しない
 - PostgreSQL 17 との差は本節では未確認とする（比較して一致を根拠にしていない）。注記の根拠は fail-closed の安全弁であることに限る
