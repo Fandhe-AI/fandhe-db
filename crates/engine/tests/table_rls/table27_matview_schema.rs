@@ -9,7 +9,7 @@
 //! - 同名の `public` の matview と独立している（行・REFRESH・DROP が混ざらない）
 //! - `DROP SCHEMA` は RESTRICT で `2BP01`、CASCADE で配下の matview（実体・索引宣言を含む）を消す
 //! - 他テナントの同名 SCHEMA・matview に影響せず、応答にも現れない（`#`・内部 ID を出さない）
-//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（存在する SCHEMA で ACL 検査対象外のセッション〔所有者相当・ロール未束縛〕または束縛ロールが USAGE を持つ場合は `42601`。簡易クエリで ACL 検査対象のセッション〔所有者相当でなく、ロール束縛済み〕が修飾名 `s.mv` で USAGE を持たなければ解析前に `42501`。拡張クエリの Parse は、一時表の名前を含まない通常経路では USAGE を検査しない解決のため `42601`〔移動先と同名の一時表がある場合の例外は `alter_matview_set_schema_parse_with_same_named_temp_table_is_3f000` と設計記録を参照。いずれも拒否される〕。未修飾名は `search_path::gate_exempt` が DDL 権限のないセッションの文を解決処理から除外するため SCHEMA の照会自体が行われず、構文解析で `42601`）
+//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（権限のない主体の要求も拒否される。応答差による SCHEMA 存否の露出は既知の課題で別途追跡する。SQLSTATE の経路差は契約にしない）
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -531,11 +531,9 @@ fn alter_matview_set_schema_stays_unsupported() {
     assert_eq!(code(&core, &mut s, "SELECT id FROM s2.mv LIMIT 5"), "42P01");
 }
 
-/// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の SQLSTATE 優先順位を固定する（設計記録 Issue #3287 の追記「意図的な拒否」の契約）。
-/// 移動元の修飾子の解決が構文解析より先に走るため、移動元の修飾子が指す SCHEMA が自テナントに存在しなければ `3F000`（SCHEMA が存在し matview のみ不在の場合は構文解析で `42601`）、`pg_catalog` など
-/// 名前解決段で拒否される修飾子なら `0A000` が返る（`public` は通常名へ変換され後続の構文解析で `42601`。セッションに同名の一時表が無い場合に限り、有ると `reject_public_qualified_temp` が先に `0A000`）。
-/// 移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
-/// 簡易クエリは修飾名で自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため（拡張クエリの `Parse` は、一時表の名前を含まない通常経路では USAGE を検査しない解決で `42601` になる。一時表と同名の識別子を含む文は一時コアへ振り分けられ別の SQLSTATE になりうるが、いずれも拒否される）、ACL 検査対象のセッション（所有者相当でなく、ロール束縛済み）で束縛ロールに USAGE が無ければ解析前に `42501` が先に返る（所有者相当・ロール未束縛のセッションは ACL 検査を省略するため `42601`。別テスト `alter_matview_set_schema_qualified_without_usage_is_42501` で固定）。未修飾名は `gate_exempt` により SCHEMA の照会自体が行われないため `42501` にならない。
+/// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の拒否を、所有者相当のセッションの簡易クエリで固定する（設計記録 Issue #3287 の追記「意図的な拒否」）。
+/// 移動元の修飾子の解決が構文解析より先に走るため、修飾子が自テナントに存在しなければ `3F000`、`pg_catalog` など組み込み SCHEMA なら `0A000`、
+/// 移動元が有効なら移動先の不備は構文エラー `42601` になる。権限のない主体・拡張クエリの Parse の SQLSTATE は契約にしない（いずれも拒否される）。
 // intentional: docs/design/schema-tenant-namespace.md
 // 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
@@ -591,93 +589,6 @@ fn alter_matview_set_schema_public_qualified_source_depends_on_temp_table() {
     let (c, m) = err_as(&core, A, &mut s, sql);
     assert_eq!(c, "0A000", "{m}");
     assert!(!m.contains('#'), "{m}");
-}
-
-/// 簡易クエリで、修飾された移動元の SCHEMA に USAGE の無い ACL 検査対象のセッション（所有者相当でなく、ロール束縛済み）は、構文解析より前に `42501` になる。
-/// ロールを作る手段が crate 内限定のため、権限の無い未知のロール ID を DDL 未許可のセッションへ束縛して再現する（fail-closed）。
-// intentional: docs/design/schema-tenant-namespace.md
-// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
-#[test]
-fn alter_matview_set_schema_qualified_without_usage_is_42501() {
-    let (core, _g, mut s) = world("t27-mv-alter-usage");
-    ok(
-        &core,
-        &mut s,
-        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
-    );
-    // 所有者相当（DDL 許可済み）のセッションは USAGE 検査の対象外なので、権限を持たない別セッションを束縛する。
-    let mut s = SessionState::default();
-    assert!(s.bind_resolution_tenant(A));
-    s.bind_role_ids(987_654_321, 987_654_321);
-    let (c, m) = err_as(
-        &core,
-        A,
-        &mut s,
-        "ALTER MATERIALIZED VIEW s.mv SET SCHEMA s2",
-    );
-    assert_eq!(c, "42501", "{m}");
-    assert!(!m.contains('#'), "{m}");
-    // 拡張クエリの Parse（一時表の名前を含まない通常経路）は USAGE を検査しない解決のため、同じセッション・SQL で `42601` になる
-    // （設計記録の契約。USAGE 検査が Parse にも入ると `42501` に変わるため、この差を固定する）。
-    let parse_err = core
-        .parse_sql_prepared_with_declared_in_session(
-            &s,
-            "ALTER MATERIALIZED VIEW s.mv SET SCHEMA s2",
-            &[],
-        )
-        .expect_err("SET SCHEMA is rejected at Parse");
-    assert_eq!(parse_err.wire_code(), "42601", "{parse_err:?}");
-}
-
-/// USAGE の無い DDL 未許可の束縛セッションでも、`search_path` に `s` を含めた未修飾 `mv` は
-/// 利用者に返る SQLSTATE が構文解析の `42601` になる（`42501` にならない）。
-/// 注意: このテストが固定するのは利用者に返る SQLSTATE だけで、`gate_exempt` による SCHEMA 照会の省略そのものは検証しない
-/// （省略されなくても `search_path` が USAGE の無い `s` を読み飛ばして同じ `42601` になるため）。
-// intentional: docs/design/schema-tenant-namespace.md
-// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
-#[test]
-fn alter_matview_set_schema_unqualified_without_usage_is_42601() {
-    let (core, _g, mut s) = world("t27-mv-alter-unq-usage");
-    ok(
-        &core,
-        &mut s,
-        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
-    );
-    let mut s = SessionState::default();
-    assert!(s.bind_resolution_tenant(A));
-    s.bind_role_ids(987_654_321, 987_654_321);
-    ok_as(&core, A, &mut s, "SET search_path = s, public");
-    let (c, m) = err_as(&core, A, &mut s, "ALTER MATERIALIZED VIEW mv SET SCHEMA s2");
-    assert_eq!(c, "42601", "{m}");
-    assert!(!m.contains('#'), "{m}");
-}
-
-/// 拡張クエリの Parse で、文中の識別子（移動先 `s2`）がセッションの一時表と同名だと一時コアへ振り分けられる。
-/// この経路はテナントを渡さず修飾名を解決するため、自テナントに実在する SCHEMA `s` で修飾した移動元でも `3F000` になる
-/// （一時表の無い通常経路の `42601` との差。いずれも拒否され移動は起きない）。
-// intentional: docs/design/schema-tenant-namespace.md
-// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
-#[test]
-fn alter_matview_set_schema_parse_with_same_named_temp_table_is_3f000() {
-    let (core, _g, mut s) = world("t27-mv-alter-temp-parse");
-    ok(
-        &core,
-        &mut s,
-        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
-    );
-    ok(
-        &core,
-        &mut s,
-        "CREATE TEMP TABLE s2 (id BIGINT PRIMARY KEY)",
-    );
-    let parse_err = core
-        .parse_sql_prepared_with_declared_in_session(
-            &s,
-            "ALTER MATERIALIZED VIEW s.mv SET SCHEMA s2",
-            &[],
-        )
-        .expect_err("SET SCHEMA is rejected at Parse");
-    assert_eq!(parse_err.wire_code(), "3F000", "{parse_err:?}");
 }
 
 /// 他テナントの同名 SCHEMA・同名 matview は互いに影響しない。

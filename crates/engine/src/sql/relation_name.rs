@@ -20,9 +20,8 @@
 //!   `Token::Ident` へ置き換える（Issue #1717。表・ビュー・索引・SEQUENCE の名前位置）。
 //!   MATERIALIZED VIEW の名前位置も同じ（Issue #3287。作成・更新・削除・参照）。
 //!   `ALTER MATERIALIZED VIEW .. SET SCHEMA` だけは対象外（Issue #3287 の追記）。移動元の名前の修飾子は、
-//!   先行する検査（一時表との衝突・SCHEMA の USAGE 等）を通過したあとにこの解決器が解決する。
-//!   拒否の SQLSTATE とその順序は設計記録 `docs/design/schema-tenant-namespace.md` の
-//!   Issue #3287 の追記「意図的な拒否」を参照（実行腕の `0A000` ではなく、いずれも fail-closed で拒否される）
+//!   この解決器が解決し、拒否される（fail-closed。実行腕の `0A000` ではない）。SQLSTATE は設計記録
+//!   `docs/design/schema-tenant-namespace.md` の Issue #3287 の追記「意図的な拒否」を参照
 //! - ENUM 型の名前（`CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の名前位置。Issue #3288）と、列型・キャスト・
 //!   `ALTER TABLE` の型名位置（`sql::type_name_position`。Issue #3289）も同じ規則（`public.` は裸の名前、
 //!   テナントの SCHEMA は内部キー）。関係位置（[`relation_positions`]）には足さない
