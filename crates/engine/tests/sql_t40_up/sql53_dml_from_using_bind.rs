@@ -217,7 +217,6 @@ fn executable_forms_run_with_exact_tags_and_rows() {
 
 /// 変換器が拒否する形は `0A000` で、行も台帳も変えない。
 // intentional: docs/design/update-from-delete-using.md
-// tracked: #3295
 #[test]
 fn converter_rejected_forms_fail_closed_without_side_effects() {
     let (core, path) = new_core("sql53-from-conv-reject", false);
@@ -319,7 +318,7 @@ fn operation_id_reuse_for_a_different_statement_is_22023() {
 }
 
 /// 束縛エラー・変換器拒否の文は台帳を消費せず、同じ ID を別の文が通常どおり使える。
-// tracked: #3295
+// intentional: docs/design/update-from-delete-using.md
 #[test]
 fn bind_and_converter_errors_do_not_consume_the_ledger() {
     let (core, path) = new_core("sql53-from-opid-unused", false);
