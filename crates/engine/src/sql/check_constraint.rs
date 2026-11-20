@@ -1762,7 +1762,8 @@ mod tests {
 
     /// 未対応の形は fail-closed のまま（TEXT の `BETWEEN` は束縛段、
     /// vector 系列の `IS NULL` は各列型の Issue が固定した拒否）。
-    /// intentional: docs/design/sql-check-constraint.md (TEXT BETWEEN・vector 系列 IS NULL)
+    /// intentional: docs/design/sql-check-constraint.md
+    /// 根拠の節: TEXT 列の BETWEEN・vector 系列の IS [NOT] NULL（未対応の形の列挙）
     #[test]
     fn validate_and_build_rejects_unsupported_in_between_null_forms() {
         for (sql, code) in [

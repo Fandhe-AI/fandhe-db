@@ -500,7 +500,8 @@ fn matview_index_and_concurrent_refresh_in_schema() {
 }
 
 /// `ALTER MATERIALIZED VIEW .. SET SCHEMA` は修飾・未修飾とも fail-closed で拒否する（対象外）。
-// intentional: docs/design/schema-tenant-namespace.md（ALTER MATERIALIZED VIEW ... SET SCHEMA は対象外）
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
 fn alter_matview_set_schema_stays_unsupported() {
     let (core, _g, mut s) = world("t27-mv-alter");

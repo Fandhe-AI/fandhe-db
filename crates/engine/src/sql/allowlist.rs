@@ -42909,7 +42909,8 @@ mod tests {
     /// SQL-42・Issue #3274: 素の走査の `ORDER BY` が算術で始まるキーを拒否する既存制限は
     /// `%` にも `+ - * /` と同じコードで適用する（`%` だけ受理範囲を広げない）。一方、
     /// 式キーとして始まる形（関数・CASE の内側の `%`）は受理する。
-    /// intentional: docs/design/implementation-status.md（Issue #3274 の記録）
+    /// intentional: docs/design/order-by-having-expressions.md
+    /// 根拠の節: 算術で始まる ORDER BY キーは 42601（同記録の対象外。経緯は Issue #3274）
     #[test]
     fn scan_order_by_arithmetic_leading_key_rejects_rem_like_other_operators() {
         let lookup = catalog_with(&["documents"]);
