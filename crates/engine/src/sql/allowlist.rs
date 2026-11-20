@@ -42910,7 +42910,7 @@ mod tests {
     /// `%` にも `+ - * /` と同じコードで適用する（`%` だけ受理範囲を広げない）。一方、
     /// 式キーとして始まる形（関数・CASE の内側の `%`）は受理する。
     /// intentional: docs/design/order-by-having-expressions.md
-    /// 根拠の節: 算術で始まる ORDER BY キーは 42601（同記録の対象外。経緯は Issue #3274）
+    /// 根拠の節: 広域取得の ORDER BY 式キー
     #[test]
     fn scan_order_by_arithmetic_leading_key_rejects_rem_like_other_operators() {
         let lookup = catalog_with(&["documents"]);

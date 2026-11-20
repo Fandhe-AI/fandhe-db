@@ -19,7 +19,9 @@
 //!   同じ応答）、あれば内部キー `#<schema_id>.<name>`（ADR D2。[`RelationKey`]）の
 //!   `Token::Ident` へ置き換える（Issue #1717。表・ビュー・索引・SEQUENCE の名前位置）。
 //!   MATERIALIZED VIEW の名前位置も同じ（Issue #3287。作成・更新・削除・参照）。
-//!   `ALTER MATERIALIZED VIEW .. SET SCHEMA` だけは対象外で、実行腕が `0A000` で拒否する
+//!   `ALTER MATERIALIZED VIEW .. SET SCHEMA` だけは対象外（Issue #3287 の追記）。移動元の名前の修飾子は
+//!   まずこの解決器が解決し（存在しない修飾子は `3F000`、`pg_catalog` 等は `0A000`）、解決後の文は
+//!   構文解析段で `42601` になる（実行腕の `0A000` ではない）
 //! - ENUM 型の名前（`CREATE TYPE <名>`・`DROP TYPE [IF EXISTS] <名>` の名前位置。Issue #3288）と、列型・キャスト・
 //!   `ALTER TABLE` の型名位置（`sql::type_name_position`。Issue #3289）も同じ規則（`public.` は裸の名前、
 //!   テナントの SCHEMA は内部キー）。関係位置（[`relation_positions`]）には足さない
