@@ -648,7 +648,7 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 | 未修飾の `t` が現在の `search_path` で見つからない状態（`public` が隠れているとき。テストは `SET search_path = nosuch` 後）での Parse・Bind・Describe | `42P01` | `extended_query_revalidates_statements_after_the_path_changes` | path 変更後は、Bind と Describe も現在の path で参照先を検証し直す。解決できない名前は拒否する（fail-closed） |
 | `public` が隠れている間に、構文が成立しない文（`SELECT FROM FROM t`）を Parse する | `42601` | `extended_query_revalidates_statements_after_the_path_changes` | 例示の SQL では、参照ゲートの `42P01` より構文エラーの `42601` を返す（観測できる応答の優先順位。内部の処理順は断定しない）。構文が成立しない文の名前の存否を応答に出さない |
 
-- 上は `search_path` に起因する拒否だけの記述である。それ以外の理由（一時カタログの検査など）による `0A000` は本節の対象外で、各条件の詳細は本書では断定しない
+- 上は `search_path` に起因する拒否と、`public` が隠れているときの構文エラー（`42601`）との応答の優先順位だけの記述である。それ以外の理由（一時カタログの検査など）による `0A000` は本節の対象外で、各条件の詳細は本書では断定しない
 - PostgreSQL 17 との差は本節では未確認とする（比較して一致を根拠にしていない）。注記の根拠は fail-closed の安全弁であることに限る
 - 免除する文の正確な一覧はコード（`is_search_path_exempt`）を参照する
 - `0A000` の文言は固定で、他テナントの SCHEMA 名・内部キーを含まない。`42P01` の文言は利用者が書いた名前だけを含み、他テナントの名前・内部キーは含まない
