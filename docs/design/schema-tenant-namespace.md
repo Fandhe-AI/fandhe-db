@@ -636,3 +636,17 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 - **論理ダンプ**: SCHEMA 配下の matview を含むダンプを固定文言で全体失敗させていた 2 か所の拒否を外した。拒否の根拠（SQL で作り直せない）が消えたため。`CREATE MATERIALIZED VIEW s.mv` の描画と本文の内部キーの逆変換は表・ビューと同じ経路
 - **意図的な拒否（`intentional`）**: `ALTER MATERIALIZED VIEW ... SET SCHEMA`（修飾・未修飾とも。fail-closed の拒否のまま。専用の Issue が必要）のみ引き続き対象外
 - **PostgreSQL との差**: 本追記で新たに生じた差は無い（D7 による SCHEMA をまたぐ本文参照の `42501` は既存の意図的な差）
+
+## 拒否の根拠（Issue #3528）: 解決の世代が食い違う文の `0A000`
+
+注記書式は [rejection-pin-annotation.md](rejection-pin-annotation.md)。「10. Issue #1715 実装記録」の拡張クエリの項と
+「追記（Issue #3197）」の互換の安全弁が決めた拒否の根拠を、PostgreSQL 17 との比較で残す。
+
+| 拒否する形 | SQLSTATE | PostgreSQL 17 での挙動 | 維持する理由 |
+| ---------- | -------- | ---------------------- | ------------ |
+| `public` が `search_path` から隠れている間に、`parse_sql`（セッションを持たない Rust API）で作った未検証の文を実行する | `0A000` | `search_path` は文の解析時に解決される。セッションを持たない解析の入口は無い | 文は path を知らずに作られており、実行時の path で解決し直すと他の SCHEMA の同名表へ黙って向きうる。免除する文（`RESET search_path` など）以外は拒否する |
+| Bind の後・Execute の前に `SET search_path` され、`public` が隠れた準備済み文（修飾名の文を含む）の実行 | `0A000` | 束縛済みのプランは Bind 時の解決のまま実行される。無効化されると再計画される | 解決の世代の食い違いを検出して実行しない。`public` が見える path では PostgreSQL と同じく Bind 時の解決のまま実行する |
+
+- 同じテストが固定する Parse・Bind・Describe の `42P01`・構文エラーの `42601` は PostgreSQL と同じ分類で、本節の対象外
+- 免除する文はセッション変数・トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE`
+- エラー文言は固定で、他テナントの SCHEMA 名・内部キーを含まない
