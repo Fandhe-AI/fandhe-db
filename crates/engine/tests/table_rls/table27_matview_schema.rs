@@ -535,7 +535,7 @@ fn alter_matview_set_schema_stays_unsupported() {
 /// 移動元の修飾子の解決が構文解析より先に走るため、移動元の修飾子が指す SCHEMA が自テナントに存在しなければ `3F000`（SCHEMA が存在し matview のみ不在の場合は構文解析で `42601`）、`pg_catalog` など
 /// 名前解決段で拒否される修飾子なら `0A000` が返る（`public` は通常名へ変換され後続の構文解析で `42601`。セッションに同名の一時表が無い場合に限り、有ると `reject_public_qualified_temp` が先に `0A000`）。
 /// 移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
-/// 簡易クエリは修飾名で自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため（拡張クエリの `Parse` は USAGE を検査しない解決で `42601` になる）、ACL 検査対象のセッション（所有者相当でなく、ロール束縛済み）で束縛ロールに USAGE が無ければ解析前に `42501` が先に返る（所有者相当・ロール未束縛のセッションは ACL 検査を省略するため `42601`。別テスト `alter_matview_set_schema_qualified_without_usage_is_42501` で固定）。未修飾名は `gate_exempt` により SCHEMA の照会自体が行われないため `42501` にならない。
+/// 簡易クエリは修飾名で自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため（拡張クエリの `Parse` は、一時表の名前を含まない通常経路では USAGE を検査しない解決で `42601` になる。一時表と同名の識別子を含む文は一時コアへ振り分けられ別の SQLSTATE になりうるが、いずれも拒否される）、ACL 検査対象のセッション（所有者相当でなく、ロール束縛済み）で束縛ロールに USAGE が無ければ解析前に `42501` が先に返る（所有者相当・ロール未束縛のセッションは ACL 検査を省略するため `42601`。別テスト `alter_matview_set_schema_qualified_without_usage_is_42501` で固定）。未修飾名は `gate_exempt` により SCHEMA の照会自体が行われないため `42501` にならない。
 // intentional: docs/design/schema-tenant-namespace.md
 // 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
@@ -617,6 +617,16 @@ fn alter_matview_set_schema_qualified_without_usage_is_42501() {
     );
     assert_eq!(c, "42501", "{m}");
     assert!(!m.contains('#'), "{m}");
+    // 拡張クエリの Parse（一時表の名前を含まない通常経路）は USAGE を検査しない解決のため、同じセッション・SQL で `42601` になる
+    // （設計記録の契約。USAGE 検査が Parse にも入ると `42501` に変わるため、この差を固定する）。
+    let parse_err = core
+        .parse_sql_prepared_with_declared_in_session(
+            &s,
+            "ALTER MATERIALIZED VIEW s.mv SET SCHEMA s2",
+            &[],
+        )
+        .expect_err("SET SCHEMA is rejected at Parse");
+    assert_eq!(parse_err.wire_code(), "42601", "{parse_err:?}");
 }
 
 /// USAGE の無い DDL 未許可の束縛セッションでも、`search_path` に `s` を含めた未修飾 `mv` は
