@@ -449,7 +449,7 @@ TABLE-27 (3) のポインタ。セッション変数 `search_path` を engine �
   Bind（wire は path が隠れているセッションで cached の `$n` なし文も `bind_prepared_in_session` で
   検証し直す）で `42P01` になる。Bind 後・Execute 前に path が変わった文と、`parse_sql` で作った
   未検証の文は、`public` が隠れている間 `0A000`（`SessionRoutedSql` の path 世代。セッション変数・
-  トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE` は免除）
+  トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE` などは免除。完全な一覧は `is_search_path_exempt`）
 - **暗黙 RLS**: path に関係なく常に掛かる（D3）。`SET search_path` は境界を越える経路にならない
   （`rls_implicit.rs` に D11 のテストを追加。セッションの無い入口の `SET search_path` は従来どおり `42601`）
 - **意図的な PostgreSQL との差**: 長すぎる要素名は切り詰めず `22023`／文字列リテラル要素は識別子形か
@@ -645,8 +645,8 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 | 拒否する形 | SQLSTATE | PostgreSQL 17 での挙動 | 維持する理由 |
 | ---------- | -------- | ---------------------- | ------------ |
 | `public` が `search_path` から隠れている間に、`parse_sql`（セッションを持たない Rust API）で作った未検証の文を実行する | `0A000` | `search_path` は文の解析時に解決される。セッションを持たない解析の入口は無い | 文は path を知らずに作られており、実行時の path で解決し直すと他の SCHEMA の同名表へ黙って向きうる。免除する文（`RESET search_path` など）以外は拒否する |
-| Bind の後・Execute の前に `SET search_path` され、`public` が隠れた準備済み文（修飾名の文を含む）の実行 | `0A000` | 束縛済みのプランは Bind 時の解決のまま実行される。無効化されると再計画される | 解決の世代の食い違いを検出して実行しない。`public` が見える path では PostgreSQL と同じく Bind 時の解決のまま実行する |
+| Bind の後・Execute の前に `SET search_path` され、`public` が隠れた準備済み文（修飾名の文を含む）の実行 | `0A000` | 束縛済みのプランは Bind 時の解決のまま実行される。無効化されると再計画される | 解決の世代の食い違いを検出して実行しない。`public` が見える path では、注記対象の SELECT などは PostgreSQL と同じく Bind 時の解決のまま実行する（COPY は例外で、`stamped_with_path_for_copy` が `public` の可視性に関わらず世代を記録し、`require_current` が世代の変化を `0A000` で拒否する） |
 
 - 同じテストが固定する Parse・Bind・Describe の `42P01`・構文エラーの `42601` は PostgreSQL と同じ分類で、本節の対象外
-- 免除する文はセッション変数・トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE`
+- 免除する文は、セッション変数・トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE` などである（例示であり網羅ではない。`CREATE SCHEMA`・`DROP SCHEMA`・ロール操作・カーソルの `MOVE` なども免除する。正確な一覧は `temp_route.rs` の `is_search_path_exempt` が SSOT）
 - エラー文言は固定で、他テナントの SCHEMA 名・内部キーを含まない
