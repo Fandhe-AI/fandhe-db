@@ -531,6 +531,45 @@ fn alter_matview_set_schema_stays_unsupported() {
     assert_eq!(code(&core, &mut s, "SELECT id FROM s2.mv LIMIT 5"), "42P01");
 }
 
+/// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の SQLSTATE 優先順位を固定する（設計記録 D8 追記の契約）。
+/// 移動元の修飾子の解決が構文解析より先に走るため、移動元が不在なら `3F000`、組み込み SCHEMA なら
+/// `0A000` が返る。移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
+#[test]
+fn alter_matview_set_schema_error_precedence_is_pinned() {
+    let (core, _g, mut s) = world("t27-mv-alter-prec");
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
+    );
+    for (sql, want) in [
+        // 移動元の修飾子が存在しない。
+        ("ALTER MATERIALIZED VIEW nope.mv SET SCHEMA s", "3F000"),
+        // 移動元の修飾子が組み込み SCHEMA。
+        (
+            "ALTER MATERIALIZED VIEW pg_catalog.mv SET SCHEMA s",
+            "0A000",
+        ),
+        // 移動元は有効で、移動先が不在・組み込み SCHEMA。
+        ("ALTER MATERIALIZED VIEW s.mv SET SCHEMA nope", "42601"),
+        (
+            "ALTER MATERIALIZED VIEW s.mv SET SCHEMA pg_catalog",
+            "42601",
+        ),
+    ] {
+        let (c, m) = err_as(&core, A, &mut s, sql);
+        assert_eq!(c, want, "{sql}: {m}");
+        assert!(!m.contains('#'), "{sql}: {m}");
+    }
+    // 失敗しても matview は元の場所に残る。
+    assert_eq!(
+        rows(&core, &mut s, "SELECT id FROM s.mv ORDER BY id LIMIT 10"),
+        int_rows(&[1, 2])
+    );
+}
+
 /// 他テナントの同名 SCHEMA・同名 matview は互いに影響しない。
 #[test]
 fn same_named_matviews_in_two_tenants_are_independent() {
