@@ -9,7 +9,7 @@
 //! - 同名の `public` の matview と独立している（行・REFRESH・DROP が混ざらない）
 //! - `DROP SCHEMA` は RESTRICT で `2BP01`、CASCADE で配下の matview（実体・索引宣言を含む）を消す
 //! - 他テナントの同名 SCHEMA・matview に影響せず、応答にも現れない（`#`・内部 ID を出さない）
-//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する
+//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で `42601` 拒否する
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -516,12 +516,12 @@ fn alter_matview_set_schema_stays_unsupported() {
         "ALTER MATERIALIZED VIEW s.mv SET SCHEMA public",
     ] {
         let (c, m) = err_as(&core, A, &mut s, sql);
-        assert!(c == "0A000" || c == "42601", "{sql}: {c} {m}");
+        assert_eq!(c, "42601", "{sql}: {m}");
         assert!(!m.contains('#'), "{sql}: {m}");
     }
     ok(&core, &mut s, "SET search_path = s, public");
     let (c, m) = err_as(&core, A, &mut s, "ALTER MATERIALIZED VIEW mv SET SCHEMA s2");
-    assert!(c == "0A000" || c == "42601", "{c} {m}");
+    assert_eq!(c, "42601", "{m}");
     assert!(!m.contains('#'), "{m}");
     // 失敗しても matview は元の場所に残る。
     assert_eq!(
