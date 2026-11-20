@@ -9,7 +9,7 @@
 //! - 同名の `public` の matview と独立している（行・REFRESH・DROP が混ざらない）
 //! - `DROP SCHEMA` は RESTRICT で `2BP01`、CASCADE で配下の matview（実体・索引宣言を含む）を消す
 //! - 他テナントの同名 SCHEMA・matview に影響せず、応答にも現れない（`#`・内部 ID を出さない）
-//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（権限のない主体の要求も拒否される。応答差による SCHEMA 存否の露出は既知の課題で別途追跡する。SQLSTATE の経路差は契約にしない）
+//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（所有者相当・DDL 許可のセッションの簡易クエリを検証。権限のない主体の扱いは #3532 で追跡する）
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -533,7 +533,7 @@ fn alter_matview_set_schema_stays_unsupported() {
 
 /// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の拒否を、所有者相当のセッションの簡易クエリで固定する（設計記録 Issue #3287 の追記「意図的な拒否」）。
 /// 移動元の修飾子の解決が構文解析より先に走るため、修飾子が自テナントに存在しなければ `3F000`、`pg_catalog` など組み込み SCHEMA なら `0A000`、
-/// 移動元が有効なら移動先の不備は構文エラー `42601` になる。権限のない主体・拡張クエリの Parse の SQLSTATE は契約にしない（いずれも拒否される）。
+/// 移動元が有効なら移動先の不備は構文エラー `42601` になる。権限のない主体の扱いは #3532 で追跡する。
 // intentional: docs/design/schema-tenant-namespace.md
 // 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
