@@ -9,7 +9,7 @@
 //! - 同名の `public` の matview と独立している（行・REFRESH・DROP が混ざらない）
 //! - `DROP SCHEMA` は RESTRICT で `2BP01`、CASCADE で配下の matview（実体・索引宣言を含む）を消す
 //! - 他テナントの同名 SCHEMA・matview に影響せず、応答にも現れない（`#`・内部 ID を出さない）
-//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（存在する SCHEMA で ACL 検査対象外のセッション〔所有者相当・ロール未束縛〕または束縛ロールが USAGE を持つ場合は `42601`。ACL 検査対象のセッション〔所有者相当でなく、ロール束縛済み〕が修飾名 `s.mv` で USAGE を持たなければ解析前に `42501`。未修飾名は `search_path::gate_exempt` が DDL 権限のないセッションの文を解決処理から除外するため SCHEMA の照会自体が行われず、構文解析で `42601`）
+//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（存在する SCHEMA で ACL 検査対象外のセッション〔所有者相当・ロール未束縛〕または束縛ロールが USAGE を持つ場合は `42601`。簡易クエリで ACL 検査対象のセッション〔所有者相当でなく、ロール束縛済み〕が修飾名 `s.mv` で USAGE を持たなければ解析前に `42501`。拡張クエリの Parse は USAGE を検査しない解決のため `42601`。未修飾名は `search_path::gate_exempt` が DDL 権限のないセッションの文を解決処理から除外するため SCHEMA の照会自体が行われず、構文解析で `42601`）
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -535,7 +535,7 @@ fn alter_matview_set_schema_stays_unsupported() {
 /// 移動元の修飾子の解決が構文解析より先に走るため、移動元の修飾子が指す SCHEMA が自テナントに存在しなければ `3F000`（SCHEMA が存在し matview のみ不在の場合は構文解析で `42601`）、`pg_catalog` など
 /// 名前解決段で拒否される修飾子なら `0A000` が返る（`public` は通常名へ変換され後続の構文解析で `42601`。セッションに同名の一時表が無い場合に限り、有ると `reject_public_qualified_temp` が先に `0A000`）。
 /// 移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
-/// 修飾名で自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため、ACL 検査対象のセッション（所有者相当でなく、ロール束縛済み）で束縛ロールに USAGE が無ければ解析前に `42501` が先に返る（所有者相当・ロール未束縛のセッションは ACL 検査を省略するため `42601`。別テスト `alter_matview_set_schema_qualified_without_usage_is_42501` で固定）。未修飾名は `gate_exempt` により SCHEMA の照会自体が行われないため `42501` にならない。
+/// 簡易クエリは修飾名で自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため（拡張クエリの `Parse` は USAGE を検査しない解決で `42601` になる）、ACL 検査対象のセッション（所有者相当でなく、ロール束縛済み）で束縛ロールに USAGE が無ければ解析前に `42501` が先に返る（所有者相当・ロール未束縛のセッションは ACL 検査を省略するため `42601`。別テスト `alter_matview_set_schema_qualified_without_usage_is_42501` で固定）。未修飾名は `gate_exempt` により SCHEMA の照会自体が行われないため `42501` にならない。
 // intentional: docs/design/schema-tenant-namespace.md
 // 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
