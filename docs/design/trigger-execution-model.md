@@ -364,12 +364,12 @@ D8 の中核の不変条件「トリガが黙って発火しない経路を作�
 
 | 拒否する形 | SQLSTATE | PostgreSQL 17 での挙動 | 維持する理由 |
 | ---------- | -------- | ---------------------- | ------------ |
-| 未結線の invoker（テスト専用の `TriggerRuntime::unwired()`。`unwired_runtime_is_0a000` が固定）はトリガを実行できず、`UnwiredInvoker::invoke` が `0A000` を返す。INSERT は `plan_insert` が INSERT イベントに該当するトリガを持つ場合に限り、この拒否になる（UPDATE 専用トリガだけを持つ表への INSERT は拒否されない） | `0A000` | 有効で発火条件を満たしたトリガは通常の経路で呼び出される（無効化されたトリガや `WHEN` が偽のものは発火しない）。「結線されていない状態」は PostgreSQL に無く、本実装だけの内部状態 | トリガを実行できない invoker のまま書き込みを通すと、トリガが黙って発火しない。fail-open を避けるため文を取り消す |
-| 書き込みハンドルが実行体を持たずにトリガ付きの表へ行を書く | `0A000` | 同上 | 通過証・実行体を持たない書き込み口からのトリガ付き表への書き込みを拒否する（D8 の通過証） |
+| 未結線の invoker（テスト専用の `TriggerRuntime::unwired()`。`unwired_runtime_is_0a000` が固定）で、発火点（`fire_before_row_insert` など）が呼び出し体を呼ぶ。計画の段（`plan_insert`）は `TriggerRuntime` が渡されていれば INSERT イベントに該当するトリガを選別するだけで invoker の結線状態は検査せず、拒否は呼び出し体の呼び出し時に `UnwiredInvoker::invoke` が返す | `0A000` | 有効で発火条件を満たしたトリガは通常の経路で呼び出される（無効化されたトリガや `WHEN` が偽のものは発火しない）。「結線されていない状態」は PostgreSQL に無く、本実装だけの内部状態 | トリガを実行できない invoker のまま書き込みを通すと、トリガが黙って発火しない。fail-open を避けるため文を取り消す |
+| 書き込みハンドルが実行体（`TriggerRuntime`）を持たず（`TriggerWriteHandle::new` の `runtime` が `None`）、INSERT イベントに該当するトリガを持つ表へ `insert_row` で挿入する（`handle_without_runtime_keeps_0a000` が固定。計画の段で拒否する。UPDATE・DELETE 専用のトリガだけを持つ表への挿入は拒否されない） | `0A000` | 同上 | 通過証・実行体を持たない書き込み口からのトリガ付き表への挿入を拒否する（D8 の通過証） |
 | 呼び出し体（invoker）が `WHEN` 条件の評価に対応していないのに、`WHEN` 付きのトリガが発火点に達する | `0A000` | `WHEN` は評価され、偽なら発火しない | 条件を無視して常に発火させる（または常に不発火にする）と意味が変わる。評価できないなら文を取り消す |
 | 実行体が結線されていない TRUNCATE が、`plan_truncate` で TRUNCATE イベントに該当する文トリガを持つ表に届く（他イベント専用のトリガだけでは拒否されない） | `0A000` | BEFORE／AFTER の文トリガが発火する | 文トリガを黙って飛ばさない。表の内容は変えず、呼び出し体も 1 回も呼ばない |
 
-- 判定は、カタログと、実行体（`TriggerRuntime` が渡されているか）・invoker の結線状態・invoker が `WHEN` 評価に対応しているかで行い（`unwired_runtime_is_0a000` は、`TriggerRuntime` は存在するがテスト専用の `UnwiredInvoker::invoke` が固定の `0A000` を返す場合を固定する。書き込み入口へ `TriggerRuntime` が渡されていない場合は表の 2 行目が別に受け持つ。`invoker_without_when_support_is_0a000` は `WHEN` 評価への未対応を固定する）、テナントのデータ（他テナントの行の有無）に依存しない
+- 判定は、カタログと、実行体（`TriggerRuntime` が渡されているか）・invoker の結線状態・invoker が `WHEN` 評価に対応しているかで行い（`unwired_runtime_is_0a000` は、`TriggerRuntime` は存在するがテスト専用の `UnwiredInvoker::invoke` が固定の `0A000` を返す場合を固定する。書き込み入口へ `TriggerRuntime` が渡されていない場合は表の 2 行目が別に受け持ち、計画の段で拒否する。`invoker_without_when_support_is_0a000` は `WHEN` 評価への未対応を固定する）、テナントのデータ（他テナントの行の有無）に依存しない
 - エラー文言は固定の英語で、値・行・他テナントの存在・件数を含めない
 - 上の拒否は「経路ごとの未対応」ではなく、機構が結線されていないときの安全弁である。経路ごとの未結線
   （結合形の `RETURNING` 付きなど）は D8 の表に別に記録しており、本節の対象外とする

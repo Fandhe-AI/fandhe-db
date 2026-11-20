@@ -7,7 +7,7 @@
 ## 1. 背景
 
 `%` は `* /` と同じ優先度の二項演算子として実装されている（実装記録は `implementation-status.md` の
-SQL-42 の項）。通常の投影では整数どうしの剰余だけを評価する。集計式（`sum(n) % 4`・`avg(n) % 1` など）では `DecimalOp::Rem` により numeric の剰余も評価する（`aggregate_projection_uses_numeric_remainder` が固定する）。上記以外のうち未対応の被演算子型・式の形は束縛時に拒否する（型検査）。整数式の値に依存する範囲検査（例: §3 の `(b + 1) % 2` の `22003`）は束縛を通り、評価時に行う。小数リテラルの剰余・`NUMERIC` 列・`::numeric` の剰余は `0A000`、整数と証明できない浮動小数点式の剰余は `42883` である（`bind_expr_any` の剰余分岐。後者の具体形は §2 が根拠を示す）。`42883` になるのは §2 の被演算子の組み合わせに限る。浮動小数点式と小数リテラルを混ぜた剰余（例: `double precision % 0.5`）は、小数リテラルを含むため `0A000` の分岐に入る（§3 の小数リテラルの扱いと同じ）。
+SQL-42 の項）。通常の投影では整数どうしの剰余だけを評価する。集計式（`sum(n) % 4`・`avg(n) % 1` など）では `DecimalOp::Rem` により numeric の剰余も評価する（`aggregate_projection_uses_numeric_remainder` が固定する）。上記以外のうち未対応の被演算子型・式の形は束縛時に拒否する（型検査）。整数式の値に依存する範囲検査（例: §3 の `(b + 1) % 2` の `22003`）は束縛を通り、評価時に行う。小数リテラルの剰余・`NUMERIC` 列・`::numeric` の剰余は `0A000`、整数と証明できない浮動小数点式の剰余は `42883` である（`bind_expr_any` の剰余分岐。後者の具体形は §2 が根拠を示す）。`42883` になる形は §2 の表（PostgreSQL 17 と一致することを根拠にした形）に限らず、ベクトル型の列に対する `%` も `42883` である（§3 末尾。`embedding % 2` を `unsupported_operand_types_are_42883` が固定する）。浮動小数点式と小数リテラルを混ぜた剰余（例: `double precision % 0.5`）は、小数リテラルを含むため `0A000` の分岐に入る（§3 の小数リテラルの扱いと同じ）。
 本書は、拒否のうち PostgreSQL 17 と同じ結果になるものの根拠を残す。
 
 ## 2. 意図的な拒否（PostgreSQL 17 と同じ）
@@ -18,7 +18,7 @@ SQL-42 の項）。通常の投影では整数どうしの剰余だけを評価�
 | `text % integer` | `42883` | `42883`（`operator does not exist: text % integer`） | 型の組み合わせに演算子が無い。暗黙の型変換で受理しない |
 | `COALESCE`・`NULLIF`・`CASE` で包んだ `double precision` の `%` | `42883` | `42883`（結果型が `double precision` のまま演算子の解決に失敗する） | 包んだ式でも直接の `double precision` と同じ結果型の規則で拒否する。ラッパーで型を隠して通す経路を作らない |
 
-- 上の表は `docs/design` に残す根拠であり、テストは `sql42_remainder_operator.rs` の
+- 上の表は PostgreSQL 17 との一致を根拠にできる形の一覧であり、本実装で `42883` になる型の全集合ではない（ベクトル型は §3 末尾）。表は `docs/design` に残す根拠であり、テストは `sql42_remainder_operator.rs` の
   `unsupported_operand_types_are_42883` が固定する
 - PostgreSQL 17 の実測は、公式の `postgres:17` コンテナで同じ形の文を実行して確かめた（使い捨て・資格情報なし）。上の表は比較できた型（real・double precision・integer・text）に限る
 
