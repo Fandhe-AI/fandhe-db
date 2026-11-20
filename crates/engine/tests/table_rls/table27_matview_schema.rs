@@ -9,7 +9,7 @@
 //! - 同名の `public` の matview と独立している（行・REFRESH・DROP が混ざらない）
 //! - `DROP SCHEMA` は RESTRICT で `2BP01`、CASCADE で配下の matview（実体・索引宣言を含む）を消す
 //! - 他テナントの同名 SCHEMA・matview に影響せず、応答にも現れない（`#`・内部 ID を出さない）
-//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（存在する SCHEMA で束縛ロールが USAGE を持つ場合は `42601`。USAGE が無ければ解析前に `42501`）
+//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（存在する SCHEMA で束縛ロールが USAGE を持つ場合は `42601`。修飾名 `s.mv` で束縛ロールに USAGE が無ければ解析前に `42501`。未修飾名は `search_path` が USAGE の無い SCHEMA を飛ばすため解決できず、後続の構文解析で `42601`）
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -535,7 +535,7 @@ fn alter_matview_set_schema_stays_unsupported() {
 /// 移動元の修飾子の解決が構文解析より先に走るため、移動元が不在なら `3F000`、`pg_catalog` など
 /// 名前解決段で拒否される修飾子なら `0A000` が返る（`public` は通常名へ変換され後続の構文解析で `42601`）。
 /// 移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
-/// 自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため、束縛ロールに USAGE が無ければ解析前に `42501` が先に返る。
+/// 修飾名で自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため、束縛ロールに USAGE が無ければ解析前に `42501` が先に返る（別テスト `alter_matview_set_schema_qualified_without_usage_is_42501` で固定）。未修飾名は `search_path` が USAGE の無い SCHEMA を飛ばすため `42501` にならない。
 // intentional: docs/design/schema-tenant-namespace.md
 // 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
@@ -570,6 +570,32 @@ fn alter_matview_set_schema_error_precedence_is_pinned() {
         rows(&core, &mut s, "SELECT id FROM s.mv ORDER BY id LIMIT 10"),
         int_rows(&[1, 2])
     );
+}
+
+/// 修飾された移動元の SCHEMA に USAGE の無い束縛ロールは、構文解析より前に `42501` になる。
+/// ロールを作る手段が crate 内限定のため、権限の無い未知のロール ID を DDL 未許可のセッションへ束縛して再現する（fail-closed）。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
+#[test]
+fn alter_matview_set_schema_qualified_without_usage_is_42501() {
+    let (core, _g, mut s) = world("t27-mv-alter-usage");
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
+    );
+    // 所有者相当（DDL 許可済み）のセッションは USAGE 検査の対象外なので、権限を持たない別セッションを束縛する。
+    let mut s = SessionState::default();
+    assert!(s.bind_resolution_tenant(A));
+    s.bind_role_ids(987_654_321, 987_654_321);
+    let (c, m) = err_as(
+        &core,
+        A,
+        &mut s,
+        "ALTER MATERIALIZED VIEW s.mv SET SCHEMA s2",
+    );
+    assert_eq!(c, "42501", "{m}");
+    assert!(!m.contains('#'), "{m}");
 }
 
 /// 他テナントの同名 SCHEMA・同名 matview は互いに影響しない。
