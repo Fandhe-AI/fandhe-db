@@ -652,6 +652,34 @@ fn alter_matview_set_schema_unqualified_without_usage_is_42601() {
     assert!(!m.contains('#'), "{m}");
 }
 
+/// 拡張クエリの Parse で、文中の識別子（移動先 `s2`）がセッションの一時表と同名だと一時コアへ振り分けられる。
+/// この経路はテナントを渡さず修飾名を解決するため、自テナントに実在する SCHEMA `s` で修飾した移動元でも `3F000` になる
+/// （一時表の無い通常経路の `42601` との差。いずれも拒否され移動は起きない）。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
+#[test]
+fn alter_matview_set_schema_parse_with_same_named_temp_table_is_3f000() {
+    let (core, _g, mut s) = world("t27-mv-alter-temp-parse");
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
+    );
+    ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE s2 (id BIGINT PRIMARY KEY)",
+    );
+    let parse_err = core
+        .parse_sql_prepared_with_declared_in_session(
+            &s,
+            "ALTER MATERIALIZED VIEW s.mv SET SCHEMA s2",
+            &[],
+        )
+        .expect_err("SET SCHEMA is rejected at Parse");
+    assert_eq!(parse_err.wire_code(), "3F000", "{parse_err:?}");
+}
+
 /// 他テナントの同名 SCHEMA・同名 matview は互いに影響しない。
 #[test]
 fn same_named_matviews_in_two_tenants_are_independent() {
