@@ -644,11 +644,11 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 
 | 拒否する形 | SQLSTATE | 固定するテスト | 維持する理由 |
 | ---------- | -------- | -------------- | ------------ |
-| 免除対象外の永続側の準備済み文を、`SET search_path` で Bind 後に path を変えてから Execute する（Execute 時点の path が `public` を隠している場合。明示修飾の `public.t` の文を含む）。`SET`・`SHOW` は拒否されない | `0A000` | `extended_query_revalidates_statements_after_the_path_changes` | 修飾済みの文にも、Bind 時の path の世代との一致を要求する。path が変わった文を再 Prepare なしで実行しない（fail-closed） |
+| 免除対象外の永続側の準備済み文を、`SET search_path` で Bind 後に path を変えてから Execute する（Execute 時点の path が `public` を隠している場合。明示修飾の `public.t` の文を含む）。`SET`・`SHOW` は拒否されない | `0A000` | `extended_query_revalidates_statements_after_the_path_changes` | 修飾済みの文にも、Bind 時の path の世代との一致を要求する。旧世代で Bind した portal は実行しない（fail-closed）。現在の path で再 Bind すれば新しい portal を作れる |
 | `public` が隠れている間に、`parse_sql`（セッションを持たない Rust API）で作った未検証の文を実行する。`RESET search_path` などの免除文は実行できる | `0A000` | `unvalidated_parsed_statements_are_rejected_while_public_is_hidden` | 文は path を知らずに作られており、実行時の path で解決し直すと別の SCHEMA の同名表へ黙って向きうる（fail-closed） |
 | 未修飾の `t` が現在の `search_path` で見つからない状態での Parse・Bind・Describe | `42P01` | `extended_query_revalidates_statements_after_the_path_changes` | path 変更後は、Bind と Describe も現在の path で参照先を検証し直す。解決できない名前は拒否する（fail-closed）。構文エラーは `42601` が先に返る |
 
 - 上は `search_path` に起因する拒否だけの記述である。それ以外の理由（一時カタログの検査など）による `0A000` は本節の対象外で、各条件の詳細は本書では断定しない
 - PostgreSQL 17 との差は本節では未確認とする（比較して一致を根拠にしていない）。注記の根拠は fail-closed の安全弁であることに限る
 - 免除する文の正確な一覧はコード（`is_search_path_exempt`）を参照する
-- エラー文言は固定で、他テナントの SCHEMA 名・内部キーを含まない
+- `0A000` の文言は固定で、他テナントの SCHEMA 名・内部キーを含まない。`42P01` の文言は利用者が書いた名前だけを含み、他テナントの名前・内部キーは含まない
