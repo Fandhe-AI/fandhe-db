@@ -2075,7 +2075,7 @@ fn describe_matches_execute_for_set_operation_order_by() {
 
 /// テナントによって可視行が違っても、誤りの分類と文言は同一で行の値を含まない。成功する形の
 /// 結果は呼び出しセッションの可視行だけで構成され、他テナントの private 行は現れない。
-// tracked: #3265
+// intentional: docs/design/set-operations.md
 #[test]
 fn set_operation_order_by_results_and_errors_respect_tenant_boundary() {
     let (storage, path) = seeded_two_tables();
