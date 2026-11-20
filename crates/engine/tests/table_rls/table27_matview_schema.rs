@@ -531,9 +531,10 @@ fn alter_matview_set_schema_stays_unsupported() {
     assert_eq!(code(&core, &mut s, "SELECT id FROM s2.mv LIMIT 5"), "42P01");
 }
 
-/// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の SQLSTATE 優先順位を固定する（設計記録 D8 追記の契約）。
-/// 移動元の修飾子の解決が構文解析より先に走るため、移動元が不在なら `3F000`、組み込み SCHEMA なら
-/// `0A000` が返る。移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
+/// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の SQLSTATE 優先順位を固定する（設計記録 Issue #3287 の追記「意図的な拒否」の契約）。
+/// 移動元の修飾子の解決が構文解析より先に走るため、移動元が不在なら `3F000`、`pg_catalog` など
+/// 名前解決段で拒否される修飾子なら `0A000` が返る（`public` は通常名へ変換され後続の構文解析で `42601`）。
+/// 移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
 // intentional: docs/design/schema-tenant-namespace.md
 // 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
