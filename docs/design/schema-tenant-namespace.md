@@ -645,7 +645,7 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 | 拒否する形 | SQLSTATE | PostgreSQL 17 での挙動 | 維持する理由 |
 | ---------- | -------- | ---------------------- | ------------ |
 | `public` が `search_path` から隠れている間に、`parse_sql`（セッションを持たない Rust API）で作った未検証の文を実行する | `0A000` | `search_path` は文の解析時に解決される。セッションを持たない解析の入口は無い | 文は path を知らずに作られており、実行時の path で解決し直すと他の SCHEMA の同名表へ黙って向きうる。免除する文（`RESET search_path` など）以外は拒否する |
-| Bind 時の世代が Execute 時点の現在の世代と一致せず、Execute 時点で `public` が `search_path` から見えない準備済み文（修飾名の文を含む。Bind 時点で既に `public` が隠れていた場合も含む）の実行 | `0A000` | 束縛済みのプランは Bind 時の解決のまま実行される。無効化されると再計画される | 解決の世代の食い違いを検出して実行しない。`public` が見える path では、注記対象の SELECT などは PostgreSQL と同じく Bind 時の解決のまま実行する（COPY は例外で、`stamped_with_path_for_copy` が `public` の可視性に関わらず世代を記録し、`require_current` が世代の変化を `0A000` で拒否する） |
+| 永続側にルートされる文（`Route::Persistent`。一時表へのルートは対象外）で、かつ `is_search_path_exempt` に該当しない文（`SET search_path = DEFAULT` は免除側で対象外）について、Bind 時の世代が Execute 時点の現在の世代と一致せず、Execute 時点で `public` が `search_path` から見えない準備済み文（修飾名の文を含む。Bind 時点で既に `public` が隠れていた場合も含む）の実行 | `0A000` | 束縛済みのプランは Bind 時の解決のまま実行される。無効化されると再計画される | 解決の世代の食い違いを検出して実行しない。`public` が見える path では、注記対象の SELECT などは PostgreSQL と同じく Bind 時の解決のまま実行する（COPY は例外で、`stamped_with_path_for_copy` が `public` の可視性に関わらず世代を記録し、`require_current` が世代の変化を `0A000` で拒否する） |
 
 - 同じテストが固定する Parse・Bind・Describe の `42P01`・構文エラーの `42601` は PostgreSQL と同じ分類で、本節の対象外
 - 免除する文は、セッション変数・トランザクション制御・一時表の作成・定数式・カーソルの `FETCH`／`CLOSE` などである（例示であり網羅ではない。`CREATE SCHEMA`・`DROP SCHEMA`・ロール操作・カーソルの `MOVE` なども免除する。正確な一覧は `temp_route.rs` の `is_search_path_exempt` が SSOT）
