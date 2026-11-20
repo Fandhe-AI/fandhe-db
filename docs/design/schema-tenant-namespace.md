@@ -639,8 +639,7 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 
 ## 拒否の根拠（Issue #3528）: 解決の世代が食い違う文の `0A000`
 
-注記書式は [rejection-pin-annotation.md](rejection-pin-annotation.md)。「10. Issue #1715 実装記録」の拡張クエリの項と
-「追記（Issue #3197）」の互換の安全弁が決めた拒否のうち、次の 2 つのテストが固定する形の根拠を残す。
+注記書式は [rejection-pin-annotation.md](rejection-pin-annotation.md)。次の 2 つのテストが固定する形の根拠を残す（実装記録の対応: Bind 済みの文の Execute は「追記（Issue #3197）」の portal の項、`parse_sql` で作った文の Execute は「10. Issue #1715 実装記録」の拡張クエリの項）。
 
 | 拒否する形 | SQLSTATE | 固定するテスト | 維持する理由 |
 | ---------- | -------- | -------------- | ------------ |
