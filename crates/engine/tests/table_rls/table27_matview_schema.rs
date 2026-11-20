@@ -9,7 +9,7 @@
 //! - 同名の `public` の matview と独立している（行・REFRESH・DROP が混ざらない）
 //! - `DROP SCHEMA` は RESTRICT で `2BP01`、CASCADE で配下の matview（実体・索引宣言を含む）を消す
 //! - 他テナントの同名 SCHEMA・matview に影響せず、応答にも現れない（`#`・内部 ID を出さない）
-//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する
+//! - 未対応の形（`ALTER MATERIALIZED VIEW .. SET SCHEMA`）は fail-closed で拒否する（所有者相当・DDL 許可のセッションの簡易クエリを検証。権限のない主体の扱いは #3532 で追跡する）
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -500,7 +500,8 @@ fn matview_index_and_concurrent_refresh_in_schema() {
 }
 
 /// `ALTER MATERIALIZED VIEW .. SET SCHEMA` は修飾・未修飾とも fail-closed で拒否する（対象外）。
-// intentional: docs/design/schema-tenant-namespace.md（ALTER MATERIALIZED VIEW ... SET SCHEMA は対象外）
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
 #[test]
 fn alter_matview_set_schema_stays_unsupported() {
     let (core, _g, mut s) = world("t27-mv-alter");
@@ -515,12 +516,12 @@ fn alter_matview_set_schema_stays_unsupported() {
         "ALTER MATERIALIZED VIEW s.mv SET SCHEMA public",
     ] {
         let (c, m) = err_as(&core, A, &mut s, sql);
-        assert!(c == "0A000" || c == "42601", "{sql}: {c} {m}");
+        assert_eq!(c, "42601", "{sql}: {m}");
         assert!(!m.contains('#'), "{sql}: {m}");
     }
     ok(&core, &mut s, "SET search_path = s, public");
     let (c, m) = err_as(&core, A, &mut s, "ALTER MATERIALIZED VIEW mv SET SCHEMA s2");
-    assert!(c == "0A000" || c == "42601", "{c} {m}");
+    assert_eq!(c, "42601", "{m}");
     assert!(!m.contains('#'), "{m}");
     // 失敗しても matview は元の場所に残る。
     assert_eq!(
@@ -528,6 +529,67 @@ fn alter_matview_set_schema_stays_unsupported() {
         int_rows(&[1, 2])
     );
     assert_eq!(code(&core, &mut s, "SELECT id FROM s2.mv LIMIT 5"), "42P01");
+}
+
+/// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の拒否を、所有者相当のセッションの簡易クエリで固定する（設計記録 Issue #3287 の追記「意図的な拒否」）。
+/// 移動元の修飾子の解決が構文解析より先に走るため、修飾子が自テナントに存在しなければ `3F000`、`pg_catalog` など組み込み SCHEMA なら `0A000`、
+/// 移動元が有効なら移動先の不備は構文エラー `42601` になる。権限のない主体の扱いは #3532 で追跡する。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
+#[test]
+fn alter_matview_set_schema_error_precedence_is_pinned() {
+    let (core, _g, mut s) = world("t27-mv-alter-prec");
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
+    );
+    for (sql, want) in [
+        // 移動元の修飾子が存在しない。
+        ("ALTER MATERIALIZED VIEW nope.mv SET SCHEMA s", "3F000"),
+        // 移動元の修飾子が組み込み SCHEMA。
+        (
+            "ALTER MATERIALIZED VIEW pg_catalog.mv SET SCHEMA s",
+            "0A000",
+        ),
+        // 移動元は有効で、移動先が不在・組み込み SCHEMA。
+        // 移動元の SCHEMA は存在するが matview が不在。
+        ("ALTER MATERIALIZED VIEW s.no_such_mv SET SCHEMA s", "42601"),
+        ("ALTER MATERIALIZED VIEW s.mv SET SCHEMA nope", "42601"),
+        (
+            "ALTER MATERIALIZED VIEW s.mv SET SCHEMA pg_catalog",
+            "42601",
+        ),
+    ] {
+        let (c, m) = err_as(&core, A, &mut s, sql);
+        assert_eq!(c, want, "{sql}: {m}");
+        assert!(!m.contains('#'), "{sql}: {m}");
+    }
+    // 失敗しても matview は元の場所に残る。
+    assert_eq!(
+        rows(&core, &mut s, "SELECT id FROM s.mv ORDER BY id LIMIT 10"),
+        int_rows(&[1, 2])
+    );
+}
+
+/// 簡易クエリで `public` 修飾の移動元は、セッションに同名の一時表が無ければ構文解析で `42601`、有れば `0A000` になる（一時表の作成前後で固定）。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
+#[test]
+fn alter_matview_set_schema_public_qualified_source_depends_on_temp_table() {
+    let (core, _g, mut s) = world("t27-mv-alter-public");
+    let sql = "ALTER MATERIALIZED VIEW public.mv SET SCHEMA s";
+    let (c, m) = err_as(&core, A, &mut s, sql);
+    assert_eq!(c, "42601", "{m}");
+    assert!(!m.contains('#'), "{m}");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE mv (id BIGINT PRIMARY KEY)",
+    );
+    let (c, m) = err_as(&core, A, &mut s, sql);
+    assert_eq!(c, "0A000", "{m}");
+    assert!(!m.contains('#'), "{m}");
 }
 
 /// 他テナントの同名 SCHEMA・同名 matview は互いに影響しない。

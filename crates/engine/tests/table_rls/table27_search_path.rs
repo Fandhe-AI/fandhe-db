@@ -302,7 +302,8 @@ fn copy_is_gated_by_search_path() {
         .is_ok());
 }
 
-// intentional: docs/design/schema-tenant-namespace.md（組み込み SCHEMA への作成は対象外）
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 追記（Issue #3196）の「作成先」
 #[test]
 fn creation_target_follows_the_path() {
     let (core, _g, mut s) = with_table("sp-create");

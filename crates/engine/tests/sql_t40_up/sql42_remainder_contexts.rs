@@ -194,7 +194,8 @@ fn order_by_expression_keys_accept_remainder() {
 
 /// 素の走査の `ORDER BY` が算術で始まるキーを拒否する既存制限は `%` にも `* /` と同じコードで
 /// 適用する（`%` だけ受理範囲を広げない。fail-closed）。
-/// intentional: docs/design/implementation-status.md（Issue #3274 の記録）
+/// intentional: docs/design/order-by-having-expressions.md
+/// 根拠の節: 広域取得の ORDER BY 式キー
 #[test]
 fn plain_scan_order_by_arithmetic_key_is_rejected_alike() {
     let (core, _p, _g) = setup("sql42-rem-order-reject");

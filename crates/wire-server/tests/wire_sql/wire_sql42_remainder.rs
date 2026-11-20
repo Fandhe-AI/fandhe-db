@@ -247,7 +247,8 @@ fn simple_query_remainder_in_each_expression_context() {
 }
 
 /// 素の走査の ORDER BY が算術で始まるキーを拒否する既存制限は `%` にも `* /` と同じく適用する。
-/// intentional: docs/design/implementation-status.md（Issue #3274 の記録）
+/// intentional: docs/design/order-by-having-expressions.md
+/// 根拠の節: 広域取得の ORDER BY 式キー
 #[test]
 fn plain_scan_order_by_remainder_key_is_rejected_and_keeps_connection() {
     let (mut a, _b, _g) = connect_two_tenants();

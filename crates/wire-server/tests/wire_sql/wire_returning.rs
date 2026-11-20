@@ -552,7 +552,8 @@ fn simple_ok(stream: &mut TcpStream, sql: &str, tag: &str) {
 /// 宣言的 UDF を RETURNING で呼ぶと、簡易クエリ（末尾 `;` の単独送信を含む）で
 /// RowDescription・DataRow・CommandComplete が同じ式の `SELECT` と一致する。
 /// 書き込みを試みうる `LANGUAGE sql` 関数は `0A000` で拒否され、接続は維持される。
-// intentional: docs/design/sql-returning.md（routine 呼び出しの 0A000）
+// intentional: docs/design/sql-returning.md
+// 根拠の節: 書き込みを試みうる routine の RETURNING は 0A000（受理範囲の表）
 #[test]
 fn wire_returning_udf_simple_query_matches_select_and_routine_is_rejected() {
     let (core, _guard) = new_core_with_docs_table();
