@@ -532,7 +532,7 @@ fn alter_matview_set_schema_stays_unsupported() {
 }
 
 /// `ALTER MATERIALIZED VIEW .. SET SCHEMA` の SQLSTATE 優先順位を固定する（設計記録 Issue #3287 の追記「意図的な拒否」の契約）。
-/// 移動元の修飾子の解決が構文解析より先に走るため、移動元が不在なら `3F000`、`pg_catalog` など
+/// 移動元の修飾子の解決が構文解析より先に走るため、移動元の修飾子が指す SCHEMA が自テナントに存在しなければ `3F000`（SCHEMA が存在し matview のみ不在の場合は構文解析で `42601`）、`pg_catalog` など
 /// 名前解決段で拒否される修飾子なら `0A000` が返る（`public` は通常名へ変換され後続の構文解析で `42601`。セッションに同名の一時表が無い場合に限り、有ると `reject_public_qualified_temp` が先に `0A000`）。
 /// 移動元が有効なら移動先（不在・組み込み）は名前解決の前に構文エラー `42601` になる。
 /// 修飾名で自テナントの移動元 SCHEMA を見つけた直後に USAGE を検査するため、束縛ロールに USAGE が無ければ解析前に `42501` が先に返る（別テスト `alter_matview_set_schema_qualified_without_usage_is_42501` で固定）。未修飾名は `gate_exempt` により SCHEMA の照会自体が行われないため `42501` にならない。
@@ -572,6 +572,25 @@ fn alter_matview_set_schema_error_precedence_is_pinned() {
     );
 }
 
+/// `public` 修飾の移動元は、セッションに同名の一時表が無ければ構文解析で `42601`、有れば `0A000` になる（一時表の作成前後で固定）。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
+#[test]
+fn alter_matview_set_schema_public_qualified_source_depends_on_temp_table() {
+    let (core, _g, mut s) = world("t27-mv-alter-public");
+    let sql = "ALTER MATERIALIZED VIEW public.mv SET SCHEMA s";
+    let (c, m) = err_as(&core, A, &mut s, sql);
+    assert_eq!(c, "42601", "{m}");
+    ok(
+        &core,
+        &mut s,
+        "CREATE TEMP TABLE mv (id BIGINT PRIMARY KEY)",
+    );
+    let (c, m) = err_as(&core, A, &mut s, sql);
+    assert_eq!(c, "0A000", "{m}");
+    assert!(!m.contains('#'), "{m}");
+}
+
 /// 修飾された移動元の SCHEMA に USAGE の無い束縛ロールは、構文解析より前に `42501` になる。
 /// ロールを作る手段が crate 内限定のため、権限の無い未知のロール ID を DDL 未許可のセッションへ束縛して再現する（fail-closed）。
 // intentional: docs/design/schema-tenant-namespace.md
@@ -595,6 +614,27 @@ fn alter_matview_set_schema_qualified_without_usage_is_42501() {
         "ALTER MATERIALIZED VIEW s.mv SET SCHEMA s2",
     );
     assert_eq!(c, "42501", "{m}");
+    assert!(!m.contains('#'), "{m}");
+}
+
+/// USAGE の無い DDL 未許可の束縛セッションでも、`search_path` に `s` を含めた未修飾 `mv` は
+/// `gate_exempt` により SCHEMA の照会が行われず構文解析で `42601` になる（`42501` にならない）。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: ALTER MATERIALIZED VIEW ... SET SCHEMA は意図的な拒否（#3287 の追記の節）
+#[test]
+fn alter_matview_set_schema_unqualified_without_usage_is_42601() {
+    let (core, _g, mut s) = world("t27-mv-alter-unq-usage");
+    ok(
+        &core,
+        &mut s,
+        "CREATE MATERIALIZED VIEW s.mv AS SELECT id FROM s.t",
+    );
+    let mut s = SessionState::default();
+    assert!(s.bind_resolution_tenant(A));
+    s.bind_role_ids(987_654_321, 987_654_321);
+    ok_as(&core, A, &mut s, "SET search_path = s, public");
+    let (c, m) = err_as(&core, A, &mut s, "ALTER MATERIALIZED VIEW mv SET SCHEMA s2");
+    assert_eq!(c, "42601", "{m}");
     assert!(!m.contains('#'), "{m}");
 }
 
