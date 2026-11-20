@@ -24,13 +24,13 @@ SQL-42 の項）。通常の投影では整数どうしの剰余だけを評価�
 
 ## 3. 本書の対象外
 
-次は PostgreSQL 17 では受理される形であり、本書では意図的な拒否として扱わない。
+次は PostgreSQL 17 が受理する形、または PostgreSQL 17 でも別の理由で拒否される形であり、本書では意図的な拒否として扱わない。
 
-- 小数リテラルどうしの剰余（`0.3 % 0.1`。PostgreSQL では numeric の剰余）は `0A000`
-- 精度を保てない整数式のラッパー（`22003`）。次の 2 種類に分けて扱う
-  - PostgreSQL 17 が受理する精度制限のケース: 値が 2^53 を超える BIGINT 被演算子（`where_remainder_large_bigint_operand_is_22003` の `(b + 1) % 2`）。PostgreSQL は整数のまま剰余を評価するが、本実装は f64 の精度を保てないため 22003 で拒否する
-  - 整数オーバーフローとして PostgreSQL でも同じ 22003 になるケース: `where_remainder_hardens_wrapper_interiors` の `COALESCE(CAST(b*b AS bigint), 0) % 2` など。fixture の `b = 4_000_000_000` では bigint の乗算が上限を超え、PostgreSQL 17 でも剰余の評価前に 22003 になるため、意図的な拒否ではなく PostgreSQL と一致する挙動である
+- PostgreSQL 17 が受理するが本実装が拒否する形
+  - 小数リテラルどうしの剰余（`0.3 % 0.1`。PostgreSQL では numeric の剰余）は `0A000`
+  - 値が 2^53 を超える BIGINT 被演算子（`where_remainder_large_bigint_operand_is_22003` の `(b + 1) % 2`）。PostgreSQL は整数のまま剰余を評価するが、本実装は f64 の精度を保てないため 22003 で拒否する
+- PostgreSQL 17 でも乗算のオーバーフローで 22003 になる形: `where_remainder_hardens_wrapper_interiors` の SELECT 側のケース（`COALESCE(CAST(b*b AS bigint), 0) % 2` など）。fixture の `b = 4_000_000_000` では bigint の乗算が上限を超え、剰余の評価前に PostgreSQL 17 でも 22003 になる。本実装の 22003 は PostgreSQL と一致する挙動で、SQLSTATE の一致を固定しているのはこの SELECT 側に限る（同テストの WHERE 句のケースは本実装で 22003 と 0A000 のどちらも許容しており、SQLSTATE の一致までは固定しない）
 
-上の 2 件はいずれも注記の無いまま残しており、受け皿の Issue が無い（Issue #3528 の対象外節に記録した）。
+上の形はいずれも注記の無いまま残しており、受け皿の Issue が無い（Issue #3528 の対象外節に記録した）。
 
 ベクトル型の列に対する `%`（`42883`）は PostgreSQL 17 との比較ができないため、上の表に含めず設計上の対象外として記録する。標準の PostgreSQL 17 に当該型が無く、拡張型も未実測である。検索用の型に算術演算子を持ち込まない方針で拒否を維持する。
