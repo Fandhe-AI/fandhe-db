@@ -681,6 +681,7 @@ fn truncate_restart_identity_with_triggers_is_0a000() {
 }
 
 // 呼び出し口（通過証）の無い公開入口では、TRUNCATE トリガがあれば `0A000` で行が残る。
+// intentional: docs/design/trigger-execution-model.md
 #[test]
 fn truncate_without_runtime_is_0a000() {
     let dir = tempdir();
