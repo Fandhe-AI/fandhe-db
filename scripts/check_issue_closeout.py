@@ -71,11 +71,13 @@ OUT_OF_SCOPE_RE = re.compile(r"out[- ]of[- ]scope", re.IGNORECASE)
 CURSOR_START = "<!-- CURSOR_SUMMARY -->"
 CURSOR_END = "<!-- /CURSOR_SUMMARY -->"
 # 署名行は行全体で照合する（リンク直後で途切れた崩れ行は署名と認めず検査対象に残す）。
+# リンク先は既知の Cursor の URL に限る（署名は https://cursor.com/bugbot、Configure は
+# https://www.cursor.com/dashboard/bugbot か同 dashboard?tab=bugbot）。別ドメイン・別パスは既定の形と認めない。
 CURSOR_REVIEWED_RE = re.compile(
     r"> <sup>Reviewed by \[Cursor Bugbot\]\(https://cursor\.com/bugbot\)"
     r" for commit [0-9a-fA-F]{7,40}\.?"
     r"(?: Bugbot is set up for automated code reviews on this repo\.)?"
-    r"(?: Configure \[here\]\(https://[^()\s<>]+\)\.?)?</sup>"
+    r"(?: Configure \[here\]\(https://www\.cursor\.com/dashboard(?:/bugbot|\?tab=bugbot)\)\.?)?</sup>"
 )
 # 書式が崩れた Cursor Bugbot の署名の検出用。署名の形をした引用行（`<sup>` で始まる行、または
 # `<sup>` の有無にかかわらず `Reviewed by` で始まる行）のうち、Bugbot の表示名・署名用 URL
@@ -191,32 +193,50 @@ def _split_segment(lines: list[str]) -> list[str]:
     return [" ".join(parts) for parts in items]
 
 
-def _cursor_summary_end(lines: list[str], start: int) -> tuple[int | None, int]:
+def _cursor_summary_end(lines: list[str], start: int) -> int | None:
     """`lines[start]` の開始の印から続く Cursor 要約区間が既定の形なら終了の印の添字を返す。
 
     形: 内側 1 行目が `---`、以降は空行か `>` 始まりの行だけで、Reviewed by の引用行を含み、
-    終了の印で閉じる。最初の不適合行で先読みを打ち切る（線形時間）。
-    戻り値は (終了の印の添字 or 不成立の None, 先読みが止まった添字)。
+    終了の印で閉じる。最初の不適合行で先読みを打ち切り、不成立なら None を返す。
     """
     i = start + 1
     if i >= len(lines) or lines[i] != "---":
-        return None, min(i, len(lines) - 1)
+        return None
     reviewed = False
     i += 1
     while i < len(lines):
         line = lines[i]
         if line == CURSOR_END:
-            return (i if reviewed else None), i
+            return i if reviewed else None
         if line.strip() and not line.startswith(">"):
-            return None, i
+            return None
         if CURSOR_REVIEWED_RE.fullmatch(line):
             reviewed = True
         elif CURSOR_SIGNATURE_HINT_RE.search(line):
             # Cursor Bugbot の署名候補なのに既定書式と一致しない行（空白の揺れ・途切れ・文の改変等）は、
             # 正規の署名が別にあっても区間ごと検査対象に残す
-            return None, i
+            return None
         i += 1
-    return None, len(lines) - 1
+    return None
+
+
+def _cursor_failed_region_end(lines: list[str], start: int) -> int:
+    """不成立だった開始の印 `lines[start]` が覆う範囲の末尾の添字を返す（この範囲の開始行は除外候補にしない）。
+
+    開始・終了の印の入れ子の深さを数え、深さが 0 に戻る終了の印までを範囲とする。対応する終了の印が
+    無ければ本文の末尾まで。崩れた外側の区間の中に既定の形の内側区間があっても、内側だけを除外して
+    外側の引用行・参照を消すことを防ぐ（fail-closed。範囲を広く取る分には検査対象が増えるだけ）。
+    呼び出し側は範囲内の開始行を読み飛ばすので、走査は全体で線形時間に収まる。
+    """
+    depth = 0
+    for j in range(start, len(lines)):
+        if lines[j] == CURSOR_START:
+            depth += 1
+        elif lines[j] == CURSOR_END:
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(lines) - 1
 
 
 def extract_out_of_scope_sections(body: str) -> list[Section]:
@@ -237,15 +257,15 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
 
     lines = text.split("\n")
     i = 0
-    no_cursor_until = -1  # 不成立になった候補の先読み範囲内の開始行は再認識しない
+    no_cursor_until = -1  # 不成立になった区間（終了の印まで）の中の開始行は除外候補にしない
     while i < len(lines):
         line = lines[i]
         i += 1
         if fence is None and active is not None:
             if line == CURSOR_START and i - 1 > no_cursor_until:
-                end, stop = _cursor_summary_end(lines, i - 1)
+                end = _cursor_summary_end(lines, i - 1)
                 if end is None:
-                    no_cursor_until = stop
+                    no_cursor_until = _cursor_failed_region_end(lines, i - 1)
                 else:
                     active.excluded["cursor-summary"] = active.excluded.get("cursor-summary", 0) + 1
                     i = end + 1

@@ -284,6 +284,42 @@ class AutoSummaryTests(unittest.TestCase):
                 self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1, mention)
                 self.assertEqual(secs[0].items, ["a #1", "b #2"], mention)
 
+    def test_cursor_configure_other_domain_kept(self):
+        # Configure のリンク先を Cursor 以外のドメイン・別パスに変えた署名は既定の形と認めず、区間を残す
+        for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
+            for url in ("https://evil.example/dashboard/bugbot",
+                        "https://www.cursor.com.evil.example/dashboard/bugbot",
+                        "https://example.com/x",
+                        "https://www.cursor.com/dashboard/other"):
+                bad = re.sub(r"Configure \[here\]\([^)]*\)", f"Configure [here]({url})", sig)
+                self.assertNotEqual(bad, sig)
+                lines = CURSOR_BLOCK.splitlines()
+                lines[5] = bad
+                lines.insert(4, "> remaining work #9")
+                secs = cic.extract_out_of_scope_sections(BASE + "\n" + "\n".join(lines) + "\n")
+                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, url)
+                self.assertIn("#9", " ".join(secs[0].items), url)
+
+    def test_cursor_malformed_outer_with_valid_inner_kept(self):
+        # 印のそろった外側区間が崩れた署名行で不成立なら、その後ろの内側の既定形区間も除外せず外側全体を残す
+        bad_sig = "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) remaining work #9</sup>"
+        for tail in ("", "> outer tail #78\n"):
+            text = (BASE + "\n<!-- CURSOR_SUMMARY -->\n---\n> outer work #77\n" + bad_sig + "\n"
+                    + CURSOR_BLOCK.replace("synthetic text", "inner work #88") + "\n"
+                    + tail + "<!-- /CURSOR_SUMMARY -->\n")
+            secs = cic.extract_out_of_scope_sections(text)
+            self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, tail)
+            joined = " ".join(secs[0].items)
+            for ref in ("#77", "#9", "#88") + (("#78",) if tail else ()):
+                self.assertIn(ref, joined, (tail, ref))
+
+    def test_cursor_valid_block_after_failed_region_still_excluded(self):
+        # 不成立の区間が終了の印で閉じた後に続く、独立した既定形の区間は従来どおり除外する
+        text = (BASE + "\n" + CURSOR_BLOCK.replace("Reviewed by", "Seen by") + "\n\n"
+                + CURSOR_BLOCK + "\n")
+        secs = cic.extract_out_of_scope_sections(text)
+        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
+
     def test_cursor_nested_inner_start_not_recognized(self):
         # 外側が不成立のとき内側の開始行を新候補にせず、外側の引用行・参照を検査に残す
         inner = CURSOR_BLOCK
