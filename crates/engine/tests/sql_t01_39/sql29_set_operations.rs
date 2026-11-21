@@ -2153,8 +2153,10 @@ fn set_operation_order_by_works_for_cursor_and_view() {
     assert_eq!(langs(&viewed), vec!["ja", "fr", "en"]);
 }
 
-/// 比較できないキー型は `0A000`（未ソートの行を返さない）。Describe と Execute で一致する。
-// intentional: docs/design/set-operations.md
+/// 比較できないキー型（`TIMESTAMPTZ`・`VECTOR` 等）は `0A000`（未ソートの行を返さない）。Describe と Execute で一致する。
+/// 式キーの拒否と違い、比較できないキー型は PostgreSQL が受理する形で未対応分のため、受け皿 #3534 で追跡する
+/// （`docs/design/set-operations.md` の未対応節）。拒否は結線までの暫定の fail-closed。
+// tracked: #3534
 #[test]
 fn set_operation_order_by_rejects_unsortable_key_types() {
     let path = unique_db_path("set-op-order-unsortable");

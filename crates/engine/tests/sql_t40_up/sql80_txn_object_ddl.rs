@@ -5,7 +5,7 @@
 //! `EngineCore::execute_sql_in_txn`（明示 Tx の production 入口）で、対象の DDL を共有 write txn へ積み、
 //! COMMIT で原子的に確定し、ROLLBACK では痕跡を残さないことを固定する。SEQUENCE の採番状態は
 //! 非トランザクション性を保つ（ROLLBACK しても採番済みの値は戻らない）。未対応の形は `0A000` で
-//! fail-closed になる（受け皿は #3311）。`sql80_txn_table_ddl.rs` と同じ流儀。
+//! fail-closed になる（受け皿は #3533）。`sql80_txn_table_ddl.rs` と同じ流儀。
 
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;

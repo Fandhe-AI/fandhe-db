@@ -432,7 +432,10 @@ fn update_set_resend_distinguishes_remainder_from_division() {
     assert_eq!(col_by_id(&core, "t1", "n"), vec![1, 1, -7, 4, 6]);
 }
 
-/// 未対応の形は fail-closed で拒否する。構文不完全形・float・小数リテラルの拒否も同様（Issue #3273）。
+/// 未対応の形は fail-closed で拒否する（Issue #3273）。ケースごとに根拠が異なる。
+/// - 構文不完全形（`n % = 0`）は通常の構文エラー `42601`。
+/// - float 列の `%`（`42883`）は PostgreSQL にも無い意図的な拒否で、根拠は設計記録 modulo-operator.md。
+/// - 小数リテラルの `%`（`0A000`）は未対応分で、受け皿 #3534 で追跡する。
 /// intentional: docs/design/modulo-operator.md
 /// tracked: #3534
 #[test]

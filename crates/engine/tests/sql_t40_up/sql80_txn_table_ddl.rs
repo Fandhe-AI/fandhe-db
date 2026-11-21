@@ -5,7 +5,7 @@
 //! `EngineCore::execute_sql_in_txn`（明示 Tx の production 入口）で、`CREATE TABLE`・`ALTER TABLE` の一部・
 //! `DROP TABLE`・`CREATE INDEX`・`DROP INDEX` を共有 write txn へ積み、COMMIT で原子的に確定し、
 //! ROLLBACK・失敗では痕跡を残さないことを固定する。DDL 後に実行できる文は暫定の許可リストに限り、
-//! それ以外は `0A000` で fail-closed になる（受け皿は #3311。権限の再判定・拡張クエリ・UPDATE/DELETE 等）。
+//! それ以外は `0A000` で fail-closed になる（受け皿は #3533。権限の再判定・拡張クエリ・UPDATE/DELETE 等）。
 //! `sql31_transaction.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／`CleanupGuard`）。
 
 use engine::core::EngineCore;
@@ -509,7 +509,7 @@ fn reads_after_a_drop_are_rejected_with_0a000() {
 }
 
 // 制約の追加・削除・改名・型変更・SERIAL/IDENTITY 列の Tx 内対応は #3313 の範囲外（受け皿の子 Issue は未起票。
-// 起票までは親の #3311 を指す）。
+// 受け皿は #3533）。
 #[test]
 // tracked: #3533
 fn unsupported_alter_actions_and_serial_columns_are_rejected_with_0a000() {
