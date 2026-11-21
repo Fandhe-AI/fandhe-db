@@ -9932,6 +9932,9 @@ impl EngineCore {
         let refreshed = self.refresh_prepared_snap(session, prepared, None)?;
         let prepared = refreshed.as_ref().unwrap_or(prepared);
         Self::check_prepared_for_session(session, prepared)?;
+        // Issue #3532: Parse は USAGE を見ないため、Bind と同じ USAGE の再検査を Describe でも行い、
+        // USAGE の無い束縛ロールに SCHEMA 配下の列の名前・型を返さない（Bind と同じ `42501`。fail-closed）。
+        self.recheck_prepared_schema_usage(session, prepared)?;
         // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
         self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
         self.describe_parsed_in_session_impl(
@@ -12550,6 +12553,8 @@ impl EngineCore {
             let refreshed = self.refresh_prepared_snap(session, prepared, snap)?;
             let prepared = refreshed.as_ref().unwrap_or(prepared);
             Self::check_prepared_for_session(session, prepared)?;
+            // Issue #3532: Bind と同じ USAGE の再検査（`describe_prepared_in_session` と同じ理由）。
+            self.recheck_prepared_schema_usage(session, prepared)?;
             // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
             self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, snap)?;
             // カーソル文は txn の開いているカーソルから列を引く（従来の経路）。

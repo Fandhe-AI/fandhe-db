@@ -295,6 +295,42 @@ fn prepared_without_params_is_rechecked_by_public_entry() {
     assert_eq!(err.wire_code(), "42501");
 }
 
+/// Describe(S)（`describe_prepared_in_session`）も Bind と同じく USAGE を検査し、USAGE の無い束縛ロールに
+/// 列の名前・型を返さない（Issue #3532。Parse は USAGE を見ない）。拒否は Bind の再検査と同じ `42501`・同じ文言。
+#[test]
+fn prepared_describe_requires_usage_for_bound_role() {
+    let (core, _g, mut o, mut a) = fixture("sacl_prep_describe");
+    assert!(a.bind_resolution_tenant("t1"));
+    let sqls = [
+        "SELECT id, name FROM s.t",
+        "SELECT id, name FROM s.t WHERE id = $1",
+    ];
+    for sql in sqls {
+        let prepared = core
+            .parse_sql_prepared_with_declared_in_session(&a, sql, &[])
+            .expect("parse");
+        let err = core
+            .describe_prepared_in_session(&a, &prepared)
+            .expect_err("describe without usage");
+        assert_eq!(err.wire_code(), "42501", "{sql}");
+        let bind_err = core
+            .recheck_prepared_schema_usage(&a, &prepared)
+            .expect_err("bind recheck without usage");
+        assert_eq!(err.to_string(), bind_err.to_string(), "{sql}");
+    }
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    for sql in sqls {
+        let prepared = core
+            .parse_sql_prepared_with_declared_in_session(&a, sql, &[])
+            .expect("parse");
+        let columns = core
+            .describe_prepared_in_session(&a, &prepared)
+            .unwrap_or_else(|e| panic!("{sql}: {} {e}", e.wire_code()))
+            .expect("columns");
+        assert_eq!(columns.len(), 2, "{sql}");
+    }
+}
+
 #[test]
 fn prepared_recheck_reports_dropped_schema_as_undefined_table() {
     let (core, _g, mut o, mut a) = fixture("sacl_prep_drop");
