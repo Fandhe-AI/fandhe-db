@@ -76,7 +76,7 @@ CURSOR_REVIEWED_RE = re.compile(
     r"(?: Configure \[here\]\(https://[^()\s<>]+\)\.?)?</sup>"
 )
 # 引用行の先頭から Cursor Bugbot の署名を始めている行（書式が崩れた署名の検出用。本文中の言及は含めない）。
-CURSOR_SIGNATURE_START_RE = re.compile(r">\s*<sup>\s*Reviewed by\s*\[Cursor Bugbot\]")
+CURSOR_SIGNATURE_START_RE = re.compile(r">\s*<sup>\s*Reviewed\s+by\b", re.IGNORECASE)
 CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
@@ -551,7 +551,7 @@ class Item:
 
 def items_from_prs(
     prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int] | None = None,
-    excluded_out: list[tuple[int, int, str, dict[str, int]]] | None = None,
+    excluded_out: list[tuple[int, int, str, dict[str, int], int]] | None = None,
 ) -> tuple[list[Item], int]:
     """PR 本文から項目を作る。`seen_prs` を渡すと既出 PR は結果から省く（報告の重複排除用）。
 
@@ -564,10 +564,11 @@ def items_from_prs(
             if pr_number in seen_prs:
                 continue
             seen_prs.add(pr_number)
-        for sec in extract_out_of_scope_sections(body):
+        for sec_index, sec in enumerate(extract_out_of_scope_sections(body)):
             sections += 1
             if excluded_out is not None and sec.excluded:
-                excluded_out.append((issue, pr_number, sec.heading, dict(sec.excluded)))
+                # 節の出現順を含め、同名見出しの別節を区別できるようにする
+                excluded_out.append((issue, pr_number, sec.heading, dict(sec.excluded), sec_index))
             for idx, text in enumerate(sec.items, 1):
                 items.append(
                     Item(issue, pr_number, sec.heading, idx,
@@ -603,7 +604,7 @@ def closeout(
     sections_total = 0
     merged_total = 0
     seen_prs: set[int] = set()
-    excluded_all: list[tuple[int, int, str, dict[str, int]]] = []
+    excluded_all: list[tuple[int, int, str, dict[str, int], int]] = []
     edges: dict[int, list[int]] = {}
     for node in descendants:
         if node.truncated_prs:
@@ -653,14 +654,14 @@ def closeout(
                 prs = node.merged_prs
             else:
                 prs = []
-            ex_out: list[tuple[int, int, str, dict[str, int]]] = []
+            ex_out: list[tuple[int, int, str, dict[str, int], int]] = []
             for it in items_from_prs(prs, n, repo, set(), ex_out)[0]:
                 refs.extend(r for r in it.refs if r not in refs)
             # ツリー外の走査で除外した要約も --verbose の EXCLUDED に出す（同じ (PR, 見出し) は重複させない）
-            known = {(e[1], e[2]) for e in excluded_all}
+            known = {(e[1], e[4]) for e in excluded_all}
             for e in ex_out:
-                if (e[1], e[2]) not in known:
-                    known.add((e[1], e[2]))
+                if (e[1], e[4]) not in known:
+                    known.add((e[1], e[4]))
                     excluded_all.append(e)
             edges[n] = refs
             nxt.extend(r for r in refs if r not in edges and r not in in_tree)
@@ -683,7 +684,7 @@ def closeout(
         elif verbose:
             lines.append(f"OK          {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
     if verbose:
-        for ex_issue, ex_pr, ex_heading, ex_counts in excluded_all:
+        for ex_issue, ex_pr, ex_heading, ex_counts, _ in excluded_all:
             kinds = " ".join(f"{k}={v}" for k, v in sorted(ex_counts.items()))
             lines.append(f'EXCLUDED    issue #{ex_issue} pr #{ex_pr} section "{ex_heading}" {kinds}')
     for comp in cycles:

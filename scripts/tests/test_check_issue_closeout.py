@@ -199,6 +199,23 @@ class AutoSummaryTests(unittest.TestCase):
         self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
         self.assertIn("#9", " ".join(secs[0].items))
 
+    def test_cursor_signature_missing_bracket_mixed_with_valid_kept(self):
+        # 閉じ角括弧が欠けた署名風の行は、正常な署名と同一区間でも区間を除外しない（fail-closed）
+        lines = CURSOR_BLOCK.splitlines()
+        lines.insert(4, "> <sup>Reviewed by [Cursor Bugbot(https://cursor.com/bugbot) remaining work #9")
+        blk = "\n".join(lines)
+        secs = cic.extract_out_of_scope_sections(BASE + "\n" + blk + "\n")
+        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
+        self.assertIn("#9", " ".join(secs[0].items))
+
+    def test_verbose_reports_both_same_heading_sections_outside_tree(self):
+        # ツリー外 PR に同名見出しの対象外節が 2 つあり両方の自動要約を除外したとき、2 つとも EXCLUDED に出る
+        sec = "## 対象外\n\n- see #600\n\n" + FOOTER + "\n\n"
+        g = FakeGh(bodies={101: (901, body("#700")), 700: (950, sec + sec)},
+                   states={700: "CLOSED"}, tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100", "--verbose"])
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("EXCLUDED") and "pr #950" in l]), 2, out)
+
     def test_cursor_quote_mentioning_reviewed_by_with_valid_signature_excluded(self):
         # 正式な署名が別にあるとき、本文の引用行に Reviewed by / <sup> が含まれるだけでは区間を検査対象に戻さない
         lines = CURSOR_BLOCK.splitlines()
