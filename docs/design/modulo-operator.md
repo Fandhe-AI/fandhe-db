@@ -18,4 +18,4 @@ SQL-42 の項）。本書は、`sql42_remainder_operator.rs` のテストが固�
 | ベクトル型の列に対する `%`（`embedding % 2`） | `42883` | 同上 | `%` はベクトルに対する定義が無く、fail-closed のまま拒否する。PostgreSQL 17 との比較はしていない（根拠にしない） |
 
 - PostgreSQL 17 の確認は、公式の `postgres:17` コンテナで同じ形の文を実行した（使い捨て・資格情報なし）。確認したのは real・double precision・integer・text に限る
-- 上の表以外の形（numeric・小数リテラル・BIGINT の範囲検査など）の SQLSTATE は本書では断定しない。小数リテラルの剰余は `decimal_literal_remainder_is_rejected_not_approximated` が `0A000` の拒否を固定するが、注記の対象外で、根拠はここに書かない
+- 上の表以外の形（numeric・小数リテラル・BIGINT の範囲検査など）の SQLSTATE は本書では断定しない。小数リテラルの剰余は `decimal_literal_remainder_is_rejected_not_approximated` が `0A000` の拒否を固定する。これは未対応分で、受け皿 Issue #3534 を `tracked:` 注記で指しており、意図的な拒否ではないため根拠はここに書かない

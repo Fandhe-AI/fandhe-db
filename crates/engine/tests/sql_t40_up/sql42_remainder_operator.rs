@@ -233,6 +233,9 @@ fn unsupported_operand_types_are_42883() {
 }
 
 /// 小数リテラルの剰余は f64 の fmod（`0.3 % 0.1` が約 0.1）へ流さず fail-closed で拒否する（0A000）。
+/// 未対応分で、受け皿 #3534 で追跡する。
+///
+/// tracked: #3534
 #[test]
 fn decimal_literal_remainder_is_rejected_not_approximated() {
     let (core, ctx, _g) = setup();
