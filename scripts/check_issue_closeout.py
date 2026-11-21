@@ -94,6 +94,8 @@ class Info:
     kind: str  # "issue" | "pr" | "missing"
     state: str = ""  # "open" | "closed"（PR は merged も closed 扱い）
     body: str = ""
+    # PR が GraphQL の merged == true（bool）と確認できたか。取れない・型が不正なら False（除外の集計に使わない）
+    merged: bool = False
 
 
 @dataclass
@@ -464,7 +466,7 @@ def resolve_numbers(
                 cache[n] = Info("missing")
             elif node.get("__typename") == "PullRequest":
                 body = (node.get("body") or "").encode("utf-8")[:MAX_BODY_BYTES].decode("utf-8", "ignore")
-                cache[n] = Info("pr", str(node.get("state", "")).lower(), body)
+                cache[n] = Info("pr", str(node.get("state", "")).lower(), body, node.get("merged") is True)
             else:
                 cache[n] = Info("issue", str(node.get("state", "")).lower())
 
@@ -582,10 +584,14 @@ def closeout(
             info = cache.get(n, Info("missing"))
             refs: list[int] = []
             direct_pr = False
+            collect_excluded = True
             if info.kind == "pr":
-                # PR を直接走査した場合、除外ログの issue 欄は空にする（`pr #N` だけを表示する）
+                # PR を直接走査した場合、除外ログの issue 欄は空にする（`pr #N` だけを表示する）。
+                # 除外の集計・表示はマージ済みと確認できた PR に限る（open・未マージで close の PR は出さない）。
+                # 参照の辿り方（循環検出用の辺）は従来どおり本文から作る
                 prs = [(n, info.body)]
                 direct_pr = True
+                collect_excluded = info.merged
             elif info.kind == "issue" and info.state == "closed":
                 node = fetch_node(runner, repo, n)
                 if node.truncated_prs:
@@ -594,7 +600,7 @@ def closeout(
             else:
                 prs = []
             ex_out: list[tuple[int | None, int, str, dict[str, int], int]] = []
-            for it in items_from_prs(prs, n, repo, set(), ex_out, direct_pr)[0]:
+            for it in items_from_prs(prs, n, repo, set(), ex_out if collect_excluded else None, direct_pr)[0]:
                 refs.extend(r for r in it.refs if r not in refs)
             # ツリー外の走査で除外した生成表示も EXCLUDED に出す（同じ (PR, 節の出現順) は重複させない）
             for e in ex_out:

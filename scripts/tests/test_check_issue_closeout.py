@@ -196,9 +196,10 @@ class AutoSummaryTests(unittest.TestCase):
 class FakeGh:
     """parent=100 の子 101..104。101 untracked、102 closed のみ、103/104 が循環、それぞれ PR を持つ。"""
 
-    def __init__(self, bodies=None, states=None, tree=None, pr_bodies=None):
-        # pr_bodies: 番号 -> ツリー外で直接参照される PR の本文
+    def __init__(self, bodies=None, states=None, tree=None, pr_bodies=None, pr_states=None):
+        # pr_bodies: 番号 -> ツリー外で直接参照される PR の本文。pr_states: 番号 -> (state, merged)。既定はマージ済み
         self.pr_bodies = pr_bodies or {}
+        self.pr_states = pr_states or {}
         self.tree = tree or {100: [101, 102, 103, 104], 101: [], 102: [], 103: [], 104: []}
         self.bodies = bodies or {
             101: (901, body(f"nothing here {SENTINEL}")),
@@ -226,7 +227,8 @@ class FakeGh:
         for n in nums:
             st = self.states.get(n)
             if n in self.pr_bodies:
-                data[f"n{n}"] = {"__typename": "PullRequest", "state": "MERGED", "merged": True,
+                pr_state, merged = self.pr_states.get(n, ("MERGED", True))
+                data[f"n{n}"] = {"__typename": "PullRequest", "state": pr_state, "merged": merged,
                                  "body": self.pr_bodies[n]}
             elif st is None:
                 data[f"n{n}"] = None
@@ -325,6 +327,29 @@ class IntegrationTests(unittest.TestCase):
                     states={700: "CLOSED", 600: "OPEN"}, tree={100: [101], 101: []})
         _, out2, _ = run_cli(g2, ["100", "--verbose"])
         self.assertIn('EXCLUDED    issue #700 pr #950 section "対象外"', out2)
+
+    def test_direct_pr_excluded_only_when_merged(self):
+        # 直接参照した PR の除外の集計・表示は merged == true の PR だけ。open・未マージで close・merged の欠落や
+        # 型の不正では出さない。参照の辿り方（循環検出）は merged に依らず変えない
+        pr_body = "## 対象外\n\n- hand over to #103\n\n" + FOOTER + "\n"
+        cases = {
+            "merged": (("MERGED", True), True),
+            "open": (("OPEN", False), False),
+            "closed-unmerged": (("CLOSED", False), False),
+            "merged-missing": (("MERGED", None), False),
+            "merged-not-bool": (("MERGED", "true"), False),
+        }
+        for name, (pr_state, shown) in cases.items():
+            g = FakeGh(bodies={101: (901, body("#700")), 103: (903, body("hand over to #700"))},
+                       tree={100: [101, 103], 101: [], 103: []}, states={103: "CLOSED"},
+                       pr_bodies={700: pr_body}, pr_states={700: pr_state})
+            for argv in (["100", "--verbose"], ["100"]):
+                _, out, _ = run_cli(g, argv)
+                ex = [l for l in out.splitlines() if l.startswith("EXCLUDED")]
+                self.assertEqual(ex, ([
+                    'EXCLUDED    pr #700 section "対象外" claude-code-footer=1' if "--verbose" in argv
+                    else "EXCLUDED    pr #700 count=1"] if shown else []), (name, argv, out))
+                self.assertIn("CYCLE       #103 -> #700 -> #103", out, (name, argv))
 
     def test_clean_tree(self):
         g = FakeGh(bodies={101: (901, body("see #600"))}, tree={100: [101], 101: []})
