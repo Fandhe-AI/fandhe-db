@@ -13,6 +13,10 @@
                                           退行幅に対する是正の回収率
   perrow  <label>=<dir>[,<dir>...] ...    agg 系の 1 セルあたり ns（meta.rows と集計数から導出）
 
+オプション（group・compare の前に置く）:
+  --extra-phases=<phase>[,<phase>...]     既定の phase の後ろに表へ足す phase（Issue #3226・#3301 の
+                                          hybrid_rrf・scan_where_nosort_k500 等）。省略時の出力は従来と同じ
+
 統計量は p50_us（1 計測 = 50 反復の中央値）の run 間集計。`幅` は (max-min)/min。
 """
 
@@ -28,6 +32,8 @@ import sys
 AGG_PHASES = ["agg_multi", "agg_count", "rls_isolation"]
 REF_PHASES = ["vector_knn", "vector_knn_where", "where_compound_count", "group_by_having"]
 PHASES = AGG_PHASES + REF_PHASES
+# --extra-phases で足す phase。判定クラスのノイズ帯は REF_PHASES の幅のまま（追加 phase は帯の算出に使わない）。
+EXTRA_PHASES: list[str] = []
 
 # 判定クラスの固定帯（benchmark-judgement-policy §4 の固定 ±5%）。
 FIXED_BAND = 0.05
@@ -80,7 +86,7 @@ def cmd_group(specs):
         print(f"### {label}（n={len(paths)}）\n")
         print("| phase | n | min-of-N (us) | median (us) | max (us) | 幅 (max-min)/min |")
         print("| ----- | -- | ------------- | ----------- | -------- | ---------------- |")
-        for ph in PHASES:
+        for ph in PHASES + EXTRA_PHASES:
             s = stats(paths, ph)
             print(f"| {ph} | {s['n']} | {f2(s['min'])} | {f2(s['median'])} | {f2(s['max'])} | {pct(s['spread'])} |")
         print()
@@ -108,7 +114,7 @@ def cmd_compare(before_label, after_label, specs):
         f"{after_label} median | ratio (min-of-N) | ratio (median) | 自区間の幅（両 arm の最大） | 判定クラス |"
     )
     print("| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |")
-    for ph in PHASES:
+    for ph in PHASES + EXTRA_PHASES:
         sb, sa = stats(b, ph), stats(a, ph)
         r_min = sa["min"] / sb["min"]
         r_med = sa["median"] / sb["median"]
@@ -183,6 +189,13 @@ def cmd_bisect(base):
 
 
 def main(argv):
+    opts = [a for a in argv[1:] if a.startswith("--extra-phases=")]
+    argv = [argv[0]] + [a for a in argv[1:] if not a.startswith("--extra-phases=")]
+    for o in opts:
+        names = [x for x in o.split("=", 1)[1].split(",") if x]
+        if not names:
+            raise SystemExit(f"invalid option: {o}")
+        EXTRA_PHASES.extend(n for n in names if n not in PHASES and n not in EXTRA_PHASES)
     if len(argv) < 2:
         raise SystemExit(__doc__)
     cmd = argv[1]
