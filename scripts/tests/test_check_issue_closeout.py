@@ -142,249 +142,31 @@ class ParseTests(unittest.TestCase):
 
 
 FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
+# 実 PR の Cursor Bugbot 要約と同じ形の区間（本文は合成）。除外せず通常の本文として検査されることの固定用
 CURSOR_BLOCK = (
-    "<!-- CURSOR_SUMMARY -->\n---\n\n> **Note**\n> synthetic text\n"
-    "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit abcdef1. Configure [here](https://www.cursor.com/dashboard?tab=bugbot).</sup>\n"
+    "<!-- CURSOR_SUMMARY -->\n---\n\n> [!NOTE]\n> **Low Risk**\n> synthetic text\n> \n"
+    "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit "
+    "0123456789abcdef0123456789abcdef01234567. Bugbot is set up for automated code reviews on this repo. "
+    "Configure [here](https://www.cursor.com/dashboard/bugbot).</sup>\n"
     "<!-- /CURSOR_SUMMARY -->"
 )
 BASE = "## 対象外\n\n- a #1\n- b #2\n"
-REAL_SIGNATURE = (
-    "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit "
-    "0123456789abcdef0123456789abcdef01234567. Bugbot is set up for automated code reviews on this repo. "
-    "Configure [here](https://www.cursor.com/dashboard/bugbot).</sup>"
-)
-
-
-def parse_verified(text):
-    # 本文の形の検査用。生成元（Cursor Bugbot の編集記録）は確認済みとして解析する
-    return cic.extract_out_of_scope_sections(text, cursor_allow=lambda block: True)
 
 
 def items_of(text):
-    secs = parse_verified(text)
+    secs = cic.extract_out_of_scope_sections(text)
     return secs[0].items if secs else []
 
 
 class AutoSummaryTests(unittest.TestCase):
-    def test_auto_summaries_excluded_items_unchanged(self):
-        secs = parse_verified(
-            BASE + "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n")
+    def test_footer_excluded_items_unchanged(self):
+        secs = cic.extract_out_of_scope_sections(BASE + "\n" + FOOTER + "\n")
         self.assertEqual(secs[0].items, ["a #1", "b #2"])
-        self.assertEqual(secs[0].excluded, {"cursor-summary": 1, "claude-code-footer": 1})
-
-    def test_cursor_missing_end_marker_kept(self):
-        text = BASE + CURSOR_BLOCK.replace("<!-- /CURSOR_SUMMARY -->", "") + "\n"
-        self.assertGreater(len(items_of(text)), 2)
-
-    def test_cursor_malformed_kept(self):
-        variants = {
-            "list": CURSOR_BLOCK.replace("> synthetic text", "- remaining work"),
-            "heading": CURSOR_BLOCK.replace("> synthetic text", "### remaining"),
-            "fence": CURSOR_BLOCK.replace("> synthetic text", "```"),
-            "nested": CURSOR_BLOCK.replace("> synthetic text", "<!-- CURSOR_SUMMARY -->"),
-            "no-hr": CURSOR_BLOCK.replace("---", "***"),
-            "no-reviewed": CURSOR_BLOCK.replace("Reviewed by", "Seen by"),
-            "indent": " " + CURSOR_BLOCK,
-            "truncated-signature": CURSOR_BLOCK.replace(
-                "> synthetic text", "> remaining work"
-            ).replace(" for commit abcdef1. Configure [here](https://www.cursor.com/dashboard?tab=bugbot).</sup>", ""),
-            "free-text-after-link": CURSOR_BLOCK.replace(
-                " for commit abcdef1.", " remaining work #9 for commit abcdef1."),
-            "trailing-space": CURSOR_BLOCK.replace("<!-- CURSOR_SUMMARY -->", "<!-- CURSOR_SUMMARY --> "),
-        }
-        for name, blk in variants.items():
-            secs = parse_verified(BASE + "\n" + blk + "\n")
-            self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, name)
-            self.assertGreater(len(secs[0].items), 2, name)
-
-    def test_cursor_malformed_signature_mixed_with_valid_kept(self):
-        # 引用記号直後の空白が二つの崩れた署名が、正常な署名と同一区間に混在しても区間を除外しない
-        good = CURSOR_BLOCK.splitlines()[4]
-        bad = ">  <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) remaining work #9"
-        lines = CURSOR_BLOCK.splitlines()
-        lines.insert(4, bad)
-        self.assertIn(good, lines)
-        blk = "\n".join(lines)
-        secs = parse_verified(BASE + "\n" + blk + "\n")
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
-        self.assertIn("#9", " ".join(secs[0].items))
-
-    def test_cursor_signature_missing_bracket_mixed_with_valid_kept(self):
-        # 閉じ角括弧が欠けた署名風の行は、正常な署名と同一区間でも区間を除外しない（fail-closed）
-        lines = CURSOR_BLOCK.splitlines()
-        lines.insert(4, "> <sup>Reviewed by [Cursor Bugbot(https://cursor.com/bugbot) remaining work #9")
-        blk = "\n".join(lines)
-        secs = parse_verified(BASE + "\n" + blk + "\n")
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
-        self.assertIn("#9", " ".join(secs[0].items))
-
-    def test_verbose_reports_both_same_heading_sections_outside_tree(self):
-        # ツリー外 PR に同名見出しの対象外節が 2 つあり両方の自動要約を除外したとき、2 つとも EXCLUDED に出る
-        sec = "## 対象外\n\n- see #600\n\n" + FOOTER + "\n\n"
-        g = FakeGh(bodies={101: (901, body("#700")), 700: (950, sec + sec)},
-                   states={700: "CLOSED"}, tree={100: [101], 101: []})
-        code, out, _ = run_cli(g, ["100", "--verbose"])
-        self.assertEqual(len([l for l in out.splitlines() if l.startswith("EXCLUDED") and "pr #950" in l]), 2, out)
-
-    def test_cursor_quote_mentioning_reviewed_by_with_valid_signature_excluded(self):
-        # 正式な署名が別にあるとき、本文の引用行に Reviewed by / <sup> が含まれるだけでは区間を検査対象に戻さない
-        lines = CURSOR_BLOCK.splitlines()
-        lines.insert(4, "> note: Reviewed by the team, see <sup>1</sup>")
-        blk = "\n".join(lines)
-        secs = parse_verified(BASE + "\n" + blk + "\n")
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
-        self.assertEqual(secs[0].items, ["a #1", "b #2"])
-
-    def test_cursor_real_signature_format_excluded(self):
-        # 実データの署名（40 桁の commit・"Bugbot is set up ..." の一文・/dashboard/bugbot）は既定の形として除外する
-        lines = CURSOR_BLOCK.splitlines()
-        lines[5] = REAL_SIGNATURE
-        secs = parse_verified(BASE + "\n" + "\n".join(lines) + "\n")
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
-        self.assertEqual(secs[0].items, ["a #1", "b #2"])
-
-    def test_cursor_real_signature_sentence_altered_kept(self):
-        # 署名の定型文を改変した行は既定の形と認めず、区間を検査対象に残す（fail-closed）
-        lines = CURSOR_BLOCK.splitlines()
-        lines[5] = REAL_SIGNATURE.replace("on this repo.", "on this repo, remaining work #9.")
-        secs = parse_verified(BASE + "\n" + "\n".join(lines) + "\n")
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
-        self.assertIn("#9", " ".join(secs[0].items))
-
-    def test_cursor_unrelated_sup_signature_quote_with_valid_signature_excluded(self):
-        # Bugbot の手掛かりを含まない別の署名の引用は、正常な署名と同じ区間にあっても区間を検査対象に戻さない
-        for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
-            for quote in ("> <sup>Reviewed by the documentation team</sup>",
-                          ">  <sup> reviewed by QA</sup>"):
-                lines = CURSOR_BLOCK.splitlines()
-                lines[5] = sig
-                lines.insert(4, quote)
-                secs = parse_verified(BASE + "\n" + "\n".join(lines) + "\n")
-                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1, quote)
-                self.assertEqual(secs[0].items, ["a #1", "b #2"], quote)
-
-    def test_cursor_bugbot_hint_mixed_with_valid_kept(self):
-        # 表示名・署名用 URL の手掛かりを含むのに既定書式と一致しない引用行は、正常な署名があっても除外しない
-        for bad in ("> Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) remaining work #9",
-                    "> <sup>see https://cursor.com/bugbot remaining work #9</sup>",
-                    "> <sup>Reviewed by Cursor remaining work #9</sup>",
-                    "> <sup>Reviewed by [Cursor  Bugbot](https://cursor.com/bugbot) for commit abcdef1. #9</sup>"):
-            for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
-                lines = CURSOR_BLOCK.splitlines()
-                lines[5] = sig
-                lines.insert(4, bad)
-                secs = parse_verified(BASE + "\n" + "\n".join(lines) + "\n")
-                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, bad)
-                self.assertIn("#9", " ".join(secs[0].items), bad)
-
-    def test_cursor_body_mentioning_bugbot_with_valid_signature_excluded(self):
-        # 要約本文が Bugbot の表示名・URL に触れるだけの引用行は署名候補にせず、正常な署名があれば除外する
-        for mention in ("> This PR excludes **Cursor Bugbot** summaries (https://cursor.com/bugbot).",
-                        "> no longer treats well-formed Cursor Bugbot blocks as items"):
-            for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
-                lines = CURSOR_BLOCK.splitlines()
-                lines[5] = sig
-                lines.insert(4, mention)
-                secs = parse_verified(BASE + "\n" + "\n".join(lines) + "\n")
-                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1, mention)
-                self.assertEqual(secs[0].items, ["a #1", "b #2"], mention)
-
-    def test_cursor_configure_other_domain_kept(self):
-        # Configure のリンク先を Cursor 以外のドメイン・別パスに変えた署名は既定の形と認めず、区間を残す
-        for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
-            for url in ("https://evil.example/dashboard/bugbot",
-                        "https://www.cursor.com.evil.example/dashboard/bugbot",
-                        "https://example.com/x",
-                        "https://www.cursor.com/dashboard/other"):
-                bad = re.sub(r"Configure \[here\]\([^)]*\)", f"Configure [here]({url})", sig)
-                self.assertNotEqual(bad, sig)
-                lines = CURSOR_BLOCK.splitlines()
-                lines[5] = bad
-                lines.insert(4, "> remaining work #9")
-                secs = parse_verified(BASE + "\n" + "\n".join(lines) + "\n")
-                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, url)
-                self.assertIn("#9", " ".join(secs[0].items), url)
-
-    def test_cursor_malformed_outer_with_valid_inner_kept(self):
-        # 印のそろった外側区間が崩れた署名行で不成立なら、その後ろの内側の既定形区間も除外せず外側全体を残す
-        bad_sig = "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) remaining work #9</sup>"
-        for tail in ("", "> outer tail #78\n"):
-            text = (BASE + "\n<!-- CURSOR_SUMMARY -->\n---\n> outer work #77\n" + bad_sig + "\n"
-                    + CURSOR_BLOCK.replace("synthetic text", "inner work #88") + "\n"
-                    + tail + "<!-- /CURSOR_SUMMARY -->\n")
-            secs = parse_verified(text)
-            self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, tail)
-            joined = " ".join(secs[0].items)
-            for ref in ("#77", "#9", "#88") + (("#78",) if tail else ()):
-                self.assertIn(ref, joined, (tail, ref))
-
-    def test_cursor_valid_block_after_failed_region_still_excluded(self):
-        # 不成立の区間が終了の印で閉じた後に続く、独立した既定形の区間は従来どおり除外する
-        text = (BASE + "\n" + CURSOR_BLOCK.replace("Reviewed by", "Seen by") + "\n\n"
-                + CURSOR_BLOCK + "\n")
-        secs = parse_verified(text)
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
-
-    def test_cursor_unverified_provenance_kept(self):
-        # 既定の形でも、生成元（Cursor Bugbot の編集記録）を確認できない PR では区間を除外しない（fail-closed）
-        text = BASE + "\n" + FOOTER + "\n\n" + CURSOR_BLOCK.replace("synthetic text", "remaining work #9") + "\n"
-        for secs in (cic.extract_out_of_scope_sections(text),
-                     cic.extract_out_of_scope_sections(text, cursor_allow=lambda block: False),
-                     cic.extract_out_of_scope_sections(text, cursor_allow=frozenset({CURSOR_BLOCK}).__contains__)):
-            self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
-            self.assertEqual(secs[0].excluded.get("claude-code-footer", 0), 1)
-            self.assertIn("#9", " ".join(secs[0].items))
-        self.assertEqual(parse_verified(text)[0].excluded.get("cursor-summary", 0), 1)
-
-    def test_cursor_failed_region_ignores_fenced_start(self):
-        # 不成立区間の入れ子はフェンス外の印だけで数える。フェンス内の開始行で範囲を延ばさない
-        bad = CURSOR_BLOCK.replace("Reviewed by", "Seen by").replace(
-            "<!-- /CURSOR_SUMMARY -->", "```\n<!-- CURSOR_SUMMARY -->\n```\n<!-- /CURSOR_SUMMARY -->")
-        secs = parse_verified(BASE + "\n" + bad + "\n\n" + CURSOR_BLOCK + "\n")
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
-
-    def test_cursor_failed_region_ignores_fenced_end(self):
-        # フェンス内の終了の印で不成立区間を閉じない。その後ろの内側の既定形区間を除外して外側の参照を消さない
-        text = (BASE + "\n<!-- CURSOR_SUMMARY -->\n---\n> outer work #77\n"
-                "```\n<!-- /CURSOR_SUMMARY -->\n```\n"
-                + CURSOR_BLOCK.replace("synthetic text", "inner work #88") + "\n<!-- /CURSOR_SUMMARY -->\n")
-        secs = parse_verified(text)
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
-        joined = " ".join(secs[0].items)
-        self.assertIn("#77", joined)
-        self.assertIn("#88", joined)
-
-    def test_cursor_nested_inner_start_not_recognized(self):
-        # 外側が不成立のとき内側の開始行を新候補にせず、外側の引用行・参照を検査に残す
-        inner = CURSOR_BLOCK
-        text = (BASE + "\n<!-- CURSOR_SUMMARY -->\n---\n> outer work #77\n" + inner + "\n")
-        secs = parse_verified(text)
-        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
-        self.assertIn("#77", " ".join(secs[0].items))
+        self.assertEqual(secs[0].excluded, {"claude-code-footer": 1})
 
     def test_footer_between_item_and_continuation_keeps_item(self):
         text = "## 対象外\n\n- a\n" + FOOTER + "\ncontinued #5\n"
         self.assertEqual(items_of(text), ["a continued #5"])
-
-    def test_cursor_block_does_not_merge_neighbors(self):
-        # 区間の前後に空行が無くても、終了の印直後の記号なし段落は単独項目として残る
-        text = BASE.rstrip("\n") + "\n" + CURSOR_BLOCK + "\nremaining work\n"
-        self.assertEqual(items_of(text), ["a #1", "b #2", "remaining work"])
-
-    def test_items_after_cursor_block_kept(self):
-        text = BASE + "\n" + CURSOR_BLOCK + "\n\n- later #3\n"
-        self.assertEqual(items_of(text), ["a #1", "b #2", "later #3"])
-
-    def test_indented_items_after_cursor_block_stay_independent(self):
-        # 列頭の項目の後、要約区間を挟んで 2 スペース字下げの受け皿なし項目が続いても結合しない
-        text = "## 対象外\n\n- a #1\n" + CURSOR_BLOCK + "\n  - later work\n  - more work\n"
-        self.assertEqual(items_of(text), ["a #1", "later work", "more work"])
-
-    def test_fence_closing_inside_cursor_block_not_fail_open(self):
-        blk = CURSOR_BLOCK.replace("> synthetic text", "```")
-        text = "## 対象外\n\n```\n" + blk + "\n\n- later #3\n"
-        # 区間より前で開いた fence は区間内の ``` で閉じる。後続の項目は落とさない
-        self.assertIn("later #3", items_of(text))
 
     def test_footer_lazy_continuation(self):
         self.assertEqual(items_of(BASE + FOOTER + "\n"), ["a #1", "b #2"])
@@ -393,124 +175,30 @@ class AutoSummaryTests(unittest.TestCase):
         for v in (FOOTER.replace("Generated", "Made"), "  " + FOOTER, FOOTER + "\ufe0f"):
             self.assertIn(v.strip(), " ".join(items_of(BASE + "\n" + v + "\n")), v)
 
-    def test_auto_summary_outside_section_noop(self):
-        text = BASE + "\n## 次\n\n" + FOOTER + "\n" + CURSOR_BLOCK + "\n"
-        secs = parse_verified(text)
+    def test_footer_outside_section_or_fence_noop(self):
+        secs = cic.extract_out_of_scope_sections(BASE + "\n## 次\n\n" + FOOTER + "\n")
         self.assertEqual(secs[0].items, ["a #1", "b #2"])
         self.assertEqual(secs[0].excluded, {})
+        secs = cic.extract_out_of_scope_sections(BASE + "\n```\n" + FOOTER + "\n```\n")
+        self.assertEqual(secs[0].excluded, {})
 
-
-# 実 PR で実測した Cursor Bugbot の本文編集記録の形（editor は Bot 型・login cursor）
-BOT = {"__typename": "Bot", "login": "cursor"}
-HUMAN = {"__typename": "User", "login": "someone"}
-
-
-def edits_of(*snaps, next_page=False):
-    """新しい順の (editor, 編集後の本文全体[, deletedAt]) から userContentEdits 応答を作る（実測した形）。"""
-    nodes = []
-    for k, snap in enumerate(snaps):
-        editor, diff = snap[0], snap[1]
-        deleted = snap[2] if len(snap) > 2 else None
-        nodes.append({"editedAt": "2026-01-01T00:%02d:00Z" % (59 - k), "deletedAt": deleted,
-                      "diff": diff, "editor": editor})
-    return {"pageInfo": {"hasNextPage": next_page}, "nodes": nodes}
-
-
-def bot_made(full, block=None, **kw):
-    """Bot が `block` を足して `full` にした編集記録（直前は区間の無い人の本文）。"""
-    block = CURSOR_BLOCK if block is None else block
-    return edits_of((BOT, full), (HUMAN, full.replace(block, "")), **kw)
-
-
-class ProvenanceTests(unittest.TestCase):
-    """Cursor 要約区間が Bot の生成物そのままかの判定（verified_cursor_blocks）。"""
-
-    FULL = BASE + "\n" + CURSOR_BLOCK + "\n"
-
-    def check(self, edits, cands=None):
-        return cic.verified_cursor_blocks([CURSOR_BLOCK] if cands is None else cands, edits)
-
-    def test_bot_generated_block_allowed(self):
-        self.assertEqual(self.check(bot_made(self.FULL)), {CURSOR_BLOCK})
-        # 実データの形: Bot の後に人が区間の外だけを編集しても、現在の区間は Bot の区間と一致するので認める
-        later = self.FULL + "\n- later #3\n"
-        self.assertEqual(self.check(edits_of((HUMAN, later), (BOT, self.FULL), (HUMAN, BASE))), {CURSOR_BLOCK})
-        # Bot が区間を保ったまま再編集していても、区間を生成した編集まで遡って認める
-        self.assertEqual(self.check(edits_of((BOT, self.FULL), (BOT, self.FULL), (HUMAN, BASE))), {CURSOR_BLOCK})
-
-    def test_human_written_block_carried_by_bot_rejected(self):
-        # 人が書いた区間を Bot が引き継いだだけ（直前の本文に同じ文字列がある）なら認めない
-        self.assertEqual(self.check(edits_of((BOT, self.FULL), (HUMAN, self.FULL))), frozenset())
-        self.assertEqual(self.check(edits_of((BOT, self.FULL), (HUMAN, self.FULL), (HUMAN, BASE))), frozenset())
-
-    def test_human_rewrite_after_bot_rejected(self):
-        # Bot の後に人が区間を書き換えた場合、現在の区間は Bot の区間とバイト単位で一致しないので認めない
-        rewritten = CURSOR_BLOCK.replace("synthetic text", "remaining work #9")
-        edits = edits_of((HUMAN, self.FULL.replace(CURSOR_BLOCK, rewritten)), (BOT, self.FULL), (HUMAN, BASE))
-        self.assertEqual(self.check(edits, [rewritten]), frozenset())
-        trailing = CURSOR_BLOCK.replace("> synthetic text", "> synthetic text ")
-        self.assertEqual(self.check(edits, [trailing]), frozenset())
-
-    def test_unusable_snapshots_rejected(self):
-        cases = {
-            "bot-diff-null": edits_of((BOT, None), (HUMAN, BASE)),
-            "bot-deleted": edits_of((BOT, self.FULL, "2026-01-02T00:00:00Z"), (HUMAN, BASE)),
-            "prev-diff-null": edits_of((BOT, self.FULL), (HUMAN, None)),
-            # 直前が削除済みなら、さらに古い本文を直前として使わない
-            "prev-deleted": edits_of((BOT, self.FULL), (HUMAN, self.FULL, "2026-01-02T00:00:00Z"), (HUMAN, BASE)),
-            "no-previous": edits_of((BOT, self.FULL)),
-            "truncated": bot_made(self.FULL, next_page=True),
-        }
-        for name, edits in cases.items():
-            self.assertEqual(self.check(edits), frozenset(), name)
-
-    def test_malformed_responses_rejected(self):
-        good = bot_made(self.FULL)
-        no_page = dict(good)
-        del no_page["pageInfo"]
-        ascending = dict(good, nodes=list(reversed(good["nodes"])))
-        no_stamp = dict(good, nodes=[dict(good["nodes"][0], editedAt=None), good["nodes"][1]])
-        for edits in (None, {}, "x", no_page, dict(good, pageInfo={"hasNextPage": None}),
-                      dict(good, nodes=None), dict(good, nodes=["x", None]), ascending, no_stamp):
-            self.assertEqual(self.check(edits), frozenset(), edits)
-        # 同時刻の編集は新しい順として許す
-        same = dict(good, nodes=[dict(n, editedAt="2026-01-01T00:00:00Z") for n in good["nodes"]])
-        self.assertEqual(self.check(same), {CURSOR_BLOCK})
-        self.assertEqual(self.check(good, []), frozenset())
-
-    def test_editor_type_checked_before_lookup(self):
-        # editor の __typename・login が str でなければ（list・dict 等でも例外を出さず）未確認にする
-        for editor in ({"__typename": ["Bot"], "login": "cursor"}, {"__typename": "Bot", "login": ["cursor"]},
-                       {"__typename": "Bot", "login": {"x": 1}}, {"__typename": "Bot"}, {"login": "cursor"},
-                       {"__typename": "User", "login": "cursor"}, {"__typename": "Bot", "login": "cursor-evil"},
-                       None, "cursor"):
-            self.assertEqual(self.check(edits_of((editor, self.FULL), (HUMAN, BASE))), frozenset(), editor)
-
-    def test_crlf_previous_is_normalized(self):
-        # 人が CRLF で書いた区間を Bot が LF で引き継いだだけでも、直前に同じ文字列があるとみなして認めない
-        self.assertEqual(self.check(edits_of((BOT, self.FULL), (HUMAN, self.FULL.replace("\n", "\r\n")))),
-                         frozenset())
-
-    def test_candidate_blocks_follow_parser(self):
-        # 候補は除外と同じパーサで数える（対象外節の中・フェンス外・既定の形のみ）
-        self.assertEqual(cic.cursor_candidate_blocks(self.FULL), [CURSOR_BLOCK])
-        self.assertEqual(cic.cursor_candidate_blocks(BASE + "\n```\n" + CURSOR_BLOCK + "\n```\n"), [])
-        self.assertEqual(cic.cursor_candidate_blocks(BASE + "\n" + CURSOR_BLOCK.replace("Reviewed by", "Seen by")), [])
-        self.assertEqual(cic.cursor_candidate_blocks("## 次\n\n" + CURSOR_BLOCK + "\n"), [])
+    def test_cursor_summary_not_excluded(self):
+        # Cursor Bugbot の要約区間は既定の形でも除外せず、区間内の行を通常どおり項目として数える
+        # （生成元を fail-closed に確認できないため。UNTRACKED は close 時に人が判断する）
+        blk = CURSOR_BLOCK.replace("synthetic text", "remaining work #9")
+        secs = cic.extract_out_of_scope_sections(BASE + "\n" + FOOTER + "\n\n" + blk + "\n")
+        self.assertEqual(secs[0].excluded, {"claude-code-footer": 1})
+        self.assertGreater(len(secs[0].items), 2)
+        self.assertEqual(secs[0].items[:2], ["a #1", "b #2"])
+        self.assertIn("#9", " ".join(secs[0].items))
 
 
 class FakeGh:
     """parent=100 の子 101..104。101 untracked、102 closed のみ、103/104 が循環、それぞれ PR を持つ。"""
 
-    def __init__(self, bodies=None, states=None, tree=None, edits=None, pr_bodies=None, edit_errors=(),
-                 provenance_fails=False):
-        # edits: PR 番号 -> userContentEdits 応答（2 段目）。pr_bodies: 番号 -> 直接参照される PR の本文。
-        # edit_errors: 2 段目で userContentEdits の取得が失敗する PR 番号。provenance_fails: 2 段目の呼び出し自体が失敗
-        self.edits = edits or {}
+    def __init__(self, bodies=None, states=None, tree=None, pr_bodies=None):
+        # pr_bodies: 番号 -> ツリー外で直接参照される PR の本文
         self.pr_bodies = pr_bodies or {}
-        self.edit_errors = set(edit_errors)
-        self.provenance_fails = provenance_fails
-        self.provenance_queries = []  # 2 段目で問い合わせた PR 番号（バッチごと）
         self.tree = tree or {100: [101, 102, 103, 104], 101: [], 102: [], 103: [], 104: []}
         self.bodies = bodies or {
             101: (901, body(f"nothing here {SENTINEL}")),
@@ -523,23 +211,6 @@ class FakeGh:
 
     def __call__(self, query, variables):
         self.calls += 1
-        if "pullRequest(number:" in query:
-            nums = [int(x) for x in re.findall(r"p(\d+): pullRequest", query)]
-            self.provenance_queries.append(nums)
-            if self.provenance_fails:
-                raise cic.FetchError("gh api failed")
-            data, errors = {}, []
-            for n in nums:
-                if n in self.edit_errors:
-                    data[f"p{n}"] = {"userContentEdits": None}
-                    errors.append({"type": "FORBIDDEN", "path": ["repository", f"p{n}", "userContentEdits"]})
-                else:
-                    data[f"p{n}"] = {"userContentEdits": self.edits.get(
-                        n, {"pageInfo": {"hasNextPage": False}, "nodes": []})}
-            resp = {"data": {"repository": data}}
-            if errors:
-                resp["errors"] = errors
-            return resp
         if "number:$number" in query:
             n = variables["number"]
             pr = self.bodies.get(n)
@@ -587,16 +258,12 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn(SENTINEL, out + err)
 
     def test_verbose_reports_excluded_without_echo(self):
-        tail = (FOOTER + "\n" + CURSOR_BLOCK.replace("synthetic text", SENTINEL) + "\n")
-        plain = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n")}, tree={100: [101], 101: []})
-        full = "## 対象外\n\n- see #600\n\n" + tail
-        g = FakeGh(bodies={101: (901, full)}, tree={100: [101], 101: []},
-                   edits={901: bot_made(full, CURSOR_BLOCK.replace("synthetic text", SENTINEL))})
+        plain = FakeGh(bodies={101: (901, f"## 対象外\n\n- see #600 {SENTINEL}\n")}, tree={100: [101], 101: []})
+        g = FakeGh(bodies={101: (901, f"## 対象外\n\n- see #600 {SENTINEL}\n\n" + FOOTER + "\n")},
+                   tree={100: [101], 101: []})
         code, out, err = run_cli(g, ["100", "--verbose"])
         pcode, pout, _ = run_cli(plain, ["100", "--verbose"])
-        self.assertIn("EXCLUDED    issue #101 pr #901", out)
-        self.assertIn("claude-code-footer=1", out)
-        self.assertIn("cursor-summary=1", out)
+        self.assertIn('EXCLUDED    issue #101 pr #901 section "対象外" claude-code-footer=1', out)
         self.assertNotIn(SENTINEL, out + err)
         self.assertEqual(code, pcode)
         self.assertEqual([l for l in out.splitlines() if l.startswith("summary:")],
@@ -605,10 +272,28 @@ class IntegrationTests(unittest.TestCase):
         qcode, quiet, qerr = run_cli(g, ["100"])
         self.assertEqual(qcode, pcode)
         self.assertEqual([l for l in quiet.splitlines() if l.startswith("EXCLUDED")],
-                         ["EXCLUDED    pr #901 count=2"])
+                         ["EXCLUDED    pr #901 count=1"])
         self.assertNotIn(SENTINEL, quiet + qerr)
         _, pquiet, _ = run_cli(plain, ["100"])
         self.assertNotIn("EXCLUDED", pquiet)
+
+    def test_cursor_summary_counted_as_untracked(self):
+        # PR 本文末尾の Cursor Bugbot 要約は除外せず、受け皿の無い行は UNTRACKED として報告する
+        g = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n")},
+                   tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100", "--verbose"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("UNTRACKED   issue #101 pr #901", out)
+        self.assertIn("OK          issue #101 pr #901", out)
+        self.assertNotIn("cursor", out.lower())
+
+    def test_verbose_reports_both_same_heading_sections_outside_tree(self):
+        # ツリー外 PR に同名見出しの対象外節が 2 つあり両方のフッターを除外したとき、2 つとも EXCLUDED に出る
+        sec = "## 対象外\n\n- see #600\n\n" + FOOTER + "\n\n"
+        g = FakeGh(bodies={101: (901, body("#700")), 700: (950, sec + sec)},
+                   states={700: "CLOSED"}, tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100", "--verbose"])
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("EXCLUDED") and "pr #950" in l]), 2, out)
 
     def test_verbose_excluded_dedup_across_outside_nodes(self):
         # ツリー外の 2 Issue が同じ PR に close されても、その PR の除外は EXCLUDED に 1 回だけ出る
@@ -619,80 +304,14 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len([l for l in out.splitlines() if l.startswith("EXCLUDED") and "pr #950" in l]), 1, out)
 
     def test_quiet_excluded_line_aggregates_per_pr(self):
-        # 通常の出力の除外行は PR ごとに 1 行で、ツリー内外の節・種別の件数を合算し重複させない
+        # 通常の出力の除外行は PR ごとに 1 行で、ツリー内外の節の件数を合算し重複させない
         sec = "## 対象外\n\n- see #600\n\n" + FOOTER + "\n"
-        g = FakeGh(bodies={101: (901, sec + "\n## 対象外\n\n- #700\n\n" + FOOTER + "\n"),
+        g = FakeGh(bodies={101: (901, sec + "\n## 対象外\n\n- #700 #701\n\n" + FOOTER + "\n"),
                            700: (950, sec), 701: (950, sec)},
                    states={700: "CLOSED", 701: "CLOSED", 600: "OPEN"}, tree={100: [101], 101: []})
-        g.bodies[101] = (901, g.bodies[101][1].replace("- #700", "- #700 #701"))
         _, out, _ = run_cli(g, ["100"])
         self.assertEqual([l for l in out.splitlines() if l.startswith("EXCLUDED")],
                          ["EXCLUDED    pr #901 count=2", "EXCLUDED    pr #950 count=1"], out)
-
-    def test_auto_summary_no_false_untracked(self):
-        tail = "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n"
-        full = "## 対象外\n\n- see #600\n" + tail
-        g = FakeGh(bodies={101: (901, full)}, tree={100: [101], 101: []}, edits={901: bot_made(full)})
-        code, out, _ = run_cli(g, ["100"])
-        self.assertEqual(code, 0, out)
-        self.assertEqual(g.provenance_queries, [[901]])
-
-    def test_cursor_not_excluded_without_verified_editor(self):
-        # 編集記録が無い・User の cursor・別の Bot・人が書いて Bot が引き継いだ・確認しきれないページング・
-        # 記録の取得失敗・2 段目の呼び出し失敗では除外しない
-        tail = "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n"
-        full = "## 対象外\n\n- see #600\n" + tail
-        before = full.replace(CURSOR_BLOCK, "")
-        cases = {
-            "none": {},
-            "user-cursor": {"edits": {901: edits_of(({"__typename": "User", "login": "cursor"}, full),
-                                                    (HUMAN, before))}},
-            "other-bot": {"edits": {901: edits_of(({"__typename": "Bot", "login": "other"}, full),
-                                                  (HUMAN, before))}},
-            "carried": {"edits": {901: edits_of((BOT, full), (HUMAN, full))}},
-            "truncated": {"edits": {901: bot_made(full, next_page=True)}},
-            "edit-error": {"edits": {901: bot_made(full)}, "edit_errors": {901}},
-            "fetch-failed": {"edits": {901: bot_made(full)}, "provenance_fails": True},
-        }
-        for name, kw in cases.items():
-            g = FakeGh(bodies={101: (901, full)}, tree={100: [101], 101: []}, **kw)
-            code, out, err = run_cli(g, ["100", "--verbose"])
-            self.assertEqual(code, 1, (name, out, err))
-            self.assertIn("UNTRACKED   issue #101 pr #901", out, name)
-            self.assertNotIn("cursor-summary", out, name)
-            self.assertIn("claude-code-footer=1", out, name)
-
-    def test_provenance_queried_only_for_prs_with_candidates(self):
-        # 2 段目（本文編集記録）は候補区間のある PR だけを問い合わせ、候補の無い PR では呼ばない
-        full = "## 対象外\n\n- see #600\n\n" + CURSOR_BLOCK + "\n"
-        g = FakeGh(bodies={101: (901, full), 102: (902, body("see #600"))},
-                   tree={100: [101, 102], 101: [], 102: []}, edits={901: bot_made(full)})
-        run_cli(g, ["100"])
-        self.assertEqual(g.provenance_queries, [[901]])
-        g2 = FakeGh(bodies={101: (901, body("see #600"))}, tree={100: [101], 101: []})
-        run_cli(g2, ["100"])
-        self.assertEqual(g2.provenance_queries, [])
-        # 区間が対象外節の外にあるだけの PR も候補にしない
-        g3 = FakeGh(bodies={101: (901, body("see #600") + "\n## 次\n\n" + CURSOR_BLOCK + "\n")},
-                    tree={100: [101], 101: []})
-        run_cli(g3, ["100"])
-        self.assertEqual(g3.provenance_queries, [])
-
-    def test_provenance_batch_error_unverifies_whole_batch(self):
-        # 2 段目の応答に errors があれば、影響する PR を絞り込まずバッチ内の全 PR を未確認にする
-        full = "## 対象外\n\n- see #600\n\n" + CURSOR_BLOCK + "\n"
-        kw = dict(bodies={101: (901, full), 102: (902, full)}, tree={100: [101, 102], 101: [], 102: []},
-                  edits={901: bot_made(full), 902: bot_made(full)}, states={600: "OPEN"})
-        ok = FakeGh(**kw)
-        _, out, _ = run_cli(ok, ["100", "--verbose"])
-        self.assertEqual(ok.provenance_queries, [[901, 902]])
-        self.assertEqual(out.count("cursor-summary=1"), 2, out)
-        bad = FakeGh(edit_errors={902}, **kw)
-        code, out, _ = run_cli(bad, ["100", "--verbose"])
-        self.assertEqual(code, 1, out)
-        self.assertNotIn("cursor-summary", out)
-        self.assertIn("UNTRACKED   issue #101 pr #901", out)
-        self.assertIn("UNTRACKED   issue #102 pr #902", out)
 
     def test_verbose_direct_pr_outside_tree_shows_pr_only(self):
         # ツリー外で直接参照した PR の除外は `pr #N` だけで示し、`issue #N pr #N` と表示しない
