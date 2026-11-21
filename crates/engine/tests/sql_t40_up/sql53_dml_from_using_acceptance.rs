@@ -668,7 +668,8 @@ fn trailing_semicolon_behaves_like_the_bare_statement() {
 
 /// 未対応の形は `0A000`／`42601`／束縛系で拒否され、行も台帳も不変。拒否のあとも同じ op id が使え、
 /// 他テナントの行へ影響しない（RLS を緩める経路にならない）。
-// tracked: #3295
+// tracked: #3534
+// intentional: docs/design/update-from-delete-using.md
 #[test]
 fn unsupported_forms_fail_closed_without_side_effects() {
     let alice = ctx("alice");

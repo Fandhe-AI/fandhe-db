@@ -324,6 +324,8 @@ fn alter_sequence_options_and_rename_commit_and_rollback() {
     auto_ok(&core, "alice", &insert_next(4, "s2"));
 }
 
+// ALTER SEQUENCE ... RESTART の Tx 内対応
+// tracked: #3533
 #[test]
 fn alter_sequence_restart_is_rejected_without_side_effects() {
     let (core, _g) = new_core("sql3315-seq-restart");
@@ -331,7 +333,6 @@ fn alter_sequence_restart_is_rejected_without_side_effects() {
     auto_ok(&core, "alice", "CREATE SEQUENCE s");
     let mut txn = core.new_session_transaction();
     begin(&core, &mut session, &mut txn);
-    // tracked: #3311（RESTART の Tx 内対応）
     assert_eq!(
         tx_code(&core, &mut session, &mut txn, "ALTER SEQUENCE s RESTART"),
         "0A000"
@@ -458,6 +459,7 @@ fn schema_create_rename_drop_commit_and_rollback() {
     auto_ok(&core, "alice", "CREATE SCHEMA app2");
 }
 
+// tracked: #3533
 #[test]
 fn statements_after_a_schema_change_are_rejected_fail_closed() {
     let (core, _g) = new_core("sql3315-schema-gate");
@@ -466,17 +468,16 @@ fn statements_after_a_schema_change_are_rejected_fail_closed() {
     begin(&core, &mut session, &mut txn);
     tx_ok(&core, &mut session, &mut txn, "CREATE SCHEMA app");
     // 後続文の `search_path` の解決・作成先の選択は確定済みカタログを読むため、SCHEMA の DDL 以外は拒否する。
-    // tracked: #3311
     assert_eq!(tx_code(&core, &mut session, &mut txn, CREATE_T), "0A000");
     assert_eq!(txn.status(), TransactionStatus::Failed);
     rollback(&core, &mut session, &mut txn);
     assert_eq!(auto_code(&core, "alice", "DROP SCHEMA app"), "3F000");
 }
 
+// tracked: #3533
 #[test]
 fn security_and_table_ddl_after_a_schema_change_are_rejected_fail_closed() {
     // 権限 DDL・ロール DDL・表 DDL が、SCHEMA の DDL を積んだ後（保護対象 DDL を挟んでも）拒否される。
-    // tracked: #3311
     for pre in [None, Some("CREATE ROLE r3315b")] {
         for sql in [
             CREATE_T,
@@ -517,12 +518,12 @@ fn schema_authorization_sees_a_role_created_in_the_same_txn() {
     commit(&core, &mut session, &mut txn);
 }
 
+// tracked: #3533
 #[test]
 fn schema_with_elements_and_cascade_are_rejected_without_side_effects() {
     let (core, _g) = new_core("sql3315-schema-unsupported");
     let mut session = ddl_session();
     auto_ok(&core, "alice", "CREATE SCHEMA keep");
-    // tracked: #3311
     for sql in [
         "CREATE SCHEMA s9 CREATE TABLE t (id BIGINT PRIMARY KEY)",
         "DROP SCHEMA keep CASCADE",
@@ -625,13 +626,14 @@ fn view_over_a_table_created_in_the_same_txn_commits_atomically() {
     assert_eq!(auto_code(&core, "alice", "SELECT id FROM u"), "42P01");
 }
 
+// OR REPLACE・DDL 後の列別名／CHECK OPTION
+// tracked: #3533
 #[test]
 fn view_unsupported_forms_are_rejected_fail_closed() {
     let (core, _g) = new_core("sql3315-view-unsupported");
     let mut session = ddl_session();
     auto_ok(&core, "alice", CREATE_T);
     auto_ok(&core, "alice", "CREATE VIEW v AS SELECT id, n FROM t");
-    // tracked: #3311（OR REPLACE・DDL 後の列別名／CHECK OPTION）
     let mut txn = core.new_session_transaction();
     begin(&core, &mut session, &mut txn);
     assert_eq!(

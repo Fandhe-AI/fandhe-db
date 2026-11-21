@@ -468,7 +468,7 @@ fn permission_denial_is_identical_regardless_of_existence_and_has_no_side_effect
 
 /// 明示トランザクション内の `DROP COLUMN` は受理され、ROLLBACK で列が戻る（SQL-80・Issue #3313）。
 /// `ALTER COLUMN ... TYPE` は未対応のまま `0A000`（既存行の書き換えを伴う形。受け皿は #3311 配下で要起票）。
-// tracked: #3311
+// tracked: #3533
 #[test]
 fn ddl_inside_explicit_transaction_is_rejected_with_0a000() {
     let (core, path) = new_core();

@@ -170,7 +170,7 @@ fn rejected_forms_map_to_documented_sqlstates() {
 
 /// SQL-80・Issue #3316: 明示 Tx 内のロール DDL は COMMIT まで効かず、ROLLBACK では何も残らない。
 /// 権限の無いセッションは対象の有無を問わず `42501`（writer を取らない）。積んだ後の読み書きは固定の `0A000`。
-// tracked: #3311
+// tracked: #3533
 #[test]
 fn explicit_transaction_applies_role_ddl_only_at_commit() {
     let (_g, _p, core) = open_core("sql39-tx");

@@ -286,7 +286,7 @@ fn read_then_write_is_accepted() {
 /// Issue #3315 で対応済み。`UPDATE ... RETURNING` は Issue #1272 で対応済み）は `0A000` でメッセージ全体をロールバックする。
 /// いずれの場合も `ReadyForQuery` は `'I'`。
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn write_not_last_runs_in_an_implicit_transaction_and_rolls_back_on_unsupported_statements() {
     let (core, _guard) = new_core_three_tenant_docs();
     let mut stream = spawn_with_alice(core);

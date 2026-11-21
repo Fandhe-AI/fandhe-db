@@ -92,7 +92,7 @@ fn writes_after_first_write_are_serialized_until_rollback() {
 
 /// DDL は `0A000` で拒否され、その間も別セッションの書き込みは成功する（writer を取らない）。
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn rejected_ddl_does_not_hold_the_writer() {
     let (core, _g) = new_core("sql31-deferred-ddl");
     let caller = ctx("tenant-a");

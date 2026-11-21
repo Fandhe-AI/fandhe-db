@@ -197,7 +197,7 @@ fn assert_rejected(sql: &str, code: &str) {
 }
 
 // intentional: docs/design/update-from-delete-using.md
-// tracked: #3295
+// tracked: #3534
 #[test]
 fn unsupported_shapes_are_rejected_with_feature_not_supported() {
     for sql in [

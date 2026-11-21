@@ -553,7 +553,7 @@ fn row_compare_in_other_paths_never_drops_the_predicate() {
 /// 永続化される定義文脈（POLICY・VIEW・部分 INDEX・CHECK）は定義時に拒否され、何も残らない。
 /// POLICY は明示ゲート・部分 INDEX は索引述語の検査で `0A000`、VIEW 本文・CHECK 本体は
 /// 行値を認識せず `42601`。
-/// tracked: #3254
+/// tracked: #3534
 #[test]
 fn row_compare_is_rejected_in_definition_contexts() {
     let (path, _g) = setup("row-cmp-defs");

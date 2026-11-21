@@ -209,7 +209,7 @@ fn upsert_returning_in_implicit_transaction_is_accepted_and_committed() {
 /// Issue #3313、VIEW・SEQUENCE・SCHEMA・型の DDL は Issue #3315 で対応済み。`UPDATE ... RETURNING` は
 /// Issue #1272 で対応済み）は `0A000`。先行する書き込みは残らず、接続は `'I'`。
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn unsupported_statement_in_implicit_transaction_rolls_back_with_0a000() {
     let (core, _guard) = new_core_three_tenant_docs();
     let (mut alice, _bob) = spawn_both(core);

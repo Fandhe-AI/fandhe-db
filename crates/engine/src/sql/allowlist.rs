@@ -42464,7 +42464,8 @@ mod tests {
 
     /// Issue #3260: 未対応文脈（CTE 本文・JOIN・集合演算・派生表・FROM なし）の DISTINCT ON は
     /// 通常のスキャンとして黙って実行されず、拒否のままであること（fail-closed）。
-    // tracked: #3259（これらの文脈での受理は親 Issue の範囲）
+    // これらの文脈での受理は #3534 の範囲
+    // tracked: #3534
     #[test]
     fn distinct_on_in_unsupported_contexts_stays_rejected() {
         let lookup = catalog_with(&["documents", "other"]);

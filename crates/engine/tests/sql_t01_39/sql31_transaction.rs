@@ -442,7 +442,7 @@ fn reusing_operation_id_within_the_same_transaction_is_rejected() {
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn unsupported_statement_inside_transaction_is_rejected_with_feature_not_supported() {
     let (engine, path) = new_core();
     let _cleanup = CleanupGuard(path);

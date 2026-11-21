@@ -727,7 +727,7 @@ fn operation_id_resend_and_reuse_follow_the_ledger_contract() {
 
 /// 未対応・不正な形は固定の SQLSTATE で拒否され、行は変わらない。
 // intentional: docs/design/update-from-delete-using.md
-// tracked: #3295
+// tracked: #3534
 #[test]
 fn unsupported_and_invalid_join_forms_fail_closed_without_side_effects() {
     let alice = ctx("alice");

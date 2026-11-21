@@ -294,7 +294,7 @@ fn schema_ddl_inside_explicit_transaction_commits_or_rolls_back() {
 
 /// 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE` は明示 Tx 内では未対応で、何も作らず何も消さない
 /// （Issue #3286・#3315）。
-// tracked: #3311
+// tracked: #3533
 #[test]
 fn schema_elements_and_cascade_inside_explicit_transaction_are_rejected() {
     let (p, _g, core) = open_fixture("sch-txn-unsupported");

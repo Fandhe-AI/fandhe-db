@@ -431,6 +431,7 @@ fn operation_id_form_is_rejected_in_read_only_transaction() {
 }
 
 /// 拒否形と期待コード。
+// tracked: #3534
 #[test]
 fn rejected_forms_fail_closed_with_expected_codes() {
     let (core, path) = new_core("sql53-from-reject", false);
@@ -517,7 +518,6 @@ fn rejected_forms_fail_closed_with_expected_codes() {
             "42702",
         ),
         // RETURNING の FROM／USING 側の列を式の中で参照する形は未対応（`0A000`。別名・対象表の式は #3251 で受理済み）
-        // tracked: #3296
         (
             "UPDATE docs SET lang = 'x' FROM langs WHERE docs.lang = langs.lang RETURNING upper(langs.label)",
             "0A000",

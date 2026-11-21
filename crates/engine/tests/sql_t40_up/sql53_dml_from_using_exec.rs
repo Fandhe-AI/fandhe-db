@@ -447,7 +447,8 @@ fn returning_with_operation_id_commits_ledger_and_rejects_resend() {
 }
 
 /// 未対応の形は fail-closed（副作用ゼロ）: FROM 側の列を含む式・項目なし・曖昧な列・句順の誤り。
-// tracked: #3296（FROM／USING 側の列を式の中で参照する RETURNING）
+// FROM／USING 側の列を式の中で参照する RETURNING
+// tracked: #3534
 #[test]
 fn unsupported_returning_forms_fail_closed_without_side_effects() {
     let (core, _g) = new_core("sql53-ret-reject");

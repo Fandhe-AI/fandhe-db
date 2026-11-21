@@ -2154,7 +2154,7 @@ fn set_operation_order_by_works_for_cursor_and_view() {
 }
 
 /// 比較できないキー型は `0A000`（未ソートの行を返さない）。Describe と Execute で一致する。
-// tracked: #3265
+// intentional: docs/design/set-operations.md
 #[test]
 fn set_operation_order_by_rejects_unsortable_key_types() {
     let path = unique_db_path("set-op-order-unsortable");
