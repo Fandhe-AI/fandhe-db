@@ -187,6 +187,14 @@ class AutoSummaryTests(unittest.TestCase):
         self.assertEqual(items_of("## 対象外\n\n" + FOOTER + "\n"), [])
         self.assertEqual(items_of("## 対象外\n\nなし\n" + FOOTER + "\n"), [])
 
+    def test_literal_gap_char_in_body_kept(self):
+        # 本文に元からある `␞` は区切りの印ではなく普通の文字として残す（生成表示行の有無に依らない）
+        for tail in ("", "\n" + FOOTER + "\n"):
+            self.assertEqual(items_of("## 対象外\n\n- " + cic.FOOTER_GAP + "\n" + tail),
+                             [cic.FOOTER_GAP], tail)
+        self.assertEqual(items_of("## 対象外\n\n- " + cic.FOOTER_GAP + " a\n" + FOOTER + "\n  b " + cic.FOOTER_GAP + "\n"),
+                         [cic.FOOTER_GAP + " a " + cic.FOOTER_GAP + " b " + cic.FOOTER_GAP])
+
     def test_footer_lazy_continuation(self):
         self.assertEqual(items_of(BASE + FOOTER + "\n"), ["a #1", "b #2"])
 
@@ -391,6 +399,15 @@ class IntegrationTests(unittest.TestCase):
                       out)
         self.assertNotIn("#601", out)
         self.assertIn("untracked=0 closed-only=1 cycles=0 ok=0", out)
+
+    def test_literal_gap_item_is_untracked(self):
+        # 本文の `- ␞` は消さず、受け皿の無い項目として UNTRACKED に残す
+        g = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n- " + cic.FOOTER_GAP + "\n\n" + FOOTER + "\n")},
+                   tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100", "--verbose"])
+        self.assertEqual(code, 1, out)
+        self.assertIn('UNTRACKED   issue #101 pr #901 section "対象外" item 2', out)
+        self.assertIn("untracked=1 closed-only=0 cycles=0 ok=1", out)
 
     def test_clean_tree(self):
         g = FakeGh(bodies={101: (901, body("see #600"))}, tree={100: [101], 101: []})

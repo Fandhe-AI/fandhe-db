@@ -152,15 +152,16 @@ def _split_items(lines: list[str | _FooterMark]) -> list[str]:
         if isinstance(line, str) and line.strip() and LIST_ITEM_RE.match(line):
             bases.append(len(line) - len(line.lstrip()))
     base = min(bases) if bases else 0
-    items: list[list[str]] = []
-    current: list[str] | None = None
+    # 組み立て中は印を _FooterMark のまま保持し、本文に元からある文字（`␞` を含む）と区別する
+    items: list[list[str | _FooterMark]] = []
+    current: list[str | _FooterMark] | None = None
     prev_blank = True
     for line in lines:
         if isinstance(line, _FooterMark):
             if current is None or prev_blank:
                 current = []
                 items.append(current)
-            current.append(FOOTER_GAP)
+            current.append(FOOTER_MARK)
             prev_blank = False
             continue
         if not line.strip():
@@ -179,13 +180,15 @@ def _split_items(lines: list[str | _FooterMark]) -> list[str]:
         prev_blank = False
     out: list[str] = []
     for parts in items:
-        # 区切りが範囲を断ち切る相手は項目の内側にしかないので、先頭・末尾の区切りは落とす
-        while parts and parts[0] == FOOTER_GAP:
+        # 区切りが範囲を断ち切る相手は項目の内側にしかないので、先頭・末尾の印は落とす。
+        # 判定は型で行い、本文に元からある `␞` は普通の文字として残す
+        while parts and isinstance(parts[0], _FooterMark):
             parts.pop(0)
-        while parts and parts[-1] == FOOTER_GAP:
+        while parts and isinstance(parts[-1], _FooterMark):
             parts.pop()
         if parts:
-            out.append(" ".join(parts))
+            # 内側に残った印だけを区切りの文字列に変換する
+            out.append(" ".join(FOOTER_GAP if isinstance(p, _FooterMark) else p for p in parts))
     return out
 
 
