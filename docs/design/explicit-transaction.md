@@ -656,7 +656,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | 索引 | `CREATE [UNIQUE] INDEX`（式・部分・GIN・HNSW の宣言）・`DROP INDEX` | 自前（`create_index_bound`・`drop_index`）。`_in_txn` 本体なし | 積む（本体を分離する） | #3313 | redb 内の索引カタログ世代を鍵にするキャッシュへ載せない（V4） |
 | 索引 | 一時表の索引 DDL | `temp_route` で `0A000` | 積む | #3313 | 一時側の write txn に積む |
 | VIEW | `CREATE VIEW`・`DROP VIEW [CASCADE]` | 自前。`drop_view_in_txn` あり | 積む（実装済み。「#3315 の実装記録」） | #3315 | `CREATE OR REPLACE VIEW`・DDL 後の列別名／`WITH CHECK OPTION` つきは `0A000`（#3311 の残り。受け皿は #3533） |
-| VIEW | マテビューの作成・`REFRESH [CONCURRENTLY]`・`DROP`・マテビューの索引 | 自前。`create_materialized_view_in_txn` などあり | `0A000` を維持（#3311 の残り。受け皿は #3533） | #3311 | 複数の文脈での本文評価と REFRESH の commit 箇所 3 つの監査を別に要する |
+| VIEW | マテビューの作成・`REFRESH [CONCURRENTLY]`・`DROP`・マテビューの索引 | 自前。`create_materialized_view_in_txn` などあり | `0A000` を維持（#3311 の残り。受け皿は #3533） | #3533 | 複数の文脈での本文評価と REFRESH の commit 箇所 3 つの監査を別に要する |
 | SEQUENCE | `CREATE`／`ALTER`（`RESTART` なし）／`DROP SEQUENCE`・RENAME | 自前。`create_sequence_in_txn`・`drop_sequence_in_txn` あり | 積む（実装済み） | #3315 | メモリ上の採番値は非トランザクション性（sequence-namespace-and-ledger.md D4）。内部 ID の再利用は払い出し時にカーソルを捨てて防ぐ。`ALTER SEQUENCE ... RESTART` は `0A000`（#3311 の残り。受け皿は #3533） |
 | SCHEMA | 要素なしの `CREATE`／`DROP`（`CASCADE` なし）／`ALTER SCHEMA ... RENAME TO` | 自前（`namespace.rs` の `*_gated`）。`*_gated_in_txn` 本体を分離 | 積む（実装済み） | #3315 | 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE`・`ALTER TABLE ... SET SCHEMA` は `0A000`（#3311 の残り。受け皿は #3533） |
 | 型 | `CREATE TYPE`（ENUM）・`DROP TYPE` | 自前（`create_enum_type_in_txn`・`drop_enum_type_in_txn` を分離） | 積む（実装済み） | #3315 | `ALTER TYPE ... ADD VALUE` は SQL に未公開（`42601` のまま） |
@@ -882,7 +882,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   で `s.t` がある状態の `BEGIN; CREATE TABLE t ...; GRANT SELECT ON t TO bob` が `s.t` へ付与された。テストで再現し修正）。
   そこで、表・索引の DDL（`relations_changed`）または関数の DDL を積んだ後は、内部キー（`#<id>.<name>`）に解決された対象を
   固定の `0A000` で拒否する（`reject_schema_keys_after_shape_change`。関係と関数を混ぜない。トリガ関数を同じ Tx で作って
-  トリガを張る形を通すため。受け皿は #3315）。何も積んでいない間は解決が確定済みの状態と一致するので受理する（共有 public 表には
+  トリガを張る形を通すため。受け皿は #3533。#3315 の残り）。何も積んでいない間は解決が確定済みの状態と一致するので受理する（共有 public 表には
   トリガを持てない〔#3361〕ため、トリガの対象は SCHEMA 配下の表に限られる）。ポリシー・行セキュリティは未修飾の名前を
   `search_path` で解決せず public の表として扱うため、この食い違いは起きない。SCHEMA 配下の表の DDL は Tx 内で受理しない（受け皿は #3533）。
   SCHEMA の作成・削除・改名は #3315 で受理するが、SCHEMA 配下の関係は未結線のため、この前提は変わらない。
