@@ -681,7 +681,7 @@ Issue #1665（`REFRESH`）・#1666（`REFRESH ... CONCURRENTLY`）・#1667（索
 
 - 単純形本文の `*` は作成時に展開せず保存する。基表への `ADD COLUMN` で出力列がずれたら
   REFRESH は `0A000` で拒否し旧実体を残す（PostgreSQL は成功する）。
-- 明示トランザクション内の CREATE／REFRESH は `0A000`（PostgreSQL は REFRESH を許す。Issue #3315 の後もマテビューは未結線で、受け皿は #3311）。
+- 明示トランザクション内の CREATE／REFRESH は `0A000`（PostgreSQL は REFRESH を許す。Issue #3315 の後もマテビューは未結線で、受け皿は #3533。#3311 の残り）。
 - `CONCURRENTLY` と `WITH NO DATA` の併用は構文段で `42601`。
 - CONCURRENTLY の重複行は `21000` ではなく `23505`（非 CONCURRENTLY と同結果にする方針）。
 - 単一ライタのため、REFRESH 中は基表への書き込みが待たされる。

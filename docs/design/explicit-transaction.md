@@ -655,16 +655,16 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | 表 | 一時表の `CREATE TEMP TABLE`・`DROP TABLE` | 一時ストア＋`SessionTempCatalog`。現状は Tx 内で `0A000`（temp-table.md） | 積む | #3313 | 一時 write txn（`ensure_temp_txn`）と `session_at_begin` の復元で巻き戻す。永続表と一時表を混ぜた DROP は従来どおり `0A000` |
 | 索引 | `CREATE [UNIQUE] INDEX`（式・部分・GIN・HNSW の宣言）・`DROP INDEX` | 自前（`create_index_bound`・`drop_index`）。`_in_txn` 本体なし | 積む（本体を分離する） | #3313 | redb 内の索引カタログ世代を鍵にするキャッシュへ載せない（V4） |
 | 索引 | 一時表の索引 DDL | `temp_route` で `0A000` | 積む | #3313 | 一時側の write txn に積む |
-| VIEW | `CREATE VIEW`・`DROP VIEW [CASCADE]` | 自前。`drop_view_in_txn` あり | 積む（実装済み。「#3315 の実装記録」） | #3315 | `CREATE OR REPLACE VIEW`・DDL 後の列別名／`WITH CHECK OPTION` つきは `0A000`（#3311） |
-| VIEW | マテビューの作成・`REFRESH [CONCURRENTLY]`・`DROP`・マテビューの索引 | 自前。`create_materialized_view_in_txn` などあり | `0A000` を維持（#3311） | #3311 | 複数の文脈での本文評価と REFRESH の commit 箇所 3 つの監査を別に要する |
-| SEQUENCE | `CREATE`／`ALTER`（`RESTART` なし）／`DROP SEQUENCE`・RENAME | 自前。`create_sequence_in_txn`・`drop_sequence_in_txn` あり | 積む（実装済み） | #3315 | メモリ上の採番値は非トランザクション性（sequence-namespace-and-ledger.md D4）。内部 ID の再利用は払い出し時にカーソルを捨てて防ぐ。`ALTER SEQUENCE ... RESTART` は `0A000`（#3311） |
-| SCHEMA | 要素なしの `CREATE`／`DROP`（`CASCADE` なし）／`ALTER SCHEMA ... RENAME TO` | 自前（`namespace.rs` の `*_gated`）。`*_gated_in_txn` 本体を分離 | 積む（実装済み） | #3315 | 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE`・`ALTER TABLE ... SET SCHEMA` は `0A000`（#3311） |
+| VIEW | `CREATE VIEW`・`DROP VIEW [CASCADE]` | 自前。`drop_view_in_txn` あり | 積む（実装済み。「#3315 の実装記録」） | #3315 | `CREATE OR REPLACE VIEW`・DDL 後の列別名／`WITH CHECK OPTION` つきは `0A000`（#3311 の残り。受け皿は #3533） |
+| VIEW | マテビューの作成・`REFRESH [CONCURRENTLY]`・`DROP`・マテビューの索引 | 自前。`create_materialized_view_in_txn` などあり | `0A000` を維持（#3311 の残り。受け皿は #3533） | #3311 | 複数の文脈での本文評価と REFRESH の commit 箇所 3 つの監査を別に要する |
+| SEQUENCE | `CREATE`／`ALTER`（`RESTART` なし）／`DROP SEQUENCE`・RENAME | 自前。`create_sequence_in_txn`・`drop_sequence_in_txn` あり | 積む（実装済み） | #3315 | メモリ上の採番値は非トランザクション性（sequence-namespace-and-ledger.md D4）。内部 ID の再利用は払い出し時にカーソルを捨てて防ぐ。`ALTER SEQUENCE ... RESTART` は `0A000`（#3311 の残り。受け皿は #3533） |
+| SCHEMA | 要素なしの `CREATE`／`DROP`（`CASCADE` なし）／`ALTER SCHEMA ... RENAME TO` | 自前（`namespace.rs` の `*_gated`）。`*_gated_in_txn` 本体を分離 | 積む（実装済み） | #3315 | 要素つき `CREATE SCHEMA`・`DROP SCHEMA ... CASCADE`・`ALTER TABLE ... SET SCHEMA` は `0A000`（#3311 の残り。受け皿は #3533） |
 | 型 | `CREATE TYPE`（ENUM）・`DROP TYPE` | 自前（`create_enum_type_in_txn`・`drop_enum_type_in_txn` を分離） | 積む（実装済み） | #3315 | `ALTER TYPE ... ADD VALUE` は SQL に未公開（`42601` のまま） |
 | 関数 | `CREATE [OR REPLACE] FUNCTION`・`DROP FUNCTION` | 自前。`create_function_in_txn` あり。暗黙 Tx は #2882 で実施済み | 積む（実装済み） | #3316 | `function_generations` は commit 後に進める。ROLLBACK 時はセッションの UDF キャッシュを再読込する |
 | トリガ | `CREATE [OR REPLACE] TRIGGER`・`DROP TRIGGER` | 自前（`create_trigger_inner`・`drop_trigger`） | 積む（実装済み） | #3316 | 共有の public 表への作成を拒否する既存の `0A000`（#3382）は維持する |
-| ポリシー | `CREATE`／`ALTER`／`DROP POLICY`・`ALTER TABLE ... ROW LEVEL SECURITY` | 自前（`policy.rs`・`row_security.rs`） | 積む（実装済み） | #3316 | 積んだ後の後続文は `0A000`（下の「#3316 の実装記録」。結線は #3311） |
+| ポリシー | `CREATE`／`ALTER`／`DROP POLICY`・`ALTER TABLE ... ROW LEVEL SECURITY` | 自前（`policy.rs`・`row_security.rs`） | 積む（実装済み） | #3316 | 積んだ後の後続文は `0A000`（下の「#3316 の実装記録」。結線は #3311 の残りで、受け皿は #3533） |
 | 権限 | `GRANT`／`REVOKE`・`ALTER DEFAULT PRIVILEGES`・`ALTER ... OWNER TO` | 自前（`privilege/apply.rs`・`default_acl.rs`・`owner_change.rs`） | 積む（実装済み） | #3316 | 同上 |
-| ロール | `CREATE`／`ALTER`／`DROP ROLE` | 自前。`*_in_txn` あり | 積む（実装済み） | #3316 | ログイン名の対応表も同じ write txn に入る。ロール DDL の後の `SET ROLE` は `0A000`（結線は #3311） |
+| ロール | `CREATE`／`ALTER`／`DROP ROLE` | 自前。`*_in_txn` あり | 積む（実装済み） | #3316 | ログイン名の対応表も同じ write txn に入る。ロール DDL の後の `SET ROLE` は `0A000`（結線は #3311 の残りで、受け皿は #3533） |
 | 拒否を維持 | `PARTITIONED` 付きの書き込み（分割実行。SQL-32 ポインタ） | — | `25001`（既存の `PartitionedDmlInTransaction`） | — | 変えない |
 | 拒否を維持 | PL/pgSQL 本体・`DO` の中の DDL | — | `0A000` | 受け皿なし | D6 |
 | 拒否を維持 | D3 に当たる本体と、どの子でも結線していない DDL | — | `0A000` | 各子 | fail-closed の既定 |
@@ -731,12 +731,12 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 - 受理する形: `CREATE TABLE`（列制約・PK・UNIQUE・CHECK・FK を含む。public）・`DROP TABLE [IF EXISTS] a, b
   [RESTRICT|CASCADE]`（永続表のみ）・`ALTER TABLE` の `ADD COLUMN`・`DROP COLUMN`・`ALTER COLUMN SET/DROP NOT NULL`・
   `SET/DROP DEFAULT` とそれらの複数アクション・`CREATE [UNIQUE] INDEX`（式・部分・GIN・HNSW の宣言）・`DROP INDEX`
-- DDL 後の文（暫定の許可リスト。受け皿は #3311）: 受理するのは DDL・Tx 制御・`SET`/`SHOW`・`INSERT`
+- DDL 後の文（暫定の許可リスト。受け皿は #3533。#3311 の残り）: 受理するのは DDL・Tx 制御・`SET`/`SHOW`・`INSERT`
   （単一行・複数行・`ON CONFLICT`・`RETURNING`）・`SELECT`/集計/スキャン/JOIN/集合演算/定数 SELECT
   （`USING PLAN`・ルーチン呼び出し・ビュー展開を除く）。表・索引を DROP した後は DDL 以外を `0A000` にする。
   それ以外（`UPDATE`・`DELETE`・`TRUNCATE`・`EXPLAIN`・`COPY`・カーソル・`LOCK`・`DO`・`SET ROLE` など）は `0A000`。
   拡張クエリの Execute（Parse・Bind 済みの文）は、確定済みカタログで束縛した文を実行しないため、DDL・Tx 制御・
-  `SET`/`SHOW` 以外を `0A000` にする（`execute_parsed_in_txn_unscrubbed`。V7。受け皿は #3311）。`COPY` は
+  `SET`/`SHOW` 以外を `0A000` にする（`execute_parsed_in_txn_unscrubbed`。V7。受け皿は #3533。#3311 の残り）。`COPY` は
   `begin_copy_in_txn` が同じく `0A000`。同じ Tx で作った表への SELECT・INSERT を Parse 時点で解決できない
   拡張クエリは `42P01` になる
 - 確定済みカタログを読む解析の表スキーマの引き当て（`impl TableLookup for Storage`・INSERT の
@@ -782,7 +782,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   索引カタログ・一意の強制・FK・生成列・世代キャッシュについても write txn を読むことを示せていない。規則（束縛と実行の両方が
   write txn を読むことを追跡で示せた種類だけを許可リストへ入れる）に従い、`UPDATE`・`DELETE`・`TRUNCATE`・`INSERT ... SELECT`・
   `ON CONFLICT ON CONSTRAINT`・DROP 後の参照・`EXPLAIN`・`USING PLAN`・拡張クエリの Execute（`25001` の順序を除く）は `0A000` のまま残し、
-  受け皿は #3311（要起票）とした。
+  受け皿は #3533（#3311 の残り）とした。
 - **権限の再判定（V2）**: 表・索引の DDL の権限ゲート（`require_ddl`）はセッションの主体だけで決まりカタログを読まないため、
   write txn 上で再判定する意味がない。カタログに依存する `require_creation_target`（SCHEMA の権限）は、SCHEMA 配下の DDL を `0A000` のまま
   残すため結線していない。結線するときは writer を取った後で write txn 上で再判定する。束縛ロールの DDL 後の DML の権限は、DML を結線した時点で検証する。
@@ -842,7 +842,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   `DROP TYPE` した型を使う列は write txn の再検証で拒否される
 - 権限の再判定（V2）: 作成先の権限（`require_creation_target`）は writer 取得の前後で判定し、SCHEMA の所有者ゲートは本体の
   中で write txn 上に判定する。ACL・ロールの Tx 内 DDL（#3316）が入るときは、確定済み側ではなく write txn 側で判定し直す
-- 未対応として `0A000` を維持（受け皿は #3311）: マテビューの作成・`REFRESH`・削除と索引、SCHEMA 配下の VIEW・SEQUENCE・型
+- 未対応として `0A000` を維持（受け皿は #3533。#3311 の残り）: マテビューの作成・`REFRESH`・削除と索引、SCHEMA 配下の VIEW・SEQUENCE・型
   （内部キー `#<id>.…`）、要素つき `CREATE SCHEMA`、`DROP SCHEMA ... CASCADE`、`ALTER TABLE ... SET SCHEMA`、
   `CREATE OR REPLACE VIEW`、`ALTER SEQUENCE ... RESTART`、SERIAL・IDENTITY 列。PL/pgSQL・`DO` の中の DDL は設計 D6 のとおり
   対応しない
@@ -869,7 +869,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   再判定は構造的に満たされる（`BEGIN` の後に他セッションが commit した変更も見る）。セッションだけで決まるゲートは
   カタログを読まないので再判定の意味が無い（V2）。no-op（`IF EXISTS` の skip・所有者が変わらない・状態が変わらない行セキュリティ）は
   印を巻き戻す。
-- **後続文の制限（P0。暫定。受け皿は #3311）**: ポリシー・行セキュリティ・GRANT/REVOKE・既定権限・所有者・ロール・トリガ・
+- **後続文の制限（P0。暫定。受け皿は #3533。#3311 の残り）**: ポリシー・行セキュリティ・GRANT/REVOKE・既定権限・所有者・ロール・トリガ・
   `DROP FUNCTION` を積んだ Tx は `TxnDdlState::guarded` を立て（`started` も立つ）、`check_post_ddl_statement` が DDL・Tx 制御・
   セッション変数の `SET`/`SHOW` 以外を固定文言の `0A000` にする。権限判定・ポリシー適用・トリガの発火・関数の解決は確定済みの
   カタログを読むため、同じ Tx で変えた内容を見ずに通す fail-open を作らない（SELECT・INSERT・`SET ROLE`・ルーチン呼び出し・
@@ -884,7 +884,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
   固定の `0A000` で拒否する（`reject_schema_keys_after_shape_change`。関係と関数を混ぜない。トリガ関数を同じ Tx で作って
   トリガを張る形を通すため。受け皿は #3315）。何も積んでいない間は解決が確定済みの状態と一致するので受理する（共有 public 表には
   トリガを持てない〔#3361〕ため、トリガの対象は SCHEMA 配下の表に限られる）。ポリシー・行セキュリティは未修飾の名前を
-  `search_path` で解決せず public の表として扱うため、この食い違いは起きない。SCHEMA 配下の表の DDL は Tx 内で受理しない（#3311）。
+  `search_path` で解決せず public の表として扱うため、この食い違いは起きない。SCHEMA 配下の表の DDL は Tx 内で受理しない（受け皿は #3533）。
   SCHEMA の作成・削除・改名は #3315 で受理するが、SCHEMA 配下の関係は未結線のため、この前提は変わらない。
 - **commit 後の副作用の監査（S8）**: 共有 txn の本体は redb の外の状態を変えない。関数の世代は `function_scopes`（COMMIT 成功後
   にだけ bump）、セッションの UDF レジストリは ROLLBACK／`ROLLBACK TO` が `SessionState` の複製で戻す。採番器・ログイン名の
@@ -896,7 +896,7 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 - **変更ログ・PITR**: 1 commit = 1 レコード（既存）。表の足跡を持たないロール DDL だけの Tx も COMMIT できる。
 - **受理しない形（`0A000`）**: PL/pgSQL 本体・`DO`・動的 `EXECUTE` の中の本種別の DDL（D6。`plpgsql_host::classify` が DML と SELECT 系
   以外を拒否する。注記 `intentional: docs/design/explicit-transaction.md`）、共有 public 表への `CREATE TRIGGER`（#3382）、
-  一時表への `OWNER TO`、積んだ後の後続文（受け皿は #3311。専用の Issue は未起票で、起票はユーザー承認待ち）。
+  一時表への `OWNER TO`、積んだ後の後続文（受け皿は #3533。#3311 の残り）。
 - テスト: `table_rls/sql80_txn_security_ddl.rs`（COMMIT・ROLLBACK・越境〔同じテナント・別テナント〕・後続文の `0A000`・組み合わせ・
   `ROLLBACK TO`・判定順・`DO`・トリガと関数）、`sql_t40_up/sql66_udf_*`（Tx 内の関数 DDL）、`rls13_*`・`sql39_*`・`sql40_*`・
   `table45_trigger_ddl`（旧 `0A000` の固定を新しい挙動へ更新）、wire は `wire_proto/sql80_txn_table_ddl.rs`（psql 形・接続断）。
@@ -906,9 +906,9 @@ Search・Aggregate・Scan）は確定済みのまま出力が決まる。想定�
 | 子 | 内容 |
 | --- | --- |
 | #3313 | 表・索引・制約・CTAS・一時表、変更ログのオラクル試験 |
-| #3314 | 上限の期限検査（実装済み）、`25001` の判定順（実装済み）。V1・V5・V7 の結線と権限の再判定は、追跡の結果を下の記録に残し、残りは #3311 |
-| #3315 | VIEW・SEQUENCE・SCHEMA・型（実装済み。「#3315 の実装記録」）。マテビューは #3311 |
-| #3316 | 関数・トリガ・ポリシー・権限・ロール（実装済み。「#3316 の実装記録」。積んだ後の後続文の結線は #3311） |
+| #3314 | 上限の期限検査（実装済み）、`25001` の判定順（実装済み）。V1・V5・V7 の結線と権限の再判定は、追跡の結果を下の記録に残し、残りは #3533（#3311 の残り） |
+| #3315 | VIEW・SEQUENCE・SCHEMA・型（実装済み。「#3315 の実装記録」）。マテビューは #3533（#3311 の残り） |
+| #3316 | 関数・トリガ・ポリシー・権限・ロール（実装済み。「#3316 の実装記録」。積んだ後の後続文の結線は #3533（#3311 の残り）） |
 | #3317 | `ROLLBACK TO`・接続断・commit 後フックの巻き戻し（実装済み。「#3317 の実装記録」） |
 | #3318 | Tx の途中・COMMIT の途中の SIGKILL で部分 commit が 0 件であること（`crash-test-cross-table` の道具 #2417・#2418 を拡張） |
 
