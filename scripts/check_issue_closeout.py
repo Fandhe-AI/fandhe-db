@@ -19,7 +19,7 @@
   いずれも「検出なし」とは扱わない
 - 自動生成表示の除外: 対象外節が PR 本文の最後だと、末尾に自動で付く Claude Code の生成表示の行が
   項目に混ざる（Issue #3536）。フェンス外かつ対象外節の中で、既定の 1 行に完全一致する行だけを除外する
-  （行を取り除くだけで、前後の項目の区切りは変えない）。Cursor Bugbot の自動要約は除外しない
+  （行の文字列だけを除き、項目の区切りは除外しない場合と同じに保つ）。Cursor Bugbot の自動要約は除外しない
   （生成元を fail-closed に確認できないため。UNTRACKED は close 時に人が判断する）。除外が起きた PR は
   通常の出力に PR 番号と件数だけ、`--verbose` では節ごとに種別と件数を出す
 - 機密保持: PR 本文・Issue タイトル・項目本文は出力に再掲しない。出すのは Issue/PR
@@ -124,22 +124,39 @@ def is_empty_marker(text: str) -> bool:
     return re.sub(r"[\W_]+", "", text.lower()) in EMPTY_MARKERS
 
 
-def _split_items(lines: list[str]) -> list[str]:
+class _FooterMark:
+    """除外した生成表示行の位置を示す印（本文の文字列とは決して一致しない）。"""
+
+
+# 除外した Claude Code の生成表示行の代わりに節の行へ置く印。`_split_items` は字下げなしの通常の行として
+# 項目の境界を判定し、文字列だけを加えない（行を消すと後続の深い行が直前の項目へ結合し、その項目の
+# 受け皿参照で残作業を隠せてしまうため。境界は除外しない場合と同じに保つ）
+FOOTER_MARK = _FooterMark()
+
+
+def _split_items(lines: list[str | _FooterMark]) -> list[str]:
     """節内の行を項目本文へ分ける。箇条書きの有無にかかわらず全行を走査する。
 
     最小インデントのリスト項目は 1 件ずつ、リストに属さない空行区切りの通常段落は独立項目、
     直前行に続くインデントなしの継続行（Markdown の lazy continuation）と深い行は直前の
-    項目へ結合する。どの行も黙って捨てない（受け皿参照の見落とし防止）。
+    項目へ結合する。どの行も黙って捨てない（受け皿参照の見落とし防止）。`FOOTER_MARK` は
+    字下げなしの通常の行として境界だけに効き、文字列を持たない（中身が空になった項目は落とす）。
     """
     bases = []
     for line in lines:
-        if line.strip() and LIST_ITEM_RE.match(line):
+        if isinstance(line, str) and line.strip() and LIST_ITEM_RE.match(line):
             bases.append(len(line) - len(line.lstrip()))
     base = min(bases) if bases else 0
     items: list[list[str]] = []
     current: list[str] | None = None
     prev_blank = True
     for line in lines:
+        if isinstance(line, _FooterMark):
+            if current is None or prev_blank:
+                current = []
+                items.append(current)
+            prev_blank = False
+            continue
         if not line.strip():
             prev_blank = True
             continue
@@ -154,7 +171,7 @@ def _split_items(lines: list[str]) -> list[str]:
         else:
             current.append(line.strip())
         prev_blank = False
-    return [" ".join(parts) for parts in items]
+    return [" ".join(parts) for parts in items if parts]
 
 
 def extract_out_of_scope_sections(body: str) -> list[Section]:
@@ -164,7 +181,7 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
     fence: tuple[str, int] | None = None  # (フェンス文字, 開始時の長さ)
     active_level = 0
     active: Section | None = None
-    buf: list[str] = []
+    buf: list[str | _FooterMark] = []
 
     def close() -> None:
         nonlocal active, buf
@@ -175,8 +192,9 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
 
     for line in text.split("\n"):
         if fence is None and active is not None and line == CLAUDE_FOOTER:
-            # 行を取り除くだけで元の空行・項目境界は変えない（継続行を別項目にしない）
+            # 文字列だけを除き、項目の境界は除外しない場合と同じに保つ（FOOTER_MARK を参照）
             active.excluded["claude-code-footer"] = active.excluded.get("claude-code-footer", 0) + 1
+            buf.append(FOOTER_MARK)
             continue
         fm = FENCE_RE.match(line)
         if fence is None:

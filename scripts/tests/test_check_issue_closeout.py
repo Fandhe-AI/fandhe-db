@@ -168,6 +168,13 @@ class AutoSummaryTests(unittest.TestCase):
         text = "## 対象外\n\n- a\n" + FOOTER + "\ncontinued #5\n"
         self.assertEqual(items_of(text), ["a continued #5"])
 
+    def test_footer_keeps_item_boundary_before_indented_line(self):
+        # フッターの後ろの字下げ行は、フッターを除いても直前の項目（とその受け皿参照）に結合しない
+        text = "## 対象外\n\n- 対応済み #600\n\n" + FOOTER + "\n  残作業あり\n"
+        secs = cic.extract_out_of_scope_sections(text)
+        self.assertEqual(secs[0].items, ["対応済み #600", "残作業あり"])
+        self.assertEqual(secs[0].excluded, {"claude-code-footer": 1})
+
     def test_footer_lazy_continuation(self):
         self.assertEqual(items_of(BASE + FOOTER + "\n"), ["a #1", "b #2"])
 
@@ -350,6 +357,16 @@ class IntegrationTests(unittest.TestCase):
                     'EXCLUDED    pr #700 section "対象外" claude-code-footer=1' if "--verbose" in argv
                     else "EXCLUDED    pr #700 count=1"] if shown else []), (name, argv, out))
                 self.assertIn("CYCLE       #103 -> #700 -> #103", out, (name, argv))
+
+    def test_footer_then_indented_line_is_untracked(self):
+        # 指摘の並び（対応済み #600／空行／フッター／字下げした残作業）で、残作業が UNTRACKED になる
+        g = FakeGh(bodies={101: (901, "## 対象外\n\n- 対応済み #600\n\n" + FOOTER + "\n  残作業あり\n")},
+                   tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100", "--verbose"])
+        self.assertEqual(code, 1, out)
+        self.assertIn('UNTRACKED   issue #101 pr #901 section "対象外" item 2', out)
+        self.assertIn('OK          issue #101 pr #901 section "対象外" item 1 refs #600(issue,open)', out)
+        self.assertIn("untracked=1 closed-only=0 cycles=0 ok=1", out)
 
     def test_clean_tree(self):
         g = FakeGh(bodies={101: (901, body("see #600"))}, tree={100: [101], 101: []})
