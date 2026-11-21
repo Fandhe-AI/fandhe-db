@@ -69,7 +69,10 @@ HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 OUT_OF_SCOPE_RE = re.compile(r"out[- ]of[- ]scope", re.IGNORECASE)
 CURSOR_START = "<!-- CURSOR_SUMMARY -->"
 CURSOR_END = "<!-- /CURSOR_SUMMARY -->"
-CURSOR_REVIEWED_PREFIX = "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot)"
+# 署名行は行全体で照合する（リンク直後で途切れた崩れ行は署名と認めず検査対象に残す）。
+CURSOR_REVIEWED_RE = re.compile(
+    r"> <sup>Reviewed by \[Cursor Bugbot\]\(https://cursor\.com/bugbot\)[^<>\n]*</sup>"
+)
 CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
@@ -175,8 +178,10 @@ def _cursor_summary_end(lines: list[str], start: int) -> int | None:
             return i if reviewed else None
         if line.strip() and not line.startswith(">"):
             return None
-        if line.startswith(CURSOR_REVIEWED_PREFIX):
+        if CURSOR_REVIEWED_RE.fullmatch(line):
             reviewed = True
+        elif line.startswith("> <sup>Reviewed by"):
+            return None
         i += 1
     return None
 
@@ -208,9 +213,12 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
                 if end is not None:
                     active.excluded["cursor-summary"] = active.excluded.get("cursor-summary", 0) + 1
                     i = end + 1
+                    # 区間の前後の項目が結合しないよう境界を空行で保つ
+                    buf.append("")
                     continue
             elif line == CLAUDE_FOOTER:
                 active.excluded["claude-code-footer"] = active.excluded.get("claude-code-footer", 0) + 1
+                buf.append("")
                 continue
         fm = FENCE_RE.match(line)
         if fence is None:

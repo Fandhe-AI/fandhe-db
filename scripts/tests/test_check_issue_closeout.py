@@ -175,12 +175,20 @@ class AutoSummaryTests(unittest.TestCase):
             "no-hr": CURSOR_BLOCK.replace("---", "***"),
             "no-reviewed": CURSOR_BLOCK.replace("Reviewed by", "Seen by"),
             "indent": " " + CURSOR_BLOCK,
+            "truncated-signature": CURSOR_BLOCK.replace(
+                "> synthetic text", "> remaining work"
+            ).replace(" for commit abc</sup>", ""),
             "trailing-space": CURSOR_BLOCK.replace("<!-- CURSOR_SUMMARY -->", "<!-- CURSOR_SUMMARY --> "),
         }
         for name, blk in variants.items():
             secs = cic.extract_out_of_scope_sections(BASE + "\n" + blk + "\n")
             self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, name)
             self.assertGreater(len(secs[0].items), 2, name)
+
+    def test_cursor_block_does_not_merge_neighbors(self):
+        # 区間の前後に空行が無くても、終了の印直後の記号なし段落は単独項目として残る
+        text = BASE.rstrip("\n") + "\n" + CURSOR_BLOCK + "\nremaining work\n"
+        self.assertEqual(items_of(text), ["a #1", "b #2", "remaining work"])
 
     def test_items_after_cursor_block_kept(self):
         text = BASE + "\n" + CURSOR_BLOCK + "\n\n- later #3\n"
