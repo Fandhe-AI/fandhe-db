@@ -241,7 +241,7 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
 | 表・関数 | 実値列（主なもの） | 備考 |
 | -------- | ------------------ | ---- |
 | `pg_namespace` | `oid`・`nspname`・`nspowner` | 組み込み（`pg_catalog`・`information_schema`・`public`）＋自テナントの SCHEMA＋（一時表があれば）一時スキーマ |
-| `pg_type` | `oid`・`typname`・`typnamespace`・`typowner`・`typlen`・`typbyval`・`typtype`・`typcategory`・`typispreferred`・`typisdefined`・`typdelim`・`typrelid`・`typelem`・`typarray`・`typinput`・`typoutput`・`typreceive`・`typsend`・`typbasetype`・`typtypmod`・`typnotnull`・`typcollation`・`typndims` | 組み込み型（WIRE-13 の公告にある型と、その配列型）＋見える ENUM 型とその配列型＋見える relation の行型（`typtype='c'`。Prisma が `reltype > 0` で絞るため） |
+| `pg_type` | `oid`・`typname`・`typnamespace`・`typowner`・`typlen`・`typbyval`・`typtype`・`typcategory`・`typispreferred`・`typisdefined`・`typdelim`・`typrelid`・`typelem`・`typarray`・`typinput`・`typoutput`・`typreceive`・`typsend`・`typbasetype`・`typtypmod`・`typnotnull`・`typcollation`・`typndims` | 組み込み型（WIRE-13 の公告にある型と、その配列型）＋見える ENUM 型とその配列型＋見える relation の行型（`typtype='c'`。Prisma が `reltype > 0` で絞るため。一時表の行型は出さない。D4 の一時表の項） |
 | `pg_class`（型ロードに要る範囲） | `oid`・`relname`・`relnamespace`・`reltype`・`relkind` | 行型の `typrelid` の結合先として。全列は段 2 |
 | `pg_attribute`（複合型の列） | `attrelid`・`attname`・`atttypid`・`attnum`・`attisdropped` | 全列は段 2 |
 | `pg_enum` | `oid`・`enumtypid`・`enumsortorder`・`enumlabel` | 見える ENUM 型だけ |
@@ -276,6 +276,7 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
 | `pg_language` | `oid`・`lanname` | 固定行（提供済みの言語） |
 | `pg_roles` | `oid`・`rolname`・`rolsuper`・`rolinherit`・`rolcreaterole`・`rolcreatedb`・`rolcanlogin`・`rolreplication`・`rolconnlimit`・`rolvaliduntil`・`rolbypassrls`・`rolpassword`（常に `********`） | 自テナントのロール＋共有定義の仮想所有者（D4）。ログイン識別子（テナント修飾子つき）は出さない |
 | `pg_inherits`・`pg_extension` | 全列 | 継承・拡張が無いため常に 0 行 |
+| `pg_tablespace` | `oid`・`spcname`・`spcowner` | `pg_default` の固定行（SQLAlchemy の reflection の表オプションと psql の `\d`・`\l+` が引く） |
 | `information_schema.schemata`・`tables`・`columns`・`views`・`sequences` | PostgreSQL 17 の列のうち棚卸しで参照されるもの（`columns` は `data_type`・`udt_schema`・`udt_name`・`is_nullable`・`column_default`・`character_maximum_length`・`numeric_precision`・`numeric_precision_radix`・`numeric_scale`・`datetime_precision`・`is_identity`・`is_generated` ほか） | `schemata`・`tables`・`views` は棚卸しの外だが利用が多いため含める。行の絞り込みは D9 |
 | 関数 | `pg_get_constraintdef`・`pg_get_indexdef`・`pg_get_viewdef`・`pg_get_functiondef`・`pg_get_userbyid`・`has_table_privilege`・`has_schema_privilege`・`information_schema._pg_expandarray`・`current_database()` | |
 | OID 別名の型 | `regrole`・`regprocedure` | D7 |
@@ -288,9 +289,8 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
 | `pg_database`（`oid`・`datname`・`datdba`・`encoding`・`datcollate`・`datctype`・`datlocprovider`・`datallowconn`） | 1 行だけ（D4。名前は O5） |
 | `pg_trigger`（`oid`・`tgrelid`・`tgname`・`tgfoid`・`tgtype`・`tgenabled`・`tgisinternal`）・`pg_policy`（`oid`・`polname`・`polrelid`・`polcmd`・`polpermissive`・`polroles`・`polqual`・`polwithcheck`） | 自テナントの分だけ |
 | `pg_rewrite`（ビューの `_RETURN`） | 見えるビューだけ |
-| `pg_tablespace` | `pg_default` の固定行 |
 | `pg_statistic_ext`・`pg_publication`・`pg_publication_rel`・`pg_publication_namespace` | 常に 0 行 |
-| 関数 | `pg_get_triggerdef`・`pg_get_ruledef`・`pg_get_function_result`・`pg_get_function_arguments`・`pg_function_is_visible`・`pg_encoding_to_char`・`pg_get_partkeydef`（常に NULL）・`pg_relation_is_publishable`（常に false）・`pg_partition_ancestors`・`array_to_string` |
+| 関数 | `pg_get_triggerdef`・`pg_get_ruledef`・`pg_get_function_result`・`pg_get_function_arguments`・`pg_function_is_visible`・`pg_encoding_to_char`・`pg_get_partkeydef`（常に NULL）・`pg_relation_is_publishable`（常に false）・`pg_partition_ancestors`・`pg_get_partition_constraintdef`（常に NULL）・`quote_ident`・`array_to_string` |
 | ACL の列（`relacl`・`nspacl`・`datacl`）と `aclitem` 型 | ACL（role ADR D5）から自テナントの付与だけを出す。PUBLIC は「同じテナントのロール全体」 |
 
 #### 提供しないもの
@@ -318,14 +318,14 @@ D8 の漏えい評価で出さないと決めたもの（`pg_stat_*`・`pg_stati
 | 範囲 | 用途 | 払い出し |
 | ---- | ---- | -------- |
 | 1〜16383 | 組み込み（`pg_catalog`=11・`public`=2200・組み込み型・組み込みカタログの relation・入出力関数・アクセス方式・照合・言語・共有定義の仮想所有者） | PostgreSQL 17 の固定値に合わせる（`pg_catalog`=11・`public`=2200 は [pg_namespace.dat](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/include/catalog/pg_namespace.dat)。`information_schema` は PostgreSQL では initdb ごとに変わるため、16384 未満の未使用値を 1 つ固定で選ぶ） |
-| 16384〜2^30−1 | 共有の `public` のオブジェクトとその従属物（下の P1 案 b・c・d を採る場合だけ使う。既定の案 a では使わず、`public` のオブジェクトもテナントの範囲で払い出す） | P1 案による |
+| 16384〜2^30−1 | 共有の `public` のオブジェクトとその従属物（下の P1 案 b・c・d を採る場合だけ使う。案 a を採る場合は使わず、`public` のオブジェクトもテナントの範囲で払い出す） | P1 案による |
 | 2^30〜2^31−2^24−1 | テナントのオブジェクト（SCHEMA・その配下・UDF・ロール・トリガ・ポリシー）とその従属物。案 a では、そのテナントから見た `public` のオブジェクトも含む | テナントごとのカウンタ。各テナントが同じ初期値から数える |
 | 2^31−2^24〜2^31−1 | 当該セッションの一時表とその従属物 | セッション内のカウンタ（永続化しない。セッションごとに同じ初期値から数える） |
 
 - 2^31 以上を使わない。OID を符号付き 32 bit で扱うクライアントで負の値にならないようにする。
 - 範囲から公開範囲かテナント範囲かが分かるが、これは `relnamespace` から既に分かる情報で、他テナントの情報を含まない。
-- 範囲を使い切ったら、その範囲を進める DDL を固定文言の `54000` で拒否する。判定はそのスコープ（自テナント・自セッション。
-  案 b〜d の共有の範囲は共有の集合）の状態だけで決まる。
+- 範囲を使い切ったら、その範囲を進める DDL を固定文言の `54000` で拒否する。判定はそのスコープ（自テナント・自セッション）の状態
+  だけで決まる。案 d の共有の範囲は、P1 の両立条件のとおりテナントごとの上限 M で判定し、他テナントの履歴に依らせない。
 
 #### 採用: スコープ別の単調カウンタと OID 台帳（案 B）
 
@@ -350,14 +350,23 @@ D8 の漏えい評価で出さないと決めたもの（`pg_stat_*`・`pg_stati
   - SQL-80 のポインタのとおり、DDL を行ったセッション自身はトランザクションの中で未 commit の OID を読める。ROLLBACK・
     savepoint への巻き戻しでカウンタを戻すと、同じ値が別のオブジェクトに付き、その値を読んだクライアントのキャッシュ（R4）が
     取り違える。
-  - 規則: プロセス内にスコープごとの「次の値」を持ち、払い出しのたびに進め、巻き戻しでは戻さない。永続側には commit 済みの
-    「先取りの上限」を持ち、プロセス内の次の値がこの上限に近づいたら、そのスコープの次の commit で上限を先へ進める。再起動時は
-    永続の上限から数え始める（先取りした未使用の値は欠番になる）。1 つのトランザクションで上限を超えて払い出す場合だけ、その
-    トランザクションの中で上限を進める（そのトランザクションが巻き戻ったうえで再起動すると、未 commit のまま見えた値が再び
-    払い出されうる。これは既知の残余として I1 で幅を測る）。
-  - 帰結: 自テナントの巻き戻し・再起動で自テナントのカウンタに欠番ができる。欠番は自テナントの操作か再起動だけで決まり、
-    他テナントの情報を含まない（R1 は満たす）。先取りはスコープごとに独立で、他テナントの commit では進まない。
-- 一時表はセッションの一時カタログに OID を持たせ、台帳を使わない。
+  - 規則: 払い出してよいのは、永続化済みの「先取りの上限」より下の値だけとする（PostgreSQL が OID の先取りを WAL に書いてから
+    払い出すのと同じ考え方）。プロセス内にスコープごとの「次の値」を持ち、払い出しのたびに進め、巻き戻しでは戻さない。
+  - 先取りの更新: 次の値が永続の上限に達したら、上限を「次の値 + max(B, その払い出しで要る数)」まで進め、その更新を
+    **利用者の txn と独立に**永続化してから払い出しを続ける（B は 1 回の先取りの幅。I1 で決める）。独立の永続化なので、
+    利用者の txn の巻き戻しでは上限は戻らない。利用者の txn が redb の write txn を持っている間でも書けるよう、媒体（別の
+    ファイルへの fsync 付きの追記など）と、バックアップ・PITR・レプリケーションでの扱いは I1 で決める。
+  - 帰結: 再起動の直後・新しいテナントの最初の DDL・巻き戻しの繰り返しの後・1 つの txn で多数の OID を要するマイグレーション
+    でも、払い出しは上限で止まらない（`54000` は範囲を使い切った場合だけ）。再起動時は永続の上限から数え始める（先取りした
+    未使用の値は欠番になる）。上限より下の値は常に永続化済みなので、公開済みの値は巻き戻しと再起動を経ても再び払い出されない。
+    先取りの更新はそのスコープの払い出しのときだけ起き、欠番は自テナントの操作か再起動だけで決まり、他テナントの情報を
+    含まない（R1 は満たす）。先取りはスコープごとに独立で、他テナントの操作では進まない。
+- 一時表はセッションの一時カタログに OID を持たせ、台帳を使わない。一時表の OID はセッションの中でだけ意味を持ち、
+  別セッションでは同じ値が別の一時表を指しうる。セッションをまたいで再利用される型情報（Npgsql はデータソース単位で
+  `pg_type` をキャッシュする）が一時表の行型を取り違えないよう、一時表には行型を作らない（`pg_class.reltype = 0`、`pg_type` に
+  一時表の行型の行を出さない）。relation の OID は、RowDescription の table OID が 0（D6）のため結果の列からは得られず、カタログの照会で
+  得るしかない。棚卸し（§3）の範囲で relation の OID を接続をまたいで保持するクライアントは見つけていない（〔要約経由〕）。I1 で、一時表を作った 2 つのセッションで `pg_type` の行と型ロードの結果が
+  食い違わないことを確かめる。
 - 既存 DB の移行: 台帳の無いオブジェクトには、プライマリの起動時に 1 つの write txn で OID を付与する（スコープごとに
   `(種別, 鍵)` の昇順。テナントごとに独立に数えるため、あるテナントの付与順は他テナントのオブジェクトに依存しない）。冪等に作り、
   付与済みなら何もしない。
@@ -375,24 +384,43 @@ D8 の漏えい評価で出さないと決めたもの（`pg_stat_*`・`pg_stati
 痕跡であり、既定で塞ぐ。**オーナー決定（2026-11-21・O1）: 既定で塞ぎ、案 a と案 d を I1 で比較して決める。**
 案 c は `public` の DDL をサーバー管理経路に限る場合だけ選びうる。
 
-| 案 | 内容 | 塞げるか | 書き込み量・R4・R6 ほか |
-| -- | ---- | -------- | ----------------------- |
-| a. テナントのカウンタで払い出す（I1 の比較対象） | `public` のオブジェクトにも、各テナントのカウンタから OID を払い出し、台帳に `(テナント, 種別, public の鍵)` で持つ。払い出すのは**そのテナントの書き込みの時点**（プライマリでの接続確立時と、そのテナントの DDL・書き込みの write txn の中）で、その時点に存在し、まだ OID の無い `public` のオブジェクトだけに付ける | 塞げる。2 回の払い出しの間に作られて消えた `public` のオブジェクトはどのテナントのカウンタも進めない。OID の順序もテナント自身が見た順になる | 書き込み量は「前回の払い出し以降に増えた `public` のオブジェクト数 × 払い出すテナント数」。毎回の要否は `public` のカタログ世代とテナントごとの払い出し済みの世代の比較（定数時間）で判定する。R6 は満たす（SELECT では書かない）が、接続確立が書き込みになりうる。払い出し前の `public` のオブジェクトはそのテナントのカタログに出ない（長い接続では次の書き込みまで遅れる。レプリカではプライマリでの払い出しが届くまで出ない）。`public` のオブジェクトの削除時に全テナントの行を消すと、削除の所要時間が他テナントの払い出し数を映すため、削除は行わず、各テナントの次の払い出し時に不要な行を片付ける（同名の作り直しを区別するため、`public` のオブジェクトに作成時の世代を持たせる） |
-| a'. 案 a を `public` の DDL の時点で全テナントへ払い出す | `public` の DDL の write txn で全テナントのカウンタを進める | **塞げない**。作って消したオブジェクトも各テナントのカウンタを進めるため、欠番が残る | 書き込み量がテナント数に比例し、DDL の所要時間がテナント数を映す。採らない |
-| a''. 案 a を初めて見えた時点（カタログの照会時）に払い出す | | 塞げる | R6 違反（代替案 F と同じ）。採らない |
-| b. `public` の relation だけ HMAC 写像 | `OID = 共有の範囲の先頭 + HMAC(サーバー鍵, public の鍵) mod 範囲の幅`。カウンタを持たない | 欠番・進み幅は生じない | 鍵が名前なので、改名で OID が変わり、同名で作り直すと同じ OID が戻る（R4 違反。代替案 C と同じ）。2^30 の範囲では約 1 万件で 5% 程度の衝突があり、振り直しの順序次第で既存の OID がずれうる。サーバー鍵の保管・レプリカとの共有・復元時の扱いが要る（HMAC は engine の `crypto::hmac_sha256` で足り、依存の追加は要らない） |
-| d. 作成時に乱数で引く（案 b の変形。I1 の比較対象） | `public` のオブジェクトの作成の write txn で、共有の範囲から暗号論的乱数で OID を引き、共有の逆引きに既にあれば引き直す。共有の台帳に持ち、改名で鍵だけ付け替える | 欠番・進み幅に履歴が乗らない（値は乱数で、引き直しの要否は全テナントに見える `public` の集合だけで決まる） | 改名で変わらず、作り直せば新しい値になる。ただし削除で逆引きを消すと、乱数が削除済みの値を引いて再利用しうる（R4 違反）。R4 を満たすには、削除した値を墓標として共有の台帳に残し、衝突判定に含める必要がある。その場合、引き直しの回数と範囲の枯渇は削除済みの `public` の DDL の履歴に依存する（下の両立条件）。書き込みは DDL の write txn の中だけ（R6 を満たす）。値が飛び飛びで PostgreSQL らしくない。乱数源は engine の `crypto::random` を使う（依存の追加なし）。案 a の複雑さ（遅延の払い出し・片付け）を負わないため、I1 では案 a の有力な対抗として比較する |
-| c. 共有のカウンタのまま許容する | 現行の案 B のまま | 塞がない | 許容できる条件: `public` の DDL がテナントの外のサーバー管理経路だけに限られる（role ADR D6 の方向。テナントのロールが `public` に DDL できない）。その場合に観測できるのは、管理経路が行った `public` の DDL の回数と従属物の数が上限で、テナントの操作の痕跡は含まない。現状は `--ddl-allowed-users` のテナントが `public` に DDL できるため、この条件は満たさない |
+案の採用条件（PR レビューで加えた。I1 の比較はこの条件で行う）:
 
-- 案 d で R1 と R4 を両立する条件（I1 で検証して明記する）。
-  - 削除した値は墓標として残し、衝突判定に含める（再利用しない）
-  - 1 回の作成で引く候補の数を固定し（例: 常に k 個引いて未使用の最初を採る）、引き直しの有無で応答・所要時間を変えない
-  - 生存と墓標を合わせた件数に、範囲の幅より十分小さい上限を設け、超えたら固定文言の `54000` にする。上限への到達は
-    `public` の DDL の総量（共有の履歴）だけで決まり、特定のテナントの操作とは結び付かないことを確かめる
-  - k 個すべてが衝突する確率が、上限の件数のもとで無視できる大きさに収まることを示す
+- K1: 他テナントの `public` の DDL の有無・回数・従属物の数が、OID の欠番・進み幅・順序に現れない（P1-1）
+- K2: R4（改名で変わらない。削除・巻き戻しの後に再利用しない）
+- K3: R6（読み取りで書かない）
+- K4: 可用性。同じスナップショットで名前を解決できる `public` のオブジェクトは、既存の接続・読み取り専用の接続・レプリカでも
+  カタログに出る（段 2 の存在確認が偽陰性にならない）
+- K5: 作成の成否（`54000` 等）と所要時間が、他テナントの過去の DDL の履歴に依存しない（無視できる確率を除く）
+
+| 案 | 内容 | 評価 |
+| -- | ---- | ---- |
+| a. テナントのカウンタで払い出す | `public` のオブジェクトにも、各テナントのカウンタから OID を払い出す。台帳の鍵は名前ではなく、`public` のオブジェクトに作成時に付ける**名前と独立な識別子**（改名で保つ。同名の作り直しでは新しい値）とし、`(テナント, 種別, 識別子)` で持つ。払い出すのは**そのテナントの書き込みの時点**（プライマリでの接続確立時と、そのテナントの write txn の中）で、その時点に存在し、まだ OID の無いオブジェクトだけに付ける | K1・K2・K3・K5 は満たす（識別子を鍵にすれば、他テナントが改名しても割り当ては引き継がれる）。**K4 を満たさない**: 他テナントが `public` に作った表は、自テナントの次の書き込みまでカタログに出ず、書き込まない接続・レプリカでは出ないままになる。読み取りで書かずにこれを解消する手段は見つかっていない。書き込み量は「増えた `public` のオブジェクト数 × 払い出すテナント数」。削除時に全テナントの行を消すと所要時間が他テナントの払い出し数を映すため、各テナントの次の払い出しで片付ける |
+| a'. 案 a を `public` の DDL の時点で全テナントへ払い出す | `public` の DDL の write txn で全テナントのカウンタを進める | **K1 を満たさない**（作って消したオブジェクトも各テナントのカウンタを進める）。DDL の所要時間がテナント数を映す。採らない |
+| a''. 案 a を初めて見えた時点（カタログの照会時）に払い出す | | **K3 を満たさない**（代替案 F と同じ）。採らない |
+| b. `public` の relation だけ HMAC 写像 | `OID = 共有の範囲の先頭 + HMAC(サーバー鍵, public の鍵) mod 範囲の幅`。カウンタを持たない | **K2 を満たさない**（鍵が名前なので改名で変わり、同名の作り直しで同じ値が戻る。代替案 C と同じ）。2^30 の範囲では約 1 万件で 5% 程度の衝突があり、振り直しの順序次第で既存の OID がずれうる |
+| d. 作成時に乱数で引く | `public` のオブジェクトの作成の write txn で、共有の範囲から暗号論的乱数で OID を引く。共有の台帳に持ち、改名で鍵を付け替える。削除した値と巻き戻しで捨てた値は墓標として残し、衝突判定に含める | K1・K3・K4 は満たす（値は作成時に決まり、既存の接続・レプリカにも同じスナップショットで見える）。K2 と K5 は次の両立条件を満たす場合だけ |
+| c. 共有のカウンタのまま許容する | 現行の案 B のまま | **K1 を満たさない**。許容できるのは `public` の DDL がテナントの外のサーバー管理経路だけに限られる場合（role ADR D6 の方向）で、そのとき観測できるのは管理経路の DDL の回数と従属物の数が上限。現状は `--ddl-allowed-users` のテナントが `public` に DDL できるため、この条件は満たさない |
+
+- 案 d の両立条件（K2・K5。I1 で検証して明記する）。
+  - 墓標: 削除した値は共有の台帳に墓標として残す。引いた値は、返す前に上の先取りと同じく利用者の txn と独立に「引いた値」と
+    して永続化し、commit されなかった値は巻き戻しの時点と再起動時に墓標にする。これで巻き戻しと再起動を経ても再利用しない
+    （確率の残余を残さない）
+  - 上限は全テナント共通にしない（全体の上限を置くと、他テナントの過去の作成・削除で自テナントの作成が `54000` に変わり、
+    K5 に反する。PR レビューの P0 指摘）。代わりに、テナントが共有の範囲から引いた値の総数に上限 M を置き、超えたら固定文言の
+    `54000` にする。総数には従属物（制約・既定値・行型など）の値と、削除・巻き戻しで墓標になった値を含む。到達は自テナントの
+    履歴だけで決まるが、減らないため、そのテナントの寿命の全体で足りる大きさに M を決め、到達後の扱い（管理経路での再設定等）
+    も I1 で決める
+  - 1 回の作成で引く候補の数 k を固定し、k 個すべてを照合して未使用の最初を採る（引き直しの有無で所要時間を変えない）。k 個
+    すべてが衝突する確率は、生存と墓標の総数が高々「テナント数 × M」のとき「(テナント数 × M ÷ 2^30)^k」以下になる。この値が
+    無視できる大きさになるよう M と k を決め、根拠を I1 に記録する。条件を満たせない構成（テナント数が多く M を小さくできない等）
+    では案 d を採らない
+  - 共有の範囲の値は乱数なので、値の大小・間隔から履歴は読めない（D1 の並び順は OID に依らない）
 - 案 a でも、カウンタの値は削除や巻き戻しで再利用しない（上の非トランザクションの払い出しと同じ規則）。
-- 決定は I1 で行う。I1 では、案 a・d（と条件つきの c）について、3 テナントでの欠番・進み幅・順序の非観測性のテスト、書き込み量、
-  接続確立の遅延、レプリカでの見え方を比べ、結果と選んだ案を本書に追記してオーナーの承認を得る。
+- 決定は I1 で行う（O1。案 a と案 d を比較する）。上の評価では、現状の構成（テナントが `public` に DDL できる）で K1〜K5 を
+  すべて満たしうるのは、両立条件つきの案 d だけである。案 a は K4 を解消する手段が見つからない限り採れない。I1 では、
+  3 テナントでの欠番・進み幅・順序の非観測性、可用性（K4）、書き込み量、接続確立の遅延、レプリカでの見え方を比べ、結果と
+  選んだ案を本書に追記してオーナーの承認を得る。
 
 #### 採らない代替案
 
@@ -438,11 +466,12 @@ PostgreSQL 17 の挙動（[datatype-oid](https://www.postgresql.org/docs/17/data
 | `regtype` | 1 | 型名（別名 `integer` 等と `[]` を含む。ENUM は可視集合で解決） | `format_type` と同じ表示 |
 | `regproc` | 1（出力と組み込みの入力）・3（UDF の入力） | 関数名。段 1 は組み込みの固定行（`array_in` 等の入出力関数）だけ、段 3 で可視の UDF を加える | 関数名 |
 | `regnamespace` | 1 | SCHEMA 名（D1 の可視集合） | SCHEMA 名 |
-| `regclass` | 2 | relation 名（`search_path`・暗黙の `pg_catalog`・一時表の順。修飾名も可） | relation 名。`search_path` で見えないときは SCHEMA で修飾 |
+| `regclass` | 2 | relation 名（解決順は D10 のとおり FROM 句と同じ。修飾名も可） | relation 名。`search_path` で見えないときは SCHEMA で修飾 |
 | `regrole`・`regprocedure` | 3 | ロール名（自テナント）・関数名と引数型 | 同左 |
 | `regoper`・`regoperator`・`regcollation`・`regconfig`・`regdictionary` | 提供しない | `0A000` | — |
 
-- 名前の解決は、FROM 句の relation と同じ解決器（schema ADR D4・D5）を使う。第 2 の解決器を作らない。
+- 名前の解決は、FROM 句の relation と同じ解決器（schema ADR D4・D5）を使う。第 2 の解決器を作らない。優先順は D10 に一本化し
+  （一時表 → 暗黙の `pg_catalog` → `search_path`）、入力と出力（修飾の要否の判定）も同じ解決結果に従う。
 - 不在と他テナント: 名前が可視集合に無ければ、PostgreSQL と同じく `42P01`（`relation "<入力>" does not exist`。`regtype` は
   `42704` とみているが実機確認は I3）。修飾子が他テナントの SCHEMA でも存在しない SCHEMA でも同じ応答にする（PostgreSQL の `regclassin` は
   `RangeVarGetRelid` を `missing_ok=true` で呼び、見つからなければ `42P01` を返す。修飾子の SCHEMA が無い場合も同じ経路になる
@@ -505,13 +534,13 @@ PostgreSQL 17 の挙動（[datatype-oid](https://www.postgresql.org/docs/17/data
 
 | Issue | 内容 | 前提 | テスト観点 |
 | ----- | ---- | ---- | ---------- |
-| I1 OID 台帳 | D4 の台帳・範囲・カウンタ、全 DDL 経路（作成・削除・改名・`SET SCHEMA`・`CASCADE`・ロールバック）への結線、起動時の付与、一時表のセッション内 OID | なし | (a) テナント B の作成・削除・ロールバックの前後で、テナント A の次の OID と既存の OID が変わらない (b) A と B の最初のオブジェクトが同じ OID 値になる (c) 再起動・改名で OID が変わらず、削除後に再利用しない (d) レプリカ・読み取り専用トランザクションで台帳へ書かない (e) バックアップ・PITR・レプリケーション後に OID が一致 (f) 起動時の付与が冪等で、付与順が他テナントに依存しない (g) 範囲の枯渇が `54000` で、他テナントの状態に依存しない (h) 台帳のキーはスコープ（テナント）を先頭にし、テナント単位の列挙が範囲走査で済む。所有者はカタログの経路で可視な relation ごとの点引きに限り、所有者表 `object_owners`（テナントが末尾）をテナント先頭へ組み替えるかを比較して決める (i) D4 の P1 の案 a・d・c を比較し、`public` の DDL の作成・削除・従属物の増減が他テナントの OID の欠番・進み幅・順序に現れないことを 3 テナントで確かめ、選んだ案を本書に追記する (j) 改名・`SET SCHEMA` の後、`regclass` の出力が新しい名前になり、旧い名前で作り直したオブジェクトは新しい OID を得て、元の OID は改名先を指す (k) トランザクションの中で読んだ未 commit の OID が、ROLLBACK・savepoint への巻き戻しの後に別のオブジェクトへ払い出されない（再起動をまたぐ残余の幅を測って記録する） (l) 案 d を採る場合、削除済みの値を再利用せず、引き直しの有無で応答・所要時間が変わらない |
+| I1 OID 台帳 | D4 の台帳・範囲・カウンタ、全 DDL 経路（作成・削除・改名・`SET SCHEMA`・`CASCADE`・ロールバック）への結線、起動時の付与、一時表のセッション内 OID | なし | (a) テナント B の作成・削除・ロールバックの前後で、テナント A の次の OID と既存の OID が変わらない (b) A と B の最初のオブジェクトが同じ OID 値になる (c) 再起動・改名で OID が変わらず、削除後に再利用しない (d) レプリカ・読み取り専用トランザクションで台帳へ書かない (e) バックアップ・PITR・レプリケーション後に OID が一致 (f) 起動時の付与が冪等で、付与順が他テナントに依存しない (g) 範囲の枯渇が `54000` で、他テナントの状態に依存しない (h) 台帳のキーはスコープ（テナント）を先頭にし、テナント単位の列挙が範囲走査で済む。所有者はカタログの経路で可視な relation ごとの点引きに限り、所有者表 `object_owners`（テナントが末尾）をテナント先頭へ組み替えるかを比較して決める (i) D4 の P1 の案 a・d・c を比較し、`public` の DDL の作成・削除・従属物の増減が他テナントの OID の欠番・進み幅・順序に現れないことを 3 テナントで確かめ、選んだ案を本書に追記する (j) 改名・`SET SCHEMA` の後、`regclass` の出力が新しい名前になり、旧い名前で作り直したオブジェクトは新しい OID を得て、元の OID は改名先を指す (k) トランザクションの中で読んだ未 commit の OID が、ROLLBACK・savepoint への巻き戻しの後に別のオブジェクトへ払い出されない (l) 案 d を採る場合、削除済みの値と巻き戻しで捨てた値を再利用せず、引き直しの有無で応答・所要時間が変わらず、`54000` の判定が自テナントの履歴だけで決まる (m) 1 つの txn で先取りの上限を越えて払い出した後の巻き戻しと再起動を経ても、公開済みの値が再び払い出されない。再起動の直後の DDL・新しいテナントの最初の DDL・先取りの幅を越える数の OID を要する 1 つの txn が `54000` にならない (n) 一時表を作った 2 つのセッションで `pg_type` と型ロードの結果が食い違わない |
 | P1〜P8 カタログ外の前提 | §3.4 の表（修飾した関数名・型名、`OPERATOR(...)`・`COLLATE pg_catalog.default`、`oid`・`name`・`"char"` 型、`version()`・`current_database()`・`current_setting`・`set_config`、一般の `SHOW`／`SET SESSION`、FROM のある文での `current_schemas`、`pg_advisory_lock`、`pg_is_in_recovery()`） | なし | 各関数・構文の PostgreSQL 17 との突き合わせ。テナント依存の値を返さないこと（`version()`・`current_setting` はテナントに依らない固定値）。P7: (a) 同じテナントの 2 セッションが同じキーを取り合うと後者が待つ (b) 別テナントの 2 セッションは同じキーでも待たない (c) 他テナントがロックを保持しているかどうかで、自テナントの取得の成否・待ち時間・`pg_try_advisory_lock` の結果が変わらない |
 | I2 仮想カタログの基盤 | 組み込み SCHEMA の relation を読み取り専用の仮想表として解決する層、D2 の `42501`・`0A000`、D10 の暗黙の `pg_catalog`、結果の上限、キャッシュの規則（可視行はキャッシュせず実行のたびに導く。束縛の結果を再利用するなら、再利用の条件にテナント・`search_path`・実効ロール・ACL の世代・カタログ世代・セッションの一時カタログの状態を含めるか、可視性に依存する部分を実行時に再評価する）、D10 の起動時の検出・警告と CHANGELOG への記載 | I1 | (a) 書き込み・DDL がすべて `42501` で副作用ゼロ (b) 永続定義からの参照が `0A000` (c) NoSQL が `0A000` (d) 準備済み文の再利用がテナント・ロール・セッションをまたがない（同じテナントで `SET ROLE` の前後、`GRANT`／`REVOKE` の前後、一時表の作成・削除の前後、別セッションで結果が正しく変わる） (e) 未提供の表が `0A000` のまま (f) カタログと同名の利用者の表がある DB を開くと警告が出る |
 | I3 段 1 | D3 段 1 の表・関数・型、D6 の組み込み型の情報源の一本化 | I2・P1〜P4（Npgsql は `version()` を送る） | (a) 3 テナントで互いの ENUM 型が `pg_type`・`pg_enum` に出ない (b) B の ENUM の作成・削除で A の行・件数・OID・並びが変わらない（A の出力をバイト単位で比較） (c) `pg_type` の組み込み行と `WireType` の一致 (d) 層 B: Npgsql の接続、pgjdbc の未知 OID 照会、psycopg の `TypeInfo.fetch`、Rails の型の遅延読み込み |
 | I4 段 2 | D3 段 2 と `regclass` | I3・P4〜P7 | (a) B の SCHEMA・表の名前で `'b.t'::regclass`・`'t'::regclass`・`to_regclass` が不在と同じ応答・同じ文言 (b) B のオブジェクトの OID 値 v を A の `regclass` 出力に渡すと、v が A の可視集合に無ければ数のまま、A の可視集合に同じ値のオブジェクトがあれば A のオブジェクトの名前になる（B の名前は出ない。R2・D7）。両方の場合をテストで固定する (c) `public` の表の `reltuples` 等が固定値で、B の行数に依存しない (d) `relowner`・`relhastriggers` が自テナントの分だけで決まる (e) 明示トランザクションの中の DDL が commit 前に他セッションへ出ない (f) 一時表が同じテナントの別セッションに出ない (g) 層 B: Rails のスキーマ読み込みと `db:migrate`、Django の `migrate`、Alembic の `upgrade`、Prisma の `migrate deploy` (h) SQLAlchemy の dialect 初期化（`pg_catalog.version()`〔P1・P4〕・`current_schema()`・`SHOW standard_conforming_strings`〔P5〕）を通って Alembic が接続できる |
 | I5 段 3 | D3 段 3、`information_schema`、RowDescription の table OID・attnum | I4 | (a) `information_schema` の行がロール権限で PostgreSQL 17 と同じく絞られ、他テナントの ACL を見ない (b) `pg_roles` にログイン識別子・他テナントのロールが出ない (c) B のロールの OID 値を A の `pg_get_userbyid` に渡すと、A に無ければ `unknown (OID=<n>)`、A に同じ値のロールがあれば A のロール名（D7） (d) 層 B: SQLAlchemy の reflection、Alembic の autogenerate、Prisma の `db pull`、Django の `inspectdb`、pgjdbc の `getTables`・`getColumns`・`getPrimaryKeys` |
-| I6 段 4 | D3 段 4、`aclitem` | I5 | 層 B: psql 17 の `\d`・`\d <表>`・`\dt`・`\dn`・`\df`・`\du`・`\l` の出力を PostgreSQL 17 と突き合わせる（公告する `server_version` のもとで） |
+| I6 段 4 | D3 段 4、`aclitem` | I5 | (a) 公告する `server_version`（O3）のもとで psql 17 の `\d <名前>` が表の種別ごと（表・ビュー・matview・索引・SEQUENCE）に発行する SQL を原文で確かめ、使う関数・表がすべて提供範囲にあることを確認する。範囲外のものが見つかったら本書の段 4 に足してから実装する (b) 層 B: psql 17 の `\d`・`\d <表>`（上の種別ごと）・`\dt`・`\dn`・`\df`・`\du`・`\l` の出力を PostgreSQL 17 と突き合わせる |
 
 - 各段の Issue は、棚卸しの該当行の SQL を原文で確かめ直すことを受け入れ条件に含める（§3.1）。
 - 共通の検証: 3 テナント A・B・C で、B と C がオブジェクトの作成・削除・改名・ロールバックを繰り返す場合と何もしない場合とで、
@@ -534,7 +563,7 @@ PostgreSQL 17 の挙動（[datatype-oid](https://www.postgresql.org/docs/17/data
 
 | ID | 事項 | 決定 |
 | -- | ---- | ---- |
-| O1 | 共有の `public` のオブジェクトの OID の払い出し方（D4 の P1。共有カウンタのままでは、他テナントの `public` の DDL の有無・回数・従属物の数が欠番と進み幅から観測できる） | 既定で塞ぐ。案 a（テナントのカウンタで、テナントの書き込みの時点に払い出す）と案 d（作成時の乱数）を I1 で比較して決める。案 c（許容）は `public` の DDL をサーバー管理経路に限る場合だけ |
+| O1 | 共有の `public` のオブジェクトの OID の払い出し方（D4 の P1。共有カウンタのままでは、他テナントの `public` の DDL の有無・回数・従属物の数が欠番と進み幅から観測できる） | 既定で塞ぐ。案 a（テナントのカウンタで、テナントの書き込みの時点に払い出す）と案 d（作成時の乱数）を I1 で比較して決める。案 c（許容）は `public` の DDL をサーバー管理経路に限る場合だけ。注記: 決定の後の PR レビューで、比較に使う採用条件 K1〜K5 を D4 の P1 に加えた（案 a は K4、案 d は全体の上限を置くと K5 を満たさない） |
 | O2 | ENUM・VECTOR 系の列の型を、現状の公告（`text`）に合わせるか、WIRE-13 を変えるか | 段 1〜3 は公告に合わせて `text`。ENUM 型の OID の公告は、カタログの提供後に別 Issue（BREAKING）で検討する |
 | O3 | `server_version=14.0` の公告を維持するか、17 系へ上げるか | 本書の範囲では維持し、層 B は公告する版数で確かめる。17 系への変更は全クライアントに影響するため別 Issue |
 | O4 | サイズ系関数を提供しない（psql の `\dt+`・`\l+` が動かない）ままでよいか | 当面は提供しない。テナントの行だけを数える測り方を設計できたら再検討する |
