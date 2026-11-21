@@ -157,7 +157,7 @@ REAL_SIGNATURE = (
 
 def parse_verified(text):
     # 本文の形の検査用。生成元（Cursor Bugbot の編集記録）は確認済みとして解析する
-    return cic.extract_out_of_scope_sections(text, cursor_verified=True)
+    return cic.extract_out_of_scope_sections(text, cursor_allow=lambda block: True)
 
 
 def items_of(text):
@@ -329,7 +329,8 @@ class AutoSummaryTests(unittest.TestCase):
         # 既定の形でも、生成元（Cursor Bugbot の編集記録）を確認できない PR では区間を除外しない（fail-closed）
         text = BASE + "\n" + FOOTER + "\n\n" + CURSOR_BLOCK.replace("synthetic text", "remaining work #9") + "\n"
         for secs in (cic.extract_out_of_scope_sections(text),
-                     cic.extract_out_of_scope_sections(text, cursor_verified=False)):
+                     cic.extract_out_of_scope_sections(text, cursor_allow=lambda block: False),
+                     cic.extract_out_of_scope_sections(text, cursor_allow=frozenset({CURSOR_BLOCK}).__contains__)):
             self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
             self.assertEqual(secs[0].excluded.get("claude-code-footer", 0), 1)
             self.assertIn("#9", " ".join(secs[0].items))
@@ -352,22 +353,6 @@ class AutoSummaryTests(unittest.TestCase):
         joined = " ".join(secs[0].items)
         self.assertIn("#77", joined)
         self.assertIn("#88", joined)
-
-    def test_cursor_edit_verified(self):
-        bot = {"__typename": "Bot", "login": "cursor"}
-        ok = {"pageInfo": {"hasNextPage": False}, "nodes": [{"editor": {"__typename": "User", "login": "x"}},
-                                                             {"editor": bot}]}
-        self.assertTrue(cic._cursor_edit_verified({"userContentEdits": ok}))
-        # 取得範囲で見つかれば続きのページがあっても確認済み
-        self.assertTrue(cic._cursor_edit_verified(
-            {"userContentEdits": {"pageInfo": {"hasNextPage": True}, "nodes": [{"editor": bot}]}}))
-        for edits in (None, {}, {"nodes": None}, {"nodes": "x"}, {"nodes": ["x", None, {"editor": None}]},
-                      {"pageInfo": {"hasNextPage": True}, "nodes": []},
-                      {"nodes": [{"editor": {"__typename": "User", "login": "cursor"}}]},
-                      {"nodes": [{"editor": {"__typename": "Bot", "login": "cursor-evil"}}]},
-                      {"nodes": [{"editor": {"login": "cursor"}}]}):
-            self.assertFalse(cic._cursor_edit_verified({"userContentEdits": edits}), edits)
-        self.assertFalse(cic._cursor_edit_verified({}))
 
     def test_cursor_nested_inner_start_not_recognized(self):
         # 外側が不成立のとき内側の開始行を新候補にせず、外側の引用行・参照を検査に残す
@@ -416,20 +401,116 @@ class AutoSummaryTests(unittest.TestCase):
 
 
 # 実 PR で実測した Cursor Bugbot の本文編集記録の形（editor は Bot 型・login cursor）
-CURSOR_EDITS = {"pageInfo": {"hasNextPage": False},
-                "nodes": [{"editor": {"__typename": "User", "login": "someone"}},
-                          {"editor": {"__typename": "Bot", "login": "cursor"}}]}
+BOT = {"__typename": "Bot", "login": "cursor"}
+HUMAN = {"__typename": "User", "login": "someone"}
+
+
+def edits_of(*snaps, next_page=False):
+    """新しい順の (editor, 編集後の本文全体[, deletedAt]) から userContentEdits 応答を作る（実測した形）。"""
+    nodes = []
+    for k, snap in enumerate(snaps):
+        editor, diff = snap[0], snap[1]
+        deleted = snap[2] if len(snap) > 2 else None
+        nodes.append({"editedAt": "2026-01-01T00:%02d:00Z" % (59 - k), "deletedAt": deleted,
+                      "diff": diff, "editor": editor})
+    return {"pageInfo": {"hasNextPage": next_page}, "nodes": nodes}
+
+
+def bot_made(full, block=None, **kw):
+    """Bot が `block` を足して `full` にした編集記録（直前は区間の無い人の本文）。"""
+    block = CURSOR_BLOCK if block is None else block
+    return edits_of((BOT, full), (HUMAN, full.replace(block, "")), **kw)
+
+
+class ProvenanceTests(unittest.TestCase):
+    """Cursor 要約区間が Bot の生成物そのままかの判定（verified_cursor_blocks）。"""
+
+    FULL = BASE + "\n" + CURSOR_BLOCK + "\n"
+
+    def check(self, edits, cands=None):
+        return cic.verified_cursor_blocks([CURSOR_BLOCK] if cands is None else cands, edits)
+
+    def test_bot_generated_block_allowed(self):
+        self.assertEqual(self.check(bot_made(self.FULL)), {CURSOR_BLOCK})
+        # 実データの形: Bot の後に人が区間の外だけを編集しても、現在の区間は Bot の区間と一致するので認める
+        later = self.FULL + "\n- later #3\n"
+        self.assertEqual(self.check(edits_of((HUMAN, later), (BOT, self.FULL), (HUMAN, BASE))), {CURSOR_BLOCK})
+        # Bot が区間を保ったまま再編集していても、区間を生成した編集まで遡って認める
+        self.assertEqual(self.check(edits_of((BOT, self.FULL), (BOT, self.FULL), (HUMAN, BASE))), {CURSOR_BLOCK})
+
+    def test_human_written_block_carried_by_bot_rejected(self):
+        # 人が書いた区間を Bot が引き継いだだけ（直前の本文に同じ文字列がある）なら認めない
+        self.assertEqual(self.check(edits_of((BOT, self.FULL), (HUMAN, self.FULL))), frozenset())
+        self.assertEqual(self.check(edits_of((BOT, self.FULL), (HUMAN, self.FULL), (HUMAN, BASE))), frozenset())
+
+    def test_human_rewrite_after_bot_rejected(self):
+        # Bot の後に人が区間を書き換えた場合、現在の区間は Bot の区間とバイト単位で一致しないので認めない
+        rewritten = CURSOR_BLOCK.replace("synthetic text", "remaining work #9")
+        edits = edits_of((HUMAN, self.FULL.replace(CURSOR_BLOCK, rewritten)), (BOT, self.FULL), (HUMAN, BASE))
+        self.assertEqual(self.check(edits, [rewritten]), frozenset())
+        trailing = CURSOR_BLOCK.replace("> synthetic text", "> synthetic text ")
+        self.assertEqual(self.check(edits, [trailing]), frozenset())
+
+    def test_unusable_snapshots_rejected(self):
+        cases = {
+            "bot-diff-null": edits_of((BOT, None), (HUMAN, BASE)),
+            "bot-deleted": edits_of((BOT, self.FULL, "2026-01-02T00:00:00Z"), (HUMAN, BASE)),
+            "prev-diff-null": edits_of((BOT, self.FULL), (HUMAN, None)),
+            # 直前が削除済みなら、さらに古い本文を直前として使わない
+            "prev-deleted": edits_of((BOT, self.FULL), (HUMAN, self.FULL, "2026-01-02T00:00:00Z"), (HUMAN, BASE)),
+            "no-previous": edits_of((BOT, self.FULL)),
+            "truncated": bot_made(self.FULL, next_page=True),
+        }
+        for name, edits in cases.items():
+            self.assertEqual(self.check(edits), frozenset(), name)
+
+    def test_malformed_responses_rejected(self):
+        good = bot_made(self.FULL)
+        no_page = dict(good)
+        del no_page["pageInfo"]
+        ascending = dict(good, nodes=list(reversed(good["nodes"])))
+        no_stamp = dict(good, nodes=[dict(good["nodes"][0], editedAt=None), good["nodes"][1]])
+        for edits in (None, {}, "x", no_page, dict(good, pageInfo={"hasNextPage": None}),
+                      dict(good, nodes=None), dict(good, nodes=["x", None]), ascending, no_stamp):
+            self.assertEqual(self.check(edits), frozenset(), edits)
+        # 同時刻の編集は新しい順として許す
+        same = dict(good, nodes=[dict(n, editedAt="2026-01-01T00:00:00Z") for n in good["nodes"]])
+        self.assertEqual(self.check(same), {CURSOR_BLOCK})
+        self.assertEqual(self.check(good, []), frozenset())
+
+    def test_editor_type_checked_before_lookup(self):
+        # editor の __typename・login が str でなければ（list・dict 等でも例外を出さず）未確認にする
+        for editor in ({"__typename": ["Bot"], "login": "cursor"}, {"__typename": "Bot", "login": ["cursor"]},
+                       {"__typename": "Bot", "login": {"x": 1}}, {"__typename": "Bot"}, {"login": "cursor"},
+                       {"__typename": "User", "login": "cursor"}, {"__typename": "Bot", "login": "cursor-evil"},
+                       None, "cursor"):
+            self.assertEqual(self.check(edits_of((editor, self.FULL), (HUMAN, BASE))), frozenset(), editor)
+
+    def test_crlf_previous_is_normalized(self):
+        # 人が CRLF で書いた区間を Bot が LF で引き継いだだけでも、直前に同じ文字列があるとみなして認めない
+        self.assertEqual(self.check(edits_of((BOT, self.FULL), (HUMAN, self.FULL.replace("\n", "\r\n")))),
+                         frozenset())
+
+    def test_candidate_blocks_follow_parser(self):
+        # 候補は除外と同じパーサで数える（対象外節の中・フェンス外・既定の形のみ）
+        self.assertEqual(cic.cursor_candidate_blocks(self.FULL), [CURSOR_BLOCK])
+        self.assertEqual(cic.cursor_candidate_blocks(BASE + "\n```\n" + CURSOR_BLOCK + "\n```\n"), [])
+        self.assertEqual(cic.cursor_candidate_blocks(BASE + "\n" + CURSOR_BLOCK.replace("Reviewed by", "Seen by")), [])
+        self.assertEqual(cic.cursor_candidate_blocks("## 次\n\n" + CURSOR_BLOCK + "\n"), [])
 
 
 class FakeGh:
     """parent=100 の子 101..104。101 untracked、102 closed のみ、103/104 が循環、それぞれ PR を持つ。"""
 
-    def __init__(self, bodies=None, states=None, tree=None, edits=None, pr_bodies=None, edit_errors=()):
-        # edits: PR 番号 -> userContentEdits 応答。pr_bodies: 番号 -> 直接参照される PR の本文。
-        # edit_errors: userContentEdits の取得だけが失敗する PR 番号
+    def __init__(self, bodies=None, states=None, tree=None, edits=None, pr_bodies=None, edit_errors=(),
+                 provenance_fails=False):
+        # edits: PR 番号 -> userContentEdits 応答（2 段目）。pr_bodies: 番号 -> 直接参照される PR の本文。
+        # edit_errors: 2 段目で userContentEdits の取得が失敗する PR 番号。provenance_fails: 2 段目の呼び出し自体が失敗
         self.edits = edits or {}
         self.pr_bodies = pr_bodies or {}
         self.edit_errors = set(edit_errors)
+        self.provenance_fails = provenance_fails
+        self.provenance_queries = []  # 2 段目で問い合わせた PR 番号（バッチごと）
         self.tree = tree or {100: [101, 102, 103, 104], 101: [], 102: [], 103: [], 104: []}
         self.bodies = bodies or {
             101: (901, body(f"nothing here {SENTINEL}")),
@@ -442,28 +523,40 @@ class FakeGh:
 
     def __call__(self, query, variables):
         self.calls += 1
+        if "pullRequest(number:" in query:
+            nums = [int(x) for x in re.findall(r"p(\d+): pullRequest", query)]
+            self.provenance_queries.append(nums)
+            if self.provenance_fails:
+                raise cic.FetchError("gh api failed")
+            data, errors = {}, []
+            for n in nums:
+                if n in self.edit_errors:
+                    data[f"p{n}"] = {"userContentEdits": None}
+                    errors.append({"type": "FORBIDDEN", "path": ["repository", f"p{n}", "userContentEdits"]})
+                else:
+                    data[f"p{n}"] = {"userContentEdits": self.edits.get(
+                        n, {"pageInfo": {"hasNextPage": False}, "nodes": []})}
+            resp = {"data": {"repository": data}}
+            if errors:
+                resp["errors"] = errors
+            return resp
         if "number:$number" in query:
             n = variables["number"]
             pr = self.bodies.get(n)
-            resp = {"data": {"repository": {"issue": {
+            return {"data": {"repository": {"issue": {
                 "number": n, "state": "CLOSED" if n != 100 else "OPEN",
                 "subIssues": {"pageInfo": {"hasNextPage": False}, "nodes": [
                     {"number": c, "state": "CLOSED"} for c in self.tree.get(n, [])]},
                 "closedByPullRequestsReferences": {"pageInfo": {"hasNextPage": False},
-                    "nodes": [{"number": pr[0], "merged": True, "body": pr[1],
-                               "userContentEdits": self._edits(pr[0])}] if pr else []},
+                    "nodes": [{"number": pr[0], "merged": True, "body": pr[1]}] if pr else []},
             }}}}
-            if pr and pr[0] in self.edit_errors:
-                resp["errors"] = [{"type": "FORBIDDEN", "path": [
-                    "repository", "issue", "closedByPullRequestsReferences", "nodes", 0, "userContentEdits"]}]
-            return resp
         nums = [int(x) for x in re.findall(r"n(\d+): issueOrPullRequest", query)]
         data, errors = {}, []
         for n in nums:
             st = self.states.get(n)
             if n in self.pr_bodies:
                 data[f"n{n}"] = {"__typename": "PullRequest", "state": "MERGED", "merged": True,
-                                 "body": self.pr_bodies[n], "userContentEdits": self._edits(n)}
+                                 "body": self.pr_bodies[n]}
             elif st is None:
                 data[f"n{n}"] = None
                 errors.append({"type": "NOT_FOUND", "path": [f"n{n}"]})
@@ -473,11 +566,6 @@ class FakeGh:
         if errors:
             resp["errors"] = errors
         return resp
-
-    def _edits(self, pr):
-        if pr in self.edit_errors:
-            return None
-        return self.edits.get(pr, {"pageInfo": {"hasNextPage": False}, "nodes": []})
 
 
 def run_cli(runner, argv, git_files=()):
@@ -501,8 +589,9 @@ class IntegrationTests(unittest.TestCase):
     def test_verbose_reports_excluded_without_echo(self):
         tail = (FOOTER + "\n" + CURSOR_BLOCK.replace("synthetic text", SENTINEL) + "\n")
         plain = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n")}, tree={100: [101], 101: []})
-        g = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n\n" + tail)}, tree={100: [101], 101: []},
-                   edits={901: CURSOR_EDITS})
+        full = "## 対象外\n\n- see #600\n\n" + tail
+        g = FakeGh(bodies={101: (901, full)}, tree={100: [101], 101: []},
+                   edits={901: bot_made(full, CURSOR_BLOCK.replace("synthetic text", SENTINEL))})
         code, out, err = run_cli(g, ["100", "--verbose"])
         pcode, pout, _ = run_cli(plain, ["100", "--verbose"])
         self.assertIn("EXCLUDED    issue #101 pr #901", out)
@@ -542,31 +631,68 @@ class IntegrationTests(unittest.TestCase):
 
     def test_auto_summary_no_false_untracked(self):
         tail = "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n"
-        g = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n" + tail)}, tree={100: [101], 101: []},
-                   edits={901: CURSOR_EDITS})
+        full = "## 対象外\n\n- see #600\n" + tail
+        g = FakeGh(bodies={101: (901, full)}, tree={100: [101], 101: []}, edits={901: bot_made(full)})
         code, out, _ = run_cli(g, ["100"])
         self.assertEqual(code, 0, out)
+        self.assertEqual(g.provenance_queries, [[901]])
 
     def test_cursor_not_excluded_without_verified_editor(self):
-        # 編集記録が無い・User の cursor・別の Bot・確認しきれないページング・記録の取得失敗では除外しない
+        # 編集記録が無い・User の cursor・別の Bot・人が書いて Bot が引き継いだ・確認しきれないページング・
+        # 記録の取得失敗・2 段目の呼び出し失敗では除外しない
         tail = "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n"
+        full = "## 対象外\n\n- see #600\n" + tail
+        before = full.replace(CURSOR_BLOCK, "")
         cases = {
             "none": {},
-            "user-cursor": {"edits": {901: {"pageInfo": {"hasNextPage": False},
-                                            "nodes": [{"editor": {"__typename": "User", "login": "cursor"}}]}}},
-            "other-bot": {"edits": {901: {"pageInfo": {"hasNextPage": False},
-                                          "nodes": [{"editor": {"__typename": "Bot", "login": "other"}}]}}},
-            "truncated": {"edits": {901: {"pageInfo": {"hasNextPage": True},
-                                          "nodes": [{"editor": {"__typename": "User", "login": "x"}}]}}},
-            "edit-error": {"edit_errors": {901}},
+            "user-cursor": {"edits": {901: edits_of(({"__typename": "User", "login": "cursor"}, full),
+                                                    (HUMAN, before))}},
+            "other-bot": {"edits": {901: edits_of(({"__typename": "Bot", "login": "other"}, full),
+                                                  (HUMAN, before))}},
+            "carried": {"edits": {901: edits_of((BOT, full), (HUMAN, full))}},
+            "truncated": {"edits": {901: bot_made(full, next_page=True)}},
+            "edit-error": {"edits": {901: bot_made(full)}, "edit_errors": {901}},
+            "fetch-failed": {"edits": {901: bot_made(full)}, "provenance_fails": True},
         }
         for name, kw in cases.items():
-            g = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n" + tail)}, tree={100: [101], 101: []}, **kw)
+            g = FakeGh(bodies={101: (901, full)}, tree={100: [101], 101: []}, **kw)
             code, out, err = run_cli(g, ["100", "--verbose"])
             self.assertEqual(code, 1, (name, out, err))
             self.assertIn("UNTRACKED   issue #101 pr #901", out, name)
             self.assertNotIn("cursor-summary", out, name)
             self.assertIn("claude-code-footer=1", out, name)
+
+    def test_provenance_queried_only_for_prs_with_candidates(self):
+        # 2 段目（本文編集記録）は候補区間のある PR だけを問い合わせ、候補の無い PR では呼ばない
+        full = "## 対象外\n\n- see #600\n\n" + CURSOR_BLOCK + "\n"
+        g = FakeGh(bodies={101: (901, full), 102: (902, body("see #600"))},
+                   tree={100: [101, 102], 101: [], 102: []}, edits={901: bot_made(full)})
+        run_cli(g, ["100"])
+        self.assertEqual(g.provenance_queries, [[901]])
+        g2 = FakeGh(bodies={101: (901, body("see #600"))}, tree={100: [101], 101: []})
+        run_cli(g2, ["100"])
+        self.assertEqual(g2.provenance_queries, [])
+        # 区間が対象外節の外にあるだけの PR も候補にしない
+        g3 = FakeGh(bodies={101: (901, body("see #600") + "\n## 次\n\n" + CURSOR_BLOCK + "\n")},
+                    tree={100: [101], 101: []})
+        run_cli(g3, ["100"])
+        self.assertEqual(g3.provenance_queries, [])
+
+    def test_provenance_batch_error_unverifies_whole_batch(self):
+        # 2 段目の応答に errors があれば、影響する PR を絞り込まずバッチ内の全 PR を未確認にする
+        full = "## 対象外\n\n- see #600\n\n" + CURSOR_BLOCK + "\n"
+        kw = dict(bodies={101: (901, full), 102: (902, full)}, tree={100: [101, 102], 101: [], 102: []},
+                  edits={901: bot_made(full), 902: bot_made(full)}, states={600: "OPEN"})
+        ok = FakeGh(**kw)
+        _, out, _ = run_cli(ok, ["100", "--verbose"])
+        self.assertEqual(ok.provenance_queries, [[901, 902]])
+        self.assertEqual(out.count("cursor-summary=1"), 2, out)
+        bad = FakeGh(edit_errors={902}, **kw)
+        code, out, _ = run_cli(bad, ["100", "--verbose"])
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("cursor-summary", out)
+        self.assertIn("UNTRACKED   issue #101 pr #901", out)
+        self.assertIn("UNTRACKED   issue #102 pr #902", out)
 
     def test_verbose_direct_pr_outside_tree_shows_pr_only(self):
         # ツリー外で直接参照した PR の除外は `pr #N` だけで示し、`issue #N pr #N` と表示しない

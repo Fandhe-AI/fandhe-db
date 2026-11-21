@@ -22,10 +22,13 @@
   フェンス外かつ対象外節の中でだけ除外する（区間は開始・終了の印の行、内側 1 行目 `---`、
   以降は空行か引用行のみ、Reviewed by の引用行を含む形）。終了の印が無い・形が崩れている・
   Bugbot の署名候補なのに既定書式と一致しない引用行がある・区間の外の行は従来どおり項目として
-  数える（fail-closed）。Cursor 区間の除外はさらに、PR の本文編集記録（GraphQL の userContentEdits）に
-  Cursor Bugbot（`Bot` 型・login `cursor`）の編集がある PR に限る。記録が無い・取得できない・ページングで
-  確認しきれない PR では除外しない。除外が起きた PR は通常の出力に PR 番号と件数だけ、`--verbose` では
-  節ごとに種別と件数を出す
+  数える（fail-closed）。Cursor 区間の除外はさらに、区間の文字列が Cursor Bugbot（`Bot` 型・login
+  `cursor`）の生成物そのままと確かめられた場合に限る。PR の本文編集記録（GraphQL の userContentEdits の
+  `diff`。実測では各編集後の本文全体・新しい順）で、その区間とバイト単位で一致する区間を Bot の編集後の
+  本文が持ち、かつ直前の本文には同じ文字列が無いことを求める。編集記録は候補区間のある PR だけを
+  2 段目で取得する。記録が無い・取得できない・errors がある（そのバッチは全件）・`diff` が null・
+  削除済み・直前が無い・ページングで確認しきれない・並びが新しい順でない場合は除外しない。除外が起きた
+  PR は通常の出力に PR 番号と件数だけ、`--verbose` では節ごとに種別と件数を出す
 - 機密保持: PR 本文・Issue タイトル・項目本文は出力に再掲しない。出すのは Issue/PR
   番号、節の見出し（無害化・80 文字で切り詰め）、分類だけ
 - subprocess はリスト引数のみ（shell 不使用）。GraphQL の値は変数で渡し、alias 名は
@@ -94,8 +97,14 @@ CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/clau
 # Cursor 要約区間の生成元として認める本文編集者（__typename, login）。実 PR の userContentEdits で実測した値
 # （2026-11-21・#3363・#3365・#3525・#3531）。同名の User アカウントと区別するため型も照合する。
 CURSOR_EDITORS = {("Bot", "cursor")}
-# PR の本文編集記録の取得件数（新しい順）。この範囲に生成元が見つからず続きがある PR は確認しきれないとして除外しない。
-USER_CONTENT_EDITS_QUERY = "userContentEdits(first:100){pageInfo{hasNextPage} nodes{editor{__typename login}}}"
+# 2 段目（候補区間のある PR だけ）で取得する本文編集記録。`diff` は各編集後の本文全体（#3531 で実測）。
+# 100 件で続きがある PR は直前の本文まで確かめきれないとして除外しない。
+EDITS_FIELDS = (
+    "userContentEdits(first:100){pageInfo{hasNextPage} "
+    "nodes{editedAt deletedAt diff editor{__typename login}}}"
+)
+# 2 段目の 1 回の問い合わせに含める PR 数（各 PR が最大 100 件の本文全体を返すため小さく保つ）
+PROVENANCE_CHUNK = 5
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
 RANGE_RE = re.compile(
@@ -122,12 +131,10 @@ class Info:
     kind: str  # "issue" | "pr" | "missing"
     state: str = ""  # "open" | "closed"（PR は merged も closed 扱い）
     body: str = ""
-    # PR の本文に Cursor Bugbot の編集記録を確認できたか（Cursor 要約区間の除外の前提。既定は未確認）
-    cursor_verified: bool = False
 
 
-# PR 本文の単位: (PR 番号, 本文, Cursor Bugbot の編集記録を確認できたか)
-PrBody = tuple[int, str, bool]
+# Cursor 要約区間の生成元を確かめた結果: PR 番号 -> 除外してよい区間の文字列（開始の印の行から終了の印の行まで）
+Provenance = dict[int, frozenset[str]]
 
 
 @dataclass
@@ -274,11 +281,14 @@ def _cursor_failed_region_end(lines: list[str], start: int) -> int:
     return len(lines) - 1
 
 
-def extract_out_of_scope_sections(body: str, cursor_verified: bool = False) -> list[Section]:
+def extract_out_of_scope_sections(
+    body: str, cursor_allow: Callable[[str], bool] | None = None
+) -> list[Section]:
     """PR 本文から「対象外」節（フェンス外の ATX 見出し）を抽出する。untrusted 入力。
 
-    `cursor_verified` は、その PR の本文に Cursor Bugbot の編集記録を確認できたか。False（既定）なら
-    既定の形の Cursor 要約区間も除外せず項目として数える（本文の文字列照合だけでは除外しない。fail-closed）。
+    `cursor_allow` は既定の形の Cursor 要約区間の文字列（開始の印の行から終了の印の行まで、改行は LF）を
+    受け取り、生成元を確かめられた区間なら True を返す。None（既定）または False の区間は除外せず項目として
+    数える（本文の文字列照合だけでは除外しない。fail-closed）。
     """
     text = body.replace("\r\n", "\n").replace("\r", "\n")
     sections: list[Section] = []
@@ -301,11 +311,11 @@ def extract_out_of_scope_sections(body: str, cursor_verified: bool = False) -> l
         line = lines[i]
         i += 1
         if fence is None and active is not None:
-            if line == CURSOR_START and cursor_verified and i - 1 > no_cursor_until:
+            if line == CURSOR_START and i - 1 > no_cursor_until:
                 end = _cursor_summary_end(lines, i - 1)
                 if end is None:
                     no_cursor_until = _cursor_failed_region_end(lines, i - 1)
-                else:
+                elif cursor_allow is not None and cursor_allow("\n".join(lines[i - 1 : end + 1])):
                     active.excluded["cursor-summary"] = active.excluded.get("cursor-summary", 0) + 1
                     i = end + 1
                     # 区間の前後の項目が（インデント差で）結合しないよう明示の境界を保つ
@@ -511,36 +521,10 @@ query($owner:String!,$name:String!,$number:Int!,$cursor:String){
       number state
       subIssues(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{number state}}
       closedByPullRequestsReferences(first:20,includeClosedPrs:true){
-        pageInfo{hasNextPage} nodes{number merged body %s}}
+        pageInfo{hasNextPage} nodes{number merged body}}
     }
   }
-}""" % USER_CONTENT_EDITS_QUERY
-
-
-def _cursor_edit_verified(pr: dict) -> bool:
-    """PR ノードの userContentEdits に Cursor Bugbot の編集記録があるか。untrusted 応答。
-
-    見つからない・フィールドが無い（取得失敗で null を含む）・形が不正なら False。取得した範囲に見つからず
-    続きのページがある場合も、確認しきれないので False（fail-closed。区間を除外しない）。
-    """
-    edits = pr.get("userContentEdits")
-    if not isinstance(edits, dict):
-        return False
-    nodes = edits.get("nodes")
-    if not isinstance(nodes, list):
-        return False
-    for n in nodes:
-        editor = n.get("editor") if isinstance(n, dict) else None
-        if isinstance(editor, dict) and (editor.get("__typename"), editor.get("login")) in CURSOR_EDITORS:
-            return True
-    return False
-
-
-def _only_edit_errors(errors: list) -> bool:
-    """GraphQL エラーがすべて userContentEdits の取得失敗か（その PR を未確認として続行してよいか）。"""
-    return bool(errors) and all(
-        isinstance(e, dict) and "userContentEdits" in (e.get("path") or []) for e in errors
-    )
+}"""
 
 
 @dataclass
@@ -548,7 +532,7 @@ class Node:
     number: int
     state: str
     children: list[int]
-    merged_prs: list[PrBody]
+    merged_prs: list[tuple[int, str]]  # (PR 番号, 本文)
     truncated_prs: bool
 
 
@@ -559,8 +543,7 @@ def fetch_node(runner: Runner, repo: str, number: int) -> Node:
     first: dict | None = None
     for _ in range(MAX_SUBISSUE_PAGES):
         resp = runner(NODE_QUERY, {"owner": owner, "name": name, "number": number, "cursor": cursor})
-        # 本文編集記録だけの取得失敗は、その PR を未確認（Cursor 区間を除外しない）として続行する
-        if resp.get("errors") and not _only_edit_errors(resp["errors"]):
+        if resp.get("errors"):
             raise FetchError(f"graphql error while fetching issue #{number}")
         issue = ((resp.get("data") or {}).get("repository") or {}).get("issue")
         if not isinstance(issue, dict):
@@ -585,7 +568,7 @@ def fetch_node(runner: Runner, repo: str, number: int) -> Node:
     for pr in refs.get("nodes") or []:
         if pr.get("merged") is True:
             body = (pr.get("body") or "").encode("utf-8")[:MAX_BODY_BYTES].decode("utf-8", "ignore")
-            prs.append((int(pr["number"]), body, _cursor_edit_verified(pr)))
+            prs.append((int(pr["number"]), body))
     return Node(number, str(first.get("state", "")).lower(), children, prs, truncated)
 
 
@@ -599,7 +582,7 @@ def resolve_numbers(
         chunk = todo[i : i + RESOLVE_CHUNK]
         fields = "".join(
             "n%d: issueOrPullRequest(number:%d){__typename ... on Issue{state} "
-            "... on PullRequest{state merged body %s}} " % (n, n, USER_CONTENT_EDITS_QUERY)
+            "... on PullRequest{state merged body}} " % (n, n)
             for n in chunk
         )
         query = (
@@ -611,8 +594,6 @@ def resolve_numbers(
         aliases = {f"n{n}" for n in chunk}
         for err in resp.get("errors") or []:
             path = err.get("path") or []
-            if _only_edit_errors([err]):
-                continue  # 本文編集記録だけの取得失敗はその PR を未確認として扱う
             if not (err.get("type") == "NOT_FOUND" and path and path[-1] in aliases):
                 raise FetchError("graphql error while resolving references")
         repo_data = (resp.get("data") or {}).get("repository")
@@ -624,9 +605,139 @@ def resolve_numbers(
                 cache[n] = Info("missing")
             elif node.get("__typename") == "PullRequest":
                 body = (node.get("body") or "").encode("utf-8")[:MAX_BODY_BYTES].decode("utf-8", "ignore")
-                cache[n] = Info("pr", str(node.get("state", "")).lower(), body, _cursor_edit_verified(node))
+                cache[n] = Info("pr", str(node.get("state", "")).lower(), body)
             else:
                 cache[n] = Info("issue", str(node.get("state", "")).lower())
+
+
+def cursor_candidate_blocks(body: str) -> list[str]:
+    """本文中の、除外の候補になる既定の形の Cursor 要約区間の文字列を返す（対象外節の中・フェンス外）。
+
+    除外と同じパーサで数える（候補の検出と除外の判定を食い違わせない）。候補が無い PR は 2 段目を問い合わせない。
+    """
+    found: list[str] = []
+
+    def record(block: str) -> bool:
+        found.append(block)
+        return False
+
+    extract_out_of_scope_sections(body, record)
+    return found
+
+
+def _editor_allowed(node: dict) -> bool:
+    """編集記録の editor が許可した生成元か。`__typename`・`login` がどちらも str の場合だけ照合する。"""
+    editor = node.get("editor")
+    if not isinstance(editor, dict):
+        return False
+    kind, login = editor.get("__typename"), editor.get("login")
+    if not isinstance(kind, str) or not isinstance(login, str):
+        return False
+    return (kind, login) in CURSOR_EDITORS
+
+
+def _snapshot(node: object) -> str | None:
+    """編集記録の node から編集後の本文全体を取り出す（改行は LF に正規化）。使えない node は None。"""
+    if not isinstance(node, dict) or node.get("deletedAt") is not None:
+        return None
+    diff = node.get("diff")
+    if not isinstance(diff, str):
+        return None
+    return diff.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _blocks_in(text: str) -> set[str]:
+    """本文全体から、開始の印の行から最初の終了の印の行までの区間の文字列を集める（形は問わない）。"""
+    lines = text.split("\n")
+    out: set[str] = set()
+    i = 0
+    while i < len(lines):
+        if lines[i] == CURSOR_START:
+            for j in range(i + 1, len(lines)):
+                if lines[j] == CURSOR_END:
+                    out.add("\n".join(lines[i : j + 1]))
+                    i = j
+                    break
+                if lines[j] == CURSOR_START:
+                    break
+        i += 1
+    return out
+
+
+def verified_cursor_blocks(candidates: list[str], edits: object) -> frozenset[str]:
+    """候補区間のうち、Cursor Bugbot の生成物そのままと確かめられたものを返す。untrusted 応答。
+
+    区間が許可した editor の編集後の本文に（区間として）バイト単位で一致して現れ、かつ一覧で隣の
+    （直前の）編集後の本文に同じ文字列が無い場合だけ認める。人の書いた文字列を Bot が引き継いだだけの区間・
+    Bot の後に人が書き換えた区間は認めない。直前は隣の node そのものとし、`diff` が null・削除済みの node を
+    読み飛ばして古い node を使わない（履歴の削除で引き継ぎの証拠を消せないように）。続きのページがある・
+    形が不正・`editedAt` が新しい順（同時刻は可）でない応答では何も認めない（fail-closed）。
+    """
+    if not candidates or not isinstance(edits, dict):
+        return frozenset()
+    page = edits.get("pageInfo")
+    nodes = edits.get("nodes")
+    if not isinstance(page, dict) or page.get("hasNextPage") is not False or not isinstance(nodes, list):
+        return frozenset()
+    stamps = [n.get("editedAt") if isinstance(n, dict) else None for n in nodes]
+    if not all(isinstance(t, str) for t in stamps):
+        return frozenset()
+    if any(stamps[k] < stamps[k + 1] for k in range(len(stamps) - 1)):
+        return frozenset()
+    snaps = [_snapshot(n) for n in nodes]
+    allowed: set[str] = set()
+    for block in candidates:
+        for k, node in enumerate(nodes):
+            snap = snaps[k]
+            if snap is None or not _editor_allowed(node) or k + 1 >= len(nodes):
+                continue
+            prev = snaps[k + 1]
+            if prev is None or block in prev:
+                continue
+            if block in _blocks_in(snap):
+                allowed.add(block)
+                break
+    return frozenset(allowed)
+
+
+def verify_cursor_blocks(
+    runner: Runner, repo: str, prs: list[tuple[int, str]], provenance: Provenance
+) -> None:
+    """候補区間のある PR だけ本文編集記録を取得し（2 段目）、除外してよい区間を `provenance` に入れる。
+
+    PR 番号でキャッシュし、同じ PR の判定を呼び出しごとに食い違わせない。応答に errors がある・取得に
+    失敗した・応答の形が不正なバッチは、影響する PR を絞り込まずバッチ内の全 PR を未確認（空集合）にする。
+    """
+    owner, name = repo.split("/", 1)
+    todo: dict[int, list[str]] = {}
+    for number, body in prs:
+        if number in provenance or number in todo:
+            continue
+        cands = cursor_candidate_blocks(body)
+        if cands:
+            todo[number] = cands
+        else:
+            provenance[number] = frozenset()
+    pending = sorted(todo)
+    for i in range(0, len(pending), PROVENANCE_CHUNK):
+        chunk = pending[i : i + PROVENANCE_CHUNK]
+        for n in chunk:
+            provenance[n] = frozenset()  # 確かめられるまでは未確認
+        fields = "".join("p%d: pullRequest(number:%d){%s} " % (n, n, EDITS_FIELDS) for n in chunk)
+        query = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){" + fields + "}}"
+        try:
+            resp = runner(query, {"owner": owner, "name": name})
+        except FetchError:
+            continue
+        if not isinstance(resp, dict) or resp.get("errors"):
+            continue
+        repo_data = (resp.get("data") or {}).get("repository")
+        if not isinstance(repo_data, dict):
+            continue
+        for n in chunk:
+            pr = repo_data.get(f"p{n}")
+            edits = pr.get("userContentEdits") if isinstance(pr, dict) else None
+            provenance[n] = verified_cursor_blocks(todo[n], edits)
 
 
 @dataclass
@@ -639,24 +750,26 @@ class Item:
 
 
 def items_from_prs(
-    prs: list[PrBody], issue: int, repo: str, seen_prs: set[int] | None = None,
+    prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int] | None = None,
     excluded_out: list[tuple[int | None, int, str, dict[str, int], int]] | None = None,
-    direct_pr: bool = False,
+    direct_pr: bool = False, provenance: Provenance | None = None,
 ) -> tuple[list[Item], int]:
     """PR 本文から項目を作る。`seen_prs` を渡すと既出 PR は結果から省く（報告の重複排除用）。
 
     `excluded_out` を渡すと、自動要約を除外した節の (issue, pr, 見出し, 種別別件数, 節の出現順) を追記する。
     `direct_pr` は Issue 経由ではなく PR を直接走査したことを示し、そのとき issue 欄を None にする。
+    `provenance` は生成元を確かめた Cursor 要約区間（無い PR・None なら Cursor 区間は除外しない）。
     """
     ex_issue = None if direct_pr else issue
     items: list[Item] = []
     sections = 0
-    for pr_number, body, cursor_verified in prs:
+    for pr_number, body in prs:
         if seen_prs is not None:
             if pr_number in seen_prs:
                 continue
             seen_prs.add(pr_number)
-        for sec_index, sec in enumerate(extract_out_of_scope_sections(body, cursor_verified)):
+        allow = (provenance or {}).get(pr_number, frozenset())
+        for sec_index, sec in enumerate(extract_out_of_scope_sections(body, allow.__contains__)):
             sections += 1
             if excluded_out is not None and sec.excluded:
                 # 節の出現順を含め、同名見出しの別節を区別できるようにする
@@ -699,6 +812,8 @@ def closeout(
     # 除外ログ。通常の出力にも PR 番号と件数を出すため常に集める（重複排除は下の集合をノード間で使い回す）
     excluded_all: list[tuple[int | None, int, str, dict[str, int], int]] = []
     edges: dict[int, list[int]] = {}
+    provenance: Provenance = {}
+    verify_cursor_blocks(runner, repo, [pr for node in descendants for pr in node.merged_prs], provenance)
     for node in descendants:
         if node.truncated_prs:
             raise FetchError(f"closing PR list truncated for issue #{node.number}")
@@ -709,11 +824,12 @@ def closeout(
         merged_total += len(node.merged_prs)
         # 報告は PR 単位で重複排除するが、参照辺は各 Issue の closing PR から必ず作る
         # （同じ PR が複数 Issue を close しても 2 件目以降の辺を落とさない）
-        items, secs = items_from_prs(node.merged_prs, node.number, repo, seen_prs, excluded_all)
+        items, secs = items_from_prs(
+            node.merged_prs, node.number, repo, seen_prs, excluded_all, provenance=provenance)
         sections_total += secs
         all_items.extend(items)
         edges.setdefault(node.number, [])
-        for it in items_from_prs(node.merged_prs, node.number, repo)[0]:
+        for it in items_from_prs(node.merged_prs, node.number, repo, provenance=provenance)[0]:
             for r in it.refs:
                 if r not in edges[node.number]:
                     edges[node.number].append(r)
@@ -744,7 +860,7 @@ def closeout(
             direct_pr = False
             if info.kind == "pr":
                 # PR を直接走査した場合、除外ログの issue 欄は空にする（`pr #N` だけを表示する）
-                prs = [(n, info.body, info.cursor_verified)]
+                prs = [(n, info.body)]
                 direct_pr = True
             elif info.kind == "issue" and info.state == "closed":
                 node = fetch_node(runner, repo, n)
@@ -754,7 +870,8 @@ def closeout(
             else:
                 prs = []
             ex_out: list[tuple[int | None, int, str, dict[str, int], int]] = []
-            for it in items_from_prs(prs, n, repo, set(), ex_out, direct_pr)[0]:
+            verify_cursor_blocks(runner, repo, prs, provenance)
+            for it in items_from_prs(prs, n, repo, set(), ex_out, direct_pr, provenance)[0]:
                 refs.extend(r for r in it.refs if r not in refs)
             # ツリー外の走査で除外した要約も EXCLUDED に出す（同じ (PR, 節の出現順) は重複させない）
             if ex_out:
