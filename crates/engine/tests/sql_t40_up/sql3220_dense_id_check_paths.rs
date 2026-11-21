@@ -353,35 +353,53 @@ const TOP_K_CONTRACT_DETAIL: &str =
 
 const COLS: &str = "id, kind, n, b, r, d, embedding";
 
-/// provider を通る形（`(ラベル, 末尾句, cosine か)`）。WHERE は呼び出し側が足す。
-const PROVIDER_SHAPES: &[(&str, &str, bool)] = &[
+/// provider を通る形（`(ラベル, 末尾句, cosine か, LIMIT)`）。WHERE は呼び出し側が足す。
+const PROVIDER_SHAPES: &[(&str, &str, bool, usize)] = &[
     (
         "knn_neg_inner_limit3",
         "ORDER BY embedding <#> '[1.0,0.0]' LIMIT 3",
         false,
+        3,
     ),
     (
         "knn_cosine_limit3",
         "ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3",
         true,
+        3,
     ),
     // 全件（5 行・10 行）より大きい LIMIT。
     (
         "knn_neg_inner_limit_over_all",
         "ORDER BY embedding <#> '[1.0,0.0]' LIMIT 1000",
         false,
+        1000,
     ),
     (
         "knn_cosine_limit_over_all",
         "ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1000",
         true,
+        1000,
     ),
 ];
+
+/// fixture（`embedding_of`）から導いた期待 id 列（クエリ `[1,0]`。alice の通常 10 行は id = 10, ..., 100）。
+/// 負の内積: `i=7`（[3e38,3e38]。内積が最大）、`i=1,3,9`（内積 1）、残り（内積 0。同点は id 昇順）。
+const NEG_INNER_ALL: [u64; 10] = [70, 10, 30, 90, 20, 40, 50, 60, 80, 100];
+/// コサイン距離: `i=1,3,9`（0）、偶数 `i`（1。同点は id 昇順）、NaN の 2 行（ゼロベクトル `i=5` と、f32 のノルム²が
+/// 桁あふれして非有限になる `i=7`）は末尾で id 昇順。
+const COSINE_ALL: [u64; 10] = [10, 30, 90, 20, 40, 60, 80, 100, 50, 70];
+/// `kind = 'a'`（偶数 `i`）は全行が `[0,1]` で、どちらの演算子でも完全同点（id 昇順）。
+const MASKED_ALL: [u64; 5] = [20, 40, 60, 80, 100];
+
+/// 期待する id 列（順序つき）。`limit` が全件より大きければ全件。
+fn expected_ids(all: &[u64], limit: usize) -> Vec<u64> {
+    all.iter().copied().take(limit).collect()
+}
 
 /// マスクで切り替わる形。同じ表・同じ文の 1 回目（恒等列の入力）と 2 回目（subset の入力）が一致する。
 #[test]
 fn sql3220_mask_path_matches_identity_path_bitwise() {
-    for (label, tail, cosine) in PROVIDER_SHAPES {
+    for (label, tail, cosine, limit) in PROVIDER_SHAPES {
         let probe = Arc::new(Probe::default());
         let (core, _g) = open("sql3220-mask", &probe, &[("docs", &[])]);
         let sql = format!("SELECT {COLS} FROM docs WHERE kind = 'a' {tail}");
@@ -417,7 +435,10 @@ fn sql3220_mask_path_matches_identity_path_bitwise() {
 
         assert_eq!(fingerprint(&cold), fingerprint(&hot), "{label}");
         assert_no_other_tenant(&hot, &sql);
-        assert!(!hot.rows.is_empty(), "{label}: non-vacuous");
+        // fixture から導いた期待 id（順序つき・件数つき）を直接固定する。
+        let want = expected_ids(&MASKED_ALL, *limit);
+        assert_eq!(ids_of(&cold), want, "{label}: cold ids");
+        assert_eq!(ids_of(&hot), want, "{label}: hot ids");
     }
 }
 
@@ -432,7 +453,7 @@ fn sql3220_null_rows_path_matches_identity_path_bitwise() {
         &[("plain", &[]), ("nulls", &[5, 55])],
     );
     let dense_slots: Vec<u64> = vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11];
-    for (label, tail, cosine) in PROVIDER_SHAPES {
+    for (label, tail, cosine, limit) in PROVIDER_SHAPES {
         let sql = |t: &str| format!("SELECT {COLS} FROM {t} {tail}");
         let fast = run(&core, &sql("plain")).unwrap_or_else(|e| panic!("{label}: {e:?}"));
         let fast_calls = probe.take();
@@ -459,7 +480,10 @@ fn sql3220_null_rows_path_matches_identity_path_bitwise() {
         );
         assert_eq!(fingerprint(&fast), fingerprint(&slow), "{label}");
         assert_no_other_tenant(&slow, &sql("nulls"));
-        assert!(!fast.rows.is_empty(), "{label}: non-vacuous");
+        let all = if *cosine { &COSINE_ALL } else { &NEG_INNER_ALL };
+        let want = expected_ids(all, *limit);
+        assert_eq!(ids_of(&fast), want, "{label}: fast ids");
+        assert_eq!(ids_of(&slow), want, "{label}: slow ids");
         // NULL 行（id 5・55）は密側の結果に出ない。
         assert!(!ids_of(&slow).contains(&5) && !ids_of(&slow).contains(&55));
     }
@@ -469,12 +493,28 @@ fn sql3220_null_rows_path_matches_identity_path_bitwise() {
 /// マスク側はカウンタで、NULL 側は NULL 行の有無で従来経路に入ったことを示す。
 #[test]
 fn sql3220_exact_scan_membership_matches_across_paths() {
-    let shapes = [
-        "ORDER BY embedding <#> '[1.0,0.0]' DESC LIMIT 4",
-        "ORDER BY embedding <=> '[1.0,0.0]' DESC LIMIT 1000",
-        "ORDER BY embedding <#> '[1.0,0.0]'",
+    // （末尾句, マスク側の期待 id, 全件側の期待 id）。fixture から導く: 降順は距離の大きい順で、
+    // 負の内積は内積 0 の 6 行（偶数 `i` と `i=5`）が先頭の同点（id 昇順）、コサインは NaN の 2 行
+    // （`i=5`・`i=7`）が最大扱いで先頭、次に距離 1 の偶数 `i`、最後に距離 0 の `i=1,3,9`。
+    // `LIMIT` 省略は昇順の全件。
+    let shapes: [(&str, Vec<u64>, Vec<u64>); 3] = [
+        (
+            "ORDER BY embedding <#> '[1.0,0.0]' DESC LIMIT 4",
+            vec![20, 40, 60, 80],
+            vec![20, 40, 50, 60],
+        ),
+        (
+            "ORDER BY embedding <=> '[1.0,0.0]' DESC LIMIT 1000",
+            MASKED_ALL.to_vec(),
+            vec![50, 70, 20, 40, 60, 80, 100, 10, 30, 90],
+        ),
+        (
+            "ORDER BY embedding <#> '[1.0,0.0]'",
+            MASKED_ALL.to_vec(),
+            NEG_INNER_ALL.to_vec(),
+        ),
     ];
-    for tail in shapes {
+    for (tail, want_masked, want_all) in shapes {
         // ケースごとに索引の無い core（1 回目の実行で索引ができる）。
         let probe = Arc::new(Probe::default());
         let (core, _g) = open(
@@ -497,7 +537,8 @@ fn sql3220_exact_scan_membership_matches_across_paths() {
         assert_eq!(c1, c0 + 1, "{tail}: second run must consume the mask path");
         assert_eq!(fingerprint(&cold), fingerprint(&hot), "{tail}");
         assert_no_other_tenant(&hot, &sql);
-        assert!(!hot.rows.is_empty());
+        assert_eq!(ids_of(&cold), want_masked, "{tail}: cold ids");
+        assert_eq!(ids_of(&hot), want_masked, "{tail}: hot ids");
 
         // NULL 行。
         let q = |t: &str| format!("SELECT {COLS} FROM {t} {tail}");
@@ -505,7 +546,8 @@ fn sql3220_exact_scan_membership_matches_across_paths() {
         let slow = run(&core, &q("nulls")).unwrap_or_else(|e| panic!("{tail}: {e:?}"));
         assert!(probe.take().is_empty());
         assert_eq!(fingerprint(&fast), fingerprint(&slow), "{tail}");
-        assert!(!fast.rows.is_empty());
+        assert_eq!(ids_of(&fast), want_all, "{tail}: fast ids");
+        assert_eq!(ids_of(&slow), want_all, "{tail}: slow ids");
         assert_no_other_tenant(&slow, &q("nulls"));
     }
 }
@@ -690,7 +732,13 @@ fn sql3220_hybrid_dense_adapter_null_rows_match_identity_path() {
             rows: 12
         }]
     );
-    assert!(!fast.rows.is_empty());
+    // 密側アダプタは NaN 距離の行（`i=5` のゼロベクトルと `i=7` の桁あふれ）を除くので、融合結果は
+    // alice の通常行から id 50・70 を除いた 8 行（NULL 行・他テナントの行は無い）。
+    for r in [&fast, &slow] {
+        let mut ids = ids_of(r);
+        ids.sort_unstable();
+        assert_eq!(ids, vec![10, 20, 30, 40, 60, 80, 90, 100]);
+    }
     assert_eq!(fingerprint(&fast), fingerprint(&slow));
     assert_no_other_tenant(&slow, &sql("nulls"));
 }
@@ -754,7 +802,14 @@ fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
         // 正常時: 他テナントの行は 3 経路のどれにも出ない。
         for sql in [&plain, &nulls, &masked, &masked] {
             let ok = run(&core, sql).unwrap_or_else(|e| panic!("{label}: {e:?}"));
-            assert!(!ok.rows.is_empty());
+            let mut ids = ids_of(&ok);
+            ids.sort_unstable();
+            let want: Vec<u64> = if sql == &masked {
+                MASKED_ALL.to_vec()
+            } else {
+                (1..=10).map(|i| i * 10).collect()
+            };
+            assert_eq!(ids, want, "{label}: {sql}");
             assert_no_other_tenant(&ok, sql);
         }
         probe.take();
