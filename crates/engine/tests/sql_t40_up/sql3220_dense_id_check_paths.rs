@@ -781,8 +781,11 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
 }
 
 /// 最適化の対象外の形（NULL 行あり・マスクで非恒等）でも従来経路のまま fail-closed に動く。
-/// provider が候補外の id（他テナントの行・NULL 行・範囲外のスロット）を返したら、結果を 1 行も返さず
-/// `XX000` で拒否する。恒等列の入力でも範囲外 id は拒否される。拒否は kNN 本体の返却値検証の固定 detail と provider 呼び出しで特定する。他テナントの行は正常時にも出ない。
+/// 次の 2 つは別々の保証として固定する。
+/// - 返却値の検証: provider が候補外のスロット（可視 arena 内の NULL 行・マスク外のスロット、範囲外のスロット）を
+///   返したら、結果を 1 行も返さず `XX000` で拒否する。恒等列の入力でも範囲外は拒否される。拒否は kNN 本体の
+///   返却値検証の固定 detail と provider 呼び出しで特定する。他テナントの行を指す捏造は扱わない
+/// - テナント境界: 正常な検索の結果に他テナント（`BOB_IDS`）の Private 行が出ない
 #[test]
 fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
     let probe = Arc::new(Probe::default());
