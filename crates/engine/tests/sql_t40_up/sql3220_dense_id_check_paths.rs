@@ -72,7 +72,7 @@ use temp_db::{unique_db_path, CleanupGuard};
 const MATCHING_NULL_IDS: [u64; 2] = [25, 65];
 
 /// 他テナント（`bob`）の行 id。alice の可視集合に現れてはならない。
-const BOB_IDS: [u64; 3] = [15, 25, 35];
+const BOB_IDS: [u64; 3] = [1015, 1025, 1035];
 
 fn ctx(tenant: &str) -> PolicyContext {
     PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
@@ -314,6 +314,15 @@ fn insert(
 /// 表 `table` へ alice の通常 10 行と、`null_ids` の NULL ベクトル行（`kind = 'n'`）と、他テナントの行を入れる。
 /// 他テナントの行はクエリ `[1,0]` に最も近い（距離 0）ため、テナント境界が破れれば結果の先頭に出る。
 fn seed(storage: &Storage, table: &str, null_ids: &[u64]) {
+    // テナント間で行 id を重ねない（`assert_no_other_tenant` が行 id だけで出どころを判定するため）。
+    // alice の通常行は 10..=100、NULL 行は `null_ids`。bob は 1000 番台。
+    assert!(
+        (1..=10_u64)
+            .map(|i| i * 10)
+            .chain(null_ids.iter().copied())
+            .all(|id| !BOB_IDS.contains(&id)),
+        "alice and bob row ids must be disjoint"
+    );
     storage.create_table(&schema(table)).expect("create table");
     for i in 1..=10_u64 {
         let kind = if i % 2 == 0 { "a" } else { "b" };
