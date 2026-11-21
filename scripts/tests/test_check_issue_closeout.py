@@ -199,6 +199,15 @@ class AutoSummaryTests(unittest.TestCase):
         self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
         self.assertIn("#9", " ".join(secs[0].items))
 
+    def test_cursor_quote_mentioning_reviewed_by_with_valid_signature_excluded(self):
+        # 正式な署名が別にあるとき、本文の引用行に Reviewed by / <sup> が含まれるだけでは区間を検査対象に戻さない
+        lines = CURSOR_BLOCK.splitlines()
+        lines.insert(4, "> note: Reviewed by the team, see <sup>1</sup>")
+        blk = "\n".join(lines)
+        secs = cic.extract_out_of_scope_sections(BASE + "\n" + blk + "\n")
+        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
+        self.assertEqual(secs[0].items, ["a #1", "b #2"])
+
     def test_cursor_nested_inner_start_not_recognized(self):
         # 外側が不成立のとき内側の開始行を新候補にせず、外側の引用行・参照を検査に残す
         inner = CURSOR_BLOCK

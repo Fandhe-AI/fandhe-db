@@ -75,6 +75,8 @@ CURSOR_REVIEWED_RE = re.compile(
     r" for commit [0-9a-fA-F]{7,40}\.?"
     r"(?: Configure \[here\]\(https://[^()\s<>]+\)\.?)?</sup>"
 )
+# 引用行の先頭から Cursor Bugbot の署名を始めている行（書式が崩れた署名の検出用。本文中の言及は含めない）。
+CURSOR_SIGNATURE_START_RE = re.compile(r">\s*<sup>\s*Reviewed by\s*\[Cursor Bugbot\]")
 CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
@@ -201,7 +203,7 @@ def _cursor_summary_end(lines: list[str], start: int) -> tuple[int | None, int]:
             return None, i
         if CURSOR_REVIEWED_RE.fullmatch(line):
             reviewed = True
-        elif "<sup>" in line or "Reviewed by" in line:
+        elif CURSOR_SIGNATURE_START_RE.match(line):
             # 引用記号直後の空白の揺れ等で署名候補なのに既定書式と一致しない行は、区間ごと検査対象に残す
             return None, i
         i += 1
@@ -651,8 +653,15 @@ def closeout(
                 prs = node.merged_prs
             else:
                 prs = []
-            for it in items_from_prs(prs, n, repo, set())[0]:
+            ex_out: list[tuple[int, int, str, dict[str, int]]] = []
+            for it in items_from_prs(prs, n, repo, set(), ex_out)[0]:
                 refs.extend(r for r in it.refs if r not in refs)
+            # ツリー外の走査で除外した要約も --verbose の EXCLUDED に出す（同じ (PR, 見出し) は重複させない）
+            known = {(e[1], e[2]) for e in excluded_all}
+            for e in ex_out:
+                if (e[1], e[2]) not in known:
+                    known.add((e[1], e[2]))
+                    excluded_all.append(e)
             edges[n] = refs
             nxt.extend(r for r in refs if r not in edges and r not in in_tree)
         resolve_numbers(runner, repo, nxt, cache)
