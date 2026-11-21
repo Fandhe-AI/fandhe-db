@@ -92,6 +92,8 @@ fn fixture(tag: &str) -> (EngineCore, CleanupGuard, SessionState, SessionState) 
     (core, g, o, bound(alice, false))
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
 #[test]
 fn qualified_reference_requires_usage_for_bound_role() {
     let (core, _g, mut o, mut a) = fixture("sacl_usage");
@@ -138,6 +140,8 @@ fn unbound_and_owner_equivalent_sessions_are_not_checked() {
     ok(&core, "t1", &mut unbound, "SELECT id FROM s.t");
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
 #[test]
 fn other_tenant_schema_is_indistinguishable_from_missing() {
     let (core, _g, _o, _a) = fixture("sacl_tenant");
@@ -212,6 +216,8 @@ fn all_tables_in_schema_only_covers_existing_relations() {
     assert_eq!(sel("t"), 0);
 }
 
+// intentional: docs/design/schema-tenant-namespace.md, docs/design/role-privilege-model.md
+// 根拠の節: 拒否の根拠（Issue #3532）・role-privilege-model.md §13 K2（組み込み SCHEMA の `0A000`）
 #[test]
 fn schema_grant_error_contracts() {
     let (core, _g, mut o, mut a) = fixture("sacl_errors");
@@ -268,6 +274,8 @@ fn dropping_schema_releases_roles_for_drop_role() {
     ok(&core, "t1", &mut o, "DROP ROLE alice");
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
 #[test]
 fn usage_denial_survives_residual_column_qualifier() {
     let (core, _g, mut o, mut a) = fixture("sacl_qual");
@@ -297,6 +305,8 @@ fn prepared_without_params_is_rechecked_by_public_entry() {
 
 /// Describe(S)（`describe_prepared_in_session`）も Bind と同じく USAGE を検査し、USAGE の無い束縛ロールに
 /// 列の名前・型を返さない（Issue #3532。Parse は USAGE を見ない）。拒否は Bind の再検査と同じ `42501`・同じ文言。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
 #[test]
 fn prepared_describe_requires_usage_for_bound_role() {
     let (core, _g, mut o, mut a) = fixture("sacl_prep_describe");
