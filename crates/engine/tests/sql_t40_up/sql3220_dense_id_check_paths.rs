@@ -1,25 +1,35 @@
-//! 密側の返却 id 検証の高速経路（`SearchedIds::Identity`）と従来経路（`SearchedIds::Counts`）が
+//! 密側の返却 id 検証で、高速経路が選ばれる入力（非 subset の恒等の候補列）と従来経路の入力（subset）が
 //! SQL 経由で同じ結果を返すことの結合テスト（Issue #3220・親 #3218。TABLE-12・TABLE-26・
 //! SQL-33 のポインタ。PR #3375 の対象外節「ビット一致を比べる結合テストが未作成」の回収）。
 //!
-//! ## どちらの経路になるか（`crates/engine/src/sql/exec.rs`）
+//! ## 本テストが固定するもの・しないもの
+//!
+//! 固定するのは「`from_ids_checked` が高速経路を選ぶ入力（`dense_slots` 無しで非 subset の恒等の候補列
+//! `0..n`）と、従来経路の入力（subset の候補列）で、SQL 経由の結果がビット一致する」ことと、その入力が
+//! provider へ実際に渡ったこと（`Probe`）。**実際に選ばれた variant（`Identity`／`Counts`）は直接観測して
+//! いない**（本体に観測点が無い）。仮に常に `Counts` を返す退行があっても、本テストの結果比較は通る。
+//! variant の選択そのもの（恒等の候補列なら `Identity`、そうでなければ `Counts`）は PR #3375 の単体テスト
+//! `core::searched_ids_tests::from_ids_checked_picks_identity_only_for_exact_identity` が、Identity と
+//! HashMap の検証結果の一致は同 `identity_matches_hashmap_for_all_short_sequences` が固定する。
+//!
+//! ## どちらの入力になるか（`crates/engine/src/sql/exec.rs`）
 //!
 //! `dense_id_counts` は `SearchedIds::from_ids_checked(&slot_ids, dense_slots)` で作られる
 //! （`execute_statement_with_cache_observed` の「Issue #3220」コメント付近）。
 //!
-//! - `Identity`: `dense_slots` が `None`（その文の arena に NULL ベクトル行が無い）かつ `slot_ids` が
+//! - 高速経路が選ばれる入力: `dense_slots` が `None`（その文の arena に NULL ベクトル行が無い）かつ `slot_ids` が
 //!   ちょうど `0..n`。`slot_ids` はマスク無しなら常に `0..arena.len()`、マスクありなら `kept`
 //!   （元スロット番号の列）なので、マスクが先頭区間でなければ恒等にならない。
-//! - `Counts`: `dense_slots` が `Some`（NULL 行あり）または `slot_ids` が非恒等（マスクで
+//! - 従来経路の入力: `dense_slots` が `Some`（NULL 行あり）または `slot_ids` が非恒等（マスクで
 //!   1 行おきなど先頭区間でない部分集合に絞った場合）。
 //!
 //! 切り替えに使った条件と、使っていない条件:
 //!
 //! - **マスク（本テストで使用）**: 同じ表・同じ文を 1 回目（走査索引が未構築。縮約 arena を
-//!   作る cold。`slot_ids = 0..5` で `Identity`）と 2 回目（索引が構築済みで `mask_kept_slots` が
-//!   `Some`。`slot_ids = kept = [1,3,5,7,9]` で `Counts`）で流して比べる。
+//!   作る cold。`slot_ids = 0..5`）と 2 回目（索引が構築済みで `mask_kept_slots` が
+//!   `Some`。`slot_ids = kept = [1,3,5,7,9]`）で流して比べる。
 //! - **NULL ベクトル行（本テストで使用）**: 同じ行に NULL 行 2 件（先頭と途中）を足した表と、足していない表を
-//!   比べる。足した側は `dense_slots = Some` で `Counts`、足していない側は `Identity`。
+//!   比べる。足した側は `dense_slots = Some`（従来経路の入力）、足していない側は恒等列（高速経路の入力）。
 //!   NULL 行は密側の候補に入らないため、論理的な結果集合は同じになる。
 //! - **削除による slot の穴は使わない**: arena の slot は可視行の並び位置で、削除しても詰まって
 //!   `0..n` のままなので、経路は切り替わらない。
@@ -34,7 +44,7 @@
 //! 経路の証拠は実行ごとに [`Probe`]（`SearchProvider` の記録ラッパ）で取る。provider に渡った
 //! `ids`／`slots` の中身を記録し、高速側は非 subset 呼び出しで `ids == 0..n`、従来側は subset 呼び出しで
 //! 期待したスロット列、であることをアサートする。厳密全走査（`DESC`・`LIMIT` 省略）は provider を通らず
-//! 検証の variant を直接観測できない。「provider 呼び出しが 0 件」と、マスク側は `index_mask_scans` の増分で
+//! 検証の variant を直接観測できない（上記のとおり他の形も同様）。「provider 呼び出しが 0 件」と、マスク側は `index_mask_scans` の増分で
 //! マスク経路に入ったことを示し、NULL 側は上記の導出（`null_row_count != 0`）に拠る。
 //!
 //! 結果の比較は行・id・距離（score は `f64::to_bits`）・投影セル（`Float`・`Vector` は f64/f32 のビット）・
@@ -336,6 +346,11 @@ fn assert_no_other_tenant(r: &QueryResult, sql: &str) {
     }
 }
 
+/// kNN 本体の返却値検証（`distance_result_is_valid_with`／`provider_result_is_valid_with`）が
+/// 違反時に返す固定の detail（`sql/exec.rs` のコサインアームと汎用アームで同一文言）。
+const TOP_K_CONTRACT_DETAIL: &str =
+    "search provider returned a result violating the top-k contract";
+
 const COLS: &str = "id, kind, n, b, r, d, embedding";
 
 /// provider を通る形（`(ラベル, 末尾句, cosine か)`）。WHERE は呼び出し側が足す。
@@ -363,7 +378,7 @@ const PROVIDER_SHAPES: &[(&str, &str, bool)] = &[
     ),
 ];
 
-/// マスクで切り替わる形。同じ表・同じ文の 1 回目（Identity）と 2 回目（Counts）が一致する。
+/// マスクで切り替わる形。同じ表・同じ文の 1 回目（恒等列の入力）と 2 回目（subset の入力）が一致する。
 #[test]
 fn sql3220_mask_path_matches_identity_path_bitwise() {
     for (label, tail, cosine) in PROVIDER_SHAPES {
@@ -668,7 +683,7 @@ fn sql3220_hybrid_dense_adapter_null_rows_match_identity_path() {
 
 /// 最適化の対象外の形（NULL 行あり・マスクで非恒等）でも従来経路のまま fail-closed に動く。
 /// provider が候補外の id（他テナントの行・NULL 行・範囲外のスロット）を返したら、結果を 1 行も返さず
-/// `XX000` で拒否する。高速経路（恒等）側でも範囲外 id は拒否される。他テナントの行は正常時にも出ない。
+/// `XX000` で拒否する。恒等列の入力でも範囲外 id は拒否される。拒否は kNN 本体の返却値検証の固定 detail と provider 呼び出しで特定する。他テナントの行は正常時にも出ない。
 #[test]
 fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
     let probe = Arc::new(Probe::default());
@@ -693,22 +708,45 @@ fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
         }
         probe.take();
 
-        // 捏造: 候補集合の外の id を 1 件足す。
-        let cases: [(&str, &str, u64); 4] = [
+        // 捏造: 候補集合の外の id を 1 件足す。期待する provider 呼び出しと、本体の返却値検証が返す
+        // 固定の detail（`sql/exec.rs` の kNN 本体。`<=>` のコサインアームと汎用アームで同じ文言）を照合する。
+        let cosine = label == "cosine";
+        let full10 = Call::Full {
+            cosine,
+            ids: (0..10).collect(),
+            rows: 10,
+        };
+        let dense = Call::Subset {
+            cosine,
+            slots: vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11],
+            rows: 12,
+        };
+        let masked_call = Call::Subset {
+            cosine,
+            slots: vec![1, 3, 5, 7, 9],
+            rows: 10,
+        };
+        let cases: [(&str, &str, u64, Call); 4] = [
             // 恒等経路（10 行）。id 10 は範囲外。
-            ("identity out of range", &plain, 10),
+            ("identity out of range", &plain, 10, full10),
             // NULL 行あり（12 行。dense は NULL スロット 0・6 を除く）。NULL 行のスロットを返す。
-            ("dense excludes null slot 0", &nulls, 0),
-            ("dense excludes null slot 6", &nulls, 6),
-            // マスク経路（kept = [1,3,5,7,9]）。kept に無い元スロット 0 を返す。2 回目の実行で効く。
-            ("mask excludes slot 0", &masked, 0),
+            ("dense excludes null slot 0", &nulls, 0, dense.clone()),
+            ("dense excludes null slot 6", &nulls, 6, dense),
+            // マスク経路（kept = [1,3,5,7,9]）。kept に無い元スロット 0（arena 内の可視行）を返す。
+            ("mask excludes slot 0", &masked, 0, masked_call),
         ];
-        for (why, sql, forged) in cases {
+        for (why, sql, forged, expected_call) in cases {
+            probe.take();
             *probe.forge.lock().expect("lock") = Some(forged);
             let res = run(&core, sql);
             *probe.forge.lock().expect("lock") = None;
+            let calls = probe.take();
+            assert_eq!(calls, vec![expected_call], "{label} {why}: provider call");
             match res {
-                Err(SqlSurfaceError::Internal { .. }) => {}
+                Err(SqlSurfaceError::Internal { detail }) => assert_eq!(
+                    detail, TOP_K_CONTRACT_DETAIL,
+                    "{label} {why}: rejected by a different check"
+                ),
                 other => panic!("{label} {why}: forged id {forged} must be rejected: {other:?}"),
             }
         }
