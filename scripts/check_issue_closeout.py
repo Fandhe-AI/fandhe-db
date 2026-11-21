@@ -71,7 +71,9 @@ CURSOR_START = "<!-- CURSOR_SUMMARY -->"
 CURSOR_END = "<!-- /CURSOR_SUMMARY -->"
 # 署名行は行全体で照合する（リンク直後で途切れた崩れ行は署名と認めず検査対象に残す）。
 CURSOR_REVIEWED_RE = re.compile(
-    r"> <sup>Reviewed by \[Cursor Bugbot\]\(https://cursor\.com/bugbot\)[^<>\n]*</sup>"
+    r"> <sup>Reviewed by \[Cursor Bugbot\]\(https://cursor\.com/bugbot\)"
+    r" for commit [0-9a-fA-F]{7,40}\.?"
+    r"(?: Configure \[here\]\(https://[^()\s<>]+\)\.?)?</sup>"
 )
 CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
@@ -161,29 +163,30 @@ def _split_items(lines: list[str]) -> list[str]:
     return [" ".join(parts) for parts in items]
 
 
-def _cursor_summary_end(lines: list[str], start: int) -> int | None:
+def _cursor_summary_end(lines: list[str], start: int) -> tuple[int | None, int]:
     """`lines[start]` の開始の印から続く Cursor 要約区間が既定の形なら終了の印の添字を返す。
 
     形: 内側 1 行目が `---`、以降は空行か `>` 始まりの行だけで、Reviewed by の引用行を含み、
-    終了の印で閉じる。最初の不適合行で先読みを打ち切る（線形時間）。不成立は None。
+    終了の印で閉じる。最初の不適合行で先読みを打ち切る（線形時間）。
+    戻り値は (終了の印の添字 or 不成立の None, 先読みが止まった添字)。
     """
     i = start + 1
     if i >= len(lines) or lines[i] != "---":
-        return None
+        return None, min(i, len(lines) - 1)
     reviewed = False
     i += 1
     while i < len(lines):
         line = lines[i]
         if line == CURSOR_END:
-            return i if reviewed else None
+            return (i if reviewed else None), i
         if line.strip() and not line.startswith(">"):
-            return None
+            return None, i
         if CURSOR_REVIEWED_RE.fullmatch(line):
             reviewed = True
         elif line.startswith("> <sup>Reviewed by"):
-            return None
+            return None, i
         i += 1
-    return None
+    return None, len(lines) - 1
 
 
 def extract_out_of_scope_sections(body: str) -> list[Section]:
@@ -204,21 +207,24 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
 
     lines = text.split("\n")
     i = 0
+    no_cursor_until = -1  # 不成立になった候補の先読み範囲内の開始行は再認識しない
     while i < len(lines):
         line = lines[i]
         i += 1
         if fence is None and active is not None:
-            if line == CURSOR_START:
-                end = _cursor_summary_end(lines, i - 1)
-                if end is not None:
+            if line == CURSOR_START and i - 1 > no_cursor_until:
+                end, stop = _cursor_summary_end(lines, i - 1)
+                if end is None:
+                    no_cursor_until = stop
+                else:
                     active.excluded["cursor-summary"] = active.excluded.get("cursor-summary", 0) + 1
                     i = end + 1
                     # 区間の前後の項目が結合しないよう境界を空行で保つ
                     buf.append("")
                     continue
             elif line == CLAUDE_FOOTER:
+                # 行を取り除くだけで元の空行・項目境界は変えない（継続行を別項目にしない）
                 active.excluded["claude-code-footer"] = active.excluded.get("claude-code-footer", 0) + 1
-                buf.append("")
                 continue
         fm = FENCE_RE.match(line)
         if fence is None:

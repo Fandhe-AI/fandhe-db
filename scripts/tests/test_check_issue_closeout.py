@@ -144,7 +144,7 @@ class ParseTests(unittest.TestCase):
 FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 CURSOR_BLOCK = (
     "<!-- CURSOR_SUMMARY -->\n---\n\n> **Note**\n> synthetic text\n"
-    "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit abc</sup>\n"
+    "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit abcdef1. Configure [here](https://www.cursor.com/dashboard?tab=bugbot).</sup>\n"
     "<!-- /CURSOR_SUMMARY -->"
 )
 BASE = "## 対象外\n\n- a #1\n- b #2\n"
@@ -177,13 +177,27 @@ class AutoSummaryTests(unittest.TestCase):
             "indent": " " + CURSOR_BLOCK,
             "truncated-signature": CURSOR_BLOCK.replace(
                 "> synthetic text", "> remaining work"
-            ).replace(" for commit abc</sup>", ""),
+            ).replace(" for commit abcdef1. Configure [here](https://www.cursor.com/dashboard?tab=bugbot).</sup>", ""),
+            "free-text-after-link": CURSOR_BLOCK.replace(
+                " for commit abcdef1.", " remaining work #9 for commit abcdef1."),
             "trailing-space": CURSOR_BLOCK.replace("<!-- CURSOR_SUMMARY -->", "<!-- CURSOR_SUMMARY --> "),
         }
         for name, blk in variants.items():
             secs = cic.extract_out_of_scope_sections(BASE + "\n" + blk + "\n")
             self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, name)
             self.assertGreater(len(secs[0].items), 2, name)
+
+    def test_cursor_nested_inner_start_not_recognized(self):
+        # 外側が不成立のとき内側の開始行を新候補にせず、外側の引用行・参照を検査に残す
+        inner = CURSOR_BLOCK
+        text = (BASE + "\n<!-- CURSOR_SUMMARY -->\n---\n> outer work #77\n" + inner + "\n")
+        secs = cic.extract_out_of_scope_sections(text)
+        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
+        self.assertIn("#77", " ".join(secs[0].items))
+
+    def test_footer_between_item_and_continuation_keeps_item(self):
+        text = "## 対象外\n\n- a\n" + FOOTER + "\ncontinued #5\n"
+        self.assertEqual(items_of(text), ["a continued #5"])
 
     def test_cursor_block_does_not_merge_neighbors(self):
         # 区間の前後に空行が無くても、終了の印直後の記号なし段落は単独項目として残る
