@@ -68,6 +68,9 @@ use engine::storage::{Storage, Visibility};
 use crate::temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// `kind = 'a'` で WHERE に一致する NULL ベクトル行の id（`seed` が参照する）。
+const MATCHING_NULL_IDS: [u64; 2] = [25, 65];
+
 /// 他テナント（`bob`）の行 id。alice の可視集合に現れてはならない。
 const BOB_IDS: [u64; 3] = [15, 25, 35];
 
@@ -218,7 +221,7 @@ fn schema(name: &str) -> TableSchema {
 
 /// alice の通常行 10 件（id = 10, 20, ..., 100）。`i` は 1..=10。偶数 `i` は `kind = 'a'`。
 /// 距離が同点になる組（`<#>`・`<=>` で `i` 奇数の一部・偶数すべて）、ゼロベクトル（`<=>` で NaN。`i=5`）、
-/// f32 の上限に近い値（`i=7`。距離の桁あふれ）、`b = i64::MAX`（`i=2`。式のオーバーフロー）を含める。
+/// f32 の上限に近い値（`i=7`。距離の桁あふれ）、`n = i32::MAX`（id 20。式のオーバーフロー）を含める。
 fn embedding_of(i: u64) -> [f32; 2] {
     match i {
         1 | 3 | 9 => [1.0, 0.0],
@@ -257,7 +260,12 @@ fn insert(
             vec_value,
             Value::Text(kind.to_string()),
             Value::Text(format!("{kind} doc {id}")),
-            Value::Integer(i32::try_from(id).expect("small id")),
+            // id 20 だけ `i32::MAX`（`n + 1` は被演算子を読めて、加算の結果だけが型の範囲を超える）。
+            Value::Integer(if id == 20 && tenant == "alice" {
+                i32::MAX
+            } else {
+                i32::try_from(id).expect("small id")
+            }),
             Value::BigInt(b),
             Value::Real(id as f32 * 0.1),
             Value::Double(id as f64 * 0.25),
@@ -285,7 +293,13 @@ fn seed(storage: &Storage, table: &str, null_ids: &[u64]) {
         );
     }
     for &id in null_ids {
-        insert(storage, table, "alice", id, None, "n", 1);
+        // `MATCHING_NULL_IDS` の NULL 行は `kind = 'a'`（WHERE に一致する NULL 行）。
+        let kind = if MATCHING_NULL_IDS.contains(&id) {
+            "a"
+        } else {
+            "n"
+        };
+        insert(storage, table, "alice", id, None, kind, 1);
     }
     for id in BOB_IDS {
         insert(storage, table, "bob", id, Some([1.0, 0.0]), "a", 1);
@@ -641,7 +655,61 @@ fn sql3220_distance_ties_keep_id_order_across_paths() {
     }
 }
 
-/// 式のオーバーフロー（`b = i64::MAX` の行を `b + 1` で投影）は、経路によらず同じ SQLSTATE で拒否される。
+/// NULL ベクトル行とマスクが重なる形。WHERE に一致する NULL 行（id 25・65）と、一致しない非 NULL 行
+/// （id 10・30・50・70・90）を持つ表で、実行器の `dense_subset(kept)` 分岐（NULL の除外とマスクの積集合）を通す。
+/// fixture のスロット（id 昇順）: 5→0, 10→1, 20→2, 25→3, 30→4, 40→5, 50→6, 55→7, 60→8, 65→9, 70→10,
+/// 80→11, 90→12, 100→13（14 行）。`kind = 'a'` は id 20・25・40・60・65・80・100（NULL は 25・65）。
+/// - 索引の構築前（1 回目）: 縮約 arena（7 行: 20,25,40,60,65,80,100 → スロット 0..6。NULL は 1・4）なので
+///   候補は dense の `[0,2,3,5,6]`（行列 7 行）。
+/// - 構築後（2 回目）: マスク `kept = [2,3,5,8,9,11,13]` から NULL（3・9）を除いた `[2,5,8,11,13]`（行列 14 行）。
+///
+/// どちらも結果は NULL 行・非一致行を含まない id 20,40,60,80,100（全行が同点なので id 昇順）。
+#[test]
+fn sql3220_null_rows_and_mask_overlap_intersect_correctly() {
+    for (label, tail, cosine, limit) in PROVIDER_SHAPES {
+        let probe = Arc::new(Probe::default());
+        let (core, _g) = open("sql3220-overlap", &probe, &[("both", &[5, 25, 55, 65])]);
+        let sql = format!("SELECT {COLS} FROM both WHERE kind = 'a' {tail}");
+        let c_init = core.scalar_index_cache_stats().index_mask_scans;
+        let cold = run(&core, &sql).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        let cold_calls = probe.take();
+        let c0 = core.scalar_index_cache_stats().index_mask_scans;
+        let hot = run(&core, &sql).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        let hot_calls = probe.take();
+        let c1 = core.scalar_index_cache_stats().index_mask_scans;
+
+        assert_eq!(c0, c_init, "{label}: first run must not use the mask path");
+        assert_eq!(c1, c0 + 1, "{label}: second run must use the mask path");
+        assert_eq!(
+            cold_calls,
+            vec![Call::Subset {
+                cosine: *cosine,
+                slots: vec![0, 2, 3, 5, 6],
+                rows: 7
+            }],
+            "{label}: cold"
+        );
+        assert_eq!(
+            hot_calls,
+            vec![Call::Subset {
+                cosine: *cosine,
+                slots: vec![2, 5, 8, 11, 13],
+                rows: 14
+            }],
+            "{label}: hot"
+        );
+        let want = expected_ids(&MASKED_ALL, *limit);
+        assert_eq!(ids_of(&cold), want, "{label}: cold ids");
+        assert_eq!(ids_of(&hot), want, "{label}: hot ids");
+        assert_eq!(fingerprint(&cold), fingerprint(&hot), "{label}");
+        assert_no_other_tenant(&hot, &sql);
+    }
+}
+
+/// 式のオーバーフロー（`n = i32::MAX` の行（id 20）を `n + 1` で投影）は、経路によらず同じ SQLSTATE で拒否される。
+/// 被演算子（INTEGER 列。`numeric_scalar_from_ref` は `i32` を無条件で f64 へ運ぶ）は正常に読めて、加算結果
+/// 2147483648 が投影の INTEGER 型へ戻す `sql/exec.rs` の `scalar_cell_for`（Integer アーム）で `22003` になる。
+/// 同じ行を `n - 1` で投影すると成功する対照で、読み出し段の拒否ではないことを固定する。
 #[test]
 fn sql3220_expression_overflow_is_identical_across_paths() {
     let probe = Arc::new(Probe::default());
@@ -655,14 +723,14 @@ fn sql3220_expression_overflow_is_identical_across_paths() {
         Err(e) => e.wire_code().to_string(),
     };
     let tail = "ORDER BY embedding <#> '[0.0,1.0]' LIMIT 20";
-    let masked = format!("SELECT id, b + 1 FROM docs WHERE kind = 'a' {tail}");
+    let masked = format!("SELECT id, n + 1 FROM docs WHERE kind = 'a' {tail}");
     let cold = code(&masked);
     let cold_calls = probe.take();
     let hot = code(&masked);
     let hot_calls = probe.take();
-    let fast = code(&format!("SELECT id, b + 1 FROM plain {tail}"));
+    let fast = code(&format!("SELECT id, n + 1 FROM plain {tail}"));
     let fast_calls = probe.take();
-    let slow = code(&format!("SELECT id, b + 1 FROM nulls {tail}"));
+    let slow = code(&format!("SELECT id, n + 1 FROM nulls {tail}"));
     let slow_calls = probe.take();
     // 経路の証拠（provider まで届いたうえで投影段が拒否している）。
     let full = |n: u64| Call::Full {
@@ -688,6 +756,16 @@ fn sql3220_expression_overflow_is_identical_across_paths() {
             rows: 12
         }]
     );
+    // 対照: 同じ行の `n - 1` は成功する（被演算子の読み出しは通る）。
+    let ok = run(
+        &core,
+        &format!("SELECT id, n - 1 FROM plain WHERE kind = 'a' {tail}"),
+    )
+    .expect("n - 1 succeeds");
+    assert!(ok.rows.iter().any(|r| r.id == 20
+        && r.cells
+            .contains(&Cell::SignedInteger(i64::from(i32::MAX) - 1))));
+    probe.take();
     assert_eq!(cold, "22003");
     assert_eq!(cold, hot);
     assert_eq!(cold, fast);
