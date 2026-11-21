@@ -102,6 +102,10 @@ enum Call {
 struct Probe {
     calls: Mutex<Vec<Call>>,
     forge: Mutex<Option<u64>>,
+    /// `Some(id)` のとき、コサイン結果の既存の NaN ヒット 1 件を id だけ候補外へ置き換える（件数を変えない）。
+    replace_nan: Mutex<Option<u64>>,
+    /// 各 provider 呼び出しの `(要求 k, 捏造後の返却件数)`。件数の契約（返却件数 <= k）を満たす根拠。
+    ks: Mutex<Vec<(usize, usize)>>,
 }
 
 impl Probe {
@@ -111,6 +115,31 @@ impl Probe {
 
     fn forged(&self) -> Option<u64> {
         *self.forge.lock().expect("lock")
+    }
+
+    fn take_ks(&self) -> Vec<(usize, usize)> {
+        std::mem::take(&mut *self.ks.lock().expect("lock"))
+    }
+
+    fn note_k(&self, k: usize, returned: usize) {
+        self.ks.lock().expect("lock").push((k, returned));
+    }
+
+    /// コサイン結果へ捏造を適用する。`replace_nan` が設定されていれば既存の NaN ヒットの id を置き換える
+    /// （件数・距離順・NaN 末尾・重複なしを保つ）。無ければ `forge` の捏造ヒットを足す。
+    fn forge_cosine(&self, hits: &mut Vec<DistanceHit>, k: usize) {
+        let replace = *self.replace_nan.lock().expect("lock");
+        if let Some(id) = replace {
+            let slot = hits
+                .iter_mut()
+                .find(|h| h.distance.is_nan())
+                .expect("fixture has a NaN distance hit to replace");
+            slot.id = id;
+            sort_distance_hits(hits);
+        } else if let Some(id) = self.forged() {
+            forge_distance_hit(hits, id);
+        }
+        self.note_k(k, hits.len());
     }
 
     fn record(&self, call: Call) {
@@ -131,10 +160,12 @@ impl SearchProvider for SharedProbe {
             ids: input.ids.to_vec(),
             rows: rows_of(input.vectors, input.dim),
         });
+        let k = input.k;
         let mut hits = CpuScalarProvider.search(input)?;
         if let Some(id) = self.0.forged() {
             hits.push(CandidateHit { id, score: -1.0e30 });
         }
+        self.0.note_k(k, hits.len());
         Ok(hits)
     }
 
@@ -147,10 +178,12 @@ impl SearchProvider for SharedProbe {
             slots: input.slots.iter().map(|&s| u64::from(s)).collect(),
             rows: rows_of(input.vectors, input.dim),
         });
+        let k = input.k;
         let mut hits = CpuScalarProvider.search_subset(input)?;
         if let Some(id) = self.0.forged() {
             hits.push(CandidateHit { id, score: -1.0e30 });
         }
+        self.0.note_k(k, hits.len());
         Ok(hits)
     }
 
@@ -160,10 +193,9 @@ impl SearchProvider for SharedProbe {
             ids: input.ids.to_vec(),
             rows: rows_of(input.vectors, input.dim),
         });
+        let k = input.k;
         let mut hits = CpuScalarProvider.search_cosine(input)?;
-        if let Some(id) = self.0.forged() {
-            forge_distance_hit(&mut hits, id);
-        }
+        self.0.forge_cosine(&mut hits, k);
         Ok(hits)
     }
 
@@ -176,10 +208,9 @@ impl SearchProvider for SharedProbe {
             slots: input.slots.iter().map(|&s| u64::from(s)).collect(),
             rows: rows_of(input.vectors, input.dim),
         });
+        let k = input.k;
         let mut hits = CpuScalarProvider.search_cosine_subset(input)?;
-        if let Some(id) = self.0.forged() {
-            forge_distance_hit(&mut hits, id);
-        }
+        self.0.forge_cosine(&mut hits, k);
         Ok(hits)
     }
 }
@@ -191,6 +222,11 @@ fn forge_distance_hit(hits: &mut Vec<DistanceHit>, id: u64) {
     let has_nan = hits.iter().any(|h| h.distance.is_nan());
     let distance = if has_nan { f64::NAN } else { 1.0e300 };
     hits.push(DistanceHit { id, distance });
+    sort_distance_hits(hits);
+}
+
+/// 距離昇順・NaN は末尾の連続区間・同点は id 昇順に並べる（`cmp_distance_asc_then_tie` の契約と同じ）。
+fn sort_distance_hits(hits: &mut [DistanceHit]) {
     hits.sort_by(|a, b| {
         a.distance
             .is_nan()
@@ -823,8 +859,12 @@ fn sql3220_hybrid_dense_adapter_null_rows_match_identity_path() {
 }
 
 /// 密側アダプタ（`CosineDenseAdapter`）は kNN 本体とは別に、渡した候補（`dense_slots`）で返却 id を検証する。
-/// NULL 行のある hybrid で、順序・件数・重複の契約は満たすが候補外（NULL 行のスロット 0・範囲外 12）の
-/// ヒットを返させ、拒否されることを固定する。アダプタは `KernelError::WorkerPanicked` を返し、融合段の
+/// NULL 行のある hybrid で、provider の返却のうち既存の NaN ヒット 1 件の id を候補外（NULL 行のスロット
+/// 0・6・範囲外 12）へ置き換える（足さない）。置き換えなので件数は変わらず（`n <= k` は正常時と同じ値で
+/// 成立。hybrid の取得件数 `k` は arena の長さで上限が掛かり、足すと `k` を超えて件数の契約で先に落ちる）、
+/// 距離昇順・NaN 末尾・重複なしも保つ。所属検査（`sql/exec.rs:1076-1078`）を外すと、置き換えた NaN ヒットは
+/// 直後の NaN 除去（`sql/exec.rs:1083`）で他の NaN ヒットと一緒に消え、問い合わせは成功する入力になる。
+/// つまり拒否は所属検査だけが生む。アダプタは `KernelError::WorkerPanicked` を返し、融合段の
 /// エラー写像（`sql/exec.rs:1245` の既定アーム）が固定 detail `"hybrid search error"` の `Internal` に丸める。
 /// この detail は他の融合段の失敗とも共通なので、拒否が「アダプタが inner を呼んだ後の検証」で起きた
 /// ことは provider 呼び出し（`Subset` と dense スロット列）で特定する。
@@ -837,10 +877,16 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
     // 正常時は通る（検証が拒否の原因になっていないことの対照）。
     run(&core, sql).unwrap_or_else(|e| panic!("hybrid normal: {e:?}"));
     probe.take();
+    // 正常時の `(k, 返却件数)`。置き換えは件数を変えないので、捏造時も同じ値で `返却件数 <= k` が保たれる。
+    let honest_ks = probe.take_ks();
+    assert!(
+        !honest_ks.is_empty() && honest_ks.iter().all(|&(k, n)| n <= k),
+        "{honest_ks:?}"
+    );
     for forged in [0_u64, 6, 12] {
-        *probe.forge.lock().expect("lock") = Some(forged);
+        *probe.replace_nan.lock().expect("lock") = Some(forged);
         let res = run(&core, sql);
-        *probe.forge.lock().expect("lock") = None;
+        *probe.replace_nan.lock().expect("lock") = None;
         assert_eq!(
             probe.take(),
             vec![Call::Subset {
@@ -850,6 +896,7 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
             }],
             "forged {forged}: provider call"
         );
+        assert_eq!(probe.take_ks(), honest_ks, "forged {forged}: k and count");
         match res {
             Err(SqlSurfaceError::Internal { detail }) => {
                 assert_eq!(detail, "hybrid search error", "forged {forged}")
@@ -860,8 +907,9 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
 }
 
 /// 上のテストの恒等候補列版（NULL 行なしの表。`dense_slots == None`）。アダプタが所属検査を `dense_slots`
-/// ありのときだけ行う退行を検出するため、provider 呼び出しが `Full`（恒等 0..10）であることと、範囲外の
-/// スロット（10・12。順序・件数・重複の契約は満たす）が同じ detail で拒否されることを固定する。
+/// ありのときだけ行う退行を検出するため、provider 呼び出しが `Full`（恒等 0..10）であることと、既存の NaN
+/// ヒットを範囲外のスロット（10・12）へ置き換えた返却（件数・順序・重複の契約は満たす）が同じ detail で
+/// 拒否されることを固定する。所属検査を外すと NaN 除去（`sql/exec.rs:1083`）で消えて成功する入力である。
 #[test]
 fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
     let probe = Arc::new(Probe::default());
@@ -870,10 +918,16 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
                ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'a') LIMIT 20";
     run(&core, sql).unwrap_or_else(|e| panic!("hybrid normal: {e:?}"));
     probe.take();
+    // 正常時の `(k, 返却件数)`。置き換えは件数を変えないので、捏造時も同じ値で `返却件数 <= k` が保たれる。
+    let honest_ks = probe.take_ks();
+    assert!(
+        !honest_ks.is_empty() && honest_ks.iter().all(|&(k, n)| n <= k),
+        "{honest_ks:?}"
+    );
     for forged in [10_u64, 12] {
-        *probe.forge.lock().expect("lock") = Some(forged);
+        *probe.replace_nan.lock().expect("lock") = Some(forged);
         let res = run(&core, sql);
-        *probe.forge.lock().expect("lock") = None;
+        *probe.replace_nan.lock().expect("lock") = None;
         assert_eq!(
             probe.take(),
             vec![Call::Full {
@@ -883,6 +937,7 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
             }],
             "forged {forged}: provider call"
         );
+        assert_eq!(probe.take_ks(), honest_ks, "forged {forged}: k and count");
         match res {
             Err(SqlSurfaceError::Internal { detail }) => {
                 assert_eq!(detail, "hybrid search error", "forged {forged}")
@@ -958,10 +1013,17 @@ fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
         ];
         for (why, sql, forged, expected_call) in cases {
             probe.take();
+            probe.take_ks();
             *probe.forge.lock().expect("lock") = Some(forged);
             let res = run(&core, sql);
             *probe.forge.lock().expect("lock") = None;
             let calls = probe.take();
+            // 件数の契約は満たす（捏造後の返却件数 <= 要求 k。`LIMIT 100` の k は 10〜12 行より大きい）。
+            let ks = probe.take_ks();
+            assert!(
+                !ks.is_empty() && ks.iter().all(|&(k, n)| n <= k),
+                "{label} {why}: {ks:?}"
+            );
             assert_eq!(calls, vec![expected_call], "{label} {why}: provider call");
             match res {
                 Err(SqlSurfaceError::Internal { detail }) => assert_eq!(
