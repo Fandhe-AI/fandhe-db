@@ -60,7 +60,7 @@ UDF の呼び出しは、セッションの UDF レジストリで解決する�
 | `... RETURNING w(lang) ...`（`LANGUAGE sql｜plpgsql` 関数。書き込みを試みうる） | `0A000`（書き込み前。行・台帳を残さない。意図的な拒否） |
 | データ変更 CTE の副文・ビュー経由の INSERT／UPDATE／DELETE の `RETURNING` に別名・式・組み込み関数・宣言的／WASM UDF（Issue #3251） | 受理（基表 DML と同じ束縛・評価。ビューは公開名で書く。routine は `0A000`） |
 | `UPDATE ... FROM`／`DELETE ... USING` の `RETURNING` に、任意の relation の列への `AS` 別名と対象表の列だけを参照する式・関数・UDF（Issue #3251） | 受理 |
-| `UPDATE ... FROM`／`DELETE ... USING` の `RETURNING` の式の中で FROM／USING 側の列を参照する形（Issue #3251） | `0A000`（未対応。SET の式と同じ境界） |
+| `UPDATE ... FROM`／`DELETE ... USING` の `RETURNING` の式の中で FROM／USING 側の列を参照する形（Issue #3251） | `0A000`（未対応。SET の式と同じ境界。受け皿 #3534） |
 | NoSQL の `returning` に式・`AS` 別名・関数呼び出しの文字列（Issue #3251） | `42601`（対応しない。「各面への展開」節） |
 | `... RETURNING my_udf(lang) ...`（未定義の関数） | `42883` |
 | `... RETURNING (SELECT ...) ...`・式の内側のサブクエリ・集計関数 | `42601`（他表を読む経路を作らない） |
@@ -437,4 +437,4 @@ INSERT／UPDATE／DELETE の該当イベントにトリガのある表でも、`
   出力位置へ配る。FROM／USING 側のセルは従来どおり一致行のセルの複製。RLS の再判定は式の評価より前。評価時エラー（`22012` 等）は
   元の SQLSTATE のまま透過し、書き込みを abort する。
 - **列権限（SQL-40）**: これらの面は列単位の付与だけでは通らず（判別できない形は全列要求の fail-closed）、表単位の権限があれば通る。
-- **受け皿**: FROM／USING 側の列を式の中で参照する形の将来対応は、SET の式の同種制限と同じ評価基盤を要する（#3296 の候補）。
+- **受け皿**: FROM／USING 側の列を式の中で参照する形の将来対応は、SET の式の同種制限と同じ評価基盤を要する（受け皿は #3534。#3296 の残り）。
