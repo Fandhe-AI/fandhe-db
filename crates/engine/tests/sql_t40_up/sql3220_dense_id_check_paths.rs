@@ -806,11 +806,14 @@ fn sql3220_null_rows_and_mask_overlap_reject_forged_ids() {
         "{honest_ks:?}"
     );
 
-    let cases: [(&str, u64); 4] = [
+    let cases: [(&str, u64); 5] = [
         ("(a) matching NULL row id 25 (slot 3)", 3),
         ("(a) matching NULL row id 65 (slot 10)", 10),
         ("(b) non-matching non-NULL row id 10 (slot 1)", 1),
         ("(b) non-matching non-NULL row id 30 (slot 4)", 4),
+        // (c) すでに返っている候補（id 20。スロット 2）の複製。件数・距離順・NaN 末尾は保ち重複だけを違反させる。
+        // 所属確認だけに簡略化すると（2 は kept にも dense にも属す）受理されて成功する入力になる。
+        ("(c) duplicate of returned candidate id 20 (slot 2)", 2),
     ];
     for (why, forged_slot) in cases {
         *probe.replace_nan.lock().expect("lock") = Some(forged_slot);
@@ -967,7 +970,9 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
         !honest_ks.is_empty() && honest_ks.iter().all(|&(k, n)| n <= k),
         "{honest_ks:?}"
     );
-    for forged in [0_u64, 6, 12] {
+    // 0・6・12 は候補外。1 は候補内（dense スロット。正常時に返っている）の複製（重複だけを違反させる）。
+    // 所属確認だけに簡略化すると、複製した NaN ヒットも直後の NaN 除去で消えて成功する入力になる。
+    for forged in [0_u64, 6, 12, 1] {
         *probe.replace_nan.lock().expect("lock") = Some(forged);
         let res = run(&core, sql);
         *probe.replace_nan.lock().expect("lock") = None;
@@ -1008,7 +1013,9 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
         !honest_ks.is_empty() && honest_ks.iter().all(|&(k, n)| n <= k),
         "{honest_ks:?}"
     );
-    for forged in [10_u64, 12] {
+    // 10・12 は範囲外。0 は候補内（恒等列の先頭スロット。正常時に返っている）の複製（重複だけを違反させる）。
+    // 所属確認だけに簡略化すると、複製した NaN ヒットも直後の NaN 除去で消えて成功する入力になる。
+    for forged in [10_u64, 12, 0] {
         *probe.replace_nan.lock().expect("lock") = Some(forged);
         let res = run(&core, sql);
         *probe.replace_nan.lock().expect("lock") = None;
@@ -1086,21 +1093,45 @@ fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
             slots: vec![1, 3, 5, 7, 9],
             rows: 10,
         };
-        let cases: [(&str, &str, u64, Call); 4] = [
+        let mut cases: Vec<(&str, &str, u64, Call, bool)> = vec![
             // 恒等経路（10 行）。id 10 は範囲外。
-            ("identity out of range", &plain, 10, full10),
+            ("identity out of range", &plain, 10, full10.clone(), false),
             // NULL 行あり（12 行。dense は NULL スロット 0・6 を除く）。NULL 行のスロットを返す。
-            ("dense excludes null slot 0", &nulls, 0, dense.clone()),
-            ("dense excludes null slot 6", &nulls, 6, dense),
+            (
+                "dense excludes null slot 0",
+                &nulls,
+                0,
+                dense.clone(),
+                false,
+            ),
+            (
+                "dense excludes null slot 6",
+                &nulls,
+                6,
+                dense.clone(),
+                false,
+            ),
             // マスク経路（kept = [1,3,5,7,9]）。kept に無い元スロット 0（arena 内の可視行）を返す。
-            ("mask excludes slot 0", &masked, 0, masked_call),
+            ("mask excludes slot 0", &masked, 0, masked_call, false),
         ];
-        for (why, sql, forged, expected_call) in cases {
+        if cosine {
+            // 重複だけを違反させる: 既存の NaN ヒット（`i=5`・`i=7` のゼロ・桁あふれ行）を、すでに返っている
+            // 候補内の id の複製に置き換える（件数・距離順・NaN 末尾は保つ）。コサインアームは NaN を除かないので、
+            // 所属確認だけに簡略化すると同じ候補を 2 回返す結果を受理する。マスク付きの表には NaN 行が無い。
+            cases.push(("identity duplicate", &plain, 0, full10, true));
+            cases.push(("dense duplicate", &nulls, 1, dense, true));
+        }
+        for (why, sql, forged, expected_call, replace) in cases {
             probe.take();
             probe.take_ks();
-            *probe.forge.lock().expect("lock") = Some(forged);
+            let knob = if replace {
+                &probe.replace_nan
+            } else {
+                &probe.forge
+            };
+            *knob.lock().expect("lock") = Some(forged);
             let res = run(&core, sql);
-            *probe.forge.lock().expect("lock") = None;
+            *knob.lock().expect("lock") = None;
             let calls = probe.take();
             // 件数の契約は満たす（捏造後の返却件数 <= 要求 k。`LIMIT 100` の k は 10〜12 行より大きい）。
             let ks = probe.take_ks();
