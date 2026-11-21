@@ -92,6 +92,8 @@ fn fixture(tag: &str) -> (EngineCore, CleanupGuard, SessionState, SessionState) 
     (core, g, o, bound(alice, false))
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
 #[test]
 fn qualified_reference_requires_usage_for_bound_role() {
     let (core, _g, mut o, mut a) = fixture("sacl_usage");
@@ -138,6 +140,8 @@ fn unbound_and_owner_equivalent_sessions_are_not_checked() {
     ok(&core, "t1", &mut unbound, "SELECT id FROM s.t");
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
 #[test]
 fn other_tenant_schema_is_indistinguishable_from_missing() {
     let (core, _g, _o, _a) = fixture("sacl_tenant");
@@ -212,6 +216,8 @@ fn all_tables_in_schema_only_covers_existing_relations() {
     assert_eq!(sel("t"), 0);
 }
 
+// intentional: docs/design/schema-tenant-namespace.md, docs/design/role-privilege-model.md
+// 根拠の節: 拒否の根拠（Issue #3532）・role-privilege-model.md §13 K2（組み込み SCHEMA の `0A000`）
 #[test]
 fn schema_grant_error_contracts() {
     let (core, _g, mut o, mut a) = fixture("sacl_errors");
@@ -268,6 +274,8 @@ fn dropping_schema_releases_roles_for_drop_role() {
     ok(&core, "t1", &mut o, "DROP ROLE alice");
 }
 
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
 #[test]
 fn usage_denial_survives_residual_column_qualifier() {
     let (core, _g, mut o, mut a) = fixture("sacl_qual");
@@ -295,6 +303,44 @@ fn prepared_without_params_is_rechecked_by_public_entry() {
     assert_eq!(err.wire_code(), "42501");
 }
 
+/// Describe(S)（`describe_prepared_in_session`）も Bind と同じく USAGE を検査し、USAGE の無い束縛ロールに
+/// 列の名前・型を返さない（Issue #3532。Parse は USAGE を見ない）。拒否は Bind の再検査と同じ `42501`・同じ文言。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
+#[test]
+fn prepared_describe_requires_usage_for_bound_role() {
+    let (core, _g, mut o, mut a) = fixture("sacl_prep_describe");
+    assert!(a.bind_resolution_tenant("t1"));
+    let sqls = [
+        "SELECT id, name FROM s.t",
+        "SELECT id, name FROM s.t WHERE id = $1",
+    ];
+    for sql in sqls {
+        let prepared = core
+            .parse_sql_prepared_with_declared_in_session(&a, sql, &[])
+            .expect("parse");
+        let err = core
+            .describe_prepared_in_session(&a, &prepared)
+            .expect_err("describe without usage");
+        assert_eq!(err.wire_code(), "42501", "{sql}");
+        let bind_err = core
+            .recheck_prepared_schema_usage(&a, &prepared)
+            .expect_err("bind recheck without usage");
+        assert_eq!(err.to_string(), bind_err.to_string(), "{sql}");
+    }
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    for sql in sqls {
+        let prepared = core
+            .parse_sql_prepared_with_declared_in_session(&a, sql, &[])
+            .expect("parse");
+        let columns = core
+            .describe_prepared_in_session(&a, &prepared)
+            .unwrap_or_else(|e| panic!("{sql}: {} {e}", e.wire_code()))
+            .expect("columns");
+        assert_eq!(columns.len(), 2, "{sql}");
+    }
+}
+
 #[test]
 fn prepared_recheck_reports_dropped_schema_as_undefined_table() {
     let (core, _g, mut o, mut a) = fixture("sacl_prep_drop");
@@ -308,6 +354,43 @@ fn prepared_recheck_reports_dropped_schema_as_undefined_table() {
     let err = core
         .recheck_prepared_schema_usage(&a, &prepared)
         .expect_err("dropped");
+    assert_eq!(err.wire_code(), "42P01");
+}
+
+/// 複数の SCHEMA を参照する文でも、再検査は参照先ごとに生存と USAGE を確かめる（SCHEMA 一覧は 1 回だけ引く。
+/// Issue #3532）。後ろの SCHEMA だけの取り消し・削除も見落とさない。
+#[test]
+fn prepared_recheck_covers_every_referenced_schema() {
+    let (core, _g, mut o, mut a) = fixture("sacl_prep_multi");
+    ok(&core, "t1", &mut o, "CREATE SCHEMA s2");
+    ok(
+        &core,
+        "t1",
+        &mut o,
+        "CREATE TABLE s2.t2 (id BIGINT PRIMARY KEY)",
+    );
+    ok(&core, "t1", &mut o, "GRANT SELECT ON s2.t2 TO alice");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s2 TO alice");
+    assert!(a.bind_resolution_tenant("t1"));
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(
+            &a,
+            "SELECT id FROM s.t UNION ALL SELECT id FROM s2.t2",
+            &[],
+        )
+        .expect("parse");
+    assert!(core.recheck_prepared_schema_usage(&a, &prepared).is_ok());
+    ok(&core, "t1", &mut o, "REVOKE USAGE ON SCHEMA s2 FROM alice");
+    let err = core
+        .recheck_prepared_schema_usage(&a, &prepared)
+        .expect_err("revoked s2");
+    assert_eq!(err.wire_code(), "42501");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s2 TO alice");
+    ok(&core, "t1", &mut o, "DROP SCHEMA s2 CASCADE");
+    let err = core
+        .recheck_prepared_schema_usage(&a, &prepared)
+        .expect_err("dropped s2");
     assert_eq!(err.wire_code(), "42P01");
 }
 

@@ -652,3 +652,40 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 - PostgreSQL 17 との差は本節では未確認とする（比較して一致を根拠にしていない）。注記の根拠は fail-closed の安全弁であることに限る
 - 免除する文の正確な一覧はコード（`is_search_path_exempt`）を参照する
 - `0A000` の文言は固定で、他テナントの SCHEMA 名・内部キーを含まない。`42P01` の文言は利用者が書いた名前だけを含み、他テナントの名前・内部キーは含まない
+
+## 拒否の根拠（Issue #3532）: USAGE の無い束縛ロールに対する SCHEMA の実在 `42501`／不在 `3F000`
+
+決定: (a)。同一テナント内では、USAGE を持たない束縛ロールが修飾名 `s.t` を参照したときの SQLSTATE が SCHEMA の存否で変わる（実在は `42501`、不在は `3F000`）。この応答差は意図的な挙動として維持する。判断の記録は Issue #3532 のコメント。注記書式は [rejection-pin-annotation.md](rejection-pin-annotation.md)。
+
+- **理由 1（存否で応答が変わること自体は PostgreSQL 17 と同じ）**: 公式 `postgres:17` コンテナで実測した。USAGE の無いロールが実在する SCHEMA の表を `SELECT` すると `42501`（"permission denied for schema"）、不在の SCHEMA の修飾名は `42P01`（"relation ... does not exist"）になり、PostgreSQL 17 でも SCHEMA の存否は SQLSTATE の差で伝わる。`GRANT ... ON SCHEMA` の不在は PostgreSQL 17 も `3F000`
+- **PostgreSQL 17 との差（既存の意図的な差）**: 参照位置の不在の SCHEMA は、本実装では `42P01` ではなく `3F000` になる。これは D4 の解決手順（SCHEMA が無ければ `3F000`）で決めた既存の差で、本 Issue で生じたものではなく、変えない。また PostgreSQL 17 は USAGE の不足を Parse（`PREPARE` を含む）で拒否するが、本実装の拡張クエリは表の SELECT 権限があれば Parse を通し、Describe(S)・Bind で拒否する（下の表。行・列メタはどの段でも返らない）
+- **理由 2（露出はテナント内に限る）**: 存否が伝わるのは同じテナントの SCHEMA だけ。他テナントの SCHEMA は、解決器が `(自テナント, SCHEMA 名)` だけを引くため不在と同じ `3F000` になり、応答本体まで区別できない（D4・K3。テナント外の存在の秘匿は SQL-40・RLS-12 のポインタに従う）
+- **適用範囲**: 検査の対象は束縛ロールを持ち、所有者相当でない主体だけ（[role-privilege-model.md](role-privilege-model.md) §13 K1）。未束縛・所有者相当のセッションは従来どおり USAGE を検査しない
+- **Describe の穴を塞いだ（本 Issue のコード変更）**: 拡張クエリの Parse は USAGE を見ない。そのため以前は、表の SELECT 権限があり USAGE の無いロールが、文の Describe（'D' 'S'）で列の名前・型（RowDescription）を受け取れた。Describe でも Bind と同じ USAGE の再検査（`recheck_prepared_schema_usage`）を行い、Bind と同じ `42501`・同じ文言で拒否する。engine の `describe_prepared_in_session`・`describe_prepared_in_txn` が内部で呼び、wire-server の Describe(S) は解決結果を使い回す分岐（カーソル文の DECLARE など）でも呼ぶ
+- **Parse は変えない**: Parse に USAGE 検査を足すことはしない。拡張クエリでは、表の SELECT 権限があるロールは Parse が通り、Bind・Describe で `42501` になる
+
+段ごとに返る応答（wire 越しの実測。`DROP SCHEMA` の行だけは engine の単体で確認した。束縛ロールは USAGE を持たない（`DROP SCHEMA` の行だけは USAGE あり）。「SELECT あり」は表単位の SELECT 権限を付与済み）:
+
+| 参照の形 | 簡易クエリ | Parse | Describe(S) | Bind | Describe(P)・Execute | 行・列メタ |
+| -------- | ---------- | ----- | ----------- | ---- | -------------------- | ---------- |
+| 実在する SCHEMA の表（SELECT あり） | `42501` | 成功 | `42501` | `42501` | 到達しない（Bind で止まる） | 返らない |
+| 実在する SCHEMA の表（SELECT なし） | `42501` | `42501` | 到達しない | 到達しない | 到達しない | 返らない |
+| 不在の SCHEMA | `3F000` | `3F000` | 到達しない | 到達しない | 到達しない | 返らない |
+| 他テナントの SCHEMA | `3F000`（不在と同じ本体） | `3F000`（不在と同じ本体） | 到達しない | 到達しない | 到達しない | 返らない |
+| Parse の後に `DROP SCHEMA` された表（USAGE あり） | — | 成功 | — | `42P01` | 到達しない | 返らない |
+
+- `$n` を持つ文も同じ（Parse 成功、Describe(S)・Bind で `42501`）。`GRANT USAGE ON SCHEMA` の後は、同じ手順で列メタと行が返る
+- 文言: USAGE の拒否は簡易クエリ・Bind・Describe(S) で同じ固定文言。SELECT 権限も無い表では、簡易クエリは USAGE の拒否の文言、拡張クエリの Parse は表単位の権限の拒否の文言になる（SQLSTATE はどちらも `42501`）。どの文言も表名・SCHEMA 名・内部キー（`#`）・テナント ID を含まない。`3F000` の文言は利用者が書いた SCHEMA 名だけを含む
+- `DROP SCHEMA` の行は engine の単体（`prepared_recheck_reports_dropped_schema_as_undefined_table`）で確認した Bind の再検査の結果。権限拒否（`42501`）に化けさせず不在として扱う
+- `GRANT ... ON SCHEMA` も同じ考え方: 不在（と他テナント）の SCHEMA は `3F000`、権限の無い付与者は `42501`。組み込み SCHEMA（`public`・`pg_catalog` など）への付与は状態に依存しない構文段の `0A000`（[role-privilege-model.md](role-privilege-model.md) §13 K2）
+
+固定するテスト:
+
+| テスト | 固定する形 |
+| ------ | ---------- |
+| `crates/engine/src/core/schema_acl_tests.rs` の `qualified_reference_requires_usage_for_bound_role` | 簡易クエリの `42501`（付与・取り消し・CREATE だけの付与） |
+| 同 `usage_denial_survives_residual_column_qualifier` | 列修飾が残る文でも `42501` |
+| 同 `schema_grant_error_contracts` | GRANT の `0A000`・`0LP01`・`3F000`・`42501` |
+| 同 `other_tenant_schema_is_indistinguishable_from_missing` | 他テナントの SCHEMA が不在と同じ `3F000`・同じ文言 |
+| 同 `prepared_describe_requires_usage_for_bound_role` | engine の Describe(S) の `42501`（Bind と同じ文言） |
+| `crates/wire-server/tests/wire_sql/wire_schema_usage_extended.rs` | 上の表の段ごとの応答（wire 越し）と、他テナントの SCHEMA の応答が不在の双子とバイト一致すること |

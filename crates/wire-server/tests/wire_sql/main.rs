@@ -60,6 +60,7 @@ mod wire_scan_order_by;
 mod wire_scan_window;
 mod wire_schema_ddl;
 mod wire_schema_qualified;
+mod wire_schema_usage_extended;
 mod wire_search_mode;
 mod wire_search_path;
 mod wire_sequence_ddl;

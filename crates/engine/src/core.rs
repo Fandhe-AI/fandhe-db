@@ -6343,6 +6343,21 @@ impl EngineCore {
         })
     }
 
+    /// [`Self::check_schema_usage_for`] の、呼び出し側が持つ読み取りスナップショットで判定する版
+    /// （`recheck_prepared_schema_usage` が生存確認と同一スナップショットで USAGE を見るために使う）。
+    pub(crate) fn check_schema_usage_for_in_txn(
+        &self,
+        txn: &redb::ReadTransaction,
+        tenant_id: &str,
+        session: &crate::sql::mode::SessionState,
+        schema_id: u64,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::schema_privilege::check_schema_usage(session, &|role| {
+            crate::catalog::privilege::schema_privileges_in_txn(txn, tenant_id, schema_id, &[role])
+                .map_err(crate::catalog::table_lookup_error)
+        })
+    }
+
     /// `search_path` の要素の可視性 probe（`current_schema()`・`current_schemas()`）。自テナントに在り、かつ
     /// USAGE を持つ SCHEMA だけが「在る」。USAGE の無い SCHEMA は値の列挙では黙って飛ばす（設計記録 K4）。
     /// 作成先の判定（`creation_target`）は飛ばさず `42501` にする。他テナントの SCHEMA は不在と同じ。
@@ -9932,6 +9947,9 @@ impl EngineCore {
         let refreshed = self.refresh_prepared_snap(session, prepared, None)?;
         let prepared = refreshed.as_ref().unwrap_or(prepared);
         Self::check_prepared_for_session(session, prepared)?;
+        // Issue #3532: Parse は USAGE を見ないため、Bind と同じ USAGE の再検査を Describe でも行い、
+        // USAGE の無い束縛ロールに SCHEMA 配下の列の名前・型を返さない（Bind と同じ `42501`。fail-closed）。
+        self.recheck_prepared_schema_usage(session, prepared)?;
         // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
         self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, None)?;
         self.describe_parsed_in_session_impl(
@@ -12550,6 +12568,8 @@ impl EngineCore {
             let refreshed = self.refresh_prepared_snap(session, prepared, snap)?;
             let prepared = refreshed.as_ref().unwrap_or(prepared);
             Self::check_prepared_for_session(session, prepared)?;
+            // Issue #3532: Bind と同じ USAGE の再検査（`describe_prepared_in_session` と同じ理由）。
+            self.recheck_prepared_schema_usage(session, prepared)?;
             // SQL-40・Issue #1967: 権限の無い主体に列の型情報を返さない（fail-closed）。
             self.require_prepared_read_privileges(session, prepared, &prepared.dummy_parsed, snap)?;
             // カーソル文は txn の開いているカーソルから列を引く（従来の経路）。
