@@ -130,8 +130,26 @@ def is_empty_marker(text: str) -> bool:
     return re.sub(r"[\W_]+", "", text.lower()) in EMPTY_MARKERS
 
 
+# 除外区間（Cursor 要約）の終端を示す内部の項目境界。行の内容としては現れない文字を使う。
+ITEM_BOUNDARY = "\x00item-boundary\x00"
+
+
 def _split_items(lines: list[str]) -> list[str]:
-    """節内の行を項目本文へ分ける。箇条書きの有無にかかわらず全行を走査する。
+    """節内の行を項目本文へ分ける。境界マーカーで区切った区間ごとに独立して分割する。"""
+    items: list[str] = []
+    seg: list[str] = []
+    for line in lines:
+        if line == ITEM_BOUNDARY:
+            items.extend(_split_segment(seg))
+            seg = []
+        else:
+            seg.append(line)
+    items.extend(_split_segment(seg))
+    return items
+
+
+def _split_segment(lines: list[str]) -> list[str]:
+    """1 区間の行を項目本文へ分ける。箇条書きの有無にかかわらず全行を走査する。
 
     最小インデントのリスト項目は 1 件ずつ、リストに属さない空行区切りの通常段落は独立項目、
     直前行に続くインデントなしの継続行（Markdown の lazy continuation）と深い行は直前の
@@ -219,8 +237,8 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
                 else:
                     active.excluded["cursor-summary"] = active.excluded.get("cursor-summary", 0) + 1
                     i = end + 1
-                    # 区間の前後の項目が結合しないよう境界を空行で保つ
-                    buf.append("")
+                    # 区間の前後の項目が（インデント差で）結合しないよう明示の境界を保つ
+                    buf.append(ITEM_BOUNDARY)
                     continue
             elif line == CLAUDE_FOOTER:
                 # 行を取り除くだけで元の空行・項目境界は変えない（継続行を別項目にしない）

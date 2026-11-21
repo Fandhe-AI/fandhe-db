@@ -208,6 +208,11 @@ class AutoSummaryTests(unittest.TestCase):
         text = BASE + "\n" + CURSOR_BLOCK + "\n\n- later #3\n"
         self.assertEqual(items_of(text), ["a #1", "b #2", "later #3"])
 
+    def test_indented_items_after_cursor_block_stay_independent(self):
+        # 列頭の項目の後、要約区間を挟んで 2 スペース字下げの受け皿なし項目が続いても結合しない
+        text = "## 対象外\n\n- a #1\n" + CURSOR_BLOCK + "\n  - later work\n  - more work\n"
+        self.assertEqual(items_of(text), ["a #1", "later work", "more work"])
+
     def test_fence_closing_inside_cursor_block_not_fail_open(self):
         blk = CURSOR_BLOCK.replace("> synthetic text", "```")
         text = "## 対象外\n\n```\n" + blk + "\n\n- later #3\n"
