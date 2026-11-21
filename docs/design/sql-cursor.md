@@ -121,7 +121,7 @@ RLS-7 の暗黙適用がそのまま効く。カーソルは接続ごとの `Ses
   | `NO SCROLL`・指定なし | 受理。逆方向の取得は `55000`（`cursor can only scan forward`） |
   | `INSENSITIVE`・`ASENSITIVE`・`WITHOUT HOLD` | 受理して何もしない（もともと INSENSITIVE） |
   | 同じ修飾語の重複 | 受理（冪等。PG と同じ） |
-  | `WITH HOLD` | `0A000`（受け皿 #3340。黙って無視して受理する経路は作らない。方式の提案は [sql-cursor-with-hold.md](sql-cursor-with-hold.md)） |
+  | `WITH HOLD` | `0A000`（受け皿 #3340。黙って無視して受理する経路は作らない。方式は [sql-cursor-with-hold.md](sql-cursor-with-hold.md)） |
   | `BINARY` | `0A000`（意図した拒否。カーソルの行の出力形式は Bind の format code に従う既存の経路しか無い） |
   | `SCROLL` と `NO SCROLL`、`INSENSITIVE` と `ASENSITIVE` の併記 | `42601` |
   | 未知の語・`NO` の後に `SCROLL` が無い・`CURSOR` の後の修飾語・`CURSOR` より前の `WITH HOLD`・`HOLD` の欠落／重複／相反 | `42601` |
@@ -376,7 +376,7 @@ NO SCROLL でも受理し、タグは行の上なら `MOVE 1`・それ以外は 
 | 指定なしのカーソルの逆方向 | 計画次第で許す | NO SCROLL と同じ（`55000`） | 計画に依存しない決定的な挙動にする |
 | `SCROLL` と `NO SCROLL`・`INSENSITIVE` と `ASENSITIVE` の併記 | `42P11` | `42601` | ErrorClass を新設しない |
 | 同名カーソルの再 `DECLARE` | `42P03` | `22000` | 既存の契約 |
-| `WITH HOLD` | 受理 | `0A000` | 受け皿 #3340（方式は [sql-cursor-with-hold.md](sql-cursor-with-hold.md)。オーナー承認待ち） |
+| `WITH HOLD` | 受理 | `0A000` | 受け皿 #3340（方式は [sql-cursor-with-hold.md](sql-cursor-with-hold.md)） |
 | `BINARY` | 受理 | `0A000` | 意図した拒否（上記） |
 | `FROM`／`IN` の省略（`FETCH c`・`MOVE c`） | 受理（`NEXT`） | `42601` | 受け皿 #3534（#3333 の残り） |
 | カーソル自身の実行が `55000` で失敗した後の `ROLLBACK TO` | そのカーソルは使えなくなる（以降 `55000`） | 位置を保って使い続けられる | 既存の契約（SQL-69 (5)・WIRE-27 (2) のポインタ先）を維持。PG17 に合わせるかは spec 側の判断事項 |
@@ -386,7 +386,7 @@ NO SCROLL でも受理し、タグは行の上なら `MOVE 1`・それ以外は 
 
 ## 対象外・申し送り
 
-- `WITH HOLD`（#3339・#3340。寿命・メモリ上限・可視性・解放の方式は [sql-cursor-with-hold.md](sql-cursor-with-hold.md)。Issue #3338・オーナー承認待ち）／`FROM`・`IN` 省略の `FETCH`（受け皿 #3534。#3333 の残り）／`CLOSE ALL`／
+- `WITH HOLD`（#3339・#3340。寿命・メモリ上限・可視性・解放の方式は [sql-cursor-with-hold.md](sql-cursor-with-hold.md)。Issue #3338）／`FROM`・`IN` 省略の `FETCH`（受け皿 #3534。#3333 の残り）／`CLOSE ALL`／
   PL/pgSQL 本体内の `MOVE`（範囲外語として `0A000` のまま）、二重引用符のカーソル名（psycopg 3 の `ServerCursor` はこの形式を
   使うため非対応になる）。
 - ベクトル順位付けの `SELECT`（SQL-1〜4）のカーソル化（WIRE-15 の対象外）。
