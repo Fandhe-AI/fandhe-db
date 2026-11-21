@@ -149,10 +149,7 @@ impl SearchProvider for SharedProbe {
         });
         let mut hits = CpuScalarProvider.search_cosine(input)?;
         if let Some(id) = self.0.forged() {
-            hits.push(DistanceHit {
-                id,
-                distance: 1.0e300,
-            });
+            forge_distance_hit(&mut hits, id);
         }
         Ok(hits)
     }
@@ -168,13 +165,30 @@ impl SearchProvider for SharedProbe {
         });
         let mut hits = CpuScalarProvider.search_cosine_subset(input)?;
         if let Some(id) = self.0.forged() {
-            hits.push(DistanceHit {
-                id,
-                distance: 1.0e300,
-            });
+            forge_distance_hit(&mut hits, id);
         }
         Ok(hits)
     }
+}
+
+/// 捏造ヒットを足す。距離昇順・NaN は末尾の連続区間・同点は id 昇順・件数と重複の契約は保ち、
+/// 候補集合への所属だけに違反する返却列にする（順序違反で同じ拒否になって所属検査の退行を
+/// 隠さないため）。NaN の候補を含むなら捏造も NaN 距離にして NaN 区間へ入れる。
+fn forge_distance_hit(hits: &mut Vec<DistanceHit>, id: u64) {
+    let has_nan = hits.iter().any(|h| h.distance.is_nan());
+    let distance = if has_nan { f64::NAN } else { 1.0e300 };
+    hits.push(DistanceHit { id, distance });
+    hits.sort_by(|a, b| {
+        a.distance
+            .is_nan()
+            .cmp(&b.distance.is_nan())
+            .then_with(|| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn schema(name: &str) -> TableSchema {
@@ -327,7 +341,7 @@ const COLS: &str = "id, kind, n, b, r, d, embedding";
 /// provider を通る形（`(ラベル, 末尾句, cosine か)`）。WHERE は呼び出し側が足す。
 const PROVIDER_SHAPES: &[(&str, &str, bool)] = &[
     (
-        "knn_l2_limit3",
+        "knn_neg_inner_limit3",
         "ORDER BY embedding <#> '[1.0,0.0]' LIMIT 3",
         false,
     ),
@@ -338,7 +352,7 @@ const PROVIDER_SHAPES: &[(&str, &str, bool)] = &[
     ),
     // 全件（5 行・10 行）より大きい LIMIT。
     (
-        "knn_l2_limit_over_all",
+        "knn_neg_inner_limit_over_all",
         "ORDER BY embedding <#> '[1.0,0.0]' LIMIT 1000",
         false,
     ),
@@ -440,29 +454,32 @@ fn sql3220_null_rows_path_matches_identity_path_bitwise() {
 /// マスク側はカウンタで、NULL 側は NULL 行の有無で従来経路に入ったことを示す。
 #[test]
 fn sql3220_exact_scan_membership_matches_across_paths() {
-    let probe = Arc::new(Probe::default());
-    let (core, _g) = open(
-        "sql3220-exact",
-        &probe,
-        &[("docs", &[]), ("plain", &[]), ("nulls", &[5, 55])],
-    );
     let shapes = [
         "ORDER BY embedding <#> '[1.0,0.0]' DESC LIMIT 4",
         "ORDER BY embedding <=> '[1.0,0.0]' DESC LIMIT 1000",
         "ORDER BY embedding <#> '[1.0,0.0]'",
     ];
     for tail in shapes {
+        // ケースごとに索引の無い core（1 回目の実行で索引ができる）。
+        let probe = Arc::new(Probe::default());
+        let (core, _g) = open(
+            "sql3220-exact",
+            &probe,
+            &[("docs", &[]), ("plain", &[]), ("nulls", &[5, 55])],
+        );
         // マスク: 同じ文の 1 回目と 2 回目。
         let sql = format!("SELECT {COLS} FROM docs WHERE kind = 'a' {tail}");
+        let c_init = core.scalar_index_cache_stats().index_mask_scans;
         let cold = run(&core, &sql).unwrap_or_else(|e| panic!("{tail}: {e:?}"));
         let c0 = core.scalar_index_cache_stats().index_mask_scans;
         let hot = run(&core, &sql).unwrap_or_else(|e| panic!("{tail}: {e:?}"));
         let c1 = core.scalar_index_cache_stats().index_mask_scans;
+        assert_eq!(c0, c_init, "{tail}: first run must not use the mask path");
         assert!(
             probe.take().is_empty(),
             "{tail}: exact scan bypasses provider"
         );
-        assert!(c1 > c0, "{tail}: second run must consume the mask path");
+        assert_eq!(c1, c0 + 1, "{tail}: second run must consume the mask path");
         assert_eq!(fingerprint(&cold), fingerprint(&hot), "{tail}");
         assert_no_other_tenant(&hot, &sql);
         assert!(!hot.rows.is_empty());
@@ -567,14 +584,39 @@ fn sql3220_expression_overflow_is_identical_across_paths() {
         Err(e) => e.wire_code().to_string(),
     };
     let tail = "ORDER BY embedding <#> '[0.0,1.0]' LIMIT 20";
-    let cold = code(&format!(
-        "SELECT id, b + 1 FROM docs WHERE kind = 'a' {tail}"
-    ));
-    let hot = code(&format!(
-        "SELECT id, b + 1 FROM docs WHERE kind = 'a' {tail}"
-    ));
+    let masked = format!("SELECT id, b + 1 FROM docs WHERE kind = 'a' {tail}");
+    let cold = code(&masked);
+    let cold_calls = probe.take();
+    let hot = code(&masked);
+    let hot_calls = probe.take();
     let fast = code(&format!("SELECT id, b + 1 FROM plain {tail}"));
+    let fast_calls = probe.take();
     let slow = code(&format!("SELECT id, b + 1 FROM nulls {tail}"));
+    let slow_calls = probe.take();
+    // 経路の証拠（provider まで届いたうえで投影段が拒否している）。
+    let full = |n: u64| Call::Full {
+        cosine: false,
+        ids: (0..n).collect(),
+        rows: n as usize,
+    };
+    assert_eq!(cold_calls, vec![full(5)]);
+    assert_eq!(
+        hot_calls,
+        vec![Call::Subset {
+            cosine: false,
+            slots: vec![1, 3, 5, 7, 9],
+            rows: 10
+        }]
+    );
+    assert_eq!(fast_calls, vec![full(10)]);
+    assert_eq!(
+        slow_calls,
+        vec![Call::Subset {
+            cosine: false,
+            slots: vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11],
+            rows: 12
+        }]
+    );
     assert_eq!(cold, "22003");
     assert_eq!(cold, hot);
     assert_eq!(cold, fast);
@@ -636,7 +678,7 @@ fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
         &[("docs", &[]), ("nulls", &[5, 55])],
     );
     let tails = [
-        ("l2", "ORDER BY embedding <#> '[1.0,0.0]' LIMIT 100"),
+        ("neg_inner", "ORDER BY embedding <#> '[1.0,0.0]' LIMIT 100"),
         ("cosine", "ORDER BY embedding <=> '[1.0,0.0]' LIMIT 100"),
     ];
     for (label, tail) in tails {
