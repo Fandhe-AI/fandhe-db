@@ -54,7 +54,7 @@ scripts/check_issue_closeout.sh "${PARENT_ISSUE}" --check-closed
 ```
 
 - 読むのは、Issue を close したマージ済み PR の本文だけ（コメントは読まない）。出力は番号・見出し・分類だけで、本文は再掲しない。結果を Issue や PR へ転記するときも spec ポインタ規約に従う
-- `--verbose`: OK の項目も出す。Claude Code の生成表示行を除外した節は `EXCLUDED` 行（種別と件数のみ）で示す。`--verbose` が無くても、除外が起きた PR は `EXCLUDED` 行（PR 番号と件数のみ）で示す
+- `--verbose`: OK の項目も出す。Claude Code の生成表示行を除外した節は `EXCLUDED` 行（種別・件数・節の出現順のみ。見出しは出さない）で示す。`--verbose` が無くても、除外が起きた PR は `EXCLUDED` 行（PR 番号と件数のみ）で示す
 - `--check-closed`: close 済み Issue を指す `tracked:` 注記を列挙する（書式は `docs/design/rejection-pin-annotation.md` の D2・D10）。親番号と併用できる
 - `--repo OWNER/NAME`: 対象リポ。`--max-hops N`: 辿る深さ（0〜3、既定 1）。`--max-nodes N`: 走査する Issue 数の上限（1〜5000、既定 500）
 - `gh` の認証とネットワークが要るため、make・CI には載せない手動ツール
