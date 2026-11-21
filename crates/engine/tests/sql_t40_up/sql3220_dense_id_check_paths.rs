@@ -337,6 +337,14 @@ fn seed(storage: &Storage, table: &str, null_ids: &[u64]) {
             b,
         );
     }
+    if table == "both_nan" {
+        // WHERE に一致するゼロベクトル行（コサイン距離が NaN。`replace_nan` の置き換え対象になる）。
+        insert(storage, table, "alice", 45, Some([0.0, 0.0]), "a", 1);
+        // 一致率を下げ（索引のマスク経路は一致行が全体の半分程度までのときに使われる）、一致しない行を足す。
+        for id in [110, 120, 130] {
+            insert(storage, table, "alice", id, Some([0.0, 1.0]), "b", 1);
+        }
+    }
     for &id in null_ids {
         // `MATCHING_NULL_IDS` の NULL 行は `kind = 'a'`（WHERE に一致する NULL 行）。
         let kind = if MATCHING_NULL_IDS.contains(&id) {
@@ -549,10 +557,12 @@ fn sql3220_null_rows_path_matches_identity_path_bitwise() {
     }
 }
 
-/// 厳密全走査（`DESC`・`LIMIT` 省略）の所属検査。provider は通らない（呼び出し 0 件）。
-/// マスク側はカウンタで、NULL 側は NULL 行の有無で従来経路に入ったことを示す。
+/// 厳密全走査（`DESC`・`LIMIT` 省略）の、正常入力での経路間の結果一致。provider は通らない（呼び出し 0 件）。
+/// マスク側はカウンタで、NULL 側は NULL 行の有無で従来経路に入ったことを示す。厳密全走査は provider を
+/// 介さず（`Probe` で候補外 id を返させる手段が無い）、候補外 id の拒否分岐（`dense_id_counts.contains`）は
+/// 本テストでは検証しない（その分岐の拒否は固定していない）。
 #[test]
-fn sql3220_exact_scan_membership_matches_across_paths() {
+fn sql3220_exact_scan_results_match_across_paths() {
     // （末尾句, マスク側の期待 id, 全件側の期待 id）。fixture から導く: 降順は距離の大きい順で、
     // 負の内積は内積 0 の 6 行（偶数 `i` と `i=5`）が先頭の同点（id 昇順）、コサインは NaN の 2 行
     // （`i=5`・`i=7`）が最大扱いで先頭、次に距離 1 の偶数 `i`、最後に距離 0 の `i=1,3,9`。
@@ -752,6 +762,70 @@ fn sql3220_null_rows_and_mask_overlap_intersect_correctly() {
     }
 }
 
+/// 上のテストの拒否側。温まった経路（マスク `kept` から NULL 行を除いた候補）で、返却のうち既存の NaN ヒット
+/// 1 件（WHERE に一致するゼロベクトル行 id 45）の id を候補外へ置き換える（足さない。件数・距離順・NaN 末尾・
+/// 重複なしの契約は保つ）。置き換え先は
+/// (a) WHERE に一致する NULL 行（id 25・65。マスクは通るが NULL 除外で落ちるべき）、
+/// (b) WHERE に一致しない非 NULL 行（id 10・30。NULL 除外は通るがマスクで落ちるべき）。
+/// 照合先がマスクだけ・NULL 除外だけに退行すると、(a)・(b) のどちらかが受理される。kNN のコサインアームには NaN
+/// 除去が無いので、受理されれば捏造した行を結果へ返して成功するか、後段の別のエラーで落ちて detail が変わる。
+/// どちらも本テストの `Err` かつ固定 detail の照合が落ちる。
+/// fixture のスロット（id 昇順 18 行。110・120・130 は一致しない行でスロット 15・16・17）: 5→0, 10→1, 20→2, 25→3, 30→4, 40→5, 45→6, 50→7, 55→8, 60→9, 65→10,
+/// 70→11, 80→12, 90→13, 100→14。マスク `kept = [2,3,5,6,9,10,12,14]` から NULL（3・10）を除いた
+/// `[2,5,6,9,12,14]` が候補。
+#[test]
+fn sql3220_null_rows_and_mask_overlap_reject_forged_ids() {
+    let probe = Arc::new(Probe::default());
+    let (core, _g) = open(
+        "sql3220-overlap-forge",
+        &probe,
+        &[("both_nan", &[5, 25, 55, 65])],
+    );
+    let sql = format!(
+        "SELECT {COLS} FROM both_nan WHERE kind = 'a' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1000"
+    );
+    // 1 回目で索引を作り、2 回目（温まった経路）の正常結果を対照にする。
+    run(&core, &sql).expect("build index");
+    probe.take();
+    probe.take_ks();
+    let before = core.scalar_index_cache_stats().index_mask_scans;
+    let honest = run(&core, &sql).expect("hot honest");
+    assert_eq!(core.scalar_index_cache_stats().index_mask_scans, before + 1);
+    let dense_call = Call::Subset {
+        cosine: true,
+        slots: vec![2, 5, 6, 9, 12, 14],
+        rows: 18,
+    };
+    assert_eq!(probe.take(), vec![dense_call.clone()]);
+    // 距離 1 の行は id 昇順、NaN のゼロベクトル行（id 45）は末尾。
+    assert_eq!(ids_of(&honest), vec![20, 40, 60, 80, 100, 45]);
+    let honest_ks = probe.take_ks();
+    assert!(
+        !honest_ks.is_empty() && honest_ks.iter().all(|&(k, n)| n <= k),
+        "{honest_ks:?}"
+    );
+
+    let cases: [(&str, u64); 4] = [
+        ("(a) matching NULL row id 25 (slot 3)", 3),
+        ("(a) matching NULL row id 65 (slot 10)", 10),
+        ("(b) non-matching non-NULL row id 10 (slot 1)", 1),
+        ("(b) non-matching non-NULL row id 30 (slot 4)", 4),
+    ];
+    for (why, forged_slot) in cases {
+        *probe.replace_nan.lock().expect("lock") = Some(forged_slot);
+        let res = run(&core, &sql);
+        *probe.replace_nan.lock().expect("lock") = None;
+        assert_eq!(probe.take(), vec![dense_call.clone()], "{why}: call");
+        assert_eq!(probe.take_ks(), honest_ks, "{why}: k and count");
+        match res {
+            Err(SqlSurfaceError::Internal { detail }) => {
+                assert_eq!(detail, TOP_K_CONTRACT_DETAIL, "{why}")
+            }
+            other => panic!("{why}: must be rejected: {other:?}"),
+        }
+    }
+}
+
 /// 式のオーバーフロー（`n = i32::MAX` の行（id 20）を `n + 1` で投影）は、経路によらず同じ SQLSTATE で拒否される。
 /// 被演算子（INTEGER 列。`numeric_scalar_from_ref` は `i32` を無条件で f64 へ運ぶ）は正常に読めて、加算結果
 /// 2147483648 が投影の INTEGER 型へ戻す `sql/exec.rs` の `scalar_cell_for`（Integer アーム）で `22003` になる。
@@ -871,10 +945,10 @@ fn sql3220_hybrid_dense_adapter_null_rows_match_identity_path() {
 /// NULL 行のある hybrid で、provider の返却のうち既存の NaN ヒット 1 件の id を候補外（NULL 行のスロット
 /// 0・6・範囲外 12）へ置き換える（足さない）。置き換えなので返却件数は正常時と同じで（`n <= k` も正常時と
 /// 同じ値で成立）、距離昇順・NaN 末尾・重複なしも保つ。正常時と同じ件数・順序の入力で所属検査だけを
-/// 確かめるため、足すのではなく置き換える。所属検査（`sql/exec.rs:1076-1078`）を外すと、置き換えた NaN ヒットは
-/// 直後の NaN 除去（`sql/exec.rs:1083`）で他の NaN ヒットと一緒に消え、問い合わせは成功する入力になる。
+/// 確かめるため、足すのではなく置き換える。所属検査（`CosineDenseAdapter::search` の `distance_result_is_valid_with` による検証）を外すと、置き換えた NaN ヒットは
+/// 直後の NaN 除去（同関数の `filter(|h| !h.distance.is_nan())`）で他の NaN ヒットと一緒に消え、問い合わせは成功する入力になる。
 /// つまり拒否は所属検査だけが生む。アダプタは `KernelError::WorkerPanicked` を返し、融合段の
-/// エラー写像（`sql/exec.rs:1245` の既定アーム）が固定 detail `"hybrid search error"` の `Internal` に丸める。
+/// エラー写像（`sql/exec.rs` の hybrid エラー写像の既定アーム）が固定 detail `"hybrid search error"` の `Internal` に丸める。
 /// この detail は他の融合段の失敗とも共通なので、拒否が「アダプタが inner を呼んだ後の検証」で起きた
 /// ことは provider 呼び出し（`Subset` と dense スロット列）で特定する。
 #[test]
@@ -918,7 +992,7 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
 /// 上のテストの恒等候補列版（NULL 行なしの表。`dense_slots == None`）。アダプタが所属検査を `dense_slots`
 /// ありのときだけ行う退行を検出するため、provider 呼び出しが `Full`（恒等 0..10）であることと、既存の NaN
 /// ヒットを範囲外のスロット（10・12）へ置き換えた返却（件数・順序・重複の契約は満たす）が同じ detail で
-/// 拒否されることを固定する。所属検査を外すと NaN 除去（`sql/exec.rs:1083`）で消えて成功する入力である。
+/// 拒否されることを固定する。所属検査を外すと NaN 除去（`CosineDenseAdapter::search` の `filter`）で消えて成功する入力である。
 #[test]
 fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
     let probe = Arc::new(Probe::default());
