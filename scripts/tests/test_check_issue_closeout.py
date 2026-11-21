@@ -148,6 +148,11 @@ CURSOR_BLOCK = (
     "<!-- /CURSOR_SUMMARY -->"
 )
 BASE = "## 対象外\n\n- a #1\n- b #2\n"
+REAL_SIGNATURE = (
+    "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit "
+    "0123456789abcdef0123456789abcdef01234567. Bugbot is set up for automated code reviews on this repo. "
+    "Configure [here](https://www.cursor.com/dashboard/bugbot).</sup>"
+)
 
 
 def items_of(text):
@@ -224,6 +229,60 @@ class AutoSummaryTests(unittest.TestCase):
         secs = cic.extract_out_of_scope_sections(BASE + "\n" + blk + "\n")
         self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
         self.assertEqual(secs[0].items, ["a #1", "b #2"])
+
+    def test_cursor_real_signature_format_excluded(self):
+        # 実データの署名（40 桁の commit・"Bugbot is set up ..." の一文・/dashboard/bugbot）は既定の形として除外する
+        lines = CURSOR_BLOCK.splitlines()
+        lines[5] = REAL_SIGNATURE
+        secs = cic.extract_out_of_scope_sections(BASE + "\n" + "\n".join(lines) + "\n")
+        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1)
+        self.assertEqual(secs[0].items, ["a #1", "b #2"])
+
+    def test_cursor_real_signature_sentence_altered_kept(self):
+        # 署名の定型文を改変した行は既定の形と認めず、区間を検査対象に残す（fail-closed）
+        lines = CURSOR_BLOCK.splitlines()
+        lines[5] = REAL_SIGNATURE.replace("on this repo.", "on this repo, remaining work #9.")
+        secs = cic.extract_out_of_scope_sections(BASE + "\n" + "\n".join(lines) + "\n")
+        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
+        self.assertIn("#9", " ".join(secs[0].items))
+
+    def test_cursor_unrelated_sup_signature_quote_with_valid_signature_excluded(self):
+        # Bugbot の手掛かりを含まない別の署名の引用は、正常な署名と同じ区間にあっても区間を検査対象に戻さない
+        for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
+            for quote in ("> <sup>Reviewed by the documentation team</sup>",
+                          ">  <sup> reviewed by QA</sup>"):
+                lines = CURSOR_BLOCK.splitlines()
+                lines[5] = sig
+                lines.insert(4, quote)
+                secs = cic.extract_out_of_scope_sections(BASE + "\n" + "\n".join(lines) + "\n")
+                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1, quote)
+                self.assertEqual(secs[0].items, ["a #1", "b #2"], quote)
+
+    def test_cursor_bugbot_hint_mixed_with_valid_kept(self):
+        # 表示名・署名用 URL の手掛かりを含むのに既定書式と一致しない引用行は、正常な署名があっても除外しない
+        for bad in ("> Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) remaining work #9",
+                    "> <sup>see https://cursor.com/bugbot remaining work #9</sup>",
+                    "> <sup>Reviewed by Cursor remaining work #9</sup>",
+                    "> <sup>Reviewed by [Cursor  Bugbot](https://cursor.com/bugbot) for commit abcdef1. #9</sup>"):
+            for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
+                lines = CURSOR_BLOCK.splitlines()
+                lines[5] = sig
+                lines.insert(4, bad)
+                secs = cic.extract_out_of_scope_sections(BASE + "\n" + "\n".join(lines) + "\n")
+                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, bad)
+                self.assertIn("#9", " ".join(secs[0].items), bad)
+
+    def test_cursor_body_mentioning_bugbot_with_valid_signature_excluded(self):
+        # 要約本文が Bugbot の表示名・URL に触れるだけの引用行は署名候補にせず、正常な署名があれば除外する
+        for mention in ("> This PR excludes **Cursor Bugbot** summaries (https://cursor.com/bugbot).",
+                        "> no longer treats well-formed Cursor Bugbot blocks as items"):
+            for sig in (CURSOR_BLOCK.splitlines()[5], REAL_SIGNATURE):
+                lines = CURSOR_BLOCK.splitlines()
+                lines[5] = sig
+                lines.insert(4, mention)
+                secs = cic.extract_out_of_scope_sections(BASE + "\n" + "\n".join(lines) + "\n")
+                self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 1, mention)
+                self.assertEqual(secs[0].items, ["a #1", "b #2"], mention)
 
     def test_cursor_nested_inner_start_not_recognized(self):
         # 外側が不成立のとき内側の開始行を新候補にせず、外側の引用行・参照を検査に残す
@@ -345,6 +404,39 @@ class IntegrationTests(unittest.TestCase):
                          [l for l in pout.splitlines() if l.startswith("summary:")])
         _, quiet, _ = run_cli(g, ["100"])
         self.assertNotIn("EXCLUDED", quiet)
+
+    def test_verbose_excluded_dedup_across_outside_nodes(self):
+        # ツリー外の 2 Issue が同じ PR に close されても、その PR の除外は EXCLUDED に 1 回だけ出る
+        sec = "## 対象外\n\n- see #600\n\n" + FOOTER + "\n"
+        g = FakeGh(bodies={101: (901, body("#700 #701")), 700: (950, sec), 701: (950, sec)},
+                   states={700: "CLOSED", 701: "CLOSED", 600: "OPEN"}, tree={100: [101], 101: []})
+        _, out, _ = run_cli(g, ["100", "--verbose"])
+        self.assertEqual(len([l for l in out.splitlines() if l.startswith("EXCLUDED") and "pr #950" in l]), 1, out)
+
+    def test_excluded_log_collected_only_when_verbose(self):
+        # 除外ログは --verbose のときだけ集める（通常の実行では items_from_prs に収集先を渡さない）
+        sec = "## 対象外\n\n- see #600\n\n" + FOOTER + "\n"
+        orig = cic.items_from_prs
+        for argv, collected in ((["100"], False), (["100", "--verbose"], True)):
+            seen = []
+
+            def spy(*args, **kwargs):
+                ex = args[4] if len(args) > 4 else kwargs.get("excluded_out")
+                seen.append(ex is not None)
+                return orig(*args, **kwargs)
+
+            g = FakeGh(bodies={101: (901, sec + "\n- #700\n"), 700: (950, sec)},
+                       states={700: "CLOSED", 600: "OPEN"}, tree={100: [101], 101: []})
+            cic.items_from_prs = spy
+            try:
+                run_cli(g, argv)
+            finally:
+                cic.items_from_prs = orig
+            self.assertTrue(seen, argv)
+            if collected:
+                self.assertIn(True, seen, argv)
+            else:
+                self.assertNotIn(True, seen, argv)
 
     def test_auto_summary_no_false_untracked(self):
         tail = "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n"

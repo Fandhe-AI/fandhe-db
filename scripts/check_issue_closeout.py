@@ -21,7 +21,8 @@
   Claude Code の生成表示の行が項目に混ざる（Issue #3536）。既定の形に完全一致する場合に限り、
   フェンス外かつ対象外節の中でだけ除外する（区間は開始・終了の印の行、内側 1 行目 `---`、
   以降は空行か引用行のみ、Reviewed by の引用行を含む形）。終了の印が無い・形が崩れている・
-  区間の外の行は従来どおり項目として数える（fail-closed）。除外は `--verbose` に種別と件数だけ出す
+  Bugbot の署名候補なのに既定書式と一致しない引用行がある・区間の外の行は従来どおり項目として
+  数える（fail-closed）。除外は `--verbose` に種別と件数だけ出す
 - 機密保持: PR 本文・Issue タイトル・項目本文は出力に再掲しない。出すのは Issue/PR
   番号、節の見出し（無害化・80 文字で切り詰め）、分類だけ
 - subprocess はリスト引数のみ（shell 不使用）。GraphQL の値は変数で渡し、alias 名は
@@ -73,10 +74,17 @@ CURSOR_END = "<!-- /CURSOR_SUMMARY -->"
 CURSOR_REVIEWED_RE = re.compile(
     r"> <sup>Reviewed by \[Cursor Bugbot\]\(https://cursor\.com/bugbot\)"
     r" for commit [0-9a-fA-F]{7,40}\.?"
+    r"(?: Bugbot is set up for automated code reviews on this repo\.)?"
     r"(?: Configure \[here\]\(https://[^()\s<>]+\)\.?)?</sup>"
 )
-# 引用行の先頭から Cursor Bugbot の署名を始めている行（書式が崩れた署名の検出用。本文中の言及は含めない）。
-CURSOR_SIGNATURE_START_RE = re.compile(r">\s*<sup>\s*Reviewed\s+by\b", re.IGNORECASE)
+# 書式が崩れた Cursor Bugbot の署名の検出用。署名の形をした引用行（`<sup>` で始まる行、または
+# `<sup>` の有無にかかわらず `Reviewed by` で始まる行）のうち、Bugbot の表示名・署名用 URL
+# （cursor.com/bugbot・dashboard/bugbot 等）の手掛かりを含む行を署名候補とみなす。無関係な署名の引用
+# （`<sup>Reviewed by the team</sup>` 等）と、要約本文で Bugbot に触れるだけの行は候補にしない。
+# 候補なのに正規の署名と一致しない行があれば区間ごと検査対象に残す（fail-closed）。
+CURSOR_SIGNATURE_HINT_RE = re.compile(
+    r"^>\s*(?:<sup>.*bugbot|(?:<sup>\s*)?Reviewed\s+by\b.*(?:bugbot|cursor))", re.IGNORECASE
+)
 CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
@@ -203,8 +211,9 @@ def _cursor_summary_end(lines: list[str], start: int) -> tuple[int | None, int]:
             return None, i
         if CURSOR_REVIEWED_RE.fullmatch(line):
             reviewed = True
-        elif CURSOR_SIGNATURE_START_RE.match(line):
-            # 引用記号直後の空白の揺れ等で署名候補なのに既定書式と一致しない行は、区間ごと検査対象に残す
+        elif CURSOR_SIGNATURE_HINT_RE.search(line):
+            # Cursor Bugbot の署名候補なのに既定書式と一致しない行（空白の揺れ・途切れ・文の改変等）は、
+            # 正規の署名が別にあっても区間ごと検査対象に残す
             return None, i
         i += 1
     return None, len(lines) - 1
@@ -604,7 +613,8 @@ def closeout(
     sections_total = 0
     merged_total = 0
     seen_prs: set[int] = set()
-    excluded_all: list[tuple[int, int, str, dict[str, int], int]] = []
+    # 除外ログは --verbose のときだけ集める（通常の実行では集計のコストを払わない）
+    excluded_all: list[tuple[int, int, str, dict[str, int], int]] | None = [] if verbose else None
     edges: dict[int, list[int]] = {}
     for node in descendants:
         if node.truncated_prs:
@@ -632,6 +642,9 @@ def closeout(
     referenced = sorted({r for it in all_items for r in it.refs})
     resolve_numbers(runner, repo, referenced, cache)
 
+    # ツリー外の走査で除外した要約の重複排除用 (PR 番号, 節の出現順)。ツリー内の分を初期値とし、ノード間で使い回す
+    excluded_keys = {(e[1], e[4]) for e in excluded_all} if excluded_all is not None else set()
+
     # ツリー外の参照先を max_hops 段だけたどり、循環の検出にだけ使う
     frontier = [n for n in referenced if n not in edges and n not in in_tree]
     expanded = 0
@@ -654,15 +667,17 @@ def closeout(
                 prs = node.merged_prs
             else:
                 prs = []
-            ex_out: list[tuple[int, int, str, dict[str, int], int]] = []
+            ex_out: list[tuple[int, int, str, dict[str, int], int]] | None = (
+                [] if excluded_all is not None else None
+            )
             for it in items_from_prs(prs, n, repo, set(), ex_out)[0]:
                 refs.extend(r for r in it.refs if r not in refs)
-            # ツリー外の走査で除外した要約も --verbose の EXCLUDED に出す（同じ (PR, 見出し) は重複させない）
-            known = {(e[1], e[4]) for e in excluded_all}
-            for e in ex_out:
-                if (e[1], e[4]) not in known:
-                    known.add((e[1], e[4]))
-                    excluded_all.append(e)
+            # ツリー外の走査で除外した要約も --verbose の EXCLUDED に出す（同じ (PR, 節の出現順) は重複させない）
+            if excluded_all is not None and ex_out:
+                for e in ex_out:
+                    if (e[1], e[4]) not in excluded_keys:
+                        excluded_keys.add((e[1], e[4]))
+                        excluded_all.append(e)
             edges[n] = refs
             nxt.extend(r for r in refs if r not in edges and r not in in_tree)
         resolve_numbers(runner, repo, nxt, cache)
@@ -683,7 +698,7 @@ def closeout(
             lines.append(f"CLOSED-ONLY {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
         elif verbose:
             lines.append(f"OK          {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
-    if verbose:
+    if excluded_all is not None:
         for ex_issue, ex_pr, ex_heading, ex_counts, _ in excluded_all:
             kinds = " ".join(f"{k}={v}" for k, v in sorted(ex_counts.items()))
             lines.append(f'EXCLUDED    issue #{ex_issue} pr #{ex_pr} section "{ex_heading}" {kinds}')
