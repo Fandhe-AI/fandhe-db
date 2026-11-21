@@ -657,7 +657,8 @@ MATERIALIZED VIEW を SCHEMA 配下に置けるようにした（ポインタ: T
 
 決定: (a)。同一テナント内では、USAGE を持たない束縛ロールが修飾名 `s.t` を参照したときの SQLSTATE が SCHEMA の存否で変わる（実在は `42501`、不在は `3F000`）。この応答差は意図的な挙動として維持する。判断の記録は Issue #3532 のコメント。注記書式は [rejection-pin-annotation.md](rejection-pin-annotation.md)。
 
-- **理由 1（PostgreSQL 17 と同じ）**: PostgreSQL 17 も、不在の SCHEMA は `3F000`、USAGE の不足は `42501` を返す。拒否の SQLSTATE の対は PostgreSQL と同じにする。ただし拡張クエリでどの段（Parse か Bind か）で返るかまで PostgreSQL と一致するかは確認していない
+- **理由 1（存否で応答が変わること自体は PostgreSQL 17 と同じ）**: 公式 `postgres:17` コンテナで実測した。USAGE の無いロールが実在する SCHEMA の表を `SELECT` すると `42501`（"permission denied for schema"）、不在の SCHEMA の修飾名は `42P01`（"relation ... does not exist"）になり、PostgreSQL 17 でも SCHEMA の存否は SQLSTATE の差で伝わる。`GRANT ... ON SCHEMA` の不在は PostgreSQL 17 も `3F000`
+- **PostgreSQL 17 との差（既存の意図的な差）**: 参照位置の不在の SCHEMA は、本実装では `42P01` ではなく `3F000` になる。これは D4 の解決手順（SCHEMA が無ければ `3F000`）で決めた既存の差で、本 Issue で生じたものではなく、変えない。また PostgreSQL 17 は USAGE の不足を Parse（`PREPARE` を含む）で拒否するが、本実装の拡張クエリは表の SELECT 権限があれば Parse を通し、Describe(S)・Bind で拒否する（下の表。行・列メタはどの段でも返らない）
 - **理由 2（露出はテナント内に限る）**: 存否が伝わるのは同じテナントの SCHEMA だけ。他テナントの SCHEMA は、解決器が `(自テナント, SCHEMA 名)` だけを引くため不在と同じ `3F000` になり、応答本体まで区別できない（D4・K3。テナント外の存在の秘匿は SQL-40・RLS-12 のポインタに従う）
 - **適用範囲**: 検査の対象は束縛ロールを持ち、所有者相当でない主体だけ（[role-privilege-model.md](role-privilege-model.md) §13 K1）。未束縛・所有者相当のセッションは従来どおり USAGE を検査しない
 - **Describe の穴を塞いだ（本 Issue のコード変更）**: 拡張クエリの Parse は USAGE を見ない。そのため以前は、表の SELECT 権限があり USAGE の無いロールが、文の Describe（'D' 'S'）で列の名前・型（RowDescription）を受け取れた。Describe でも Bind と同じ USAGE の再検査（`recheck_prepared_schema_usage`）を行い、Bind と同じ `42501`・同じ文言で拒否する。engine の `describe_prepared_in_session`・`describe_prepared_in_txn` が内部で呼び、wire-server の Describe(S) は解決結果を使い回す分岐（カーソル文の DECLARE など）でも呼ぶ

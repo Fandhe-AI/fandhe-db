@@ -2,8 +2,9 @@
 //! （Issue #3532、ポインタ: SQL-40・RLS-12）。
 //!
 //! 意図的な挙動の根拠は `docs/design/schema-tenant-namespace.md` の「拒否の根拠（Issue #3532）」節。
-//! 同一テナント内の実在する SCHEMA は `42501`、不在は `3F000`（PostgreSQL 17 と同じ差）。他テナントの SCHEMA は
-//! 不在と同じ `3F000` で、応答本体まで区別できない。拡張クエリは Parse が USAGE を見ないため、表の SELECT 権限が
+//! 同一テナント内の実在する SCHEMA は `42501`、不在は `3F000`。存否で応答が変わるのは PostgreSQL 17 と同じだが、
+//! PostgreSQL 17 の不在は `42P01` で、`3F000` は同 ADR D4 の既存の差。他テナントの SCHEMA は不在と同じ `3F000` で、
+//! 応答本体まで区別できない。拡張クエリは Parse が USAGE を見ないため、表の SELECT 権限が
 //! あれば Parse は通り、Bind と文の Describe（'D' 'S'。カーソル文の DECLARE を含む）で `42501` になる。どの段でも
 //! 行（DataRow）と列メタ（RowDescription）は返らない。
 //!
