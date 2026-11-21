@@ -508,8 +508,7 @@ fn reads_after_a_drop_are_rejected_with_0a000() {
     assert_eq!(read_rows(&core, "alice", "SELECT id FROM t"), Ok(0));
 }
 
-// 制約の追加・削除・改名・型変更・SERIAL/IDENTITY 列の Tx 内対応は #3313 の範囲外（受け皿の子 Issue は未起票。
-// 受け皿は #3533）。
+// 制約の追加・削除・改名・型変更・SERIAL/IDENTITY 列の Tx 内対応は #3313 の範囲外（受け皿は #3533）。
 #[test]
 // tracked: #3533
 fn unsupported_alter_actions_and_serial_columns_are_rejected_with_0a000() {

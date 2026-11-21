@@ -762,7 +762,7 @@ fn unsupported_and_invalid_join_forms_fail_closed_without_side_effects() {
             "DELETE FROM t USING s JOIN (SELECT k FROM u) q ON s.k = q.k WHERE t.k = s.k",
             "42601",
         ),
-        // 対象表と source をまたぐ非等値・OR（tracked: #3295）
+        // 対象表と source をまたぐ非等値・OR（tracked: #3534）
         (
             "DELETE FROM t USING s JOIN u ON s.k = u.k WHERE t.k = s.k AND t.x < u.w",
             "0A000",
