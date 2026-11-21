@@ -1874,6 +1874,12 @@ fn handle_describe_body(
                             .describe_prepared_in_txn(session, txn, prepared)
                             .map_err(HandlerError::Sql)?
                     } else {
+                        // Issue #3532: 解決結果を使い回す分岐（束縛ロールではカーソル文が通る）でも、Bind と
+                        // 同じく SCHEMA 修飾の USAGE を Describe 時点の ACL で検査する（Parse は USAGE を見ない）。
+                        // 上の 2 分岐は `describe_prepared_in_txn` が内部で検査する。拒否は Bind と同じ `42501`。
+                        engine
+                            .recheck_prepared_schema_usage(session, prepared)
+                            .map_err(HandlerError::Sql)?;
                         engine
                             .describe_parsed_in_txn(session, txn, parsed)
                             .map_err(HandlerError::Sql)?
