@@ -442,7 +442,7 @@ fn reusing_operation_id_within_the_same_transaction_is_rejected() {
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn unsupported_statement_inside_transaction_is_rejected_with_feature_not_supported() {
     let (engine, path) = new_core();
     let _cleanup = CleanupGuard(path);
@@ -455,7 +455,7 @@ fn unsupported_statement_inside_transaction_is_rejected_with_feature_not_support
         .expect("begin");
     // 未対応の DDL（`CREATE MATERIALIZED VIEW` 等。表・索引の DDL は SQL-80・Issue #3313、VIEW・SEQUENCE・
     // SCHEMA・型の DDL は Issue #3315 で対応済みで、`sql80_txn_table_ddl.rs`・`sql80_txn_object_ddl.rs` が担う。
-    // マテリアライズドビューは受け皿 #3311）は明示トランザクション内では `0A000`。
+    // マテリアライズドビューは受け皿 #3533）は明示トランザクション内では `0A000`。
     // `DELETE`・`UPDATE`・UPSERT・複数行 `INSERT` は Issue #1179 で対応済み（`sql31_txn_dml.rs` 参照）。
     let err = engine
         .execute_sql_in_txn(

@@ -833,8 +833,8 @@ fn rows_from_is_rejected_with_a_fixed_0a000() {
     }
 }
 
-/// EXPLAIN・`$n`・ビュー本文の中の `LATERAL unnest` は #3324 の範囲で、従来どおり拒否される。
-/// tracked: #3324
+/// `EXPLAIN` の中の `LATERAL unnest` は従来どおり `0A000` で拒否される。
+/// tracked: #3534
 #[test]
 fn explain_is_rejected_until_the_lateral_explain_issue() {
     let (core, _g) = open();

@@ -239,6 +239,7 @@ fn output_is_tenant_independent() {
     }
 }
 
+// tracked: #3534
 #[test]
 fn unsupported_forms_are_rejected_without_effects() {
     let (core, _g) = seeded("x75d-reject");
@@ -247,7 +248,6 @@ fn unsupported_forms_are_rejected_without_effects() {
     for (sql, expected) in [
         // UPDATE ... FROM／DELETE ... USING は Issue #3293 で受理する（`sql53_explain_dml_from_using.rs`）。
         // 結合形のうち拒否のままの形（FROM に 2 表以上・ON 付き結合）はここで固定する。
-        // tracked: #3294
         (
             "EXPLAIN UPDATE a SET v = 'z' FROM pt, nn WHERE a.k = pt.k AND pt.k = nn.k",
             "0A000",

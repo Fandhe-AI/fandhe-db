@@ -5,7 +5,7 @@
 //! `EngineCore::execute_sql_in_txn`（明示 Tx の production 入口）で、`CREATE TABLE`・`ALTER TABLE` の一部・
 //! `DROP TABLE`・`CREATE INDEX`・`DROP INDEX` を共有 write txn へ積み、COMMIT で原子的に確定し、
 //! ROLLBACK・失敗では痕跡を残さないことを固定する。DDL 後に実行できる文は暫定の許可リストに限り、
-//! それ以外は `0A000` で fail-closed になる（受け皿は #3311。権限の再判定・拡張クエリ・UPDATE/DELETE 等）。
+//! それ以外は `0A000` で fail-closed になる（受け皿は #3533。権限の再判定・拡張クエリ・UPDATE/DELETE 等）。
 //! `sql31_transaction.rs` と同じ流儀（実 `Storage` ＋ `CpuScalarProvider`、`unique_db_path`／`CleanupGuard`）。
 
 use engine::core::EngineCore;
@@ -358,7 +358,7 @@ fn ddl_without_ddl_permission_is_42501_and_leaks_no_existence() {
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn insert_select_after_ddl_is_rejected_with_0a000() {
     // 挿入先スキーマを確定済みカタログから取る INSERT ... SELECT は、同じ Tx の CREATE TABLE・ADD COLUMN を
     // 解決できないため、結線までは 0A000 で拒否する（Tx は失敗状態。部分実行しない）。
@@ -386,7 +386,7 @@ fn insert_select_after_ddl_is_rejected_with_0a000() {
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn conflict_on_constraint_and_file_form_insert_after_ddl_are_rejected_with_0a000() {
     // 同じ Tx で作った一意索引を ON CONFLICT ON CONSTRAINT の対象として受理せず（SQL-49 の 42704 を判定できる
     // 結線まで 0A000）、ファイル形 INSERT も確定済みカタログを引くため結線まで 0A000 で拒否する（部分実行しない）。
@@ -447,7 +447,7 @@ fn conflict_on_constraint_and_file_form_insert_after_ddl_are_rejected_with_0a000
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn statements_not_yet_wired_after_ddl_are_rejected_with_0a000() {
     // DDL 後の UPDATE・DELETE・TRUNCATE・EXPLAIN・COPY 等は未対応。
     let (core, _guard) = new_core("sql80-post-ddl-gate");
@@ -479,7 +479,7 @@ fn statements_not_yet_wired_after_ddl_are_rejected_with_0a000() {
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn reads_after_a_drop_are_rejected_with_0a000() {
     // DROP 後の参照は未対応。確定済みカタログでの解析・ビュー展開が古い名前を見るため。
     let (core, _guard) = new_core("sql80-after-drop");
@@ -508,10 +508,9 @@ fn reads_after_a_drop_are_rejected_with_0a000() {
     assert_eq!(read_rows(&core, "alice", "SELECT id FROM t"), Ok(0));
 }
 
-// 制約の追加・削除・改名・型変更・SERIAL/IDENTITY 列の Tx 内対応は #3313 の範囲外（受け皿の子 Issue は未起票。
-// 起票までは親の #3311 を指す）。
+// 制約の追加・削除・改名・型変更・SERIAL/IDENTITY 列の Tx 内対応は #3313 の範囲外（受け皿は #3533）。
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn unsupported_alter_actions_and_serial_columns_are_rejected_with_0a000() {
     let (core, _guard) = new_core("sql80-unsupported-forms");
     let mut session = ddl_session();
@@ -808,7 +807,7 @@ fn drop_if_exists_of_a_missing_table_in_a_transaction_commits_without_effect() {
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn extended_execute_after_ddl_is_rejected_for_everything_but_ddl() {
     // V7: Parse 済み（確定済みカタログで束縛した）文は、DDL を積んだ Tx では実行しない。
     // 古いスキーマで INSERT を束縛してしまう経路を作らない。
@@ -841,7 +840,7 @@ fn extended_execute_after_ddl_is_rejected_for_everything_but_ddl() {
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn copy_after_ddl_is_rejected_with_0a000() {
     let (core, _guard) = new_core("sql80-copy");
     let mut session = ddl_session();

@@ -487,7 +487,7 @@ TABLE-41 (2) のポインタ（TABLE-18 の RLS 契約は変えない）。兄�
 - 順序: 構文 → 本文サイズ → DDL 権限（`42501`。互換性の情報を権限のない主体へ返さない）→ 別名の突合
   （`42601`／`42701`）→ 同名が表・索引なら `42809` → 新本文の検証（参照先不存在 `42P01` 等）→
   自己参照・循環 `42P17` → 互換性 `42P16` → 依存ビューあり `0A000` → ネスト深さ `54000` → 置換。
-  不在なら通常の `CREATE VIEW` と同じ。明示トランザクション内の `CREATE VIEW`・`DROP VIEW` は Issue #3315 で受理に変わった（`OR REPLACE` は `0A000`。受け皿 #3311）
+  不在なら通常の `CREATE VIEW` と同じ。明示トランザクション内の `CREATE VIEW`・`DROP VIEW` は Issue #3315 で受理に変わった（`OR REPLACE` は `0A000`。受け皿 #3533。#3311 の残り）
 
 ### 互換性規則（`sql::view_replace::check_replace_compatible`）
 
@@ -681,7 +681,7 @@ Issue #1665（`REFRESH`）・#1666（`REFRESH ... CONCURRENTLY`）・#1667（索
 
 - 単純形本文の `*` は作成時に展開せず保存する。基表への `ADD COLUMN` で出力列がずれたら
   REFRESH は `0A000` で拒否し旧実体を残す（PostgreSQL は成功する）。
-- 明示トランザクション内の CREATE／REFRESH は `0A000`（PostgreSQL は REFRESH を許す。Issue #3315 の後もマテビューは未結線で、受け皿は #3311）。
+- 明示トランザクション内の CREATE／REFRESH は `0A000`（PostgreSQL は REFRESH を許す。Issue #3315 の後もマテビューは未結線で、受け皿は #3533。#3311 の残り）。
 - `CONCURRENTLY` と `WITH NO DATA` の併用は構文段で `42601`。
 - CONCURRENTLY の重複行は `21000` ではなく `23505`（非 CONCURRENTLY と同結果にする方針）。
 - 単一ライタのため、REFRESH 中は基表への書き込みが待たされる。

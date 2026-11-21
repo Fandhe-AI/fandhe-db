@@ -358,8 +358,8 @@ fn bootstrap_role_cannot_bypass_for_role_set_path() {
 }
 
 /// テナント境界（RLS-12）: 他テナントのロール・SCHEMA は不在と同じ応答、未束縛はカタログ照会より前に `42501`、
-/// 明示 Tx 内は autocommit と同じ判定（SQL-80・Issue #3316）。積んだ後の読み取りは固定の拒否で、結線は #3311。
-// tracked: #3311
+/// 明示 Tx 内は autocommit と同じ判定（SQL-80・Issue #3316）。積んだ後の読み取りは固定の拒否で、結線は #3533。
+// tracked: #3533
 #[test]
 fn tenant_boundary_and_gates() {
     let f = fx("sql40_dp_tenant");

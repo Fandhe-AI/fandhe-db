@@ -503,7 +503,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   - 型付きダミーを持たない列型（JSON 系・配列・ビット列・ベクトル系）の相手は Parse で固定文言の `0A000`。
   - NULL のバインドはリテラル `NULL` 成分と同じ SQLSTATE（現状は裸の識別子として解決され `42703`）。行値の NULL 成分の評価は本 Issue の対象外で、スカラー比較と同じ規則を維持する。
 - **EXPLAIN**: 出力は閉じた語彙で値・述語テキストを含まず、展開後の束縛結果から導かれる。等価な展開形を手で書いた文の EXPLAIN と完全に一致し、テナントによらず同一（述語の描画器は新設しない。SQL-75・SQL-27 のポインタ）。
-- **RLS**: 展開は既存の述語木だけを生成し、テナント境界・ポリシー・`visible()` の合成点には手を入れない。生成葉の束縛結果の `visible()` の有無を取りこぼさないよう伝播する。ポリシー式（`CREATE/ALTER POLICY`）での行値比較は従来どおり `0A000`（親 #3254）。
+- **RLS**: 展開は既存の述語木だけを生成し、テナント境界・ポリシー・`visible()` の合成点には手を入れない。生成葉の束縛結果の `visible()` の有無を取りこぼさないよう伝播する。ポリシー式（`CREATE/ALTER POLICY`）での行値比較は従来どおり `0A000`（親 #3254。受け皿 #3534）。
 - **検証**: `tests/table_rls/prepared_row_compare.rs`（リテラル形とのパリティ・型付きダミー・序数）・`tests/table_rls/rls10_row_compare_paths.rs`（T2／T3 の越境）・`tests/sql_named/sql_where_row_compare.rs`（EXPLAIN）・`crates/wire-server/tests/wire_sql/wire_row_compare.rs`（wire）。
 
 ## 行値の IN の要素の成分の `$n`（パターン 13。Issue #3300。SQL-9・SQL-75・WIRE-12・RLS-10 のポインタ）
@@ -519,7 +519,7 @@ Bind 値 `None`（SQL NULL）は、`sql::params` が裸の `Token::Ident("NULL")
   - スカラー `n IN ($1, $2)` は従来どおり `42601`。
   - `EXPLAIN` 前置・`WITH`・集合演算・JOIN・`HAVING` は先頭語・既存の一律拒否のまま `42601`。
   - 型付きダミーを持たない列型の相手は Parse で固定文言の `0A000`。NULL のバインドはリテラル `NULL` 成分と同じ SQLSTATE（パターン 12 と同じ規則）。
-  - 定義文脈（POLICY・VIEW・部分索引・CHECK）は従来どおり拒否（受け皿は #3254）。
+  - 定義文脈（POLICY・VIEW・部分索引・CHECK）は従来どおり拒否（受け皿は #3534。#3254 の残り）。
 - **EXPLAIN**: 値も述語テキストも出さない閉じた語彙のまま、脱糖後の束縛結果から導かれる。手で展開した形（`IN` は `(a = 1 AND b = 1) OR (a = 3 AND b = 5)`、`NOT IN` は `(a <> 1 OR b <> 1) AND (a <> 3 OR b <> 5)`）の EXPLAIN と完全に一致し、テナントによらず同一。DML では `filter: present` が出る。述語の描画器は新設しない（SQL-75・SQL-27 のポインタ）。`EXPLAIN` と `$n` の組み合わせは `42601` のまま。
 - **RLS**: 脱糖は既存の述語木だけを生成し、テナント境界・ポリシー・`visible()` の合成点には手を入れない。`Or` 分岐の中の `RowCompare` でも `visible()` の有無を落とさないことを越境試験で固定する。
 - **索引**: 本 Issue の対象外。全走査で正しい結果を返す（複合索引の範囲化・IN の索引化は未対応）。

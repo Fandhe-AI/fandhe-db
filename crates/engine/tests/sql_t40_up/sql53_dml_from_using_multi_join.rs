@@ -727,7 +727,7 @@ fn operation_id_resend_and_reuse_follow_the_ledger_contract() {
 
 /// 未対応・不正な形は固定の SQLSTATE で拒否され、行は変わらない。
 // intentional: docs/design/update-from-delete-using.md
-// tracked: #3295
+// tracked: #3534
 #[test]
 fn unsupported_and_invalid_join_forms_fail_closed_without_side_effects() {
     let alice = ctx("alice");
@@ -762,7 +762,7 @@ fn unsupported_and_invalid_join_forms_fail_closed_without_side_effects() {
             "DELETE FROM t USING s JOIN (SELECT k FROM u) q ON s.k = q.k WHERE t.k = s.k",
             "42601",
         ),
-        // 対象表と source をまたぐ非等値・OR（tracked: #3295）
+        // 対象表と source をまたぐ非等値・OR（tracked: #3534）
         (
             "DELETE FROM t USING s JOIN u ON s.k = u.k WHERE t.k = s.k AND t.x < u.w",
             "0A000",

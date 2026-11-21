@@ -145,8 +145,8 @@ fn sqlstate_contract() {
 }
 
 /// SQL-80・Issue #3316: 明示 Tx 内の行セキュリティの切り替えは ROLLBACK の後に状態を変えない（COMMIT で確定する形は
-/// `sql80_txn_security_ddl.rs`）。積んだ後の読み取りは固定の拒否で、結線は #3311。
-// tracked: #3311
+/// `sql80_txn_security_ddl.rs`）。積んだ後の読み取りは固定の拒否で、結線は #3533。
+// tracked: #3533
 #[test]
 fn explicit_transaction_applies_row_security_only_at_commit() {
     let (_g, path, core) = open_fixture("rls13-tx");

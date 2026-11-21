@@ -510,7 +510,7 @@ fn nosql_insert_defers_not_null_so_before_row_can_fill() {
 }
 
 // 未結線の形（NoSQL の RETURNING）は従来どおり 0A000 のまま。トリガは呼ばれない。
-// tracked: #3189
+// tracked: #3534
 #[test]
 fn nosql_returning_with_triggers_stays_unsupported() {
     let dir = tempdir();

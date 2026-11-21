@@ -275,7 +275,7 @@ fn role_ddl_is_invisible_until_commit_and_commits_without_a_table_footprint() {
 
 /// 権限・ポリシー・ロール等を積んだ後の後続文は、古い判定で通さず固定文言の `0A000` にする（名前・存在を含めない）。
 /// `ROLLBACK TO` で制限が解ける。
-// tracked: #3311
+// tracked: #3533
 #[test]
 fn followers_after_guarded_ddl_are_rejected_with_a_fixed_message() {
     let f = fx("sql80_sec_guard");
@@ -381,7 +381,7 @@ fn combined_ddl_commits_atomically() {
 /// 名前解決は確定済みのカタログで行われる。同じ Tx で作った public 表と同名の SCHEMA 配下の表が `search_path` で
 /// 見えるとき、その名前の本種別の DDL が SCHEMA 配下の表へ当たってはならない（別の表の権限・ポリシーを変える
 /// fail-open）。表・索引の DDL を積んだ後は、SCHEMA 配下の内部キーに解決された対象を固定の拒否にする。
-// tracked: #3315
+// tracked: #3533
 #[test]
 fn names_resolved_to_schema_tables_after_table_ddl_are_not_applied_to_the_wrong_table() {
     let f = fx("sql80_sec_shadow");
@@ -497,7 +497,7 @@ fn ddl_inside_do_blocks_stays_unsupported() {
 
 /// 関数・トリガ: 同じ Tx で作ったトリガ関数にトリガを張れ、ROLLBACK では何も残らず、COMMIT で確定する。
 /// 積んだ後の INSERT は古いトリガで発火させず `0A000`。表の DDL の後の `CREATE FUNCTION` は `0A000`。
-/// tracked: #3311
+/// tracked: #3533
 #[test]
 fn trigger_and_function_ddl_commit_and_rollback() {
     let f = fx("sql80_sec_trigger");

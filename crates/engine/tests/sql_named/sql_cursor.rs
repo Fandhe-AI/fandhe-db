@@ -2066,7 +2066,7 @@ fn parse_sql_prepared_accepts_fetch_directions() {
 
 /// `FROM`／`IN` の省略は向きではなく文法の任意要素のため今回の範囲外で、前方向へ読み替えず
 /// `42601` で拒否する（fail-closed）。
-// tracked: #3333
+// tracked: #3534
 #[test]
 fn fetch_without_from_or_in_is_rejected_for_now() {
     let (engine, path) = new_core();

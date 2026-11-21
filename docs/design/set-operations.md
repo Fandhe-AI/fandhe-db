@@ -204,7 +204,7 @@ Describe は検証していなかったため範囲外の値が Describe だけ�
 - `DISTINCT`・ベクトル順位付けを含む枝（集合演算の結果全体に対する `ORDER BY` は構文・束縛を
   Issue #3266、実行を Issue #3267 で対応済み。集計の枝・括弧付き枝の `ORDER BY`／`LIMIT`／`OFFSET` は Issue #1191 で対応済み）。
   全体 `ORDER BY` の未対応は、比較できない型・ICU 照合のキー、`FETCH ... WITH TIES`（いずれも
-  `0A000`／`42601`。親 Issue #3265 の配下で追跡）
+  `0A000`／`42601`。経緯は親 Issue #3265 の配下。現在の受け皿は、`TIMESTAMPTZ`・`VECTOR` のソートキー型の未対応が Issue #3534。それ以外の比較できない型・ICU 照合・`FETCH ... WITH TIES` は受け皿の Issue が未定）
 - 式射影の枝・定数枝（Issue #3270・#3271 で結果と `EXPLAIN` を対応済み）の残る未対応（受け皿の Issue は未定）:
   全枝が定数の集合演算とその `EXPLAIN`（`0A000`）、定数枝の集計・`WHERE`／`HAVING`・括弧付き定数枝の
   `LIMIT`／`OFFSET`（`42601`）、型の決まらない `NULL`・文字列リテラルの型解決（`42703`／`42804`）、

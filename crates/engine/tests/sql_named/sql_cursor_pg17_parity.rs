@@ -315,7 +315,7 @@ fn duplicate_cursor_name_differs_from_pg17_by_design() {
 
 /// `WITH HOLD`（PG17 は受理）は `0A000`、`FROM`／`IN` の省略（PG17 は受理）は `42601`。
 /// `BINARY`（PG17 は受理）は意図した `0A000`。
-// tracked: #3340, #3333
+// tracked: #3340, #3534
 // intentional: docs/design/sql-cursor.md
 #[test]
 fn forms_accepted_by_pg17_but_rejected_here_stay_fail_closed() {

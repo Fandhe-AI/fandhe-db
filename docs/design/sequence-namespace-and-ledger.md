@@ -274,7 +274,7 @@ CACHE は引き続き `0A000` で、内部の値は 1 固定のまま。永続�
 
 - 受理: `RESTART [[WITH] n]`・`START [WITH]`・`INCREMENT [BY]`・`MINVALUE`／`NO MINVALUE`・`MAXVALUE`／`NO MAXVALUE`・`CYCLE`／`NO CYCLE` の任意順（1 個以上）と、単独の `RENAME TO <新名>`。タグは `ALTER SEQUENCE`（RENAME も同じ）
 - `42601`: オプションなし・同種の重複・`RENAME TO` と他オプションの併用・小数・未知のトークン。`22003`: i64 の範囲外
-- `0A000`: `IF EXISTS`・`AS`・`CACHE`・`OWNED BY`・`SET SCHEMA`・`OWNER TO`・`SET LOGGED`／`UNLOGGED`・修飾名。明示トランザクション内の `ALTER SEQUENCE`（`RESTART` なし）・`RENAME TO` は Issue #3315 で共有 write txn に積まれる。`RESTART` だけは採番器の現在値を commit 後にしか捨てられないため `0A000`（受け皿 #3311）。内部 ID の再利用による古いカーソルの引き継ぎは、ID の払い出し時にカーソルを捨てて防ぐ（`explicit-transaction.md`「#3315 の実装記録」）
+- `0A000`: `IF EXISTS`・`AS`・`CACHE`・`OWNED BY`・`SET SCHEMA`・`OWNER TO`・`SET LOGGED`／`UNLOGGED`・修飾名。明示トランザクション内の `ALTER SEQUENCE`（`RESTART` なし）・`RENAME TO` は Issue #3315 で共有 write txn に積まれる。`RESTART` だけは採番器の現在値を commit 後にしか捨てられないため `0A000`（受け皿 #3533。#3311 の残り）。内部 ID の再利用による古いカーソルの引き継ぎは、ID の払い出し時にカーソルを捨てて防ぐ（`explicit-transaction.md`「#3315 の実装記録」）
 - `22023` の検査順（PostgreSQL 17 の `init_params` と同じ）: `INCREMENT` ≠ 0 → MIN／MAX の決定（`NO MINVALUE`／`NO MAXVALUE` は変更後の INCREMENT の符号から既定値を再導出。未指定は現行値を維持）→ MIN < MAX → START ∈ [MIN, MAX]（START を指定しなくても現行値を常に検査）→ RESTART 値（値なしは START）または現在値 ∈ [MIN, MAX]。文言は値を含まない固定文言
 - 判定の順序: 構文 → DDL 権限（`42501`。対象の有無を問わない）→ 名前の解決（`42P01`／`42809`）→ RENAME 先の衝突（`42P07`。同名も）→ 範囲（`22023`）
 

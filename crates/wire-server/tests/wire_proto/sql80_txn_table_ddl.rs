@@ -169,7 +169,7 @@ fn implicit_transaction_message_rolls_back_the_table_when_a_later_statement_fail
 }
 
 #[test]
-// tracked: #3311
+// tracked: #3533
 fn statements_not_yet_wired_after_ddl_fail_the_transaction_with_0a000() {
     // DDL 後の UPDATE・DELETE 等は未対応。Tx は失敗状態になり ROLLBACK で戻る。
     let (core, _guard) = new_core();
@@ -360,7 +360,7 @@ fn connection_drop_after_ddl_and_savepoint_leaves_nothing_and_frees_the_writer()
 /// SQL-80・Issue #3316: 関数・ポリシー・行セキュリティ・ロールの DDL も、psql 形（末尾 `;` 付きを 1 文ずつ単独送信）の
 /// 明示 Tx で通り、COMMIT で原子的に確定する。積んだ後の読み取りは固定の `0A000`（古い判定で通さない）で、
 /// `ROLLBACK` の後に通常へ戻る。
-// tracked: #3311
+// tracked: #3533
 #[test]
 fn psql_style_security_ddl_commits_and_guards_followers() {
     let (core, _guard) = new_core();
