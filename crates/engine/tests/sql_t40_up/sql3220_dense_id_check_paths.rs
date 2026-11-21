@@ -510,7 +510,7 @@ fn sql3220_exact_scan_membership_matches_across_paths() {
     }
 }
 
-/// 空集合（該当なし）と `LIMIT 0`。空結果の列メタ（型）が経路間で一致し、`LIMIT 0` は同じ拒否になる。
+/// 空集合（該当なし。空マスクの経路に入ったことをカウンタで固定）と `LIMIT 0`（`22000` の直接固定）。
 /// 検証 variant の比較ではなく、空結果と列メタの一致を固定する（候補 0 件・k=0 は検証に届かない場合がある）。
 #[test]
 fn sql3220_empty_results_match_across_paths() {
@@ -520,12 +520,17 @@ fn sql3220_empty_results_match_across_paths() {
         &probe,
         &[("docs", &[]), ("plain", &[]), ("nulls", &[5, 55])],
     );
-    // 該当なし（マスクは空になる。cold・hot ともに空）。
+    // 該当なし（2 回目だけ空マスクの経路を通る）。`index_mask_scans` が 1 回目は不変・2 回目だけ +1。
     let none = format!(
         "SELECT {COLS} FROM docs WHERE kind = 'zzz' ORDER BY embedding <#> '[1.0,0.0]' LIMIT 5"
     );
+    let c_init = core.scalar_index_cache_stats().index_mask_scans;
     let cold = run(&core, &none).expect("cold none");
+    let c0 = core.scalar_index_cache_stats().index_mask_scans;
     let hot = run(&core, &none).expect("hot none");
+    let c1 = core.scalar_index_cache_stats().index_mask_scans;
+    assert_eq!(c0, c_init, "first run must not use the mask path");
+    assert_eq!(c1, c0 + 1, "second run must consume the empty mask path");
     assert!(cold.rows.is_empty() && hot.rows.is_empty());
     assert_eq!(fingerprint(&cold), fingerprint(&hot));
 
@@ -535,7 +540,16 @@ fn sql3220_empty_results_match_across_paths() {
             |t: &str| format!("SELECT {COLS} FROM {t} ORDER BY embedding {op} '[1.0,0.0]' LIMIT 0");
         let fast = run(&core, &q("plain")).expect_err("fast limit 0");
         let slow = run(&core, &q("nulls")).expect_err("slow limit 0");
-        assert_eq!(fast.wire_code(), slow.wire_code(), "{op}");
+        // 期待する SQLSTATE を直接固定する（`sql/parser.rs` の LIMIT 範囲検査。InvalidInput = 22000）。
+        for e in [&fast, &slow] {
+            assert_eq!(e.wire_code(), "22000", "{op}");
+            match e {
+                SqlSurfaceError::InvalidInput { detail } => {
+                    assert!(detail.starts_with("LIMIT 0 out of range"), "{op}: {detail}")
+                }
+                other => panic!("{op}: expected InvalidInput, got {other:?}"),
+            }
+        }
         assert_eq!(format!("{fast:?}"), format!("{slow:?}"), "{op}");
     }
     // 空の結果でも列メタは非空（型が公告される）。
@@ -679,6 +693,43 @@ fn sql3220_hybrid_dense_adapter_null_rows_match_identity_path() {
     assert!(!fast.rows.is_empty());
     assert_eq!(fingerprint(&fast), fingerprint(&slow));
     assert_no_other_tenant(&slow, &sql("nulls"));
+}
+
+/// 密側アダプタ（`CosineDenseAdapter`）は kNN 本体とは別に、渡した候補（`dense_slots`）で返却 id を検証する。
+/// NULL 行のある hybrid で、順序・件数・重複の契約は満たすが候補外（NULL 行のスロット 0・範囲外 12）の
+/// ヒットを返させ、拒否されることを固定する。アダプタは `KernelError::WorkerPanicked` を返し、融合段の
+/// エラー写像（`sql/exec.rs:1245` の既定アーム）が固定 detail `"hybrid search error"` の `Internal` に丸める。
+/// この detail は他の融合段の失敗とも共通なので、拒否が「アダプタが inner を呼んだ後の検証」で起きた
+/// ことは provider 呼び出し（`Subset` と dense スロット列）で特定する。
+#[test]
+fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
+    let probe = Arc::new(Probe::default());
+    let (core, _g) = open("sql3220-hybrid-forge", &probe, &[("nulls", &[5, 55])]);
+    let sql = "SELECT id, kind FROM nulls \
+               ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'a') LIMIT 20";
+    // 正常時は通る（検証が拒否の原因になっていないことの対照）。
+    run(&core, sql).unwrap_or_else(|e| panic!("hybrid normal: {e:?}"));
+    probe.take();
+    for forged in [0_u64, 6, 12] {
+        *probe.forge.lock().expect("lock") = Some(forged);
+        let res = run(&core, sql);
+        *probe.forge.lock().expect("lock") = None;
+        assert_eq!(
+            probe.take(),
+            vec![Call::Subset {
+                cosine: true,
+                slots: vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11],
+                rows: 12
+            }],
+            "forged {forged}: provider call"
+        );
+        match res {
+            Err(SqlSurfaceError::Internal { detail }) => {
+                assert_eq!(detail, "hybrid search error", "forged {forged}")
+            }
+            other => panic!("forged {forged} must be rejected: {other:?}"),
+        }
+    }
 }
 
 /// 最適化の対象外の形（NULL 行あり・マスクで非恒等）でも従来経路のまま fail-closed に動く。
