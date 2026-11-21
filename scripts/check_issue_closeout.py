@@ -201,7 +201,8 @@ def _cursor_summary_end(lines: list[str], start: int) -> tuple[int | None, int]:
             return None, i
         if CURSOR_REVIEWED_RE.fullmatch(line):
             reviewed = True
-        elif line.startswith("> <sup>Reviewed by"):
+        elif "<sup>" in line or "Reviewed by" in line:
+            # 引用記号直後の空白の揺れ等で署名候補なのに既定書式と一致しない行は、区間ごと検査対象に残す
             return None, i
         i += 1
     return None, len(lines) - 1

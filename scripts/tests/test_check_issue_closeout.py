@@ -187,6 +187,18 @@ class AutoSummaryTests(unittest.TestCase):
             self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, name)
             self.assertGreater(len(secs[0].items), 2, name)
 
+    def test_cursor_malformed_signature_mixed_with_valid_kept(self):
+        # 引用記号直後の空白が二つの崩れた署名が、正常な署名と同一区間に混在しても区間を除外しない
+        good = CURSOR_BLOCK.splitlines()[4]
+        bad = ">  <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) remaining work #9"
+        lines = CURSOR_BLOCK.splitlines()
+        lines.insert(4, bad)
+        self.assertIn(good, lines)
+        blk = "\n".join(lines)
+        secs = cic.extract_out_of_scope_sections(BASE + "\n" + blk + "\n")
+        self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0)
+        self.assertIn("#9", " ".join(secs[0].items))
+
     def test_cursor_nested_inner_start_not_recognized(self):
         # 外側が不成立のとき内側の開始行を新候補にせず、外側の引用行・参照を検査に残す
         inner = CURSOR_BLOCK
