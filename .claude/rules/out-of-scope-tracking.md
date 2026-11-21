@@ -54,7 +54,7 @@ scripts/check_issue_closeout.sh "${PARENT_ISSUE}" --check-closed
 ```
 
 - 読むのは、Issue を close したマージ済み PR の本文だけ（コメントは読まない）。出力は番号・見出し・分類だけで、本文は再掲しない。結果を Issue や PR へ転記するときも spec ポインタ規約に従う
-- `--verbose`: OK の項目も出す
+- `--verbose`: OK の項目も出す。Claude Code の生成表示行を除外した節は `EXCLUDED` 行（種別・件数・節の出現順のみ。見出しは出さない）で示す。`--verbose` が無くても、除外が起きた PR は `EXCLUDED` 行（PR 番号と件数のみ）で示す
 - `--check-closed`: close 済み Issue を指す `tracked:` 注記を列挙する（書式は `docs/design/rejection-pin-annotation.md` の D2・D10）。親番号と併用できる
 - `--repo OWNER/NAME`: 対象リポ。`--max-hops N`: 辿る深さ（0〜3、既定 1）。`--max-nodes N`: 走査する Issue 数の上限（1〜5000、既定 500）
 - `gh` の認証とネットワークが要るため、make・CI には載せない手動ツール
@@ -74,6 +74,8 @@ scripts/check_issue_closeout.sh "${PARENT_ISSUE}" --check-closed
   - 「前例 #N」のような受け皿ではない言及も参照として数える
   - 「対応しない」旨の項目も UNTRACKED になる
   - 見出しに「対象外」も "out of scope" も含まない節は拾わない
+  - 除外するのは、既定の 1 行に完全一致する Claude Code の生成表示行だけ。形の違う行は項目として数える
+  - Cursor の自動要約は除外しない（生成元を fail-closed に確認できないため。UNTRACKED は close 時に人が判断する）
 
 ## 本リポ固有の注意
 

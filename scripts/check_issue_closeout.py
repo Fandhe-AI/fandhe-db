@@ -17,6 +17,11 @@
 - fail-closed: `gh` の失敗・GraphQL エラー（許容する NOT_FOUND を除く）・ページの
   打ち切り・ノード数の上限超過・JSON の不正・`git ls-files` の失敗は終了コード 3。
   いずれも「検出なし」とは扱わない
+- 自動生成表示の除外: 対象外節が PR 本文の最後だと、末尾に自動で付く Claude Code の生成表示の行が
+  項目に混ざる（Issue #3536）。フェンス外かつ対象外節の中で、既定の 1 行に完全一致する行だけを除外する
+  （行の文字列だけを除き、項目の区切りは除外しない場合と同じに保つ）。Cursor Bugbot の自動要約は除外しない
+  （生成元を fail-closed に確認できないため。UNTRACKED は close 時に人が判断する）。除外が起きた PR は
+  通常の出力に PR 番号と件数だけ、`--verbose` では節ごとに種別・件数・節の出現順を出す（見出しは出さない）
 - 機密保持: PR 本文・Issue タイトル・項目本文は出力に再掲しない。出すのは Issue/PR
   番号、節の見出し（無害化・80 文字で切り詰め）、分類だけ
 - subprocess はリスト引数のみ（shell 不使用）。GraphQL の値は変数で渡し、alias 名は
@@ -62,6 +67,7 @@ SCAN_PATH = re.compile(
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 OUT_OF_SCOPE_RE = re.compile(r"out[- ]of[- ]scope", re.IGNORECASE)
+CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
 RANGE_RE = re.compile(
@@ -79,6 +85,8 @@ class FetchError(Exception):
 class Section:
     heading: str
     items: list[str] = field(default_factory=list)
+    # 自動生成表示として除外した種別ごとの件数（内容は保持しない。EXCLUDED 行の報告用）
+    excluded: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -86,6 +94,8 @@ class Info:
     kind: str  # "issue" | "pr" | "missing"
     state: str = ""  # "open" | "closed"（PR は merged も closed 扱い）
     body: str = ""
+    # PR が GraphQL の merged == true（bool）と確認できたか。取れない・型が不正なら False（除外の集計に使わない）
+    merged: bool = False
 
 
 @dataclass
@@ -114,22 +124,46 @@ def is_empty_marker(text: str) -> bool:
     return re.sub(r"[\W_]+", "", text.lower()) in EMPTY_MARKERS
 
 
-def _split_items(lines: list[str]) -> list[str]:
+class _FooterMark:
+    """除外した生成表示行の位置を示す印（本文の文字列とは決して一致しない）。"""
+
+
+# 除外した Claude Code の生成表示行の代わりに節の行へ置く印。`_split_items` は字下げなしの通常の行として
+# 項目の境界を判定し、文字列だけを加えない（行を消すと後続の深い行が直前の項目へ結合し、その項目の
+# 受け皿参照で残作業を隠せてしまうため。境界は除外しない場合と同じに保つ）
+FOOTER_MARK = _FooterMark()
+# 項目本文の中で生成表示行があった位置に残す区切り（U+241E）。空白でも英数字・`#`・範囲記号でもないので、
+# 参照・範囲（`#600` と `〜 #602` 等）を前後で成立させず、`なし` 等の判定（非英数字を除く）にも影響しない。
+# 除外しない場合（表示行の文字列がそこにある場合）と参照抽出の結果を同じに保ち、表示行の文字列だけを消す
+FOOTER_GAP = "\u241e"
+
+
+def _split_items(lines: list[str | _FooterMark]) -> list[str]:
     """節内の行を項目本文へ分ける。箇条書きの有無にかかわらず全行を走査する。
 
     最小インデントのリスト項目は 1 件ずつ、リストに属さない空行区切りの通常段落は独立項目、
     直前行に続くインデントなしの継続行（Markdown の lazy continuation）と深い行は直前の
-    項目へ結合する。どの行も黙って捨てない（受け皿参照の見落とし防止）。
+    項目へ結合する。どの行も黙って捨てない（受け皿参照の見落とし防止）。`FOOTER_MARK` は
+    字下げなしの通常の行として境界を判定し、項目の内側には `FOOTER_GAP` だけを残す（項目の先頭・末尾の区切りと、
+    区切りしか持たない項目は落とす）。
     """
     bases = []
     for line in lines:
-        if line.strip() and LIST_ITEM_RE.match(line):
+        if isinstance(line, str) and line.strip() and LIST_ITEM_RE.match(line):
             bases.append(len(line) - len(line.lstrip()))
     base = min(bases) if bases else 0
-    items: list[list[str]] = []
-    current: list[str] | None = None
+    # 組み立て中は印を _FooterMark のまま保持し、本文に元からある文字（`␞` を含む）と区別する
+    items: list[list[str | _FooterMark]] = []
+    current: list[str | _FooterMark] | None = None
     prev_blank = True
     for line in lines:
+        if isinstance(line, _FooterMark):
+            if current is None or prev_blank:
+                current = []
+                items.append(current)
+            current.append(FOOTER_MARK)
+            prev_blank = False
+            continue
         if not line.strip():
             prev_blank = True
             continue
@@ -144,7 +178,18 @@ def _split_items(lines: list[str]) -> list[str]:
         else:
             current.append(line.strip())
         prev_blank = False
-    return [" ".join(parts) for parts in items]
+    out: list[str] = []
+    for parts in items:
+        # 区切りが範囲を断ち切る相手は項目の内側にしかないので、先頭・末尾の印は落とす。
+        # 判定は型で行い、本文に元からある `␞` は普通の文字として残す
+        while parts and isinstance(parts[0], _FooterMark):
+            parts.pop(0)
+        while parts and isinstance(parts[-1], _FooterMark):
+            parts.pop()
+        if parts:
+            # 内側に残った印だけを区切りの文字列に変換する
+            out.append(" ".join(FOOTER_GAP if isinstance(p, _FooterMark) else p for p in parts))
+    return out
 
 
 def extract_out_of_scope_sections(body: str) -> list[Section]:
@@ -154,7 +199,7 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
     fence: tuple[str, int] | None = None  # (フェンス文字, 開始時の長さ)
     active_level = 0
     active: Section | None = None
-    buf: list[str] = []
+    buf: list[str | _FooterMark] = []
 
     def close() -> None:
         nonlocal active, buf
@@ -164,6 +209,11 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
         active, buf = None, []
 
     for line in text.split("\n"):
+        if fence is None and active is not None and line == CLAUDE_FOOTER:
+            # 文字列だけを除き、項目の境界は除外しない場合と同じに保つ（FOOTER_MARK を参照）
+            active.excluded["claude-code-footer"] = active.excluded.get("claude-code-footer", 0) + 1
+            buf.append(FOOTER_MARK)
+            continue
         fm = FENCE_RE.match(line)
         if fence is None:
             if fm:
@@ -452,7 +502,7 @@ def resolve_numbers(
                 cache[n] = Info("missing")
             elif node.get("__typename") == "PullRequest":
                 body = (node.get("body") or "").encode("utf-8")[:MAX_BODY_BYTES].decode("utf-8", "ignore")
-                cache[n] = Info("pr", str(node.get("state", "")).lower(), body)
+                cache[n] = Info("pr", str(node.get("state", "")).lower(), body, node.get("merged") is True)
             else:
                 cache[n] = Info("issue", str(node.get("state", "")).lower())
 
@@ -467,9 +517,16 @@ class Item:
 
 
 def items_from_prs(
-    prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int] | None = None
+    prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int] | None = None,
+    excluded_out: list[tuple[int | None, int, dict[str, int], int]] | None = None,
+    direct_pr: bool = False,
 ) -> tuple[list[Item], int]:
-    """PR 本文から項目を作る。`seen_prs` を渡すと既出 PR は結果から省く（報告の重複排除用）。"""
+    """PR 本文から項目を作る。`seen_prs` を渡すと既出 PR は結果から省く（報告の重複排除用）。
+
+    `excluded_out` を渡すと、自動生成表示を除外した節の (issue, pr, 種別別件数, 節の出現順) を追記する（見出しは持たない）。
+    `direct_pr` は Issue 経由ではなく PR を直接走査したことを示し、そのとき issue 欄を None にする。
+    """
+    ex_issue = None if direct_pr else issue
     items: list[Item] = []
     sections = 0
     for pr_number, body in prs:
@@ -477,8 +534,11 @@ def items_from_prs(
             if pr_number in seen_prs:
                 continue
             seen_prs.add(pr_number)
-        for sec in extract_out_of_scope_sections(body):
+        for sec_index, sec in enumerate(extract_out_of_scope_sections(body)):
             sections += 1
+            if excluded_out is not None and sec.excluded:
+                # 節の出現順を含め、同名見出しの別節を区別できるようにする
+                excluded_out.append((ex_issue, pr_number, dict(sec.excluded), sec_index))
             for idx, text in enumerate(sec.items, 1):
                 items.append(
                     Item(issue, pr_number, sec.heading, idx,
@@ -514,6 +574,8 @@ def closeout(
     sections_total = 0
     merged_total = 0
     seen_prs: set[int] = set()
+    # 除外ログ。通常の出力にも PR 番号と件数を出すため常に集める（重複排除は下の集合をノード間で使い回す）
+    excluded_all: list[tuple[int | None, int, dict[str, int], int]] = []
     edges: dict[int, list[int]] = {}
     for node in descendants:
         if node.truncated_prs:
@@ -525,7 +587,7 @@ def closeout(
         merged_total += len(node.merged_prs)
         # 報告は PR 単位で重複排除するが、参照辺は各 Issue の closing PR から必ず作る
         # （同じ PR が複数 Issue を close しても 2 件目以降の辺を落とさない）
-        items, secs = items_from_prs(node.merged_prs, node.number, repo, seen_prs)
+        items, secs = items_from_prs(node.merged_prs, node.number, repo, seen_prs, excluded_all)
         sections_total += secs
         all_items.extend(items)
         edges.setdefault(node.number, [])
@@ -541,6 +603,9 @@ def closeout(
     referenced = sorted({r for it in all_items for r in it.refs})
     resolve_numbers(runner, repo, referenced, cache)
 
+    # ツリー外の走査で除外した生成表示の重複排除用 (PR 番号, 節の出現順)。ツリー内の分を初期値とし、ノード間で使い回す
+    excluded_keys = {(e[1], e[3]) for e in excluded_all}
+
     # ツリー外の参照先を max_hops 段だけたどり、循環の検出にだけ使う
     frontier = [n for n in referenced if n not in edges and n not in in_tree]
     expanded = 0
@@ -554,8 +619,15 @@ def closeout(
                 raise FetchError("node limit exceeded")
             info = cache.get(n, Info("missing"))
             refs: list[int] = []
+            direct_pr = False
+            collect_excluded = True
             if info.kind == "pr":
+                # PR を直接走査した場合、除外ログの issue 欄は空にする（`pr #N` だけを表示する）。
+                # 除外の集計・表示はマージ済みと確認できた PR に限る（open・未マージで close の PR は出さない）。
+                # 参照の辿り方（循環検出用の辺）は従来どおり本文から作る
                 prs = [(n, info.body)]
+                direct_pr = True
+                collect_excluded = info.merged
             elif info.kind == "issue" and info.state == "closed":
                 node = fetch_node(runner, repo, n)
                 if node.truncated_prs:
@@ -563,8 +635,14 @@ def closeout(
                 prs = node.merged_prs
             else:
                 prs = []
-            for it in items_from_prs(prs, n, repo, set())[0]:
+            ex_out: list[tuple[int | None, int, dict[str, int], int]] = []
+            for it in items_from_prs(prs, n, repo, set(), ex_out if collect_excluded else None, direct_pr)[0]:
                 refs.extend(r for r in it.refs if r not in refs)
+            # ツリー外の走査で除外した生成表示も EXCLUDED に出す（同じ (PR, 節の出現順) は重複させない）
+            for e in ex_out:
+                if (e[1], e[3]) not in excluded_keys:
+                    excluded_keys.add((e[1], e[3]))
+                    excluded_all.append(e)
             edges[n] = refs
             nxt.extend(r for r in refs if r not in edges and r not in in_tree)
         resolve_numbers(runner, repo, nxt, cache)
@@ -585,6 +663,19 @@ def closeout(
             lines.append(f"CLOSED-ONLY {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
         elif verbose:
             lines.append(f"OK          {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
+    if verbose:
+        # 見出しは出さず、種別・件数・節の出現順（1 始まり）だけを出す
+        for ex_issue, ex_pr, ex_counts, ex_index in excluded_all:
+            kinds = " ".join(f"{k}={v}" for k, v in sorted(ex_counts.items()))
+            src = f"pr #{ex_pr}" if ex_issue is None else f"issue #{ex_issue} pr #{ex_pr}"
+            lines.append(f"EXCLUDED    {src} section {ex_index + 1} {kinds}")
+    else:
+        # 通常の出力では、除外が起きた PR ごとに PR 番号と除外件数だけを 1 行出す（本文・見出しは出さない）
+        per_pr: dict[int, int] = {}
+        for _, ex_pr, ex_counts, _ in excluded_all:
+            per_pr[ex_pr] = per_pr.get(ex_pr, 0) + sum(ex_counts.values())
+        for ex_pr, total in per_pr.items():
+            lines.append(f"EXCLUDED    pr #{ex_pr} count={total}")
     for comp in cycles:
         lines.append("CYCLE       " + " -> ".join(f"#{n}" for n in comp + [comp[0]]))
 
