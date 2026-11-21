@@ -39,11 +39,11 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
 | ---- | ---- |
 | 修飾名の修飾子が組み込み SCHEMA（`pg_catalog`・`information_schema`）か `pg_temp` なら `0A000`（`relations in this schema are not supported`） | `crates/engine/src/sql/relation_name.rs:1114`〜`:1118`（`resolve`） |
 | 組み込み SCHEMA 名の定数（`public`・`pg_catalog`・`information_schema`） | `crates/engine/src/catalog/namespace.rs:61`（`BUILTIN_SCHEMA_NAMES`）・`:77`（`is_builtin_schema_name`） |
-| `search_path` 要素の正規化で組み込み名を小文字へ畳む | `crates/engine/src/sql/search_path.rs:118`（`normalize_name`） |
+| `search_path` 要素の正規化で組み込み名を小文字へ畳む | `crates/engine/src/sql/search_path.rs:117`〜`:118`（`normalize_name`） |
 | `current_schemas(true)` が `pg_catalog` を暗黙に前置する（明示リストに無いときだけ） | `crates/engine/src/sql/search_path.rs:1105`〜`:1120`（`SchemaFnValues::schemas`） |
 | `pg_catalog`・`information_schema` は `current_schemas` 上は常に実在扱い | `crates/engine/src/sql/search_path.rs:1140` |
 | 未修飾の relation 名の解決は組み込み SCHEMA を飛ばす（暗黙の `pg_catalog` はまだ relation を持たない） | `crates/engine/src/sql/search_path.rs:727`〜`:749`（`resolve_path_refs` とその doc） |
-| 作成系 DDL の作成先が組み込み SCHEMA なら `0A000` | `crates/engine/src/sql/search_path.rs:916`〜`:921`（`creation_target`） |
+| 作成系 DDL の作成先が組み込み SCHEMA なら `0A000` | `crates/engine/src/sql/search_path.rs:921`〜`:942`（`creation_target`。拒否は `:932`〜`:936`） |
 | `pg_catalog` 修飾の型名（`'a'::pg_catalog.int4`）は `0A000`。`pg_catalog.f(x)` は書き換えずに後段へ流れる | `crates/engine/src/sql/relation_name.rs` の単体テスト（`:1589`・`:1919`） |
 | システムカタログは対象外として `0A000` を維持する、という過去の決定 | [schema-tenant-namespace.md](schema-tenant-namespace.md) D9（`:186`）・D4 の手順 3（`:115`） |
 | 型 OID の写像は wire-server の `WireType` が単一情報源。ENUM・VECTOR 系は `text`（25）、`id` は `numeric`（1700） | `crates/wire-server/src/result_encoder.rs`・[wire-type-oid-mapping.md](wire-type-oid-mapping.md) |
@@ -60,15 +60,20 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
 | ロール（`roles`・`role_memberships`） | `(tenant_id, ...)`。ログイン名対応表だけサーバー全体 | テナント別（role ADR D1） |
 | UDF（`functions`） | `(scope=tenant_id, function_key, arg_signature)` | テナント別 |
 | トリガ（`triggers`）・利用者ポリシー（`policies`） | `(table_key, scope=tenant_id, name)` | 共有の表にもテナント別に付く |
-| ACL（`acl`）・所有者（`object_owners`） | 先頭または末尾に `tenant_id` | 共有の表にもテナント別に持つ（role ADR D5・D6） |
+| ACL（`acl`） | `(tenant_id, object_kind, object_key, column, grantee_id, grantor_id)`（テナントが先頭） | 共有の表にもテナント別に持つ（role ADR D5） |
+| 所有者（`object_owners`） | `(object_kind, object_key, tenant_id)`（テナントが**末尾**。`crates/engine/src/catalog/privilege/owner.rs:34`） | 共有の表にもテナント別に持つ（role ADR D6）。テナント単位の列挙 `list_owners_for_tenant_in_txn`（同 `:133`〜`:150`）は全行走査 |
 | 行ストア（`user_rows/{内部キー}`） | `(tenant_id, rowid)` | `public` の表は全テナントの行が同じ物理表に混在する |
 
 - SCHEMA・ロール・UDF・トリガ・ポリシー・SEQUENCE の内部 ID は、いずれも**全テナント共有の単調カウンタ**から払い出す。
 - 表・ビュー・索引は名前がキーで、改名しても変わらない内部 ID を持たない（改名は redb の `rename_table` で付け替える。
   [alter-table-rename-table.md](alter-table-rename-table.md)）。
-- 列挙のコスト: `public` の relation は裸の名前の範囲、SCHEMA 配下は自テナントの各 `#<id>.` 接頭辞の範囲、UDF・ロール・
-  ACL は `tenant_id` 先頭の範囲、トリガ・ポリシーは `(table_key, tenant_id)` の組の範囲で引ける。どれもセッションの
-  テナントから見える集合だけを走査でき、他テナントのオブジェクト数に比例する全走査は要らない（D5 の前提）。
+- 列挙のコスト（D5 の前提）。
+  - `public` の relation は裸の名前の範囲、SCHEMA 配下は自テナントの各 `#<id>.` 接頭辞の範囲、UDF・ロール・ACL は `tenant_id`
+    先頭の範囲で引ける。走査量は自テナントから見える件数で決まる
+  - トリガ・ポリシーはキーの先頭が表なので、可視な表ごとに `(table_key, tenant_id)` の接頭辞で走査する。列挙のコストは
+    可視な表の数（と自テナントのトリガ・ポリシーの数）に比例し、他テナントの件数には依らない
+  - 所有者はテナントがキーの末尾なので、テナント単位の範囲走査では引けない。カタログの経路では、可視な relation・SCHEMA・
+    関数ごとに `(種別, 対象, 自テナント)` を点引きする。テナント単位の全行走査（`list_owners_for_tenant_in_txn`。論理ダンプ専用）は使わない
 
 ### 2.2 テナント・ロール・RLS の境界（要約）
 
@@ -85,6 +90,8 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
   タグ（pgjdbc `REL42.7.8`）で、URL は下の各表に記す。ブランチの URL は今後内容が変わりうる。
 - WebFetch は取得したページを小型モデルで要約して返すため、表・列・関数の名前は要約を経ている。WHERE の細部と列の並びは
   実装 Issue で原文と突き合わせる（各段の Issue の受け入れ条件に含める）。読めなかった箇所は「未確認」と書く。
+- 棚卸し表の出典の列の末尾に、行ごとの確認の度合いを付けた（〔要約経由〕は WebFetch の要約だけに基づく行、〔原文確認〕は
+  該当行を直接確かめた部分）。
 - 次の 3 点は原文の該当行を直接確認した（段の境界を決めるため）。
   - psql の `\d` は、引数が無いとき `listTables("tvmsE", ...)`、あるときに `describeTableDetails` を呼ぶ（`command.c` の `exec_command_d`）
   - psql のパターン句は `<列> OPERATOR(pg_catalog.~) '^(...)$' COLLATE pg_catalog.default` で、SCHEMA を指定しないと
@@ -102,37 +109,37 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
 
 | 道具 | 発行タイミング | 引く表・ビュー／列／関数（主なもの） | OID 別名の型 | 必須度 | 出典 |
 | ---- | -------------- | ------------------------------------ | ------------ | ------ | ---- |
-| psql 17 | 接続直後 | 発行しない。版数は ParameterStatus の `server_version` から得る | — | — | [startup.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/bin/psql/startup.c)・[command.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/bin/psql/command.c) |
-| psql 17 `\d`（引数なし）・`\dt` | メタコマンド時 | `pg_class`・`pg_namespace`・`pg_am`（12 以上）。`pg_get_userbyid(relowner)`。`+` で `pg_table_size`・`pg_size_pretty`・`obj_description`。`relkind IN (...)`、既定で `pg_catalog`・`information_schema`・`pg_toast` を除外、パターン時は `pg_table_is_visible` | — | psql | [describe.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/bin/psql/describe.c)（`listTables`） |
-| psql 17 `\d <名前>` | メタコマンド時 | 1 回目: `pg_class`・`pg_namespace`（`c.oid`・`nspname`・`relname`）。2 回目以降（OID を文字列で埋め込む）: `pg_attribute`・`pg_attrdef`・`pg_collation`・`pg_type`・`pg_index`・`pg_constraint`・`pg_inherits`・`pg_policy`・`pg_roles`・`pg_statistic_ext`・`pg_rewrite`・`pg_trigger`・`pg_publication` 系・`pg_depend`・`pg_sequence`・`pg_am`。関数 `format_type`・`pg_get_expr`・`pg_get_indexdef`・`pg_get_constraintdef`・`pg_get_triggerdef`・`pg_get_viewdef`・`pg_get_ruledef`・`pg_get_partkeydef`・`pg_get_partition_constraintdef`・`pg_partition_ancestors`・`col_description`・`pg_relation_is_publishable`・`array_to_string`・`quote_ident` | `'<oid>'::pg_catalog.oid`・`::regclass`（`conrelid`・`inhparent` ほか）・`::regnamespace`・`reloftype::regtype`・`'pg_catalog.pg_class'::regclass` | psql | 同上（`describeTableDetails`・`describeOneTableDetails`）。行番号は未確認 |
-| psql 17 `\dn` | メタコマンド時 | `pg_namespace`・`pg_get_userbyid(nspowner)`。`+` で `nspacl`・`obj_description`。既定で `^pg_` と `information_schema` を除外 | — | psql | 同上（`listSchemas`） |
-| psql 17 `\df` | メタコマンド時 | `pg_proc`・`pg_namespace`・`pg_type`・`pg_language`（`+`）。`pg_get_function_result`・`pg_get_function_arguments`・`pg_function_is_visible`・`pg_type_is_visible`。`prokind` で絞る | `'pg_catalog.trigger'::regtype` | psql | 同上（`describeFunctions`） |
-| psql 17 `\l` | メタコマンド時（`psql -l` は起動直後） | `pg_database`（`datname`・`datdba`・`encoding`・`datcollate`・`datctype`・版数で `datlocprovider` など）・`pg_encoding_to_char`・`pg_get_userbyid`。`+` で `pg_database_size`・`has_database_privilege`・`pg_tablespace` | — | psql | 同上（`listAllDbs`） |
-| psql 17 `\du` | メタコマンド時 | `pg_roles`（`rolname`・`rolsuper`・`rolinherit`・`rolcreaterole`・`rolcreatedb`・`rolcanlogin`・`rolconnlimit`・`rolvaliduntil`・`rolreplication`・`rolbypassrls`）。既定で `^pg_` を除外 | — | psql | 同上（`describeRoles`） |
-| libpq 17 | 接続時 | 発行しない。`target_session_attrs` 指定時だけ `SHOW transaction_read_only` か `pg_is_in_recovery()` | — | 接続（指定時のみ） | [fe-connect.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/interfaces/libpq/fe-connect.c)・[fe-exec.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/interfaces/libpq/fe-exec.c) |
-| pgjdbc 42.7.8 | 接続時 | カタログは引かない。サーバー版 12 未満で `SET extra_float_digits`、条件付きで `SET application_name`、`targetServerType` 指定時に `show transaction_read_only` | — | 接続（条件付き） | [ConnectionFactoryImpl.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/core/v3/ConnectionFactoryImpl.java) |
-| pgjdbc `TypeInfoCache` | 未知 OID・型名の初回解決時（遅延） | `pg_type`（`oid`・`typname`・`typnamespace`・`typtype`・`typinput`・`typelem`・`typarray`・`typdelim`）・`pg_namespace`・`current_schemas(true/false)`・`generate_series`・`array_upper` | `'pg_catalog.array_in'::regproc` | 通常 | [TypeInfoCache.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/jdbc/TypeInfoCache.java) |
-| pgjdbc `ResultSetMetaData` | `isNullable` 等の初回呼び出し時 | `pg_class`・`pg_namespace`・`pg_attribute`・`pg_type`・`pg_attrdef`・`pg_get_expr`。RowDescription の table OID と attnum で引く | — | 反映 | [PgResultSetMetaData.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/jdbc/PgResultSetMetaData.java) |
-| pgjdbc `getTables`・`getColumns`・`getPrimaryKeys`・`getSchemas` | メタデータ API 呼び出し時 | `pg_namespace`・`pg_class`・`pg_description`・`pg_attribute`・`pg_type`・`pg_attrdef`・`pg_index`・`current_database()`・`pg_get_expr`・`row_number() OVER`・`information_schema._pg_expandarray(indkey)`・設定次第で `has_table_privilege`・`has_schema_privilege`。`pg_database`（`getCatalogs`） | `'pg_class'::regclass` | 反映 | [PgDatabaseMetaData.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/jdbc/PgDatabaseMetaData.java)（`getIndexInfo` 以降は未確認） |
-| Npgsql（main） | データソースごとに最初の物理接続の Open 時に 1 回（結果をキャッシュ） | `version()`。型ロード: `pg_type`（`oid`・`typname`・`typtype`・`typnotnull`・`typelem`・`typbasetype`・`typcategory`・`typrelid`・`typreceive`）・`pg_namespace`・`pg_class`（`relkind`）・`pg_proc`（`proname='array_recv'` で配列を判定）・`pg_range`（`rngtypid`・`rngsubtype`・`rngmultitypid`）・`pg_attribute`（複合型の列）・`pg_enum`（`enumlabel`・`enumsortorder`） | — | 接続 | [PostgresDatabaseInfo.cs](https://raw.githubusercontent.com/npgsql/npgsql/main/src/Npgsql/PostgresDatabaseInfo.cs)・[NpgsqlDataSource.cs](https://raw.githubusercontent.com/npgsql/npgsql/main/src/Npgsql/NpgsqlDataSource.cs) |
-| Npgsql | Open 時（条件は未確認） | `pg_is_in_recovery()`・`SHOW default_transaction_read_only` | — | 未確認 | [NpgsqlConnector.cs](https://raw.githubusercontent.com/npgsql/npgsql/main/src/Npgsql/Internal/NpgsqlConnector.cs) |
-| psycopg 3 | 接続時 | 発行しない（`connection.py`。`_connect_gen` の確認は未了） | — | — | [connection.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/connection.py) |
-| psycopg 3 `TypeInfo.fetch`・`register_composite`・`register_enum` | 利用者が明示的に呼んだとき | `pg_type`（`typname`・`oid`・`typarray`・`typdelim`）・`pg_attribute`・`pg_enum`・`pg_range` | `to_regtype(%s)` または `%s::regtype`、`oid::regtype::text` | 反映 | [_typeinfo.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/_typeinfo.py)・[composite.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/types/composite.py)・[enum.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/types/enum.py) |
-| psycopg2 `register_composite` 等 | 明示呼び出し時 | `pg_type`・`pg_namespace`・`pg_attribute`・`pg_range`。0 行のときだけ `%s::regtype` で再検索 | `%s::regtype` | 反映 | [extras.py](https://raw.githubusercontent.com/psycopg/psycopg2/master/lib/extras.py)（接続時の挙動は未確認） |
-| node-postgres | 接続時 | 発行しない。型 OID は `pg-types` が静的に持つ | — | — | [client.js](https://raw.githubusercontent.com/brianc/node-postgres/master/packages/pg/lib/client.js)・[builtins.js](https://raw.githubusercontent.com/brianc/node-pg-types/master/lib/builtins.js) |
-| pgx（参考） | 接続時は発行しない。`LoadType` の明示呼び出し時 | `pg_type`（`typtype`・`typbasetype`・`typelem`・`typdelim`・`typrelid`）・`pg_attribute`・`pg_range` | `$1::text::regtype::oid` | 反映 | [conn.go](https://raw.githubusercontent.com/jackc/pgx/master/conn.go) |
-| SQLAlchemy 2.x | 接続時（dialect の初期化） | `pg_catalog.version()`・`current_schema()`・`show standard_conforming_strings` | — | 接続 | [base.py](https://raw.githubusercontent.com/sqlalchemy/sqlalchemy/main/lib/sqlalchemy/dialects/postgresql/base.py) |
-| SQLAlchemy 2.x | reflection（`has_table`・`get_columns`・`get_pk_constraint`・`get_foreign_keys`・`get_indexes`・`get_check_constraints`・`get_enums` ほか） | `pg_class`（`relpersistence`・`relkind`）・`pg_namespace`・`pg_attribute`（`attgenerated`・`attidentity`）・`pg_attrdef`・`pg_description`・`pg_collation`・`pg_type`・`pg_enum`・`pg_sequence`・`pg_constraint`・`pg_index`（`indkey`・`indclass`・`indoption`・`indnkeyatts`・`indnullsnotdistinct`）・`pg_am`・`pg_opclass`・`pg_inherits`・`pg_tablespace`。関数 `pg_table_is_visible`・`pg_type_is_visible`・`format_type`・`pg_get_expr`・`pg_get_constraintdef`・`pg_get_indexdef`・`pg_get_viewdef`・`pg_get_serial_sequence`・`unnest`・`generate_subscripts` | `attrelid::regclass::text`・`'pg_catalog.pg_class'::regclass` | 反映（`has_table` は Alembic 経由で通常） | 同上・[pg_catalog.py](https://raw.githubusercontent.com/sqlalchemy/sqlalchemy/main/lib/sqlalchemy/dialects/postgresql/pg_catalog.py) |
-| Alembic | migrate 時・autogenerate 時 | `alembic_version` の存在確認は SQLAlchemy の `has_table`。autogenerate の serial 判定で `pg_class`・`pg_depend`・`pg_attribute` | `'pg_class'::regclass`・`cast(:seqname as regclass)` | 通常（存在確認）・反映 | [ddl/postgresql.py](https://raw.githubusercontent.com/sqlalchemy/alembic/main/alembic/ddl/postgresql.py)・[runtime/migration.py](https://raw.githubusercontent.com/sqlalchemy/alembic/main/alembic/runtime/migration.py) |
-| Prisma（prisma-engines） | migrate の接続直後 | `pg_namespace` の存在確認・`version()`・`current_setting('server_version_num')`・`pg_advisory_lock(...)`。`_prisma_migrations` の存在は `pg_class`・`pg_namespace`（`relkind='r'`・`nspname = ANY($1)`） | — | 通常 | [flavour/postgres.rs](https://raw.githubusercontent.com/prisma/prisma-engines/main/schema-engine/connectors/sql-schema-connector/src/flavour/postgres.rs) |
-| Prisma | `db pull`・`migrate dev` の差分計算 | `pg_class`（`relispartition`・`relhassubclass`・`relrowsecurity`・`reloptions`・`reltype > 0`）・`pg_namespace`・`pg_constraint`・`pg_views`・`pg_type`・`pg_enum`・`information_schema.columns`（`data_type`・`udt_name`・`numeric_precision` ほか）・`pg_attribute`・`pg_attrdef`・`pg_index`・`pg_am`・`pg_opclass`・`pg_proc`・`pg_language`・`pg_extension`・`information_schema.sequences`。関数 `obj_description`・`col_description`・`format_type`・`pg_get_expr`・`pg_get_constraintdef`・`pg_get_functiondef` | `typinput::regproc::text` | 反映 | [postgres.rs](https://raw.githubusercontent.com/prisma/prisma-engines/main/schema-engine/sql-schema-describer/src/postgres.rs)（`load_migrations_table` の SQL は未確認） |
-| Rails（ActiveRecord main） | 接続確立直後 | `SET SESSION`（`standard_conforming_strings`・`intervalstyle`・`client_min_messages`・`timezone`。値が ParameterStatus と違うときだけ）・`SET search_path`。型マップは既知 OID の固定表で、問い合わせしない | — | 接続 | [postgresql_adapter.rb](https://raw.githubusercontent.com/rails/rails/main/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb) |
-| Rails | 型マップに無い OID を初めて見たとき | `pg_type`（`oid`・`typname`・`typelem`・`typdelim`・`typinput`・`typtype`・`typbasetype`）LEFT JOIN `pg_range`（`rngsubtype`）。初回は `typtype IN ('r','e','d')` の一括も | 旧版のみ `'pg_catalog'::regnamespace` | 通常 | 同上 |
-| Rails | モデルのスキーマ読み込み・`table_exists?`・マイグレーション | `pg_class`・`pg_namespace`（`relkind IN ('r','v','m','p','f')`・`ANY (current_schemas(false))`）・`pg_attribute`・`pg_attrdef`・`pg_type`・`pg_collation`・`format_type`・`pg_get_expr`・`col_description`・`pg_constraint`（PK）・`pg_depend`・`pg_get_serial_sequence` | `<表名>::regclass`・`'pg_class'::regclass`・`oid::regclass::text` | 通常 | 同上・[schema_statements.rb](https://raw.githubusercontent.com/rails/rails/main/activerecord/lib/active_record/connection_adapters/postgresql/schema_statements.rb) |
-| Rails | `db:schema:dump`・reflection | `pg_index`・`pg_am`・`pg_constraint`（`f`・`c`・`u`・`x`）・`pg_get_indexdef`・`pg_get_constraintdef`・`obj_description`・`pg_inherits`・`pg_get_partkeydef`・`pg_depend`（拡張のメンバー） | `c.confrelid::regclass::text`・`'pg_extension'::regclass` ほか | 反映 | 同上 |
-| Django（main） | 接続時 | `set_config('TimeZone', ...)`（ずれているときだけ）。版数は `server_version`（問い合わせなし） | — | 接続 | [base.py](https://raw.githubusercontent.com/django/django/main/django/db/backends/postgresql/base.py)・[operations.py](https://raw.githubusercontent.com/django/django/main/django/db/backends/postgresql/operations.py) |
-| Django | `migrate`（`django_migrations` の存在確認は `get_table_list`） | `pg_class`・`pg_namespace`（`relkind IN ('f','m','p','r','v')`・`relispartition`・`pg_table_is_visible`）・`obj_description` | — | 通常 | [introspection.py](https://raw.githubusercontent.com/django/django/main/django/db/backends/postgresql/introspection.py)・[recorder.py](https://raw.githubusercontent.com/django/django/main/django/db/migrations/recorder.py) |
-| Django | `inspectdb`・`get_constraints` ほか | `pg_attribute`・`pg_attrdef`・`pg_collation`・`pg_type`・`pg_constraint`・`pg_index`・`pg_am`・`pg_depend`・`pg_get_expr`・`pg_get_indexdef`・`col_description`・`unnest ... WITH ORDINALITY` | `'pg_class'::regclass` | 反映 | 同上 |
+| psql 17 | 接続直後 | 発行しない。版数は ParameterStatus の `server_version` から得る | — | — | [startup.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/bin/psql/startup.c)・[command.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/bin/psql/command.c) 〔要約経由〕 |
+| psql 17 `\d`（引数なし）・`\dt` | メタコマンド時 | `pg_class`・`pg_namespace`・`pg_am`（12 以上）。`pg_get_userbyid(relowner)`。`+` で `pg_table_size`・`pg_size_pretty`・`obj_description`。`relkind IN (...)`、既定で `pg_catalog`・`information_schema`・`pg_toast` を除外、パターン時は `pg_table_is_visible` | — | psql | [describe.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/bin/psql/describe.c)（`listTables`） 〔`\d` の振り分けは原文確認。表・列・条件は要約経由〕 |
+| psql 17 `\d <名前>` | メタコマンド時 | 1 回目: `pg_class`・`pg_namespace`（`c.oid`・`nspname`・`relname`）。2 回目以降（OID を文字列で埋め込む）: `pg_attribute`・`pg_attrdef`・`pg_collation`・`pg_type`・`pg_index`・`pg_constraint`・`pg_inherits`・`pg_policy`・`pg_roles`・`pg_statistic_ext`・`pg_rewrite`・`pg_trigger`・`pg_publication` 系・`pg_depend`・`pg_sequence`・`pg_am`。関数 `format_type`・`pg_get_expr`・`pg_get_indexdef`・`pg_get_constraintdef`・`pg_get_triggerdef`・`pg_get_viewdef`・`pg_get_ruledef`・`pg_get_partkeydef`・`pg_get_partition_constraintdef`・`pg_partition_ancestors`・`col_description`・`pg_relation_is_publishable`・`array_to_string`・`quote_ident` | `'<oid>'::pg_catalog.oid`・`::regclass`（`conrelid`・`inhparent` ほか）・`::regnamespace`・`reloftype::regtype`・`'pg_catalog.pg_class'::regclass` | psql | 同上（`describeTableDetails`・`describeOneTableDetails`）。行番号は未確認 〔要約経由。パターン句の形は原文確認〕 |
+| psql 17 `\dn` | メタコマンド時 | `pg_namespace`・`pg_get_userbyid(nspowner)`。`+` で `nspacl`・`obj_description`。既定で `^pg_` と `information_schema` を除外 | — | psql | 同上（`listSchemas`） 〔要約経由〕 |
+| psql 17 `\df` | メタコマンド時 | `pg_proc`・`pg_namespace`・`pg_type`・`pg_language`（`+`）。`pg_get_function_result`・`pg_get_function_arguments`・`pg_function_is_visible`・`pg_type_is_visible`。`prokind` で絞る | `'pg_catalog.trigger'::regtype` | psql | 同上（`describeFunctions`） 〔要約経由〕 |
+| psql 17 `\l` | メタコマンド時（`psql -l` は起動直後） | `pg_database`（`datname`・`datdba`・`encoding`・`datcollate`・`datctype`・版数で `datlocprovider` など）・`pg_encoding_to_char`・`pg_get_userbyid`。`+` で `pg_database_size`・`has_database_privilege`・`pg_tablespace` | — | psql | 同上（`listAllDbs`） 〔要約経由〕 |
+| psql 17 `\du` | メタコマンド時 | `pg_roles`（`rolname`・`rolsuper`・`rolinherit`・`rolcreaterole`・`rolcreatedb`・`rolcanlogin`・`rolconnlimit`・`rolvaliduntil`・`rolreplication`・`rolbypassrls`）。既定で `^pg_` を除外 | — | psql | 同上（`describeRoles`） 〔要約経由〕 |
+| libpq 17 | 接続時 | 発行しない。`target_session_attrs` 指定時だけ `SHOW transaction_read_only` か `pg_is_in_recovery()` | — | 接続（指定時のみ） | [fe-connect.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/interfaces/libpq/fe-connect.c)・[fe-exec.c](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/interfaces/libpq/fe-exec.c) 〔要約経由〕 |
+| pgjdbc 42.7.8 | 接続時 | カタログは引かない。サーバー版 12 未満で `SET extra_float_digits`、条件付きで `SET application_name`、`targetServerType` 指定時に `show transaction_read_only` | — | 接続（条件付き） | [ConnectionFactoryImpl.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/core/v3/ConnectionFactoryImpl.java) 〔要約経由〕 |
+| pgjdbc `TypeInfoCache` | 未知 OID・型名の初回解決時（遅延） | `pg_type`（`oid`・`typname`・`typnamespace`・`typtype`・`typinput`・`typelem`・`typarray`・`typdelim`）・`pg_namespace`・`current_schemas(true/false)`・`generate_series`・`array_upper` | `'pg_catalog.array_in'::regproc` | 通常 | [TypeInfoCache.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/jdbc/TypeInfoCache.java) 〔要約経由〕 |
+| pgjdbc `ResultSetMetaData` | `isNullable` 等の初回呼び出し時 | `pg_class`・`pg_namespace`・`pg_attribute`・`pg_type`・`pg_attrdef`・`pg_get_expr`。RowDescription の table OID と attnum で引く | — | 反映 | [PgResultSetMetaData.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/jdbc/PgResultSetMetaData.java) 〔要約経由〕 |
+| pgjdbc `getTables`・`getColumns`・`getPrimaryKeys`・`getSchemas` | メタデータ API 呼び出し時 | `pg_namespace`・`pg_class`・`pg_description`・`pg_attribute`・`pg_type`・`pg_attrdef`・`pg_index`・`current_database()`・`pg_get_expr`・`row_number() OVER`・`information_schema._pg_expandarray(indkey)`・設定次第で `has_table_privilege`・`has_schema_privilege`。`pg_database`（`getCatalogs`） | `'pg_class'::regclass` | 反映 | [PgDatabaseMetaData.java](https://raw.githubusercontent.com/pgjdbc/pgjdbc/REL42.7.8/pgjdbc/src/main/java/org/postgresql/jdbc/PgDatabaseMetaData.java)（`getIndexInfo` 以降は未確認） 〔要約経由〕 |
+| Npgsql（main） | データソースごとに最初の物理接続の Open 時に 1 回（結果をキャッシュ） | `version()`。型ロード: `pg_type`（`oid`・`typname`・`typtype`・`typnotnull`・`typelem`・`typbasetype`・`typcategory`・`typrelid`・`typreceive`）・`pg_namespace`・`pg_class`（`relkind`）・`pg_proc`（`proname='array_recv'` で配列を判定）・`pg_range`（`rngtypid`・`rngsubtype`・`rngmultitypid`）・`pg_attribute`（複合型の列）・`pg_enum`（`enumlabel`・`enumsortorder`） | — | 接続 | [PostgresDatabaseInfo.cs](https://raw.githubusercontent.com/npgsql/npgsql/main/src/Npgsql/PostgresDatabaseInfo.cs)・[NpgsqlDataSource.cs](https://raw.githubusercontent.com/npgsql/npgsql/main/src/Npgsql/NpgsqlDataSource.cs) 〔要約経由〕 |
+| Npgsql | Open 時（条件は未確認） | `pg_is_in_recovery()`・`SHOW default_transaction_read_only` | — | 未確認 | [NpgsqlConnector.cs](https://raw.githubusercontent.com/npgsql/npgsql/main/src/Npgsql/Internal/NpgsqlConnector.cs) 〔要約経由〕 |
+| psycopg 3 | 接続時 | 発行しない（`connection.py`。`_connect_gen` の確認は未了） | — | — | [connection.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/connection.py) 〔要約経由〕 |
+| psycopg 3 `TypeInfo.fetch`・`register_composite`・`register_enum` | 利用者が明示的に呼んだとき | `pg_type`（`typname`・`oid`・`typarray`・`typdelim`）・`pg_attribute`・`pg_enum`・`pg_range` | `to_regtype(%s)` または `%s::regtype`、`oid::regtype::text` | 反映 | [_typeinfo.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/_typeinfo.py)・[composite.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/types/composite.py)・[enum.py](https://raw.githubusercontent.com/psycopg/psycopg/master/psycopg/psycopg/types/enum.py) 〔要約経由〕 |
+| psycopg2 `register_composite` 等 | 明示呼び出し時 | `pg_type`・`pg_namespace`・`pg_attribute`・`pg_range`。0 行のときだけ `%s::regtype` で再検索 | `%s::regtype` | 反映 | [extras.py](https://raw.githubusercontent.com/psycopg/psycopg2/master/lib/extras.py)（接続時の挙動は未確認） 〔要約経由〕 |
+| node-postgres | 接続時 | 発行しない。型 OID は `pg-types` が静的に持つ | — | — | [client.js](https://raw.githubusercontent.com/brianc/node-postgres/master/packages/pg/lib/client.js)・[builtins.js](https://raw.githubusercontent.com/brianc/node-pg-types/master/lib/builtins.js) 〔要約経由〕 |
+| pgx（参考） | 接続時は発行しない。`LoadType` の明示呼び出し時 | `pg_type`（`typtype`・`typbasetype`・`typelem`・`typdelim`・`typrelid`）・`pg_attribute`・`pg_range` | `$1::text::regtype::oid` | 反映 | [conn.go](https://raw.githubusercontent.com/jackc/pgx/master/conn.go) 〔要約経由〕 |
+| SQLAlchemy 2.x | 接続時（dialect の初期化） | `pg_catalog.version()`・`current_schema()`・`show standard_conforming_strings` | — | 接続 | [base.py](https://raw.githubusercontent.com/sqlalchemy/sqlalchemy/main/lib/sqlalchemy/dialects/postgresql/base.py) 〔要約経由〕 |
+| SQLAlchemy 2.x | reflection（`has_table`・`get_columns`・`get_pk_constraint`・`get_foreign_keys`・`get_indexes`・`get_check_constraints`・`get_enums` ほか） | `pg_class`（`relpersistence`・`relkind`）・`pg_namespace`・`pg_attribute`（`attgenerated`・`attidentity`）・`pg_attrdef`・`pg_description`・`pg_collation`・`pg_type`・`pg_enum`・`pg_sequence`・`pg_constraint`・`pg_index`（`indkey`・`indclass`・`indoption`・`indnkeyatts`・`indnullsnotdistinct`）・`pg_am`・`pg_opclass`・`pg_inherits`・`pg_tablespace`。関数 `pg_table_is_visible`・`pg_type_is_visible`・`format_type`・`pg_get_expr`・`pg_get_constraintdef`・`pg_get_indexdef`・`pg_get_viewdef`・`pg_get_serial_sequence`・`unnest`・`generate_subscripts` | `attrelid::regclass::text`・`'pg_catalog.pg_class'::regclass` | 反映（`has_table` は Alembic 経由で通常） | 同上・[pg_catalog.py](https://raw.githubusercontent.com/sqlalchemy/sqlalchemy/main/lib/sqlalchemy/dialects/postgresql/pg_catalog.py) 〔要約経由〕 |
+| Alembic | migrate 時・autogenerate 時 | `alembic_version` の存在確認は SQLAlchemy の `has_table`。autogenerate の serial 判定で `pg_class`・`pg_depend`・`pg_attribute` | `'pg_class'::regclass`・`cast(:seqname as regclass)` | 通常（存在確認）・反映 | [ddl/postgresql.py](https://raw.githubusercontent.com/sqlalchemy/alembic/main/alembic/ddl/postgresql.py)・[runtime/migration.py](https://raw.githubusercontent.com/sqlalchemy/alembic/main/alembic/runtime/migration.py) 〔要約経由〕 |
+| Prisma（prisma-engines） | migrate の接続直後 | `pg_namespace` の存在確認・`version()`・`current_setting('server_version_num')`・`pg_advisory_lock(...)`。`_prisma_migrations` の存在は `pg_class`・`pg_namespace`（`relkind='r'`・`nspname = ANY($1)`） | — | 通常 | [flavour/postgres.rs](https://raw.githubusercontent.com/prisma/prisma-engines/main/schema-engine/connectors/sql-schema-connector/src/flavour/postgres.rs) 〔要約経由〕 |
+| Prisma | `db pull`・`migrate dev` の差分計算 | `pg_class`（`relispartition`・`relhassubclass`・`relrowsecurity`・`reloptions`・`reltype > 0`）・`pg_namespace`・`pg_constraint`・`pg_views`・`pg_type`・`pg_enum`・`information_schema.columns`（`data_type`・`udt_name`・`numeric_precision` ほか）・`pg_attribute`・`pg_attrdef`・`pg_index`・`pg_am`・`pg_opclass`・`pg_proc`・`pg_language`・`pg_extension`・`information_schema.sequences`。関数 `obj_description`・`col_description`・`format_type`・`pg_get_expr`・`pg_get_constraintdef`・`pg_get_functiondef` | `typinput::regproc::text` | 反映 | [postgres.rs](https://raw.githubusercontent.com/prisma/prisma-engines/main/schema-engine/sql-schema-describer/src/postgres.rs)（`load_migrations_table` の SQL は未確認） 〔要約経由〕 |
+| Rails（ActiveRecord main） | 接続確立直後 | `SET SESSION`（`standard_conforming_strings`・`intervalstyle`・`client_min_messages`・`timezone`。値が ParameterStatus と違うときだけ）・`SET search_path`。型マップは既知 OID の固定表で、問い合わせしない | — | 接続 | [postgresql_adapter.rb](https://raw.githubusercontent.com/rails/rails/main/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb) 〔要約経由〕 |
+| Rails | 型マップに無い OID を初めて見たとき | `pg_type`（`oid`・`typname`・`typelem`・`typdelim`・`typinput`・`typtype`・`typbasetype`）LEFT JOIN `pg_range`（`rngsubtype`）。初回は `typtype IN ('r','e','d')` の一括も | 旧版のみ `'pg_catalog'::regnamespace` | 通常 | 同上 〔呼び出し元は原文確認。SQL の列は要約経由〕 |
+| Rails | モデルのスキーマ読み込み・`table_exists?`・マイグレーション | `pg_class`・`pg_namespace`（`relkind IN ('r','v','m','p','f')`・`ANY (current_schemas(false))`）・`pg_attribute`・`pg_attrdef`・`pg_type`・`pg_collation`・`format_type`・`pg_get_expr`・`col_description`・`pg_constraint`（PK）・`pg_depend`・`pg_get_serial_sequence` | `<表名>::regclass`・`'pg_class'::regclass`・`oid::regclass::text` | 通常 | 同上・[schema_statements.rb](https://raw.githubusercontent.com/rails/rails/main/activerecord/lib/active_record/connection_adapters/postgresql/schema_statements.rb) 〔要約経由〕 |
+| Rails | `db:schema:dump`・reflection | `pg_index`・`pg_am`・`pg_constraint`（`f`・`c`・`u`・`x`）・`pg_get_indexdef`・`pg_get_constraintdef`・`obj_description`・`pg_inherits`・`pg_get_partkeydef`・`pg_depend`（拡張のメンバー） | `c.confrelid::regclass::text`・`'pg_extension'::regclass` ほか | 反映 | 同上 〔要約経由〕 |
+| Django（main） | 接続時 | `set_config('TimeZone', ...)`（ずれているときだけ）。版数は `server_version`（問い合わせなし） | — | 接続 | [base.py](https://raw.githubusercontent.com/django/django/main/django/db/backends/postgresql/base.py)・[operations.py](https://raw.githubusercontent.com/django/django/main/django/db/backends/postgresql/operations.py) 〔要約経由〕 |
+| Django | `migrate`（`django_migrations` の存在確認は `get_table_list`） | `pg_class`・`pg_namespace`（`relkind IN ('f','m','p','r','v')`・`relispartition`・`pg_table_is_visible`）・`obj_description` | — | 通常 | [introspection.py](https://raw.githubusercontent.com/django/django/main/django/db/backends/postgresql/introspection.py)・[recorder.py](https://raw.githubusercontent.com/django/django/main/django/db/migrations/recorder.py) 〔要約経由〕 |
+| Django | `inspectdb`・`get_constraints` ほか | `pg_attribute`・`pg_attrdef`・`pg_collation`・`pg_type`・`pg_constraint`・`pg_index`・`pg_am`・`pg_depend`・`pg_get_expr`・`pg_get_indexdef`・`col_description`・`unnest ... WITH ORDINALITY` | `'pg_class'::regclass` | 反映 | 同上 〔要約経由〕 |
 
 ### 3.3 棚卸しから読み取れること
 
@@ -167,26 +174,25 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
 
 ### D1. 見える行の規則（fail-closed）
 
-- カタログの行は、セッションが**名前を解決できる**オブジェクトからだけ導く。対象は次の 3 つに限る。
-  1. 共有の `public` のオブジェクト（表・ビュー・matview・索引・SEQUENCE 定義・ENUM 型と、その列・制約・既定値）
-  2. 自テナントの SCHEMA とその配下のオブジェクト、自テナントの UDF・ロール・トリガ・ポリシー（共有の表に付いたものを含む）
-  3. 当該セッションの一時表（同じテナントの別セッションの一時表も出さない。PostgreSQL より狭い）
-- これに組み込みの固定行（D4 の組み込み範囲。`pg_catalog`・`information_schema`・`public`・組み込み型・アクセス方式など）を加える。
+- 可視集合（どのオブジェクトの行を返すか）は TABLE-51 (1) に従う。本書はその実装上の追加判断だけを決める。
+- 組み込みの固定行（D4 の組み込み範囲。`pg_catalog`・`information_schema`・`public`・組み込み型・アクセス方式など）を加える。
   固定行はテナントに依存しない。
-- 導出はテナント内の範囲走査だけで行う（§2.1）。他テナントの行を読んでから捨てる実装をしない。走査量・応答時間が
-  他テナントのオブジェクト数に依存しないようにするため。
-- 1 行の可視性を決めるのに必要な情報が欠ける場合（OID が未割り当て、所有者・型の参照先が見えない等）は、その行を返さない。
-  参照先が見えない列は、PostgreSQL が「該当なし」に使う値（OID 0・NULL）にし、他テナントの値を出さない。
+- 導出は、自テナントのスコープを先頭にした範囲走査と、可視な relation ごとの点引き・接頭辞走査だけで行う（§2.1・D5）。
+  他テナントの行を読んでから捨てる実装をしない。全行走査で列挙する既存の関数（所有者表の `list_owners_for_tenant_in_txn` 等）は
+  カタログの経路で使わない。走査量・応答時間を他テナントのオブジェクト数に依存させないため。
+- 行を返すのに必要な情報が欠ける場合（OID が未割り当て等）はその行を返さない。参照先が見えない列は、PostgreSQL が「該当なし」に
+  使う値（OID 0・NULL）にし、他テナントの値を出さない。
 - `public` の表に付く「テナントごとの情報」（所有者・ACL・トリガ・ポリシー・行セキュリティの有効化）は、自テナントの分だけで
-  計算する。例: `relhastriggers` は自テナントのトリガの有無、`relowner` は自テナントの所有者行（無ければ D4 の共有定義の
+  計算する。例: `relhastriggers` は自テナントのトリガの有無、`relowner` は自テナントの所有者行（無ければ O6 の共有定義の
   仮想所有者）。
-- 並び順: `ORDER BY` の無い問い合わせの行順は、各カタログで OID の昇順とする（自テナントの集合だけで決まる）。
+- 並び順: `ORDER BY` の無い問い合わせの行順は、可視の内容だけから決まる順（SCHEMA 名・オブジェクト名・列番号などの辞書順）とし、
+  OID の大小に依らせない。共有の `public` の OID の払い出し方（D4・O1）によっては、OID の大小が他テナントの DDL の前後関係を
+  映しうるため（P1-1 の監査指摘）。PostgreSQL も `ORDER BY` の無い行順を保証しないので、互換性は損なわない。
 - 本書はテナントをまたいで共有する名前空間を新しく作らない。組み込みの固定行（共有定義の仮想所有者を含む）の名前は全テナントで
   同じ予約名とし、その名前のロール等の作成は、他テナントの状態に依らない固定の応答で拒否する（O6）。
 - エラー: カタログの照会では他テナントの名前・内部キーを解決しないので、エラー文に出る名前は利用者が書いたものだけになる。
   内部キー `#<id>.` は表示しない（schema ADR D2）。
-- 明示トランザクションの中の DDL（SQL-80 のポインタ）: カタログは文と同じ読み取り元（トランザクション中は自分の未 commit の
-  変更を含む）から導く。他セッションには commit 後の状態だけが見える（redb のトランザクション分離に従う）。
+- SQL-80 (2) と TABLE-51 (4) に従う。カタログは文と同じ読み取り元から導く。
 - 結果の行数は他の SELECT と同じ上限に従う（[limit-omitted-result-cap.md](limit-omitted-result-cap.md)）。上限に当たる
   かどうかは自テナントの可視集合の大きさだけで決まる。
 
@@ -200,13 +206,21 @@ Issue #3342 本文の file:line は main 3ef68d68 時点のため、ここで再
   テナントに依存しない固定の応答になる。
 - `pg_catalog`・`information_schema` を作成先にする作成系 DDL（`CREATE TABLE pg_catalog.x` 等）も `42501` に揃える（PostgreSQL 17 の応答の実機確認は I2）
   （現状の `0A000` から変わる。拒否の固定テストは [rejection-pin-annotation.md](rejection-pin-annotation.md) の手順で付け替える）。
-- 永続するオブジェクトの定義（ビュー・matview の本文、CHECK・DEFAULT・生成列・索引の式、UDF・トリガ関数の本文）からカタログを
-  参照することは `0A000` で拒否する。共有の `public` のビューがカタログを読むと、定義者と読み手のテナントが食い違い、可視性の
-  基準があいまいになるため（fail-closed。必要になったら別 ADR で再検討する）。カタログを読めるのは、通常の SELECT（CTE・
-  副問い合わせ・利用者の表との結合を含む）・`EXPLAIN`・拡張クエリの準備済み文だけ。
-- `CREATE TABLE ... AS SELECT`・`INSERT ... SELECT` の元にカタログを使うことも、初期は `0A000` とする（§7 の未決事項 O8）。
-- NoSQL（HTTP）表層にはカタログを加えない（`0A000` のまま）。HTTP 表層には修飾名の `pg_catalog` に相当する概念が無く、
-  ドライバ互換の需要も無いため。
+- **永続して保存される式・本文のすべて**からカタログを参照することは `0A000` で拒否する。少なくとも次を含む。
+  - ビュー・matview の本文
+  - CHECK・DEFAULT・生成列の式、式索引の式、部分索引の `WHERE`
+  - 利用者ポリシーの `USING`・`WITH CHECK`、トリガの `WHEN`
+  - UDF・トリガ関数・`DO` ブロックの本文のうち、定義として保存されるもの
+  - 上の列挙に無い永続定義も既定で拒否する（default-deny。新しい永続定義の種類を足すときは、カタログを参照できないことを
+    その Issue で確認し、許可する場合は本書を改める）
+  - 理由: 共有の `public` の定義がカタログを読むと、定義者と評価時のテナントが食い違い、可視性の基準があいまいになる
+    （fail-closed。必要になったら別 ADR で再検討する）
+- 1 回限りの文のうち、カタログを読めるのは通常の SELECT（CTE・副問い合わせ・利用者の表との結合を含む）・`EXPLAIN`・拡張クエリの
+  準備済み文だけとする。次は初期は `0A000` とする（§7 の O8。カタログの内容が書き込みの対象・値を左右する文をまとめて扱うため）。
+  - `CREATE TABLE ... AS SELECT`・`INSERT ... SELECT`・`COPY (SELECT ...) TO` の元
+  - `UPDATE`・`DELETE`・`MERGE` の読み側（`FROM`・`USING` 句、`WHERE` の副問い合わせ）
+- NoSQL（HTTP）表層: TABLE-51 (4) に従い、NoSQL へは加えない（`0A000` のまま）。HTTP 表層には修飾名の `pg_catalog` に
+  相当する概念が無く、ドライバ互換の需要も無い。
 
 ### D3. 提供範囲と段階
 
@@ -304,22 +318,26 @@ D8 の漏えい評価で出さないと決めたもの（`pg_stat_*`・`pg_stati
 | 範囲 | 用途 | 払い出し |
 | ---- | ---- | -------- |
 | 1〜16383 | 組み込み（`pg_catalog`=11・`public`=2200・組み込み型・組み込みカタログの relation・入出力関数・アクセス方式・照合・言語・共有定義の仮想所有者） | PostgreSQL 17 の固定値に合わせる（`pg_catalog`=11・`public`=2200 は [pg_namespace.dat](https://raw.githubusercontent.com/postgres/postgres/REL_17_STABLE/src/include/catalog/pg_namespace.dat)。`information_schema` は PostgreSQL では initdb ごとに変わるため、16384 未満の未使用値を 1 つ固定で選ぶ） |
-| 16384〜2^30−1 | 共有の `public` のオブジェクトとその従属物 | 共有カウンタ（`public` の DDL だけが進める） |
-| 2^30〜2^31−2^24−1 | テナントのオブジェクト（SCHEMA・その配下・UDF・ロール・トリガ・ポリシー）とその従属物 | テナントごとのカウンタ。各テナントが同じ初期値から数える |
+| 16384〜2^30−1 | 共有の `public` のオブジェクトとその従属物（下の P1 案 b・c・d を採る場合だけ使う。既定の案 a では使わず、`public` のオブジェクトもテナントの範囲で払い出す） | P1 案による |
+| 2^30〜2^31−2^24−1 | テナントのオブジェクト（SCHEMA・その配下・UDF・ロール・トリガ・ポリシー）とその従属物。案 a では、そのテナントから見た `public` のオブジェクトも含む | テナントごとのカウンタ。各テナントが同じ初期値から数える |
 | 2^31−2^24〜2^31−1 | 当該セッションの一時表とその従属物 | セッション内のカウンタ（永続化しない。セッションごとに同じ初期値から数える） |
 
 - 2^31 以上を使わない。OID を符号付き 32 bit で扱うクライアントで負の値にならないようにする。
 - 範囲から公開範囲かテナント範囲かが分かるが、これは `relnamespace` から既に分かる情報で、他テナントの情報を含まない。
-- 範囲を使い切ったら、その範囲を進める DDL を固定文言の `54000` で拒否する。判定はそのスコープ（共有・自テナント・自セッション）の
-  カウンタだけで決まる。
+- 範囲を使い切ったら、その範囲を進める DDL を固定文言の `54000` で拒否する。判定はそのスコープ（自テナント・自セッション。
+  案 b〜d の共有の範囲は共有の集合）の状態だけで決まる。
 
 #### 採用: スコープ別の単調カウンタと OID 台帳（案 B）
+
+テナントの SCHEMA 配下・UDF・ロール・トリガ・ポリシーと一時表はこの方式で決める。共有の `public` のオブジェクトの払い出しは、
+次節の P1 の比較（既定の提案は案 a）で決める。
 
 - 新しい redb 表を 2 つ置く（遅延作成）。
   - 正引き: キー `(スコープ, 種別, オブジェクトの鍵)` → OID
   - 逆引き: キー `(スコープ, OID)` → `(種別, オブジェクトの鍵)`
-  - スコープは「共有」か「テナント（`tenant_id`）」。キーの先頭に置き、他テナントの行を構造上引かない（SCHEMA・ロールと同じ流儀）
-  - カウンタはスコープごとに 1 行（共有 1 行＋テナントごとに 1 行）。再利用しない
+  - スコープは「テナント（`tenant_id`）」（案 b〜d では加えて「共有」）。**キーの先頭に置き**、他テナントの行を構造上引かない
+    （SCHEMA・ロールと同じ流儀。所有者表のようにテナントを末尾に置く形〔§2.1〕にはしない）
+  - カウンタはスコープごとに 1 行。再利用しない
 - オブジェクトの鍵
   - 上位のオブジェクト（relation・ENUM 型・SCHEMA・UDF・ロール・トリガ・ポリシー）は内部キー（`public` は裸の名前、SCHEMA 配下は
     `#<schema_id>.<name>`、UDF は `(function_key, arg_signature)` 等）
@@ -331,19 +349,30 @@ D8 の漏えい評価で出さないと決めたもの（`pg_stat_*`・`pg_stati
 - 既存 DB の移行: 台帳の無いオブジェクトには、プライマリの起動時に 1 つの write txn で OID を付与する（スコープごとに
   `(種別, 鍵)` の昇順。テナントごとに独立に数えるため、あるテナントの付与順は他テナントのオブジェクトに依存しない）。冪等に作り、
   付与済みなら何もしない。
-- レプリカ・読み取り専用の文は付与しない（R6）。台帳に OID が無いオブジェクトは D1 の「可視性を決められない行」として返さない。
+- レプリカ・読み取り専用の文は付与しない（R6）。台帳に OID が無いオブジェクトは D1 のとおり返さない。
 - バックアップ・PITR・レプリケーションと savepoint の巻き戻しは、`storage/table_image.rs` の `SHAPES`（engine が使う
   `(K, V)` の型の組の一覧）に載った形の表だけを扱い、未知の形の表は fail-closed で拒否する。台帳の表は既存の形を再利用するか、
-  新しい形を `SHAPES` に登録する必要がある。どちらにするかと、各経路で OID が保たれることは実装 Issue I1 の受け入れ条件にする。論理ダンプ（[logical-dump.md](logical-dump.md)）からの復元は DDL を再実行するため OID が振り直される
-  （`pg_dump` と同じ）。
+  新しい形を `SHAPES` に登録する必要がある。どちらにするかと、各経路で OID が保たれることは実装 Issue I1 の受け入れ条件にする。
+  論理ダンプ（[logical-dump.md](logical-dump.md)）からの復元は DDL を再実行するため OID が振り直される（`pg_dump` と同じ）。
 
-#### 共有の `public` の OID について残る観測
+#### P1. 共有の `public` のオブジェクトの OID（監査指摘 P1-1）
 
-- 共有カウンタは `public` の DDL だけで進むため、空きから「その間に `public` のオブジェクトが作られて消えた」ことは分かる。
-  `public` のオブジェクトは存在中は全テナントから見える共有の定義（TABLE-27 のポインタ）であり、テナント固有の情報ではない。
-  一方で、どのテナントの DDL かは分からないが「誰かが作って消した」ことは残る。これを許容するかはオーナー判断とする（O1）。
-  許容しない場合の代替は、共有の範囲だけ案 C の鍵つき写像にすることだが、`public` の relation は名前が鍵なので、案 C の
-  欠点（改名で OID が変わり、同名で作り直すと同じ OID が戻る。衝突時の振り直し）をそのまま負う。
+共有のカウンタ 1 本で `public` のオブジェクトに払い出すと、OID の欠番と進み幅から、他テナントが行った `public` の DDL の有無・
+回数と、従属物（制約・既定値・行型など）の数が観測できる（`public` へ DDL できるテナントは、自分の DDL の前後の OID を比べて
+間を数えられる）。`public` のオブジェクトは存在中は全テナントに見えるが、「作って消した」履歴と従属物の数はテナントの操作の
+痕跡であり、既定で塞ぐ。次の案を I1 で比較して決める。**既定の提案は案 a とする。**
+
+| 案 | 内容 | 塞げるか | 書き込み量・R4・R6 ほか |
+| -- | ---- | -------- | ----------------------- |
+| a. テナントのカウンタで払い出す（既定の提案） | `public` のオブジェクトにも、各テナントのカウンタから OID を払い出し、台帳に `(テナント, 種別, public の鍵)` で持つ。払い出すのは**そのテナントの書き込みの時点**（プライマリでの接続確立時と、そのテナントの DDL・書き込みの write txn の中）で、その時点に存在し、まだ OID の無い `public` のオブジェクトだけに付ける | 塞げる。2 回の払い出しの間に作られて消えた `public` のオブジェクトはどのテナントのカウンタも進めない。OID の順序もテナント自身が見た順になる | 書き込み量は「前回の払い出し以降に増えた `public` のオブジェクト数 × 払い出すテナント数」。毎回の要否は `public` のカタログ世代とテナントごとの払い出し済みの世代の比較（定数時間）で判定する。R6 は満たす（SELECT では書かない）が、接続確立が書き込みになりうる。払い出し前の `public` のオブジェクトはそのテナントのカタログに出ない（長い接続では次の書き込みまで遅れる。レプリカではプライマリでの払い出しが届くまで出ない）。`public` のオブジェクトの削除時に全テナントの行を消すと、削除の所要時間が他テナントの払い出し数を映すため、削除は行わず、各テナントの次の払い出し時に不要な行を片付ける（同名の作り直しを区別するため、`public` のオブジェクトに作成時の世代を持たせる） |
+| a'. 案 a を `public` の DDL の時点で全テナントへ払い出す | `public` の DDL の write txn で全テナントのカウンタを進める | **塞げない**。作って消したオブジェクトも各テナントのカウンタを進めるため、欠番が残る | 書き込み量がテナント数に比例し、DDL の所要時間がテナント数を映す。採らない |
+| a''. 案 a を初めて見えた時点（カタログの照会時）に払い出す | | 塞げる | R6 違反（代替案 F と同じ）。採らない |
+| b. `public` の relation だけ HMAC 写像 | `OID = 共有の範囲の先頭 + HMAC(サーバー鍵, public の鍵) mod 範囲の幅`。カウンタを持たない | 欠番・進み幅は生じない | 鍵が名前なので、改名で OID が変わり、同名で作り直すと同じ OID が戻る（R4 違反。代替案 C と同じ）。2^30 の範囲では約 1 万件で 5% 程度の衝突があり、振り直しの順序次第で既存の OID がずれうる。サーバー鍵の保管・レプリカとの共有・復元時の扱いが要る（HMAC は engine の `crypto::hmac_sha256` で足り、依存の追加は要らない） |
+| d. 作成時に乱数で引く（案 b の変形） | `public` のオブジェクトの作成の write txn で、共有の範囲から暗号論的乱数で OID を引き、共有の逆引きに既にあれば引き直す。共有の台帳に持ち、改名で鍵だけ付け替える | 欠番・進み幅に履歴が乗らない（値は乱数で、引き直しの要否は全テナントに見える `public` の集合だけで決まる） | 改名で変わらず、作り直せば新しい値になる（R4 を満たす）。書き込みは DDL の write txn の中だけ（R6 を満たす）。値が飛び飛びで PostgreSQL らしくない。乱数源は engine の `crypto::random` を使う（依存の追加なし）。案 a の複雑さ（遅延の払い出し・片付け）を負わないため、I1 では案 a の有力な対抗として比較する |
+| c. 共有のカウンタのまま許容する | 現行の案 B のまま | 塞がない | 許容できる条件: `public` の DDL がテナントの外のサーバー管理経路だけに限られる（role ADR D6 の方向。テナントのロールが `public` に DDL できない）。その場合に観測できるのは、管理経路が行った `public` の DDL の回数と従属物の数が上限で、テナントの操作の痕跡は含まない。現状は `--ddl-allowed-users` のテナントが `public` に DDL できるため、この条件は満たさない |
+
+- 決定は I1 で行う。I1 では、案 a・d・c（条件つき）について、3 テナントでの欠番・進み幅・順序の非観測性のテスト、書き込み量、
+  接続確立の遅延、レプリカでの見え方を比べ、結果と選んだ案を本書に追記してオーナーの承認を得る。
 
 #### 採らない代替案
 
@@ -351,7 +380,7 @@ D8 の漏えい評価で出さないと決めたもの（`pg_stat_*`・`pg_stati
 | -- | ---- | ------------ |
 | A. 内部 ID をそのまま出す | SCHEMA・UDF・ロール等の内部 ID を OID にする | 内部 ID は全テナント共有のカウンタで、値と空きから他テナントの作成回数が分かる（R1 違反）。schema ADR D2 も内部 ID を応答に出さないと決めている |
 | A'. PostgreSQL と同じ全体で 1 本のカウンタ | 全オブジェクトを 1 本の新しいカウンタで数える | 他テナントの DDL で空きができる（R1 違反） |
-| C. テナント鍵つきの写像 | `OID = 範囲の先頭 + HMAC(サーバー鍵, スコープ ‖ 種別 ‖ 鍵) mod 範囲の幅`。台帳を持たない | 表・ビュー・索引には改名で変わらない内部 ID が無く、鍵が名前になるため、改名で OID が変わり、同名で作り直すと同じ OID が戻る（R4 違反。キャッシュした型情報を取り違える）。2^30 の範囲では可視集合の中の衝突が無視できず（約 1 万件で 5% 程度）、衝突の解決順を可視集合だけで決めると、後から作ったオブジェクトが既存の OID をずらしうる。サーバー鍵の保管・レプリカとの共有・復元時の扱いも要る。HMAC は engine の `crypto::hmac_sha256` で足り、依存の追加は要らないので、O1 の代替としては残す |
+| C. テナント鍵つきの写像（全オブジェクト） | `OID = 範囲の先頭 + HMAC(サーバー鍵, スコープ ‖ 種別 ‖ 鍵) mod 範囲の幅`。台帳を持たない | 表・ビュー・索引には改名で変わらない内部 ID が無く、鍵が名前になるため、改名で OID が変わり、同名で作り直すと同じ OID が戻る（R4 違反。キャッシュした型情報を取り違える）。2^30 の範囲では可視集合の中の衝突が無視できず（約 1 万件で 5% 程度）、衝突の解決順を可視集合だけで決めると、後から作ったオブジェクトが既存の OID をずらしうる。サーバー鍵の保管・レプリカとの共有・復元時の扱いも要る。`public` に限った形は P1 の案 b として比較する |
 | D. 問い合わせ時の順位 | 可視集合を並べた順位を OID にする | 作成・削除のたびに他のオブジェクトの OID が変わる（R4 違反） |
 | E. セッション単位の仮想 OID | 接続ごとに初めて見た順で払い出す | 同じテナントの別接続で OID が食い違う。Npgsql はデータソース（接続プール）単位で型情報を共有するため壊れる（R4 違反） |
 | F. 照会時に台帳へ遅延で書く | カタログを読んだ時点で未割り当てのオブジェクトに払い出す | 読み取りの文が書き込みになり、読み取り専用トランザクション・レプリカで動かず、単一ライタの待ちを読み取りに持ち込む（R6 違反） |
@@ -361,6 +390,10 @@ D8 の漏えい評価で出さないと決めたもの（`pg_stat_*`・`pg_stati
 - 正引き・逆引きともにスコープ先頭のキーで、自テナント（と共有・自セッション）の範囲だけを引く。
 - 逆引きで他テナントの OID の値を与えられても、自テナントのスコープにその値が無ければ「無い」になる。他テナントの台帳は読まない。
 - カタログの照会は、可視集合の件数に比例するコストに収める。可視集合の上限は既存の上限（`MAX_LIST_TABLES` 等）から決まる。
+- トリガ・ポリシーは可視な表ごとの `(table_key, 自テナント)` の接頭辞走査で引く。`pg_trigger`・`pg_policy` の列挙コストは可視な表の
+  数に比例する（他テナントのトリガ・ポリシーの件数には依らない）。
+- 所有者は可視な relation・SCHEMA・関数ごとの点引き（`(種別, 対象, 自テナント)`）で引く。所有者表はテナントがキーの末尾にあり、
+  テナント単位の列挙は全行走査になるため（§2.1）、カタログの経路では列挙しない。
 
 ### D6. 型 OID と WIRE-13 の整合
 
@@ -398,6 +431,12 @@ PostgreSQL 17 の挙動（[datatype-oid](https://www.postgresql.org/docs/17/data
 - 数の入力（`'16390'::regclass`）は、PostgreSQL と同じく存在を確かめずに受け付ける（実機確認は I4）。
 - 出力: 0 は `-`、可視集合に無い OID は 10 進の数（PostgreSQL と同じ）。他テナントのオブジェクトの OID と同じ値を渡されても、
   自テナントの可視集合で解釈するだけなので、他テナントの名前は出ない。
+- 見えない OID を裸の数で出すことの帰結（いずれも仕様として固定する）。
+  - OID は呼び出し元の可視集合の中でだけ解釈するので、他テナントのオブジェクトの OID と同じ値が、範囲の重なる自テナントの
+    別のオブジェクトに当たることがある。これは仕様で、他テナントの情報は出ない（R2）
+  - 台帳の欠損などで自テナントのオブジェクトの OID が逆引きできない場合も裸の数になる。名前を推測して出さないので、fail-closed の
+    期待どおりの挙動である
+  - 上の 2 点はテストで固定し、PostgreSQL 17 の出力（`-`・裸の数）との一致は I4 の実機確認を必須にする
 - `pg_get_userbyid`・`has_table_privilege(oid, ...)` 等の OID を受け取る関数も同じ規則で、可視集合に無い OID には PostgreSQL が
   存在しない OID に返す値（`unknown (OID=<n>)`・NULL。実機確認は I4・I5）を返す。
 - キャスト: `oid` と各別名の型の間、`int4`・`int8` から `oid`、別名の型から `text` を提供する。別名の型と `oid` の比較
@@ -446,7 +485,7 @@ PostgreSQL 17 の挙動（[datatype-oid](https://www.postgresql.org/docs/17/data
 
 | Issue | 内容 | 前提 | テスト観点 |
 | ----- | ---- | ---- | ---------- |
-| I1 OID 台帳 | D4 の台帳・範囲・カウンタ、全 DDL 経路（作成・削除・改名・`SET SCHEMA`・`CASCADE`・ロールバック）への結線、起動時の付与、一時表のセッション内 OID | なし | (a) テナント B の作成・削除・ロールバックの前後で、テナント A の次の OID と既存の OID が変わらない (b) A と B の最初のオブジェクトが同じ OID 値になる (c) 再起動・改名で OID が変わらず、削除後に再利用しない (d) レプリカ・読み取り専用トランザクションで台帳へ書かない (e) バックアップ・PITR・レプリケーション後に OID が一致 (f) 起動時の付与が冪等で、付与順が他テナントに依存しない (g) 範囲の枯渇が `54000` で、他テナントの状態に依存しない |
+| I1 OID 台帳 | D4 の台帳・範囲・カウンタ、全 DDL 経路（作成・削除・改名・`SET SCHEMA`・`CASCADE`・ロールバック）への結線、起動時の付与、一時表のセッション内 OID | なし | (a) テナント B の作成・削除・ロールバックの前後で、テナント A の次の OID と既存の OID が変わらない (b) A と B の最初のオブジェクトが同じ OID 値になる (c) 再起動・改名で OID が変わらず、削除後に再利用しない (d) レプリカ・読み取り専用トランザクションで台帳へ書かない (e) バックアップ・PITR・レプリケーション後に OID が一致 (f) 起動時の付与が冪等で、付与順が他テナントに依存しない (g) 範囲の枯渇が `54000` で、他テナントの状態に依存しない (h) 台帳のキーはスコープ（テナント）を先頭にし、テナント単位の列挙が範囲走査で済む。所有者はカタログの経路で可視な relation ごとの点引きに限り、所有者表 `object_owners`（テナントが末尾）をテナント先頭へ組み替えるかを比較して決める (i) D4 の P1 の案 a・d・c を比較し、`public` の DDL の作成・削除・従属物の増減が他テナントの OID の欠番・進み幅・順序に現れないことを 3 テナントで確かめ、選んだ案を本書に追記する |
 | P1〜P8 カタログ外の前提 | §3.4 の表（修飾した関数名・型名、`OPERATOR(...)`・`COLLATE pg_catalog.default`、`oid`・`name`・`"char"` 型、`version()`・`current_database()`・`current_setting`・`set_config`、一般の `SHOW`／`SET SESSION`、FROM のある文での `current_schemas`、`pg_advisory_lock`、`pg_is_in_recovery()`） | なし | 各関数・構文の PostgreSQL 17 との突き合わせ。テナント依存の値を返さないこと（`version()`・`current_setting` はテナントに依らない固定値） |
 | I2 仮想カタログの基盤 | 組み込み SCHEMA の relation を読み取り専用の仮想表として解決する層、D2 の `42501`・`0A000`、D10 の暗黙の `pg_catalog`、結果の上限・キャッシュ鍵（テナント・`search_path`・カタログ世代を含める） | I1 | (a) 書き込み・DDL がすべて `42501` で副作用ゼロ (b) 永続定義からの参照が `0A000` (c) NoSQL が `0A000` (d) 準備済み文のキャッシュがテナントをまたがない (e) 未提供の表が `0A000` のまま |
 | I3 段 1 | D3 段 1 の表・関数・型、D6 の組み込み型の情報源の一本化 | I2・P1〜P4（Npgsql は `version()` を送る） | (a) 3 テナントで互いの ENUM 型が `pg_type`・`pg_enum` に出ない (b) B の ENUM の作成・削除で A の行・件数・OID・並びが変わらない（A の出力をバイト単位で比較） (c) `pg_type` の組み込み行と `WireType` の一致 (d) 層 B: Npgsql の接続、pgjdbc の未知 OID 照会、psycopg の `TypeInfo.fetch`、Rails の型の遅延読み込み |
@@ -464,7 +503,7 @@ PostgreSQL 17 の挙動（[datatype-oid](https://www.postgresql.org/docs/17/data
 | ---- | ------------ |
 | アクセス制御の不備 | 可視集合を名前解決と同じ規則で導き、テナント先頭のキーの範囲だけを引く（D1・D5）。ロール権限は可視集合の後段（D9） |
 | インジェクション | カタログの行は内部の値から組み立て、SQL 文字列を連結して別の問い合わせを作らない。`pg_get_*def` の出力は既存の正規化済み定義から作る |
-| 不安全な設計 | 可視性を決められない行は返さない。永続定義からの参照は拒否（D2）。読み取りで書き込まない（D4 R6） |
+| 不安全な設計 | OID 等が欠けて行を組み立てられないときは返さない。永続定義からの参照は拒否（D2）。読み取りで書き込まない（D4 R6） |
 | 情報漏えい | 件数・サイズ・統計・xid を出さない（D8）。内部 ID を OID にしない（D4 案 A を不採用） |
 | DoS | 結果の行数は既存の上限、走査は可視集合の大きさ、台帳はスコープごとの上限に収まる |
 | 脆弱な依存 | 依存を追加しない（案 C を採る場合も既存の `crypto::hmac_sha256` で足りる） |
@@ -473,14 +512,14 @@ PostgreSQL 17 の挙動（[datatype-oid](https://www.postgresql.org/docs/17/data
 
 | ID | 事項 | 本書の推奨 |
 | -- | ---- | ---------- |
-| O1 | 共有の `public` の OID の空きから「`public` のオブジェクトが作られて消えた」ことが分かる点を許容するか | 許容する（共有の定義でテナント固有ではない）。許容しない場合の共有の範囲だけの案 C は、改名で OID が変わる等の欠点を負う |
+| O1 | 共有の `public` のオブジェクトの OID の払い出し方（D4 の P1。共有カウンタのままでは、他テナントの `public` の DDL の有無・回数・従属物の数が欠番と進み幅から観測できる） | 既定で塞ぐ。既定の提案は案 a（テナントのカウンタで、テナントの書き込みの時点に払い出す）。案 d（作成時の乱数）と比べて I1 で決める。案 c（許容）は `public` の DDL をサーバー管理経路に限る場合だけ |
 | O2 | ENUM・VECTOR 系の列の型を、現状の公告（`text`）に合わせるか、ENUM 型の OID・`vector` 型を公告するよう WIRE-13 を変えるか | 段 1〜3 は公告に合わせて `text`。ENUM の OID の公告は、カタログの提供後に別 Issue（BREAKING）で検討 |
 | O3 | `server_version=14.0` の公告を維持するか、17 系へ上げるか（psql・pgjdbc は版数で問い合わせの形を選ぶ） | 本書の範囲では維持し、層 B は公告する版数で確かめる。17 系への変更は全クライアントに影響するため別 Issue |
 | O4 | サイズ系関数を提供しない（psql の `\dt+`・`\l+` が動かない）ままでよいか | 当面は提供しない。テナントの行だけを数える測り方を設計できたら再検討 |
-| O5 | `pg_database` の 1 行の `datname`（固定名か、接続時の `database` パラメータか） | 接続時の `database` パラメータ（テナントに依らない値に限る）。検証の要否は P 群で決める |
+| O5 | `pg_database` の 1 行の `datname`（固定名か、接続時の `database` パラメータか） | 接続時の `database` パラメータ（テナントに依らない値に限る）。クライアントが渡す値なので、採る場合は識別子の規則（TABLE-6 のポインタ。長さ上限・文字種）で検証し、不正なら固定の値に倒すことを実装 Issue の受け入れ条件にする |
 | O6 | 共有の定義の仮想所有者（自テナントの所有者行が無い `public` のオブジェクトの `relowner`）の OID と名前 | 組み込みの範囲の固定 OID と固定名の NOLOGIN ロールを全テナントで同じに出す |
 | O7 | 実装 Issue の分け方（I1〜I6・P1〜P8）と、P 群（カタログ外の前提）を本ツリーに含めるか別ツリーにするか | 本書の表のとおり。P 群は段 1 の前に置く |
-| O8 | `CREATE TABLE ... AS SELECT`・`INSERT ... SELECT` の元としてカタログを使うことを許すか | 初期は `0A000`。需要が出たら、書き込み先が自テナントの行に限られることを確かめてから解禁 |
+| O8 | 書き込みの文の元としてカタログを使うこと（`CREATE TABLE ... AS SELECT`・`INSERT ... SELECT`・`COPY (SELECT ...) TO`、`UPDATE`・`DELETE`・`MERGE` の読み側）を許すか | 初期はすべて `0A000`（D2）。需要が出たら、書き込み先が自テナントの行に限られ、カタログの内容で書き込みの成否が他テナントに依らないことを確かめてから文ごとに解禁 |
 | O9 | 層 B の対象に Npgsql・pgjdbc・Rails・Django・Prisma・SQLAlchemy を加えるか（CI の実行環境とテスト用依存が増える） | 段ごとに必要なものだけ opt-in で加える。既存の 3 クライアントの基盤（[three-client-e2e-harness.md](three-client-e2e-harness.md)）を広げる |
 | O10 | 既存 DB にカタログと同名の利用者の表がある場合の扱い（D10） | 起動時に検出して警告し、破壊的変更として CHANGELOG に記す |
 
