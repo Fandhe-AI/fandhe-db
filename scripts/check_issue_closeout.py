@@ -17,6 +17,11 @@
 - fail-closed: `gh` の失敗・GraphQL エラー（許容する NOT_FOUND を除く）・ページの
   打ち切り・ノード数の上限超過・JSON の不正・`git ls-files` の失敗は終了コード 3。
   いずれも「検出なし」とは扱わない
+- 自動要約の除外: 対象外節が PR 本文の最後だと、末尾に自動で付く Cursor Bugbot の要約区間と
+  Claude Code の生成表示の行が項目に混ざる（Issue #3536）。既定の形に完全一致する場合に限り、
+  フェンス外かつ対象外節の中でだけ除外する（区間は開始・終了の印の行、内側 1 行目 `---`、
+  以降は空行か引用行のみ、Reviewed by の引用行を含む形）。終了の印が無い・形が崩れている・
+  区間の外の行は従来どおり項目として数える（fail-closed）。除外は `--verbose` に種別と件数だけ出す
 - 機密保持: PR 本文・Issue タイトル・項目本文は出力に再掲しない。出すのは Issue/PR
   番号、節の見出し（無害化・80 文字で切り詰め）、分類だけ
 - subprocess はリスト引数のみ（shell 不使用）。GraphQL の値は変数で渡し、alias 名は
@@ -62,6 +67,10 @@ SCAN_PATH = re.compile(
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 OUT_OF_SCOPE_RE = re.compile(r"out[- ]of[- ]scope", re.IGNORECASE)
+CURSOR_START = "<!-- CURSOR_SUMMARY -->"
+CURSOR_END = "<!-- /CURSOR_SUMMARY -->"
+CURSOR_REVIEWED_PREFIX = "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot)"
+CLAUDE_FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
 LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|[0-9]{1,9}[.)])\s+(.*)$")
 EMPTY_MARKERS = {"なし", "特になし", "none", "na"}
 RANGE_RE = re.compile(
@@ -79,6 +88,8 @@ class FetchError(Exception):
 class Section:
     heading: str
     items: list[str] = field(default_factory=list)
+    # 自動要約として除外した種別ごとの件数（内容は保持しない。--verbose の報告用）
+    excluded: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -147,6 +158,29 @@ def _split_items(lines: list[str]) -> list[str]:
     return [" ".join(parts) for parts in items]
 
 
+def _cursor_summary_end(lines: list[str], start: int) -> int | None:
+    """`lines[start]` の開始の印から続く Cursor 要約区間が既定の形なら終了の印の添字を返す。
+
+    形: 内側 1 行目が `---`、以降は空行か `>` 始まりの行だけで、Reviewed by の引用行を含み、
+    終了の印で閉じる。最初の不適合行で先読みを打ち切る（線形時間）。不成立は None。
+    """
+    i = start + 1
+    if i >= len(lines) or lines[i] != "---":
+        return None
+    reviewed = False
+    i += 1
+    while i < len(lines):
+        line = lines[i]
+        if line == CURSOR_END:
+            return i if reviewed else None
+        if line.strip() and not line.startswith(">"):
+            return None
+        if line.startswith(CURSOR_REVIEWED_PREFIX):
+            reviewed = True
+        i += 1
+    return None
+
+
 def extract_out_of_scope_sections(body: str) -> list[Section]:
     """PR 本文から「対象外」節（フェンス外の ATX 見出し）を抽出する。untrusted 入力。"""
     text = body.replace("\r\n", "\n").replace("\r", "\n")
@@ -163,7 +197,21 @@ def extract_out_of_scope_sections(body: str) -> list[Section]:
             sections.append(active)
         active, buf = None, []
 
-    for line in text.split("\n"):
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if fence is None and active is not None:
+            if line == CURSOR_START:
+                end = _cursor_summary_end(lines, i - 1)
+                if end is not None:
+                    active.excluded["cursor-summary"] = active.excluded.get("cursor-summary", 0) + 1
+                    i = end + 1
+                    continue
+            elif line == CLAUDE_FOOTER:
+                active.excluded["claude-code-footer"] = active.excluded.get("claude-code-footer", 0) + 1
+                continue
         fm = FENCE_RE.match(line)
         if fence is None:
             if fm:
@@ -467,9 +515,13 @@ class Item:
 
 
 def items_from_prs(
-    prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int] | None = None
+    prs: list[tuple[int, str]], issue: int, repo: str, seen_prs: set[int] | None = None,
+    excluded_out: list[tuple[int, int, str, dict[str, int]]] | None = None,
 ) -> tuple[list[Item], int]:
-    """PR 本文から項目を作る。`seen_prs` を渡すと既出 PR は結果から省く（報告の重複排除用）。"""
+    """PR 本文から項目を作る。`seen_prs` を渡すと既出 PR は結果から省く（報告の重複排除用）。
+
+    `excluded_out` を渡すと、自動要約を除外した節の (issue, pr, 見出し, 種別別件数) を追記する。
+    """
     items: list[Item] = []
     sections = 0
     for pr_number, body in prs:
@@ -479,6 +531,8 @@ def items_from_prs(
             seen_prs.add(pr_number)
         for sec in extract_out_of_scope_sections(body):
             sections += 1
+            if excluded_out is not None and sec.excluded:
+                excluded_out.append((issue, pr_number, sec.heading, dict(sec.excluded)))
             for idx, text in enumerate(sec.items, 1):
                 items.append(
                     Item(issue, pr_number, sec.heading, idx,
@@ -514,6 +568,7 @@ def closeout(
     sections_total = 0
     merged_total = 0
     seen_prs: set[int] = set()
+    excluded_all: list[tuple[int, int, str, dict[str, int]]] = []
     edges: dict[int, list[int]] = {}
     for node in descendants:
         if node.truncated_prs:
@@ -525,7 +580,7 @@ def closeout(
         merged_total += len(node.merged_prs)
         # 報告は PR 単位で重複排除するが、参照辺は各 Issue の closing PR から必ず作る
         # （同じ PR が複数 Issue を close しても 2 件目以降の辺を落とさない）
-        items, secs = items_from_prs(node.merged_prs, node.number, repo, seen_prs)
+        items, secs = items_from_prs(node.merged_prs, node.number, repo, seen_prs, excluded_all)
         sections_total += secs
         all_items.extend(items)
         edges.setdefault(node.number, [])
@@ -585,6 +640,10 @@ def closeout(
             lines.append(f"CLOSED-ONLY {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
         elif verbose:
             lines.append(f"OK          {base} refs " + " ".join(describe_ref(r, cache, parent) for r in it.refs))
+    if verbose:
+        for ex_issue, ex_pr, ex_heading, ex_counts in excluded_all:
+            kinds = " ".join(f"{k}={v}" for k, v in sorted(ex_counts.items()))
+            lines.append(f'EXCLUDED    issue #{ex_issue} pr #{ex_pr} section "{ex_heading}" {kinds}')
     for comp in cycles:
         lines.append("CYCLE       " + " -> ".join(f"#{n}" for n in comp + [comp[0]]))
 

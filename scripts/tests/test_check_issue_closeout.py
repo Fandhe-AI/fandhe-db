@@ -141,6 +141,71 @@ class ParseTests(unittest.TestCase):
         self.assertLessEqual(len(h), 80)
 
 
+FOOTER = "\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
+CURSOR_BLOCK = (
+    "<!-- CURSOR_SUMMARY -->\n---\n\n> **Note**\n> synthetic text\n"
+    "> <sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit abc</sup>\n"
+    "<!-- /CURSOR_SUMMARY -->"
+)
+BASE = "## 対象外\n\n- a #1\n- b #2\n"
+
+
+def items_of(text):
+    secs = cic.extract_out_of_scope_sections(text)
+    return secs[0].items if secs else []
+
+
+class AutoSummaryTests(unittest.TestCase):
+    def test_auto_summaries_excluded_items_unchanged(self):
+        secs = cic.extract_out_of_scope_sections(
+            BASE + "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n")
+        self.assertEqual(secs[0].items, ["a #1", "b #2"])
+        self.assertEqual(secs[0].excluded, {"cursor-summary": 1, "claude-code-footer": 1})
+
+    def test_cursor_missing_end_marker_kept(self):
+        text = BASE + CURSOR_BLOCK.replace("<!-- /CURSOR_SUMMARY -->", "") + "\n"
+        self.assertGreater(len(items_of(text)), 2)
+
+    def test_cursor_malformed_kept(self):
+        variants = {
+            "list": CURSOR_BLOCK.replace("> synthetic text", "- remaining work"),
+            "heading": CURSOR_BLOCK.replace("> synthetic text", "### remaining"),
+            "fence": CURSOR_BLOCK.replace("> synthetic text", "```"),
+            "nested": CURSOR_BLOCK.replace("> synthetic text", "<!-- CURSOR_SUMMARY -->"),
+            "no-hr": CURSOR_BLOCK.replace("---", "***"),
+            "no-reviewed": CURSOR_BLOCK.replace("Reviewed by", "Seen by"),
+            "indent": " " + CURSOR_BLOCK,
+            "trailing-space": CURSOR_BLOCK.replace("<!-- CURSOR_SUMMARY -->", "<!-- CURSOR_SUMMARY --> "),
+        }
+        for name, blk in variants.items():
+            secs = cic.extract_out_of_scope_sections(BASE + "\n" + blk + "\n")
+            self.assertEqual(secs[0].excluded.get("cursor-summary", 0), 0, name)
+            self.assertGreater(len(secs[0].items), 2, name)
+
+    def test_items_after_cursor_block_kept(self):
+        text = BASE + "\n" + CURSOR_BLOCK + "\n\n- later #3\n"
+        self.assertEqual(items_of(text), ["a #1", "b #2", "later #3"])
+
+    def test_fence_closing_inside_cursor_block_not_fail_open(self):
+        blk = CURSOR_BLOCK.replace("> synthetic text", "```")
+        text = "## 対象外\n\n```\n" + blk + "\n\n- later #3\n"
+        # 区間より前で開いた fence は区間内の ``` で閉じる。後続の項目は落とさない
+        self.assertIn("later #3", items_of(text))
+
+    def test_footer_lazy_continuation(self):
+        self.assertEqual(items_of(BASE + FOOTER + "\n"), ["a #1", "b #2"])
+
+    def test_footer_variants_kept(self):
+        for v in (FOOTER.replace("Generated", "Made"), "  " + FOOTER, FOOTER + "\ufe0f"):
+            self.assertIn(v.strip(), " ".join(items_of(BASE + "\n" + v + "\n")), v)
+
+    def test_auto_summary_outside_section_noop(self):
+        text = BASE + "\n## 次\n\n" + FOOTER + "\n" + CURSOR_BLOCK + "\n"
+        secs = cic.extract_out_of_scope_sections(text)
+        self.assertEqual(secs[0].items, ["a #1", "b #2"])
+        self.assertEqual(secs[0].excluded, {})
+
+
 class FakeGh:
     """parent=100 の子 101..104。101 untracked、102 closed のみ、103/104 が循環、それぞれ PR を持つ。"""
 
@@ -199,6 +264,28 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("CYCLE       #103 -> #104 -> #103", out)
         self.assertIn("untracked=1 closed-only=2 cycles=1 ok=1", out)
         self.assertNotIn(SENTINEL, out + err)
+
+    def test_verbose_reports_excluded_without_echo(self):
+        tail = (FOOTER + "\n" + CURSOR_BLOCK.replace("synthetic text", SENTINEL) + "\n")
+        plain = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n")}, tree={100: [101], 101: []})
+        g = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n\n" + tail)}, tree={100: [101], 101: []})
+        code, out, err = run_cli(g, ["100", "--verbose"])
+        pcode, pout, _ = run_cli(plain, ["100", "--verbose"])
+        self.assertIn("EXCLUDED    issue #101 pr #901", out)
+        self.assertIn("claude-code-footer=1", out)
+        self.assertIn("cursor-summary=1", out)
+        self.assertNotIn(SENTINEL, out + err)
+        self.assertEqual(code, pcode)
+        self.assertEqual([l for l in out.splitlines() if l.startswith("summary:")],
+                         [l for l in pout.splitlines() if l.startswith("summary:")])
+        _, quiet, _ = run_cli(g, ["100"])
+        self.assertNotIn("EXCLUDED", quiet)
+
+    def test_auto_summary_no_false_untracked(self):
+        tail = "\n" + FOOTER + "\n\n" + CURSOR_BLOCK + "\n"
+        g = FakeGh(bodies={101: (901, "## 対象外\n\n- see #600\n" + tail)}, tree={100: [101], 101: []})
+        code, out, _ = run_cli(g, ["100"])
+        self.assertEqual(code, 0, out)
 
     def test_clean_tree(self):
         g = FakeGh(bodies={101: (901, body("see #600"))}, tree={100: [101], 101: []})
