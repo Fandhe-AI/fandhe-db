@@ -80,7 +80,7 @@ WHERE は最上位の `AND` で conjunct に平坦化し、解決済みの relat
 | 対象と source をまたぐ上記以外（非等値・`OR`・キー化できない型の等値） | 残余述語（Issue #3295。単一表 source のみ。畳み込み source は `0A000`。下記「非等値・OR をまたぐ述語」節） |
 | 上記以外（参照列が無い等） | `0A000` |
 
-`0A000` で拒否する形（設計上の対象外・fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: 畳み込み source（FROM／USING が 2 表以上・JOIN 段あり）での対象と source をまたぐ非等値・`OR`・キー化できない型の等値、embedding を参照する対象側述語・残余、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列、残余での source 疑似列 `id`・VECTOR／配列列の参照。同じ relation 内の列比較は Issue #3295 で対象側／（単一表）source 側へ押し下げて受理する。キー列の型クラスが比較できない組は `42804`。等値結合キーが無い形（WHERE 省略・source だけの述語）と FROM／USING が 2 表以上の形は Issue #3294 で受理した。
+`0A000` で拒否する形（fail-closed の安全弁。取りこぼした述語は書き込み範囲を広げるため、未分類は必ず拒否する）: 畳み込み source（FROM／USING が 2 表以上・JOIN 段あり）での対象と source をまたぐ非等値・`OR`（未対応。受け皿は #3534 で、対応するまで `0A000` を維持する）。設計上の対象外は次のとおり: 畳み込み source での対象と source をまたぐキー化できない型の等値、embedding を参照する対象側述語・残余、SET 右辺の source 疑似列 `id`・結合ビューへ写像できない型の source 列、残余での source 疑似列 `id`・VECTOR／配列列の参照。同じ relation 内の列比較は Issue #3295 で対象側／（単一表）source 側へ押し下げて受理する。キー列の型クラスが比較できない組は `42804`。等値結合キーが無い形（WHERE 省略・source だけの述語）と FROM／USING が 2 表以上の形は Issue #3294 で受理した。
 
 SET は、リテラルと対象表の列だけを使う式をそのまま運び、列参照（source 列を含む）と source 列を含む式（Issue #3296）を「対象列 ++ source の取り出し列」の合成スキーマ上の式として束縛する（合成名は利用者の識別子と衝突しない綴り）。Describe 経路で変換エラーを返すかどうかは #3202 の方針の範囲。
 
@@ -198,7 +198,7 @@ SQL-53 (b)・SQL-75・SQL-76 のポインタ。`EXPLAIN [ANALYZE|VERBOSE|(オプ
 - **ANALYZE**: 既存の DML ANALYZE（#2055）と同じ契約で実際に実行する。autocommit は暗黙 Tx で実行して commit、明示 Tx は同じ Tx 上で実行（`ROLLBACK` で戻る）、`USING OPERATION_ID` は台帳に記録される。`actual_rows` は `RETURNING` の可視行数（無ければ 0）。`READ ONLY` Tx は `25006`
 - **VERBOSE**: `RETURNING` の列を `output:` に出す（Describe と同じ列）。`FORMAT JSON` は既存の包みで通り、`ANALYZE` との併用は `0A000`
 - **権限**: 非 EXPLAIN と同じビット（対象表 `UPDATE|SELECT`／`DELETE|SELECT`、FROM／USING 側の SELECT）。EXPLAIN は抜け道にならない
-- **まだ拒否する形**: target がビューの形・一時表が関与する形（FROM／USING 側の単純形ビューは #3292 で受理済みで、EXPLAIN も同じ計画を返す）、FROM 内の JOIN ON・多方向結合（#3294。木の組み立ては source 1 個前提で、#3294 が計画を拡張するときに追随させる）、分割実行（`PARTITIONED`）、セッション無しの入口
+- **まだ拒否する形**: target がビューの形・一時表が関与する形（FROM／USING 側の単純形ビューは #3292 で受理済みで、EXPLAIN も同じ計画を返す）、FROM 内の JOIN ON・多方向結合（DML 本体の多方向結合は #3294 で受理済み。EXPLAIN の木の組み立ては source 1 個前提のままで、EXPLAIN の残件の受け皿は #3534）、分割実行（`PARTITIONED`）、セッション無しの入口
 
 ## `$n` と公開名重複（Issue #3297）
 
