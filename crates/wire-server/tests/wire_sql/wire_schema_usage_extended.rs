@@ -344,3 +344,99 @@ fn wire_foreign_schema_is_indistinguishable_from_missing_on_every_step() {
         expect_error_at(sql, replies, b"EZ", "3F000");
     }
 }
+
+/// 名前付きの文を Parse だけして Sync する（USAGE が有効な時点の Parse を、後の Describe・Bind と分けるため）。
+fn parse_named(stream: &mut TcpStream, name: &str, sql: &str) -> Vec<Reply> {
+    send_length_prefixed_message(stream, b'P', &parse_body(name, sql, 0));
+    send_length_prefixed_message(stream, b'S', &[]);
+    read_until_ready(stream)
+}
+
+/// 名前付きの文の Describe(S) だけを送って Sync する。
+fn describe_named(stream: &mut TcpStream, name: &str) -> Vec<Reply> {
+    let mut body = vec![b'S'];
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    send_length_prefixed_message(stream, b'D', &body);
+    send_length_prefixed_message(stream, b'S', &[]);
+    read_until_ready(stream)
+}
+
+/// 名前付きの文を無名 portal へ Bind → Execute → Sync する（`param` があれば text で 1 つ渡す）。
+fn bind_execute_named(stream: &mut TcpStream, name: &str, param: Option<&str>) -> Vec<Reply> {
+    let mut body = vec![0u8]; // 無名 portal
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0i16.to_be_bytes()); // param format code count（text）
+    match param {
+        Some(v) => {
+            body.extend_from_slice(&1i16.to_be_bytes());
+            let len = i32::try_from(v.len()).expect("short value");
+            body.extend_from_slice(&len.to_be_bytes());
+            body.extend_from_slice(v.as_bytes());
+        }
+        None => body.extend_from_slice(&0i16.to_be_bytes()),
+    }
+    body.extend_from_slice(&0i16.to_be_bytes()); // result format code count
+    send_length_prefixed_message(stream, b'B', &body);
+    send_length_prefixed_message(stream, b'E', &execute_body("", 0));
+    send_length_prefixed_message(stream, b'S', &[]);
+    read_until_ready(stream)
+}
+
+/// USAGE がある時点で Parse した名前付きの文は、その後の `REVOKE USAGE` を Describe(S)・Bind の時点で反映する
+/// （Parse 時の USAGE を使い回さない）。REVOKE 前の Describe(S) は成功し（陰性対照）、REVOKE 後は Bind と同じ
+/// `42501`・同じ文言で、ParameterDescription・RowDescription を返さない。
+// intentional: docs/design/schema-tenant-namespace.md
+// 根拠の節: 拒否の根拠（Issue #3532）
+#[test]
+fn wire_revoke_usage_after_parse_is_reflected_by_describe_and_bind() {
+    let (addr, _guard, core) = serve("wire-schema-usage-revoke", false);
+    let mut owner = bound_session(OWNER, true);
+    setup(
+        &core,
+        OBSERVER_TENANT,
+        &mut owner,
+        "GRANT USAGE ON SCHEMA s TO alice",
+    );
+    let mut a = authenticate_to_ready_for_query(addr, "alice", "pw-alice");
+    let cases = [
+        ("stmt_plain", "SELECT id, name FROM s.t", None),
+        (
+            "stmt_param",
+            "SELECT id, name FROM s.t WHERE id = $1",
+            Some("1"),
+        ),
+    ];
+    for (name, sql, _) in cases {
+        assert_eq!(
+            kinds(&parse_named(&mut a, name, sql)),
+            b"1Z".to_vec(),
+            "{name}: parse"
+        );
+        // 陰性対照: REVOKE 前の Describe(S) は成功する。
+        assert_eq!(
+            kinds(&describe_named(&mut a, name)),
+            b"tTZ".to_vec(),
+            "{name}: describe before revoke"
+        );
+    }
+
+    setup(
+        &core,
+        OBSERVER_TENANT,
+        &mut owner,
+        "REVOKE USAGE ON SCHEMA s FROM alice",
+    );
+
+    for (name, _, param) in cases {
+        let described = expect_error_at(name, &describe_named(&mut a, name), b"EZ", "42501");
+        let bound = expect_error_at(
+            name,
+            &bind_execute_named(&mut a, name, param),
+            b"EZ",
+            "42501",
+        );
+        assert_eq!(described, bound, "{name}: describe and bind wording");
+    }
+}
