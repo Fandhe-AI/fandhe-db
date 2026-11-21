@@ -307,13 +307,14 @@ fn seed(storage: &Storage, table: &str, null_ids: &[u64]) {
 }
 
 fn open(label: &str, probe: &Arc<Probe>, tables: &[(&str, &[u64])]) -> (EngineCore, CleanupGuard) {
-    let path = unique_db_path(label);
-    let storage = Storage::open(&path).expect("open storage");
+    // パスを払い出した直後にガードを作る（以降の `open`・seed が panic しても一時 DB を残さない）。
+    let guard = CleanupGuard(unique_db_path(label));
+    let storage = Storage::open(&guard.0).expect("open storage");
     for (table, null_ids) in tables {
         seed(&storage, table, null_ids);
     }
     let core = EngineCore::from_storage(storage, Box::new(SharedProbe(Arc::clone(probe))));
-    (core, CleanupGuard(path))
+    (core, guard)
 }
 
 fn run(core: &EngineCore, sql: &str) -> Result<QueryResult, SqlSurfaceError> {
@@ -846,6 +847,39 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
                 cosine: true,
                 slots: vec![1, 2, 3, 4, 5, 7, 8, 9, 10, 11],
                 rows: 12
+            }],
+            "forged {forged}: provider call"
+        );
+        match res {
+            Err(SqlSurfaceError::Internal { detail }) => {
+                assert_eq!(detail, "hybrid search error", "forged {forged}")
+            }
+            other => panic!("forged {forged} must be rejected: {other:?}"),
+        }
+    }
+}
+
+/// 上のテストの恒等候補列版（NULL 行なしの表。`dense_slots == None`）。アダプタが所属検査を `dense_slots`
+/// ありのときだけ行う退行を検出するため、provider 呼び出しが `Full`（恒等 0..10）であることと、範囲外の
+/// スロット（10・12。順序・件数・重複の契約は満たす）が同じ detail で拒否されることを固定する。
+#[test]
+fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
+    let probe = Arc::new(Probe::default());
+    let (core, _g) = open("sql3220-hybrid-forge-id", &probe, &[("plain", &[])]);
+    let sql = "SELECT id, kind FROM plain \
+               ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'a') LIMIT 20";
+    run(&core, sql).unwrap_or_else(|e| panic!("hybrid normal: {e:?}"));
+    probe.take();
+    for forged in [10_u64, 12] {
+        *probe.forge.lock().expect("lock") = Some(forged);
+        let res = run(&core, sql);
+        *probe.forge.lock().expect("lock") = None;
+        assert_eq!(
+            probe.take(),
+            vec![Call::Full {
+                cosine: true,
+                ids: (0..10).collect(),
+                rows: 10
             }],
             "forged {forged}: provider call"
         );
