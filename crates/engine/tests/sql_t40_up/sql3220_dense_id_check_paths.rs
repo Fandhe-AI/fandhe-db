@@ -359,7 +359,7 @@ fn seed(storage: &Storage, table: &str, null_ids: &[u64]) {
     }
 }
 
-fn open(label: &str, probe: &Arc<Probe>, tables: &[(&str, &[u64])]) -> (EngineCore, CleanupGuard) {
+fn open(label: &str, probe: &Arc<Probe>, tables: &[(&str, &[u64])]) -> (CleanupGuard, EngineCore) {
     // パスを払い出した直後にガードを作る（以降の `open`・seed が panic しても一時 DB を残さない）。
     let guard = CleanupGuard(unique_db_path(label));
     let storage = Storage::open(&guard.0).expect("open storage");
@@ -367,7 +367,8 @@ fn open(label: &str, probe: &Arc<Probe>, tables: &[(&str, &[u64])]) -> (EngineCo
         seed(&storage, table, null_ids);
     }
     let core = EngineCore::from_storage(storage, Box::new(SharedProbe(Arc::clone(probe))));
-    (core, guard)
+    // ガードを先に返し、呼び出し側でも先に束縛する（`Drop` は宣言の逆順なので DB を閉じてから削除する。`temp_db.rs`）。
+    (guard, core)
 }
 
 fn run(core: &EngineCore, sql: &str) -> Result<QueryResult, SqlSurfaceError> {
@@ -469,7 +470,7 @@ fn expected_ids(all: &[u64], limit: usize) -> Vec<u64> {
 fn sql3220_mask_path_matches_identity_path_bitwise() {
     for (label, tail, cosine, limit) in PROVIDER_SHAPES {
         let probe = Arc::new(Probe::default());
-        let (core, _g) = open("sql3220-mask", &probe, &[("docs", &[])]);
+        let (_g, core) = open("sql3220-mask", &probe, &[("docs", &[])]);
         let sql = format!("SELECT {COLS} FROM docs WHERE kind = 'a' {tail}");
 
         let cold = run(&core, &sql).unwrap_or_else(|e| panic!("{label}: {e:?}"));
@@ -515,7 +516,7 @@ fn sql3220_mask_path_matches_identity_path_bitwise() {
 fn sql3220_null_rows_path_matches_identity_path_bitwise() {
     // NULL 行は id 5（先頭スロット 0）と id 55（スロット 6）。通常行は 10, 20, ..., 100。
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open(
+    let (_g, core) = open(
         "sql3220-null",
         &probe,
         &[("plain", &[]), ("nulls", &[5, 55])],
@@ -587,7 +588,7 @@ fn sql3220_exact_scan_results_match_across_paths() {
     for (tail, want_masked, want_all) in shapes {
         // ケースごとに索引の無い core（1 回目の実行で索引ができる）。
         let probe = Arc::new(Probe::default());
-        let (core, _g) = open(
+        let (_g, core) = open(
             "sql3220-exact",
             &probe,
             &[("docs", &[]), ("plain", &[]), ("nulls", &[5, 55])],
@@ -627,7 +628,7 @@ fn sql3220_exact_scan_results_match_across_paths() {
 #[test]
 fn sql3220_empty_results_match_across_paths() {
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open(
+    let (_g, core) = open(
         "sql3220-empty",
         &probe,
         &[("docs", &[]), ("plain", &[]), ("nulls", &[5, 55])],
@@ -676,7 +677,7 @@ fn sql3220_distance_ties_keep_id_order_across_paths() {
     for op in ["<#>", "<=>"] {
         // 演算子ごとに新しい core（1 回目が cold になる）。
         let probe = Arc::new(Probe::default());
-        let (core, _g) = open(
+        let (_g, core) = open(
             "sql3220-ties",
             &probe,
             &[("docs", &[]), ("plain", &[]), ("nulls", &[5, 55])],
@@ -724,7 +725,7 @@ fn sql3220_distance_ties_keep_id_order_across_paths() {
 fn sql3220_null_rows_and_mask_overlap_intersect_correctly() {
     for (label, tail, cosine, limit) in PROVIDER_SHAPES {
         let probe = Arc::new(Probe::default());
-        let (core, _g) = open("sql3220-overlap", &probe, &[("both", &[5, 25, 55, 65])]);
+        let (_g, core) = open("sql3220-overlap", &probe, &[("both", &[5, 25, 55, 65])]);
         let sql = format!("SELECT {COLS} FROM both WHERE kind = 'a' {tail}");
         let c_init = core.scalar_index_cache_stats().index_mask_scans;
         let cold = run(&core, &sql).unwrap_or_else(|e| panic!("{label}: {e:?}"));
@@ -776,7 +777,7 @@ fn sql3220_null_rows_and_mask_overlap_intersect_correctly() {
 #[test]
 fn sql3220_null_rows_and_mask_overlap_reject_forged_ids() {
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open(
+    let (_g, core) = open(
         "sql3220-overlap-forge",
         &probe,
         &[("both_nan", &[5, 25, 55, 65])],
@@ -833,7 +834,7 @@ fn sql3220_null_rows_and_mask_overlap_reject_forged_ids() {
 #[test]
 fn sql3220_expression_overflow_is_identical_across_paths() {
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open(
+    let (_g, core) = open(
         "sql3220-overflow",
         &probe,
         &[("docs", &[]), ("plain", &[]), ("nulls", &[5, 55])],
@@ -899,7 +900,7 @@ fn sql3220_expression_overflow_is_identical_across_paths() {
 #[test]
 fn sql3220_hybrid_dense_adapter_null_rows_match_identity_path() {
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open(
+    let (_g, core) = open(
         "sql3220-hybrid",
         &probe,
         &[("plain", &[]), ("nulls", &[5, 55])],
@@ -954,7 +955,7 @@ fn sql3220_hybrid_dense_adapter_null_rows_match_identity_path() {
 #[test]
 fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open("sql3220-hybrid-forge", &probe, &[("nulls", &[5, 55])]);
+    let (_g, core) = open("sql3220-hybrid-forge", &probe, &[("nulls", &[5, 55])]);
     let sql = "SELECT id, kind FROM nulls \
                ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'a') LIMIT 20";
     // 正常時は通る（検証が拒否の原因になっていないことの対照）。
@@ -996,7 +997,7 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids() {
 #[test]
 fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open("sql3220-hybrid-forge-id", &probe, &[("plain", &[])]);
+    let (_g, core) = open("sql3220-hybrid-forge-id", &probe, &[("plain", &[])]);
     let sql = "SELECT id, kind FROM plain \
                ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'a') LIMIT 20";
     run(&core, sql).unwrap_or_else(|e| panic!("hybrid normal: {e:?}"));
@@ -1039,7 +1040,7 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
 #[test]
 fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
     let probe = Arc::new(Probe::default());
-    let (core, _g) = open(
+    let (_g, core) = open(
         "sql3220-forge",
         &probe,
         &[("docs", &[]), ("nulls", &[5, 55])],
