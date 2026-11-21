@@ -104,6 +104,9 @@ struct Probe {
     forge: Mutex<Option<u64>>,
     /// `Some(id)` のとき、コサイン結果の既存の NaN ヒット 1 件を id だけ候補外へ置き換える（件数を変えない）。
     replace_nan: Mutex<Option<u64>>,
+    /// `Some(id)` のとき、内積側（`search`・`search_subset`）の返却の末尾のヒットの id だけを `id`（すでに返っている
+    /// 候補内の id）へ置き換える。score・件数は変えない（有限性・件数は保たれる。並び順は置き換え先を選んで保つ）。
+    replace_last: Mutex<Option<u64>>,
     /// 各 provider 呼び出しの `(要求 k, 捏造後の返却件数)`。件数の契約（返却件数 <= k）を満たす根拠。
     ks: Mutex<Vec<(usize, usize)>>,
 }
@@ -119,6 +122,14 @@ impl Probe {
 
     fn take_ks(&self) -> Vec<(usize, usize)> {
         std::mem::take(&mut *self.ks.lock().expect("lock"))
+    }
+
+    /// `replace_last` が設定されていれば、末尾のヒットの id だけを置き換える。
+    fn replace_last_candidate(&self, hits: &mut [CandidateHit]) {
+        let replace = *self.replace_last.lock().expect("lock");
+        if let Some(id) = replace {
+            hits.last_mut().expect("non-empty hits").id = id;
+        }
     }
 
     fn note_k(&self, k: usize, returned: usize) {
@@ -165,6 +176,7 @@ impl SearchProvider for SharedProbe {
         if let Some(id) = self.0.forged() {
             hits.push(CandidateHit { id, score: -1.0e30 });
         }
+        self.0.replace_last_candidate(&mut hits);
         self.0.note_k(k, hits.len());
         Ok(hits)
     }
@@ -183,6 +195,7 @@ impl SearchProvider for SharedProbe {
         if let Some(id) = self.0.forged() {
             hits.push(CandidateHit { id, score: -1.0e30 });
         }
+        self.0.replace_last_candidate(&mut hits);
         self.0.note_k(k, hits.len());
         Ok(hits)
     }
@@ -1038,6 +1051,14 @@ fn sql3220_hybrid_dense_adapter_rejects_forged_ids_on_identity_candidates() {
     }
 }
 
+/// 捏造・置き換えの種類（どの `Probe` のつまみを使うか）。
+#[derive(Clone, Copy)]
+enum Knob {
+    Forge,
+    ReplaceNan,
+    ReplaceLast,
+}
+
 /// 最適化の対象外の形（NULL 行あり・マスクで非恒等）でも従来経路のまま fail-closed に動く。
 /// 次の 2 つは別々の保証として固定する。
 /// - 返却値の検証: provider が候補外のスロット（可視 arena 内の NULL 行・マスク外のスロット、範囲外のスロット）を
@@ -1093,45 +1114,59 @@ fn sql3220_forged_ids_are_rejected_on_both_paths_and_never_cross_tenants() {
             slots: vec![1, 3, 5, 7, 9],
             rows: 10,
         };
-        let mut cases: Vec<(&str, &str, u64, Call, bool)> = vec![
+        let mut cases: Vec<(&str, &str, u64, Call, Knob)> = vec![
             // 恒等経路（10 行）。id 10 は範囲外。
-            ("identity out of range", &plain, 10, full10.clone(), false),
+            (
+                "identity out of range",
+                &plain,
+                10,
+                full10.clone(),
+                Knob::Forge,
+            ),
             // NULL 行あり（12 行。dense は NULL スロット 0・6 を除く）。NULL 行のスロットを返す。
             (
                 "dense excludes null slot 0",
                 &nulls,
                 0,
                 dense.clone(),
-                false,
+                Knob::Forge,
             ),
             (
                 "dense excludes null slot 6",
                 &nulls,
                 6,
                 dense.clone(),
-                false,
+                Knob::Forge,
             ),
             // マスク経路（kept = [1,3,5,7,9]）。kept に無い元スロット 0（arena 内の可視行）を返す。
-            ("mask excludes slot 0", &masked, 0, masked_call, false),
+            ("mask excludes slot 0", &masked, 0, masked_call, Knob::Forge),
         ];
-        if cosine {
+        if !cosine {
+            // 負の内積（`provider_result_is_valid_with`）の重複: NaN ヒットが無いので、末尾のヒットの id だけを、
+            // すでに返っている候補内の id に置き換える（score・件数はそのまま。置き換え先は直前のヒットより大きい
+            // id を選び、同点の id 昇順も保つ）。恒等列: 内積 0 の同点群の末尾スロット 9 を、先に返っているスロット 8
+            // へ。dense: 末尾スロット 11 を、先に返っているスロット 10 へ。出現回数の検証だけが失われると、
+            // 同じ候補を 2 回返す結果を受理して成功する入力になる。
+            cases.push(("identity duplicate", &plain, 8, full10, Knob::ReplaceLast));
+            cases.push(("dense duplicate", &nulls, 10, dense, Knob::ReplaceLast));
+        } else {
             // 重複だけを違反させる: 既存の NaN ヒット（`i=5`・`i=7` のゼロ・桁あふれ行）を、すでに返っている
             // 候補内の id の複製に置き換える（件数・距離順・NaN 末尾は保つ）。コサインアームは NaN を除かないので、
             // 所属確認だけに簡略化すると同じ候補を 2 回返す結果を受理する。マスク付きの表には NaN 行が無い。
-            cases.push(("identity duplicate", &plain, 0, full10, true));
-            cases.push(("dense duplicate", &nulls, 1, dense, true));
+            cases.push(("identity duplicate", &plain, 0, full10, Knob::ReplaceNan));
+            cases.push(("dense duplicate", &nulls, 1, dense, Knob::ReplaceNan));
         }
-        for (why, sql, forged, expected_call, replace) in cases {
+        for (why, sql, forged, expected_call, knob) in cases {
             probe.take();
             probe.take_ks();
-            let knob = if replace {
-                &probe.replace_nan
-            } else {
-                &probe.forge
+            let cell = match knob {
+                Knob::Forge => &probe.forge,
+                Knob::ReplaceNan => &probe.replace_nan,
+                Knob::ReplaceLast => &probe.replace_last,
             };
-            *knob.lock().expect("lock") = Some(forged);
+            *cell.lock().expect("lock") = Some(forged);
             let res = run(&core, sql);
-            *knob.lock().expect("lock") = None;
+            *cell.lock().expect("lock") = None;
             let calls = probe.take();
             // 件数の契約は満たす（捏造後の返却件数 <= 要求 k。`LIMIT 100` の k は 10〜12 行より大きい）。
             let ks = probe.take_ks();
