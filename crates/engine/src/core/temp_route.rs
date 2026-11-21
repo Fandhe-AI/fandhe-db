@@ -1166,6 +1166,9 @@ impl EngineCore {
             return Ok(());
         };
         let mut seen: Vec<u64> = Vec::new();
+        // テナントの SCHEMA 一覧は、内部キーが最初に現れた時点で 1 回だけ引いて使い回す（Issue #3532。
+        // Describe(S) でも呼ぶため、参照先の SCHEMA の数だけ一覧を作り直さない）。
+        let mut alive_schemas = None;
         for t in &prepared.tokens {
             let crate::sql::lexer::Token::Ident(name) = t else {
                 continue;
@@ -1182,11 +1185,16 @@ impl EngineCore {
                     seen.push(schema_id);
                     // Parse 後に DROP SCHEMA された場合は ACL 行も消えるため、USAGE 検査より先に
                     // 生存を再検証し、解決器経路と同じ undefined table（42P01）にする（42501 に化けさせない）。
-                    let alive = self
-                        .storage
-                        .schema_names_for_tenant(tenant)
-                        .map_err(crate::catalog::table_lookup_error)?
-                        .contains_key(&schema_id);
+                    if alive_schemas.is_none() {
+                        alive_schemas = Some(
+                            self.storage
+                                .schema_names_for_tenant(tenant)
+                                .map_err(crate::catalog::table_lookup_error)?,
+                        );
+                    }
+                    let alive = alive_schemas
+                        .as_ref()
+                        .is_some_and(|names| names.contains_key(&schema_id));
                     if !alive {
                         return Err(SqlSurfaceError::undefined_table(rel));
                     }

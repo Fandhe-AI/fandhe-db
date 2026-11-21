@@ -357,6 +357,43 @@ fn prepared_recheck_reports_dropped_schema_as_undefined_table() {
     assert_eq!(err.wire_code(), "42P01");
 }
 
+/// 複数の SCHEMA を参照する文でも、再検査は参照先ごとに生存と USAGE を確かめる（SCHEMA 一覧は 1 回だけ引く。
+/// Issue #3532）。後ろの SCHEMA だけの取り消し・削除も見落とさない。
+#[test]
+fn prepared_recheck_covers_every_referenced_schema() {
+    let (core, _g, mut o, mut a) = fixture("sacl_prep_multi");
+    ok(&core, "t1", &mut o, "CREATE SCHEMA s2");
+    ok(
+        &core,
+        "t1",
+        &mut o,
+        "CREATE TABLE s2.t2 (id BIGINT PRIMARY KEY)",
+    );
+    ok(&core, "t1", &mut o, "GRANT SELECT ON s2.t2 TO alice");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s TO alice");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s2 TO alice");
+    assert!(a.bind_resolution_tenant("t1"));
+    let prepared = core
+        .parse_sql_prepared_with_declared_in_session(
+            &a,
+            "SELECT id FROM s.t UNION ALL SELECT id FROM s2.t2",
+            &[],
+        )
+        .expect("parse");
+    assert!(core.recheck_prepared_schema_usage(&a, &prepared).is_ok());
+    ok(&core, "t1", &mut o, "REVOKE USAGE ON SCHEMA s2 FROM alice");
+    let err = core
+        .recheck_prepared_schema_usage(&a, &prepared)
+        .expect_err("revoked s2");
+    assert_eq!(err.wire_code(), "42501");
+    ok(&core, "t1", &mut o, "GRANT USAGE ON SCHEMA s2 TO alice");
+    ok(&core, "t1", &mut o, "DROP SCHEMA s2 CASCADE");
+    let err = core
+        .recheck_prepared_schema_usage(&a, &prepared)
+        .expect_err("dropped s2");
+    assert_eq!(err.wire_code(), "42P01");
+}
+
 #[test]
 fn search_path_creation_target_requires_usage() {
     let (core, _g, _o, mut a) = fixture("sacl_ct");
