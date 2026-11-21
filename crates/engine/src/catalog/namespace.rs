@@ -992,6 +992,41 @@ pub(crate) fn schema_names_for_tenant_in_txn<R: ReadSource>(
     Ok(out)
 }
 
+/// `tenant_id` の SCHEMA のうち、`wanted` に含まれる ID だけを集めて返す（生存確認用。名前は複製しない）。
+/// 走査は [`schema_names_for_tenant_in_txn`] と同じ範囲・同じ [`MAX_SCHEMAS_PER_TENANT`] 打ち切りで、
+/// `wanted` がすべて見つかった時点で止める。`recheck_prepared_schema_usage` が、ACL 判定と同じ読み取り
+/// スナップショット上で参照先の生存を確かめるために呼ぶ（Issue #3532）。
+pub(crate) fn alive_schema_ids_in_txn<R: ReadSource>(
+    src: &R,
+    tenant_id: &str,
+    wanted: &[u64],
+) -> Result<std::collections::BTreeSet<u64>> {
+    let mut found = std::collections::BTreeSet::new();
+    if wanted.is_empty() {
+        return Ok(found);
+    }
+    let table = match src.open_table(SCHEMAS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(found),
+        Err(e) => return Err(e.into()),
+    };
+    for (scanned, entry) in table.range((tenant_id, "")..)?.enumerate() {
+        let (k, v) = entry?;
+        let (tenant, _) = k.value();
+        if tenant != tenant_id || scanned >= MAX_SCHEMAS_PER_TENANT {
+            break;
+        }
+        let id = decode_schema_def(v.value())?;
+        if wanted.contains(&id) {
+            found.insert(id);
+            if found.len() >= wanted.len() {
+                break;
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// `tenant_id` の形状検査（空は拒否。形式の詳細検証は `PolicyContext` が担うため多層防御の下限）。
 fn validate_tenant_id(tenant_id: &str) -> Result<()> {
     if tenant_id.is_empty() {

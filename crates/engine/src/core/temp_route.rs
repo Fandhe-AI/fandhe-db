@@ -1151,6 +1151,9 @@ impl EngineCore {
     /// 準備済み文のトークン列に現れる SCHEMA 修飾の内部キー（`#<id>.<名前>`。解決器だけが作れる）から
     /// SCHEMA ID を集め、束縛ロールの USAGE を再検査する（Bind と Describe(S) の入口。件数はトークン数で有界）。
     /// 解決時のテナント（`resolution_tenant`）が無ければ Parse が SCHEMA を解決していないため何もしない。
+    /// 生存確認と全参照先の USAGE 判定は、再検査開始時に開いた 1 つの読み取りスナップショットで行う
+    /// （別々に読むと、並行 DROP SCHEMA で 42P01 が 42501 に化けうる。Issue #3532）。生存確認は対象 ID が
+    /// すべて見つかった時点で走査を止め、名前は複製しない。
     /// wire-server は `$n` を持たない準備済み文（`PreparedStatement::Parsed`）の Bind・Describe(S) でも、解決結果を
     /// 使い回す分岐で必ず本メソッドを呼ぶ（Parse は USAGE を見ないため、拡張クエリではここが USAGE の検査点。
     /// Describe(S) での呼び出しは Issue #3532。`describe_prepared_in_*` も内部で呼ぶ）。
@@ -1165,10 +1168,8 @@ impl EngineCore {
         let Some(tenant) = session.resolution_tenant() else {
             return Ok(());
         };
-        let mut seen: Vec<u64> = Vec::new();
-        // テナントの SCHEMA 一覧は、内部キーが最初に現れた時点で 1 回だけ引いて使い回す（Issue #3532。
-        // Describe(S) でも呼ぶため、参照先の SCHEMA の数だけ一覧を作り直さない）。
-        let mut alive_schemas = None;
+        // トークン順・重複なしで参照先 SCHEMA を集める（関係名はエラー文言用）。
+        let mut refs: Vec<(u64, String)> = Vec::new();
         for t in &prepared.tokens {
             let crate::sql::lexer::Token::Ident(name) = t else {
                 continue;
@@ -1181,26 +1182,25 @@ impl EngineCore {
                 name: rel,
             }) = crate::catalog::namespace::RelationKey::parse(name)
             {
-                if !seen.contains(&schema_id) {
-                    seen.push(schema_id);
-                    // Parse 後に DROP SCHEMA された場合は ACL 行も消えるため、USAGE 検査より先に
-                    // 生存を再検証し、解決器経路と同じ undefined table（42P01）にする（42501 に化けさせない）。
-                    if alive_schemas.is_none() {
-                        alive_schemas = Some(
-                            self.storage
-                                .schema_names_for_tenant(tenant)
-                                .map_err(crate::catalog::table_lookup_error)?,
-                        );
-                    }
-                    let alive = alive_schemas
-                        .as_ref()
-                        .is_some_and(|names| names.contains_key(&schema_id));
-                    if !alive {
-                        return Err(SqlSurfaceError::undefined_table(rel));
-                    }
-                    self.check_schema_usage_for(tenant, session, schema_id)?;
+                if !refs.iter().any(|(id, _)| *id == schema_id) {
+                    refs.push((schema_id, rel));
                 }
             }
+        }
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let snap = self.begin_read_txn()?;
+        let ids: Vec<u64> = refs.iter().map(|(id, _)| *id).collect();
+        let alive = crate::catalog::namespace::alive_schema_ids_in_txn(&snap, tenant, &ids)
+            .map_err(crate::catalog::table_lookup_error)?;
+        for (schema_id, rel) in refs {
+            // Parse 後に DROP SCHEMA された場合は ACL 行も消えるため、USAGE 検査より先に生存を見て、
+            // 解決器経路と同じ undefined table（42P01）にする（42501 に化けさせない）。
+            if !alive.contains(&schema_id) {
+                return Err(SqlSurfaceError::undefined_table(rel));
+            }
+            self.check_schema_usage_for_in_txn(&snap, tenant, session, schema_id)?;
         }
         Ok(())
     }

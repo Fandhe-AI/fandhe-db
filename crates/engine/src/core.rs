@@ -6343,6 +6343,21 @@ impl EngineCore {
         })
     }
 
+    /// [`Self::check_schema_usage_for`] の、呼び出し側が持つ読み取りスナップショットで判定する版
+    /// （`recheck_prepared_schema_usage` が生存確認と同一スナップショットで USAGE を見るために使う）。
+    pub(crate) fn check_schema_usage_for_in_txn(
+        &self,
+        txn: &redb::ReadTransaction,
+        tenant_id: &str,
+        session: &crate::sql::mode::SessionState,
+        schema_id: u64,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::schema_privilege::check_schema_usage(session, &|role| {
+            crate::catalog::privilege::schema_privileges_in_txn(txn, tenant_id, schema_id, &[role])
+                .map_err(crate::catalog::table_lookup_error)
+        })
+    }
+
     /// `search_path` の要素の可視性 probe（`current_schema()`・`current_schemas()`）。自テナントに在り、かつ
     /// USAGE を持つ SCHEMA だけが「在る」。USAGE の無い SCHEMA は値の列挙では黙って飛ばす（設計記録 K4）。
     /// 作成先の判定（`creation_target`）は飛ばさず `42501` にする。他テナントの SCHEMA は不在と同じ。
